@@ -711,14 +711,14 @@ typedef struct {
     int16_t ir_y; // unsmoothed: values outside the screen mean "pointing off-screen, bar visible"
     int16_t accel[3];   // raw, 1 g ~ 100 units after calibration
     int8_t stick[2][2]; // [nunchuk or classic left, classic right][x, y], -127..127, y up
-    uint8_t trigger[2]; // classic analog L/R
+    uint8_t trigger[2]; // classic analog L/R, 0..255 (a Classic Controller Pro may read 0: use WL_CC_L / WL_CC_R)
 } WlRawRemote;
 
 typedef struct {
     bool connected;
     uint16_t buttons;
-    int8_t stick[2][2]; // [main, C][x, y]
-    uint8_t trigger[2];
+    int8_t stick[2][2]; // [main, C][x, y], -127..127 over the stick's real travel, y up
+    uint8_t trigger[2]; // analog L/R, 0..255 over the trigger's travel (WL_PAD_L / WL_PAD_R: the click)
 } WlRawPad;
 
 typedef struct {
