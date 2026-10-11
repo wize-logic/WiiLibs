@@ -1,0 +1,23 @@
+build/
+compile_commands.json
+__pycache__/
+
+# Local tooling and editor state
+.claude/
+CLAUDE.md
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local build trees, logs and run output
+build*/
+*.log
+.cache/
+
+# Local configuration and secrets
+.env
+.env.*
+*.local

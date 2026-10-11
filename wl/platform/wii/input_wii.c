@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: MIT
+// Wii input backend: WPAD (buttons, IR, accelerometer, Nunchuk, Classic), PAD
+// (GameCube ports) and the USB keyboard (libwiikeyboard) polled into WlRawInput once per frame.
+// Mapping to actions belongs to the layer above; this file only reads devices and never blocks.
+// Only this directory may include <ogc/*.h>.
+#include <math.h>
+#include <ogc/pad.h>
+#include <string.h>
+#include <wiikeyboard/keyboard.h>
+#include <wiiuse/wpad.h>
+
+#include "wl/platform/platform.h"
+
+// platform.h button words are libogc's, copied unchanged: prove it at build time.
+WL_STATIC_ASSERT(WL_WM_2 == WPAD_BUTTON_2 && WL_WM_1 == WPAD_BUTTON_1 && WL_WM_B == WPAD_BUTTON_B &&
+                     WL_WM_A == WPAD_BUTTON_A && WL_WM_MINUS == WPAD_BUTTON_MINUS &&
+                     WL_WM_HOME == WPAD_BUTTON_HOME && WL_WM_LEFT == WPAD_BUTTON_LEFT &&
+                     WL_WM_RIGHT == WPAD_BUTTON_RIGHT && WL_WM_DOWN == WPAD_BUTTON_DOWN &&
+                     WL_WM_UP == WPAD_BUTTON_UP && WL_WM_PLUS == WPAD_BUTTON_PLUS,
+                 "remote button bits");
+WL_STATIC_ASSERT(WL_NC_Z == WPAD_NUNCHUK_BUTTON_Z && WL_NC_C == WPAD_NUNCHUK_BUTTON_C,
+                 "nunchuk button bits");
+WL_STATIC_ASSERT(WL_CC_UP == WPAD_CLASSIC_BUTTON_UP && WL_CC_LEFT == WPAD_CLASSIC_BUTTON_LEFT &&
+                     WL_CC_ZR == WPAD_CLASSIC_BUTTON_ZR && WL_CC_X == WPAD_CLASSIC_BUTTON_X &&
+                     WL_CC_A == WPAD_CLASSIC_BUTTON_A && WL_CC_Y == WPAD_CLASSIC_BUTTON_Y &&
+                     WL_CC_B == WPAD_CLASSIC_BUTTON_B && WL_CC_ZL == WPAD_CLASSIC_BUTTON_ZL &&
+                     WL_CC_R == WPAD_CLASSIC_BUTTON_FULL_R && WL_CC_PLUS == WPAD_CLASSIC_BUTTON_PLUS &&
+                     WL_CC_HOME == WPAD_CLASSIC_BUTTON_HOME &&
+                     WL_CC_MINUS == WPAD_CLASSIC_BUTTON_MINUS &&
+                     WL_CC_L == WPAD_CLASSIC_BUTTON_FULL_L && WL_CC_DOWN == WPAD_CLASSIC_BUTTON_DOWN &&
+                     WL_CC_RIGHT == WPAD_CLASSIC_BUTTON_RIGHT,
+                 "classic button bits");
+WL_STATIC_ASSERT(WL_PAD_LEFT == PAD_BUTTON_LEFT && WL_PAD_RIGHT == PAD_BUTTON_RIGHT &&
+                     WL_PAD_DOWN == PAD_BUTTON_DOWN && WL_PAD_UP == PAD_BUTTON_UP &&
+                     WL_PAD_Z == PAD_TRIGGER_Z && WL_PAD_R == PAD_TRIGGER_R &&
+                     WL_PAD_L == PAD_TRIGGER_L && WL_PAD_A == PAD_BUTTON_A &&
+                     WL_PAD_B == PAD_BUTTON_B && WL_PAD_X == PAD_BUTTON_X &&
+                     WL_PAD_Y == PAD_BUTTON_Y && WL_PAD_START == PAD_BUTTON_START,
+                 "pad button bits");
+WL_STATIC_ASSERT(WL_INPUT_MAX_REMOTES <= WPAD_MAX_WIIMOTES && WL_INPUT_MAX_PADS <= PAD_CHANMAX,
+                 "channel counts");
+
+#define IR_VRES_W 640u
+#define IR_VRES_H 480u
+// The Wii Remote status report carries the battery as 0..200 (0xC8 = full scale); libogc hands
+// the byte on unchanged. Hardware check: log it on a fresh and a weak battery (input suite).
+#define BATTERY_FULL_CODE 200u
+
+static bool g_init;
+static bool g_kb_init;
+static bool g_kb_connected;
+static bool g_remote_was[WL_INPUT_MAX_REMOTES];
+static bool g_pad_was[WL_INPUT_MAX_PADS];
+static bool g_pad_rumble[WL_INPUT_MAX_PADS];
+static int g_battery_logged[WL_INPUT_MAX_REMOTES] = {-1, -1, -1, -1};
+
+WlResult wl_platform_input_init(void) {
+    if (g_init) {
+        return WL_OK;
+    }
+    (void)WPAD_Init(); // idempotent; other code may also call it
+    (void)WPAD_SetDataFormat(WPAD_CHAN_ALL, WPAD_FMT_BTNS_ACC_IR);
+    (void)WPAD_SetVRes(WPAD_CHAN_ALL, IR_VRES_W, IR_VRES_H);
+    (void)PAD_Init();
+    // The USB keyboard stack starts its own threads. A failure (no USB, IOS without it) only
+    // means no keyboard: everything else keeps working.
+    g_kb_init = KEYBOARD_Init(NULL) >= 0;
+    if (!g_kb_init) {
+        WL_LOG_W("input", "USB keyboard stack did not start; keyboard disabled");
+    }
+    g_init = true;
+    return WL_OK;
+}
+
+void wl_platform_input_shutdown(void) {
+    if (!g_init) {
+        return;
+    }
+    for (uint8_t i = 0; i < WL_INPUT_MAX_REMOTES; i++) {
+        (void)WPAD_Rumble(i, 0);
+    }
+    for (uint8_t i = 0; i < WL_INPUT_MAX_PADS; i++) {
+        PAD_ControlMotor(i, PAD_MOTOR_STOP);
+        g_pad_rumble[i] = false;
+    }
+    if (g_kb_init) {
+        (void)KEYBOARD_Deinit();
+        g_kb_init = false;
+    }
+    g_kb_connected = false;
+    memset(g_remote_was, 0, sizeof g_remote_was);
+    memset(g_pad_was, 0, sizeof g_pad_was);
+    g_init = false;
+}
+
+static int16_t sat16(float v) {
+    if (v > 32767.0f) {
+        return 32767;
+    }
+    if (v < -32768.0f) {
+        return -32768;
+    }
+    return (int16_t)v;
+}
+
+// libogc reports a stick as magnitude 0..1 and an angle in degrees from +y, clockwise.
+static void js_to_xy(const struct joystick_t *js, int8_t out[2]) {
+    float rad = js->ang * (3.14159265f / 180.0f);
+    float m = js->mag < 0.0f ? 0.0f : (js->mag > 1.0f ? 1.0f : js->mag);
+    out[0] = (int8_t)lroundf(m * sinf(rad) * 127.0f);
+    out[1] = (int8_t)lroundf(m * cosf(rad) * 127.0f);
+}
+
+static void poll_remote(uint32_t chan, WlRawRemote *out) {
+    memset(out, 0, sizeof *out);
+    u32 type = 0;
+    s32 res = WPAD_Probe((s32)chan, &type);
+    if (res != WPAD_ERR_NONE) {
+        g_remote_was[chan] = false; // absent, or still negotiating (NOT_READY)
+        return;
+    }
+    const WPADData *d = WPAD_Data((int)chan);
+    if (d == NULL || d->err != WPAD_ERR_NONE) {
+        g_remote_was[chan] = false;
+        return;
+    }
+    if (!g_remote_was[chan]) {
+        // Fresh connection: the data format does not survive a reconnect on every libogc build.
+        (void)WPAD_SetDataFormat((s32)chan, WPAD_FMT_BTNS_ACC_IR);
+        (void)WPAD_SetVRes((s32)chan, IR_VRES_W, IR_VRES_H);
+        g_remote_was[chan] = true;
+    }
+    out->connected = true;
+    switch (type) {
+    case WPAD_EXP_NONE:
+        out->extension = WL_EXT_NONE;
+        break;
+    case WPAD_EXP_NUNCHUK:
+        out->extension = WL_EXT_NUNCHUK;
+        break;
+    case WPAD_EXP_CLASSIC:
+        out->extension = WL_EXT_CLASSIC;
+        break;
+    default:
+        out->extension = WL_EXT_OTHER;
+        break;
+    }
+    if (g_battery_logged[chan] != (int)d->battery_level) { // to settle the scale on real hardware
+        g_battery_logged[chan] = (int)d->battery_level;
+        WL_LOG_I("input", "remote %u battery code %u (read as 0..%u)", (unsigned)chan,
+                 (unsigned)d->battery_level, BATTERY_FULL_CODE);
+    }
+    unsigned pct = ((unsigned)d->battery_level * 100u) / BATTERY_FULL_CODE;
+    out->battery = (uint8_t)(pct > 100u ? 100u : pct);
+    out->buttons = d->btns_h;
+
+    // IR: the bounded position when libogc has one, else the unbounded one so the pointer can
+    // keep tracking off-screen while the sensor bar is still seen.
+    if (d->ir.valid) {
+        out->ir_valid = true;
+        out->ir_x = sat16(d->ir.x);
+        out->ir_y = sat16(d->ir.y);
+    } else if (d->ir.raw_valid) {
+        out->ir_valid = true;
+        out->ir_x = sat16(d->ir.ax);
+        out->ir_y = sat16(d->ir.ay);
+    }
+
+    struct gforce_t g;
+    WPAD_GForce((int)chan, &g);
+    out->accel[0] = sat16(g.x * 100.0f);
+    out->accel[1] = sat16(g.y * 100.0f);
+    out->accel[2] = sat16(g.z * 100.0f);
+
+    if (type == WPAD_EXP_NUNCHUK) {
+        js_to_xy(&d->exp.nunchuk.js, out->stick[0]);
+    } else if (type == WPAD_EXP_CLASSIC) {
+        js_to_xy(&d->exp.classic.ljs, out->stick[0]);
+        js_to_xy(&d->exp.classic.rjs, out->stick[1]);
+        out->trigger[0] = d->exp.classic.ls_raw;
+        out->trigger[1] = d->exp.classic.rs_raw;
+    }
+}
+
+static void poll_pads(WlRawPad out[WL_INPUT_MAX_PADS]) {
+    PADStatus st[PAD_CHANMAX];
+    memset(st, 0, sizeof st);
+    (void)PAD_Read(st);
+    for (uint32_t i = 0; i < WL_INPUT_MAX_PADS; i++) {
+        memset(&out[i], 0, sizeof out[i]);
+        // NOT_READY and TRANSFER are momentary: keep the previous connection state; only
+        // NO_CONTROLLER removes a pad.
+        if (st[i].err == PAD_ERR_NONE) {
+            g_pad_was[i] = true;
+            out[i].connected = true;
+            out[i].buttons = st[i].button;
+            out[i].stick[0][0] = st[i].stickX;
+            out[i].stick[0][1] = st[i].stickY;
+            out[i].stick[1][0] = st[i].substickX;
+            out[i].stick[1][1] = st[i].substickY;
+            out[i].trigger[0] = st[i].triggerL;
+            out[i].trigger[1] = st[i].triggerR;
+        } else if (st[i].err == PAD_ERR_NO_CONTROLLER) {
+            g_pad_was[i] = false;
+        } else {
+            out[i].connected = g_pad_was[i];
+        }
+    }
+}
+
+static uint8_t kmods_from(uint16_t m) {
+    uint8_t r = 0;
+    if (MOD_ONESET(m, MOD_ANYSHIFT)) {
+        r |= WL_KMOD_SHIFT;
+    }
+    if (MOD_ONESET(m, MOD_ANYCONTROL)) {
+        r |= WL_KMOD_CTRL;
+    }
+    if (MOD_ONESET(m, MOD_ANYMETA)) {
+        r |= WL_KMOD_ALT;
+    }
+    return r;
+}
+
+static void poll_keyboard(WlRawKeyboard *out) {
+    memset(out, 0, sizeof *out);
+    if (!g_kb_init) {
+        return;
+    }
+    keyboard_event ev;
+    // At most WL_INPUT_MAX_KEYS events per poll; the rest wait in libwiikeyboard's queue.
+    while (out->count < WL_INPUT_MAX_KEYS && KEYBOARD_GetEvent(&ev) > 0) {
+        switch (ev.type) {
+        case KEYBOARD_CONNECTED:
+            g_kb_connected = true;
+            break;
+        case KEYBOARD_DISCONNECTED:
+            g_kb_connected = false;
+            break;
+        case KEYBOARD_PRESSED:
+        case KEYBOARD_RELEASED:
+            out->keys[out->count].code = ev.keycode;
+            out->keys[out->count].modifiers = kmods_from(ev.modifiers);
+            out->keys[out->count].down = ev.type == KEYBOARD_PRESSED;
+            out->count++;
+            break;
+        }
+    }
+    out->connected = g_kb_connected;
+}
+
+void wl_platform_input_poll(WlRawInput *out) {
+    memset(out, 0, sizeof *out);
+    if (!g_init && wl_platform_input_init() != WL_OK) {
+        return;
+    }
+    WPAD_ScanPads();
+    for (uint32_t i = 0; i < WL_INPUT_MAX_REMOTES; i++) {
+        poll_remote(i, &out->remotes[i]);
+    }
+    poll_pads(out->pads);
+    poll_keyboard(&out->keyboard);
+}
+
+void wl_platform_rumble(uint8_t remote, bool on) {
+    if (remote < WL_INPUT_MAX_REMOTES) {
+        (void)WPAD_Rumble(remote, on ? 1 : 0);
+    }
+}
+
+void wl_platform_pad_rumble(uint8_t pad, bool on) {
+    if (pad < WL_INPUT_MAX_PADS && g_pad_rumble[pad] != on) {
+        PAD_ControlMotor(pad, on ? PAD_MOTOR_RUMBLE : PAD_MOTOR_STOP);
+        g_pad_rumble[pad] = on;
+    }
+}

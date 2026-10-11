@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+// The C library's pread, pwrite on a file in a given folder, through <unistd.h> as a program calls
+// them: on the Wii these are wii/posix_wii.c's weak definitions over wl_posix_*, on the host the
+// C library's own. Platform-independent: test_platform_posix.c runs it against a temp file and the
+// on-console runner against the SD card (libfat's devoptab, which seeks and reads like a file).
+#define _POSIX_C_SOURCE 200809L
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "tests/platform/check.h"
+
+static uint8_t pat(uint32_t i) {
+    return (uint8_t)((i * 2654435761u) >> 24);
+}
+
+void wlt_suite_posix(const char *path);
+
+void wlt_suite_posix(const char *path) {
+    uint8_t data[1000], back[200];
+    for (uint32_t i = 0; i < sizeof data; i++) {
+        data[i] = pat(i);
+    }
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
+    wlt_check("posix_open", fd >= 0, path);
+    if (fd < 0) {
+        return;
+    }
+    wlt_check("posix_write", write(fd, data, sizeof data) == (ssize_t)sizeof data, "write");
+    wlt_check("posix_seek", lseek(fd, 17, SEEK_SET) == 17, "lseek to 17");
+
+    memset(back, 0, sizeof back);
+    wlt_check("posix_pread", pread(fd, back, sizeof back, 600) == (ssize_t)sizeof back, "pread 200 at 600");
+    wlt_check("posix_pread_data", memcmp(back, data + 600, sizeof back) == 0, "bytes at 600");
+    wlt_check("posix_pread_keeps_position", lseek(fd, 0, SEEK_CUR) == 17, "position stays 17");
+    uint8_t one = 0;
+    wlt_check("posix_read_continues", read(fd, &one, 1) == 1 && one == data[17], "read at 17");
+
+    wlt_check("posix_pread_short", pread(fd, back, sizeof back, 900) == 100, "pread 200 at 900 gives 100");
+    wlt_check("posix_pread_eof", pread(fd, back, sizeof back, 1000) == 0, "pread at the end gives 0");
+
+    const uint8_t patch[4] = {0xde, 0xad, 0xbe, 0xef};
+    wlt_check("posix_pwrite", pwrite(fd, patch, sizeof patch, 100) == (ssize_t)sizeof patch, "pwrite 4 at 100");
+    wlt_check("posix_pwrite_keeps_position", lseek(fd, 0, SEEK_CUR) == 18, "position stays 18");
+    uint8_t check[6];
+    wlt_check("posix_pwrite_data",
+              pread(fd, check, sizeof check, 99) == (ssize_t)sizeof check && check[0] == data[99] &&
+                  memcmp(check + 1, patch, sizeof patch) == 0 && check[5] == data[104],
+              "bytes around 100");
+    close(fd);
+    wlt_check("posix_unlink", unlink(path) == 0, "unlink");
+}
