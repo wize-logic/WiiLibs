@@ -13,6 +13,8 @@
 #include "wl/xboxrt/thunk.h"
 
 #define TAG "xbcrash"
+
+extern recomp_func_t recomp_lookup(uint32_t xbox_va) __attribute__((weak));
 #define STACK_WORDS 1024u
 #define MAX_FRAMES 48u
 
@@ -38,7 +40,7 @@ static void build_symbols(void) {
             memcpy(g_syms, wl_xb_symbols, wl_xb_symbol_count * sizeof *g_syms);
             g_sym_count = wl_xb_symbol_count;
         }
-    } else if (g_xbox_code_hi > g_xbox_code_lo) {
+    } else if (g_xbox_code_hi > g_xbox_code_lo && recomp_lookup != NULL) {
         // every address of the code range through the generated dispatch table
         uint32_t cap = 1024, n = 0;
         WlXbSymbol *s = malloc(cap * sizeof *s);

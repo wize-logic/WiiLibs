@@ -45,15 +45,15 @@ __attribute__((weak)) recomp_func_t recomp_lookup_manual(uint32_t xbox_va) {
     return g_manual != NULL ? g_manual(xbox_va) : NULL;
 }
 
-// No generated code linked (the runtime's own tests): nothing is translated.
-__attribute__((weak)) recomp_func_t recomp_lookup(uint32_t xbox_va) {
-    (void)xbox_va;
-    return NULL;
-}
+// The generated dispatch table's lookup, referenced weakly: a program without generated code (the
+// runtime's own tests) links, and finds nothing translated. Generated code must be linked as
+// objects (sources of the executable, or an OBJECT library): from a static archive nothing would
+// pull it in.
+extern recomp_func_t recomp_lookup(uint32_t xbox_va) __attribute__((weak));
 
 recomp_func_t wl_xb_lookup(uint32_t va) {
     recomp_func_t fn = recomp_lookup_manual(va);
-    if (fn == NULL) {
+    if (fn == NULL && recomp_lookup != NULL) {
         fn = recomp_lookup(va);
     }
     if (fn == NULL) {
