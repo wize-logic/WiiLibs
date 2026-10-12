@@ -41,7 +41,7 @@ WlNv2a *wl_nv2a_create(const WlNv2aConfig *cfg) {
     }
     dev->cfg = *cfg;
     dev->ram_bytes = cfg->ram_bytes != 0 ? cfg->ram_bytes : 64u * 1024u * 1024u;
-    if ((dev->ram_bytes & (dev->ram_bytes - 1u)) != 0 || dev->ram_bytes < 2u * WL_NV2A_PRAMIN_SIZE) {
+    if ((dev->ram_bytes & (dev->ram_bytes - 1u)) != 0 || dev->ram_bytes < 65536u) {
         free(dev);
         return NULL;
     }
@@ -68,6 +68,13 @@ WlNv2a *wl_nv2a_create(const WlNv2aConfig *cfg) {
 void wl_nv2a_destroy(WlNv2a *dev) {
     if (dev == NULL) {
         return;
+    }
+    {
+        unsigned i;
+
+        for (i = 0; i < WL_NV2A_PRAMIN_SIZE / WL_NV2A_RAMIN_PAGE; i++) {
+            free(dev->ramin[i]);
+        }
     }
     free(dev->batch_indices);
     free(dev->batch_inline);
@@ -119,31 +126,46 @@ void *wl_nv2a_phys(WlNv2a *dev, uint32_t phys, uint32_t bytes) {
     return host;
 }
 
-static uint32_t ramin_phys(const WlNv2a *dev, uint32_t instance) {
-    return dev->ram_bytes - WL_NV2A_PRAMIN_SIZE + (instance & (WL_NV2A_PRAMIN_SIZE - 1u));
+// ---- instance memory ----------------------------------------------------------------------------
+// The device's own megabyte behind PRAMIN (xemu keeps it apart from RAM too: the Xbox's Direct3D
+// writes its objects, RAMHT and RAMFC through the window), in 64 KiB pages made at their first write.
+
+uint32_t wl_nv2a_ramin_read32(const WlNv2a *dev, uint32_t offset) {
+    const uint8_t *page;
+
+    offset &= (WL_NV2A_PRAMIN_SIZE - 1u) & ~3u;
+    page = dev->ramin[offset / WL_NV2A_RAMIN_PAGE];
+    return page != NULL ? wl_rd_le32(page + offset % WL_NV2A_RAMIN_PAGE) : 0;
+}
+
+uint8_t *wl_nv2a_ramin_page(WlNv2a *dev, uint32_t offset) {
+    uint8_t **page = &dev->ramin[(offset & (WL_NV2A_PRAMIN_SIZE - 1u)) / WL_NV2A_RAMIN_PAGE];
+
+    if (*page == NULL) {
+        *page = calloc(1, WL_NV2A_RAMIN_PAGE);
+    }
+    return *page;
 }
 
 static uint32_t ramin_word(WlNv2a *dev, uint32_t instance) {
-    const uint8_t *p = wl_nv2a_phys(dev, ramin_phys(dev, instance & ~3u), 4);
-    return p != NULL ? wl_rd_le32(p) : 0;
+    return wl_nv2a_ramin_read32(dev, instance);
 }
 
 void wl_nv2a_dma_load(WlNv2a *dev, uint32_t instance, WlNv2aDma *out) {
-    const uint8_t *p;
-
     memset(out, 0, sizeof *out);
     out->instance = instance;
     out->limit = 0xFFFFFFFFu;
     if (instance == 0) {
         return;
     }
-    p = wl_nv2a_phys(dev, ramin_phys(dev, instance), 12);
-    if (p == NULL) {
-        return;
-    }
     {
-        uint32_t flags = wl_rd_le32(p), limit = wl_rd_le32(p + 4), frame = wl_rd_le32(p + 8);
+        uint32_t flags = ramin_word(dev, instance), limit = ramin_word(dev, instance + 4),
+                 frame = ramin_word(dev, instance + 8);
 
+        if (flags == 0) {
+            WL_LOG_W(WL_NV2A_TAG, "no DMA object at instance %05x: base 0, no limit", (unsigned)instance);
+            return;
+        }
         out->class_id = flags & WL_NV2A_DMA_CLASS_MASK;
         out->base = (frame & WL_NV2A_DMA_PAGE_MASK) | (flags >> WL_NV2A_DMA_ADJUST_SHIFT);
         out->limit = limit;
@@ -156,16 +178,12 @@ void wl_nv2a_dma_load(WlNv2a *dev, uint32_t instance, WlNv2aDma *out) {
 static uint32_t ramht_lookup(WlNv2a *dev, unsigned chid, uint32_t handle, uint32_t *engine) {
     uint32_t base = (dev->pfifo_ramht & 0x1F0u) << 8;
     uint32_t size = 4096u << ((dev->pfifo_ramht >> 16) & 3u);
-    const uint8_t *table = wl_nv2a_phys(dev, ramin_phys(dev, base), size);
     uint32_t found = 0, offset;
     bool exact = false;
 
     *engine = 0;
-    if (table == NULL) {
-        return 0;
-    }
     for (offset = 0; offset + 8 <= size; offset += 8) {
-        uint32_t key = wl_rd_le32(table + offset), context = wl_rd_le32(table + offset + 4);
+        uint32_t key = ramin_word(dev, base + offset), context = ramin_word(dev, base + offset + 4);
 
         if (key != handle || !(context & WL_NV2A_RAMHT_VALID)) {
             continue;
@@ -771,12 +789,8 @@ uint32_t wl_nv2a_mmio_read(WlNv2a *dev, uint32_t offset, unsigned size) {
         size = 4;
     }
     if (offset >= WL_NV2A_PRAMIN && offset < WL_NV2A_PRAMIN + WL_NV2A_PRAMIN_SIZE) {
-        const uint8_t *p = wl_nv2a_phys_write(dev, ramin_phys(dev, offset - WL_NV2A_PRAMIN), size);
-
-        if (p == NULL) {
-            return 0;
-        }
-        return size == 4 ? wl_rd_le32(p) : size == 2 ? wl_rd_le16(p) : p[0];
+        word = wl_nv2a_ramin_read32(dev, offset - WL_NV2A_PRAMIN);
+        return (word >> shift) & lane_mask(size, 0);
     }
     if (offset >= WL_NV2A_USER) {
         unsigned chid = (offset - WL_NV2A_USER) / WL_NV2A_USER_STRIDE;
@@ -847,12 +861,15 @@ static void mmio_write(WlNv2a *dev, uint32_t offset, uint32_t value, unsigned si
     uint32_t mask;
 
     if (offset >= WL_NV2A_PRAMIN && offset < WL_NV2A_PRAMIN + WL_NV2A_PRAMIN_SIZE) {
-        uint8_t *p = wl_nv2a_phys_write(dev, ramin_phys(dev, offset - WL_NV2A_PRAMIN), size);
+        uint32_t at = offset - WL_NV2A_PRAMIN;
+        uint8_t *page = wl_nv2a_ramin_page(dev, at);
 
-        if (p != NULL) {
-            if (size == 4) {
+        if (page != NULL) {
+            uint8_t *p = page + at % WL_NV2A_RAMIN_PAGE;
+
+            if (size == 4 && (at % WL_NV2A_RAMIN_PAGE) + 4u <= WL_NV2A_RAMIN_PAGE) {
                 wl_wr_le32(p, value);
-            } else if (size == 2) {
+            } else if (size == 2 && (at % WL_NV2A_RAMIN_PAGE) + 2u <= WL_NV2A_RAMIN_PAGE) {
                 wl_wr_le16(p, (uint16_t)value);
             } else {
                 p[0] = (uint8_t)value;

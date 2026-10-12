@@ -19,7 +19,9 @@ enum {
     WL_NV2A_BATCH_INLINE_BYTES = 65536,
     WL_NV2A_BATCH_IMMEDIATE = 512,
     // push buffer words a kick may read before it is taken for a loop
-    WL_NV2A_KICK_WORD_LIMIT = 64u * 1024u * 1024u
+    WL_NV2A_KICK_WORD_LIMIT = 64u * 1024u * 1024u,
+    // instance memory's pages
+    WL_NV2A_RAMIN_PAGE = 65536
 };
 
 typedef struct WlNv2aChannel {
@@ -62,6 +64,9 @@ struct WlNv2a {
     uint32_t reg_values[WL_NV2A_REGISTER_SLOTS];
     uint32_t reg_used;
 
+    // instance memory (PRAMIN), the device's own: pages made at their first write
+    uint8_t *ramin[WL_NV2A_PRAMIN_SIZE / WL_NV2A_RAMIN_PAGE];
+
     WlNv2aChannel channels[WL_NV2A_CHANNELS];
     // the channel whose push buffer is running (for the puller's methods); -1 none
     int current_channel;
@@ -91,6 +96,9 @@ struct WlNv2a {
 
 // guest memory for the model's own writes (semaphores, notifiers, reports): not captured
 void *wl_nv2a_phys_write(WlNv2a *dev, uint32_t phys, uint32_t bytes);
+// instance memory: a word (0 where nothing was written), a page (made if it was not)
+uint32_t wl_nv2a_ramin_read32(const WlNv2a *dev, uint32_t offset);
+uint8_t *wl_nv2a_ramin_page(WlNv2a *dev, uint32_t offset);
 // a DMA object at an instance address, from instance memory
 void wl_nv2a_dma_load(WlNv2a *dev, uint32_t instance, WlNv2aDma *out);
 // the time PTIMER shows now

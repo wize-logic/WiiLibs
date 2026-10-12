@@ -138,6 +138,25 @@ static void walk_state(WlNv2a *dev, Walker *w) {
     for (i = 0; i < 256; i++) {
         walk_u8(w, &dev->crtc[i]);
     }
+    // instance memory: each page, if it was written
+    for (i = 0; i < WL_NV2A_PRAMIN_SIZE / WL_NV2A_RAMIN_PAGE; i++) {
+        uint32_t present = dev->ramin[i] != NULL, word;
+        unsigned j;
+
+        walk_u32(w, &present);
+        if (!present || w->failed) {
+            continue;
+        }
+        if (w->reading && wl_nv2a_ramin_page(dev, i * WL_NV2A_RAMIN_PAGE) == NULL) {
+            w->failed = true;
+            return;
+        }
+        for (j = 0; j < WL_NV2A_RAMIN_PAGE; j += 4) {
+            word = wl_rd_le32(dev->ramin[i] + j);
+            walk_u32(w, &word);
+            wl_wr_le32(dev->ramin[i] + j, word);
+        }
+    }
     walk_u32(w, &dev->reg_used);
     walk_words(w, dev->reg_keys, WL_NV2A_REGISTER_SLOTS);
     walk_words(w, dev->reg_values, WL_NV2A_REGISTER_SLOTS);

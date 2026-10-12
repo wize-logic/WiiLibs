@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-// What the NV2A tests share: a guest RAM of 4 MiB (its last megabyte instance memory), push
-// buffers written into it word by word, RAMHT entries and objects set up through PRAMIN as a
-// driver writes them, and a device over it.
+// What the NV2A tests share: a guest RAM of 4 MiB, push buffers written into it word by word, RAMHT
+// entries and objects set up through PRAMIN (the device's instance memory) as a driver writes them,
+// and a device over it.
 #pragma once
 
 #include <stdint.h>
@@ -14,7 +14,6 @@
 
 enum {
     T_RAM = 4u * 1024u * 1024u,
-    T_RAMIN = T_RAM - 0x100000u, // instance offset 0's guest-physical address
     T_RAMHT = 0x10000u,          // RAMHT's instance offset (NV_PFIFO_RAMHT base 0x100)
     T_PB = 0x10000u,             // where the tests' push buffers start
     T_CHANNEL = 0

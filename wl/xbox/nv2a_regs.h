@@ -30,7 +30,8 @@ enum {
     WL_NV2A_PRMCIO = 0x601000,
     WL_NV2A_PRAMDAC = 0x680000,
     WL_NV2A_PRMDIO = 0x681000,
-    // instance memory: the last megabyte of RAM, seen through this window [envy-pusher, NV4:NV40]
+    // instance memory (objects, RAMHT, RAMFC) through this window [envy-pusher, NV4:NV40]; the model
+    // keeps it as the device's own megabyte, as xemu does
     WL_NV2A_PRAMIN = 0x700000,
     WL_NV2A_PRAMIN_SIZE = 0x100000,
     // the channels' control areas: 0x800000 + chid * 0x10000 [envy-pusher]

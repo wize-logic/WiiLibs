@@ -50,8 +50,8 @@ typedef struct WlNv2aConfig {
     void *user;
     // NULL: none (the state is tracked, nothing is drawn); copied
     const WlNv2aBackend *backend;
-    // optional: the RAM's size (0: 64 MiB; a power of two), which PFB reports and whose last
-    // megabyte is the instance memory PRAMIN shows
+    // optional: the RAM's size (0: 64 MiB; a power of two), which PFB reports and the GPU's
+    // addresses wrap at
     uint32_t ram_bytes;
     // optional: the time PTIMER counts, in nanoseconds (NULL: a microsecond each time it is read)
     uint64_t (*time_ns)(void *user);

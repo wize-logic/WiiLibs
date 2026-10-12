@@ -94,14 +94,25 @@ TEST registers_answer_as_an_idle_gpu(void) {
     PASS();
 }
 
-TEST pramin_is_the_last_megabyte_of_ram(void) {
+TEST pramin_is_the_devices_own_memory(void) {
     TGuest g;
+    unsigned i;
     ASSERT(t_create(&g, NULL) != NULL);
     t_ramin(&g, 0x1234 * 4, 0xCAFEF00Du);
-    ASSERT_EQ(0xCAFEF00Du, t_r32(&g, T_RAMIN + 0x1234 * 4));
-    t_w32(&g, T_RAMIN + 0x40, 0x01020304u);
-    ASSERT_EQ(0x01020304u, t_mmio_r(&g, WL_NV2A_PRAMIN + 0x40));
-    ASSERT_EQ(0x02u, wl_nv2a_mmio_read(g.dev, WL_NV2A_PRAMIN + 0x42, 1));
+    t_ramin(&g, 0xFFFFC, 0x01020304u);
+    ASSERT_EQ(0xCAFEF00Du, t_mmio_r(&g, WL_NV2A_PRAMIN + 0x1234 * 4));
+    ASSERT_EQ(0x01020304u, t_mmio_r(&g, WL_NV2A_PRAMIN + 0xFFFFC));
+    ASSERT_EQ(0x02u, wl_nv2a_mmio_read(g.dev, WL_NV2A_PRAMIN + 0xFFFFE, 1));
+    wl_nv2a_mmio_write(g.dev, WL_NV2A_PRAMIN + 0x41, 0xAB, 1);
+    ASSERT_EQ(0x0000AB00u, t_mmio_r(&g, WL_NV2A_PRAMIN + 0x40));
+    ASSERT_EQ(0u, t_mmio_r(&g, WL_NV2A_PRAMIN + 0x80000)); // never written
+    // guest RAM untouched
+    for (i = 0; i < T_RAM; i += 4) {
+        if (t_r32(&g, i) != 0) {
+            break;
+        }
+    }
+    ASSERT_EQ((unsigned)T_RAM, i);
     t_destroy(&g);
     PASS();
 }
@@ -495,7 +506,7 @@ TEST capture_replays_to_the_same_draws(void) {
 
 SUITE(nv2a_suite) {
     RUN_TEST(registers_answer_as_an_idle_gpu);
-    RUN_TEST(pramin_is_the_last_megabyte_of_ram);
+    RUN_TEST(pramin_is_the_devices_own_memory);
     RUN_TEST(direct3d_handshake_jump_at_physical_zero);
     RUN_TEST(methods_increasing_and_non_increasing);
     RUN_TEST(a_method_header_goes_on_across_kicks);
