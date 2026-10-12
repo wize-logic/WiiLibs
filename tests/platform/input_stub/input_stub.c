@@ -36,6 +36,23 @@ s32 WPAD_ScanPads(void) {
     return 0;
 }
 
+// As libogc's: each queued report becomes the channel's WPAD_Data in turn, and the callback sees it.
+s32 WPAD_ReadPending(s32 chan, WPADDataCallback datacb) {
+    g_input_stub.read_pending_calls++;
+    if (chan < 0 || chan > 3) {
+        return -1;
+    }
+    unsigned n = g_input_stub.queue_len[chan];
+    for (unsigned i = 0; i < n; i++) {
+        g_input_stub.data[chan] = g_input_stub.queue[chan][i];
+        if (datacb != NULL) {
+            datacb(chan, &g_input_stub.data[chan]);
+        }
+    }
+    g_input_stub.queue_len[chan] = 0;
+    return (s32)n;
+}
+
 s32 WPAD_Rumble(s32 chan, int status) {
     g_input_stub.rumble[chan] = status;
     g_input_stub.rumble_calls++;

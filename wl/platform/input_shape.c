@@ -50,20 +50,34 @@ static float clampf(float v) {
     return v < -1.0f ? -1.0f : v > 1.0f ? 1.0f : v;
 }
 
-bool wl_pointer_update(WlPointer *p, const WlRawRemote *remote, uint64_t now_us, uint32_t hold_us) {
+bool wl_pointer_update_steady(WlPointer *p, const WlRawRemote *remote, uint64_t now_us, uint32_t hold_us,
+                              float radius) {
     if (!remote->connected) {
         p->tracking = false;
         return false;
     }
     if (remote->ir_valid) {
-        p->x = clampf(((float)remote->ir_x - IR_HALF_W) / IR_HALF_W);
-        p->y = clampf(((float)remote->ir_y - IR_HALF_H) / IR_HALF_H);
+        float x = clampf(((float)remote->ir_x - IR_HALF_W) / IR_HALF_W);
+        float y = clampf(((float)remote->ir_y - IR_HALF_H) / IR_HALF_H);
+        float dx = x - p->x;
+        float dy = y - p->y;
+        // (a reading at an edge is taken: the turn is fastest there, and a held position just inside
+        // it would never reach it)
+        bool at_edge = (fabsf(x) >= 1.0f && x != p->x) || (fabsf(y) >= 1.0f && y != p->y);
+        if (!p->tracking || radius <= 0.0f || at_edge || dx * dx + dy * dy > radius * radius) {
+            p->x = x;
+            p->y = y;
+        }
         p->seen_us = now_us;
         p->tracking = true;
     } else if (p->tracking && now_us - p->seen_us > hold_us) {
         p->tracking = false;
     }
     return p->tracking;
+}
+
+bool wl_pointer_update(WlPointer *p, const WlRawRemote *remote, uint64_t now_us, uint32_t hold_us) {
+    return wl_pointer_update_steady(p, remote, now_us, hold_us, 0.0f);
 }
 
 float wl_pointer_turn(float offset, float dead_zone) {

@@ -157,6 +157,96 @@ TEST pointer_turn_has_a_dead_zone_and_a_ramp(void) {
     PASS();
 }
 
+TEST pointer_holds_within_its_play_radius_and_moves_beyond_it(void) {
+    WlPointer p;
+    memset(&p, 0, sizeof p);
+    const float radius = 0.03f; // 9.6 px across, 7.2 down
+    WlRawRemote r = remote_at(320, 240, true);
+    ASSERT(wl_pointer_update_steady(&p, &r, 1000, 150000, radius));
+    ASSERT_IN_RANGE(0.0f, p.x, 0.0001f); // (the first reading is the position)
+    // a hand's tremor: a few pixels about the point does not move it
+    int tremor[][2] = {{323, 241}, {317, 238}, {319, 244}, {325, 237}, {320, 240}, {316, 243}};
+    for (int i = 0; i < 6; i++) {
+        r = remote_at(tremor[i][0], tremor[i][1], true);
+        ASSERT(wl_pointer_update_steady(&p, &r, 2000 + (uint64_t)i, 150000, radius));
+        ASSERT_IN_RANGE(0.0f, p.x, 0.0f);
+        ASSERT_IN_RANGE(0.0f, p.y, 0.0f);
+    }
+    // a deliberate move goes to the reading itself, not part of the way (no lag)
+    r = remote_at(360, 240, true);
+    ASSERT(wl_pointer_update_steady(&p, &r, 3000, 150000, radius));
+    ASSERT_IN_RANGE(0.125f, p.x, 0.0001f);
+    ASSERT_IN_RANGE(0.0f, p.y, 0.0001f);
+    // and the new position holds as the old did
+    r = remote_at(362, 238, true);
+    ASSERT(wl_pointer_update_steady(&p, &r, 4000, 150000, radius));
+    ASSERT_IN_RANGE(0.125f, p.x, 0.0001f);
+    // just inside the radius holds, just outside moves (the distance is of both axes)
+    r = remote_at(360 + 9, 240, true);
+    ASSERT(wl_pointer_update_steady(&p, &r, 5000, 150000, radius));
+    ASSERT_IN_RANGE(0.125f, p.x, 0.0f);
+    r = remote_at(360 + 11, 240, true);
+    ASSERT(wl_pointer_update_steady(&p, &r, 6000, 150000, radius));
+    ASSERT_IN_RANGE(371.0f / 320.0f - 1.0f, p.x, 0.0001f);
+    PASS();
+}
+
+TEST pointer_without_a_radius_follows_every_reading(void) {
+    WlPointer p;
+    memset(&p, 0, sizeof p);
+    WlRawRemote r = remote_at(320, 240, true);
+    ASSERT(wl_pointer_update_steady(&p, &r, 1000, 150000, 0.0f));
+    r = remote_at(321, 240, true);
+    ASSERT(wl_pointer_update_steady(&p, &r, 2000, 150000, 0.0f));
+    ASSERT_IN_RANGE(1.0f / 320.0f, p.x, 0.0001f);
+    // wl_pointer_update is the same
+    memset(&p, 0, sizeof p);
+    r = remote_at(320, 240, true);
+    wl_pointer_update(&p, &r, 1000, 150000);
+    r = remote_at(321, 240, true);
+    wl_pointer_update(&p, &r, 2000, 150000);
+    ASSERT_IN_RANGE(1.0f / 320.0f, p.x, 0.0001f);
+    PASS();
+}
+
+TEST pointer_reaches_the_edge_through_its_radius(void) {
+    WlPointer p;
+    memset(&p, 0, sizeof p);
+    const float radius = 0.03f;
+    WlRawRemote r = remote_at(630, 240, true);
+    ASSERT(wl_pointer_update_steady(&p, &r, 1000, 150000, radius));
+    r = remote_at(640, 240, true); // (the edge itself)
+    ASSERT(wl_pointer_update_steady(&p, &r, 2000, 150000, radius));
+    ASSERT_IN_RANGE(1.0f, p.x, 0.0001f);
+    memset(&p, 0, sizeof p);
+    r = remote_at(636, 240, true);
+    ASSERT(wl_pointer_update_steady(&p, &r, 1000, 150000, radius));
+    r = remote_at(700, 240, true); // off the screen, the bar seen: the edge, not 4 px short of it
+    ASSERT(wl_pointer_update_steady(&p, &r, 2000, 150000, radius));
+    ASSERT_IN_RANGE(1.0f, p.x, 0.0001f);
+    PASS();
+}
+
+TEST pointer_found_again_after_a_loss_starts_at_its_reading(void) {
+    WlPointer p;
+    memset(&p, 0, sizeof p);
+    const float radius = 0.03f;
+    WlRawRemote r = remote_at(320, 240, true);
+    ASSERT(wl_pointer_update_steady(&p, &r, 1000000, 150000, radius));
+    r = remote_at(0, 0, false);
+    ASSERT(!wl_pointer_update_steady(&p, &r, 1400000, 150000, radius)); // gone
+    r = remote_at(324, 242, true); // seen again, within the radius of where it was held
+    ASSERT(wl_pointer_update_steady(&p, &r, 1500000, 150000, radius));
+    ASSERT_IN_RANGE(4.0f / 320.0f, p.x, 0.0001f); // not the old position
+    // a loss shorter than the hold keeps the position and the radius around it
+    r = remote_at(0, 0, false);
+    ASSERT(wl_pointer_update_steady(&p, &r, 1550000, 150000, radius));
+    r = remote_at(326, 242, true);
+    ASSERT(wl_pointer_update_steady(&p, &r, 1600000, 150000, radius));
+    ASSERT_IN_RANGE(4.0f / 320.0f, p.x, 0.0001f);
+    PASS();
+}
+
 SUITE(input_shape_suite) {
     RUN_TEST(stick_scales_over_the_travel_and_clamps);
     RUN_TEST(stick_pair_is_a_circle);
@@ -166,6 +256,10 @@ SUITE(input_shape_suite) {
     RUN_TEST(pointer_loss_is_held_briefly_then_ends);
     RUN_TEST(pointer_never_tracks_before_it_is_seen_or_without_a_remote);
     RUN_TEST(pointer_turn_has_a_dead_zone_and_a_ramp);
+    RUN_TEST(pointer_holds_within_its_play_radius_and_moves_beyond_it);
+    RUN_TEST(pointer_without_a_radius_follows_every_reading);
+    RUN_TEST(pointer_reaches_the_edge_through_its_radius);
+    RUN_TEST(pointer_found_again_after_a_loss_starts_at_its_reading);
 }
 
 GREATEST_MAIN_DEFS();

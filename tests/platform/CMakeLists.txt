@@ -60,12 +60,15 @@ wl_add_test(test_platform_hwcount SOURCES test_platform_hwcount.c LIBS wl_platfo
 
 # Input shaping (sticks, triggers, the Remote's pointer): portable, also on ppc-be ...
 wl_add_test(test_platform_input_shape SOURCES test_platform_input_shape.c LIBS wl_platform LABELS unit be)
+# ... and the folding of a frame's reports into one (input_reports.c).
+wl_add_test(test_platform_input_reports SOURCES test_platform_input_reports.c LIBS wl_platform LABELS unit be)
 
 # ... and the Wii input backend (wii/input_wii.c) compiled against stand-ins for libogc's WPAD, PAD
 # and keyboard, which answer from what the test sets up. It links wl_base for the log only.
 wl_add_test(test_platform_input_wii
     SOURCES test_platform_input_wii.c input_stub/input_stub.c
             ${PROJECT_SOURCE_DIR}/wl/platform/wii/input_wii.c ${PROJECT_SOURCE_DIR}/wl/platform/input_shape.c
+            ${PROJECT_SOURCE_DIR}/wl/platform/input_reports.c
     LIBS wl_base LABELS unit be)
 target_include_directories(test_platform_input_wii BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/input_stub)
 target_link_libraries(test_platform_input_wii PRIVATE m)

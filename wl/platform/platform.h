@@ -857,6 +857,12 @@ typedef struct {
     int16_t accel[3];   // raw, 1 g ~ 100 units after calibration
     int8_t stick[2][2]; // [nunchuk or classic left, classic right][x, y], -127..127, y up
     uint8_t trigger[2]; // classic analog L/R, 0..255 (a Classic Controller Pro may read 0: use WL_CC_L / WL_CC_R)
+    // The Remote reports about every 5 ms, so several times in a frame. wl_platform_input_poll reads
+    // them all (input_reports.h): `buttons` has every button pressed in any report of the frame (a
+    // tap shorter than a frame is not lost), ir_x / ir_y are the mean of the reports that had a
+    // pointer (ir_valid false when none did), `accel` is the last report's.
+    int16_t accel_peak[3]; // the frame's report of greatest acceleration, in accel's units (for gestures)
+    uint8_t reports;       // reports read this frame, up to 255; 0: none came, the last state is repeated
 } WlRawRemote;
 
 typedef struct {
