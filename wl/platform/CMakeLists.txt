@@ -13,7 +13,7 @@ target_link_libraries(wl_platform PUBLIC wl_base m)
 
 if(WL_PLATFORM STREQUAL "wii")
     target_sources(wl_platform PRIVATE
-        wii/atomic_wii.c wii/crash_wii.c wii/tls_wii.c wii/audio_wii.c wii/backtrace_wii.c wii/exit_wii.c wii/fs_wii.c wii/gx_wii.c wii/gx_target_wii.c wii/input_wii.c wii/log_wii.c
+        wii/atomic_wii.c wii/crash_wii.c wii/tls_wii.c wii/audio_wii.c wii/backtrace_wii.c wii/exit_wii.c wii/fs_wii.c wii/gx_wii.c wii/gx_direct_wii.c wii/gx_target_wii.c wii/input_wii.c wii/log_wii.c
         wii/heap_wrap_wii.c wii/hwcount_wii.c wii/mem_wii.c wii/net_wii.c wii/posix_wii.c wii/profile_wii.c wii/random_wii.c wii/stop_wii.c wii/tev_wii.c wii/thread_wii.c wii/trace_wii.c wii/video_wii.c)
     target_link_libraries(wl_platform PUBLIC fat wiikeyboard wiiuse bte aesnd asnd ogc m)
     # devkitPPC's sched_yield is an ENOSYS stub: thread_wii.c's __wrap_sched_yield yields.
@@ -21,7 +21,7 @@ if(WL_PLATFORM STREQUAL "wii")
 else()
     find_package(Threads REQUIRED)
     target_sources(wl_platform PRIVATE
-        host/audio_host.c host/backtrace_host.c host/fs_host.c host/gx_host.c host/gx_target_host.c host/hwcount_host.c host/input_host.c host/mem_host.c host/net_host.c host/profile_host.c host/stop_host.c
+        host/audio_host.c host/backtrace_host.c host/fs_host.c host/gx_host.c host/gx_direct_host.c host/gx_target_host.c host/hwcount_host.c host/input_host.c host/mem_host.c host/net_host.c host/profile_host.c host/stop_host.c
         host/random_host.c host/system_host.c host/tev_host.c host/thread_host.c)
     target_link_libraries(wl_platform PUBLIC Threads::Threads)
 endif()
