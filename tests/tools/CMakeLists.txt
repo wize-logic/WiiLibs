@@ -48,3 +48,31 @@ set_tests_properties(test_wl_profile PROPERTIES LABELS unit)
 add_test(NAME test_qemu_icount
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_qemu_icount.py)
 set_tests_properties(test_qemu_icount PROPERTIES LABELS unit)
+
+# the fused multiply-add check (tools/fma_check.py): its parser, filters and command line on canned
+# listings, and real PowerPC objects where a PowerPC Linux compiler is installed
+add_test(NAME test_fma_check
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_fma_check.py)
+set_tests_properties(test_fma_check PROPERTIES LABELS unit)
+
+# wl_add_fma_check: the check is a step after a target links, here over host programs with a
+# stand-in objdump that finds a fmadd in any file whose path has "fused" in it. Built with the
+# tests: one clean (its objects), one clean (its linked file), one with a fused function the check
+# is told to allow. Built by the tests below, which expect the build to fail: one fused (its
+# objects) and one fused (its linked file).
+set(fma_stub ${CMAKE_CURRENT_SOURCE_DIR}/fma_objdump_stub.py)
+add_executable(wl_fma_clean hbc_program.c)
+wl_add_fma_check(wl_fma_clean OBJDUMP ${fma_stub})
+add_executable(wl_fma_clean_linked hbc_program.c)
+wl_add_fma_check(wl_fma_clean_linked LINKED OBJDUMP ${fma_stub} DISASSEMBLER_OPTIONS "")
+add_executable(wl_fma_fused_allowed hbc_program.c)
+wl_add_fma_check(wl_fma_fused_allowed OBJDUMP ${fma_stub} EXCLUDE_FUNCTION "fused_*")
+add_executable(wl_fma_fused EXCLUDE_FROM_ALL hbc_program.c)
+wl_add_fma_check(wl_fma_fused OBJDUMP ${fma_stub})
+add_executable(wl_fma_fused_linked EXCLUDE_FROM_ALL hbc_program.c)
+wl_add_fma_check(wl_fma_fused_linked LINKED OBJDUMP ${fma_stub})
+foreach(fused wl_fma_fused wl_fma_fused_linked)
+    add_test(NAME test_${fused}_fails_the_build
+        COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ${fused})
+    set_tests_properties(test_${fused}_fails_the_build PROPERTIES LABELS unit WILL_FAIL TRUE)
+endforeach()
