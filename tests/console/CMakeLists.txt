@@ -35,3 +35,21 @@ if(Python3_FOUND)
             --screenshot ${CMAKE_CURRENT_BINARY_DIR}/wl_console_tests.png)
     set_tests_properties(wl_console_tests_dolphin PROPERTIES LABELS dolphin TIMEOUT 240)
 endif()
+
+# wl/xboxrt's guest memory on the console's MMU (tests/xboxrt/wii_console.c) as
+# wl_xboxrt_console.dol: the page table filled by first-touch DSIs, evictions, a pinned page that
+# moves a user page, device accesses through the DSI trampoline. Dolphin runs it with its full MMU
+# emulation (--mmu); it prints XBRT lines.
+if(TARGET wl_xboxrt)
+    add_executable(wl_xboxrt_console ${PROJECT_SOURCE_DIR}/tests/xboxrt/wii_console.c)
+    wl_target_defaults(wl_xboxrt_console)
+    target_link_libraries(wl_xboxrt_console PRIVATE wl_xboxrt wl_platform)
+    ogc_create_dol(wl_xboxrt_console)
+    if(Python3_FOUND)
+        add_test(NAME wl_xboxrt_console_dolphin
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/dolphin_run.py
+                ${CMAKE_CURRENT_BINARY_DIR}/wl_xboxrt_console.dol
+                --mmu --until "XBRT DONE" --fail "XBRT FAIL" --seconds 120)
+        set_tests_properties(wl_xboxrt_console_dolphin PROPERTIES LABELS dolphin TIMEOUT 180)
+    endif()
+endif()
