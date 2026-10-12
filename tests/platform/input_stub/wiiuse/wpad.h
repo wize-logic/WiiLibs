@@ -103,6 +103,8 @@ s32 WPAD_SetDataFormat(s32 chan, s32 fmt);
 s32 WPAD_SetVRes(s32 chan, u32 xres, u32 yres);
 s32 WPAD_Probe(s32 chan, u32 *type);
 s32 WPAD_ScanPads(void);
+typedef void (*WPADDataCallback)(s32 chan, const WPADData *data);
+s32 WPAD_ReadPending(s32 chan, WPADDataCallback datacb);
 s32 WPAD_Rumble(s32 chan, int status);
 WPADData *WPAD_Data(int chan);
 void WPAD_GForce(int chan, struct gforce_t *gforce);

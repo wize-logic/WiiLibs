@@ -27,7 +27,8 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `fs_posix.inc` | the file half of `platform.h` on unbuffered POSIX fds, shared by both backends |
 | `posix.h`, `posix.c` | `wl_posix_pread`, `wl_posix_pwrite` (a seek, the transfer and a seek back under one lock, so the descriptor's position is left alone), `WlPlacedReader` (`wl_posix_placed_open`, `_pread`, `_release`, `_close`: a descriptor read at offsets that remembers where it stands, so that a read that starts where the last ended is one `read` with no seek, where `wl_posix_pread` is three, each of which on FAT follows the file's chain of clusters) and `wl_posix_pause`: the POSIX calls devkitPPC's newlib declares and does not define; `wl_posix_sysconf`, sysconf's memory and processor answers for the console; `wl_posix_thread_set_priority` and `wl_posix_thread_set_relative_priority`, a pthread's priority (devkitPPC's `pthread_create` starts every thread at libogc's lowest, 127, and ignores attributes; the definitions are `wii/thread_wii.c`'s and `host/thread_host.c`'s). `wii/posix_wii.c` defines the C library's `pread`, `pwrite`, `pause` and `sysconf` over them, as weak symbols (a newlib that gains them wins), so a program calls them by their own names |
 | `timebase.h` | the Wii's time base (60.75 MHz) and its conversions to microseconds and milliseconds with no 64-bit division (`wl_timebase_us`, `wl_timebase_ms`: long division in base 2^16 by a constant, exact for every count; `wl_udiv64_16` for another divisor under 65536), and `wl_timebase_read` (`mftbu`/`mftb` in place, without libogc's call); `wl_platform_time_us` and `wl_platform_time_ms` use them |
-| `input_shape.h`, `input_shape.c` | the raw input in the ranges an application wants, with no libogc in it: sticks over their real travel (a GameCube stick's full deflection is 87, the C stick's 74), triggers 0..255 (the Classic Controller's are 5 bits, the GameCube's start at 30), and the Remote's pointer (position across the screen, a short loss held, a dead zone box and a turn ramp) |
+| `input_shape.h`, `input_shape.c` | the raw input in the ranges an application wants, with no libogc in it: sticks over their real travel (a GameCube stick's full deflection is 87, the C stick's 74), triggers 0..255 (the Classic Controller's are 5 bits, the GameCube's start at 30), and the Remote's pointer (position across the screen, a short loss held, a play radius against tremor, a dead zone box and a turn ramp) |
+| `input_reports.h`, `input_reports.c` | a Wii Remote's reports of one frame folded into one reading, with no libogc in it: every button pressed in any report, the pointer's mean over the reports that had one, the acceleration's peak (`wii/input_wii.c` feeds it from `WPAD_ReadPending`) |
 | `tev.h`, `tev.c` | TEV programs as data: stages (inputs a b c d, op, bias, scale, clamp, output register, order, swap tables, konst selections), the helpers a translator allocates with (konst slots, register pool, resource merging), a validator, a software evaluator, the fixed GX recipes as programs; see below |
 | `backtrace.h`, `backtrace.c` | return-address backtraces for the 32-bit PowerPC frame layout: a portable walker over a read callback, `wl_platform_backtrace` for the running thread, `wl_platform_log_backtrace` for a "where from" log line; see below |
 | `profile.h`, `profile.c` | the sampling profiler: a ring of samples (the interrupted pc, link register, thread and the return addresses up its stack), the text dumps, the jitter; `wii/profile_wii.c` is the sampler over libogc's decrementer tick tasks; `tools/wl_profile.py` symbolizes the dumps; see below |
@@ -716,11 +717,27 @@ first). Expect 4-9 MiB/s from SD cards and 15-25 MiB/s from USB drives; Dolphin'
 nothing about hardware speed.
 
 **Input.** The raw button words equal libogc's `WPAD_*`/`PAD_*` values (asserted at build time).
-IR is the bounded position when libogc has a fix, else the unbounded one, so the pointer keeps
-tracking off-screen. The accelerometer is `WPAD_GForce` x 100. The remote battery byte is 0..200
+A Remote reports about every 5 ms, six or seven times in a 30 Hz frame, and libogc queues the
+reports (16 a Remote; `WPAD_DroppedEvents` counts a longer frame's losses). A poll reads all of
+them (`WPAD_ReadPending` with a callback, which is what `WPAD_ScanPads` does with none) and folds
+them into the one `WlRawRemote` (`input_reports.h`): `buttons` has every button pressed in any
+report (a tap shorter than a frame is not lost; it is released in the next frame), the pointer is
+the mean of the reports that had one (none if none did), `accel` is the last report's and
+`accel_peak` the report of greatest magnitude (a swing, for gestures), `reports` counts them (0:
+none came since the last poll, and the last state stands). A report with an error is skipped. The
+folding is about 330 instructions a report (counted with `tools/qemu_icount.py` on `ppc-be`), so a
+frame of one Remote's seven reports costs a few microseconds. IR is the bounded position when
+libogc has a fix, else the unbounded one, so the pointer keeps tracking off-screen.
+`wl_pointer_update_steady` adds a play radius that holds a hand's tremor out of the pointer: it
+moves only to a reading farther than the radius from where it is held (or at the screen's edge),
+and then to the reading itself, so a deliberate move has no lag. The accelerometer is
+`WPAD_GForce` x 100. The remote battery byte is 0..200
 on the wire, reported as 0..100. Data format and IR resolution are re-applied on every new
 connection. A Remote that was connected and reads NOT_READY or TRANSFER (an extension plugged in) stays
-connected with nothing pressed for up to 120 polls, then counts as gone. Sticks are -127..127 over
+connected with nothing pressed for up to 120 polls, then counts as gone. A GameCube controller that
+answers `PAD_ERR_TRANSFER` or `PAD_ERR_NOT_READY` (libogc hands it back with nothing pressed) keeps
+its last good state, so that a held trigger is not released for a frame, until ten polls in a row
+have failed; then it counts as gone, and returns with its next good read. Sticks are -127..127 over
 the real travel of the stick (`input_shape.h`: libogc's `PAD_Clamp` takes a GameCube stick as full at
 72, or 59 for the C stick, after a dead zone of 15 per axis, so a raw reading is full at 87 and 74; it
 is not called, because the application's own dead zone would add to it); triggers are 0..255: the

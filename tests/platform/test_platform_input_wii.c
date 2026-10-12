@@ -2,7 +2,10 @@
 // wl/platform/wii/input_wii.c compiled against stand-ins for libogc's WPAD, PAD and keyboard
 // (tests/platform/input_stub): what the console backend reports for a Wii Remote with a Nunchuk or
 // a Classic Controller, a GameCube pad, and a Remote that drops out for a moment.
+#define _POSIX_C_SOURCE 199309L // (clock_gettime, for the cost check)
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "greatest.h"
 #include "input_stub.h"
@@ -292,6 +295,257 @@ TEST stopping_every_motor_stops_every_motor(void) {
     PASS();
 }
 
+// ---- every report of the frame (WPAD_ReadPending, input_reports.h) ----------------------------
+
+// Queues one report on `chan`: the channel's data as set up, with these buttons, a pointer
+// (ir_x < 0: none) and a g-force.
+static void report(int chan, u32 buttons, float ir_x, float ir_y, float gx, float gy, float gz) {
+    WPADData *r = &g_input_stub.queue[chan][g_input_stub.queue_len[chan]++];
+    *r = g_input_stub.data[chan];
+    r->btns_h = buttons;
+    r->ir.valid = ir_x >= 0.0f;
+    r->ir.raw_valid = r->ir.valid;
+    r->ir.x = r->ir.ax = ir_x;
+    r->ir.y = r->ir.ay = ir_y;
+    r->gforce.x = gx;
+    r->gforce.y = gy;
+    r->gforce.z = gz;
+}
+
+TEST a_press_that_came_and_went_inside_the_frame_is_pressed_for_the_frame(void) {
+    reset();
+    remote(0, WPAD_EXP_NONE, 0);
+    report(0, 0, 300, 200, 0, 0, 1);
+    report(0, WPAD_BUTTON_A, 300, 200, 0, 0, 1);
+    report(0, WPAD_BUTTON_A | WPAD_BUTTON_B, 300, 200, 0, 0, 1);
+    report(0, 0, 300, 200, 0, 0, 1); // let go before the frame's last report
+    report(0, 0, 300, 200, 0, 0, 1);
+    WlRawInput in = poll();
+    ASSERT(in.remotes[0].buttons & WL_WM_A);
+    ASSERT(in.remotes[0].buttons & WL_WM_B);
+    ASSERT_EQ(5, in.remotes[0].reports);
+    // and it is released in the next frame, which has reports of nothing pressed
+    report(0, 0, 300, 200, 0, 0, 1);
+    report(0, 0, 300, 200, 0, 0, 1);
+    in = poll();
+    ASSERT_EQ(0u, in.remotes[0].buttons);
+    ASSERT_EQ(2, in.remotes[0].reports);
+    PASS();
+}
+
+TEST a_held_button_is_held_in_every_frame_and_a_late_release_is_seen_late(void) {
+    reset();
+    remote(0, WPAD_EXP_NUNCHUK, 0);
+    for (int frame = 0; frame < 3; frame++) {
+        for (int i = 0; i < 6; i++) {
+            report(0, WPAD_BUTTON_B | WPAD_NUNCHUK_BUTTON_Z, 300, 200, 0, 0, 1);
+        }
+        WlRawInput in = poll();
+        ASSERT(in.remotes[0].buttons & WL_WM_B);
+        ASSERT(in.remotes[0].buttons & WL_NC_Z); // (the extension's half too)
+    }
+    // released mid-frame: still down for that frame, up in the next
+    report(0, WPAD_BUTTON_B, 300, 200, 0, 0, 1);
+    report(0, 0, 300, 200, 0, 0, 1);
+    ASSERT(poll().remotes[0].buttons & WL_WM_B);
+    report(0, 0, 300, 200, 0, 0, 1);
+    ASSERT_EQ(0u, poll().remotes[0].buttons);
+    PASS();
+}
+
+TEST a_frame_without_reports_repeats_the_last_snapshot(void) {
+    reset();
+    remote(0, WPAD_EXP_NONE, WPAD_BUTTON_A);
+    g_input_stub.data[0].ir.valid = 1;
+    g_input_stub.data[0].ir.x = 320.0f;
+    g_input_stub.data[0].ir.y = 240.0f;
+    WlRawInput in = poll(); // nothing queued
+    ASSERT_EQ(0, in.remotes[0].reports);
+    ASSERT(in.remotes[0].buttons & WL_WM_A);
+    ASSERT(in.remotes[0].ir_valid);
+    ASSERT_EQ(320, in.remotes[0].ir_x);
+    PASS();
+}
+
+TEST the_pointer_is_the_mean_of_the_reports_that_had_one(void) {
+    reset();
+    remote(0, WPAD_EXP_NONE, 0);
+    report(0, 0, 300, 200, 0, 0, 1);
+    report(0, 0, -1, -1, 0, 0, 1); // the sensor bar lost for one report: not a zero
+    report(0, 0, 304, 204, 0, 0, 1);
+    report(0, 0, 308, 202, 0, 0, 1);
+    WlRawInput in = poll();
+    ASSERT(in.remotes[0].ir_valid);
+    ASSERT_EQ(304, in.remotes[0].ir_x);
+    ASSERT_EQ(202, in.remotes[0].ir_y);
+    // a frame in which no report had a pointer has none, though the snapshot's flag was left set
+    report(0, 0, -1, -1, 0, 0, 1);
+    report(0, 0, -1, -1, 0, 0, 1);
+    in = poll();
+    ASSERT(!in.remotes[0].ir_valid);
+    // a pointer off the screen (the unbounded position) averages too, and a half rounds away
+    report(0, 0, 10, 10, 0, 0, 1);
+    g_input_stub.queue[0][0].ir.valid = 0;
+    g_input_stub.queue[0][0].ir.ax = -41.0f;
+    g_input_stub.queue[0][0].ir.ay = 10.0f;
+    report(0, 0, 10, 10, 0, 0, 1);
+    g_input_stub.queue[0][1].ir.valid = 0;
+    g_input_stub.queue[0][1].ir.ax = -40.0f;
+    in = poll();
+    ASSERT(in.remotes[0].ir_valid);
+    ASSERT_EQ(-41, in.remotes[0].ir_x); // -40.5 to -41
+    ASSERT_EQ(10, in.remotes[0].ir_y);
+    PASS();
+}
+
+TEST the_acceleration_keeps_its_peak_and_its_last_value(void) {
+    reset();
+    remote(0, WPAD_EXP_NONE, 0);
+    report(0, 0, 300, 200, 0.0f, 0.0f, 1.0f);
+    report(0, 0, 300, 200, 2.5f, -1.0f, 0.5f); // the swing
+    report(0, 0, 300, 200, 0.5f, 0.0f, 1.0f);
+    WlRawInput in = poll();
+    ASSERT_EQ(250, in.remotes[0].accel_peak[0]);
+    ASSERT_EQ(-100, in.remotes[0].accel_peak[1]);
+    ASSERT_EQ(50, in.remotes[0].accel_peak[2]);
+    ASSERT_EQ(50, in.remotes[0].accel[0]); // the last
+    ASSERT_EQ(100, in.remotes[0].accel[2]);
+    PASS();
+}
+
+TEST a_report_with_an_error_is_not_read(void) {
+    reset();
+    remote(0, WPAD_EXP_NONE, 0);
+    report(0, WPAD_BUTTON_A, 100, 100, 0, 0, 1);
+    g_input_stub.queue[0][0].err = WPAD_ERR_TRANSFER;
+    report(0, WPAD_BUTTON_B, 300, 200, 0, 0, 1);
+    WlRawInput in = poll();
+    ASSERT_EQ(1, in.remotes[0].reports);
+    ASSERT(!(in.remotes[0].buttons & WL_WM_A));
+    ASSERT(in.remotes[0].buttons & WL_WM_B);
+    ASSERT_EQ(300, in.remotes[0].ir_x);
+    PASS();
+}
+
+TEST the_reports_of_each_remote_stay_its_own(void) {
+    reset();
+    remote(0, WPAD_EXP_NONE, 0);
+    remote(2, WPAD_EXP_NONE, 0);
+    report(0, WPAD_BUTTON_A, 100, 100, 0, 0, 1);
+    report(0, 0, 100, 100, 0, 0, 1);
+    report(2, WPAD_BUTTON_1, 500, 400, 0, 0, 1);
+    WlRawInput in = poll();
+    ASSERT_EQ(WL_WM_A, in.remotes[0].buttons);
+    ASSERT_EQ(WL_WM_1, in.remotes[2].buttons);
+    ASSERT_EQ(100, in.remotes[0].ir_x);
+    ASSERT_EQ(500, in.remotes[2].ir_x);
+    ASSERT_EQ(2, in.remotes[0].reports);
+    ASSERT_EQ(1, in.remotes[2].reports);
+    PASS();
+}
+
+// Reading a frame's reports costs little: four Remotes with two dozen reports each (a long frame)
+// are read in well under 0.1 ms on the host (the stand-in's copying and the test's queuing
+// included, so a ceiling; the Wii's processor is slower, and tools/qemu_icount.py counts the
+// instructions of the folding).
+TEST reading_four_remotes_of_two_dozen_reports_is_cheap(void) {
+    reset();
+    for (int c = 0; c < 4; c++) {
+        remote(c, WPAD_EXP_NUNCHUK, 0);
+    }
+    enum { FRAMES = 2000 };
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int f = 0; f < FRAMES; f++) {
+        for (int c = 0; c < 4; c++) {
+            for (int i = 0; i < 24; i++) {
+                report(c, (u32)(i & 3), (float)(300 + i), 200.0f, 0.1f * (float)i, 0.0f, 1.0f);
+            }
+        }
+        WlRawInput in = poll();
+        ASSERT_EQ(24, in.remotes[3].reports);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double us = ((double)(t1.tv_sec - t0.tv_sec) * 1e6 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e3) / FRAMES;
+    printf("(%.1f us a frame for 96 reports, queuing them included) ", us);
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    ASSERT(us < 100.0);
+#endif // (qemu's clock says nothing about the console's: tools/qemu_icount.py counts instructions)
+    PASS();
+}
+
+// ---- a GameCube pad's momentary errors ----------------------------------------------------------
+
+TEST a_pad_that_fails_to_transfer_keeps_its_last_good_state(void) {
+    reset();
+    g_input_stub.pad[1].err = PAD_ERR_NONE;
+    g_input_stub.pad[1].button = PAD_BUTTON_A;
+    g_input_stub.pad[1].stickX = 87;
+    g_input_stub.pad[1].triggerR = 180;
+    WlRawInput in = poll();
+    ASSERT_EQ(255, in.pads[1].trigger[1]);
+    // libogc hands back the failed pad with nothing in it
+    memset(&g_input_stub.pad[1], 0, sizeof g_input_stub.pad[1]);
+    g_input_stub.pad[1].err = PAD_ERR_TRANSFER;
+    for (int i = 0; i < 5; i++) {
+        in = poll();
+        ASSERT(in.pads[1].connected);
+        ASSERT(in.pads[1].buttons & WL_PAD_A);
+        ASSERT_EQ(127, in.pads[1].stick[0][0]);
+        ASSERT_EQ(255, in.pads[1].trigger[1]); // a held trigger stays held
+    }
+    // a good read ends it: the new state is the pad's
+    g_input_stub.pad[1].err = PAD_ERR_NONE;
+    g_input_stub.pad[1].button = 0;
+    in = poll();
+    ASSERT_EQ(0u, in.pads[1].buttons);
+    ASSERT_EQ(0, in.pads[1].trigger[1]);
+    PASS();
+}
+
+TEST a_pad_that_keeps_failing_is_gone_and_returns_with_a_good_read(void) {
+    reset();
+    g_input_stub.pad[0].err = PAD_ERR_NONE;
+    g_input_stub.pad[0].button = PAD_BUTTON_B;
+    ASSERT(poll().pads[0].connected);
+    g_input_stub.pad[0].err = PAD_ERR_TRANSFER;
+    int held = 0;
+    while (poll().pads[0].connected) {
+        ASSERT(++held < 100);
+    }
+    ASSERT(held >= 5 && held <= 20); // several, not one
+    // gone stays gone, with nothing pressed, while it still fails
+    WlRawInput in = poll();
+    ASSERT(!in.pads[0].connected);
+    ASSERT_EQ(0u, in.pads[0].buttons);
+    // and a failure count starts again after a good read
+    g_input_stub.pad[0].err = PAD_ERR_NONE;
+    g_input_stub.pad[0].button = PAD_BUTTON_X;
+    ASSERT(poll().pads[0].connected);
+    g_input_stub.pad[0].err = PAD_ERR_TRANSFER;
+    for (int i = 0; i < held; i++) {
+        in = poll();
+        ASSERT(in.pads[0].connected);
+        ASSERT(in.pads[0].buttons & WL_PAD_X);
+    }
+    PASS();
+}
+
+TEST a_pad_never_seen_is_not_held_by_an_error(void) {
+    reset();
+    g_input_stub.pad[3].err = PAD_ERR_TRANSFER;
+    ASSERT(!poll().pads[3].connected);
+    // and an unplugged one is gone at once, its last state forgotten
+    g_input_stub.pad[3].err = PAD_ERR_NONE;
+    g_input_stub.pad[3].button = PAD_BUTTON_A;
+    ASSERT(poll().pads[3].connected);
+    g_input_stub.pad[3].err = PAD_ERR_NO_CONTROLLER;
+    ASSERT(!poll().pads[3].connected);
+    g_input_stub.pad[3].err = PAD_ERR_TRANSFER;
+    ASSERT(!poll().pads[3].connected);
+    PASS();
+}
+
 SUITE(input_wii_suite) {
     RUN_TEST(classic_controller_sticks_and_triggers);
     RUN_TEST(classic_pro_triggers_are_the_digital_bits);
@@ -307,6 +561,17 @@ SUITE(input_wii_suite) {
     RUN_TEST(only_a_change_is_sent_to_a_motor);
     RUN_TEST(a_remote_that_comes_back_is_told_again);
     RUN_TEST(stopping_every_motor_stops_every_motor);
+    RUN_TEST(a_press_that_came_and_went_inside_the_frame_is_pressed_for_the_frame);
+    RUN_TEST(a_held_button_is_held_in_every_frame_and_a_late_release_is_seen_late);
+    RUN_TEST(a_frame_without_reports_repeats_the_last_snapshot);
+    RUN_TEST(the_pointer_is_the_mean_of_the_reports_that_had_one);
+    RUN_TEST(the_acceleration_keeps_its_peak_and_its_last_value);
+    RUN_TEST(a_report_with_an_error_is_not_read);
+    RUN_TEST(the_reports_of_each_remote_stay_its_own);
+    RUN_TEST(reading_four_remotes_of_two_dozen_reports_is_cheap);
+    RUN_TEST(a_pad_that_fails_to_transfer_keeps_its_last_good_state);
+    RUN_TEST(a_pad_that_keeps_failing_is_gone_and_returns_with_a_good_read);
+    RUN_TEST(a_pad_never_seen_is_not_held_by_an_error);
 }
 
 GREATEST_MAIN_DEFS();

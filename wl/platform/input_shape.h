@@ -43,6 +43,14 @@ typedef struct {
 // not connected resets p.
 bool wl_pointer_update(WlPointer *p, const WlRawRemote *remote, uint64_t now_us, uint32_t hold_us);
 
+// The same with a play radius, which takes a hand's tremor out of the pointer: while the reading is
+// within `radius` (0..1 of the half screen, as the pointer's own units; 0 for none) of the held
+// position p->x, p->y, the pointer holds still; a reading beyond it, or one at the screen's edge, moves it
+// to the reading at once, so a deliberate move has no lag. A pointer found again after a loss
+// starts at its reading.
+bool wl_pointer_update_steady(WlPointer *p, const WlRawRemote *remote, uint64_t now_us, uint32_t hold_us,
+                              float radius);
+
 // A turn rate from the pointer's offset on one axis: 0..1 and the sign of `offset`. Nothing
 // within `dead_zone` (0..1 of the half screen); beyond it a ramp that starts gently (squared) and
 // reaches 1 at the screen's edge, so that a small step out of the box turns slowly.

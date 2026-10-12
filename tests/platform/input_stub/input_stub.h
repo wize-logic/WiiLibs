@@ -17,6 +17,9 @@ typedef struct {
     unsigned motor_calls;       // PAD_ControlMotor calls, all channels
     s32 motor_mode;     // what CONF_GetPadMotorMode reports: 1 on, 0 off, negative unreadable
     s32 sound_mode;     // what CONF_GetSoundMode reports: 0 mono, 1 stereo, 2 surround, negative unreadable
+    WPADData queue[4][64]; // the reports libogc has queued per channel, oldest first (WPAD_ReadPending)
+    unsigned queue_len[4];
+    unsigned read_pending_calls;
     unsigned data_format_calls; // WPAD_SetDataFormat on one channel (a new connection)
 } InputStub;
 
