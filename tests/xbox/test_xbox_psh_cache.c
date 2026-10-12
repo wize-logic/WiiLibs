@@ -1,0 +1,237 @@
+// SPDX-License-Identifier: MIT
+// wl/xbox/psh_cache: every program the cache gives is the one a fresh translation makes, byte for
+// byte: for random combiner programs drawn with their constants as they were, changed within their
+// signatures (a channel's 0s and 1s, and the equal channels, kept: the program patched in place)
+// and changed outside them; for more structures than the cache holds; with the caller's extra word
+// and a recipe.
+#include <stdint.h>
+#include <string.h>
+
+#include "greatest.h"
+#include "wl/xbox/psh_cache.h"
+
+static uint32_t g_rng = 0xC0FFEEu;
+static uint32_t rnd(void) {
+    g_rng = g_rng * 1664525u + 1013904223u;
+    return g_rng >> 8;
+}
+
+static WlXboxPshCache g_cache;
+static WlXboxPshProgram g_fresh;
+
+static unsigned rand_input(void) {
+    static const unsigned regs[] = {0, 1, 2, 3, 4, 5, 8, 9, 12, 13};
+    static const unsigned maps[] = {0x00, 0x20, 0x40, 0x80, 0xc0};
+    return regs[rnd() % 10u] | (rnd() % 3u == 0 ? 0x10u : 0u) | maps[rnd() % 5u];
+}
+
+static unsigned rand_output(void) {
+    static const unsigned names[] = {0, 0, 12, 13, 8, 4};
+    return names[rnd() % 6u];
+}
+
+// a constant whose channels are 0, 255 or something else, some equal
+static uint32_t rand_constant(void) {
+    uint32_t value = 0;
+    for (int ch = 0; ch < 4; ch++) {
+        unsigned kind = rnd() % 4u, channel = kind == 0 ? 0u : kind == 1 ? 255u : 1u + rnd() % 254u;
+        value = value << 8 | channel;
+    }
+    return value;
+}
+
+static void program_random(uint32_t *state, WlXboxPshTextures *textures) {
+    memset(state, 0, WL_XBOX_PSH_WORDS * sizeof *state);
+    unsigned count = 1 + rnd() % 3u;
+    state[WL_XBOX_PSH_COMBINER_COUNT] = count | (rnd() % 2u ? 0x1000u : 0u);
+    for (unsigned st = 0; st < count; st++) {
+        for (int portion = 0; portion < 2; portion++) {
+            uint32_t in = 0;
+            for (int k = 0; k < 4; k++) {
+                in = in << 8 | rand_input();
+            }
+            unsigned ab = rand_output(), cd = rand_output();
+            if (ab && ab == cd) {
+                cd = 0;
+            }
+            state[(portion ? WL_XBOX_PSH_ALPHA_INPUTS0 : WL_XBOX_PSH_RGB_INPUTS0) + st] = in;
+            state[(portion ? WL_XBOX_PSH_ALPHA_OUTPUTS0 : WL_XBOX_PSH_RGB_OUTPUTS0) + st] =
+                ab << 4 | cd;
+        }
+    }
+    for (int i = 0; i < 8; i++) {
+        state[WL_XBOX_PSH_CONSTANT0_0 + i] = rand_constant();
+        state[WL_XBOX_PSH_CONSTANT1_0 + i] = rand_constant();
+    }
+    state[WL_XBOX_PSH_FINAL_CONSTANT0] = rand_constant();
+    state[WL_XBOX_PSH_FINAL_CONSTANT1] = rand_constant();
+    memset(textures, 0, sizeof *textures);
+    textures->present = 1u + rnd() % 7u;
+    textures->fog = (unsigned char)(rnd() % 2u);
+    textures->fog_color = rand_constant() & 0x00FFFFFFu;
+}
+
+// each constant's channels changed where they are neither 0 nor 255, equal channels kept equal
+// (within its signature), or (outside) any channel
+static void constants_change(uint32_t *state, WlXboxPshTextures *textures, bool within) {
+    static const int words[] = {WL_XBOX_PSH_CONSTANT0_0, WL_XBOX_PSH_CONSTANT1_0};
+    uint32_t *slots[19];
+    int n = 0;
+    for (int w = 0; w < 2; w++) {
+        for (int i = 0; i < 8; i++) {
+            slots[n++] = &state[words[w] + i];
+        }
+    }
+    slots[n++] = &state[WL_XBOX_PSH_FINAL_CONSTANT0];
+    slots[n++] = &state[WL_XBOX_PSH_FINAL_CONSTANT1];
+    slots[n++] = &textures->fog_color;
+    uint32_t before[19];
+    for (int s = 0; s < n; s++) {
+        before[s] = *slots[s];
+    }
+    for (int s = 0; s < n; s++) {
+        uint32_t value = *slots[s];
+        int same;
+        // (a constant equal to one before it stays so: its signature says so)
+        for (same = 0; same < s && before[same] != value; same++) {
+        }
+        if (within && same < s) {
+            *slots[s] = *slots[same];
+            continue;
+        }
+        if (!within) {
+            *slots[s] = rand_constant() & (s == n - 1 ? 0x00FFFFFFu : 0xFFFFFFFFu);
+            continue;
+        }
+        // (a new value for each distinct middle channel, the same for equal ones)
+        unsigned from[4], to[4], used = 0;
+        uint32_t out = 0;
+        for (int ch = 3; ch >= 0; ch--) {
+            unsigned channel = (value >> (8 * ch)) & 255u, now = channel;
+            if (channel != 0 && channel != 255) {
+                unsigned u;
+                for (u = 0; u < used && from[u] != channel; u++) {
+                }
+                if (u == used) {
+                    bool taken;
+                    from[used] = channel;
+                    do {
+                        to[used] = 1u + rnd() % 254u;
+                        taken = false;
+                        for (unsigned v = 0; v < used; v++) {
+                            taken |= to[v] == to[used];
+                        }
+                    } while (taken);
+                    used++;
+                }
+                now = to[u];
+            }
+            out = out << 8 | now;
+        }
+        *slots[s] = out;
+    }
+}
+
+static void compare(const uint32_t *state, const WlXboxPshTextures *textures, uint32_t extra,
+                    unsigned long *differ) {
+    bool usable, translated;
+    const WlXboxPshProgram *cached =
+        wl_xbox_psh_cache_program(&g_cache, state, extra, textures, &usable, &translated);
+    bool fresh_usable = wl_xbox_psh_translate(state, textures, NULL, &g_fresh);
+    if (usable != fresh_usable || (usable && memcmp(cached, &g_fresh, sizeof g_fresh))) {
+        ++*differ;
+    }
+}
+
+TEST cached_programs_are_fresh_translations(void) {
+    static uint32_t state[WL_XBOX_PSH_WORDS], first[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures, first_textures;
+    unsigned long differ = 0;
+    WlXboxPshCacheCounts counts;
+    wl_xbox_psh_cache_init(&g_cache, NULL);
+    for (int n = 0; n < 400; n++) {
+        program_random(state, &textures);
+        memcpy(first, state, sizeof state);
+        first_textures = textures;
+        compare(state, &textures, 0, &differ);
+        compare(state, &textures, 0, &differ);
+        for (int change = 0; change < 6; change++) {
+            constants_change(state, &textures, change < 4);
+            compare(state, &textures, 0, &differ);
+        }
+        compare(first, &first_textures, 0, &differ);
+    }
+    wl_xbox_psh_cache_counts(&g_cache, &counts);
+    ASSERT_EQ(0ul, differ);
+    ASSERT_EQ(0ul, counts.audits_differ);
+    // (more structures than the cache holds: some pushed out)
+    ASSERT(counts.evicted > 0);
+    ASSERT(counts.patched > 0);
+    ASSERT(counts.generic > 0);
+    ASSERT(counts.found >= 400);
+    ASSERT(counts.translated < 400 * 9);
+    PASS();
+}
+
+TEST the_last_call_and_the_extra_word(void) {
+    static uint32_t state[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures;
+    WlXboxPshCacheCounts before, after;
+    bool usable, translated;
+    wl_xbox_psh_cache_init(&g_cache, NULL);
+    program_random(state, &textures);
+    const WlXboxPshProgram *one =
+        wl_xbox_psh_cache_program(&g_cache, state, 5, &textures, &usable, &translated);
+    ASSERT(translated);
+    wl_xbox_psh_cache_counts(&g_cache, &before);
+    const WlXboxPshProgram *two =
+        wl_xbox_psh_cache_program(&g_cache, state, 5, &textures, &usable, &translated);
+    ASSERT(!translated);
+    ASSERT_EQ(one, two);
+    wl_xbox_psh_cache_counts(&g_cache, &after);
+    ASSERT_EQ(before.found + 1, after.found);
+    // another extra word: another structure
+    wl_xbox_psh_cache_program(&g_cache, state, 6, &textures, &usable, &translated);
+    ASSERT(translated);
+    wl_xbox_psh_cache_program(&g_cache, state, 5, &textures, &usable, &translated);
+    ASSERT(!translated);
+    PASS();
+}
+
+static int g_recipe_calls;
+static bool recipe_make(const uint32_t *state, const WlXboxPshTextures *textures,
+                        WlXboxPshProgram *program, void *user) {
+    (void)state;
+    (void)textures;
+    (void)program;
+    ++*(int *)user;
+    return false;
+}
+
+TEST the_cache_translates_through_its_recipe(void) {
+    static uint32_t state[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures;
+    WlXboxPshRecipe recipe = {recipe_make, &g_recipe_calls};
+    bool usable, translated;
+    wl_xbox_psh_cache_init(&g_cache, &recipe);
+    g_recipe_calls = 0;
+    program_random(state, &textures);
+    wl_xbox_psh_cache_program(&g_cache, state, 0, &textures, &usable, &translated);
+    ASSERT(translated);
+    ASSERT(g_recipe_calls >= 1);
+    PASS();
+}
+
+SUITE(psh_cache_suite) {
+    RUN_TEST(cached_programs_are_fresh_translations);
+    RUN_TEST(the_last_call_and_the_extra_word);
+    RUN_TEST(the_cache_translates_through_its_recipe);
+}
+
+GREATEST_MAIN_DEFS();
+
+int main(int argc, char **argv) {
+    GREATEST_MAIN_BEGIN();
+    RUN_SUITE(psh_cache_suite);
+    GREATEST_MAIN_END();
+}

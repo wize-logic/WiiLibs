@@ -27,6 +27,7 @@ Each module is `wl/<name>/` with its own README, a CMake target `wl_<name>` (ali
 | `gs` | Genius Sonority FSYS archives, TOC, LZSS | all |
 | `brstm` | NW4R audio: BRSTM, BRSAR, RWSD, DSP-ADPCM (via `codec`) | all (path open: host) |
 | `sdat` | NDS SDAT sound archives (SSEQ/SBNK/SWAR/STRM) | all (index: host) |
+| `xbox` | The Xbox's NV2A on GX: pixel shaders' register combiners translated to TEV programs (with a cache that rewrites constants in place, and a hook for a game's hand-made programs), vertex programs decoded, analysed (inputs, affinity, constants read) and run on the processor, and compiled ahead of time to C by `tools/xbox_vsh_codegen.c` | all (the tool: host) |
 
 ## Building
 
@@ -71,6 +72,7 @@ cmake --build build/wii && ctest --test-dir build/wii -L dolphin --output-on-fai
 | `tools/qemu_icount.py` | Counts the instructions a program built for big-endian PowerPC Linux (the `ppc-be` toolchain, `-mcpu=750`) runs under qemu-ppc: in all, by function, by translation block, and the difference from a smaller run of the same program (a cost per item: per vertex, per output frame). Speed counted without a Wii: exact and repeatable, though not cycles. Tests: `tests/tools/test_qemu_icount.py` |
 | `tools/fma_check.py` | Lists the fused multiply-adds (`fmadd`, `fmsub`, `fnmadd`, `fnmsub` and their single forms, the Gekko's paired singles `ps_madd`..`ps_madds1`, AltiVec's and VSX's) in PowerPC objects, archives and ELF files, by object and function, with the instructions (`-v`); exit 1 if there are any, 2 if the check could not be made (a file objdump cannot read as PowerPC is never a pass). For a program whose results must match another machine's bit for bit: compilers fuse unasked, and Clang has let some through `-ffp-contract=off`. Shell-pattern filters on objects and archive members (`--include`, `--exclude`) and on functions (`--include-function`, `--exclude-function`), `@file` response files (ninja's), `--stamp` for build systems. Runs objdump with `-M gekko`, without which the paired singles are misread. From CMake: `wl_add_fma_check(<target> [LINKED] [OBJDUMP ...] [EXCLUDE ...] [EXCLUDE_FUNCTION ...])` (`cmake/WiiLibs.cmake`) fails the target's build if its objects (or, with `LINKED`, its ELF) have one; pairs with `wl_target_defaults(<target> DETERMINISTIC)`. Tests: `tests/tools/` (host; real objects where a PowerPC Linux compiler is installed) |
 | `tools/xbox_tex_reference.py` | Reference implementation of the Xbox texture conversions |
+| `tools/xbox_vsh_codegen.c` | Compiles a file of Xbox (NV2A) vertex programs to C functions that give, bit for bit, what `wl/xbox/vsh.h`'s interpreter gives, and a table of them for `wl_xbox_vsh_compile` (`wl/xbox/README.md`). Built with the host build (`xbox_vsh_codegen`). Tests: `tests/xbox/test_xbox_vsh_native.c` |
 
 To use it from another CMake project: `add_subdirectory(path/to/WiiLibs)` and link
 `WiiLibs::<module>`. Tests and `-Werror` are on only when WiiLibs is the top-level project

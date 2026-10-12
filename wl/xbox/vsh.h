@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: MIT
+// The Xbox's vertex programs (NV2A vertex microcode) run on the processor (vsh.c): GX has no
+// programmable vertex stage, so a port of an Xbox game runs each draw's vertices through the
+// game's program here, and GX draws the results in screen space.
+//
+// A program is decoded once (wl_xbox_vsh_compile) from its instructions, four words each as the
+// Xbox's Direct3D takes a vertex shader's function after its header word, then run for each vertex
+// (wl_xbox_vsh_run, or wl_xbox_vsh_run_live for the outputs a draw reads). Programs known ahead of
+// time can be compiled to C (tools/xbox_vsh_codegen.c; vsh_native.h): compile then finds a
+// program's function in the table given by a hash of its words, and runs that instead of
+// interpreting it, to the bit the same. The analysis (wl_xbox_vsh_analyze*) says what each output
+// depends on: which inputs, whether affinely (then GX's matrices can compute it), whether through
+// the constants.
+#pragma once
+
+#include <stdint.h>
+
+enum {
+    WL_XBOX_VSH_CONSTANT_COUNT = 192,
+    /* c[-96] is the first */
+    WL_XBOX_VSH_CONSTANT_BIAS = 96,
+    WL_XBOX_VSH_INPUT_COUNT = 16,
+    WL_XBOX_VSH_MAX_INSTRUCTIONS = 136
+};
+
+typedef struct WlXboxVshOperand {
+    unsigned char mux, index, negate;
+    unsigned char swizzle[4];
+} WlXboxVshOperand;
+
+typedef struct WlXboxVshInstruction {
+    unsigned char mac, ilu;
+    unsigned char mac_mask, ilu_mask, output_mask;
+    unsigned char temporary, output_address, output_is_register, output_from_ilu, relative;
+    /* the screen-space conversion's reciprocal of the clip-space w: the
+    position is kept as it was before it (clip_captured) */
+    unsigned char captures_clip;
+    unsigned char input, constant;
+    WlXboxVshOperand operands[3];
+} WlXboxVshInstruction;
+
+typedef struct WlXboxVshOutput WlXboxVshOutput;
+
+/* a program compiled ahead of time (vsh_native.h), for the outputs
+in live (WL_XBOX_VSH_LIVE_...) */
+typedef void (*WlXboxVshLiveProc)(const float (*constants)[4], const float (*inputs)[4],
+                                  WlXboxVshOutput *output, unsigned live);
+/* ... and its colours alone */
+typedef void (*WlXboxVshColorsProc)(const float (*constants)[4], const float (*inputs)[4],
+                                    WlXboxVshOutput *output);
+/* ... and its position alone, for four values of v0 (points) at once, the
+other inputs those given: each one's clip-space position (clip, as the
+program captures it) and screen-space position, the same to the bit as
+four runs for the position (wl_xbox_vsh_run_positions) */
+typedef void (*WlXboxVshPositionsProc)(const float (*constants)[4], const float (*inputs)[4],
+                                       const float (*points)[4], float (*clips)[4],
+                                       float (*positions)[4]);
+
+/* the outputs a draw reads (wl_xbox_vsh_run_live): the others are left as they
+were, or hold what the instructions computed on the way */
+enum {
+    /* (position, clip and clip_captured) */
+    WL_XBOX_VSH_LIVE_POSITION = 1 << 0,
+    WL_XBOX_VSH_LIVE_D0 = 1 << 1,
+    WL_XBOX_VSH_LIVE_D1 = 1 << 2,
+    /* (b0 and b1) */
+    WL_XBOX_VSH_LIVE_BACK = 1 << 3,
+    WL_XBOX_VSH_LIVE_POINT_SIZE = 1 << 4,
+    /* (t[n]: WL_XBOX_VSH_LIVE_T0 << n) */
+    WL_XBOX_VSH_LIVE_T0 = 1 << 5,
+    WL_XBOX_VSH_LIVE_FOG = 1 << 9,
+    WL_XBOX_VSH_LIVE_ALL = (1 << 10) - 1
+};
+
+/* a program compiled ahead of time, as tools/xbox_vsh_codegen.c lists them:
+found by its words' hash (wl_xbox_vsh_hash) and instruction count */
+typedef struct WlXboxVshNative {
+    unsigned long hash, count;
+    /* (for the outputs a draw reads: WL_XBOX_VSH_LIVE_...) */
+    WlXboxVshLiveProc run;
+    /* its colours (d0, d1) and fog alone */
+    WlXboxVshColorsProc colors;
+    /* its position for four values of v0 (NULL: none) */
+    WlXboxVshPositionsProc positions;
+} WlXboxVshNative;
+
+typedef struct WlXboxVshProgram {
+    unsigned long count;
+    /* (wl_xbox_vsh_hash: the generated programs' names) */
+    unsigned long hash;
+    WlXboxVshLiveProc native;
+    /* (the compiled program's colours and fog alone; NULL on the
+    interpreter) */
+    WlXboxVshColorsProc native_colors;
+    /* (its position for four values of v0; NULL on the interpreter) */
+    WlXboxVshPositionsProc native_positions;
+    WlXboxVshInstruction instructions[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+} WlXboxVshProgram;
+
+/* what a vertex leaves: the screen-space position the program computes
+(pixels, and depth scaled by the viewport), the clip-space position before
+its conversion if the program converts it, the colors, the texture
+coordinates and the fog */
+struct WlXboxVshOutput {
+    float position[4];
+    float clip[4];
+    int clip_captured;
+    float d0[4], d1[4], b0[4], b1[4];
+    float t[4][4];
+    float fog;
+    float point_size;
+};
+
+/* what a program's outputs depend on, found from its instructions alone
+(wl_xbox_vsh_analyze): each component's input registers (bit n: v[n]), and
+WL_XBOX_VSH_NOT_AFFINE when it is not an affine function of them (a product of
+two inputs, a reciprocal, a minimum, a lookup by an input's index, ...).
+An affine output is A x + b for the draw's constants, which GX's matrices
+can compute. */
+enum { WL_XBOX_VSH_NOT_AFFINE = 1 << 16 };
+/* (wl_xbox_vsh_analyze_constants: a component that reads a constant register,
+c[n] or c[a0 + n], on the way; one without it is the vertex's alone, the
+same for any constants) */
+enum { WL_XBOX_VSH_READS_CONSTANT = 1 << 17 };
+
+typedef struct WlXboxVshDependencies {
+    unsigned long clip[4], position[4];
+    unsigned long d0[4], d1[4], b0[4], b1[4];
+    unsigned long t[4][4];
+    unsigned long fog, point_size;
+    int clip_captured;
+    /* the input registers any instruction reads */
+    unsigned long inputs;
+    /* the constant registers it reads (bit n of word n / 32: c[n - 96]),
+    all of them when it reads one by a0 */
+    unsigned long constants[WL_XBOX_VSH_CONSTANT_COUNT / 32];
+    int relative;
+} WlXboxVshDependencies;
+
+/* a program decoded from its instructions (four words each; at most
+WL_XBOX_VSH_MAX_INSTRUCTIONS, the last the one with its end bit), with its
+compiled functions when the table has them (natives: NULL, or native_count
+of them) */
+void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction_count,
+                         const WlXboxVshNative *natives, unsigned long native_count,
+                         WlXboxVshProgram *program);
+/* a program's words hashed (FNV-1a), which finds its function */
+unsigned long wl_xbox_vsh_hash(const uint32_t *instructions, unsigned long instruction_count);
+
+void wl_xbox_vsh_run(const WlXboxVshProgram *program, const float (*constants)[4],
+                     const float (*inputs)[4], float point_size, WlXboxVshOutput *output);
+/* wl_xbox_vsh_run for the outputs in live alone (WL_XBOX_VSH_LIVE_...): those are
+the same, bit for bit, the others undefined */
+void wl_xbox_vsh_run_live(const WlXboxVshProgram *program, const float (*constants)[4],
+                          const float (*inputs)[4], float point_size, WlXboxVshOutput *output,
+                          unsigned live);
+/* a vertex's colours (d0, d1) and fog alone: the compiled colours function
+where there is one, else all of the program */
+void wl_xbox_vsh_run_colors(const WlXboxVshProgram *program, const float (*constants)[4],
+                            const float (*inputs)[4], WlXboxVshOutput *output);
+/* the clip-space and screen-space positions for four values of v0 (points;
+the other inputs as given), as four wl_xbox_vsh_run_live for the position give
+them, to the bit: 0 (nothing done) for a program without its compiled
+function */
+int wl_xbox_vsh_run_positions(const WlXboxVshProgram *program, const float (*constants)[4],
+                              const float (*inputs)[4], const float (*points)[4], float (*clips)[4],
+                              float (*positions)[4]);
+
+/* the input registers the outputs in live (WL_XBOX_VSH_LIVE_...) read, as the
+analysis found them (bit n: v[n]): the others may hold anything */
+unsigned long wl_xbox_vsh_live_inputs(const WlXboxVshDependencies *dependencies, unsigned live);
+void wl_xbox_vsh_analyze(const WlXboxVshProgram *program, WlXboxVshDependencies *dependencies);
+/* wl_xbox_vsh_analyze for a draw whose input registers in uniform (bit n:
+v[n]) hold the same values for every vertex */
+void wl_xbox_vsh_analyze_uniform(const WlXboxVshProgram *program, unsigned long uniform,
+                                 WlXboxVshDependencies *dependencies);
+/* wl_xbox_vsh_analyze, with WL_XBOX_VSH_READS_CONSTANT in each component that
+reads a constant register */
+void wl_xbox_vsh_analyze_constants(const WlXboxVshProgram *program,
+                                   WlXboxVshDependencies *dependencies);
