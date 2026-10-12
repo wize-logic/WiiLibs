@@ -15,12 +15,14 @@
 
 static uint32_t g_allocs, g_frees;
 static bool g_alloc_fails;
+static size_t g_last_alloc_bytes;
 
 static void *counting_alloc(size_t bytes) {
     if (g_alloc_fails) {
         return NULL;
     }
     g_allocs++;
+    g_last_alloc_bytes = bytes;
     return aligned_alloc(32, bytes);
 }
 
@@ -161,7 +163,8 @@ TEST back_buffer_parked_when_drawn_then_target_resolved_and_back_restored(void) 
     ASSERT_EQ(BACK_H, o[3].h);
     ASSERT(wl_gx_target_current() == NULL);
 
-    // something drawn into the back buffer: parked on the way out, put back on the way in
+    // something drawn into the back buffer: parked on the way out (as much as the target can draw
+    // over: its scissor), put back on the way in
     wl_gx_target_drawn();
     wl_host_target_clear_ops();
     ASSERT_EQ(NULL, wl_gx_target_use(&a));
@@ -170,16 +173,19 @@ TEST back_buffer_parked_when_drawn_then_target_resolved_and_back_restored(void) 
     ASSERT_EQ(WL_HOST_TARGET_COPY_BEGIN, o[0].kind);
     ASSERT_EQ(WL_HOST_TARGET_COPY, o[1].kind);
     ASSERT_EQ(WL_GX_TARGET_COPY_RGBA8, o[1].what);
-    ASSERT_EQ(BACK_W, o[1].w);
-    ASSERT_EQ(BACK_H, o[1].h);
+    ASSERT_EQ(64u, o[1].w);
+    ASSERT_EQ(64u, o[1].h);
     const void *parked_colour = o[1].dst;
     ASSERT_EQ(WL_HOST_TARGET_COPY, o[2].kind);
     ASSERT_EQ(WL_GX_TARGET_COPY_Z24X8, o[2].what);
+    ASSERT_EQ(64u, o[2].w);
+    ASSERT_EQ(64u, o[2].h);
     const void *parked_depth = o[2].dst;
     ASSERT(parked_colour != parked_depth);
     ASSERT_EQ(WL_HOST_TARGET_COPY_END, o[3].kind);
     ASSERT_EQ(WL_HOST_TARGET_SCISSOR, o[4].kind);
     ASSERT_EQ(2u, g_allocs);
+    ASSERT_EQ((size_t)(64 * 64 * 4), g_last_alloc_bytes); // (blocks of the part parked)
 
     wl_host_target_clear_ops();
     done = wl_gx_target_use(NULL);
@@ -191,16 +197,20 @@ TEST back_buffer_parked_when_drawn_then_target_resolved_and_back_restored(void) 
     ASSERT_EQ(WL_HOST_TARGET_RESTORE, o[4].kind);
     ASSERT_EQ(parked_colour, o[4].dst);
     ASSERT_EQ(parked_depth, o[4].depth_src);
-    ASSERT_EQ(BACK_W, o[4].w);
-    ASSERT_EQ(BACK_H, o[4].h);
+    ASSERT_EQ(64u, o[4].w); // the part parked...
+    ASSERT_EQ(64u, o[4].h);
+    ASSERT_EQ(BACK_W, o[4].back_w); // ...of the whole back buffer
+    ASSERT_EQ(BACK_H, o[4].back_h);
 
-    // the parked blocks are kept for the next park, and the restore did not park again
+    // the parked blocks are kept for the next park (a smaller part), and the restore did not park again
     wl_gx_target_drawn();
     wl_host_target_clear_ops();
     (void)wl_gx_target_use(&b);
     ASSERT_EQ(2u, g_allocs);
     o = ops(&n);
     ASSERT_EQ(parked_colour, o[1].dst);
+    ASSERT_EQ(32u, o[1].w);
+    ASSERT_EQ(32u, o[1].h);
 
     WlGxTargetStats st;
     wl_gx_target_stats(&st, false);
@@ -387,6 +397,8 @@ TEST a_smaller_back_buffer_is_what_is_parked_and_restored(void) {
     wl_gx_begin_frame(0);
     wl_gx_target_drawn();
     WlGxTarget a = target_a();
+    a.width = 640; // (larger than the back buffer: its scissor, and the part parked, are all of it)
+    a.height = 480;
     uint32_t n;
     (void)wl_gx_target_use(&a);
     const WlHostTargetOp *o = ops(&n);
@@ -395,8 +407,11 @@ TEST a_smaller_back_buffer_is_what_is_parked_and_restored(void) {
     wl_host_target_clear_ops();
     (void)wl_gx_target_use(NULL);
     o = ops(&n);
-    ASSERT_EQ(WL_HOST_TARGET_RESTORE, o[4].kind);
-    ASSERT_EQ(320u, o[4].w);
+    ASSERT_EQ(2u, n); // (a not resolved: larger than the back buffer) the scissor, the restore
+    ASSERT_EQ(WL_HOST_TARGET_RESTORE, o[1].kind);
+    ASSERT_EQ(320u, o[1].w);
+    ASSERT_EQ(240u, o[1].h);
+    ASSERT_EQ(320u, o[1].back_w);
     wl_gx_target_clear(true, true, 0, 0.0f, 0, 0, 320, 240);
     o = ops(&n);
     ASSERT_EQ(320u, o[n - 1].back_w);
@@ -491,6 +506,86 @@ TEST the_host_end_frame_squeezes_only_a_pillarboxed_picture(void) {
     PASS();
 }
 
+TEST a_larger_target_parks_the_larger_part_after_putting_the_back_buffer_back(void) {
+    start();
+    wl_gx_begin_frame(0);
+    wl_gx_target_drawn();
+    WlGxTarget a = target_a(), b = target_b();
+    uint32_t n;
+    (void)wl_gx_target_use(&b); // 32 by 32 parked
+    ASSERT_EQ(2u, g_allocs);
+    wl_host_target_clear_ops();
+    const WlGxTarget *done = wl_gx_target_use(&a); // 64 by 64: b resolved, the back buffer back, 64 parked
+    ASSERT(done != NULL && done->id == &g_id_b);
+    const WlHostTargetOp *o = ops(&n);
+    ASSERT_EQ(10u, n);
+    ASSERT_EQ(WL_HOST_TARGET_COPY, o[1].kind); // b's copy
+    ASSERT_EQ(&g_memory_b[0], o[1].dst);
+    ASSERT_EQ(WL_HOST_TARGET_SCISSOR, o[3].kind); // the back buffer's, and its 32 by 32 put back
+    ASSERT_EQ(BACK_W, o[3].w);
+    ASSERT_EQ(WL_HOST_TARGET_RESTORE, o[4].kind);
+    ASSERT_EQ(32u, o[4].w);
+    ASSERT_EQ(WL_HOST_TARGET_COPY, o[6].kind); // then 64 by 64 parked, into larger blocks
+    ASSERT_EQ(WL_GX_TARGET_COPY_RGBA8, o[6].what);
+    ASSERT_EQ(64u, o[6].w);
+    ASSERT_EQ(64u, o[6].h);
+    ASSERT_EQ(WL_GX_TARGET_COPY_Z24X8, o[7].what);
+    ASSERT_EQ(WL_HOST_TARGET_SCISSOR, o[9].kind); // a's
+    ASSERT_EQ(64u, o[9].w);
+    ASSERT_EQ(4u, g_allocs);
+    ASSERT_EQ(2u, g_frees);
+    ASSERT_EQ((size_t)(64 * 64 * 4), g_last_alloc_bytes);
+
+    // a smaller one after it: a resolved, nothing parked again
+    wl_host_target_clear_ops();
+    (void)wl_gx_target_use(&b);
+    o = ops(&n);
+    ASSERT_EQ(4u, n);
+    ASSERT_EQ(&g_memory_a[0], o[1].dst);
+    wl_host_target_clear_ops();
+    (void)wl_gx_target_use(NULL); // the 64 by 64 put back
+    o = ops(&n);
+    ASSERT_EQ(WL_HOST_TARGET_RESTORE, o[4].kind);
+    ASSERT_EQ(64u, o[4].w);
+    ASSERT_EQ(64u, o[4].h);
+    WlGxTargetStats st;
+    wl_gx_target_stats(&st, false);
+    ASSERT_EQ(2u, st.parks);
+    ASSERT_EQ(2u, st.restores);
+    finish();
+    ASSERT_EQ(4u, g_frees);
+    PASS();
+}
+
+TEST the_part_parked_is_whole_tiles_within_the_back_buffer(void) {
+    start();
+    wl_gx_begin_frame(0);
+    wl_gx_target_drawn();
+    WlGxTarget odd = target_a();
+    odd.width = 66; // (not resolved, but drawn: its scissor is 66 by 30)
+    odd.height = 30;
+    uint32_t n;
+    (void)wl_gx_target_use(&odd);
+    const WlHostTargetOp *o = ops(&n);
+    ASSERT_EQ(68u, o[1].w);
+    ASSERT_EQ(32u, o[1].h);
+    ASSERT_EQ(WL_HOST_TARGET_SCISSOR, o[4].kind);
+    ASSERT_EQ(66u, o[4].w);
+    ASSERT_EQ(30u, o[4].h);
+    wl_host_target_clear_ops();
+    (void)wl_gx_target_use(NULL);
+    WlGxTarget wide = target_a();
+    wide.width = 1024; // (its scissor is the back buffer's width)
+    wl_gx_target_drawn();
+    wl_host_target_clear_ops();
+    (void)wl_gx_target_use(&wide);
+    o = ops(&n);
+    ASSERT_EQ(BACK_W, o[1].w);
+    ASSERT_EQ(64u, o[1].h);
+    finish();
+    PASS();
+}
+
 SUITE(target_suite) {
     RUN_TEST(resolvable_and_sizes);
     RUN_TEST(back_buffer_parked_when_drawn_then_target_resolved_and_back_restored);
@@ -505,6 +600,8 @@ SUITE(target_suite) {
     RUN_TEST(squeeze_narrows_the_finished_picture_with_the_parked_colour_block);
     RUN_TEST(squeeze_without_memory_leaves_the_picture_alone);
     RUN_TEST(the_host_end_frame_squeezes_only_a_pillarboxed_picture);
+    RUN_TEST(a_larger_target_parks_the_larger_part_after_putting_the_back_buffer_back);
+    RUN_TEST(the_part_parked_is_whole_tiles_within_the_back_buffer);
 }
 
 // ---- the ramp --------------------------------------------------------------------------------------

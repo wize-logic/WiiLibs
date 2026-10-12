@@ -111,11 +111,12 @@ TEST park_the_back_buffer_and_take_the_efb(void) {
     wl_gx_target_drawn();
     unsigned from = g_gx_stub_log_count;
     ASSERT(wl_gx_target_use(&a) == NULL);
-    // colour then depth out of the EFB, unfiltered; the scissor of the target
+    // colour then depth out of the EFB, unfiltered, as much as the target can draw over (64 x 64 from the
+    // origin); the scissor of the target
     EXPECT(from, "copy_filter off",
-           "wl_gpu_buffer_invalidate PC 1228800", "GX_SetTexCopySrc 0 0 640 480", "GX_SetTexCopyDst 640 480 0x6 0",
+           "wl_gpu_buffer_invalidate PC 16384", "GX_SetTexCopySrc 0 0 64 64", "GX_SetTexCopyDst 64 64 0x6 0",
            "GX_CopyTex PC 0", "GX_PixModeSync",
-           "wl_gpu_buffer_invalidate PD 1228800", "GX_SetTexCopySrc 0 0 640 480", "GX_SetTexCopyDst 640 480 0x16 0",
+           "wl_gpu_buffer_invalidate PD 16384", "GX_SetTexCopySrc 0 0 64 64", "GX_SetTexCopyDst 64 64 0x16 0",
            "GX_CopyTex PD 0", "GX_PixModeSync",
            "copy_filter display", "GX_InvalidateTexAll",
            "GX_SetScissor 0 0 64 64", "wl_gx_invalidate_shadow");
@@ -160,12 +161,13 @@ TEST put_the_back_buffer_back_through_a_z_texture(void) {
            "copy_filter display", "GX_InvalidateTexAll",
            // the whole of the back buffer
            "GX_SetScissor 0 0 640 480", "wl_gx_invalidate_shadow",
-           // the parked colour as texture map 0 and the parked depth as map 1, unfiltered
+           // the parked colour (64 x 64) as texture map 0 and the parked depth as map 1, unfiltered
            "GX_InvalidateTexAll",
-           "GX_InitTexObj PC 640 480 0x6 0 0 0", "GX_InitTexObjFilterMode 0 0", "GX_LoadTexObj PC 0",
-           "GX_InitTexObj PD 640 480 0x16 0 0 0", "GX_InitTexObjFilterMode 0 0", "GX_LoadTexObj PD 1",
+           "GX_InitTexObj PC 64 64 0x6 0 0 0", "GX_InitTexObjFilterMode 0 0", "GX_LoadTexObj PC 0",
+           "GX_InitTexObj PD 64 64 0x16 0 0 0", "GX_InitTexObjFilterMode 0 0", "GX_LoadTexObj PD 1",
            "GX_SetColorUpdate 1", "GX_SetAlphaUpdate 1", "GX_SetZMode 1 7 1",
-           // the quad: orthographic over the pixels, depth from the Z texture, replaced at the end
+           // the quad over the part parked: orthographic over the back buffer's pixels, depth from the Z
+           // texture, replaced at the end
            "GX_LoadProjectionMtx ortho 0.003125 -1 -0.00416667 1 1 0 1", "GX_SetViewport 0 0 640 480 0 1",
            "GX_SetBlendMode 0 1 0 0", "GX_SetAlphaCompare 7 0 0 7 0", "GX_SetCullMode 0",
            "GX_SetNumIndStages 0", "GX_SetTevDirect 0", "GX_SetTevDirect 1", "GX_SetNumChans 0",
@@ -182,9 +184,9 @@ TEST put_the_back_buffer_back_through_a_z_texture(void) {
            "GX_SetVtxDesc 13 1", "GX_SetVtxAttrFmt 0 13 1 4 0", "GX_SetTexCoordGen 0 1 4 60",
            "GX_Begin 0x80 0 4",
            "GX_Position3f32 0 0 -1", "GX_TexCoord2f32 0 0",
-           "GX_Position3f32 640 0 -1", "GX_TexCoord2f32 1 0",
-           "GX_Position3f32 640 480 -1", "GX_TexCoord2f32 1 1",
-           "GX_Position3f32 0 480 -1", "GX_TexCoord2f32 0 1",
+           "GX_Position3f32 64 0 -1", "GX_TexCoord2f32 1 0",
+           "GX_Position3f32 64 64 -1", "GX_TexCoord2f32 1 1",
+           "GX_Position3f32 0 64 -1", "GX_TexCoord2f32 0 1",
            "GX_End", "GX_SetZTexture 0 0x11 0", "GX_SetZCompLoc 1", "wl_gx_invalidate_shadow");
     ASSERT(g_shadow > shadows);
     PASS();

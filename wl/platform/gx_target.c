@@ -19,9 +19,11 @@ static struct {
     WlGxTarget owner;
     WlGxTarget resolved; // the last one wl_gx_target_use returned
     bool drawn;          // the back buffer has had something drawn or cleared this frame
-    bool parked;         // its colour and depth are in `colour` and `depth`
+    bool parked;         // its colour and depth are in `colour` and `depth`, (0, 0) to (parked_w, parked_h)
     bool squeeze_warned; // the lack of memory for wl_gx_target_squeeze has been told
+    uint32_t parked_w, parked_h;
     void *colour, *depth;
+    size_t colour_bytes, depth_bytes; // the blocks' sizes
     WlGxTargetStats stats;
 } t;
 
@@ -42,7 +44,24 @@ static void free_parked(void) {
         release(t.depth);
     }
     t.colour = t.depth = NULL;
+    t.colour_bytes = t.depth_bytes = 0;
     t.parked = false;
+}
+
+// A block of at least `bytes` in *block: the one there, or a new one (the old given back). False,
+// and *block NULL, when the allocator has none.
+static bool block_at_least(void **block, size_t *size, size_t bytes) {
+    WlGxTargetAlloc alloc = t.alloc != NULL ? t.alloc : default_alloc;
+    WlGxTargetFree release = t.release != NULL ? t.release : default_free;
+    if (*block != NULL && *size >= bytes) {
+        return true;
+    }
+    if (*block != NULL) {
+        release(*block);
+    }
+    *block = alloc(bytes);
+    *size = *block != NULL ? bytes : 0;
+    return *block != NULL;
 }
 
 static void back_size(uint32_t *w, uint32_t *h) {
@@ -102,43 +121,40 @@ void wl_gx_target_shutdown(void) {
     t.drawn = false;
 }
 
-// The back buffer's colour and depth out of the EFB, into blocks asked for at the first park.
-static void park(void) {
-    uint32_t w, h;
-    back_size(&w, &h);
-    if (t.colour == NULL || t.depth == NULL) {
-        size_t bytes = wl_gx_tex_bytes(WL_GX_TEX_RGBA8, w, h);
-        WlGxTargetAlloc alloc = t.alloc != NULL ? t.alloc : default_alloc;
-        WlGxTargetFree release = t.release != NULL ? t.release : default_free;
-        // (the colour's block may be there already: wl_gx_target_squeeze's)
-        if (t.colour == NULL) {
-            t.colour = alloc(bytes);
-        }
-        if (t.depth == NULL) {
-            t.depth = alloc(bytes);
-        }
-        if (t.colour == NULL || t.depth == NULL) {
-            if (t.colour != NULL) {
-                release(t.colour);
-            }
-            if (t.depth != NULL) {
-                release(t.depth);
-            }
-            t.colour = t.depth = NULL;
-            WL_LOG_W(TAG, "no memory to park the back buffer (%u bytes twice): a target's draws go over it",
-                     (unsigned)bytes);
-            return;
-        }
+// The part of the back buffer a target of scissor `w` by `h` can draw over, which a park keeps: from
+// the EFB's origin, in whole 4 by 4 tiles of the copies, within the back buffer.
+static void park_size(uint32_t w, uint32_t h, uint32_t *pw, uint32_t *ph) {
+    uint32_t bw, bh;
+    back_size(&bw, &bh);
+    w = (w + 3u) & ~3u;
+    h = (h + 3u) & ~3u;
+    *pw = w < bw ? w : bw;
+    *ph = h < bh ? h : bh;
+}
+
+// The back buffer's colour and depth, `w` by `h` from the EFB's origin (what the targets coming can
+// draw over: park_size), out of the EFB, into blocks asked for at the first park and again, larger,
+// when a park needs more.
+static void park(uint32_t w, uint32_t h) {
+    size_t bytes = wl_gx_tex_bytes(WL_GX_TEX_RGBA8, w, h);
+    // (the colour's block may be there already, and larger: wl_gx_target_squeeze's)
+    if (!block_at_least(&t.colour, &t.colour_bytes, bytes) || !block_at_least(&t.depth, &t.depth_bytes, bytes)) {
+        free_parked();
+        WL_LOG_W(TAG, "no memory to park the back buffer (%u bytes twice): a target's draws go over it",
+                 (unsigned)bytes);
+        return;
     }
     wl_gx_target_be_copy_begin();
     wl_gx_target_be_copy(t.colour, w, h, WL_GX_TARGET_COPY_RGBA8);
     wl_gx_target_be_copy(t.depth, w, h, WL_GX_TARGET_COPY_Z24X8);
     wl_gx_target_be_copy_end();
     t.parked = true;
+    t.parked_w = w;
+    t.parked_h = h;
     t.stats.parks++;
 }
 
-// The back buffer put back over a target's pixels, if it was parked.
+// The back buffer put back over a target's pixels, if it was parked: the part parked.
 static void restore(void) {
     uint32_t w, h;
     back_size(&w, &h);
@@ -146,7 +162,7 @@ static void restore(void) {
     if (!t.parked) {
         return;
     }
-    wl_gx_target_be_restore(t.colour, t.depth, w, h);
+    wl_gx_target_be_restore(t.colour, t.depth, t.parked_w, t.parked_h, w, h);
     t.parked = false;
     t.stats.restores++;
 }
@@ -180,10 +196,16 @@ const WlGxTarget *wl_gx_target_use(const WlGxTarget *target) {
         }
         return NULL;
     }
-    // the one leaving
+    uint32_t w, h, sw = 0, sh = 0, pw, ph;
+    back_size(&w, &h);
+    if (target != NULL) {
+        wl_gx_target_scissor_size(target, w, h, &sw, &sh);
+    }
+    // the one leaving (the back buffer leaves only for a target)
     if (!t.owner_is_target) {
         if (t.drawn && !t.parked) {
-            park();
+            park_size(sw, sh, &pw, &ph);
+            park(pw, ph);
         }
     } else {
         resolved = resolve();
@@ -193,9 +215,13 @@ const WlGxTarget *wl_gx_target_use(const WlGxTarget *target) {
         restore();
         t.owner_is_target = false;
     } else {
-        uint32_t w, h, sw, sh;
-        back_size(&w, &h);
-        wl_gx_target_scissor_size(target, w, h, &sw, &sh);
+        if (t.parked && (sw > t.parked_w || sh > t.parked_h)) {
+            // a target larger than the part parked: the back buffer put back (the last target's
+            // pixels are resolved), then parked again, the larger part
+            park_size(sw > t.parked_w ? sw : t.parked_w, sh > t.parked_h ? sh : t.parked_h, &pw, &ph);
+            restore();
+            park(pw, ph);
+        }
         wl_gx_target_be_scissor(sw, sh);
         t.owner = *target;
         t.owner_is_target = true;
@@ -233,18 +259,15 @@ bool wl_gx_target_squeeze(uint32_t x, uint32_t w) {
     if (w == 0u || x + w > bw) {
         return false;
     }
-    if (t.colour == NULL) {
-        // (the block a park would copy the colour into: free at the end of a frame)
-        WlGxTargetAlloc alloc = t.alloc != NULL ? t.alloc : default_alloc;
-        t.colour = alloc(wl_gx_tex_bytes(WL_GX_TEX_RGBA8, bw, bh));
-        if (t.colour == NULL) {
-            if (!t.squeeze_warned) {
-                t.squeeze_warned = true;
-                WL_LOG_W(TAG, "no memory to narrow the picture (%u bytes): it is shown the full width",
-                         (unsigned)wl_gx_tex_bytes(WL_GX_TEX_RGBA8, bw, bh));
-            }
-            return false;
+    // (the block a park copies the colour into, free at the end of a frame: made as large as the
+    // back buffer where a park's is smaller)
+    if (!block_at_least(&t.colour, &t.colour_bytes, wl_gx_tex_bytes(WL_GX_TEX_RGBA8, bw, bh))) {
+        if (!t.squeeze_warned) {
+            t.squeeze_warned = true;
+            WL_LOG_W(TAG, "no memory to narrow the picture (%u bytes): it is shown the full width",
+                     (unsigned)wl_gx_tex_bytes(WL_GX_TEX_RGBA8, bw, bh));
         }
+        return false;
     }
     t.parked = false;
     wl_gx_target_be_squeeze(t.colour, bw, bh, x, w);

@@ -3,9 +3,12 @@
 // the frame, and a draw into any other surface (a texture to render into, a reflection, a
 // screen-in-the-world) takes it over:
 //
-//  - the back buffer, if anything was drawn into it, is parked first: its colour and its depth are
-//    copied out of the EFB into memory of the layer's own;
-//  - the target is drawn at the EFB's origin, within a scissor of its size;
+//  - the back buffer, if anything was drawn into it, is parked first: its colour and its depth, as
+//    much of them as the target can draw over (its scissor, from the EFB's origin), are copied out
+//    of the EFB into memory of the layer's own; a larger target coming while it is parked has the
+//    back buffer put back and parked again, the larger part;
+//  - the target is drawn at the EFB's origin, within a scissor of its size, which the caller's draws
+//    and clears must keep to (the part of the back buffer outside it is not parked);
 //  - when another surface takes the EFB, the target's pixels are copied into its own memory in
 //    GX's texture format (resolved), so that a texture object over that memory shows them;
 //  - the back buffer is put back by a quad that writes the parked colour and, through a Z texture,
@@ -55,18 +58,21 @@ void wl_gx_target_scissor_size(const WlGxTarget *target, uint32_t back_w, uint32
 void wl_gx_target_set_back_buffer_size(uint32_t width, uint32_t height);
 
 // Where the parked colour and depth come from: two blocks of wl_gx_tex_bytes(WL_GX_TEX_RGBA8, w, h)
-// bytes (the back buffer's size), 32-byte aligned, asked for at the first park. `alloc` returns NULL
-// when it has none: the back buffer is then not parked (a target's draws go over it) and the next
-// park asks again. Default: aligned_alloc and free. The blocks are given back to `release` by
-// wl_gx_shutdown and when the back buffer's size changes.
+// bytes (the part parked: a target's scissor, in whole 4 by 4 tiles), 32-byte aligned, asked for at
+// the first park and kept; a park that needs more gives them back and asks for larger ones. `alloc`
+// returns NULL when it has none: the back buffer is then not parked (a target's draws go over it)
+// and the next park asks again. Default: aligned_alloc and free. The blocks are given back to
+// `release` by wl_gx_shutdown and when the back buffer's size changes.
 typedef void *(*WlGxTargetAlloc)(size_t bytes);
 typedef void (*WlGxTargetFree)(void *memory);
 void wl_gx_target_set_allocator(WlGxTargetAlloc alloc, WlGxTargetFree release);
 
 // The surface the next draws (and clears) are into: `target`, or the back buffer for NULL. A
 // target that is not the owner already takes the EFB: the owner leaves it (a back buffer with
-// something drawn into it is parked; a target is resolved) and `target` comes (the back buffer
-// is put back, with the scissor of the whole of it; a target gets a scissor of its size). The
+// something drawn into it is parked, as much as `target` can draw over; a target is resolved) and
+// `target` comes (the back buffer is put back, with the scissor of the whole of it; a target gets a
+// scissor of its size, and the back buffer is parked again, the larger part, if the target is
+// larger than the part parked). The
 // owner at the start of a frame is the back buffer (wl_gx_begin_frame), and wl_gx_end_frame puts
 // it back if a target has the EFB.
 //
@@ -74,8 +80,9 @@ void wl_gx_target_set_allocator(WlGxTargetAlloc alloc, WlGxTargetFree release);
 // until the next call), or NULL when none was: the owner was the back buffer, was already the
 // owner, or had nothing to copy to (counted in the stats' `skipped`).
 //
-// What this leaves in GX, for a caller that draws with GX itself: the scissor; and, after a back
-// buffer is put back, everything wl_gx_target_clear leaves. Nothing else changes.
+// What this leaves in GX, for a caller that draws with GX itself: the scissor, which its draws into a
+// target must keep (set it again after anything that changes it); and, after a back buffer is put
+// back, everything wl_gx_target_clear leaves. Nothing else changes.
 const WlGxTarget *wl_gx_target_use(const WlGxTarget *target);
 // The owner (the layer's copy of its descriptor), or NULL for the back buffer.
 const WlGxTarget *wl_gx_target_current(void);
@@ -99,8 +106,9 @@ void wl_gx_target_clear(bool colour, bool depth, uint32_t rgba, float z, int x, 
 // picture of a 4:3 game on a 16:9 screen (video_mode.h). For the end of the frame, once the back
 // buffer owns the EFB again (wl_gx_end_frame does it before the display copy); the EFB's contents
 // are replaced and its depth cleared. It borrows the memory a park keeps for the back buffer's
-// colour (asked from the allocator at the first call if no park has; the same block, so a program
-// that parks pays the 1.2 MiB once). Returns false, leaving the EFB as it was, for a bad range or
+// colour (asked from the allocator, as large as the back buffer, at the first call, the park's
+// smaller block given back; parks then use it, so a program that parks pays the 1.2 MiB once).
+// Returns false, leaving the EFB as it was, for a bad range or
 // when there is no memory. Leaves in GX what wl_gx_target_clear does, and the texture map 0.
 bool wl_gx_target_squeeze(uint32_t x, uint32_t w);
 
