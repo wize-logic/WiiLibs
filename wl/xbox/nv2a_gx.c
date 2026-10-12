@@ -355,93 +355,24 @@ static bool surface_prepare(WlNv2aGx *gx, const WlNv2aSurface *s) {
 
 // ---- the raster state -----------------------------------------------------------------------------
 
-static WlGxCompare gx_compare(uint32_t func) {
-    // (the NV2A's functions are OpenGL's 0x200..0x207, in GX's order)
-    return func >= WL_NV2A_FUNC_NEVER && func <= WL_NV2A_FUNC_ALWAYS ? (WlGxCompare)(func - WL_NV2A_FUNC_NEVER)
-                                                                      : WL_GX_ALWAYS;
-}
-
-// GX's factor for the NV2A's (GX's colour factors are the other side's: a source's factor of the
-// destination colour, a destination's of the source colour); *exact false when it is not
-static WlGxBlendFactor gx_blend_factor(uint32_t factor, bool source, bool *exact) {
-    switch (factor) {
-    case WL_NV2A_BLEND_ZERO:
-        return WL_GX_BL_ZERO;
-    case WL_NV2A_BLEND_ONE:
-        return WL_GX_BL_ONE;
-    case WL_NV2A_BLEND_SRC_COLOR:
-        if (source) {
-            *exact = false;
-            return WL_GX_BL_ONE;
-        }
-        return WL_GX_BL_OTHERCLR;
-    case WL_NV2A_BLEND_ONE_MINUS_SRC_COLOR:
-        if (source) {
-            *exact = false;
-            return WL_GX_BL_ZERO;
-        }
-        return WL_GX_BL_INVOTHERCLR;
-    case WL_NV2A_BLEND_SRC_ALPHA_SATURATE:
-        *exact = false;
-        return WL_GX_BL_SRCALPHA;
-    case WL_NV2A_BLEND_SRC_ALPHA:
-        return WL_GX_BL_SRCALPHA;
-    case WL_NV2A_BLEND_ONE_MINUS_SRC_ALPHA:
-        return WL_GX_BL_INVSRCALPHA;
-    case WL_NV2A_BLEND_DST_ALPHA:
-        return WL_GX_BL_DSTALPHA;
-    case WL_NV2A_BLEND_ONE_MINUS_DST_ALPHA:
-        return WL_GX_BL_INVDSTALPHA;
-    case WL_NV2A_BLEND_DST_COLOR:
-        if (!source) {
-            *exact = false;
-            return WL_GX_BL_ONE;
-        }
-        return WL_GX_BL_OTHERCLR;
-    case WL_NV2A_BLEND_ONE_MINUS_DST_COLOR:
-        if (!source) {
-            *exact = false;
-            return WL_GX_BL_ZERO;
-        }
-        return WL_GX_BL_INVOTHERCLR;
-    default:
-        // (no constant colour on GX's blender)
-        *exact = false;
-        return WL_GX_BL_ONE;
-    }
-}
-
 // whether this draw's raster state was mapped exactly (blending's approximations counted)
 static bool states_apply(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aSurface *s) {
     uint32_t mask = wl_nv2a_k(k, WL_NV2A_K_SET_COLOR_MASK);
-    bool exact = true, alpha_test = wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_TEST_ENABLE) != 0;
-    bool depth = s->zeta_format != 0;
+    bool alpha_test = wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_TEST_ENABLE) != 0, depth = s->zeta_format != 0, exact;
+    bool depth_test = depth && wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_TEST_ENABLE) != 0;
+    WlGxBlendMode mode;
+    WlGxBlendFactor source, destination;
+    WlGxCull negative = gx->cull_positive == WL_GX_CULL_BACK ? WL_GX_CULL_FRONT : WL_GX_CULL_BACK;
+    static const WlGxCull none = WL_GX_CULL_NONE, all = WL_GX_CULL_ALL;
 
-    if (wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_ENABLE)) {
-        uint32_t equation = wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_EQUATION);
-        WlGxBlendFactor src = gx_blend_factor(wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_SFACTOR), true, &exact);
-        WlGxBlendFactor dst = gx_blend_factor(wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_DFACTOR), false, &exact);
-        WlGxBlendMode mode = WL_GX_BM_BLEND;
-
-        if (equation == WL_NV2A_BLEND_EQ_REVERSE_SUBTRACT || equation == WL_NV2A_BLEND_EQ_REVERSE_SUBTRACT_SIGNED) {
-            // (GX subtracts the source from the destination, factors one)
-            mode = WL_GX_BM_SUBTRACT;
-            exact = exact && src == WL_GX_BL_ONE && dst == WL_GX_BL_ONE;
-        } else if (equation != WL_NV2A_BLEND_EQ_ADD) {
-            exact = false;
-        }
-        wl_gx_direct_blend(mode, src, dst);
-    } else {
-        wl_gx_direct_blend(WL_GX_BM_NONE, WL_GX_BL_ONE, WL_GX_BL_ZERO);
-    }
+    exact = wl_nv2a_gx_blend(k, &mode, &source, &destination);
+    wl_gx_direct_blend(mode, source, destination);
     wl_gx_direct_color_update((mask & 0x00010101u) != 0, (mask & 0x01000000u) != 0);
-    // (no depth buffer: no depth test and no writes)
-    wl_gx_direct_zmode(depth && wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_TEST_ENABLE) != 0,
-                       gx_compare(wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_FUNC)),
-                       depth && wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_MASK) != 0 &&
-                           (wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_TEST_ENABLE) != 0));
+    // (no depth buffer: no depth test and no writes; no writes without the test, as the NV2A)
+    wl_gx_direct_zmode(depth_test, wl_nv2a_gx_compare(wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_FUNC)),
+                       depth_test && wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_MASK) != 0);
     if (alpha_test) {
-        wl_gx_direct_alpha_compare(gx_compare(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_FUNC)),
+        wl_gx_direct_alpha_compare(wl_nv2a_gx_compare(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_FUNC)),
                                    (uint8_t)wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
     } else {
         wl_gx_direct_alpha_compare(WL_GX_ALWAYS, 0);
@@ -449,25 +380,19 @@ static bool states_apply(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aSurfac
     // (the depth test after texturing when the alpha test may discard, so a discarded texel writes
     // no depth)
     wl_gx_direct_zcompare_early(!alpha_test);
-    // culling by the NV2A's rule: the front face is the winding SET_FRONT_FACE names (CCW: a positive
-    // area in the screen's coordinates, as OpenGL defines it), the face culled SET_CULL_FACE's
-    {
-        WlGxCull cull = WL_GX_CULL_NONE;
-
-        if (wl_nv2a_k(k, WL_NV2A_K_SET_CULL_FACE_ENABLE)) {
-            uint32_t face = wl_nv2a_k(k, WL_NV2A_K_SET_CULL_FACE);
-            bool front_positive = wl_nv2a_k(k, WL_NV2A_K_SET_FRONT_FACE) == WL_NV2A_FRONT_CCW;
-            WlGxCull negative = gx->cull_positive == WL_GX_CULL_BACK ? WL_GX_CULL_FRONT : WL_GX_CULL_BACK;
-
-            if (face == WL_NV2A_CULL_FRONT_AND_BACK) {
-                cull = WL_GX_CULL_ALL;
-            } else if ((face == WL_NV2A_CULL_FRONT) == front_positive) {
-                cull = gx->cull_positive;
-            } else {
-                cull = negative;
-            }
-        }
-        wl_gx_direct_cull(cull);
+    switch (wl_nv2a_cull(k)) {
+    case WL_NV2A_CULLS_POSITIVE:
+        wl_gx_direct_cull(gx->cull_positive);
+        break;
+    case WL_NV2A_CULLS_NEGATIVE:
+        wl_gx_direct_cull(negative);
+        break;
+    case WL_NV2A_CULLS_ALL:
+        wl_gx_direct_cull(all);
+        break;
+    default:
+        wl_gx_direct_cull(none);
+        break;
     }
     return exact;
 }
@@ -1036,35 +961,6 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
 
 // ---- clears ---------------------------------------------------------------------------------------
 
-static uint32_t clear_rgba(const WlNv2aKelvin *k, const WlNv2aSurface *s) {
-    uint32_t value = wl_nv2a_k(k, WL_NV2A_K_SET_COLOR_CLEAR_VALUE);
-
-    if (s->color_bytes == 2) {
-        uint8_t rgba[4];
-
-        if (s->color_format == WL_NV2A_SURFACE_COLOR_R5G6B5) {
-            wl_gxc_rgb565_decode(value & 0xFFFFu, rgba);
-        } else {
-            rgba[0] = (uint8_t)(((value >> 10) & 31u) << 3 | ((value >> 12) & 7u));
-            rgba[1] = (uint8_t)(((value >> 5) & 31u) << 3 | ((value >> 7) & 7u));
-            rgba[2] = (uint8_t)((value & 31u) << 3 | ((value >> 2) & 7u));
-            rgba[3] = 255;
-        }
-        return (uint32_t)rgba[0] << 24 | (uint32_t)rgba[1] << 16 | (uint32_t)rgba[2] << 8 | rgba[3];
-    }
-    // ARGB to RGBA (an X8R8G8B8 surface's alpha reads as whatever the clear gives it)
-    return value << 8 | value >> 24;
-}
-
-static float clear_depth(const WlNv2aKelvin *k, const WlNv2aSurface *s) {
-    uint32_t value = wl_nv2a_k(k, WL_NV2A_K_SET_ZSTENCIL_CLEAR_VALUE);
-
-    if (s->zeta_format == WL_NV2A_SURFACE_ZETA_Z16) {
-        return (float)(value & 0xFFFFu) * (1.0f / 65535.0f);
-    }
-    return (float)(value >> 8) * (1.0f / 16777215.0f);
-}
-
 static void backend_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
     WlNv2aGx *gx = user;
     WlNv2aSurface s;
@@ -1085,8 +981,8 @@ static void backend_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
     x1 = ((h >> 16) + 1u) / s.samples_x;
     y0 = (v & 0xFFFFu) / s.samples_y;
     y1 = ((v >> 16) + 1u) / s.samples_y;
-    rgba = clear_rgba(k, &s);
-    z = clear_depth(k, &s);
+    rgba = wl_nv2a_clear_rgba(k, &s);
+    z = wl_nv2a_clear_depth(k, &s);
     if (surface_is_screen(gx, &s) && !gx->frame_open && colour && depth && z >= 1.0f && x0 == 0 && y0 == 0 &&
         x1 >= gx->cfg.width && y1 >= gx->cfg.height) {
         // the frame's first clear, of all of it: GX's own (the copy that ends a frame clears the EFB)

@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "wl/platform/gx_direct.h"
 #include "wl/xbox/nv2a_kelvin.h"
 #include "wl/xbox/nv2a_texcache.h"
 #include "wl/xbox/psh.h"
@@ -61,3 +62,20 @@ void wl_nv2a_psh_textures(const WlNv2aKelvin *k, const WlNv2aTexEntry *const ent
 // coordinate after the transform for its texture (a linear texture's in texels made a fraction;
 // a cube map's direction made its sphere map's place; a projected lookup divided by q)
 void wl_nv2a_texcoord(const WlNv2aTexEntry *entry, unsigned stage_program, const float t[4], float st[2]);
+
+// ---- the raster state as GX takes it (the GX backend and the software reference alike) ----------
+// a compare function (the NV2A's are OpenGL's 0x200..0x207, in GX's order)
+WlGxCompare wl_nv2a_gx_compare(uint32_t func);
+// GX's blending for the NV2A's: true when exact (GX has no constant colour, no MIN or MAX, no
+// source minus destination, and its colour factors are the other side's)
+bool wl_nv2a_gx_blend(const WlNv2aKelvin *k, WlGxBlendMode *mode, WlGxBlendFactor *source,
+                      WlGxBlendFactor *destination);
+// what culling discards, by the NV2A's rule: the front face is the winding SET_FRONT_FACE names
+// (CCW: a positive area in the screen's coordinates, as OpenGL defines it), the face culled
+// SET_CULL_FACE's
+enum { WL_NV2A_CULLS_NONE, WL_NV2A_CULLS_POSITIVE, WL_NV2A_CULLS_NEGATIVE, WL_NV2A_CULLS_ALL };
+unsigned wl_nv2a_cull(const WlNv2aKelvin *k);
+// a clear's colour (0xRRGGBBAA, from SET_COLOR_CLEAR_VALUE in the surface's format) and depth
+// (0..1, from SET_ZSTENCIL_CLEAR_VALUE)
+uint32_t wl_nv2a_clear_rgba(const WlNv2aKelvin *k, const WlNv2aSurface *s);
+float wl_nv2a_clear_depth(const WlNv2aKelvin *k, const WlNv2aSurface *s);

@@ -223,3 +223,128 @@ void wl_nv2a_texcoord(const WlNv2aTexEntry *entry, unsigned stage_program, const
         st[1] *= 1.0f / (float)entry->height;
     }
 }
+
+// ---- the raster state as GX takes it ----------------------------------------------------------------
+
+WlGxCompare wl_nv2a_gx_compare(uint32_t func) {
+    return func >= WL_NV2A_FUNC_NEVER && func <= WL_NV2A_FUNC_ALWAYS ? (WlGxCompare)(func - WL_NV2A_FUNC_NEVER)
+                                                                      : WL_GX_ALWAYS;
+}
+
+// GX's factor for the NV2A's (OpenCE-Wii's gx_blend_factor: GX's colour factors are the other
+// side's, a source's factor of the destination colour, a destination's of the source colour)
+static WlGxBlendFactor gx_blend_factor(uint32_t factor, bool source, bool *exact) {
+    switch (factor) {
+    case WL_NV2A_BLEND_ZERO:
+        return WL_GX_BL_ZERO;
+    case WL_NV2A_BLEND_ONE:
+        return WL_GX_BL_ONE;
+    case WL_NV2A_BLEND_SRC_COLOR:
+        if (source) {
+            *exact = false;
+            return WL_GX_BL_ONE;
+        }
+        return WL_GX_BL_OTHERCLR;
+    case WL_NV2A_BLEND_ONE_MINUS_SRC_COLOR:
+        if (source) {
+            *exact = false;
+            return WL_GX_BL_ZERO;
+        }
+        return WL_GX_BL_INVOTHERCLR;
+    case WL_NV2A_BLEND_SRC_ALPHA_SATURATE:
+        *exact = false;
+        return WL_GX_BL_SRCALPHA;
+    case WL_NV2A_BLEND_SRC_ALPHA:
+        return WL_GX_BL_SRCALPHA;
+    case WL_NV2A_BLEND_ONE_MINUS_SRC_ALPHA:
+        return WL_GX_BL_INVSRCALPHA;
+    case WL_NV2A_BLEND_DST_ALPHA:
+        return WL_GX_BL_DSTALPHA;
+    case WL_NV2A_BLEND_ONE_MINUS_DST_ALPHA:
+        return WL_GX_BL_INVDSTALPHA;
+    case WL_NV2A_BLEND_DST_COLOR:
+        if (!source) {
+            *exact = false;
+            return WL_GX_BL_ONE;
+        }
+        return WL_GX_BL_OTHERCLR;
+    case WL_NV2A_BLEND_ONE_MINUS_DST_COLOR:
+        if (!source) {
+            *exact = false;
+            return WL_GX_BL_ZERO;
+        }
+        return WL_GX_BL_INVOTHERCLR;
+    default:
+        // (no constant colour on GX's blender)
+        *exact = false;
+        return WL_GX_BL_ONE;
+    }
+}
+
+bool wl_nv2a_gx_blend(const WlNv2aKelvin *k, WlGxBlendMode *mode, WlGxBlendFactor *source,
+                      WlGxBlendFactor *destination) {
+    bool exact = true;
+    uint32_t equation;
+
+    if (!wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_ENABLE)) {
+        *mode = WL_GX_BM_NONE;
+        *source = WL_GX_BL_ONE;
+        *destination = WL_GX_BL_ZERO;
+        return true;
+    }
+    equation = wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_EQUATION);
+    *source = gx_blend_factor(wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_SFACTOR), true, &exact);
+    *destination = gx_blend_factor(wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_DFACTOR), false, &exact);
+    *mode = WL_GX_BM_BLEND;
+    if (equation == WL_NV2A_BLEND_EQ_REVERSE_SUBTRACT || equation == WL_NV2A_BLEND_EQ_REVERSE_SUBTRACT_SIGNED) {
+        // (GX subtracts the source from the destination, its factors one)
+        *mode = WL_GX_BM_SUBTRACT;
+        exact = exact && *source == WL_GX_BL_ONE && *destination == WL_GX_BL_ONE;
+    } else if (equation != WL_NV2A_BLEND_EQ_ADD) {
+        exact = false;
+    }
+    return exact;
+}
+
+unsigned wl_nv2a_cull(const WlNv2aKelvin *k) {
+    uint32_t face;
+    bool front_positive;
+
+    if (!wl_nv2a_k(k, WL_NV2A_K_SET_CULL_FACE_ENABLE)) {
+        return WL_NV2A_CULLS_NONE;
+    }
+    face = wl_nv2a_k(k, WL_NV2A_K_SET_CULL_FACE);
+    front_positive = wl_nv2a_k(k, WL_NV2A_K_SET_FRONT_FACE) == WL_NV2A_FRONT_CCW;
+    if (face == WL_NV2A_CULL_FRONT_AND_BACK) {
+        return WL_NV2A_CULLS_ALL;
+    }
+    return (face == WL_NV2A_CULL_FRONT) == front_positive ? WL_NV2A_CULLS_POSITIVE : WL_NV2A_CULLS_NEGATIVE;
+}
+
+uint32_t wl_nv2a_clear_rgba(const WlNv2aKelvin *k, const WlNv2aSurface *s) {
+    uint32_t value = wl_nv2a_k(k, WL_NV2A_K_SET_COLOR_CLEAR_VALUE);
+
+    if (s->color_bytes == 2) {
+        uint32_t r, g, b;
+
+        if (s->color_format == WL_NV2A_SURFACE_COLOR_R5G6B5) {
+            r = (value >> 11) & 31u, g = (value >> 5) & 63u, b = value & 31u;
+            r = r << 3 | r >> 2, g = g << 2 | g >> 4, b = b << 3 | b >> 2;
+        } else {
+            r = (value >> 10) & 31u, g = (value >> 5) & 31u, b = value & 31u;
+            r = r << 3 | r >> 2, g = g << 3 | g >> 2, b = b << 3 | b >> 2;
+        }
+        return r << 24 | g << 16 | b << 8 | 0xFFu;
+    }
+    // ARGB to RGBA
+    return value << 8 | value >> 24;
+}
+
+float wl_nv2a_clear_depth(const WlNv2aKelvin *k, const WlNv2aSurface *s) {
+    uint32_t value = wl_nv2a_k(k, WL_NV2A_K_SET_ZSTENCIL_CLEAR_VALUE);
+
+    if (s->zeta_format == WL_NV2A_SURFACE_ZETA_Z16) {
+        return (float)(value & 0xFFFFu) * (1.0f / 65535.0f);
+    }
+    return (float)(value >> 8) * (1.0f / 16777215.0f);
+}

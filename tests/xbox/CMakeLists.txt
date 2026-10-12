@@ -8,6 +8,7 @@ wl_add_test(test_xbox_nv2a SOURCES test_xbox_nv2a.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_nv2a_kelvin SOURCES test_xbox_nv2a_kelvin.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_nv2a_texture SOURCES test_xbox_nv2a_texture.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_nv2a_gx SOURCES test_xbox_nv2a_gx.c LIBS wl_xbox_gx LABELS unit be)
+wl_add_test(test_xbox_nv2a_raster SOURCES test_xbox_nv2a_raster.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_vsh SOURCES test_xbox_vsh.c LIBS wl_xbox LABELS unit be)
 target_include_directories(test_xbox_vsh PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
