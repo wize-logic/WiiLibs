@@ -50,7 +50,22 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     // ---- platform: the card, the log ------------------------------------------------------------
 #if defined(__wii__)
     if (!wl_mem_ready()) {
-        wl_mem_init(NULL);
+        // wl_mem takes only what its heaps need (MEM1's budgets and arenas, a small MEM2 asset
+        // heap): the rest stays malloc's, for the guest's frames and the host-side buffers. Its
+        // default would claim both regions whole and leave no room for the frame pools.
+        static WlMemTagDef tags[WL_TAG_BUILTIN_COUNT];
+        memcpy(tags, wl_mem_builtin_tags(), sizeof tags);
+        tags[WL_TAG_ASSET].budget = 2u << 20;
+        tags[WL_TAG_AUDIO_BANK].budget = 0;
+        WlMemConfig mcfg;
+        wl_mem_config_default(&mcfg);
+        mcfg.tags = tags;
+        mcfg.tag_count = WL_TAG_BUILTIN_COUNT;
+        mcfg.claim[WL_MEM1] = WL_MEM_CLAIM_NEEDED;
+        mcfg.claim[WL_MEM2] = WL_MEM_CLAIM_NEEDED;
+        if (wl_mem_init(&mcfg) != WL_OK) {
+            WL_LOG_E(TAG, "wl_mem_init failed");
+        }
     }
     wl_platform_fs_mount(WL_DEVICE_SD);
     if (cfg->log_dir == NULL) {
@@ -104,29 +119,45 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     mc.htab_bytes = cfg->htab_bytes != 0 ? cfg->htab_bytes : mc.htab_bytes;
 #if defined(__wii__)
     {
-        uint32_t want = cfg->frame_pool_bytes;
-        void *pool = NULL;
-        if (want == 0) {
-            // the largest block the heap gives, less what everything else needs
-            uint32_t largest = 0;
-            for (uint32_t try_bytes = 64u << 20; try_bytes >= (8u << 20) && largest == 0; try_bytes -= 2u << 20) {
-                void *probe = memalign(WL_XB_PAGE, try_bytes);
-                if (probe != NULL) {
-                    largest = try_bytes;
-                    free(probe);
+        uint32_t want = cfg->frame_pool_bytes & ~(WL_XB_PAGE - 1u);
+        void *pool[2] = {NULL, NULL};
+        uint32_t bytes[2] = {0, 0};
+        if (want != 0) {
+            pool[0] = memalign(WL_XB_PAGE, want);
+            bytes[0] = pool[0] != NULL ? want : 0;
+        } else {
+            // the two largest blocks the heap gives (MEM2's and what is left of MEM1's), held while
+            // probing, then `keep_free_bytes` given back from the smaller one first
+            for (unsigned i = 0; i < 2u; i++) {
+                for (uint32_t t = 64u << 20; t >= (1u << 20) && pool[i] == NULL; t -= 1u << 20) {
+                    pool[i] = memalign(WL_XB_PAGE, t);
+                    bytes[i] = pool[i] != NULL ? t : 0;
                 }
             }
-            want = largest > cfg->keep_free_bytes + (8u << 20) ? largest - cfg->keep_free_bytes : largest;
+            uint32_t give = cfg->keep_free_bytes;
+            for (int i = 1; i >= 0 && give != 0; i--) {
+                if (pool[i] == NULL) {
+                    continue;
+                }
+                free(pool[i]);
+                uint32_t keep = bytes[i] > give + (1u << 20) ? bytes[i] - give : 0;
+                give -= bytes[i] - keep < give ? bytes[i] - keep : give;
+                pool[i] = keep != 0 ? memalign(WL_XB_PAGE, keep) : NULL;
+                bytes[i] = pool[i] != NULL ? keep : 0;
+            }
         }
-        if (want != 0) {
-            pool = memalign(WL_XB_PAGE, want);
-        }
-        if (pool == NULL) {
+        if (pool[0] == NULL && pool[1] == NULL) {
             WL_LOG_E(TAG, "no memory for guest frames");
             return WL_ERR_NOMEM;
         }
-        mc.frame_pools[0].base = pool;
-        mc.frame_pools[0].bytes = want & ~(WL_XB_PAGE - 1u);
+        for (unsigned i = 0, n = 0; i < 2u; i++) {
+            if (pool[i] != NULL) {
+                mc.frame_pools[n].base = pool[i];
+                mc.frame_pools[n].bytes = bytes[i];
+                WL_LOG_I(TAG, "guest frames: %u KB at %p", (unsigned)(bytes[i] >> 10), pool[i]);
+                n++;
+            }
+        }
     }
 #endif
     r = wl_xb_mem_init(&mc);
