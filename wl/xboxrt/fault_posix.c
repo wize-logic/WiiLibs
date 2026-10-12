@@ -3,6 +3,12 @@
 // is emulated through the decoder of the host's instruction set (x86_decode.h on x86-64,
 // ppc_decode.h on 32-bit PowerPC) and the thread resumes after the instruction; anything else is
 // a guest crash report. A fault outside the span goes to the handler that was there before.
+//
+// After the device has answered, the access is a safe point (thread.h's wl_xb_safe_point): pending
+// interrupt work runs and a waiting thread gets the lock, from inside the handler. That is sound
+// here because the fault is synchronous, on the thread holding the guest lock, in guest code (the
+// safe point refuses kernel calls and other threads), which holds no host locks; SA_NODEFER lets
+// the ISR's own device accesses fault again, and the interrupted registers stay in the ucontext.
 #define _GNU_SOURCE
 #include <signal.h>
 #include <string.h>
@@ -12,6 +18,7 @@
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/ppc_decode.h"
+#include "wl/xboxrt/thread.h"
 #include "wl/xboxrt/x86_decode.h"
 
 static struct sigaction g_old_segv, g_old_bus;
@@ -111,6 +118,7 @@ static void on_fault(int sig, siginfo_t *si, void *ctx) {
     uintptr_t pc = 0;
     if (va >= WL_XB_MMIO_BASE && wl_xb_mmio_find(va) != NULL) {
         if (emulate((ucontext_t *)ctx, va, &what, &pc)) {
+            wl_xb_safe_point();
             return;
         }
         WlXbCrash c = {"device access the decoder cannot emulate", what, va, ea, pc, false};

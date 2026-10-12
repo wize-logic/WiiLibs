@@ -38,6 +38,7 @@ static int g_exit_code;
 static uint32_t g_live; // guest threads started and not ended
 static uint32_t g_tls_data, g_tls_bytes, g_tls_zero;
 static WlXbThreadStats g_stats;
+volatile uint32_t g_xb_attention;
 
 void wl_xb_thread_config_default(WlXbThreadConfig *cfg) {
     cfg->quantum_ms = 10;
@@ -63,6 +64,7 @@ static void enqueue(WlXbThread *t) {
     t->next_ready = *pp;
     *pp = t;
     t->ready = true;
+    g_xb_attention = 1; // the holder gives the lock up at its next safe point when this one outranks it
 }
 
 static WlXbThread *dequeue(void) {
@@ -99,6 +101,7 @@ static void take(WlXbThread *self) {
 }
 
 void wl_xb_lock(WlXbThread *self) {
+    self->host_tid = wl_platform_thread_self_id();
     wl_platform_mutex_lock(g_m);
     take(self);
     wl_platform_mutex_unlock(g_m);
@@ -174,16 +177,40 @@ static void requeue(WlXbThread *self) {
     wl_xb_cpu_load(&self->cpu);
 }
 
-void wl_xb_yield_point(void) {
-    wl_xb_service_poll();
-    WlXbThread *self = g_cur;
+// Gives the lock to the head of the ready queue when it outranks the caller, or ties with it and
+// the caller's quantum is over. true when it did.
+static bool yield_if_due(WlXbThread *self) {
     WlXbThread *head = g_ready;
     if (self == NULL || head == NULL || wl_xb_in_service()) {
-        return;
+        return false;
     }
     if (head->priority > self->priority ||
         (head->priority == self->priority && wl_platform_time_us() - g_quantum_start >= (uint64_t)g_cfg.quantum_ms * 1000u)) {
         requeue(self);
+        return true;
+    }
+    return false;
+}
+
+void wl_xb_yield_point(void) {
+    wl_xb_service_poll();
+    yield_if_due(g_cur);
+}
+
+void wl_xb_safe_point(void) {
+    WlXbThread *self = g_cur;
+    if (self == NULL || self->kernel_depth != 0 || self->is_service || wl_xb_in_service() ||
+        self->host_tid != wl_platform_thread_self_id()) {
+        return; // not the holder in guest code: a kernel call's own access, another host thread
+    }
+    g_xb_attention = 0; // cleared before looking, so work raised from here on sets it again
+    g_stats.safe_points++;
+    wl_xb_service_poll_levels();
+    if (yield_if_due(self)) {
+        g_stats.safe_yields++;
+    }
+    if (g_ready != NULL) {
+        g_xb_attention = 1; // a thread of equal priority still waits for the quantum's end
     }
 }
 
@@ -538,7 +565,17 @@ uint32_t wl_xb_call_guest(uint32_t va, uint32_t argc, const uint32_t *args, bool
     }
     g_esp -= 4u;
     wl_xb_wr32(g_esp, 0); // the return address: nowhere (the callee returns to C)
+    // guest code called from a kernel call (a thread's routine run inline, an APC) is guest code
+    // again: its device accesses are safe points
+    WlXbThread *self = g_cur;
+    uint32_t depth = self != NULL ? self->kernel_depth : 0;
+    if (self != NULL) {
+        self->kernel_depth = 0;
+    }
     fn();
+    if (self != NULL) {
+        self->kernel_depth = depth;
+    }
     g_esp = saved;
     return g_eax;
 }

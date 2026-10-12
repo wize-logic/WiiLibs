@@ -4,7 +4,8 @@
 // manual lookup, at VAs in its code section) call the imports the way translated code does (push
 // the arguments, push a return address, call through the slot). Covers the thunk ABI (stdcall pops,
 // fastcall, cdecl, 64-bit returns), dispatcher objects and waits under contention between guest
-// threads, critical sections, timers with DPCs, an interrupt line with its ISR and DPC, user APCs
+// threads, critical sections, timers with DPCs, an interrupt line with its ISR and DPC, an ISR and
+// a thread switch delivered to a loop that only polls a device register, user APCs
 // from overlapped reads, the file layer (D: read-only, Z: sparse, listings, renames), virtual and
 // contiguous memory, Rtl's strings, time and printf, the crypto exports, the EEPROM settings.
 #define _DEFAULT_SOURCE
@@ -461,6 +462,108 @@ TEST timers_dpcs_interrupts(void) {
     PASS();
 }
 
+// ---- A thread that spins on a device register ---------------------------------------------------
+// D3D's fence wait: a loop that reads a GPU register until the GPU's ISR moves a word in memory,
+// with no kernel call in it. The device access itself must be the safe point: the ISR runs there
+// (or on the service thread, which is handed the lock there), and a thread that outranks the
+// spinning one gets the lock there too.
+
+#define SPIN_DEV_VA 0xFEF00000u
+#define SPIN_LINE 9u
+
+static volatile uint32_t g_spin_reads, g_spin_raise_at;
+static volatile bool g_spin_irq;
+static uint32_t g_spin_flag, g_spin_isr_runs, g_hi_flag, g_hi_tp;
+
+static uint32_t spin_dev_read(void *user, uint32_t off, unsigned size) {
+    (void)user;
+    (void)size;
+    g_spin_reads++;
+    if (g_spin_raise_at != 0 && g_spin_reads == g_spin_raise_at) {
+        g_spin_irq = true; // the device raises its line (a level source) in the middle of the loop
+    }
+    return off == 0x44u ? g_spin_reads : 0u;
+}
+
+static void spin_dev_write(void *user, uint32_t off, uint32_t v, unsigned size) {
+    (void)user;
+    (void)size;
+    if (off == 0x100u && (v & 1u) != 0) {
+        g_spin_irq = false; // acknowledged
+    }
+}
+
+static bool spin_level(void *user) {
+    (void)user;
+    return g_spin_irq;
+}
+
+static void spin_isr(void) {
+    // BOOLEAN ServiceRoutine(PKINTERRUPT, PVOID): acknowledge at the device, move the fence
+    g_spin_isr_runs++;
+    wl_xb_wr32(SPIN_DEV_VA + 0x100u, 1); // a device access inside the ISR: no safe point there
+    wl_xb_wr32(g_spin_flag, wl_xb_rd32(g_spin_flag) + 1u);
+    g_eax = 1;
+    guest_ret(8);
+}
+
+static void hi_routine(void) {
+    // stdcall SystemRoutine(ctx1, ctx2): go above the spinning thread, sleep, then mark the flag;
+    // waking, it waits for the lock, which the spinning thread holds
+    uint32_t esp = g_esp;
+    wl_xb_thread_set_priority(wl_xb_current(), 20);
+    KN(S_KE_DELAY, 0, 0, g_hi_tp);
+    wl_xb_wr32(g_hi_flag, 1);
+    g_esp = esp;
+    guest_ret(8);
+}
+
+TEST device_polls_are_safe_points(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    WlXbDevice dev = {"spin", SPIN_DEV_VA, 0x1000u, spin_dev_read, spin_dev_write, NULL};
+    ASSERT_EQ(WL_OK, wl_xb_mmio_register(&dev));
+    wl_xb_irq_set_level(SPIN_LINE, spin_level, NULL);
+    uint32_t irql = gmem(4), ki = gmem(0x80);
+    g_spin_flag = gmem(4);
+    uint32_t vector = KN(S_HAL_VECTOR, SPIN_LINE, irql);
+    KN(S_KE_INIT_INTERRUPT, ki, guest_fn(3, spin_isr), 0, vector, wl_xb_rd8(irql), 0 /* level sensitive */, 0);
+    ASSERT_EQ_FMT(1u, KN(S_KE_CONNECT_INTERRUPT, ki), "%u");
+
+    // the fence wait: nothing but device reads until the ISR has moved the word
+    g_spin_isr_runs = 0;
+    g_spin_reads = 0;
+    g_spin_raise_at = 100;
+    uint64_t t0 = wl_platform_time_ms();
+    while (wl_xb_rd32(g_spin_flag) == 0 && wl_platform_time_ms() - t0 < 3000u) {
+        (void)wl_xb_rd32(SPIN_DEV_VA + 0x44u);
+    }
+    ASSERT_EQ_FMT(1u, wl_xb_rd32(g_spin_flag), "%u");
+    ASSERT_EQ_FMT(1u, g_spin_isr_runs, "%u");
+    ASSERT(!g_spin_irq);
+    ASSERT(g_spin_reads >= 100u);
+
+    // a thread that outranks the spinning one wakes from a delay: the spinning thread hands it the
+    // lock at a device access (and first lets it start, its quantum over)
+    g_hi_flag = gmem(4);
+    g_hi_tp = gmem(8);
+    wl_xb_wr64(g_hi_tp, (uint64_t)(int64_t)-100000); // 10 ms
+    uint32_t hp = gmem(4);
+    WlXbThreadStats ts0, ts1;
+    wl_xb_thread_stats(&ts0);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(4, hi_routine)), "%08x");
+    t0 = wl_platform_time_ms();
+    while (wl_xb_rd32(g_hi_flag) == 0 && wl_platform_time_ms() - t0 < 3000u) {
+        (void)wl_xb_rd32(SPIN_DEV_VA + 0x44u);
+    }
+    ASSERT_EQ_FMT(1u, wl_xb_rd32(g_hi_flag), "%u");
+    wl_xb_thread_stats(&ts1);
+    ASSERT(ts1.safe_yields > ts0.safe_yields);
+    KN(S_NT_CLOSE, wl_xb_rd32(hp));
+    PASS();
+}
+
 // ---- Files ----------------------------------------------------------------------------------------
 
 static uint32_t g_apc_runs, g_apc_ctx, g_apc_info;
@@ -728,6 +831,7 @@ SUITE(kernel_suite) {
     RUN_TEST(threads_and_critical_sections);
     RUN_TEST(events_timeouts_mutants);
     RUN_TEST(timers_dpcs_interrupts);
+    RUN_TEST(device_polls_are_safe_points);
     RUN_TEST(files_dvd_and_overlapped);
     RUN_TEST(files_sparse_cache_drive);
     RUN_TEST(virtual_and_contiguous_memory);

@@ -3,10 +3,13 @@
 //
 // The kernel (wl/xboxkrnl) decides what an interrupt does (its KINTERRUPTs, DPC queue, timers);
 // the runtime decides when that work runs: at the next yield point of the thread holding the
-// guest lock (every kernel call is one, and so is the generated code's rdtsc), or on the service
-// thread, which takes the lock itself when no guest thread runs. Either way the work runs with
-// the lock held and the interrupted thread's registers saved, on the interrupted thread's KPCR,
-// never inside itself.
+// guest lock (every kernel call is one, so is the generated code's rdtsc, and so is every device
+// access once the device has answered: thread.h's wl_xb_safe_point), or on the service thread,
+// which takes the lock itself when no guest thread runs and is handed it at the holder's next
+// safe point when one does. Either way the work runs with the lock held and the interrupted
+// thread's registers saved, on the interrupted thread's KPCR, never inside itself, and on a guest
+// stack of its own (the service thread's): a device access can come in the middle of a translated
+// function whose esp the compiler has not stored yet, so the interrupted stack is left alone.
 //
 // The service thread also keeps KeTickCount moving in guest memory (GetTickCount reads it
 // directly) and makes the vertical blank: from the retrace interrupt on the Wii, from a 59.94 Hz
@@ -67,6 +70,9 @@ void wl_xb_service_raise(uint32_t reasons);
 void wl_xb_service_set_deadline(uint64_t when_us);
 // A safe point: runs the handler if something is pending (the lock held, not inside the handler).
 void wl_xb_service_poll(void);
+// The same, asking the level sources too (a device access's safe point: the device may have just
+// raised its line).
+void wl_xb_service_poll_levels(void);
 // True while the handler runs (an ISR's or DPC's kernel calls see it).
 bool wl_xb_in_service(void);
 

@@ -127,6 +127,10 @@ static void thunk_dispatch(void) {
     uint32_t outer_caller = g_caller;
     g_caller = ret;
     Slot *s = &g_slots[slot];
+    WlXbThread *self = wl_xb_current();
+    if (self != NULL) {
+        self->kernel_depth++; // the kernel's own device accesses are no safe points
+    }
     g_calls++;
     uint64_t n = s->ordinal < 512u ? ++g_calls_by_ordinal[s->ordinal] : 0;
     if (g_trace_all || (g_trace_first && n == 1)) {
@@ -142,6 +146,9 @@ static void thunk_dispatch(void) {
                      s->name != NULL ? s->name : "?");
         }
         g_eax = 0;
+    }
+    if (self != NULL) {
+        self->kernel_depth--;
     }
     g_esp += s->arg_bytes;
     g_caller = outer_caller;
@@ -224,6 +231,7 @@ jmp_buf *recomp_setjmp_slot(uint32_t buf_va) {
     for (uint32_t i = 0; i < t->jmp_count; i++) {
         if (t->jmp[i].buf_va == buf_va) {
             t->jmp_count = i + 1u; // re-armed: the inner ones are gone
+            t->jmp[i].kernel_depth = t->kernel_depth;
             return &t->jmp[i].native;
         }
     }
@@ -231,6 +239,7 @@ jmp_buf *recomp_setjmp_slot(uint32_t buf_va) {
         t->jmp_count = WL_XB_MAX_JMP_SLOTS - 1u; // keep the deepest
     }
     t->jmp[t->jmp_count].buf_va = buf_va;
+    t->jmp[t->jmp_count].kernel_depth = t->kernel_depth;
     return &t->jmp[t->jmp_count++].native;
 }
 
@@ -251,6 +260,7 @@ int recomp_guest_longjmp(uint32_t buf_va, uint32_t value) {
         g_seh_ebp = wl_xb_rd32(buf_va + 0x00u);
         g_ebp = g_seh_ebp;
         t->jmp_count = i + 1u;
+        t->kernel_depth = t->jmp[i].kernel_depth; // a jump out of guest code a kernel call made
         longjmp(t->jmp[i].native, value != 0 ? (int)value : 1);
     }
     return 0;

@@ -36,6 +36,7 @@ static WlPlatformSemaphore g_retrace_sem;
 static volatile uint32_t g_tick_va;
 static uint64_t g_tick_start_us;
 static WlXbServiceStats g_stats;
+static uint32_t g_work_esp; // the top of the service thread's guest stack: where the work runs
 
 void wl_xb_service_config_default(WlXbServiceConfig *cfg) {
     cfg->vblank_hz_milli = 59940;
@@ -89,6 +90,7 @@ static void wake_service(void) {
 }
 
 void wl_xb_service_raise(uint32_t reasons) {
+    g_xb_attention = 1;
     if (g_started) {
         wl_platform_mutex_lock(g_sm);
         g_pending |= reasons;
@@ -102,6 +104,7 @@ void wl_xb_service_raise(uint32_t reasons) {
 void wl_xb_irq_assert(uint32_t line) {
     if (line < WL_XB_IRQ_LINES) {
         __atomic_fetch_or(&g_lines, 1u << line, __ATOMIC_SEQ_CST);
+        g_xb_attention = 1;
         wl_xb_service_raise(WL_XB_SVC_IRQ);
     }
 }
@@ -142,6 +145,9 @@ static void run_service(void) {
     g_in_service = true;
     WlXbCpu saved;
     wl_xb_cpu_save(&saved);
+    // the work's guest stack: the service thread's, free whenever someone else runs the work (the
+    // service thread runs guest code only in here, and this never nests)
+    uint32_t work_esp = g_work_esp;
     for (uint32_t round = 0; round < MAX_ROUNDS; round++) {
         uint32_t reasons = __atomic_exchange_n(&g_pending, 0u, __ATOMIC_SEQ_CST);
         uint64_t deadline = g_deadline;
@@ -160,6 +166,9 @@ static void run_service(void) {
             break;
         }
         g_stats.handler_runs++;
+        if (work_esp != 0) {
+            g_esp = work_esp;
+        }
         g_handler(g_handler_user, reasons);
         wl_xb_cpu_load(&saved);
         if ((reasons & WL_XB_SVC_IRQ) && round + 1u == MAX_ROUNDS) {
@@ -169,19 +178,32 @@ static void run_service(void) {
     g_in_service = false;
 }
 
-void wl_xb_service_poll(void) {
+static void poll(bool levels) {
     if (g_in_service) {
         return;
     }
     update_tick();
     uint64_t deadline = g_deadline;
     bool due = g_pending != 0 || g_lines != 0 || (deadline != 0 && wl_platform_time_us() >= deadline);
+    if (!due && levels) {
+        for (uint32_t i = 0; i < WL_XB_IRQ_LINES && !due; i++) {
+            due = g_level[i].fn != NULL && g_level[i].fn(g_level[i].user);
+        }
+    }
     if (!due) {
-        // level sources are asked only when something else is pending or the service thread looks
+        // a kernel call's poll leaves the level sources to the service thread and the device safe points
         return;
     }
     g_stats.polls_with_work++;
     run_service();
+}
+
+void wl_xb_service_poll(void) {
+    poll(false);
+}
+
+void wl_xb_service_poll_levels(void) {
+    poll(true);
 }
 
 static void *service_main(void *arg) {
@@ -290,6 +312,7 @@ WlResult wl_xb_service_start(const WlXbServiceConfig *cfg) {
         if (r != WL_OK) {
             return r;
         }
+        g_work_esp = g_svc->cpu.g_esp;
     }
     g_running = true;
     g_started = true;

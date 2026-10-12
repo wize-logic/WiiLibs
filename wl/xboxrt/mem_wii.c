@@ -24,6 +24,7 @@
 #include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/ppc_decode.h"
+#include "wl/xboxrt/thread.h"
 
 #define TAG "xbmmu"
 #define VSID_BASE 0x00051000u // segment n's VSID is VSID_BASE + n
@@ -221,6 +222,7 @@ void wl_xb_dsi_slow(void *frame) {
             uint32_t acc = wl_xb_ppc_ea(&a, f->gpr);
             if (wl_xb_ppc_emulate(&a, f->gpr, acc, va)) {
                 f->pc += 4u;
+                wl_xb_safe_point(); // normal context (the trampoline): interrupt work, a waiting thread
                 return;
             }
             what = "no device at the address";

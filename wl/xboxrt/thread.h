@@ -5,8 +5,8 @@
 // Wii, a pthread on the host), and one guest lock decides which of them runs guest code: the
 // holder runs the title and every kernel call; the register file (regs.h) is loaded from the
 // holder's WlXbThread when it takes the lock and saved back when it gives it up. A thread gives
-// the lock up when it waits (wl_xb_wait), when it ends, and at a yield point (a kernel call) when
-// another thread is ready and its quantum is over; the next holder is the highest-priority ready
+// the lock up when it waits (wl_xb_wait), when it ends, and at a yield point (a kernel call, an
+// rdtsc, a device access: wl_xb_safe_point) when another thread is ready and its quantum is over; the next holder is the highest-priority ready
 // thread, first come first served within a priority. Interrupt work (the vblank ISR, DPCs, timer
 // expiry: irq.h) runs at yield points of whichever thread holds the lock, or on the service
 // thread when no one does.
@@ -55,12 +55,15 @@ struct WlXbThread {
     bool ready;                // in the ready queue
     bool woken;                // a wake arrived while it slept (wl_xb_wake)
     bool running_guest;        // between its routine's start and its end
+    uint32_t kernel_depth;     // > 0 while in a kernel call (thunk.c): device accesses are no safe points
+    uint32_t host_tid;         // wl_platform_thread_self_id of its host thread (set when it takes the lock)
     jmp_buf exit_jmp;          // where wl_xb_thread_exit lands
     WlXbThread *next_ready;
     WlXbThread *next_all;
     uint32_t jmp_count;        // guest setjmp buffers this thread armed (recomp_setjmp_slot)
     struct {
         uint32_t buf_va;
+        uint32_t kernel_depth; // when it was armed
         jmp_buf native;
     } jmp[WL_XB_MAX_JMP_SLOTS];
 };
@@ -140,6 +143,20 @@ void wl_xb_yield_point(void);
 // Gives the lock up to every ready thread of equal or higher priority (NtYieldExecution).
 void wl_xb_yield(void);
 
+// A safe point in the middle of guest code: what wl_xb_yield_point does (the interrupt work, with
+// the level sources asked too, then a yield when one is due), for the device-access fault paths
+// once the device has answered (fault_posix.c, mem_wii.c) and for the generated code's optional
+// loop hook. It does nothing unless the calling host thread holds the guest lock outside a kernel
+// call and outside the interrupt work, so it may be called from any fault. A title that polls a
+// device register until an interrupt changes memory (D3D's fence wait) gets its ISR and DPCs this
+// way, and a thread waiting for the lock (the service thread first) gets it at the next access.
+// Lock not necessarily held.
+void wl_xb_safe_point(void);
+// Non-zero when a safe point has something to do (interrupt work raised, a thread waiting for the
+// lock). Generated code may test it at loop back edges, where a spin on plain guest memory has no
+// other safe point: if (g_xb_attention) wl_xb_safe_point();
+extern volatile uint32_t g_xb_attention;
+
 // ---- Calling guest code ------------------------------------------------------------------------
 
 // Calls the guest function at `va` with `argc` 32-bit arguments (pushed right to left, a
@@ -168,6 +185,8 @@ typedef struct {
     uint32_t threads_created, threads_live;
     uint32_t handoffs;      // the lock changed hands
     uint32_t waits, wakes, timeouts;
+    uint32_t safe_points;   // wl_xb_safe_point calls that held the lock in guest code
+    uint32_t safe_yields;   // of those, the ones that gave the lock to a waiting thread
 } WlXbThreadStats;
 void wl_xb_thread_stats(WlXbThreadStats *out);
 
