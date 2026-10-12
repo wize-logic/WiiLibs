@@ -2,9 +2,13 @@
 # wl_xbox: what a port of an Xbox (Direct3D 8) game needs of the NV2A on GX: its pixel shaders'
 # register combiners translated to TEV programs (psh.h, with a cache of them: psh_cache.h) and its
 # vertex programs decoded, analysed and run on the processor (vsh.h, with the programs compiled
-# ahead of time by tools/xbox_vsh_codegen.c: vsh_native.h). Builds everywhere; no fused
-# multiply-adds, so a vertex program gives the same bits on every target, interpreted or compiled.
-add_library(wl_xbox STATIC psh.c psh_cache.c vsh.c nv2a.c nv2a_kelvin.c nv2a_capture.c nv2a_texture.c nv2a_texcache.c nv2a_pipeline.c nv2a_record.c nv2a_raster.c)
+# ahead of time by tools/xbox_vsh_codegen.c: vsh_native.h); and the NV2A as a device that runs a
+# title's push buffers (nv2a.h: the MMIO registers, the pusher and puller, the 3D state, vertex
+# fetch, captures), the textures converted for GX and kept, the processor's vertex pipeline, a
+# recorder and a software reference of the GX backend. Builds everywhere; no fused multiply-adds,
+# so a vertex program gives the same bits on every target, interpreted or compiled.
+add_library(wl_xbox STATIC psh.c psh_cache.c vsh.c
+    nv2a.c nv2a_kelvin.c nv2a_capture.c nv2a_texture.c nv2a_texcache.c nv2a_pipeline.c nv2a_record.c nv2a_raster.c)
 wl_target_defaults(wl_xbox DETERMINISTIC)
 target_link_libraries(wl_xbox PUBLIC wl_platform wl_gfx wl_codec m)
 add_library(WiiLibs::xbox ALIAS wl_xbox)

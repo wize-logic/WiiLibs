@@ -237,13 +237,16 @@ static bool is_display(const WlNv2aGx *gx, uint32_t phys) {
 }
 
 // a surface the back buffer holds: one the display was flipped to, or one the size of the screen
+// (not a multisampled one: a title resolves that into the surface it shows, reading it as a
+// texture, so it is a render target)
 static bool surface_is_screen(const WlNv2aGx *gx, const WlNv2aSurface *s) {
     uint32_t w = s->clip_width / s->samples_x, h = s->clip_height / s->samples_y;
 
     if (s->color_format == 0 || is_display(gx, s->color_phys)) {
         return true;
     }
-    return !s->swizzled && w * 4u >= gx->cfg.width * 3u && h * 4u >= gx->cfg.height * 3u;
+    return !s->swizzled && s->samples_x == 1 && s->samples_y == 1 && w * 4u >= gx->cfg.width * 3u &&
+           h * 4u >= gx->cfg.height * 3u;
 }
 
 static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {

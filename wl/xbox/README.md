@@ -1,15 +1,23 @@
 # wl/xbox: the Xbox's NV2A on GX
 
 Target `wl_xbox` (alias `WiiLibs::xbox`) depends on `wl_platform` (its TEV programs,
-`wl/platform/tev.h`) and `wl_gfx` (`wl/gfx/gfx_sqrt.h`). What a port of an Xbox (Direct3D 8) game
-needs to draw with the game's own shaders on the Wii, which has no programmable stages: the pixel
-shaders' register combiners become TEV programs, and the vertex programs run on the processor.
-Game-agnostic: a game's own knowledge (programs it recognizes and makes by hand, its list of
-vertex programs) stays with the game. Headers: `wl/xbox/psh.h`, `wl/xbox/psh_cache.h`,
-`wl/xbox/vsh.h`, `wl/xbox/vsh_native.h`. Built with `-ffp-contract=off` (`DETERMINISTIC`), so a
-vertex program gives the same bits interpreted or compiled, on every target.
+`wl/platform/tev.h`), `wl_gfx` (`wl/gfx/gfx_sqrt.h`) and `wl_codec` (the Xbox's textures). What a
+port or a recompilation of an Xbox (Direct3D 8) game needs to draw on the Wii, which has no
+programmable stages: the pixel shaders' register combiners become TEV programs, the vertex programs
+run on the processor, and, for a title whose own Direct3D runs unchanged, the NV2A itself is a
+device that executes the title's push buffers ("The NV2A as a device", below). Game-agnostic: a
+game's own knowledge (programs it recognizes and makes by hand, its list of vertex programs) stays
+with the game. Headers: `wl/xbox/psh.h`, `wl/xbox/psh_cache.h`, `wl/xbox/vsh.h`,
+`wl/xbox/vsh_native.h`, and the NV2A's `nv2a.h`, `nv2a_regs.h`, `nv2a_kelvin.h`, `nv2a_capture.h`,
+`nv2a_texture.h`, `nv2a_texcache.h`, `nv2a_pipeline.h`, `nv2a_record.h`, `nv2a_raster.h`. Built with
+`-ffp-contract=off` (`DETERMINISTIC`), so a vertex program gives the same bits interpreted or
+compiled, on every target.
 
-(The Xbox's textures are `wl/codec/xbox_tex.h`.)
+Target `wl_xbox_gx` (alias `WiiLibs::xbox_gx`, header `nv2a_gx.h`) is the NV2A backend on GX. It calls
+only wl/platform (its direct GX layer, `wl/platform/gx_direct.h`, render targets and TEV programs), so
+it builds everywhere: over libogc on the Wii, over the host's recorder elsewhere.
+
+(The Xbox's textures as such are `wl/codec/xbox_tex.h`.)
 
 ## Pixel shaders (`psh.h`)
 
@@ -81,3 +89,143 @@ bumped lookups; the cache against fresh translations, byte for byte; synthetic v
 the tool at build time (under qemu on ppc-be) against the interpreter, bit for bit.
 
 The OpenCE-Wii port (Halo) checks the translation further with the game's own programs.
+
+## The NV2A as a device (`nv2a.h`)
+
+A recompiled title keeps its own Direct3D (Halo's is D3D8 1.0.3925, statically linked), which writes
+NV2A push buffers into contiguous guest RAM and kicks them by writing a channel's DMA_PUT through
+MMIO. `WlNv2a` is the device behind that MMIO window:
+
+```c
+WlNv2a *wl_nv2a_create(const WlNv2aConfig *cfg);   // {phys_ptr, user, backend, [ram_bytes, time_ns]}
+uint32_t wl_nv2a_mmio_read(WlNv2a *, uint32_t offset, unsigned size);   // offset from 0xFD000000
+void     wl_nv2a_mmio_write(WlNv2a *, uint32_t offset, uint32_t value, unsigned size);
+void     wl_nv2a_vblank(WlNv2a *);                   // the host's retrace
+bool     wl_nv2a_irq_pending(const WlNv2a *);        // then the runtime runs the title's ISR
+```
+
+`phys_ptr(user, phys, bytes)` gives the host address of guest-physical bytes (little-endian,
+contiguous for the length asked; `EA(0x80000000 | phys)` in the runtime), and every read the model
+and its backends make of guest memory goes through it (`wl_nv2a_phys`). Pure C11, one thread at a
+time (the guest lock); backend callbacks run inside the MMIO write that kicked the push buffer.
+
+- **Registers** answer as an idle GPU's: the FIFO's caches empty (CACHE1_STATUS, RUNOUT_STATUS),
+  PGRAPH not busy (STATUS 0), the write-combining flush done at once (PFB 0x100410's bit 16 reads
+  clear), PTIMER counting (the configuration's clock, or a microsecond a read), the RAM's size in
+  PFB_CSTATUS, the interrupt status registers (PMC, PFIFO, PGRAPH, PCRTC, PTIMER) showing what was
+  raised and cleared by writing ones, PMC_INTR_0 their enabled sum. A write of PCRTC_START is the
+  flip. Any other register reads back what was written. Instance memory (PRAMIN, 0x700000) is the
+  device's own megabyte, made in 64 KiB pages as it is written (xemu keeps it apart from RAM too).
+- **The pusher.** A write of DMA_PUT (0x800040 + chid * 0x10000) runs the channel's push buffer from
+  GET to PUT before it returns, then GET = PUT: method headers increasing and non-increasing, old
+  and new jumps, one level of call and return (envytools' "PFIFO DMA pusher"); a header's words may
+  span kicks. Direct3D's start-up handshake works as on the hardware: GET starts at 0, a jump at
+  physical 0 takes it to the push buffer, and GET is then PUT.
+- **The puller** binds objects to subchannels by handle (RAMHT, searched whole), handles its own
+  methods (the reference counter, NV1A semaphores: an acquire whose value is not there is counted
+  and passed, as a synchronous GPU has nothing to wait for), looks up the handles of methods
+  0x180-0x1FC and hands the 3D class's methods to the state tracker (other classes are logged once).
+- **Semaphores, notifiers, reports** are written into guest memory: the 3D class's back-end
+  semaphore release (0x1D6C/0x1D70, Direct3D's fences), NOTIFY's notifier (and PGRAPH's NOTIFY
+  interrupt for a NOTIFY of 1), GET_REPORT's pixel count (what the backend says it drew while
+  counting: the GX backend estimates the area, the software reference counts).
+- **Traps.** NO_OPERATION with a parameter raises PGRAPH's ERROR interrupt with the method and data
+  in TRAPPED_ADDR/DATA, as nxdk's pbkit uses it for callbacks; with the interrupt enabled the channel
+  stops after it, as the GPU stalls, and goes on once the ISR clears it.
+
+The numbers (`nv2a_regs.h`) are WiiLibs' names for facts each cited to a public source (envytools'
+docs and rnndb, nxdk's pbkit, nouveau); `tests/xbox/test_xbox_nv2a_regs.c` compares them by name
+with another table when one is checked out beside WiiLibs (test-only: read as text, nothing kept).
+
+## The 3D state and draws (`nv2a_kelvin.h`)
+
+`WlNv2aKelvin` is every method's last word (`raw[method / 4]`, read with `wl_nv2a_k`), the vertex
+program's 136 slots and 192 constants loaded through their windows (the slot moving on after the
+fourth word), SET_VIEWPORT_SCALE/OFFSET also written into c[58]/c[59] (Direct3D's c[-38]/c[-37],
+which its programs' epilogue reads), the context DMAs resolved, and the sixteen attributes' current
+values. Helpers decode it: the surface (`wl_nv2a_surface`: addresses, clip, formats, samples, depth
+range), the combiners as psh's 57 words (`wl_nv2a_psh_words`), the program from
+SET_TRANSFORM_PROGRAM_START to its end bit.
+
+A begin/end becomes draws (`WlNv2aDraw`): DRAW_ARRAYS' ranges and ARRAY_ELEMENT16/32's indices into
+the vertex arrays (offset bit 31 selecting DMA B, stride bits 31:8), INLINE_ARRAY's words (the enabled
+attributes in order, each at a multiple of its component's size), or immediate vertices
+(SET_VERTEX3F/4F/4S, SET_VERTEX_DATA2F/2S/4UB/4S/4F: a write of attribute 0's last component completes
+a vertex). `wl_nv2a_draw_fetch` gives a vertex as the program's sixteen input registers, every
+array format decoded (D3DCOLOR's B, G, R, A to r, g, b, a; normalized and plain shorts; floats and
+FLOAT2H; bytes; the 11:11:10 normal), a disabled attribute its current value. A long batch is handed
+over in parts of whole primitives (a strip's parts even, so its winding holds).
+
+## Backends
+
+- **GX** (`nv2a_gx.h`, target `wl_xbox_gx`): OpenCE-Wii's Direct3D device on GX (d3d8_gx.c, CC0),
+  reorganized around the NV2A's state. Vertices through the title's program on the processor, sent
+  in screen space through an orthographic projection with the depth range, or, for a program that
+  divides by w, as (x w, y w, -w) through a perspective projection whose depth a + b / w is fitted
+  from the draw (the far plane moved so nothing is clipped there); indexed draws reuse the vertices
+  run. The combiners through psh's cache (with a title's `WlXboxPshRecipe`), the fog psh's ramp, a
+  program beyond GX texture 0 times colour. Blending, depth, alpha test and colour masks on GX
+  (constant colours, MIN/MAX and src - dst approximated and counted); culling by the NV2A's rule on
+  the screen winding (GX's sense measured once at start); stencil draws skipped and counted. The
+  EFB is the back buffer; another surface (a multisampled one among them) takes it through
+  `wl/platform/gx_target.h`, and a texture at its address then samples its image. The frame's first
+  full clear is GX's copy clear, others are quads. A frame is shown on FLIP_INCREMENT_WRITE, on a
+  switch to another screen-sized surface, or when the display flips to the surface in the EFB.
+- **Textures** (`nv2a_texture.h`, `nv2a_texcache.h`): a stage's registers decoded (swizzled, linear,
+  DXT, cube, P8; levels and faces) and converted into GX's formats (wl/codec's exact conversions,
+  the rest decoded to RGBA8: A4R4G4B4 keeps its four bits of alpha so a glyph cache's text stays
+  smooth; DXT3/5's alpha a separate I4; P8 as C8 with a TLUT; a cube map made into psh's sphere
+  map), kept by (address, format, size, palette) within a budget (4 MiB by default) and checked by a
+  hash of the guest's texels once a frame (every use once found rewritten).
+- **The pipeline** (`nv2a_pipeline.h`) is what both drawing backends do on the processor: programs
+  compiled and kept, vertices run (or the fixed function's composite matrix), the NV2A's fog modes,
+  what psh is told of the textures, each stage's GX coordinates, the GX mappings of the raster state.
+- **The recorder** (`nv2a_record.h`) digests and describes every clear, draw, frame and flip.
+- **The software reference** (`nv2a_raster.h`) draws what the GX backend is asked to into RGBA8
+  surfaces: the same pipeline and textures, the combiners as the same TEV program (`wl_tev_eval`),
+  GX's blending; for pictures of a capture without a Wii, and tests from push buffer to pixel.
+
+## Captures (`nv2a_capture.h`) and `tools/xbox_nv2a_replay.c`
+
+`wl_nv2a_capture_frames(dev, &sink, n)` captures from the next flip to n flips after it: a snapshot of
+the model's state, then every MMIO write and vertical blank it receives and every block of guest
+memory it or its backend reads (unchanged blocks not repeated). The runtime gives a sink that writes
+a file, for example:
+
+```c
+static WlResult file_write(void *user, const void *data, uint32_t bytes) {
+    return fwrite(data, 1, bytes, (FILE *)user) == bytes ? WL_OK : WL_ERR_IO;
+}
+WlNv2aCaptureSink sink = {fopen("sd:/nv2a.capture", "wb"), file_write};
+wl_nv2a_capture_frames(dev, &sink, 2);     // close the file once wl_nv2a_capture_active is false
+```
+
+`wl_nv2a_replay` runs a capture through a new model and any backend over a guest memory of its own.
+The host tool prints what was drawn and, with `--png`, each frame from the software reference:
+
+```sh
+xbox_nv2a_replay nv2a.capture -v --png frames/
+```
+
+## The NV2A's tests
+
+`tests/xbox/test_xbox_nv2a*.c` (host and ppc-be): the registers, the pusher (jumps, calls, a header
+across kicks, a ring's wrap), Direct3D's handshake, RAMHT and DMA objects, semaphores, notifiers,
+reports, the vblank and flips, a trap, a capture replayed (`test_xbox_nv2a.c`); every vertex format,
+each kind of draw, long batches, the windows, the combiner words, the surface (`_kelvin`); texture
+registers, conversions sampled against the texel decoders, levels, DXT and P8, sphere maps, the
+cache (`_texture`); the GX backend over the host's recorder: vertices as GX gets them, the TEV
+program, textures, the perspective path, culling, stencil, clears, render targets (`_gx`); the
+software reference from push buffer to pixel, and a capture replayed to the same pixels (`_raster`);
+the numbers against another table (`_regs`). The replay tool runs over the capture the raster test
+writes. On the console, `tests/xbox/suite_nv2a.c` (in `wl_console_tests.dol`) draws synthetic frames
+through the GX backend on the Wii's GX and reads the EFB back.
+
+## Not handled yet
+
+Stencil (GX has none: those draws are skipped); the fixed-function transform beyond the composite
+matrix (no lighting, no texgen); point sprites, line widths; the NV2A's dependent texture modes
+(bump-env, dot products) beyond what psh does; the 2D classes (M2MF, image blit: logged); surfaces
+in guest memory (a render target's pixels are on the host: a title reading them back with the CPU
+sees what was there); occlusion counts with a depth test (the GX backend counts area); the
+pixel-centre offset is OpenCE-Wii's +0.5 and wants checking against a title's viewport constants.
