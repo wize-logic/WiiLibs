@@ -14,6 +14,9 @@ wl_add_test(test_platform_fs SOURCES test_platform_fs.c suite_fs.c LIBS wl_platf
 wl_add_test(test_platform_backtrace SOURCES test_platform_backtrace.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_net SOURCES test_platform_net.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_posix SOURCES test_platform_posix.c suite_posix.c LIBS wl_platform LABELS unit be)
+# Crash-safe file replacement and the sweep after a cut one; the directory listing cache (POSIX paths, a temp folder).
+wl_add_test(test_platform_file_replace SOURCES test_platform_file_replace.c LIBS wl_platform LABELS unit be)
+wl_add_test(test_platform_dircache SOURCES test_platform_dircache.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_random SOURCES test_platform_random.c LIBS wl_platform LABELS unit be)
 # The time base's conversions (timebase.h) against a bit-by-bit division: edges, wrap, random counts.
 wl_add_test(test_platform_timebase SOURCES test_platform_timebase.c LIBS wl_platform LABELS unit be)
