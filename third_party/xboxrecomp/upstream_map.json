@@ -1,0 +1,935 @@
+{
+ "schema": 1,
+ "comment": [
+  "Policy for following xboxrecomp (tools/xboxrecomp_sync.py; docs/xboxrecomp-sync.md).",
+  "areas: the first matching glob files a changed upstream path under a research area (one brief, one reviewer each).",
+  "rules: the first matching glob says what WiiLibs does with an upstream path:",
+  "  vendored  copied pristine to third_party/xboxrecomp/<path>",
+  "  patched   vendored, and a patch in third_party/xboxrecomp/patches/ changes it (applied in the build tree)",
+  "  port      WiiLibs has (or plans: status planned) its own code derived from it; listed in wl",
+  "  concept   read for facts and ideas only; nothing copied (licence notes say why for some)",
+  "  ignore    not relevant to WiiLibs",
+  "wl: the WiiLibs files that depend on it (a brief lists them); wl_tests: the ctest names that cover it.",
+  "Globs: * stays within a path component, ** crosses them."
+ ],
+ "upstream": {
+  "name": "xboxrecomp",
+  "url": "https://github.com/sp00nznet/xboxrecomp",
+  "branch": "main",
+  "license": "MIT"
+ },
+ "vendor_dir": "third_party/xboxrecomp",
+ "areas": [
+  {
+   "path": "NOTICE",
+   "area": "meta"
+  },
+  {
+   "path": "LICENSE*",
+   "area": "meta"
+  },
+  {
+   "path": "LICENSES/**",
+   "area": "meta"
+  },
+  {
+   "path": "CONTRIBUTORS.md",
+   "area": "meta"
+  },
+  {
+   "path": "CONTRIBUTING.md",
+   "area": "docs"
+  },
+  {
+   "path": "README.md",
+   "area": "docs"
+  },
+  {
+   "path": "docs/**",
+   "area": "docs"
+  },
+  {
+   "path": "src/README.md",
+   "area": "docs"
+  },
+  {
+   "path": "src/**/README.md",
+   "area": "docs"
+  },
+  {
+   "path": "tools/README.md",
+   "area": "docs"
+  },
+  {
+   "path": "tools/conformance/**",
+   "area": "conformance"
+  },
+  {
+   "path": "tools/recomp/**",
+   "area": "lifter"
+  },
+  {
+   "path": "tools/disasm/**",
+   "area": "analysis"
+  },
+  {
+   "path": "tools/func_id/**",
+   "area": "analysis"
+  },
+  {
+   "path": "tools/abi_analysis/**",
+   "area": "analysis"
+  },
+  {
+   "path": "tools/xbe_parser/**",
+   "area": "analysis"
+  },
+  {
+   "path": "tools/rtti/**",
+   "area": "analysis"
+  },
+  {
+   "path": "tools/seed_from_log/**",
+   "area": "analysis"
+  },
+  {
+   "path": "tools/split/**",
+   "area": "analysis"
+  },
+  {
+   "path": "tools/debug_symbols/**",
+   "area": "analysis"
+  },
+  {
+   "path": "tools/symbols/**",
+   "area": "analysis"
+  },
+  {
+   "path": "tools/ghidra_naming/**",
+   "area": "analysis"
+  },
+  {
+   "path": "tools/ida_naming/**",
+   "area": "analysis"
+  },
+  {
+   "path": "tools/kernel_audit/**",
+   "area": "kernel"
+  },
+  {
+   "path": "tools/**",
+   "area": "tools"
+  },
+  {
+   "path": "templates/runtime/**",
+   "area": "runtime-abi"
+  },
+  {
+   "path": "templates/**",
+   "area": "runtime-abi"
+  },
+  {
+   "path": "include/**",
+   "area": "runtime-abi"
+  },
+  {
+   "path": "src/nv2a/**",
+   "area": "nv2a"
+  },
+  {
+   "path": "src/kernel/nv2a_*",
+   "area": "nv2a"
+  },
+  {
+   "path": "tests/nv2a_*/**",
+   "area": "nv2a"
+  },
+  {
+   "path": "tests/d3d8_*/**",
+   "area": "d3d"
+  },
+  {
+   "path": "src/kernel/xbox_memory_layout.*",
+   "area": "memory"
+  },
+  {
+   "path": "src/kernel/guest_vmem.*",
+   "area": "memory"
+  },
+  {
+   "path": "src/platform/mmio_decode.h",
+   "area": "memory"
+  },
+  {
+   "path": "tests/memory_*/**",
+   "area": "memory"
+  },
+  {
+   "path": "tests/mmio_decode/**",
+   "area": "memory"
+  },
+  {
+   "path": "src/kernel/**",
+   "area": "kernel"
+  },
+  {
+   "path": "src/platform/**",
+   "area": "kernel"
+  },
+  {
+   "path": "tests/kernel_*/**",
+   "area": "kernel"
+  },
+  {
+   "path": "src/d3d/**",
+   "area": "d3d"
+  },
+  {
+   "path": "src/apu/**",
+   "area": "audio"
+  },
+  {
+   "path": "src/audio/**",
+   "area": "audio"
+  },
+  {
+   "path": "tests/apu_*/**",
+   "area": "audio"
+  },
+  {
+   "path": "tests/audio_*/**",
+   "area": "audio"
+  },
+  {
+   "path": "tests/adpcm_*/**",
+   "area": "audio"
+  },
+  {
+   "path": "tests/wma_*/**",
+   "area": "audio"
+  },
+  {
+   "path": "tests/xaudio2/**",
+   "area": "audio"
+  },
+  {
+   "path": "src/input/**",
+   "area": "io"
+  },
+  {
+   "path": "src/usb/**",
+   "area": "io"
+  },
+  {
+   "path": "src/video/**",
+   "area": "io"
+  },
+  {
+   "path": "tests/idex_*/**",
+   "area": "io"
+  },
+  {
+   "path": "tests/fist/**",
+   "area": "runtime-abi"
+  },
+  {
+   "path": "tests/fp_precision/**",
+   "area": "runtime-abi"
+  },
+  {
+   "path": "tests/mmx_*/**",
+   "area": "runtime-abi"
+  },
+  {
+   "path": "tests/**",
+   "area": "tests"
+  },
+  {
+   "path": "CMakeLists.txt",
+   "area": "build"
+  },
+  {
+   "path": "**/CMakeLists.txt",
+   "area": "build"
+  },
+  {
+   "path": "cmake/**",
+   "area": "build"
+  },
+  {
+   "path": "Dockerfile.*",
+   "area": "build"
+  },
+  {
+   "path": "**/.gitignore",
+   "area": "build"
+  },
+  {
+   "path": ".gitattributes",
+   "area": "build"
+  }
+ ],
+ "rules": [
+  {
+   "upstream": "tools/conformance/msvc-wine/**",
+   "kind": "ignore",
+   "notes": "ISC-licensed scripts for MSVC under Wine (Windows, Apple Silicon); WiiLibs records x86 goldens with gcc -m32 instead"
+  },
+  {
+   "upstream": "tools/recomp/lifter.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/"
+   ],
+   "wl_tests": [
+    "xboxrecomp_pytest",
+    "xbox_recomp_conformance"
+   ],
+   "notes": "patches 0001 (shift mask), 0002 (cvt helper), 0003 (MEMF_SET), 0004 (reserved names), 0005 (fld/fstp m80), 0007 (setp/setnp)"
+  },
+  {
+   "upstream": "tools/recomp/translator.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/"
+   ],
+   "wl_tests": [
+    "xboxrecomp_pytest",
+    "xbox_recomp_conformance"
+   ],
+   "notes": "patch 0006 (--runtime-header)"
+  },
+  {
+   "upstream": "tools/recomp/__main__.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/"
+   ],
+   "wl_tests": [
+    "xboxrecomp_pytest",
+    "xbox_recomp_conformance"
+   ],
+   "notes": "patch 0006 (--runtime-header)"
+  },
+  {
+   "upstream": "tools/recomp/test_lifter_fpu.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/"
+   ],
+   "notes": "patch 0003 updates the expected store text"
+  },
+  {
+   "upstream": "tools/recomp/test_lifter_sse.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/"
+   ],
+   "notes": "patch 0003 updates the expected store text"
+  },
+  {
+   "upstream": "tools/recomp/**",
+   "kind": "vendored",
+   "wl": [
+    "tools/xbox_recomp.py"
+   ],
+   "wl_tests": [
+    "xboxrecomp_pytest",
+    "xbox_recomp_conformance"
+   ],
+   "notes": "the lifter: driven by tools/xbox_recomp.py and wl_add_xbox_title"
+  },
+  {
+   "upstream": "tools/conformance/cases.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/",
+    "tests/xbox_recomp/conformance.py"
+   ],
+   "wl_tests": [
+    "xbox_recomp_conformance"
+   ],
+   "notes": "patches 0001, 0002, 0005 and 0007 add cases; tests/xbox_recomp/conformance.py replays every case on ppc-be"
+  },
+  {
+   "upstream": "tools/conformance/harness.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/",
+    "tests/xbox_recomp/conformance.py"
+   ],
+   "wl_tests": [
+    "xbox_recomp_conformance"
+   ],
+   "notes": "patch 0007 declares the ucomiss snapshot in each lifted case; conformance.py mirrors the lifted-case template"
+  },
+  {
+   "upstream": "tools/conformance/**",
+   "kind": "vendored",
+   "wl": [
+    "tests/xbox_recomp/conformance.py"
+   ],
+   "wl_tests": [
+    "xbox_recomp_conformance"
+   ],
+   "notes": "cases.py/harness.py/__main__ helpers are imported by the ppc-be net; corpus/xbe phases need MSVC and are not run"
+  },
+  {
+   "upstream": "templates/runtime/recomp_types.h",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/",
+    "wl/xboxrt/recomp/recomp_types.h",
+    "wl/xboxrt/recomp/gen_recomp_types.py",
+    "wl/xboxrt/recomp/README.md"
+   ],
+   "wl_tests": [
+    "xbox_recomp_header",
+    "xbox_recomp_conformance"
+   ],
+   "notes": "the generated-code ABI. WiiLibs' big-endian header is generated from the patched template by wl/xboxrt/recomp/gen_recomp_types.py; the xbox_recomp_header test fails until it is regenerated"
+  },
+  {
+   "upstream": "templates/runtime/**",
+   "kind": "port",
+   "wl": [
+    "wl/xboxrt (runtime and memory, agent B)"
+   ],
+   "status": "planned",
+   "notes": "Windows-only templates (CreateFileMapping, VirtualAlloc, kernel stubs); the facts go to B's runtime"
+  },
+  {
+   "upstream": "templates/new-game/src/main.c",
+   "kind": "vendored",
+   "wl": [
+    "wl/xboxrt (boot main, agent B)"
+   ],
+   "status": "planned",
+   "notes": "vendored only because two upstream tests read it (the register globals contract)"
+  },
+  {
+   "upstream": "templates/new-game/**",
+   "kind": "concept",
+   "wl": [
+    "cmake/WiiLibs.cmake (wl_add_xbox_title)"
+   ],
+   "notes": "the per-title project skeleton; recomp_manual.c is the title-override pattern"
+  },
+  {
+   "upstream": "tools/xbe_parser/**",
+   "kind": "vendored",
+   "wl": [
+    "tools/xbox_recomp.py"
+   ],
+   "wl_tests": [
+    "xboxrecomp_pytest",
+    "xbox_recomp_synthetic_title"
+   ]
+  },
+  {
+   "upstream": "tools/disasm/**",
+   "kind": "vendored",
+   "wl": [
+    "tools/xbox_recomp.py"
+   ],
+   "wl_tests": [
+    "xboxrecomp_pytest",
+    "xbox_recomp_synthetic_title"
+   ]
+  },
+  {
+   "upstream": "tools/func_id/**",
+   "kind": "vendored",
+   "wl": [
+    "tools/xbox_recomp.py"
+   ],
+   "wl_tests": [
+    "xboxrecomp_pytest",
+    "xbox_recomp_synthetic_title"
+   ]
+  },
+  {
+   "upstream": "tools/abi_analysis/**",
+   "kind": "vendored",
+   "wl": [
+    "tools/xbox_recomp.py"
+   ],
+   "wl_tests": [
+    "xboxrecomp_pytest",
+    "xbox_recomp_synthetic_title"
+   ]
+  },
+  {
+   "upstream": "tools/kernel_audit/**",
+   "kind": "vendored",
+   "wl": [
+    "wl/xboxkrnl (ordinal tables, agent B)"
+   ],
+   "status": "planned",
+   "notes": "coverage.py and test_bridge_ordinals.py read upstream's src/kernel/kernel_bridge.c, which is not vendored: that test is deselected"
+  },
+  {
+   "upstream": "tools/xiso/**",
+   "kind": "vendored"
+  },
+  {
+   "upstream": "tools/debug_symbols/**",
+   "kind": "vendored"
+  },
+  {
+   "upstream": "tools/seed_from_log/**",
+   "kind": "vendored",
+   "notes": "the runtime must print the lines it parses ([ICALL] Failed to resolve VA ...)"
+  },
+  {
+   "upstream": "tools/ghidra_naming/merge_names.py",
+   "kind": "vendored",
+   "notes": "vendored because tools/recomp/test_reserved_idents.py imports it"
+  },
+  {
+   "upstream": "tools/ghidra_naming/test_merge_names.py",
+   "kind": "vendored"
+  },
+  {
+   "upstream": "tools/ghidra_naming/**",
+   "kind": "concept",
+   "notes": "needs Ghidra; WiiLibs has a ghidra-mcp server for naming"
+  },
+  {
+   "upstream": "tools/__init__.py",
+   "kind": "vendored"
+  },
+  {
+   "upstream": "tools/README.md",
+   "kind": "concept",
+   "notes": "pipeline overview"
+  },
+  {
+   "upstream": "tools/rtti/**",
+   "kind": "concept",
+   "notes": "not needed by the pipeline WiiLibs runs; vendor it (kind vendored) when a title needs it"
+  },
+  {
+   "upstream": "tools/split/**",
+   "kind": "concept",
+   "notes": "not needed by the pipeline WiiLibs runs; vendor it (kind vendored) when a title needs it"
+  },
+  {
+   "upstream": "tools/symbols/**",
+   "kind": "concept",
+   "notes": "not needed by the pipeline WiiLibs runs; vendor it (kind vendored) when a title needs it"
+  },
+  {
+   "upstream": "tools/ida_naming/**",
+   "kind": "concept",
+   "notes": "not needed by the pipeline WiiLibs runs; vendor it (kind vendored) when a title needs it"
+  },
+  {
+   "upstream": "tools/xmv/**",
+   "kind": "concept",
+   "notes": "not needed by the pipeline WiiLibs runs; vendor it (kind vendored) when a title needs it"
+  },
+  {
+   "upstream": "tools/fusion/**",
+   "kind": "concept",
+   "notes": "white-room reading of Microsoft's recompiler; needs pefile/numpy"
+  },
+  {
+   "upstream": "tools/stackwalk.py",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxrt (crash report, agent B)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "tools/doctor.py",
+   "kind": "concept"
+  },
+  {
+   "upstream": "tools/test_doctor.py",
+   "kind": "concept"
+  },
+  {
+   "upstream": "tools/validate_ordinals.py",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxkrnl (agent B)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "tools/symbolize.py",
+   "kind": "ignore",
+   "notes": "MSVC x64 map files"
+  },
+  {
+   "upstream": "tools/sdk_validate.py",
+   "kind": "ignore",
+   "notes": "needs the Microsoft XDK"
+  },
+  {
+   "upstream": "tools/macos/**",
+   "kind": "ignore"
+  },
+  {
+   "upstream": "tools/linux/**",
+   "kind": "ignore"
+  },
+  {
+   "upstream": "src/kernel/nv2a_combiner.*",
+   "kind": "port",
+   "wl": [
+    "wl/xbox/psh.c",
+    "wl/xbox/psh.h"
+   ],
+   "wl_tests": [
+    "test_xbox_psh"
+   ],
+   "notes": "register combiners -> TEV; the file cites xemu's generator as a behaviour reference"
+  },
+  {
+   "upstream": "src/kernel/nv2a_vsh_interp.*",
+   "kind": "port",
+   "wl": [
+    "wl/xbox/vsh.c",
+    "wl/xbox/vsh.h"
+   ],
+   "wl_tests": [
+    "test_xbox_vsh"
+   ]
+  },
+  {
+   "upstream": "src/kernel/nv2a_pb_*",
+   "kind": "concept",
+   "wl": [
+    "wl/xbox (NV2A device, push-buffer decoder, agent C)"
+   ],
+   "status": "planned",
+   "notes": "push-buffer executor; cites xemu pgraph: facts only"
+  },
+  {
+   "upstream": "src/kernel/xbox_memory_layout.*",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxrt (guest memory, agent B)"
+   ],
+   "status": "planned",
+   "notes": "memory map, code bounds, per-title hardware-poke workarounds (cachebeta addresses)"
+  },
+  {
+   "upstream": "src/kernel/guest_vmem.*",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxrt (guest memory, agent B)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "src/kernel/kernel_thunks.c",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxkrnl (ordinal table, agent B)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "src/kernel/icall_feedback.c",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxrt (indirect-call logging, agent B)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "src/kernel/recomp_icall_feedback.h",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxrt (agent B)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "src/kernel/recomp_trace.c",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxrt (agent B)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "src/kernel/**",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxkrnl (kernel, agent B)"
+   ],
+   "status": "planned",
+   "notes": "Win32-bound bridges; the ordinals, argument sizes and object semantics are the reusable facts"
+  },
+  {
+   "upstream": "src/platform/mmio_decode.h",
+   "kind": "port",
+   "wl": [
+    "wl/xboxrt (x86-64 MMIO decoder, agent B)"
+   ],
+   "status": "planned",
+   "notes": "MIT; the host x86-64 fault decoder"
+  },
+  {
+   "upstream": "src/platform/**",
+   "kind": "ignore",
+   "notes": "Win32 primitive shims; wl/platform covers the targets"
+  },
+  {
+   "upstream": "src/nv2a/nv2a_regs.h",
+   "kind": "concept",
+   "license": "LGPL-2.1-or-later (xemu, upstream NOTICE)",
+   "notes": "never copy; register offsets are facts, re-derive them from envytools/nouveau"
+  },
+  {
+   "upstream": "src/nv2a/nv2a_core.c",
+   "kind": "concept",
+   "license": "LGPL v2+ (file header; missing from upstream NOTICE)",
+   "notes": "never copy"
+  },
+  {
+   "upstream": "src/nv2a/nv2a_state.h",
+   "kind": "concept",
+   "license": "LGPL v2+ (file header; missing from upstream NOTICE)",
+   "notes": "never copy"
+  },
+  {
+   "upstream": "src/nv2a/qemu_shim.h",
+   "kind": "concept",
+   "license": "hosts LGPL code (QEMU shim)",
+   "notes": "never copy"
+  },
+  {
+   "upstream": "src/nv2a/**",
+   "kind": "concept",
+   "wl": [
+    "wl/xbox (NV2A on GX, agent C)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "src/d3d/d3d8_swizzle.h",
+   "kind": "concept",
+   "wl": [
+    "wl/codec/xbox_tex.c",
+    "wl/codec/xbox_tex.h"
+   ],
+   "wl_tests": [
+    "test_codec"
+   ]
+  },
+  {
+   "upstream": "src/d3d/d3d8_combiners.*",
+   "kind": "concept",
+   "wl": [
+    "wl/xbox/psh.c"
+   ],
+   "wl_tests": [
+    "test_xbox_psh"
+   ]
+  },
+  {
+   "upstream": "src/d3d/d3d8_vsh.*",
+   "kind": "concept",
+   "wl": [
+    "wl/xbox/vsh.c"
+   ],
+   "wl_tests": [
+    "test_xbox_vsh"
+   ]
+  },
+  {
+   "upstream": "src/d3d/d3d8_resources.c",
+   "kind": "concept",
+   "wl": [
+    "wl/codec/xbox_tex.c"
+   ],
+   "wl_tests": [
+    "test_codec"
+   ],
+   "notes": "texture format table"
+  },
+  {
+   "upstream": "src/d3d/**",
+   "kind": "concept",
+   "wl": [
+    "wl/xbox (agent C)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "src/apu/**",
+   "kind": "concept",
+   "license": "LGPL-2.1-or-later (xemu, upstream NOTICE)",
+   "wl": [
+    "wl/xboxrt (APU as absent hardware, agent B)"
+   ],
+   "status": "planned",
+   "notes": "never copy"
+  },
+  {
+   "upstream": "src/audio/**",
+   "kind": "concept",
+   "wl": [
+    "wl/audio"
+   ]
+  },
+  {
+   "upstream": "src/input/**",
+   "kind": "concept",
+   "wl": [
+    "wl/platform (input)"
+   ]
+  },
+  {
+   "upstream": "src/usb/**",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxrt (USB as absent hardware, agent B)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "src/video/**",
+   "kind": "ignore",
+   "notes": "Media Foundation FMV player"
+  },
+  {
+   "upstream": "src/README.md",
+   "kind": "concept"
+  },
+  {
+   "upstream": "include/**",
+   "kind": "concept"
+  },
+  {
+   "upstream": "tests/mmio_decode/**",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxrt (agent B)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "tests/kernel_*/**",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxkrnl tests (agent B)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "tests/memory_*/**",
+   "kind": "concept",
+   "wl": [
+    "wl/xboxrt tests (agent B)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "tests/nv2a_*/**",
+   "kind": "concept",
+   "wl": [
+    "tests/xbox"
+   ],
+   "notes": "the facts the tests pin"
+  },
+  {
+   "upstream": "tests/d3d8_smoke/**",
+   "kind": "concept",
+   "wl": [
+    "tests/xbox (agent C)"
+   ],
+   "status": "planned"
+  },
+  {
+   "upstream": "tests/fist/**",
+   "kind": "concept",
+   "wl": [
+    "tests/xbox_recomp"
+   ],
+   "notes": "x87 store behaviour of the runtime header"
+  },
+  {
+   "upstream": "tests/fp_precision/**",
+   "kind": "concept",
+   "wl": [
+    "tests/xbox_recomp"
+   ]
+  },
+  {
+   "upstream": "tests/mmx_*/**",
+   "kind": "concept",
+   "wl": [
+    "tests/xbox_recomp"
+   ]
+  },
+  {
+   "upstream": "tests/**",
+   "kind": "concept",
+   "notes": "C tests of the Win32 runtime: read for the facts they pin"
+  },
+  {
+   "upstream": "docs/**",
+   "kind": "concept",
+   "notes": "referred to by URL and commit (third_party/xboxrecomp/README.md); when a doc and recomp_types.h disagree, the header wins"
+  },
+  {
+   "upstream": "README.md",
+   "kind": "concept",
+   "notes": "the changelog is quoted in every brief"
+  },
+  {
+   "upstream": "CONTRIBUTORS.md",
+   "kind": "concept"
+  },
+  {
+   "upstream": "CONTRIBUTING.md",
+   "kind": "ignore"
+  },
+  {
+   "upstream": "LICENSE",
+   "kind": "vendored"
+  },
+  {
+   "upstream": "NOTICE",
+   "kind": "vendored",
+   "notes": "mirror any new LGPL file in upstream_map.json as concept with a licence note"
+  },
+  {
+   "upstream": "LICENSES/**",
+   "kind": "concept",
+   "notes": "the LGPL text; WiiLibs takes no LGPL code, so it is not vendored"
+  },
+  {
+   "upstream": "CMakeLists.txt",
+   "kind": "ignore"
+  },
+  {
+   "upstream": "**/CMakeLists.txt",
+   "kind": "ignore"
+  },
+  {
+   "upstream": "cmake/**",
+   "kind": "ignore"
+  },
+  {
+   "upstream": "Dockerfile.*",
+   "kind": "ignore",
+   "notes": "the i386 oracle image; WiiLibs uses gcc -m32"
+  },
+  {
+   "upstream": "**/.gitignore",
+   "kind": "ignore"
+  },
+  {
+   "upstream": ".gitattributes",
+   "kind": "ignore"
+  }
+ ]
+}

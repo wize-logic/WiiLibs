@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Mon, 12 Oct 2026 18:00:00 -0400
+Subject: [PATCH] recomp: reserve newlib, glibc, libgcc and libogc names
+
+_FUNC_RESERVED_IDENT covers the C keywords, the standard headers as the
+Microsoft CRT declares them, and the Win32 exports, because the host was
+Windows. Generated code built against another C library meets names MSVC
+never declares: newlib (devkitPro and most bare-metal GCC toolchains) and
+glibc declare index, rindex, bcopy, bzero, random, j0/j1/y0/y1, gamma and
+drem by default; libgcc's helpers (__divdi3, __fixdfdi) are called by
+name on 32-bit targets; libogc exports gettime and settime; and every
+embedded program has its own main.
+
+Two failure modes, and the second is the reason for the list. A
+conflicting declaration fails the build with an error inside a system
+header (or, for the function-like macros -- stdin, errno, assert, the
+ctype set in newlib -- an expansion error). But a definition that only
+shadows a symbol of a static library builds cleanly: the linker never
+pulls the library's member, the guest function replaces it, and every
+libc routine that calls it (strchr calling index, printf calling write)
+runs guest code.
+
+Names are mangled with the address like every other reserved name, so
+the cost of over-reserving is a suffix in traces.
+
+Tests: test_reserved_idents_toolchains.py checks a representative set is
+reserved and mangled, compiles the mangled declarations against the
+headers a generated TU sees, and requires at least one unmangled
+declaration to clash on the compiler at hand (the negative control).
+---
+ tools/recomp/lifter.py                        | 55 ++++++++++++++-
+ .../recomp/test_reserved_idents_toolchains.py | 70 +++++++++++++++++++
+ 2 files changed, 124 insertions(+), 1 deletion(-)
+ create mode 100644 tools/recomp/test_reserved_idents_toolchains.py
+
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index 7f7e152..93f6f0f 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -99,7 +99,60 @@ _FUNC_RESERVED_IDENT = frozenset({
+     "longjmp", "setjmp",
+     # Host Win32 API export names (data/win32_api_names.txt) so a guest
+     # function named like a linked import does not collide at link time.
+-}) | _WIN32_EXPORTS
++}) | _WIN32_EXPORTS | frozenset({
++    # Names other C runtimes and embedded toolchains export or define as
++    # macros: newlib (devkitPro, most bare-metal GCC toolchains), glibc,
++    # libgcc and libogc. A guest function defined under one of these does not
++    # always fail to build -- a static libc pulls an archive member only for a
++    # symbol nothing else defines, so the recompiled function silently
++    # replaces the library's and every libc routine that calls it (strchr
++    # calling index, printf calling write) runs guest code instead. The
++    # function-like macros (stdin, errno, assert, the ctype set) fail
++    # earlier, with an expansion error inside a system header.
++    # program entry and startup
++    "main", "_start", "_init", "_fini", "__eabi", "environ", "errno",
++    # <stdio.h>
++    "printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf",
++    "vsprintf", "vsnprintf", "scanf", "fscanf", "sscanf", "puts", "fputs",
++    "putchar", "fputc", "putc", "getchar", "fgetc", "getc", "gets", "fgets",
++    "ungetc", "fopen", "freopen", "fclose", "fread", "fwrite", "fseek",
++    "ftell", "rewind", "fflush", "feof", "ferror", "clearerr", "perror",
++    "remove", "rename", "tmpfile", "tmpnam", "setbuf", "setvbuf", "fileno",
++    "stdin", "stdout", "stderr",
++    # <ctype.h> (macros in newlib)
++    "isalnum", "isalpha", "iscntrl", "isdigit", "isgraph", "islower",
++    "isprint", "ispunct", "isspace", "isupper", "isxdigit", "isblank",
++    "isascii", "toascii", "tolower", "toupper",
++    # <time.h>
++    "time", "clock", "difftime", "mktime", "asctime", "ctime", "gmtime",
++    "localtime", "strftime", "nanosleep", "gettimeofday", "settimeofday",
++    # <assert.h>, <errno.h>, <signal.h>
++    "assert", "raise", "signal", "sigsetjmp", "siglongjmp",
++    # POSIX and BSD names newlib declares by default (unistd.h, strings.h,
++    # the BSD parts of string.h and stdlib.h)
++    "open", "close", "read", "write", "lseek", "unlink", "link", "stat",
++    "fstat", "lstat", "mkdir", "rmdir", "chdir", "getcwd", "isatty", "sync",
++    "sleep", "usleep", "fork", "getpid", "kill", "dup", "dup2", "pipe",
++    "access", "sbrk", "brk", "index", "rindex", "bcopy", "bzero", "bcmp",
++    "ffs", "strcasecmp", "strncasecmp", "strlcpy", "strlcat", "strsep",
++    "stpcpy", "stpncpy", "strndup", "memccpy", "mempcpy", "strtok_r",
++    "random", "srandom", "drand48", "erand48", "lrand48", "srand48",
++    "itoa", "utoa", "ecvt", "fcvt", "gcvt", "putenv", "setenv", "unsetenv",
++    "memalign", "valloc", "aligned_alloc", "posix_memalign",
++    # <math.h> extensions newlib declares by default
++    "j0", "j1", "jn", "y0", "y1", "yn", "gamma", "drem", "finite",
++    "significand", "scalb", "isnanf", "isinff", "finitef", "matherr",
++    "sincos", "exp10", "pow10", "log2f", "dremf", "gammaf",
++    # libgcc helpers the compiler calls by name on a 32-bit target
++    "__divdi3", "__udivdi3", "__moddi3", "__umoddi3", "__ashldi3",
++    "__ashrdi3", "__lshrdi3", "__muldi3", "__negdi2", "__cmpdi2",
++    "__ucmpdi2", "__fixdfdi", "__fixunsdfdi", "__fixsfdi", "__floatdidf",
++    "__floatdisf", "__floatundidf", "__clzsi2", "__ctzsi2", "__popcountsi2",
++    "__bswapsi2", "__bswapdi2",
++    # libogc's unprefixed globals (the rest are VIDEO_/GX_/LWP_/SYS_...)
++    "gettime", "settime", "diff_ticks", "diff_sec", "diff_msec",
++    "diff_usec", "diff_nsec", "_exit", "_sbrk_r", "_malloc_r", "_free_r",
++})
+ 
+ 
+ def _func_ident(addr, name):
+diff --git a/tools/recomp/test_reserved_idents_toolchains.py b/tools/recomp/test_reserved_idents_toolchains.py
+new file mode 100644
+index 0000000..ab89ec2
+--- /dev/null
++++ b/tools/recomp/test_reserved_idents_toolchains.py
+@@ -0,0 +1,70 @@
++"""Names newlib, glibc, libgcc and libogc own are mangled too.
++
++The reserved set began as the Microsoft CRT's names plus the Win32 exports,
++because the host was Windows. Built against another C library, a guest
++function can collide with names MSVC never declares: newlib and glibc
++declare index, bcopy, random, j0 and drem by default; libogc exports gettime;
++every embedded program has a main. A declaration that conflicts fails to
++build, but a definition that only shadows a static library's symbol builds
++cleanly and replaces it, so libc's own callers run guest code.
++"""
++
++import os
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++from .lifter import _FUNC_RESERVED_IDENT, _func_ident
++
++ADDR = 0x00011234
++
++TOOLCHAIN_NAMES = ("main", "index", "rindex", "bcopy", "bzero", "random",
++                   "srandom", "j0", "j1", "y0", "y1", "gamma", "drem", "read",
++                   "write", "open", "close", "sync", "printf", "sprintf",
++                   "time", "strlcpy", "stdin", "errno", "isalpha", "toupper",
++                   "gettime", "__divdi3", "__udivdi3", "sincos")
++
++# Declared by a hosted C library's default (GNU/BSD) visibility. The negative
++# control below needs only one of them to clash on the compiler at hand.
++CLASHING = ("index", "rindex", "bcopy", "bzero", "random", "j0", "y1", "drem")
++
++HEADERS = """#include <string.h>
++#include <math.h>
++#include <stdlib.h>
++#include <setjmp.h>
++#include <stdint.h>
++"""
++
++
++class ToolchainReservedIdentTest(unittest.TestCase):
++    def test_toolchain_names_are_reserved_and_mangled(self):
++        for name in TOOLCHAIN_NAMES:
++            with self.subTest(name):
++                self.assertIn(name, _FUNC_RESERVED_IDENT)
++                self.assertEqual(_func_ident(ADDR, name), f"{name}_{ADDR:08X}")
++
++    def test_mangled_names_compile_and_unmangled_clash(self):
++        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
++        if not cc:
++            self.skipTest("no C compiler")
++
++        def compiles(decl):
++            with tempfile.TemporaryDirectory() as tmp:
++                c_path = os.path.join(tmp, "t.c")
++                with open(c_path, "w") as f:
++                    f.write(HEADERS + decl + "\n")
++                return subprocess.run([cc, "-c", c_path, "-o",
++                                       os.path.join(tmp, "t.o")],
++                                      capture_output=True).returncode == 0
++
++        decls = "\n".join(f"void {_func_ident(ADDR, n)}(void);"
++                          for n in TOOLCHAIN_NAMES)
++        self.assertTrue(compiles(decls), "mangled declarations must compile")
++        clashed = [n for n in CLASHING if not compiles(f"void {n}(void);")]
++        self.assertTrue(clashed, "no unmangled name clashed: the control is "
++                                 "not testing anything on this compiler")
++
++
++if __name__ == "__main__":
++    unittest.main()
