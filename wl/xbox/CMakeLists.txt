@@ -9,6 +9,13 @@ wl_target_defaults(wl_xbox DETERMINISTIC)
 target_link_libraries(wl_xbox PUBLIC wl_platform wl_gfx wl_codec m)
 add_library(WiiLibs::xbox ALIAS wl_xbox)
 
+# wl_xbox_gx: the NV2A's draws on GX (nv2a_gx.h), through wl/platform's direct GX layer: libogc on the
+# Wii, the host's recorder elsewhere
+add_library(wl_xbox_gx STATIC nv2a_gx.c)
+wl_target_defaults(wl_xbox_gx DETERMINISTIC)
+target_link_libraries(wl_xbox_gx PUBLIC wl_xbox wl_platform)
+add_library(WiiLibs::xbox_gx ALIAS wl_xbox_gx)
+
 # the vertex program compiler, a host tool (it includes vsh.c for its decoder's internals)
 if(NOT WL_PLATFORM STREQUAL "wii")
     add_executable(xbox_vsh_codegen ${PROJECT_SOURCE_DIR}/tools/xbox_vsh_codegen.c)
