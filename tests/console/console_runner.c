@@ -51,6 +51,7 @@ void wlt_suite_threads(void);
 void wlt_suite_fs(void);
 void wlt_suite_posix(const char *path);
 void wlt_suite_sseq(void);
+void wlt_suite_sqrt(void);
 
 // Close enough for an EFB colour: the EFB keeps 6 or 8 bits a channel depending on the mode.
 static bool near_rgb(uint32_t got, uint32_t want) {
@@ -828,6 +829,8 @@ int main(void) {
     wlt_suite_posix("sd:/wltest/posix.tmp");
     wlt_report("WLT SUITE sseq");
     wlt_suite_sseq();
+    wlt_report("WLT SUITE sqrt");
+    wlt_suite_sqrt();
 
     wlt_report("WLT RESULT pass=%d fail=%d", g_pass, g_fail);
     wlt_report("WLT DONE");

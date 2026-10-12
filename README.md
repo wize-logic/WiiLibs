@@ -18,7 +18,7 @@ Each module is `wl/<name>/` with its own README, a CMake target `wl_<name>` (ali
 | `host` | POSIX helpers for tools: files, JSON reader, SHA-1, threads, processes | host |
 | `platform` | Platform layer (GX, video, input, audio out, files, sockets, threads, tagged memory, a malloc that spills from MEM1 into MEM2, ring buffers, backtraces, a sampling profiler that a control file arms, a bring-up text console and stop screen) with a libogc backend and a dependency-free host backend | all |
 | `audio` | ADPCM decode (DSP-ADPCM via `codec`), 32-voice mixer, streamed music, DS SSEQ/SBNK/SWAR synthesiser, music track engine (`wl_audio_core` is the portable part) | all |
-| `gfx` | Matrix/vector maths, Broadway paired-single fast paths (C fallback elsewhere), GX texture decode/encode (wrappers over `codec`) | all |
+| `gfx` | Matrix/vector maths, Broadway paired-single fast paths (C fallback elsewhere), a correctly rounded `sqrtf` from `frsqrte` (opt-in `--wrap=sqrtf`), GX texture decode/encode (wrappers over `codec`) | all |
 | `gxtex` | Offline GX texture encoding, BRRES TEX0 reading, NDS 2D graphics (NCGR/NCLR/NCER/NANR) to GX | all |
 | `nds` | NDS ROM header, FNT/FAT, overlays, NARC, LZ10/LZ11/BLZ | all |
 | `ctr` | 3DS NCSD, NCCH, ExeFS, RomFS, GARC (decrypted images) | all (file source: host) |
