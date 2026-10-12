@@ -12,6 +12,7 @@
 // two endpoints with weights 5/8 : 3/8 ((5a + 3b) >> 3, not S3TC's 2/3 : 1/3).
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -61,6 +62,21 @@ size_t wl_gxc_encode_ci(WlGxcFormat fmt, const uint8_t *indices, uint32_t w, uin
 // w*h*4 bytes. I4/I8: intensity in all four channels; IA: intensity in rgb. Returns the bytes read, 0 on bad arguments.
 size_t wl_gxc_decode(WlGxcFormat fmt, const void *src, size_t src_len, uint32_t w, uint32_t h, uint8_t *rgba_out);
 size_t wl_gxc_decode_ci(WlGxcFormat fmt, const void *src, size_t src_len, uint32_t w, uint32_t h, uint8_t *indices_out);
+
+// ---- one texel ----------------------------------------------------------------------------------
+// A single texel of an encoded image, for code that samples a few texels of a GX texture on the processor
+// (a lightmap under an object, a picking test) without decoding the whole image. `src` holds the image as
+// wl_gxc_encode wrote it (`src_len` at least wl_gxc_tex_bytes for w x h), x < w and y < h; false for bad
+// arguments. Mip levels are the caller's: pass the level's own start and size.
+// wl_gxc_texel_read: the RGBA wl_gxc_decode gives for that texel (every format but C4 and C8).
+bool wl_gxc_texel_read(WlGxcFormat fmt, const void *src, size_t src_len, uint32_t w, uint32_t h, uint32_t x,
+                       uint32_t y, uint8_t rgba[4]);
+// wl_gxc_texel_raw: the texel as it is stored, before any expansion: I4 and C4 the nibble, I8, IA4 and C8 the
+// byte, IA8 (alpha << 8 | intensity), RGB565 and RGB5A3 the big-endian 16-bit value, RGBA8 alpha << 24 | red
+// << 16 | green << 8 | blue, CMPR the texel's 2-bit index into its sub-block's four colours (with
+// wl_gxc_cmpr_palette). All formats.
+bool wl_gxc_texel_raw(WlGxcFormat fmt, const void *src, size_t src_len, uint32_t w, uint32_t h, uint32_t x,
+                      uint32_t y, uint32_t *raw);
 
 // Palette entries: `rgba` (count*4 bytes) to `count` big-endian 16-bit entries (count*2 bytes written), and back.
 void wl_gxc_tlut_encode(WlGxcTlutFormat fmt, const uint8_t *rgba, uint32_t count, void *dst);

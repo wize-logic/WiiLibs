@@ -35,6 +35,13 @@ It is the one implementation behind `wl/gfx`'s `tex_codec` (run-time textures), 
   black. `wl_gxc_cmpr_encode_block` is deterministic and integer only: the endpoints are the two
   most distant distinct 565 colours of the block, pixels with alpha < 128 select the transparent
   mode, so blocks of at most two colours are exact up to 565 rounding.
+- **One texel:** `wl_gxc_texel_read` gives the RGBA `wl_gxc_decode` would for one texel of an encoded
+  image (every format but C4 and C8), and `wl_gxc_texel_raw` the texel as it is stored (I4/C4 the nibble,
+  I8/IA4/C8 the byte, IA8 `alpha << 8 | intensity`, RGB565 and RGB5A3 the 16-bit value, RGBA8
+  `alpha << 24 | red << 16 | green << 8 | blue`, CMPR the 2-bit index into the sub-block's palette),
+  for code that samples a few texels of a GX texture on the processor (a lightmap under an object)
+  without decoding the image. Both check the position and the source's length; a mip level is passed
+  as its own start and size. `wl_gxc_decode` uses the same texel code, so they cannot differ.
 - **TLUTs:** `wl_gxc_tlut_encode` / `wl_gxc_tlut_decode` convert RGBA entries to big-endian 16-bit
   entries and back.
 

@@ -222,6 +222,114 @@ TEST hostile_arguments_are_refused(void) {
 
 // ---- DSP-ADPCM ---------------------------------------------------------------------------------
 
+TEST texel_reads_agree_with_the_whole_image_decode(void) {
+    enum { W = 21, H = 13 };
+    static uint8_t src[W * H * 4];
+    static uint8_t enc[4096];
+    static uint8_t dec[W * H * 4];
+    static uint8_t idx[W * H];
+    static uint8_t back[W * H];
+    for (int i = 0; i < W * H * 4; i++) {
+        src[i] = (uint8_t)rnd();
+    }
+    for (int i = 0; i < W * H; i++) {
+        idx[i] = (uint8_t)rnd();
+    }
+    for (int f = WL_GXC_I4; f <= WL_GXC_CMPR; f++) {
+        size_t n = wl_gxc_encode((WlGxcFormat)f, src, W, H, enc, sizeof enc);
+        ASSERT(n > 0);
+        ASSERT_EQ(n, wl_gxc_decode((WlGxcFormat)f, enc, n, W, H, dec));
+        for (uint32_t y = 0; y < H; y++) {
+            for (uint32_t x = 0; x < W; x++) {
+                uint8_t px[4];
+                uint32_t raw;
+                ASSERT(wl_gxc_texel_read((WlGxcFormat)f, enc, n, W, H, x, y, px));
+                ASSERT_MEM_EQ(dec + (y * W + x) * 4u, px, 4);
+                ASSERT(wl_gxc_texel_raw((WlGxcFormat)f, enc, n, W, H, x, y, &raw));
+                switch (f) {
+                case WL_GXC_I8:
+                    ASSERT_EQ(px[0], raw);
+                    break;
+                case WL_GXC_IA8:
+                    ASSERT_EQ(((uint32_t)px[3] << 8) | px[0], raw);
+                    break;
+                case WL_GXC_RGB565: {
+                    uint8_t c[4];
+                    wl_gxc_rgb565_decode(raw, c);
+                    ASSERT_MEM_EQ(px, c, 4);
+                    break;
+                }
+                case WL_GXC_RGB5A3: {
+                    uint8_t c[4];
+                    wl_gxc_rgb5a3_decode(raw, c);
+                    ASSERT_MEM_EQ(px, c, 4);
+                    break;
+                }
+                case WL_GXC_RGBA8:
+                    ASSERT_EQ(((uint32_t)px[3] << 24) | ((uint32_t)px[0] << 16) | ((uint32_t)px[1] << 8) | px[2], raw);
+                    break;
+                case WL_GXC_I4:
+                    ASSERT_EQ(px[0], raw * 17u);
+                    break;
+                default:
+                    ASSERT(raw < 256u);
+                    break;
+                }
+            }
+        }
+    }
+    // CMPR: the raw index picks the palette entry the decoder shows
+    {
+        size_t n = wl_gxc_encode(WL_GXC_CMPR, src, W, H, enc, sizeof enc);
+        for (uint32_t y = 0; y < H; y++) {
+            for (uint32_t x = 0; x < W; x++) {
+                uint32_t raw;
+                uint8_t px[4];
+                const uint8_t *tile = enc + ((y / 8u) * 3u + (x / 8u)) * 32u;
+                const uint8_t *blk = tile + (((y % 8u) / 4u) * 2u + ((x % 8u) / 4u)) * 8u;
+                uint8_t pal[4][4];
+                wl_gxc_cmpr_palette(((uint32_t)blk[0] << 8) | blk[1], ((uint32_t)blk[2] << 8) | blk[3], pal);
+                ASSERT(wl_gxc_texel_raw(WL_GXC_CMPR, enc, n, W, H, x, y, &raw));
+                ASSERT(wl_gxc_texel_read(WL_GXC_CMPR, enc, n, W, H, x, y, px));
+                ASSERT_MEM_EQ(pal[raw], px, 4);
+            }
+        }
+    }
+    // the colour-indexed formats: raw is the index, read refuses them
+    for (int f = WL_GXC_C4; f <= WL_GXC_C8; f++) {
+        size_t n = wl_gxc_encode_ci((WlGxcFormat)f, idx, W, H, enc, sizeof enc);
+        ASSERT(n > 0);
+        ASSERT_EQ(n, wl_gxc_decode_ci((WlGxcFormat)f, enc, n, W, H, back));
+        for (uint32_t y = 0; y < H; y++) {
+            for (uint32_t x = 0; x < W; x++) {
+                uint32_t raw;
+                uint8_t px[4];
+                ASSERT(wl_gxc_texel_raw((WlGxcFormat)f, enc, n, W, H, x, y, &raw));
+                ASSERT_EQ(back[y * W + x], raw);
+                ASSERT(!wl_gxc_texel_read((WlGxcFormat)f, enc, n, W, H, x, y, px));
+            }
+        }
+    }
+    PASS();
+}
+
+TEST texel_reads_refuse_hostile_arguments(void) {
+    uint8_t enc[64] = {0};
+    uint8_t px[4];
+    uint32_t raw;
+    ASSERT(wl_gxc_texel_read(WL_GXC_RGBA8, enc, 64, 4, 4, 3, 3, px));
+    ASSERT(!wl_gxc_texel_read(WL_GXC_RGBA8, enc, 64, 4, 4, 4, 0, px));  // x out of range
+    ASSERT(!wl_gxc_texel_read(WL_GXC_RGBA8, enc, 64, 4, 4, 0, 4, px));  // y out of range
+    ASSERT(!wl_gxc_texel_read(WL_GXC_RGBA8, enc, 63, 4, 4, 0, 0, px));  // source shorter than the image
+    ASSERT(!wl_gxc_texel_read(WL_GXC_RGBA8, NULL, 64, 4, 4, 0, 0, px));
+    ASSERT(!wl_gxc_texel_read(WL_GXC_RGBA8, enc, 64, 0, 4, 0, 0, px));
+    ASSERT(!wl_gxc_texel_read((WlGxcFormat)99, enc, 64, 4, 4, 0, 0, px));
+    ASSERT(!wl_gxc_texel_raw((WlGxcFormat)99, enc, 64, 4, 4, 0, 0, &raw));
+    ASSERT(!wl_gxc_texel_raw(WL_GXC_RGBA8, enc, 64, 4, 4, 0, 0, NULL));
+    ASSERT(!wl_gxc_texel_raw(WL_GXC_CMPR, enc, 31, 8, 8, 0, 0, &raw));
+    PASS();
+}
+
 TEST dsp_known_frame_gives_known_samples(void) {
     // Predictor pair 0 = (0.5, 0), scale 1 (step 4096), history 0: s = (nib*4096 + 1024 + 1024*h1) >> 11.
     WlDspState st;
@@ -328,6 +436,8 @@ SUITE(codec_suite) {
     RUN_TEST(cmpr_edge_blocks_repeat_the_edge);
     RUN_TEST(other_formats_layout_and_roundtrip);
     RUN_TEST(hostile_arguments_are_refused);
+    RUN_TEST(texel_reads_agree_with_the_whole_image_decode);
+    RUN_TEST(texel_reads_refuse_hostile_arguments);
     RUN_TEST(dsp_known_frame_gives_known_samples);
     RUN_TEST(dsp_clamps_and_masks_the_predictor);
     RUN_TEST(dsp_matches_a_reference_decoder);
