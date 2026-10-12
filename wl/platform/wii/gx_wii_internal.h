@@ -3,9 +3,12 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 // The copy filter for EFB copies to textures: off (the display copy's deflicker filter blurs them),
 // or the video mode's own for the copy to the XFB. Writes GX_SetCopyFilter.
 void wl_gx_wii_copy_filter(bool display);
 // GX commands were submitted behind the shadow's back (wl_gx_peek_rgba then syncs first).
 void wl_gx_wii_note_commands(void);
+// A draw-sync token sent into the FIFO now (0 before wl_gx_init): hwcount.h's marks.
+uint32_t wl_gx_wii_mark_token(void);

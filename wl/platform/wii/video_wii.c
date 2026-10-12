@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "wl/platform/platform.h"
+#include "wl/platform/hwcount.h"
 #include "wl/platform/present.h"
 
 #define TAG "VIDEO"
@@ -196,7 +197,9 @@ void *wl_platform_video_back_buffer(void) {
             WL_LOG_E(TAG, "no free XFB after %u retraces: %s", (unsigned)waited,
                      r >= 0 ? "a waiting frame dropped" : "still waiting");
         }
+        wl_hwcount_wait_begin(WL_HWWAIT_DISPLAY);
         VIDEO_WaitVSync(); // (sleeps; the queue moves on in the retrace interrupt)
+        wl_hwcount_wait_end(WL_HWWAIT_DISPLAY);
     }
 }
 

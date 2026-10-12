@@ -51,6 +51,8 @@ wl_add_test(test_platform_stop SOURCES test_platform_stop.c LIBS wl_platform LAB
 # Leaving the program: shutdown hooks, the system buttons' thread, the GX FIFO's size from its budget.
 wl_add_test(test_platform_shutdown SOURCES test_platform_shutdown.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_profile_arm SOURCES test_platform_profile_arm.c LIBS wl_platform LABELS unit be)
+# The hardware counters' engine (hwcount.c) on a fake machine: groups, windows, medians, the verdict, the log.
+wl_add_test(test_platform_hwcount SOURCES test_platform_hwcount.c LIBS wl_platform LABELS unit be)
 
 # Input shaping (sticks, triggers, the Remote's pointer): portable, also on ppc-be ...
 wl_add_test(test_platform_input_shape SOURCES test_platform_input_shape.c LIBS wl_platform LABELS unit be)

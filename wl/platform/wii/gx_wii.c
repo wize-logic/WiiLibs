@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "wl/platform/gx_target_internal.h"
+#include "wl/platform/hwcount.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/tev.h"
@@ -233,6 +234,7 @@ WlResult wl_gx_init(void) {
 #endif
     g.fifo = fifo;
     g.fifo_bytes = fifo_bytes;
+    wl_hwcount_set_fifo_size(fifo_bytes);
     g.fb_w = vi.fb_width;
     g.efb_h = vi.efb_height;
 
@@ -270,6 +272,7 @@ void wl_gx_shutdown(void) {
         return;
     }
     (void)wl_gx_sync();
+    wl_hwcount_stop();
     wl_gx_target_shutdown();
     WL_LOG_I(TAG, "down: FIFO peak fill %u of %u bytes, %u samples above the high-water mark",
              (unsigned)g.stats.fifo_peak, (unsigned)g.fifo_bytes, (unsigned)g.stats.fifo_hiwater);
@@ -324,6 +327,7 @@ static uint32_t send_token(void) {
 static bool wait_token(uint32_t t) {
     uint64_t t0 = now_us();
     bool ok = true;
+    wl_hwcount_wait_begin(WL_HWWAIT_GPU); // (the processor's counters leave the wait out)
     // (the first token after init is waited for exactly: the register held anything before it)
     while (g.token == 1u ? GX_GetDrawSync() != 1u : !token_passed(t)) {
         if (now_us() - t0 > WAIT_TIMEOUT_US) {
@@ -334,7 +338,13 @@ static bool wait_token(uint32_t t) {
         }
     }
     note_wait(t0);
+    wl_hwcount_wait_end(WL_HWWAIT_GPU);
     return ok;
+}
+
+// A draw-sync token for hwcount.h's timeline: the GPU stamps the time it passes it.
+uint32_t wl_gx_wii_mark_token(void) {
+    return g.ready ? send_token() : 0u;
 }
 
 bool wl_gx_sync(void) {
@@ -382,6 +392,7 @@ static void clear_efb(uint32_t rgba) {
 void wl_gx_begin_frame(uint32_t clear_rgba) {
     WL_ASSERT(g.ready);
     VCHECK(!g.in_frame, "begin_frame inside a frame");
+    wl_hwcount_frame_begin(); // (closes the last frame's window, opens this one's: the counters' selections queue here)
     wl_gx_reset_state();
     if (clear_rgba != g.clear_next) {
         clear_efb(clear_rgba);
@@ -443,6 +454,7 @@ uint32_t wl_gx_end_frame(void) {
     }
     g.in_frame = false;
     g.stats.frames++;
+    wl_hwcount_frame_end();
     return wl_platform_video_present_when(token_passed, t);
 }
 
