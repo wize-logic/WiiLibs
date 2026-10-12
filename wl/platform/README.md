@@ -30,6 +30,8 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `tev.h`, `tev.c` | TEV programs as data: stages (inputs a b c d, op, bias, scale, clamp, output register, order, swap tables, konst selections), the helpers a translator allocates with (konst slots, register pool, resource merging), a validator, a software evaluator, the fixed GX recipes as programs; see below |
 | `backtrace.h`, `backtrace.c` | return-address backtraces for the 32-bit PowerPC frame layout: a portable walker over a read callback, `wl_platform_backtrace` for the running thread, `wl_platform_log_backtrace` for a "where from" log line; see below |
 | `profile.h`, `profile.c` | the sampling profiler: a ring of samples (the interrupted pc, link register, thread and the return addresses up its stack), the text dumps, the jitter; `wii/profile_wii.c` is the sampler over libogc's decrementer tick tasks; `tools/wl_profile.py` symbolizes the dumps; see below |
+| `overlay.h`, `overlay.c` | drawing for a frame overlay: rectangles, outlines, gauges and text in a built-in 5 by 7 font, as quads through `wl_gx_draw`; see "Frame overlay" |
+| `audio_gain.h`, `audio_gain.c` | the audio output's master gain (`wl_platform_audio_fade`): a linear ramp applied to each block after the program's fill function; see "Audio fade" |
 | `stop.h`, `stop.c`, `stop_backend.h` | the bring-up text console (libogc's, in one of the video's framebuffers) and the stop screen: a message on it and in the log, then a wait for HOME or START to leave; `wl_platform_missing_symbol` is what `tools/link_stubs.py` points its stubs at; `wii/stop_wii.c` and `host/stop_host.c` are the backends; see "Console and stop screen" |
 | `profile_arm.h`, `profile_arm.c` | arming the profiler from a control file (`profile.txt` in the program's folder): the settings' parser, the watcher thread that waits for the program's own readiness hooks, samples for a time and writes `profile<N>.txt`; see "Arming it from a file" under the sampling profiler |
 | `hwcount.h`, `hwcount.c`, `hwcount_app.c` | the console measuring itself: the Broadway's performance monitor (PMC1 to PMC4) and GX's counters read once a frame in rotating groups, medians a second, a verdict on what bounds the frame, marks and the FIFO's fill as a timeline; armed by `hwcount.txt`; `wii/hwcount_wii.c` is the Wii's machine; see "Hardware counters" |
@@ -86,6 +88,12 @@ motors are stopped.
 
 The hooks run while the program's other threads still run; a hook that must keep another thread
 from starting new work (a write to a file) has to stop it itself, and should not wait long.
+
+`wl_platform_system_simulate(events)` makes the watcher see a reset or power press that did not happen:
+it logs "reset button (simulated): not leaving" (or "power button ...") at its next look and leaves
+nothing. A script that tests how a program reacts to the buttons (its log, its hooks' timing) can press
+them without ending the run; real presses are served as ever. `WL_ERR_STATE` while the watcher is not
+running. The hooks are not run by a simulated press: `wl_platform_exit` is the test of those.
 
 **Rumble.** `wl_platform_rumble` and `wl_platform_pad_rumble` honour the console's setting for
 Wii Remote vibration (SYSCONF's `BT.MOT`, libogc's `CONF_GetPadMotorMode`; `wl_platform_rumble_enabled`):
@@ -496,6 +504,43 @@ wl_heap_overflow_log_sites(12);   // "812 KiB in 12 blocks (peak 900 KiB, 40 mad
   against a plain model over a long random run; all run on
   the host, under sanitizers and on `ppc-be`. The console runner links with the wrappers and mallocs
   past MEM1 (`ctest -L dolphin`; "WLT SUITE heap_overflow" in its log).
+
+## Frame overlay (`overlay.h`) and audio fade
+
+**Frame overlay.** `wl_gx_set_overlay(fn, user)` hangs a function on the end of every frame:
+`wl_gx_end_frame` calls `fn(user, width, height)` after the program's last draw and before the display
+copy, so what it draws lands over the finished picture. A menu, a notice or a gauge that belongs to the
+platform rather than the program (the HOME button's menu, a battery warning) can be put there without
+touching the program's renderer. Rules:
+
+- The state is reset before the call (`wl_gx_reset_state`: the whole EFB, an orthographic projection
+  over its pixels with y down, blending off) and after it, so the overlay inherits nothing and leaves
+  nothing; a program that sets GX behind the shadow calls `wl_gx_invalidate_shadow` before
+  `wl_gx_end_frame` as it must anyway.
+- The back buffer has the EFB (a render target that held it has been resolved).
+- An unset hook costs one pointer test a frame, and the program that wants the frame free when nothing
+  is shown sets the hook only while something is (`wl_gx_set_overlay(NULL, NULL)` removes it). The
+  hook is read on the thread that ends frames; set it from there.
+- The overlay's draws are in the frame, so its quads cost the GPU what quads cost: a menu's text is
+  some hundreds of them (a run of lit pixels in a glyph's row is one quad), sent in batches of 128.
+
+`overlay.h` draws for it with no textures and no assets: `wl_overlay_begin` (blending, no depth, vertex
+colours), `wl_overlay_rect`, `wl_overlay_frame`, `wl_overlay_gauge`, `wl_overlay_text` (with a
+shadow; `\n` starts a line; a scale of 1 to 8 screen pixels to a glyph pixel), `wl_overlay_text_width`
+and `_height`, and `wl_overlay_end`. The font is 5 by 7 pixels in a cell of 6 by 9: capitals, digits
+and `. , : ; - + ! ? % / ( ) ' _ > < [ ] = *`; lower case is drawn as capitals and any other character
+as a box. Hand-drawn for this library (the glyph shapes are the usual ones for a 5 by 7 matrix).
+Tests: `test_platform_overlay` (the hook once a frame with the state reset around it, removable; the
+quads of a rectangle, an outline, a gauge and a glyph; batches; the font's glyphs differ).
+
+**Audio fade.** `wl_platform_audio_fade(gain, ms)` sets the output's master gain: from where it is to
+`gain` (0 to 1) linearly over `ms` milliseconds of output (0: at once), applied by the audio thread to
+each hardware block after the program's `fill` (so a program's mixer is untouched: a pause menu fades
+the sound out and back with one call each). While the gain is 1 and no ramp runs, a block costs a
+test. Two calls between two blocks make one: the last wins, from where the ramp is. The request is
+three atomics, so any thread may call it; `wl_platform_audio_gain()` returns the last target. Test:
+`test_platform_audio_fade` (untouched at 1, at once for 0 ms, the ramp's shape and end, continuing from
+the middle of a ramp, clamping, set before the output starts).
 
 ## Hardware facts behind the rules
 

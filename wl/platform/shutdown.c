@@ -67,9 +67,18 @@ static struct {
     bool running;
 } g_watch;
 
+static atomic_uint g_simulated;
+
 static void *watch_main(void *arg) {
     (void)arg;
     while (atomic_load(&g_watch.stop) == 0u) {
+        const uint32_t simulated = atomic_exchange(&g_simulated, 0u);
+        if ((simulated & WL_SYS_POWER) != 0u) {
+            WL_LOG_I(LOG_TAG, "power button (simulated): not leaving");
+        }
+        if ((simulated & WL_SYS_RESET) != 0u) {
+            WL_LOG_I(LOG_TAG, "reset button (simulated): not leaving");
+        }
         uint32_t events = wl_platform_system_events();
         if ((events & WL_SYS_POWER) != 0u) {
             wl_platform_exit(WL_EXIT_POWER_OFF);
@@ -109,6 +118,14 @@ WlResult wl_platform_system_watch_start(uint32_t period_ms, WlSystemTickFn tick,
         return r;
     }
     g_watch.running = true;
+    return WL_OK;
+}
+
+WlResult wl_platform_system_simulate(uint32_t events) {
+    if (!g_watch.running) {
+        return WL_ERR_STATE;
+    }
+    atomic_fetch_or(&g_simulated, events & (WL_SYS_POWER | WL_SYS_RESET));
     return WL_OK;
 }
 
