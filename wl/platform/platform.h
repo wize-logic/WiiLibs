@@ -318,6 +318,34 @@ void wl_gx_tex_bind_ex(const WlGxTexObj *tex, const WlGxSampler *sampler, const 
 void wl_gx_tex_bind(const WlGxTexObj *tex);
 void wl_gx_tex_invalidate(void);
 
+// The ramp: an I8 texture of 256 by 4 texels whose value is its x coordinate (every row the same),
+// bound to a texture map of the caller's choice with nearest filtering and clamping. A vertex
+// carries a number from 0 to 1 as a texture coordinate s = wl_gx_ramp_coordinate(value) (the middle
+// of texel round(value * 255)); the TEV reads it back as the texture's colour and alpha, so a value
+// the hardware has no vertex output for (the fog factor of a vertex shader, a per-vertex weight)
+// reaches the stages. For a texture coordinate generator that passes the coordinate unchanged.
+#define WL_GX_RAMP_WIDTH 256u
+#define WL_GX_RAMP_HEIGHT 4u
+#define WL_GX_RAMP_BYTES (WL_GX_RAMP_WIDTH * WL_GX_RAMP_HEIGHT)
+// Writes the ramp's image into `image` (WL_GX_RAMP_BYTES bytes, tile-ordered like any I8 texture).
+void wl_gx_ramp_fill(void *image);
+// The shared image: 32-byte aligned, committed for the GPU, built at the first call.
+const void *wl_gx_ramp_image(void);
+// Loads the ramp into texture map `texmap` (0..7). Bypasses the shadow's texture binding when the
+// map is 0 (it is marked unknown). Needs wl_gx_init.
+void wl_gx_ramp_bind(uint32_t texmap);
+// The texture coordinate s that reads `value` (0 to 1; anything else, NaN included, is clamped to 0
+// or 1) off the ramp: (value * 255 + 0.5) / 256.
+static inline float wl_gx_ramp_coordinate(float value) {
+    if (!(value >= 0.0f)) {
+        value = 0.0f;
+    }
+    if (value > 1.0f) {
+        value = 1.0f;
+    }
+    return (value * 255.0f + 0.5f) * (1.0f / 256.0f);
+}
+
 // Frame: begin sets the default state, viewport/scissor to the full EFB and clears to
 // `clear_rgba` (free when it equals the colour the last end_frame cleared with); end copies the
 // EFB to the back XFB (clearing for the next frame), sends a draw-sync token behind the copy and

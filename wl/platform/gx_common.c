@@ -16,6 +16,28 @@ size_t wl_gx_tex_bytes(WlGxTexFormat fmt, uint32_t width, uint32_t height) {
     return tx * ty * tile[fmt][2];
 }
 
+void wl_gx_ramp_fill(void *image) {
+    uint8_t *texels = image;
+    // I8 is stored in tiles of 8 by 4 texels, 32 bytes each, a row of 8 texels after another: the
+    // 256 by 4 ramp is one row of 32 tiles, and a texel's value is its x coordinate
+    for (uint32_t y = 0; y < WL_GX_RAMP_HEIGHT; y++) {
+        for (uint32_t x = 0; x < WL_GX_RAMP_WIDTH; x++) {
+            texels[(x / 8u) * 32u + y * 8u + (x % 8u)] = (uint8_t)x;
+        }
+    }
+}
+
+const void *wl_gx_ramp_image(void) {
+    static _Alignas(32) uint8_t image[WL_GX_RAMP_BYTES];
+    static bool made;
+    if (!made) {
+        wl_gx_ramp_fill(image);
+        wl_gpu_buffer_commit(image, sizeof image);
+        made = true;
+    }
+    return image;
+}
+
 size_t wl_gx_tex_bytes_mips(WlGxTexFormat fmt, uint32_t width, uint32_t height, uint32_t mips) {
     size_t total = 0;
     for (uint32_t i = 0; i < (mips == 0 ? 1u : mips); i++) {

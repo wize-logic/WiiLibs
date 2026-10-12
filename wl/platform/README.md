@@ -30,13 +30,14 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `backtrace.h`, `backtrace.c` | return-address backtraces for the 32-bit PowerPC frame layout: a portable walker over a read callback, `wl_platform_backtrace` for the running thread, `wl_platform_log_backtrace` for a "where from" log line; see below |
 | `profile.h`, `profile.c` | the sampling profiler: a ring of samples (the interrupted pc, link register, thread and the return addresses up its stack), the text dumps, the jitter; `wii/profile_wii.c` is the sampler over libogc's decrementer tick tasks; `tools/wl_profile.py` symbolizes the dumps; see below |
 | `net.h`, `net.c`, `net_internal.h` | IPv4 TCP and UDP sockets over IOS (libogc) or the host: addresses as host-order values, errors as results, poll for select, the network started in the background; `net.c` has the errno mapping and the address text; see below |
-| `gx_common.c` | GX helpers needing no hardware: texture sizes, sampler filter resolution |
+| `gx_common.c` | GX helpers needing no hardware: texture sizes, sampler filter resolution, the ramp texture's image |
+| `gx_target.h`, `gx_target.c`, `gx_target_internal.h` | render targets on GX's one EFB: who owns it, parking and putting back the back buffer, resolving a target into its memory, clear quads; the portable bookkeeping over a small backend (`gx_target_internal.h`: `wii/gx_target_wii.c`, `host/gx_target_host.c`); see "Render targets" |
 | `stack.c` | stack depth measurement: a fill pattern and the high-water mark (`wl_platform_stack_used`) |
-| `wii/` | libogc backends (`heap_wrap_wii.c` wraps newlib's malloc family for the overflow heap and includes no libogc header; `tev_wii.c` applies a TEV program to GX): 64-bit atomics (the libatomic calls compilers make; Broadway has no 8-byte atomic instructions), thread-local variables (`__emutls_get_address` for `-femulated-tls`), the crash report (and the backtrace it uses, `backtrace_wii.c`), the exit tracer (`trace_wii.c`), network (`net_wii.c`, libogc's `net_*`), audio (AESND/ASND), exit and system buttons, fs (libfat, IOS 58), gx (with an optional EFB alpha, `wl_gx_set_efb_alpha`), input (WPAD/PAD/keyboard), log sinks, mem, threads (LWP), video |
-| `host/` | stubs: backtrace (the real chain on ppc-be, none elsewhere), net (POSIX sockets), audio (test renders blocks), fs (devices map to directories), gx (records draws), input (preloaded state), mem (malloc'd regions), system and log, tev (records the last applied program), threads (pthreads) |
+| `wii/` | libogc backends (`heap_wrap_wii.c` wraps newlib's malloc family for the overflow heap and includes no libogc header; `tev_wii.c` applies a TEV program to GX): 64-bit atomics (the libatomic calls compilers make; Broadway has no 8-byte atomic instructions), thread-local variables (`__emutls_get_address` for `-femulated-tls`), the crash report (and the backtrace it uses, `backtrace_wii.c`), the exit tracer (`trace_wii.c`), network (`net_wii.c`, libogc's `net_*`), audio (AESND/ASND), exit and system buttons, fs (libfat, IOS 58), gx (with an optional EFB alpha, `wl_gx_set_efb_alpha`; `gx_target_wii.c` is the render targets' copies and quads), input (WPAD/PAD/keyboard), log sinks, mem, threads (LWP), video |
+| `host/` | stubs: backtrace (the real chain on ppc-be, none elsewhere), net (POSIX sockets), audio (test renders blocks), fs (devices map to directories), gx (records draws; `gx_target_host.c` records the render targets' operations), input (preloaded state), mem (malloc'd regions), system and log, tev (records the last applied program), threads (pthreads) |
 
 Host test control lives in `host/*_host.h`: `wl_host_audio_render`, `wl_host_fs_set_root`,
-`wl_host_gx_state` / `wl_host_gx_record`, `wl_host_input_set`, `wl_host_system_raise`, `wl_host_tev_last`.
+`wl_host_gx_state` / `wl_host_gx_record`, `wl_host_target_ops`, `wl_host_input_set`, `wl_host_system_raise`, `wl_host_tev_last`.
 
 ## Typical start-up
 
@@ -405,7 +406,36 @@ The front face is clockwise (opposite of OpenGL). Directional lights are point l
 A FIFO overflow or bad state hangs real hardware: the debug validation in `gx_wii.c` catches
 bad enums, unaligned buffers and draws with the wrong state. TMEM is about 1 MiB: prefer CMPR
 and C4/C8 textures. `wl_gx_copy_efb_texture` is the render-to-texture path; its I4/I8 copies take
-the red channel as is (the luminance copy would map black to 16 and white to 235).
+the red channel as is (the luminance copy would map black to 16 and white to 235). Copies out of
+the EFB to textures are unfiltered: the vertical (deflicker) filter that stays set for the display
+copy would blur them, so it is switched off around each copy and back on after. A copy may reach
+any of the EFB's 528 rows, below the picture too.
+
+**Render targets** (`gx_target.h`). GX draws into one EFB, so a texture to render into takes it
+from the back buffer and gives it back. `wl_gx_target_use(&target)` is called before each draw
+(or clear) with the surface it goes to, NULL for the back buffer. A change of surface moves the
+EFB: a back buffer with something drawn into it (`wl_gx_target_drawn`) is parked first, its
+colour (RGBA8) and depth (Z24X8) copied into two blocks of the layer's own (from the allocator
+`wl_gx_target_set_allocator` gives, `aligned_alloc` by default), unfiltered; a target is drawn within a
+scissor of its size at the EFB's origin and is resolved when it leaves (its pixels copied into
+`target.memory` in GX's RGBA8 or RGB565 tiles, which a texture object over that memory then reads,
+and the target is returned to the caller to record); the back buffer is put back by a quad of the
+whole of it that writes the parked colour and, through a Z texture (`GX_SetZTexture` replace, depth
+test always passing), the parked depth. `wl_gx_target_clear` is a clear of a rectangle once the
+frame has begun, also a quad. `wl_gx_begin_frame` gives the EFB to the back buffer, and
+`wl_gx_end_frame` puts it back if a target holds it. The target functions that draw use raw GX and
+call `wl_gx_invalidate_shadow` after; what they leave set is listed with `wl_gx_target_clear`.
+The part of the EFB that is the back buffer defaults to the video mode's width and EFB height and
+is set with `wl_gx_target_set_back_buffer_size` (a game that draws a 640 by 480 picture in a taller
+EFB parks and restores that). Tests: `test_platform_target` (the owner on the host stub),
+`test_platform_target_gx` (`wii/gx_target_wii.c` against a recording stand-in for libogc's GX, the exact calls in
+order) and the console suite's `gx_target_*` cases (read back from the EFB).
+
+**The ramp.** `wl_gx_ramp_bind(map)` loads a 256 by 4 I8 texture whose value is its x coordinate
+(nearest, clamped) into a texture map; a vertex whose texture coordinate is
+`wl_gx_ramp_coordinate(v)` delivers the number `v` (0 to 1) to the TEV as the texture's colour and
+alpha. It carries a value that GX has no vertex output for (a vertex shader's fog factor, a weight)
+into the stages.
 
 **Threads.** libogc LWPs are strictly priority-scheduled on one core: a higher-priority thread
 preempts as soon as it is ready, a lower one runs only while higher ones block. So spin-wait
