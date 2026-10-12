@@ -27,6 +27,9 @@ if(WL_PLATFORM STREQUAL "host")
     # the committed big-endian header is what the generator makes from the patched template
     add_test(NAME xbox_recomp_header_current
         COMMAND ${Python3_EXECUTABLE} ${recomp_include}/gen_recomp_types.py --check)
+    # the vendored copy is pristine (every file matches UPSTREAM.json) and every patch applies
+    add_test(NAME xboxrecomp_vendored_copy
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/xboxrecomp_sync.py status)
     # xboxrecomp's own pytest suite, on the patched copy
     add_test(NAME xboxrecomp_pytest
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/run_pytest.py --build ${work}/pytest)
@@ -36,8 +39,8 @@ if(WL_PLATFORM STREQUAL "host")
     # whole programs lifted function by function, against the x86 CPU
     add_test(NAME xbox_recomp_e2e
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/e2e.py --build ${work}/e2e)
-    set_tests_properties(xbox_recomp_header_current xboxrecomp_pytest xbox_recomp_conformance
-        xbox_recomp_e2e PROPERTIES LABELS unit SKIP_RETURN_CODE 77 TIMEOUT 1500)
+    set_tests_properties(xbox_recomp_header_current xboxrecomp_vendored_copy xboxrecomp_pytest
+        xbox_recomp_conformance xbox_recomp_e2e PROPERTIES LABELS unit SKIP_RETURN_CODE 77 TIMEOUT 1500)
     if(no_capstone)
         set_tests_properties(xboxrecomp_pytest xbox_recomp_conformance xbox_recomp_e2e
             PROPERTIES DISABLED TRUE)
