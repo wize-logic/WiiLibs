@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Mon, 12 Oct 2026 18:00:00 -0400
+Subject: [PATCH] recomp: cvt(t)ss2si/cvt(t)sd2si through recomp_cvt_si32
+
+The scalar SSE float-to-int conversions were lifted as a bare
+"(int32_t)x" cast, which is wrong in two ways.
+
+1. The non-truncating forms (cvtss2si, cvtsd2si) round under MXCSR.RC,
+   round to nearest even by default, but a C cast truncates: cvtss2si of
+   1.5 gave 1 where the CPU gives 2, and of 3.5 gave 3 instead of 4.
+   Host-independent; it is wrong on x86 too.
+2. A NaN or a value outside int32 is undefined behaviour for the cast.
+   x86 returns the integer indefinite 0x80000000 (invalid masked). An x86
+   host's cvttsd2si happens to do the same; a PowerPC host's fctiwz
+   saturates (+3e9 gives 0x7FFFFFFF), so the result depends on the host.
+
+recomp_cvt_si32(value, truncate) in recomp_types.h does both explicitly:
+nearest-even (or truncation) independent of the host rounding mode, and
+0x80000000 for NaN and out-of-range values. x87 fist/fistp already went
+through recomp_fist, and cvt(t)ps2pi through MMX_CVT_F2I; this covers the
+remaining scalar forms. The operand read is unchanged (a register source
+for the sd forms still reads lane f[0], as movsd does; SSE2 doubles are
+outside this fix).
+
+Tests: test_cvt_si32.py checks every form emits the helper, and compiles
+the helper from the header and compares it with a Python reference over
+ties, signed zeroes, the int32 edges, infinities and NaN. Conformance
+cases sse_cvt(t)ss2si_{mem,reg} and sse2_cvt(t)sd2si_mem run the same
+edges on the real CPU.
+---
+ templates/runtime/recomp_types.h | 23 ++++++++
+ tools/conformance/cases.py       | 31 +++++++++++
+ tools/recomp/lifter.py           | 12 ++++-
+ tools/recomp/test_cvt_si32.py    | 92 ++++++++++++++++++++++++++++++++
+ 4 files changed, 156 insertions(+), 2 deletions(-)
+ create mode 100644 tools/recomp/test_cvt_si32.py
+
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index 8e9325e..6ca6fd0 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -330,6 +330,29 @@ static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits)
+     return (int64_t)rounded;
+ }
+ 
++/* SSE scalar float -> int32 (cvtss2si, cvttss2si, cvtsd2si, cvttsd2si).
++ * truncate = 1 for the cvtt forms, which round toward zero; the others round
++ * under MXCSR.RC, which nothing in the generated code changes from its
++ * default, round to nearest even -- so that is done here explicitly rather
++ * than with the host's rounding mode. NaN and anything outside int32 give the
++ * integer indefinite 0x80000000, as the CPU does with the invalid exception
++ * masked; a bare C cast is undefined there, and saturates on PowerPC. */
++static inline int32_t recomp_cvt_si32(double value, int truncate) {
++    double rounded;
++    if (value != value) return (int32_t)0x80000000u;
++    if (truncate) {
++        rounded = trunc(value);
++    } else {
++        double lo = floor(value), fraction = value - lo;
++        rounded = lo;
++        if (fraction > 0.5 || (fraction == 0.5 && fmod(lo, 2.0) != 0.0))
++            rounded = lo + 1.0;
++    }
++    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
++        return (int32_t)0x80000000u;
++    return (int32_t)rounded;
++}
++
+ /* ================================================================
+  * ICALL trace ring buffer (for debugging indirect calls)
+  * ================================================================ */
+diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
+index 3dc42a7..7256008 100644
+--- a/tools/conformance/cases.py
++++ b/tools/conformance/cases.py
+@@ -49,6 +49,18 @@ _EDGES = [0x00000000, 0x00000001, 0x0000007F, 0x00000080, 0x000000FF,
+ _PAIRS = [(a, b) for a in _EDGES for b in (0x00000001, 0x0000007F, 0x00000080,
+                                            0x000000FF, 0xFFFFFFFF)]
+ 
++# Scalar float -> int32 conversions. Ties at .5 (cvtss2si rounds to even;
++# cvttss2si truncates), the signed zeroes, the largest floats either side of
++# 2^31, and values that do not fit at all: x86 answers those with the integer
++# indefinite 0x80000000, and a C cast is undefined (PowerPC saturates).
++_CVT_VALUES = (0.0, -0.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 1.49999988,
++               123456.75, -123456.75, 2147483520.0, -2147483648.0,
++               2147483648.0, -2147483904.0, 3.0e9, -3.0e9, 1.0e20,
++               float("inf"), -float("inf"), float("nan"))
++_CVT_SS = [((v, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)) for v in _CVT_VALUES]
++_CVT_SD = [(v, 0.0) for v in _CVT_VALUES + (2147483647.0, 2147483647.5,
++                                            -2147483648.5, -2147483648.75)]
++
+ # Shift counts that differ once a host stops masking them to five bits:
+ # zero, in range, 31, and 32..255 (which x86 reduces modulo 32).
+ _SHIFT_COUNTS = [(a, c) for a in (0x00000001, 0x80000001, 0x12345678,
+@@ -519,6 +531,25 @@ for _op in (
+             ["pxor mm0, mm0", "pxor mm1, mm1", "xorps xmm0, xmm0"]
+             + _before + [_op] + _after + ["emms"], [(0, 7), (1, 7)]))
+ 
++# cvt(t)ss2si / cvt(t)sd2si: the non-t forms round to nearest even (MXCSR's
++# default), the t forms truncate, and both return 0x80000000 for NaN and for
++# anything outside int32. The double forms use the fpu kind only for its
++# input layout (a double at [eax]); the x87 stack stays empty.
++CASES += [
++    Case("sse_cvtss2si_mem", "cvtss2si rounds to nearest even; 0x80000000 out of range",
++         ["cvtss2si eax, dword ptr [eax]"], _CVT_SS, "sse"),
++    Case("sse_cvttss2si_mem", "cvttss2si truncates; 0x80000000 out of range",
++         ["cvttss2si eax, dword ptr [eax]"], _CVT_SS, "sse"),
++    Case("sse_cvtss2si_reg", "the register form converts lane 0 the same way",
++         ["movss xmm1, dword ptr [eax]", "cvtss2si eax, xmm1"], _CVT_SS, "sse"),
++    Case("sse_cvttss2si_reg", "the register form of the truncating conversion",
++         ["movss xmm1, dword ptr [eax]", "cvttss2si eax, xmm1"], _CVT_SS, "sse"),
++    Case("sse2_cvtsd2si_mem", "cvtsd2si of a double rounds to nearest even",
++         ["cvtsd2si eax, qword ptr [eax]"], _CVT_SD, "fpu"),
++    Case("sse2_cvttsd2si_mem", "cvttsd2si of a double truncates",
++         ["cvttsd2si eax, qword ptr [eax]"], _CVT_SD, "fpu"),
++]
++
+ CASES.append(Case("pushad_popad", "POPAD restores registers and skips saved ESP",
+     ["pushad", "mov eax, 0", "mov ecx, 0", "popad", "add eax, ecx"], _PAIRS))
+ 
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index e5530c3..6b7651f 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -3306,16 +3306,24 @@ class Lifter:
+             if nops >= 2:
+                 src = _fmt_operand_read(ops[1])
+                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
++        # cvt(t)ss2si / cvt(t)sd2si: through recomp_cvt_si32, not a C cast.
++        # A cast truncates, so the non-t forms (round under MXCSR, nearest by
++        # default) came out truncated: cvtss2si of 1.5 gave 1 where the CPU
++        # gives 2. And an out-of-range or NaN source is undefined in C, where
++        # x86 returns the integer indefinite 0x80000000; a PowerPC host's
++        # fctiwz saturates instead (+3e9 -> 0x7FFFFFFF).
+         if m in ("cvtss2si", "cvttss2si"):
+             if nops >= 2:
+-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
++                t = 1 if m.startswith("cvtt") else 0
++                return [_fmt_operand_write(ops[0], f"(uint32_t)recomp_cvt_si32({_sse_read(ops[1])}, {t})") + f" /* {m} */"]
+         if m == "cvtsi2sd":
+             if nops >= 2:
+                 src = _fmt_operand_read(ops[1])
+                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
+         if m in ("cvtsd2si", "cvttsd2si"):
+             if nops >= 2:
+-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
++                t = 1 if m.startswith("cvtt") else 0
++                return [_fmt_operand_write(ops[0], f"(uint32_t)recomp_cvt_si32({_sse_read(ops[1])}, {t})") + f" /* {m} */"]
+         if m == "cvtss2sd":
+             if nops >= 2:
+                 return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]
+diff --git a/tools/recomp/test_cvt_si32.py b/tools/recomp/test_cvt_si32.py
+new file mode 100644
+index 0000000..a60adde
+--- /dev/null
++++ b/tools/recomp/test_cvt_si32.py
+@@ -0,0 +1,92 @@
++"""cvt(t)ss2si and cvt(t)sd2si go through recomp_cvt_si32.
++
++They used to lift to a bare "(int32_t)x" cast. That is wrong twice: the
++non-truncating forms round (to nearest even under the default MXCSR) but a
++cast truncates, so cvtss2si of 1.5 gave 1 instead of 2; and a NaN or
++out-of-range source is undefined in C, where x86 returns the integer
++indefinite 0x80000000 (a PowerPC host saturates to 0x7FFFFFFF instead).
++
++The emitted text is checked here, and the helper itself is compiled from the
++runtime header and compared with a Python reference over the edges.
++"""
++
++import math
++import os
++import pathlib
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++from .disasm import Instruction, Operand
++from .lifter import Lifter
++
++_HEADER_DIR = pathlib.Path(__file__).resolve().parents[2] / "templates" / "runtime"
++
++VALUES = (0.0, -0.0, 0.5, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5, 0.49999999999999994,
++          123456.75, -123456.25, 2147483647.0, 2147483647.4, 2147483647.5,
++          2147483648.0, -2147483648.0, -2147483648.4, -2147483648.5,
++          -2147483649.0, 3.0e9, -3.0e9, 1.0e300, float("inf"), -float("inf"),
++          float("nan"))
++
++
++def _reference(v, truncate):
++    if math.isnan(v) or math.isinf(v):
++        return 0x80000000
++    r = math.trunc(v) if truncate else round(v)   # round() is half-to-even
++    if r < -2**31 or r > 2**31 - 1:
++        return 0x80000000
++    return r & 0xFFFFFFFF
++
++
++def _lift(mnemonic, src):
++    insn = Instruction(0, 4, mnemonic, "", "00")
++    insn.operands = [Operand(type="reg", reg="eax"), src]
++    return Lifter().lift_instruction(insn)
++
++
++class CvtSi32Test(unittest.TestCase):
++    def test_every_form_calls_the_helper(self):
++        mem = Operand(type="mem", mem_base="esi", mem_size=4)
++        memd = Operand(type="mem", mem_base="esi", mem_size=8)
++        for mnemonic, src, t in (("cvtss2si", mem, 0), ("cvttss2si", mem, 1),
++                                 ("cvtsd2si", memd, 0), ("cvttsd2si", memd, 1),
++                                 ("cvtss2si", Operand(type="reg", reg="xmm1"), 0)):
++            with self.subTest(mnemonic):
++                text = " ".join(_lift(mnemonic, src))
++                self.assertIn(f"recomp_cvt_si32(", text)
++                self.assertIn(f", {t})", text)
++                self.assertNotIn("(int32_t)MEM", text)
++
++    def test_helper_matches_x86(self):
++        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
++        if not cc:
++            self.skipTest("no C compiler")
++        lines = ["#define RECOMP_GENERATED_CODE 1",
++                 '#include "recomp_types.h"', "#include <stdio.h>",
++                 "int main(void) {", "    volatile double v;"]
++        for v in VALUES:
++            lit = ("NAN" if math.isnan(v) else
++                   ("INFINITY" if v > 0 else "-INFINITY") if math.isinf(v)
++                   else repr(v))
++            for t in (0, 1):
++                lines.append(f"    v = {lit}; printf(\"%u\\n\", "
++                             f"(unsigned)recomp_cvt_si32(v, {t}));")
++        lines += ["    return 0;", "}"]
++        with tempfile.TemporaryDirectory() as tmp:
++            c_path = os.path.join(tmp, "t.c")
++            exe = os.path.join(tmp, "t")
++            with open(c_path, "w") as f:
++                f.write("\n".join(lines) + "\n")
++            r = subprocess.run([cc, "-O2", "-w", "-I", str(_HEADER_DIR),
++                                c_path, "-o", exe, "-lm"],
++                               capture_output=True, text=True)
++            self.assertEqual(r.returncode, 0, r.stderr[-3000:])
++            out = subprocess.run([exe], capture_output=True, text=True,
++                                 check=True).stdout.split()
++        want = [str(_reference(v, t)) for v in VALUES for t in (0, 1)]
++        self.assertEqual(out, want)
++
++
++if __name__ == "__main__":
++    unittest.main()

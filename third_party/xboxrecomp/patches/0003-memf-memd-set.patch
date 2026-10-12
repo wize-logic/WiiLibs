@@ -1,0 +1,216 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Mon, 12 Oct 2026 18:00:00 -0400
+Subject: [PATCH] recomp: emit MEMF_SET/MEMD_SET for float and double stores
+
+fst/fstp m32/m64 and the SSE scalar stores (movss/movsd to memory and the
+other _sse_write sites) were emitted as assignments, "MEMF(a) = v". That
+fixes the store to whatever a float lvalue does, so a runtime cannot
+choose a different way to write guest memory without rewriting the
+generated code.
+
+A big-endian host is the case that needs it. Guest memory holds the
+x86's little-endian bytes, so every access byte-reverses. GCC can do that
+in the access itself (scalar_storage_order("little-endian") gives
+lwbrx/stwbrx), but a byte-reversed float store compiles to a float store,
+an integer reload and a three-instruction swap (7 instructions on
+PowerPC 750), where storing the float's integer bits with one
+byte-reversed integer store takes 3. Emitting a macro lets the runtime
+header pick the cheap form; generated code stays the same for every host.
+
+recomp_types.h defines MEMF_SET(addr, v) and MEMD_SET(addr, v) as the old
+assignment, inside #ifndef so a runtime can supply its own, so nothing
+changes for a little-endian host. Loads still use MEMF/MEMD.
+
+Tests: test_float_store_macro.py checks the lifter source has no
+assignment to MEMF/MEMD left, that the store forms emit the macros, that
+the header's defaults are overridable, and compiles a store through each
+default. test_lifter_sse.py and test_lifter_fpu.py expect the new text.
+---
+ templates/runtime/recomp_types.h       | 14 +++++
+ tools/recomp/lifter.py                 | 11 ++--
+ tools/recomp/test_float_store_macro.py | 86 ++++++++++++++++++++++++++
+ tools/recomp/test_lifter_fpu.py        |  4 +-
+ tools/recomp/test_lifter_sse.py        |  2 +-
+ 5 files changed, 110 insertions(+), 7 deletions(-)
+ create mode 100644 tools/recomp/test_float_store_macro.py
+
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index 6ca6fd0..3cfc7b0 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -450,6 +450,20 @@ void recomp_trace_esp(const char *name, const char *tag);
+ #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
+ #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
+ 
++/** Float/double stores. The lifter emits MEMF_SET(addr, v) rather than
++ * "MEMF(addr) = v" so a runtime can store a float some other way without
++ * the generated code changing. A host that keeps guest memory little-endian
++ * on a big-endian CPU stores through the value's integer bits: one
++ * byte-reversed integer store, where a byte-reversing float lvalue costs a
++ * store, a reload and a three-instruction swap. Here, with guest memory in
++ * host order, both are the plain assignment, as before. */
++#ifndef MEMF_SET
++#define MEMF_SET(addr, v) ((void)(MEMF(addr) = (float)(v)))
++#endif
++#ifndef MEMD_SET
++#define MEMD_SET(addr, v) ((void)(MEMD(addr) = (double)(v)))
++#endif
++
+ /* ================================================================
+  * SSE / XMM register state
+  *
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index 6b7651f..7f7e152 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -3163,9 +3163,12 @@ class Lifter:
+             elif op.type == "reg":
+                 return f"{op.reg} = {val};"
+             elif op.type == "mem":
++                # MEMD_SET/MEMF_SET, not an assignment to MEMD/MEMF: see
++                # the runtime header. A host that byte-swaps guest memory
++                # stores a float through its integer bits.
+                 if op.mem_size == 8:
+-                    return f"MEMD({_fmt_mem(op)}) = {val};"
+-                return f"MEMF({_fmt_mem(op)}) = {val};"
++                    return f"MEMD_SET({_fmt_mem(op)}, {val});"
++                return f"MEMF_SET({_fmt_mem(op)}, {val});"
+             return f"/* sse_write? */;"
+ 
+         # ── Packed (128-bit) access ──
+@@ -3538,9 +3541,9 @@ class Lifter:
+             if len(ops) >= 1 and ops[0].type == "mem":
+                 pop = " fp_pop();" if m == "fstp" else ""
+                 if ops[0].mem_size == 4:
+-                    return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{do_pop} /* {m} */"]
++                    return [f"MEMF_SET({_fmt_mem(ops[0])}, (float)fp_top());{do_pop} /* {m} */"]
+                 elif ops[0].mem_size == 8:
+-                    return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{do_pop} /* {m} */"]
++                    return [f"MEMD_SET({_fmt_mem(ops[0])}, fp_top());{do_pop} /* {m} */"]
+             # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
+             # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
+             # is the common idiom for "pop the value fptan/fsincos just pushed";
+diff --git a/tools/recomp/test_float_store_macro.py b/tools/recomp/test_float_store_macro.py
+new file mode 100644
+index 0000000..ba37e3d
+--- /dev/null
++++ b/tools/recomp/test_float_store_macro.py
+@@ -0,0 +1,86 @@
++"""Float and double stores go through MEMF_SET / MEMD_SET.
++
++The lifter used to emit "MEMF(addr) = v". That only works while a float
++lvalue is the right way to write guest memory. A runtime that keeps guest
++memory little-endian on a big-endian host wants the store done through the
++value's integer bits (one byte-reversed integer store instead of a store, a
++reload and a three-instruction swap), and with an assignment in the
++generated code it cannot get there without rewriting that code. The macros
++default to the old assignment, so nothing changes for a little-endian host.
++"""
++
++import os
++import pathlib
++import re
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++from .disasm import Instruction, Operand
++from .lifter import Lifter
++
++_ROOT = pathlib.Path(__file__).resolve().parents[2]
++_LIFTER = _ROOT / "tools" / "recomp" / "lifter.py"
++_HEADER = _ROOT / "templates" / "runtime" / "recomp_types.h"
++
++
++def _lift(mnemonic, ops):
++    insn = Instruction(0, 4, mnemonic, "", "00")
++    insn.operands = ops
++    return " ".join(Lifter().lift_instruction(insn))
++
++
++class FloatStoreMacroTest(unittest.TestCase):
++    def test_lifter_never_assigns_to_memf_or_memd(self):
++        src = _LIFTER.read_text(encoding="utf-8")
++        self.assertEqual(re.findall(r"MEM[FD]\([^)]*\)\}?\)? = ", src), [])
++
++    def test_stores_use_the_macros(self):
++        m32 = Operand(type="mem", mem_base="ecx", mem_size=4)
++        m64 = Operand(type="mem", mem_base="ecx", mem_size=8)
++        xmm = Operand(type="reg", reg="xmm2")
++        self.assertIn("MEMF_SET(ecx, xmm2.f[0]);", _lift("movss", [m32, xmm]))
++        self.assertIn("MEMF_SET(ecx, (float)fp_top());", _lift("fst", [m32]))
++        self.assertIn("MEMD_SET(ecx, fp_top()); fp_pop();",
++                      _lift("fstp", [m64]))
++
++    def test_header_defines_overridable_defaults(self):
++        text = _HEADER.read_text(encoding="utf-8")
++        for name in ("MEMF_SET", "MEMD_SET"):
++            self.assertRegex(text, r"#ifndef %s\n#define %s\(addr, v\)" % (name, name))
++
++    def test_default_macros_store_the_value(self):
++        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
++        if not cc:
++            self.skipTest("no C compiler")
++        src = r"""
++#define RECOMP_GENERATED_CODE 1
++#include "recomp_types.h"
++#include <stdio.h>
++ptrdiff_t g_xbox_mem_offset;
++static unsigned char ram[64];
++int main(void) {
++    g_xbox_mem_offset = (ptrdiff_t)(uintptr_t)ram;
++    MEMF_SET(4, 1.5);
++    MEMD_SET(8, -0.25f);
++    printf("%g %g\n", (double)MEMF(4), MEMD(8));
++    return 0;
++}
++"""
++        with tempfile.TemporaryDirectory() as tmp:
++            c_path = os.path.join(tmp, "t.c")
++            exe = os.path.join(tmp, "t")
++            with open(c_path, "w") as f:
++                f.write(src)
++            r = subprocess.run([cc, "-O2", "-w", "-I", str(_HEADER.parent),
++                                c_path, "-o", exe, "-lm"],
++                               capture_output=True, text=True)
++            self.assertEqual(r.returncode, 0, r.stderr[-3000:])
++            out = subprocess.run([exe], capture_output=True, text=True,
++                                 check=True).stdout.split()
++        self.assertEqual(out, ["1.5", "-0.25"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/recomp/test_lifter_fpu.py b/tools/recomp/test_lifter_fpu.py
+index eb6ae22..b136109 100644
+--- a/tools/recomp/test_lifter_fpu.py
++++ b/tools/recomp/test_lifter_fpu.py
+@@ -27,11 +27,11 @@ class FpuLifterTest(unittest.TestCase):
+ 
+         self.assertEqual(
+             Lifter().lift_instruction(store),
+-            ["MEMF(esp + 0x18) = (float)fp_top(); /* fst */"],
++            ["MEMF_SET(esp + 0x18, (float)fp_top()); /* fst */"],
+         )
+         self.assertEqual(
+             Lifter().lift_instruction(store_pop),
+-            ["MEMF(esp + 0x18) = (float)fp_top(); fp_pop(); /* fstp */"],
++            ["MEMF_SET(esp + 0x18, (float)fp_top()); fp_pop(); /* fstp */"],
+         )
+ 
+     def test_qword_integer_conversion_uses_signed_64_bit_storage(self):
+diff --git a/tools/recomp/test_lifter_sse.py b/tools/recomp/test_lifter_sse.py
+index eafa32d..833f78b 100644
+--- a/tools/recomp/test_lifter_sse.py
++++ b/tools/recomp/test_lifter_sse.py
+@@ -58,7 +58,7 @@ class SsePackedLifterTest(unittest.TestCase):
+             Lifter().lift_instruction(
+                 _insn("movss", "dword ptr [ecx], xmm2",
+                       [_mem("ecx", 0, size=4), _xmm("xmm2")])),
+-            ["MEMF(ecx) = xmm2.f[0]; /* movss */"],
++            ["MEMF_SET(ecx, xmm2.f[0]); /* movss */"],
+         )
+ 
+     def test_packed_arithmetic_emits_a_statement(self):

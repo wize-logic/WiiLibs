@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Mon, 12 Oct 2026 18:00:00 -0400
+Subject: [PATCH] recomp: mask shl/shr counts to 5 bits
+
+x86 reduces the count of an 8-, 16- or 32-bit shift modulo 32 before
+shifting: "shl eax, cl" with cl = 33 shifts by 1, and cl = 32 leaves eax
+alone. _lift_shift emitted "dst << cnt" with the raw count, which C leaves
+undefined for counts of 32 and more. On an x86 host the compiler emits the
+same masked shl/shr, so the generated code happened to agree with the CPU.
+On a PowerPC host it does not: slw/srw read six bits of the count, so
+counts 32..63 shift every bit out, where x86 shifts by count - 32. Running
+lifted code on big-endian PowerPC (qemu-ppc) against a native x86 run,
+11 of 66 shift results differed before this change. sar was already
+masked (_lift_sar); this does the same for shl and shr.
+
+The operand is also widened to uint32_t before the shift: a narrow read
+(LO8, LO16, MEM16) promotes to int, and "int << 31" is undefined as well.
+CF reads its bit index masked too: x86 leaves CF undefined once the count
+reaches the operand width, but an unmasked "8 - cnt" was a negative shift
+count in C.
+
+Tests: test_shift_count_mask.py compiles the lifted statement and sweeps
+counts 0..255 at 8, 16 and 32 bits against the masked x86 answer;
+conformance cases shl_cl_wide, shr_cl_wide, shl_cl_i16, shr_cl_i8 and
+shl_cl_carry run counts 32..255 on the real CPU (the existing shl_cl
+inputs only reach counts 0, 1 and 31 once masked).
+---
+ tools/conformance/cases.py            |  20 +++++
+ tools/recomp/lifter.py                |  23 +++++-
+ tools/recomp/test_shift_count_mask.py | 108 ++++++++++++++++++++++++++
+ 3 files changed, 147 insertions(+), 4 deletions(-)
+ create mode 100644 tools/recomp/test_shift_count_mask.py
+
+diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
+index fe73c06..3dc42a7 100644
+--- a/tools/conformance/cases.py
++++ b/tools/conformance/cases.py
+@@ -49,6 +49,12 @@ _EDGES = [0x00000000, 0x00000001, 0x0000007F, 0x00000080, 0x000000FF,
+ _PAIRS = [(a, b) for a in _EDGES for b in (0x00000001, 0x0000007F, 0x00000080,
+                                            0x000000FF, 0xFFFFFFFF)]
+ 
++# Shift counts that differ once a host stops masking them to five bits:
++# zero, in range, 31, and 32..255 (which x86 reduces modulo 32).
++_SHIFT_COUNTS = [(a, c) for a in (0x00000001, 0x80000001, 0x12345678,
++                                  0xFFFFFFFF)
++                 for c in (0, 1, 7, 8, 15, 16, 31, 32, 33, 40, 63, 64, 255)]
++
+ # Doubles for the x87 cases. Ordinary values, the signed zeroes, a tie for
+ # the rounding modes, and one pair that is only interesting in reverse
+ # (fsubr/fdivr swap the operands, so a/b and b/a must differ).
+@@ -161,6 +167,20 @@ CASES = [
+          ["shr eax, cl"], _PAIRS),
+     Case("rol_cl", "rotate left",
+          ["rol eax, cl"], _PAIRS),
++    # Counts of 32 and more. x86 masks every 8/16/32-bit shift count to five
++    # bits; C leaves those shifts undefined and a PowerPC host's slw/srw read
++    # six bits, so 32..63 shift everything out there. _PAIRS only reaches
++    # counts 0, 1 and 31 once masked; these reach the counts that differ.
++    Case("shl_cl_wide", "shl by 32..255 shifts by count & 31",
++         ["shl eax, cl"], _SHIFT_COUNTS),
++    Case("shr_cl_wide", "shr by 32..255 shifts by count & 31",
++         ["shr eax, cl"], _SHIFT_COUNTS),
++    Case("shl_cl_i16", "a 16-bit shl masks to 5 bits too, then truncates",
++         ["shl ax, cl", "movzx eax, ax"], _SHIFT_COUNTS),
++    Case("shr_cl_i8", "an 8-bit shr by 8..31 empties the byte",
++         ["shr al, cl", "movzx eax, al"], _SHIFT_COUNTS),
++    Case("shl_cl_carry", "CF is the last bit out, at a masked count",
++         ["shl eax, cl", "sbb eax, eax"], _SHIFT_COUNTS),
+     Case("shld", "double-precision shift",
+          ["shld eax, ecx, 5"], _PAIRS),
+ 
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index e7ab880..e5530c3 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -2090,17 +2090,32 @@ class Lifter:
+         return [f"/* {m}: unhandled */"]
+ 
+     def _lift_shift(self, insn, ops, c_op):
++        """shl/shr, with the count masked to 5 bits as x86 masks it.
++
++        x86 takes the count of an 8-, 16- or 32-bit shift modulo 32: "shl eax,
++        cl" with cl = 33 shifts by 1, and cl = 32 leaves eax alone. C leaves a
++        shift by 32 or more undefined, and an x86 host only appears to agree
++        because the compiler emits the same masked instruction. PowerPC's
++        slw/srw use six bits of the count, so 32..63 give 0 there (33 gives 0,
++        not eax << 1): 11 of 66 shift results differed on a big-endian
++        PowerPC host before this mask. sar already masks (_lift_sar).
++
++        The operand is widened to uint32_t first: a narrow read (LO8, MEM16)
++        promotes to int, and "int << 31" is undefined too. CF reads the bit
++        index masked as well; x86 leaves CF undefined when the count reaches
++        the operand width, and an unmasked "8 - cnt" would be a negative shift.
++        """
+         if len(ops) < 2:
+             return [f"/* shift: bad operands */"]
+         dst = _fmt_operand_read(ops[0])
+-        cnt = _fmt_operand_read(ops[1])
++        cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
+         out = []
+         if self.needs_cf:
+             w = (_operand_width(ops[0]) or 4) * 8
+             # CF is the last bit shifted out; a zero count leaves CF alone.
+-            bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
+-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
+-        out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
++            bit = f"{cnt} - 1" if c_op == ">>" else f"({w}u - {cnt}) & 31u"
++            out.append(f"if ({cnt}) _cf = (int)((((uint32_t)({dst})) >> ({bit})) & 1);")
++        out.append(_fmt_operand_write(ops[0], f"(uint32_t)({dst}) {c_op} {cnt}"))
+         out.append(self._result_snapshot(ops, "shift"))
+         return out
+ 
+diff --git a/tools/recomp/test_shift_count_mask.py b/tools/recomp/test_shift_count_mask.py
+new file mode 100644
+index 0000000..c1b9be1
+--- /dev/null
++++ b/tools/recomp/test_shift_count_mask.py
+@@ -0,0 +1,108 @@
++"""shl/shr mask their count to 5 bits, as x86 does.
++
++x86 reduces the count of an 8-, 16- or 32-bit shift modulo 32 before
++shifting. C leaves a shift by the type's width or more undefined, and an x86
++host compiles the unmasked expression to the same masked instruction, so the
++missing mask was invisible there. A PowerPC host is not: slw/srw read six bits
++of the count, so 32..63 shift everything out where x86 shifts by count - 32.
++
++The sweep compiles the lifter's own statement and compares it, for every count
++0..255 at each width, against the x86 answer computed with the count masked.
++"""
++
++import os
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++from .disasm import Instruction, Operand
++from .lifter import Lifter
++
++
++def _shift(mnemonic, dst):
++    insn = Instruction(0, 2, mnemonic, "", "00")
++    insn.operands = [dst, Operand(type="reg", reg="cl")]
++    return Lifter().lift_instruction(insn)
++
++
++PRELUDE = r"""
++#include <stdint.h>
++#include <stdio.h>
++#define LO8(r)  ((uint8_t)((r) & 0xFF))
++#define LO16(r) ((uint16_t)((r) & 0xFFFF))
++#define SET_LO8(r, v)  ((r) = ((r) & 0xFFFFFF00u) | ((uint32_t)(uint8_t)(v)))
++#define SET_LO16(r, v) ((r) = ((r) & 0xFFFF0000u) | ((uint32_t)(uint16_t)(v)))
++static uint32_t _fa, _fb;
++static int32_t _fas, _fbs;
++"""
++
++BODY = r"""
++int main(int argc, char **argv) {
++    /* The value comes from argv so the compiler cannot fold the shifts. */
++    uint32_t v = (uint32_t)(argc > 1 ? (uint32_t)argv[1][0] : 0u) | 0x80000001u;
++    for (uint32_t c = 0; c < 256; c++) {
++        uint32_t eax = v, ecx = c;
++        STMT;
++        uint32_t got = (uint32_t)(GOT), want = (uint32_t)(WANT);
++        if (got != want) {
++            printf("FAIL c=%u got=0x%X want=0x%X\n", c, got, want);
++            return 1;
++        }
++    }
++    printf("OK\n");
++    return 0;
++}
++"""
++
++CASES = {
++    "shl eax": ("shl", "eax", "eax", "v << (c & 31)"),
++    "shr eax": ("shr", "eax", "eax", "v >> (c & 31)"),
++    "shl ax": ("shl", "ax", "LO16(eax)", "(uint16_t)((v & 0xFFFF) << (c & 31))"),
++    "shr ax": ("shr", "ax", "LO16(eax)", "(uint16_t)((v & 0xFFFF) >> (c & 31))"),
++    "shl al": ("shl", "al", "LO8(eax)", "(uint8_t)((v & 0xFF) << (c & 31))"),
++    "shr al": ("shr", "al", "LO8(eax)", "(uint8_t)((v & 0xFF) >> (c & 31))"),
++}
++
++
++class ShiftCountMaskTest(unittest.TestCase):
++    def test_count_is_masked_in_the_emitted_c(self):
++        for mnemonic in ("shl", "shr"):
++            lifted = _shift(mnemonic, Operand(type="reg", reg="eax"))
++            self.assertIn("& 31u", lifted[0], lifted)
++
++    def test_carry_reads_a_masked_bit_index(self):
++        insn = Instruction(0, 2, "shl", "", "00")
++        insn.operands = [Operand(type="reg", reg="al"),
++                         Operand(type="reg", reg="cl")]
++        lifter = Lifter()
++        lifter.needs_cf = True
++        cf = lifter.lift_instruction(insn)[0]
++        self.assertIn("_cf", cf)
++        self.assertIn("& 31u)", cf)
++
++    def test_compiled_sweep_matches_x86(self):
++        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
++        if not cc:
++            self.skipTest("no C compiler")
++        with tempfile.TemporaryDirectory() as tmp:
++            for name, (mnemonic, reg, got, want) in CASES.items():
++                with self.subTest(name):
++                    stmt = " ".join(_shift(mnemonic,
++                                           Operand(type="reg", reg=reg)))
++                    src = PRELUDE + BODY.replace("STMT;", stmt) \
++                        .replace("GOT", got).replace("WANT", want)
++                    c_path = os.path.join(tmp, "t.c")
++                    exe = os.path.join(tmp, "t")
++                    with open(c_path, "w") as f:
++                        f.write(src)
++                    r = subprocess.run([cc, "-O2", "-w", c_path, "-o", exe],
++                                       capture_output=True, text=True)
++                    self.assertEqual(r.returncode, 0, r.stderr)
++                    r = subprocess.run([exe, "x"], capture_output=True,
++                                       text=True)
++                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
++
++
++if __name__ == "__main__":
++    unittest.main()
