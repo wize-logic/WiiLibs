@@ -28,6 +28,8 @@ Each module is `wl/<name>/` with its own README, a CMake target `wl_<name>` (ali
 | `brstm` | NW4R audio: BRSTM, BRSAR, RWSD, DSP-ADPCM (via `codec`) | all (path open: host) |
 | `sdat` | NDS SDAT sound archives (SSEQ/SBNK/SWAR/STRM) | all (index: host) |
 | `xbox` | The Xbox's NV2A on GX: pixel shaders' register combiners translated to TEV programs (with a cache that rewrites constants in place, and a hook for a game's hand-made programs), vertex programs decoded, analysed (inputs, affinity, constants read) and run on the processor, and compiled ahead of time to C by `tools/xbox_vsh_codegen.c` | all (the tool: host) |
+| `xboxrt` | The runtime a recompiled Xbox title runs on: guest memory at the Xbox's addresses (the Wii's MMU with a hashed page table filled on first touch; a reservation elsewhere), devices behind faults with PowerPC and x86-64 instruction decoders, the generated code's register file, guest threads under one guest lock, interrupts and the vertical blank, the kernel thunk dispatcher, the XBE loader, crash reports, and the boot code (`wl_xboxrt_boot`, `wl_xboxrt_main`) | all (the MMU backend: Wii; faults: host, ppc-be) |
+| `xboxkrnl` | The Xbox kernel's exports for recompiled titles over `xboxrt` and `platform`: dispatcher objects and waits, critical sections, threads, IRQL/DPCs/timers/interrupts, memory, files through a mount table (the title's folder, the hard disk's partitions, sparse cache drives), settings, AV and HAL queries, Rtl, SHA-1/HMAC/RC4; every import of Halo's XBE covered | all |
 
 ## Building
 
@@ -44,7 +46,9 @@ cmake -S . -B build/wii -G Ninja -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Wii.cma
 cmake --build build/wii
 ```
 
-On the Wii, the tests are one program, `tests/console/wl_console_tests.dol`. It runs the
+On the Wii, the tests are one program, `tests/console/wl_console_tests.dol` (and
+`wl_xboxrt_console.dol` beside it for wl/xboxrt's guest memory on the MMU, which Dolphin runs with
+`--mmu`: `wl/xboxrt/README.md`). It runs the
 platform-independent suites (threads, files, the SSEQ synth through real audio output) and a
 GX/video smoke test on the real backends. `ctest -L dolphin` runs it in Dolphin through
 `tools/dolphin_run.py`. From Linux (WSL) that is the Windows Dolphin: `WL_DOLPHIN`, or
