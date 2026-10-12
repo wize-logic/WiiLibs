@@ -29,6 +29,7 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `tev.h`, `tev.c` | TEV programs as data: stages (inputs a b c d, op, bias, scale, clamp, output register, order, swap tables, konst selections), the helpers a translator allocates with (konst slots, register pool, resource merging), a validator, a software evaluator, the fixed GX recipes as programs; see below |
 | `backtrace.h`, `backtrace.c` | return-address backtraces for the 32-bit PowerPC frame layout: a portable walker over a read callback, `wl_platform_backtrace` for the running thread, `wl_platform_log_backtrace` for a "where from" log line; see below |
 | `profile.h`, `profile.c` | the sampling profiler: a ring of samples (the interrupted pc, link register, thread and the return addresses up its stack), the text dumps, the jitter; `wii/profile_wii.c` is the sampler over libogc's decrementer tick tasks; `tools/wl_profile.py` symbolizes the dumps; see below |
+| `stop.h`, `stop.c`, `stop_backend.h` | the bring-up text console (libogc's, in one of the video's framebuffers) and the stop screen: a message on it and in the log, then a wait for HOME or START to leave; `wl_platform_missing_symbol` is what `tools/link_stubs.py` points its stubs at; `wii/stop_wii.c` and `host/stop_host.c` are the backends; see "Console and stop screen" |
 | `net.h`, `net.c`, `net_internal.h` | IPv4 TCP and UDP sockets over IOS (libogc) or the host: addresses as host-order values, errors as results, poll for select, the network started in the background; `net.c` has the errno mapping and the address text; see below |
 | `gx_common.c` | GX helpers needing no hardware: texture sizes, sampler filter resolution |
 | `stack.c` | stack depth measurement: a fill pattern and the high-water mark (`wl_platform_stack_used`) |
@@ -36,7 +37,7 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `host/` | stubs: backtrace (the real chain on ppc-be, none elsewhere), net (POSIX sockets), audio (test renders blocks), fs (devices map to directories), gx (records draws), input (preloaded state), mem (malloc'd regions), system and log, tev (records the last applied program), entropy (getrandom, /dev/urandom), threads (pthreads) |
 
 Host test control lives in `host/*_host.h`: `wl_host_audio_render`, `wl_host_fs_set_root`,
-`wl_host_gx_state` / `wl_host_gx_record`, `wl_host_input_set`, `wl_host_system_raise`, `wl_host_tev_last`.
+`wl_host_gx_state` / `wl_host_gx_record`, `wl_host_input_set`, `wl_host_stop_set_hook`, `wl_host_system_raise`, `wl_host_tev_last`.
 
 ## Typical start-up
 
@@ -211,6 +212,27 @@ tools/wl_profile.py program.elf profile.txt --top 40 --callers update --tree 2 -
   an ELF made with the host compiler), and `check_profile` in the console runner (a busy loop and
   a second thread under the real decrementer: the samples land in the loop, name its caller and the
   thread, are about 1 ms apart and not evenly, and stop when stopped).
+
+## Console and stop screen (`stop.h`)
+
+A program in bring-up, before its renderer draws, still needs to say what it does and why it
+stopped.
+
+- `wl_platform_console_start()` starts libogc's text console in the video's back buffer
+  (`wl_platform_video_init` first, if need be), so `printf` shows on the screen. It takes one of the
+  video's framebuffers rather than allocating a third (600 KB of MEM1's heap at 640x480); the
+  program's frames cover the text once they start. Idempotent; on the host it does nothing and
+  stdout is the terminal.
+- `wl_platform_console_report(tag, fmt, ...)` writes a line to stdout and to the log.
+- `wl_platform_stop_screen(fmt, ...)` does not return. It reports the message and logs it as an
+  error, flushes the log, puts the console's framebuffer back on the screen after the last frame
+  presented (`wl_platform_video_wait_shown`, then `VIDEO_SetNextFramebuffer`: the retrace
+  interrupt would otherwise show the last frame over the text), and waits for HOME on a Remote or
+  START on a GameCube controller, or a reset or power event, to leave for the loader. The first stop
+  wins; one reached while stopping only waits. On the host it prints to stderr and exits with
+  status 1, or calls the hook of `wl_host_stop_set_hook` (a test leaves it with `longjmp`).
+- `wl_platform_missing_symbol(name)` is the stop for a function the program does not provide:
+  `tools/link_stubs.py` defines every unresolved symbol as a function that calls it.
 
 ## Sockets (`net.h`)
 

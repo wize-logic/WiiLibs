@@ -76,3 +76,16 @@ foreach(fused wl_fma_fused wl_fma_fused_linked)
         COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ${fused})
     set_tests_properties(test_${fused}_fails_the_build PROPERTIES LABELS unit WILL_FAIL TRUE)
 endforeach()
+
+# the stub linker (tools/link_stubs.py): the symbols it finds, the C file it writes, and programs
+# linked and run with the host compiler standing in for the Wii's; and, natively, against
+# wl_platform's host backend with its stop screen as the stop function
+if(CMAKE_CROSSCOMPILING)
+    set(link_stubs_library_args "")
+else()
+    set(link_stubs_library_args
+        $<TARGET_FILE:wl_platform> $<TARGET_FILE:wl_base> ${PROJECT_SOURCE_DIR})
+endif()
+add_test(NAME test_link_stubs
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_link_stubs.py ${link_stubs_library_args})
+set_tests_properties(test_link_stubs PROPERTIES LABELS unit)
