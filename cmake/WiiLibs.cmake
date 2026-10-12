@@ -65,6 +65,17 @@ function(wl_platform_heap_overflow target)
     endif()
 endfunction()
 
+# wl_gfx_wrap_sqrtf(<executable>): every call of sqrtf in the program, the libraries' too, is
+# wl_sqrtf_exact (wl/gfx/gfx_sqrt.h): the correctly rounded root, bit for bit newlib's, without
+# newlib's loop of a bit a step (about 60 instructions on Broadway against about 290). The program
+# links wl_gfx, which holds __wrap_sqrtf. On any platform with GNU ld; a build without CMake passes
+# -Wl,--wrap=sqrtf -Wl,-u,__wrap_sqrtf and links libwl_gfx.a.
+function(wl_gfx_wrap_sqrtf target)
+    target_link_libraries(${target} PRIVATE wl_gfx)
+    # -u pulls __wrap_sqrtf out of libwl_gfx.a even when only libc's objects call sqrtf
+    target_link_options(${target} PRIVATE "LINKER:--wrap=sqrtf" "LINKER:-u,__wrap_sqrtf")
+endfunction()
+
 # wl_add_hbc_package(<target> NAME <name> [DOL <file>] [OUTPUT <zip>] [APP_DIR <dir>] [CODER <c>]
 #                    [VERSION <v>] [SHORT_DESCRIPTION <s>] [LONG_DESCRIPTION <l> |
 #                    LONG_DESCRIPTION_FILE <file>] [ICON <128x48.png> | ICON_TEXT <line> [<line>]]
