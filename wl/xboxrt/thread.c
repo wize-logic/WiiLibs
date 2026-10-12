@@ -87,14 +87,30 @@ static void hand_off(void) {
     }
 }
 
-// Waits for the baton (g_m held).
+// Waits for the baton (g_m held). The service thread says so when it has waited a second or more:
+// the holder spins without reaching a safe point, and interrupts are held off meanwhile.
 static void take(WlXbThread *self) {
     if (g_owner == NULL && g_ready == NULL) {
         g_owner = self;
     } else {
         enqueue(self);
+        uint64_t since = wl_platform_time_ms(), warned = 0;
         while (g_owner != self) {
-            wl_platform_cond_wait(self->cond, g_m);
+            if (!self->is_service) {
+                wl_platform_cond_wait(self->cond, g_m);
+                continue;
+            }
+            wl_platform_cond_wait_timeout(self->cond, g_m, 500);
+            uint64_t waited = wl_platform_time_ms() - since;
+            WlXbThread *holder = g_owner;
+            if (holder != self && holder != NULL && waited >= 1000u && (warned == 0 || waited - warned >= 5000u)) {
+                warned = waited;
+                g_stats.service_starved++;
+                WL_LOG_W(TAG,
+                         "interrupts held off for %u ms: thread %u (%s) keeps the guest lock without a safe point "
+                         "(a kernel call, rdtsc or a device access)",
+                         (unsigned)waited, (unsigned)holder->id, holder->name);
+            }
         }
     }
     g_quantum_start = wl_platform_time_us();

@@ -187,6 +187,7 @@ typedef struct {
     uint32_t waits, wakes, timeouts;
     uint32_t safe_points;   // wl_xb_safe_point calls that held the lock in guest code
     uint32_t safe_yields;   // of those, the ones that gave the lock to a waiting thread
+    uint32_t service_starved; // the service thread waited a second or more for the lock (logged)
 } WlXbThreadStats;
 void wl_xb_thread_stats(WlXbThreadStats *out);
 
