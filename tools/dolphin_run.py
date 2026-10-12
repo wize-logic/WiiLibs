@@ -202,12 +202,14 @@ def dolphin_ini(sd_image: str, sd_folder: str, dump_frames: bool, gdb_port: int 
     return "\n".join(lines) + "\n"
 
 
-def gfx_ini(dump_frames: bool) -> str:
+def gfx_ini(dump_frames: bool, widescreen: bool = False) -> str:
     # CPU access to the EFB on (Dolphin may skip it for speed, and peeks then read 0): programs
     # and tests read pixels back
     text = "[Hacks]\nEFBAccessEnable = True\n"
+    # (the window, and so the capture, in the TV's shape: 1 forces 16:9, 2 forces 4:3)
+    text += f"[Settings]\nAspectRatio = {1 if widescreen else 2}\n"
     if dump_frames:
-        text += "[Settings]\nDumpFramesAsImages = True\n"
+        text += "DumpFramesAsImages = True\n"
     return text
 
 
@@ -357,6 +359,8 @@ def main() -> int:
                         help="the GPU emulated on the CPU's thread (slower; no CPU/GPU races)")
     parser.add_argument("--panics", action="store_true",
                         help="show Dolphin's panic messages (they stop the emulation until answered)")
+    parser.add_argument("--wii-aspect", choices=("4:3", "16:9"), default="4:3",
+                        help="the TV's shape the console's settings give programs (default 4:3)")
     parser.add_argument("--video", default="", help="Dolphin's video backend (D3D, D3D12, Vulkan, OGL; "
                                                     "default: Dolphin's own)")
     parser.add_argument("--dump-frames", type=Path, help="dump every frame as PNGs into this folder")
@@ -388,7 +392,7 @@ def main() -> int:
                                                               bool(args.dump_frames),
                                                               GDB_PORT if args.backtrace else 0, args.video,
                                                               args.panics, args.single_core))
-    (user / "Config" / "GFX.ini").write_text(gfx_ini(bool(args.dump_frames)))
+    (user / "Config" / "GFX.ini").write_text(gfx_ini(bool(args.dump_frames), args.wii_aspect == "16:9"))
     log = user / "Logs" / "dolphin.log"
     if log.exists():
         log.unlink()
@@ -398,7 +402,10 @@ def main() -> int:
 
     kill_dolphin(to_windows(user))
     try:
-        process = subprocess.Popen([str(dolphin), "-u", to_windows(user), "-b", "-e", to_windows(program)],
+        process = subprocess.Popen([str(dolphin), "-u", to_windows(user), "-b",
+                                    # (the console's TV shape, SYSCONF's IPL.AR, which programs read)
+                                    "-C", f"SYSCONF.IPL.AR={1 if args.wii_aspect == '16:9' else 0}",
+                                    "-e", to_windows(program)],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
         print(f"dolphin_run.py: {error}", file=sys.stderr)
