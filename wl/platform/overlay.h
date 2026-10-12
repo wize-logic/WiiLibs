@@ -36,5 +36,10 @@ int wl_overlay_text_height(int scale, const char *text);
 // drawing the font some other way.
 const uint8_t *wl_overlay_glyph(char c);
 
+// Whether every character of the text has a glyph of its own (a newline counts; lower case does, as
+// its capital): text that is drawn as it was written, with no box among it. For checking the words a
+// program gives its menus.
+bool wl_overlay_text_drawable(const char *text);
+
 // A gauge: a rectangle outlined with `fraction` (0 to 1) of it filled.
 void wl_overlay_gauge(int x, int y, int w, int h, float fraction, uint32_t fill_rgba, uint32_t back_rgba);

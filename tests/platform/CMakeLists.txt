@@ -83,3 +83,9 @@ target_link_libraries(test_platform_input_wii PRIVATE m)
 # output's master fade (audio_gain.c).
 wl_add_test(test_platform_overlay SOURCES test_platform_overlay.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_audio_fade SOURCES test_platform_audio_fade.c LIBS wl_platform LABELS unit be)
+
+# The HOME menu and its notices, the wrist strap reminder, and the shell that joins them to the
+# console and the frame overlay (home_menu.c, strap_screen.c, home_shell.c and their drawing).
+wl_add_test(test_platform_home_menu SOURCES test_platform_home_menu.c LIBS wl_platform LABELS unit be)
+wl_add_test(test_platform_strap_screen SOURCES test_platform_strap_screen.c LIBS wl_platform LABELS unit be)
+wl_add_test(test_platform_home_shell SOURCES test_platform_home_shell.c LIBS wl_platform LABELS unit be)

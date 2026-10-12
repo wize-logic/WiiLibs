@@ -78,7 +78,7 @@ static const struct {
 
 static const uint8_t k_box[GLYPH_ROWS] = {0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F};
 
-const uint8_t *wl_overlay_glyph(char c) {
+static const uint8_t *find_glyph(char c) {
     if (c >= 'a' && c <= 'z') {
         c = (char)(c - 'a' + 'A');
     }
@@ -87,7 +87,21 @@ const uint8_t *wl_overlay_glyph(char c) {
             return k_font[i].rows;
         }
     }
-    return k_box;
+    return NULL;
+}
+
+const uint8_t *wl_overlay_glyph(char c) {
+    const uint8_t *rows = find_glyph(c);
+    return rows != NULL ? rows : k_box;
+}
+
+bool wl_overlay_text_drawable(const char *text) {
+    for (const char *p = text; *p != '\0'; p++) {
+        if (*p != '\n' && find_glyph(*p) == NULL) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // ---- the quads: collected, and sent in batches
