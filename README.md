@@ -29,6 +29,10 @@ Each module is `wl/<name>/` with its own README, a CMake target `wl_<name>` (ali
 | `sdat` | NDS SDAT sound archives (SSEQ/SBNK/SWAR/STRM) | all (index: host) |
 | `xbox` | The Xbox's NV2A on GX: pixel shaders' register combiners translated to TEV programs (with a cache that rewrites constants in place, and a hook for a game's hand-made programs), vertex programs decoded, analysed (inputs, affinity, constants read) and run on the processor, and compiled ahead of time to C by `tools/xbox_vsh_codegen.c` | all (the tool: host) |
 
+`wl/xboxrt/recomp/` holds the runtime header recompiled Xbox code includes (`recomp_types.h`,
+generated from xboxrecomp's template; its README lists the runtime ABI): see "Recompiling an Xbox
+title" below.
+
 ## Building
 
 ```sh
@@ -73,10 +77,45 @@ cmake --build build/wii && ctest --test-dir build/wii -L dolphin --output-on-fai
 | `tools/fma_check.py` | Lists the fused multiply-adds (`fmadd`, `fmsub`, `fnmadd`, `fnmsub` and their single forms, the Gekko's paired singles `ps_madd`..`ps_madds1`, AltiVec's and VSX's) in PowerPC objects, archives and ELF files, by object and function, with the instructions (`-v`); exit 1 if there are any, 2 if the check could not be made (a file objdump cannot read as PowerPC is never a pass). For a program whose results must match another machine's bit for bit: compilers fuse unasked, and Clang has let some through `-ffp-contract=off`. Shell-pattern filters on objects and archive members (`--include`, `--exclude`) and on functions (`--include-function`, `--exclude-function`), `@file` response files (ninja's), `--stamp` for build systems. Runs objdump with `-M gekko`, without which the paired singles are misread. From CMake: `wl_add_fma_check(<target> [LINKED] [OBJDUMP ...] [EXCLUDE ...] [EXCLUDE_FUNCTION ...])` (`cmake/WiiLibs.cmake`) fails the target's build if its objects (or, with `LINKED`, its ELF) have one; pairs with `wl_target_defaults(<target> DETERMINISTIC)`. Tests: `tests/tools/` (host; real objects where a PowerPC Linux compiler is installed) |
 | `tools/xbox_tex_reference.py` | Reference implementation of the Xbox texture conversions |
 | `tools/xbox_vsh_codegen.c` | Compiles a file of Xbox (NV2A) vertex programs to C functions that give, bit for bit, what `wl/xbox/vsh.h`'s interpreter gives, and a table of them for `wl_xbox_vsh_compile` (`wl/xbox/README.md`). Built with the host build (`xbox_vsh_codegen`). Tests: `tests/xbox/test_xbox_vsh_native.c` |
+| `tools/xbox_recomp.py` | Runs xboxrecomp's pipeline (vendored in `third_party/xboxrecomp`, WiiLibs' patches applied in the build tree) on an XBE: parse, disassemble every executable section, identify, calling conventions, lift to C in chunks, each stage cached by its inputs' hashes; wraps the chunks in a fixed set of translation units for a build system. A title's knowledge comes in a JSON config (`--config`: hand-written functions, seeds, extra options). From CMake: `wl_add_xbox_title` (below). Tests: `tests/tools/test_xbox_recomp.py`, `tests/xbox_recomp/` (host) |
+| `tools/xbox_recomp_smoke.py` | Smoke check on a real title: runs the driver on an XBE into a build directory and compiles every chunk for the Wii with devkitPPC, reporting functions, unresolved call targets, unimplemented instructions and the summed `.text`. Nothing it generates leaves the build directory |
+| `tools/xboxrecomp_sync.py` | Follows xboxrecomp upstream: `status`, `fetch`, `brief` (a research brief per area: commits, release notes, files mapped to the WiiLibs files they affect, licence flags for LGPL/xemu/Cxbx, questions for each reviewer), `merge`/`apply` (refresh the pristine copy, re-apply the patches, report failures), `check-map`, `test`, `advance` (record the triage), `patch-repo`/`export-patches` (edit the patches in git). Procedure: [docs/xboxrecomp-sync.md](docs/xboxrecomp-sync.md). Tests: `tests/tools/test_xboxrecomp_sync.py` (a synthetic upstream) |
 
 To use it from another CMake project: `add_subdirectory(path/to/WiiLibs)` and link
 `WiiLibs::<module>`. Tests and `-Werror` are on only when WiiLibs is the top-level project
 (`WL_BUILD_TESTS`, `WL_WERROR`).
+
+## Recompiling an Xbox title
+
+WiiLibs carries [xboxrecomp](https://github.com/sp00nznet/xboxrecomp)'s static recompiler (MIT): its
+Python pipeline lifts an Xbox executable's x86 code to C, function by function, and the C is compiled
+for the Wii (or the host, or `ppc-be` for tests). In a CMake project that adds WiiLibs:
+
+```cmake
+wl_add_xbox_title(mygame XBE ${GAME_DIR}/default.xbe
+    TITLE_CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/title.json   # optional: hand-written functions, seeds
+    OPT -Os                                               # default; -O2 is about 40% bigger
+    SOURCES src/overrides.c)                              # the title project's own code
+```
+
+At build time `tools/xbox_recomp.py` runs the pipeline on the XBE into the build tree (the generated
+code is derived from the game: it stays there and is never committed), the chunks are compiled with
+the flags they need against `wl/xboxrt/recomp/recomp_types.h`, and the executable links WiiLibs' Xbox
+runtime (`WiiLibs::xboxrt`, being written; `RUNTIME` names another). On the Wii it gets its `.dol`.
+The header makes the generated code right on a big-endian CPU: guest memory keeps the x86's
+little-endian bytes and every access byte-reverses (`lwbrx`/`stwbrx`); guest addresses go through
+`WL_XB_EA` (user space as is, the 0x8xxxxxxx/0xFxxxxxxx windows at 0x1xxxxxxx). Its README lists the
+symbols a runtime defines.
+
+What makes it trustworthy: `ctest -R xbox_recomp_conformance` lifts every one of xboxrecomp's
+conformance cases (x86 snippets with inputs; 207 cases, 6,322 vectors) and runs them big-endian
+under qemu-ppc against a recording of this machine's x86 CPU; `xbox_recomp_e2e` does the same with
+whole programs; `xboxrecomp_pytest` runs upstream's own test suite on the patched pipeline.
+WiiLibs' fixes to upstream (shift counts, float-to-int conversions, float stores, reserved names,
+80-bit x87 operands, parity conditions, a runtime-header option) are patch files in
+`third_party/xboxrecomp/patches/`, written to be sent upstream. Upstream updates are taken with
+`tools/xboxrecomp_sync.py` ([docs/xboxrecomp-sync.md](docs/xboxrecomp-sync.md)). Retail Halo
+(7,493 functions) lifts and compiles for the Wii to 10.8 MiB of code at `-Os`.
 
 ## Conventions
 
@@ -93,7 +132,11 @@ To use it from another CMake project: `add_subdirectory(path/to/WiiLibs)` and li
 - The Wii backends of `wl/platform` and `wl/audio` pass the console tests in Dolphin: GX
   read-back, video pacing, LWP threads with real priorities, libfat SD on IOS 58, and AESND
   output. Input is only initialised, not driven. Nothing has run on hardware yet.
-- No tests against real game files.
+- No tests against real game files (the Xbox smoke check, `tools/xbox_recomp_smoke.py`, is run by
+  hand on a title the developer owns).
+- Recompiled Xbox code: the runtime (`wl/xboxrt`), the kernel and NV2A on GX are being written; a
+  title links only against a stand-in so far. Each `tail_jump_alias` entry is lifted as a full copy
+  of the body it enters (Halo: 2.0 MB of x86 lifted from 1.6 MB of unique code).
 
 ## Licence
 
