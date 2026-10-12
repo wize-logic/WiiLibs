@@ -7,9 +7,11 @@
 // which checks the device prefix and mount state and writes the path to hand to the C library.
 // Unbuffered fds are used on purpose: stdio's 1 KiB default buffer would split large reads into
 // many small SD transfers.
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -215,4 +217,223 @@ bool wl_platform_fs_exists(const char *path) {
     char real[WL_FS_PATH_MAX + 64];
     struct stat st;
     return fs_resolve(path, real, sizeof real) == WL_OK && stat(real, &st) == 0;
+}
+
+// ---- Files at offsets, sizes, directories ------------------------------------------------------
+
+static WlResult fs_write_all(int fd, const uint8_t *p, uint32_t left) {
+    while (left > 0) {
+        ssize_t n = write(fd, p, left);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return WL_ERR_IO;
+        }
+        if (n == 0) {
+            return WL_ERR_IO; // card full
+        }
+        p += n;
+        left -= (uint32_t)n;
+    }
+    return WL_OK;
+}
+
+WlResult wl_platform_fs_write_at(WlPlatformFile *file, uint64_t offset, const void *src, uint32_t size) {
+    if (file == NULL || (src == NULL && size > 0)) {
+        return WL_ERR_ARG;
+    }
+    if (offset > 0xFFFFFFFFull) {
+        return WL_ERR_RANGE;
+    }
+    if (lseek(file->fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
+        return WL_ERR_IO;
+    }
+    WlResult r = fs_write_all(file->fd, src, size);
+    if (r == WL_OK && offset + size > file->size) {
+        file->size = offset + size;
+    }
+    return r;
+}
+
+WlResult wl_platform_fs_read_some_at(WlPlatformFile *file, uint64_t offset, void *dst, uint32_t size,
+                                     uint32_t *got) {
+    if (file == NULL || got == NULL || (dst == NULL && size > 0)) {
+        return WL_ERR_ARG;
+    }
+    *got = 0;
+    if (offset >= file->size || size == 0) {
+        return WL_OK;
+    }
+    if (offset + size > file->size) {
+        size = (uint32_t)(file->size - offset);
+    }
+    if (lseek(file->fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
+        return WL_ERR_IO;
+    }
+    uint8_t *p = dst;
+    while (*got < size) {
+        ssize_t n = read(file->fd, p + *got, size - *got);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return WL_ERR_IO;
+        }
+        if (n == 0) {
+            break; // the file shrank under us: what was there
+        }
+        *got += (uint32_t)n;
+    }
+    return WL_OK;
+}
+
+WlResult wl_platform_fs_truncate(WlPlatformFile *file, uint64_t size) {
+    if (file == NULL) {
+        return WL_ERR_ARG;
+    }
+    if (size > 0xFFFFFFFFull) {
+        return WL_ERR_RANGE;
+    }
+    if (ftruncate(file->fd, (off_t)size) != 0) {
+        return WL_ERR_IO;
+    }
+    file->size = size;
+    return WL_OK;
+}
+
+static void fs_stat_from(const struct stat *st, WlPlatformStat *out) {
+    out->is_dir = S_ISDIR(st->st_mode);
+    out->size = out->is_dir ? 0 : (uint64_t)st->st_size;
+    out->mtime_us = st->st_mtime > 0 ? (uint64_t)st->st_mtime * 1000000ull : 0;
+    out->read_only = (st->st_mode & S_IWUSR) == 0;
+}
+
+WlResult wl_platform_fs_stat(const char *path, WlPlatformStat *out) {
+    if (out == NULL) {
+        return WL_ERR_ARG;
+    }
+    char real[WL_FS_PATH_MAX + 64];
+    WlResult r = fs_resolve(path, real, sizeof real);
+    if (r != WL_OK) {
+        return r;
+    }
+    struct stat st;
+    if (stat(real, &st) != 0) {
+        return fs_errno_result(errno);
+    }
+    fs_stat_from(&st, out);
+    return WL_OK;
+}
+
+WlResult wl_platform_fs_fstat(WlPlatformFile *file, WlPlatformStat *out) {
+    if (file == NULL || out == NULL) {
+        return WL_ERR_ARG;
+    }
+    struct stat st;
+    if (fstat(file->fd, &st) != 0) {
+        return WL_ERR_IO;
+    }
+    fs_stat_from(&st, out);
+    out->size = file->size; // what this handle wrote, even before the device has it
+    return WL_OK;
+}
+
+WlResult wl_platform_fs_rmdir(const char *path) {
+    char real[WL_FS_PATH_MAX + 64];
+    WlResult r = fs_resolve(path, real, sizeof real);
+    if (r != WL_OK) {
+        return r;
+    }
+    if (rmdir(real) == 0) {
+        return WL_OK;
+    }
+    int e = errno;
+    return (e == ENOTEMPTY || e == EEXIST || e == EBUSY) ? WL_ERR_DENIED : fs_errno_result(e);
+}
+
+struct WlPlatformDir {
+    atomic_bool busy;
+    DIR *stream;
+    char path[WL_FS_PATH_MAX + 64]; // the C library's path of the directory, for each entry's stat
+};
+
+static WlPlatformDir g_dirs[WL_FS_MAX_DIRS];
+
+WlResult wl_platform_fs_dir_open(const char *path, WlPlatformDir **out) {
+    if (out == NULL) {
+        return WL_ERR_ARG;
+    }
+    char real[WL_FS_PATH_MAX + 64];
+    WlResult r = fs_resolve(path, real, sizeof real);
+    if (r != WL_OK) {
+        return r;
+    }
+    WlPlatformDir *d = NULL;
+    for (uint32_t i = 0; i < WL_FS_MAX_DIRS && d == NULL; i++) {
+        bool expected = false;
+        if (atomic_compare_exchange_strong(&g_dirs[i].busy, &expected, true)) {
+            d = &g_dirs[i];
+        }
+    }
+    if (d == NULL) {
+        return WL_ERR_LIMIT;
+    }
+    d->stream = opendir(real);
+    if (d->stream == NULL) {
+        int e = errno;
+        atomic_store(&d->busy, false);
+        return fs_errno_result(e);
+    }
+    size_t n = strlen(real);
+    while (n > 1 && real[n - 1] == '/') {
+        real[--n] = '\0';
+    }
+    memcpy(d->path, real, n + 1);
+    *out = d;
+    return WL_OK;
+}
+
+WlResult wl_platform_fs_dir_next(WlPlatformDir *dir, char *name, size_t name_cap, WlPlatformStat *st) {
+    if (dir == NULL || name == NULL || name_cap == 0) {
+        return WL_ERR_ARG;
+    }
+    for (;;) {
+        struct dirent *e = readdir(dir->stream);
+        if (e == NULL) {
+            return WL_ERR_NOT_FOUND;
+        }
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        size_t len = strlen(e->d_name);
+        size_t keep = len < name_cap - 1 ? len : name_cap - 1;
+        memcpy(name, e->d_name, keep);
+        name[keep] = '\0';
+        if (st != NULL) {
+            char full[2 * (WL_FS_PATH_MAX + 64)];
+            struct stat s;
+            memset(st, 0, sizeof *st);
+            int n = snprintf(full, sizeof full, "%s/%s", dir->path, e->d_name);
+            if (n > 0 && (size_t)n < sizeof full && stat(full, &s) == 0) {
+                fs_stat_from(&s, st);
+            }
+        }
+        return WL_OK;
+    }
+}
+
+void wl_platform_fs_dir_rewind(WlPlatformDir *dir) {
+    if (dir != NULL) {
+        rewinddir(dir->stream);
+    }
+}
+
+void wl_platform_fs_dir_close(WlPlatformDir *dir) {
+    if (dir == NULL || !atomic_load(&dir->busy)) {
+        return;
+    }
+    closedir(dir->stream);
+    dir->stream = NULL;
+    atomic_store(&dir->busy, false);
 }

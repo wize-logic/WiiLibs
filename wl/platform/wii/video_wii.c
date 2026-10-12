@@ -63,10 +63,17 @@ static void on_pre_retrace(u32 retrace_count) {
     }
 }
 
+static WlRetraceHook volatile g_hook;
+static void *volatile g_hook_user;
+
 // After: what the interface scans now (a committed frame has reached the screen).
 static void on_retrace(u32 retrace_count) {
     (void)retrace_count;
     g_retraces++;
+    WlRetraceHook hook = g_hook;
+    if (hook != NULL) {
+        hook(g_hook_user);
+    }
     // (the GameCube pads are read at every retrace, so that a press shorter than a frame is seen)
     wl_input_wii_retrace();
     if (g_inited) {
@@ -348,6 +355,14 @@ uint32_t wl_platform_video_shown_count(void) {
 
 uint32_t wl_platform_video_retrace_count(void) {
     return g_retraces;
+}
+
+void wl_platform_video_set_retrace_hook(WlRetraceHook fn, void *user) {
+    u32 level = IRQ_Disable(); // the pair changes between two retraces, never across one
+    g_hook = NULL;
+    g_hook_user = user;
+    g_hook = fn;
+    IRQ_Restore(level);
 }
 
 uint32_t wl_platform_video_dropped_count(void) {

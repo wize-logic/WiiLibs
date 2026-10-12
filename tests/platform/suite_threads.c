@@ -717,6 +717,174 @@ static void check_heap_contention(void) {
               "all blocks freed, no bad frees");
 }
 
+// ---------------------------------------------------------------------------------------------
+// Waits with deadlines, recursive mutexes, condition variables, detach/exit/ids/priorities
+// ---------------------------------------------------------------------------------------------
+
+typedef struct {
+    WlPlatformMutex m;
+    WlPlatformCond c;
+    uint32_t value;  // guarded by m
+    uint32_t woken;  // guarded by m
+    uint32_t target; // consumers stop once value reaches it
+} CondBox;
+
+static void *cond_consumer(void *arg) {
+    CondBox *b = arg;
+    wl_platform_mutex_lock(b->m);
+    while (b->value < b->target) {
+        wl_platform_cond_wait(b->c, b->m);
+    }
+    b->woken++;
+    wl_platform_mutex_unlock(b->m);
+    return NULL;
+}
+
+static void *cond_counter(void *arg) {
+    CondBox *b = arg;
+    for (uint32_t i = 0; i < 1000u; i++) {
+        wl_platform_mutex_lock(b->m);
+        b->value++;
+        wl_platform_cond_broadcast(b->c);
+        wl_platform_mutex_unlock(b->m);
+    }
+    return NULL;
+}
+
+static void *exit_early(void *arg) {
+    if (arg != NULL) {
+        wl_platform_thread_exit((void *)(uintptr_t)0x5EED);
+    }
+    return (void *)(uintptr_t)0xBAD;
+}
+
+static atomic_uint g_detached_ran;
+
+static void *detached_worker(void *arg) {
+    uint32_t *id = arg;
+    *id = wl_platform_thread_self_id();
+    atomic_fetch_add(&g_detached_ran, 1u);
+    return NULL;
+}
+
+static void check_waits(void) {
+    // a semaphore wait with a deadline: the deadline passes, then a count arrives in time
+    WlPlatformSemaphore sem;
+    wlt_check("sem_create_t", wl_platform_sem_create(&sem, 0, 4) == WL_OK, "create");
+    uint64_t t0 = wl_platform_time_ms();
+    bool got = wl_platform_sem_wait_timeout(sem, 30);
+    uint64_t waited = wl_platform_time_ms() - t0;
+    wlt_check("sem_timeout_expires", !got && waited >= 25 && waited < 2000, "a wait with nothing to take times out");
+    wlt_check("sem_try_empty", !wl_platform_sem_wait_timeout(sem, 0), "a try on an empty semaphore fails at once");
+    wl_platform_sem_post(sem);
+    wlt_check("sem_try_ready", wl_platform_sem_wait_timeout(sem, 0), "a try on a posted semaphore takes it");
+    wl_platform_sem_post(sem);
+    wlt_check("sem_timeout_ready", wl_platform_sem_wait_timeout(sem, 1000), "a posted count is taken before the deadline");
+    wl_platform_sem_destroy(sem);
+
+    // a recursive mutex: the holder locks it again; another thread's try fails until it is free
+    WlPlatformMutex rm;
+    wlt_check("mutex_recursive_create", wl_platform_mutex_create_recursive(&rm) == WL_OK, "create");
+    wl_platform_mutex_lock(rm);
+    wlt_check("mutex_recursive_relock", wl_platform_mutex_try_lock(rm), "the holder takes it again");
+    wl_platform_mutex_lock(rm);
+    wl_platform_mutex_unlock(rm);
+    wl_platform_mutex_unlock(rm);
+    wl_platform_mutex_unlock(rm);
+    wlt_check("mutex_recursive_free", wl_platform_mutex_try_lock(rm), "free again after as many unlocks");
+    wl_platform_mutex_unlock(rm);
+    wl_platform_mutex_destroy(rm);
+    WlPlatformMutex pm;
+    wlt_check("mutex_plain_create", wl_platform_mutex_create(&pm) == WL_OK, "create");
+    wlt_check("mutex_try_free", wl_platform_mutex_try_lock(pm), "a free mutex is taken by a try");
+    wl_platform_mutex_unlock(pm);
+    wl_platform_mutex_destroy(pm);
+
+    // a condition variable: timed wait expires; a broadcast wakes every consumer
+    CondBox box = {0};
+    bool ok = wl_platform_mutex_create(&box.m) == WL_OK && wl_platform_cond_create(&box.c) == WL_OK;
+    wlt_check("cond_create", ok, "mutex + condition");
+    if (!ok) {
+        return;
+    }
+    wl_platform_mutex_lock(box.m);
+    t0 = wl_platform_time_ms();
+    bool woke = wl_platform_cond_wait_timeout(box.c, box.m, 30);
+    waited = wl_platform_time_ms() - t0;
+    wl_platform_mutex_unlock(box.m);
+    wlt_check("cond_timeout_expires", !woke && waited >= 25 && waited < 2000, "a timed wait with no signal times out");
+    wl_platform_mutex_lock(box.m);
+    wlt_check("cond_timeout_zero", !wl_platform_cond_wait_timeout(box.c, box.m, 0), "a zero wait returns at once");
+    wl_platform_mutex_unlock(box.m);
+
+    box.target = 1000;
+    Worker consumers[4] = {0};
+    Worker counter = {0};
+    bool spawned = true;
+    for (uint32_t i = 0; i < 4; i++) {
+        spawned &= spawn(&consumers[i], cond_consumer, &box, WL_THREAD_PRIO_MAIN);
+    }
+    spawned &= spawn(&counter, cond_counter, &box, WL_THREAD_PRIO_IO);
+    wlt_check("cond_spawn", spawned, "consumers and counter");
+    reap(&counter);
+    for (uint32_t i = 0; i < 4; i++) {
+        reap(&consumers[i]);
+    }
+    wlt_check("cond_broadcast", box.value == 1000 && box.woken == 4, "every consumer saw the count reach its target");
+    wl_platform_cond_destroy(box.c);
+    wl_platform_mutex_destroy(box.m);
+
+    // exit: a thread ends early with a result its join sees
+    Worker ex = {0};
+    if (spawn(&ex, exit_early, &ex, WL_THREAD_PRIO_MAIN)) {
+        void *r = reap(&ex);
+        wlt_check("thread_exit_result", r == (void *)(uintptr_t)0x5EED, "the join sees the exit's result");
+    } else {
+        wlt_check("thread_exit_spawn", false, "spawn");
+    }
+
+    // ids: the caller's is stable and not 0; detached threads run, end and give their slots back
+    uint32_t me = wl_platform_thread_self_id();
+    wlt_check("thread_self_id", me != 0 && me == wl_platform_thread_self_id(), "stable, not 0");
+    enum { DETACHED = 6 };
+    static uint8_t stacks[DETACHED][STACK_SIZE] __attribute__((aligned(32)));
+    static uint32_t ids[DETACHED];
+    atomic_store(&g_detached_ran, 0);
+    bool detached_ok = true;
+    for (uint32_t round = 0; round < 3 && detached_ok; round++) {
+        uint32_t before = atomic_load(&g_detached_ran);
+        for (uint32_t i = 0; i < DETACHED; i++) {
+            WlPlatformThread t;
+            ids[i] = 0;
+            detached_ok &= wl_platform_thread_create(&t, detached_worker, &ids[i], stacks[i], STACK_SIZE,
+                                                     WL_THREAD_PRIO_MAIN) == WL_OK;
+            detached_ok &= wl_platform_thread_detach(t) == WL_OK;
+        }
+        for (uint32_t spin = 0; spin < 2000 && atomic_load(&g_detached_ran) < before + DETACHED; spin++) {
+            wl_platform_thread_sleep_ms(1);
+        }
+        detached_ok &= atomic_load(&g_detached_ran) == before + DETACHED;
+        for (uint32_t i = 0; i < DETACHED; i++) {
+            detached_ok &= ids[i] != 0 && ids[i] != me;
+        }
+        wl_platform_thread_sleep_ms(5); // let them finish their returns before their stacks are reused
+    }
+    wlt_check("thread_detach", detached_ok, "three rounds of detached threads ran and were reclaimed");
+
+    // priority change of a live thread
+    Worker pw = {0};
+    box.target = 0;
+    if (spawn(&pw, return_arg, NULL, WL_THREAD_PRIO_IO)) {
+        WlResult pr = wl_platform_thread_set_priority(pw.th, WL_THREAD_PRIO_NET);
+        reap(&pw);
+        wlt_check("thread_set_priority", pr == WL_OK || pr == WL_ERR_STATE, "accepted (or already ended)");
+    }
+
+    uint64_t wall = wl_platform_wall_time_us();
+    wlt_check("wall_clock", wall > 1262304000000000ull && wl_platform_wall_time_us() >= wall,
+              "after 2010 and not stepping back");
+}
+
 void wlt_suite_threads(void);
 
 void wlt_suite_threads(void) {
@@ -734,4 +902,5 @@ void wlt_suite_threads(void) {
     check_run_on_stack();
     check_io();
     check_heap_contention();
+    check_waits();
 }

@@ -3,23 +3,28 @@
 // the ring and IO-thread logic is testable on the host. Priorities are ignored (the host
 // scheduler is preemptive and multicore: a stronger race test than the console's) and stacks are
 // validated but not used (wl_platform_run_on_stack's is). Handles are pool index + 1; pools are
-// fixed and guarded by one lock.
+// fixed and guarded by one lock. Condition variables wait on CLOCK_MONOTONIC, so a change of the
+// wall clock does not stretch or cut a timeout.
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdatomic.h>
 #include <time.h>
 
 #include "wl/platform/platform.h"
 #include "wl/platform/posix.h"
 
-#define MAX_THREADS 16u
+#define MAX_THREADS 64u
 #define MAX_SEMS 64u
-#define MAX_MUTEXES 64u
+#define MAX_MUTEXES 128u
+#define MAX_CONDS 256u
 #define MIN_STACK 4096u
 
 typedef struct {
     bool used;
+    bool detached; // nobody joins it: the slot is freed when it ends
+    bool finished; // its function returned (or it called wl_platform_thread_exit)
     pthread_t th;
     WlPlatformThreadFn fn;
     void *arg;
@@ -38,19 +43,41 @@ typedef struct {
     pthread_mutex_t m;
 } HostMutex;
 
+typedef struct {
+    bool used;
+    pthread_cond_t c;
+} HostCond;
+
 static pthread_mutex_t g_pool = PTHREAD_MUTEX_INITIALIZER;
 static HostThread g_threads[MAX_THREADS];
 static HostSem g_sems[MAX_SEMS];
 static HostMutex g_mutexes[MAX_MUTEXES];
+static HostCond g_conds[MAX_CONDS];
 static void *g_results[MAX_THREADS];
+static _Thread_local HostThread *t_self;   // the pool thread running here (NULL: not one)
+static _Thread_local uint32_t t_id;        // wl_platform_thread_self_id, handed out on first use
+static atomic_uint g_next_id = 1;
 
 bool wl_platform_thread_priorities_real(void) {
     return false;
 }
 
+// The end of a pool thread, by return or by wl_platform_thread_exit: a detached one gives its
+// slot back, a joinable one keeps it for the join.
+static void thread_finish(HostThread *t, void *result) {
+    pthread_mutex_lock(&g_pool);
+    g_results[t - g_threads] = result;
+    t->finished = true;
+    if (t->detached) {
+        t->used = false;
+    }
+    pthread_mutex_unlock(&g_pool);
+}
+
 static void *thread_main(void *p) {
     HostThread *t = p;
-    g_results[t - g_threads] = t->fn(t->arg);
+    t_self = t;
+    thread_finish(t, t->fn(t->arg));
     return NULL;
 }
 
@@ -71,6 +98,8 @@ WlResult wl_platform_thread_create(WlPlatformThread *out, WlPlatformThreadFn fn,
     }
     HostThread *t = &g_threads[i];
     t->used = true;
+    t->detached = false;
+    t->finished = false;
     t->fn = fn;
     t->arg = arg;
     g_results[i] = NULL;
@@ -91,7 +120,7 @@ WlResult wl_platform_thread_join(WlPlatformThread thread, void **out_result) {
     }
     uint32_t i = thread.id - 1u;
     pthread_mutex_lock(&g_pool);
-    bool ok = g_threads[i].used;
+    bool ok = g_threads[i].used && !g_threads[i].detached;
     pthread_t th = g_threads[i].th;
     pthread_mutex_unlock(&g_pool);
     if (!ok || pthread_join(th, NULL) != 0) {
@@ -265,4 +294,176 @@ void wl_platform_mutex_destroy(WlPlatformMutex mutex) {
 }
 
 void wl_platform_tls_thread_exit(void) {
+}
+
+WlResult wl_platform_thread_detach(WlPlatformThread thread) {
+    if (thread.id == 0 || thread.id > MAX_THREADS) {
+        return WL_ERR_ARG;
+    }
+    HostThread *t = &g_threads[thread.id - 1u];
+    pthread_mutex_lock(&g_pool);
+    if (!t->used || t->detached) {
+        pthread_mutex_unlock(&g_pool);
+        return WL_ERR_STATE;
+    }
+    pthread_detach(t->th);
+    t->detached = true;
+    if (t->finished) {
+        t->used = false; // it ended before anyone said it would not be joined
+    }
+    pthread_mutex_unlock(&g_pool);
+    return WL_OK;
+}
+
+void wl_platform_thread_exit(void *result) {
+    if (t_self != NULL) {
+        thread_finish(t_self, result);
+    }
+    pthread_exit(NULL);
+}
+
+uint32_t wl_platform_thread_self_id(void) {
+    if (t_id == 0) {
+        t_id = atomic_fetch_add(&g_next_id, 1u);
+    }
+    return t_id;
+}
+
+WlResult wl_platform_thread_set_priority(WlPlatformThread thread, WlThreadPriority priority) {
+    if (thread.id == 0 || thread.id > MAX_THREADS || (unsigned)priority > WL_THREAD_PRIO_AUDIO) {
+        return WL_ERR_ARG;
+    }
+    pthread_mutex_lock(&g_pool);
+    bool live = g_threads[thread.id - 1u].used && !g_threads[thread.id - 1u].finished;
+    pthread_mutex_unlock(&g_pool);
+    return live ? WL_OK : WL_ERR_STATE;
+}
+
+// A deadline `ms` from now on `clock`.
+static struct timespec deadline_after(clockid_t clock, uint32_t ms) {
+    struct timespec ts;
+    clock_gettime(clock, &ts);
+    ts.tv_sec += (time_t)(ms / 1000u);
+    ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    return ts;
+}
+
+bool wl_platform_sem_wait_timeout(WlPlatformSemaphore sem, uint32_t timeout_ms) {
+    if (timeout_ms == WL_WAIT_FOREVER) {
+        wl_platform_sem_wait(sem);
+        return true;
+    }
+    HostSem *s = sem_of(sem);
+    // the semaphore's condition variable keeps the default clock (realtime): the deadline is taken
+    // on that clock
+    struct timespec until = deadline_after(CLOCK_REALTIME, timeout_ms);
+    pthread_mutex_lock(&s->m);
+    while (s->count == 0) {
+        if (timeout_ms == 0 || pthread_cond_timedwait(&s->c, &s->m, &until) == ETIMEDOUT) {
+            break;
+        }
+    }
+    bool got = s->count > 0;
+    if (got) {
+        s->count--;
+    }
+    pthread_mutex_unlock(&s->m);
+    return got;
+}
+
+WlResult wl_platform_mutex_create_recursive(WlPlatformMutex *out) {
+    if (out == NULL) {
+        return WL_ERR_ARG;
+    }
+    pthread_mutex_lock(&g_pool);
+    uint32_t i = 0;
+    while (i < MAX_MUTEXES && g_mutexes[i].used) {
+        i++;
+    }
+    if (i == MAX_MUTEXES) {
+        pthread_mutex_unlock(&g_pool);
+        return WL_ERR_LIMIT;
+    }
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    g_mutexes[i].used = true;
+    pthread_mutex_init(&g_mutexes[i].m, &attr);
+    pthread_mutexattr_destroy(&attr);
+    pthread_mutex_unlock(&g_pool);
+    out->id = i + 1u;
+    return WL_OK;
+}
+
+bool wl_platform_mutex_try_lock(WlPlatformMutex mutex) {
+    return pthread_mutex_trylock(&mutex_of(mutex)->m) == 0;
+}
+
+WlResult wl_platform_cond_create(WlPlatformCond *out) {
+    if (out == NULL) {
+        return WL_ERR_ARG;
+    }
+    pthread_mutex_lock(&g_pool);
+    uint32_t i = 0;
+    while (i < MAX_CONDS && g_conds[i].used) {
+        i++;
+    }
+    if (i == MAX_CONDS) {
+        pthread_mutex_unlock(&g_pool);
+        return WL_ERR_LIMIT;
+    }
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    g_conds[i].used = true;
+    pthread_cond_init(&g_conds[i].c, &attr);
+    pthread_condattr_destroy(&attr);
+    pthread_mutex_unlock(&g_pool);
+    out->id = i + 1u;
+    return WL_OK;
+}
+
+static HostCond *cond_of(WlPlatformCond h) {
+    WL_ASSERT(h.id >= 1 && h.id <= MAX_CONDS && g_conds[h.id - 1u].used);
+    return &g_conds[h.id - 1u];
+}
+
+void wl_platform_cond_wait(WlPlatformCond cond, WlPlatformMutex mutex) {
+    pthread_cond_wait(&cond_of(cond)->c, &mutex_of(mutex)->m);
+}
+
+bool wl_platform_cond_wait_timeout(WlPlatformCond cond, WlPlatformMutex mutex, uint32_t timeout_ms) {
+    if (timeout_ms == WL_WAIT_FOREVER) {
+        wl_platform_cond_wait(cond, mutex);
+        return true;
+    }
+    HostMutex *m = mutex_of(mutex);
+    if (timeout_ms == 0) {
+        pthread_mutex_unlock(&m->m);
+        sched_yield();
+        pthread_mutex_lock(&m->m);
+        return false;
+    }
+    struct timespec until = deadline_after(CLOCK_MONOTONIC, timeout_ms);
+    return pthread_cond_timedwait(&cond_of(cond)->c, &m->m, &until) != ETIMEDOUT;
+}
+
+void wl_platform_cond_signal(WlPlatformCond cond) {
+    pthread_cond_signal(&cond_of(cond)->c);
+}
+
+void wl_platform_cond_broadcast(WlPlatformCond cond) {
+    pthread_cond_broadcast(&cond_of(cond)->c);
+}
+
+void wl_platform_cond_destroy(WlPlatformCond cond) {
+    HostCond *c = cond_of(cond);
+    pthread_mutex_lock(&g_pool);
+    pthread_cond_destroy(&c->c);
+    c->used = false;
+    pthread_mutex_unlock(&g_pool);
 }

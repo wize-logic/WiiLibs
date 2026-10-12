@@ -3,8 +3,10 @@
 // handles of platform.h, plus the priority table of WlThreadPriority. Only this directory may
 // include <ogc/*.h>. Handles are the 32-bit LWP ids by value.
 #define _POSIX_C_SOURCE 200809L
+#include <ogc/irq.h>
 #include <ogc/lwp.h>
 #include <ogc/mutex.h>
+#include <ogc/cond.h>
 #include <ogc/semaphore.h>
 #include <pthread.h>
 #include <time.h>
@@ -25,6 +27,8 @@ static const uint8_t k_lwp_prio[] = {
 
 static bool g_main_pinned;
 
+static void reap_detached(void);
+
 bool wl_platform_thread_priorities_real(void) {
     return true;
 }
@@ -41,6 +45,7 @@ WlResult wl_platform_thread_create(WlPlatformThread *out, WlPlatformThreadFn fn,
         LWP_SetThreadPriority(LWP_GetSelf(), k_lwp_prio[WL_THREAD_PRIO_MAIN]);
         g_main_pinned = true;
     }
+    reap_detached();
     lwp_t t = 0;
     if (LWP_CreateThread(&t, fn, arg, stack, (u32)stack_size, k_lwp_prio[priority]) < 0) {
         return WL_ERR_FAILED;
@@ -143,6 +148,141 @@ void wl_platform_mutex_unlock(WlPlatformMutex mutex) {
 
 void wl_platform_mutex_destroy(WlPlatformMutex mutex) {
     (void)LWP_MutexDestroy(mutex.id);
+}
+
+// ---- Detached threads, exit, ids, priorities ------------------------------------------------
+// An LWP thread's control block (a KThread, which LWP_CreateThread allocates; the lwp_t is its
+// address) is freed by LWP_JoinThread. A detached thread is remembered here and joined once it
+// has finished, at the next detach or create: no thread waits for it.
+#define MAX_DETACHED 64u
+static lwp_t g_detached[MAX_DETACHED];
+
+static void reap_detached(void) {
+    for (uint32_t i = 0; i < MAX_DETACHED; i++) {
+        lwp_t t = g_detached[i];
+        if (t != 0 && ((KThread *)(uintptr_t)t)->state == KTHR_STATE_FINISHED) {
+            g_detached[i] = 0;
+            (void)LWP_JoinThread(t, NULL); // finished: returns at once and frees the block
+        }
+    }
+}
+
+WlResult wl_platform_thread_detach(WlPlatformThread thread) {
+    if (thread.id == 0 || thread.id == LWP_THREAD_NULL) {
+        return WL_ERR_ARG;
+    }
+    reap_detached();
+    for (uint32_t i = 0; i < MAX_DETACHED; i++) {
+        if (g_detached[i] == 0) {
+            g_detached[i] = thread.id;
+            return WL_OK;
+        }
+    }
+    return WL_ERR_LIMIT; // still joinable
+}
+
+void wl_platform_thread_exit(void *result) {
+    KThreadExit((sptr)(uintptr_t)result);
+    for (;;) {
+    }
+}
+
+uint32_t wl_platform_thread_self_id(void) {
+    return LWP_GetSelf();
+}
+
+WlResult wl_platform_thread_set_priority(WlPlatformThread thread, WlThreadPriority priority) {
+    if (thread.id == 0 || (unsigned)priority >= WL_ARRAY_COUNT(k_lwp_prio)) {
+        return WL_ERR_ARG;
+    }
+    LWP_SetThreadPriority(thread.id, k_lwp_prio[priority]);
+    return WL_OK;
+}
+
+// libogc's semaphores have no timed wait (they block on a thread queue without a deadline), so a
+// wait with a deadline tries, then sleeps a millisecond and tries again: up to a millisecond late,
+// and it may lose a count to an untimed waiter that arrives meanwhile.
+bool wl_platform_sem_wait_timeout(WlPlatformSemaphore sem, uint32_t timeout_ms) {
+    if (timeout_ms == WL_WAIT_FOREVER) {
+        wl_platform_sem_wait(sem);
+        return true;
+    }
+    uint64_t start = wl_platform_time_ms();
+    for (;;) {
+        u32 value = 0;
+        u32 level = IRQ_Disable();
+        bool ready = LWP_SemGetValue(sem.id, &value) == 0 && value > 0;
+        if (ready) {
+            (void)LWP_SemWait(sem.id); // a count is there: does not block
+        }
+        IRQ_Restore(level);
+        if (ready) {
+            return true;
+        }
+        if (wl_platform_time_ms() - start >= timeout_ms) {
+            return false;
+        }
+        wl_platform_thread_sleep_ms(1);
+    }
+}
+
+WlResult wl_platform_mutex_create_recursive(WlPlatformMutex *out) {
+    if (out == NULL) {
+        return WL_ERR_ARG;
+    }
+    mutex_t m = 0;
+    if (LWP_MutexInit(&m, true) < 0) {
+        return WL_ERR_NOMEM;
+    }
+    out->id = m;
+    return WL_OK;
+}
+
+bool wl_platform_mutex_try_lock(WlPlatformMutex mutex) {
+    return LWP_MutexTryLock(mutex.id) == 0;
+}
+
+WlResult wl_platform_cond_create(WlPlatformCond *out) {
+    if (out == NULL) {
+        return WL_ERR_ARG;
+    }
+    cond_t c = 0;
+    if (LWP_CondInit(&c) < 0) {
+        return WL_ERR_NOMEM;
+    }
+    out->id = c;
+    return WL_OK;
+}
+
+void wl_platform_cond_wait(WlPlatformCond cond, WlPlatformMutex mutex) {
+    (void)LWP_CondWait(cond.id, mutex.id);
+}
+
+bool wl_platform_cond_wait_timeout(WlPlatformCond cond, WlPlatformMutex mutex, uint32_t timeout_ms) {
+    if (timeout_ms == WL_WAIT_FOREVER) {
+        wl_platform_cond_wait(cond, mutex);
+        return true;
+    }
+    if (timeout_ms == 0) {
+        (void)LWP_MutexUnlock(mutex.id);
+        LWP_YieldThread();
+        (void)LWP_MutexLock(mutex.id);
+        return false;
+    }
+    struct timespec rel = {(time_t)(timeout_ms / 1000u), (long)(timeout_ms % 1000u) * 1000000L};
+    return LWP_CondTimedWait(cond.id, mutex.id, &rel) == 0;
+}
+
+void wl_platform_cond_signal(WlPlatformCond cond) {
+    (void)LWP_CondSignal(cond.id);
+}
+
+void wl_platform_cond_broadcast(WlPlatformCond cond) {
+    (void)LWP_CondBroadcast(cond.id);
+}
+
+void wl_platform_cond_destroy(WlPlatformCond cond) {
+    (void)LWP_CondDestroy(cond.id);
 }
 
 // A pthread_t is libogc's thread: the block devkitPPC's pthread_create allocates begins with the
