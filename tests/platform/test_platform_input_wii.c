@@ -10,6 +10,8 @@
 #include "greatest.h"
 #include "input_stub.h"
 #include "wl/platform/platform.h"
+#include "wl/platform/input_reports.h"
+#include "wl/platform/wii/input_wii.h"
 
 static void reset(void) {
     memset(&g_input_stub, 0, sizeof g_input_stub);
@@ -546,6 +548,126 @@ TEST a_pad_never_seen_is_not_held_by_an_error(void) {
     PASS();
 }
 
+// ---- the GameCube pads read at every retrace
+
+static void retrace_with(u16 buttons, s8 err) {
+    g_input_stub.pad[0].err = err;
+    g_input_stub.pad[0].button = buttons;
+    wl_input_wii_retrace();
+}
+
+TEST a_tap_between_two_polls_is_seen_by_the_poll_after_it(void) {
+    reset();
+    (void)poll(); // (starts input)
+    retrace_with(0, PAD_ERR_NONE);
+    (void)poll();
+    unsigned reads = g_input_stub.pad_reads;
+    retrace_with(0, PAD_ERR_NONE);
+    retrace_with(PAD_BUTTON_A, PAD_ERR_NONE); // a press of one field ...
+    retrace_with(0, PAD_ERR_NONE);            // ... and gone before the poll
+    WlRawInput in = poll();
+    ASSERT(in.pads[0].connected);
+    ASSERT(in.pads[0].buttons & WL_PAD_A);
+    // the poll took the retraces' word and did not read the pad again
+    ASSERT_EQ(reads + 3, g_input_stub.pad_reads);
+    // and the next poll sees it released
+    retrace_with(0, PAD_ERR_NONE);
+    ASSERT_EQ(0u, poll().pads[0].buttons & WL_PAD_A);
+    ASSERT_EQ(0, g_input_stub.irq_depth);
+    PASS();
+}
+
+TEST a_poll_between_retraces_still_sees_a_held_button_and_the_latest_sticks(void) {
+    reset();
+    (void)poll();
+    g_input_stub.pad[0].stickX = 87;
+    retrace_with(PAD_BUTTON_B, PAD_ERR_NONE);
+    ASSERT(poll().pads[0].buttons & WL_PAD_B);
+    // no retrace since: the poll reads the pad itself, and a button still held is still held
+    WlRawInput in = poll();
+    ASSERT(in.pads[0].buttons & WL_PAD_B);
+    ASSERT_EQ(127, in.pads[0].stick[0][0]);
+    PASS();
+}
+
+TEST a_retrace_error_keeps_the_pad_and_a_long_run_of_them_loses_it(void) {
+    reset();
+    (void)poll();
+    retrace_with(PAD_BUTTON_Y, PAD_ERR_NONE);
+    (void)poll();
+    for (unsigned i = 0; i < WL_PAD_ERROR_GRACE_SAMPLES - 1; i++) {
+        retrace_with(0, PAD_ERR_TRANSFER);
+    }
+    WlRawInput in = poll();
+    ASSERT(in.pads[0].connected);
+    ASSERT(in.pads[0].buttons & WL_PAD_Y); // (the state it was last read in)
+    retrace_with(0, PAD_ERR_TRANSFER);
+    ASSERT(!poll().pads[0].connected);
+    PASS();
+}
+
+TEST the_pad_counters_tell_retrace_samples_from_polls_that_read(void) {
+    reset();
+    WlPadStats before, st;
+    (void)poll(); // (starts input)
+    wl_platform_input_pad_stats(&before);
+    (void)poll(); // no pad yet: a poll that read
+    retrace_with(0, PAD_ERR_NONE);
+    (void)poll();
+    for (int i = 0; i < 4; i++) {
+        retrace_with(0, PAD_ERR_NONE);
+    }
+    retrace_with(0, PAD_ERR_TRANSFER); // (a sample without fresh data)
+    (void)poll();
+    wl_platform_input_pad_stats(&st);
+    ASSERT_EQ(3u, st.polls - before.polls);
+    ASSERT_EQ(1u, st.polls_unsampled - before.polls_unsampled);
+    ASSERT_EQ(5u, st.retrace_samples - before.retrace_samples); // (the first sample found no pad there yet)
+    ASSERT_EQ(4u, st.retrace_fresh - before.retrace_fresh);
+    PASS();
+}
+
+TEST the_retrace_before_input_starts_does_nothing(void) {
+    reset();
+    wl_platform_input_shutdown();
+    unsigned reads = g_input_stub.pad_reads;
+    wl_input_wii_retrace();
+    ASSERT_EQ(reads, g_input_stub.pad_reads);
+    PASS();
+}
+
+// ---- the Nunchuk's readings
+
+TEST the_nunchuks_readings_of_a_frame_are_kept_in_order(void) {
+    reset();
+    remote(0, WPAD_EXP_NUNCHUK, 0);
+    for (int i = 0; i < 3; i++) {
+        WPADData *d = &g_input_stub.queue[0][i];
+        memset(d, 0, sizeof *d);
+        d->err = WPAD_ERR_NONE;
+        d->exp.type = EXP_NUNCHUK;
+        d->exp.nunchuk.gforce.x = 0.1f * (float)i;
+        d->exp.nunchuk.gforce.y = 0.5f + (float)i;
+        d->exp.nunchuk.gforce.z = -1.0f;
+    }
+    g_input_stub.queue_len[0] = 3;
+    WlRawInput in = poll();
+    ASSERT_EQ(3, in.remotes[0].nunchuk_samples);
+    ASSERT_EQ(3, in.remotes[0].nunchuk_reports);
+    ASSERT_EQ(50, in.remotes[0].nunchuk_accel[0][1]);
+    ASSERT_EQ(150, in.remotes[0].nunchuk_accel[1][1]);
+    ASSERT_EQ(250, in.remotes[0].nunchuk_accel[2][1]);
+    ASSERT_EQ(-100, in.remotes[0].nunchuk_accel[2][2]);
+    // a Remote without a Nunchuk has none
+    remote(1, WPAD_EXP_NONE, 0);
+    g_input_stub.queue[1][0].err = WPAD_ERR_NONE;
+    g_input_stub.queue[1][0].exp.type = 0;
+    g_input_stub.queue_len[1] = 1;
+    in = poll();
+    ASSERT_EQ(0, in.remotes[1].nunchuk_samples);
+    PASS();
+}
+
 SUITE(input_wii_suite) {
     RUN_TEST(classic_controller_sticks_and_triggers);
     RUN_TEST(classic_pro_triggers_are_the_digital_bits);
@@ -572,6 +694,12 @@ SUITE(input_wii_suite) {
     RUN_TEST(a_pad_that_fails_to_transfer_keeps_its_last_good_state);
     RUN_TEST(a_pad_that_keeps_failing_is_gone_and_returns_with_a_good_read);
     RUN_TEST(a_pad_never_seen_is_not_held_by_an_error);
+    RUN_TEST(a_tap_between_two_polls_is_seen_by_the_poll_after_it);
+    RUN_TEST(a_poll_between_retraces_still_sees_a_held_button_and_the_latest_sticks);
+    RUN_TEST(a_retrace_error_keeps_the_pad_and_a_long_run_of_them_loses_it);
+    RUN_TEST(the_pad_counters_tell_retrace_samples_from_polls_that_read);
+    RUN_TEST(the_retrace_before_input_starts_does_nothing);
+    RUN_TEST(the_nunchuks_readings_of_a_frame_are_kept_in_order);
 }
 
 GREATEST_MAIN_DEFS();

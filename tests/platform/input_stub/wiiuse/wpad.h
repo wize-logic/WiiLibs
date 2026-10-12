@@ -50,6 +50,7 @@ typedef int32_t s32;
 #define WPAD_CLASSIC_BUTTON_DOWN (0x4000u << 16)
 #define WPAD_CLASSIC_BUTTON_RIGHT (0x8000u << 16)
 
+#define EXP_NUNCHUK 1
 enum { WPAD_EXP_NONE = 0, WPAD_EXP_NUNCHUK, WPAD_EXP_CLASSIC, WPAD_EXP_GUITARHERO3, WPAD_EXP_WIIBOARD, WPAD_EXP_UNKNOWN = 255 };
 enum { WPAD_FMT_BTNS = 0, WPAD_FMT_BTNS_ACC, WPAD_FMT_BTNS_ACC_IR };
 
@@ -62,17 +63,18 @@ struct joystick_t {
     float ang; // degrees from +y, clockwise
     float mag; // 0..1
 };
+struct gforce_t {
+    float x, y, z;
+};
 struct nunchuk_t {
     struct joystick_t js;
+    struct gforce_t gforce;
 };
 struct classic_ctrl_t {
     uint8_t rs_raw;
     uint8_t ls_raw;
     struct joystick_t ljs;
     struct joystick_t rjs;
-};
-struct gforce_t {
-    float x, y, z;
 };
 struct ir_t {
     int raw_valid;

@@ -63,6 +63,9 @@ wl_add_test(test_platform_input_shape SOURCES test_platform_input_shape.c LIBS w
 # ... and the folding of a frame's reports into one (input_reports.c).
 wl_add_test(test_platform_input_reports SOURCES test_platform_input_reports.c LIBS wl_platform LABELS unit be)
 
+# ... and a Nunchuk's thrust found in synthetic acceleration traces (input_gesture.c).
+wl_add_test(test_platform_input_gesture SOURCES test_platform_input_gesture.c LIBS wl_platform LABELS unit be)
+
 # ... and the Wii input backend (wii/input_wii.c) compiled against stand-ins for libogc's WPAD, PAD
 # and keyboard, which answer from what the test sets up. It links wl_base for the log only.
 wl_add_test(test_platform_input_wii

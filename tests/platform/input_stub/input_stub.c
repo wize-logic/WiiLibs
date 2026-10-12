@@ -4,6 +4,7 @@
 
 #include "input_stub.h"
 #include <ogc/conf.h>
+#include <ogc/irq.h>
 #include <wiikeyboard/keyboard.h>
 
 InputStub g_input_stub;
@@ -71,7 +72,16 @@ u32 PAD_Init(void) {
     return 1;
 }
 
+u32 IRQ_Disable(void) {
+    return (u32)g_input_stub.irq_depth++;
+}
+
+void IRQ_Restore(u32 level) {
+    g_input_stub.irq_depth = (int)level;
+}
+
 u32 PAD_Read(PADStatus *status) {
+    g_input_stub.pad_reads++;
     memcpy(status, g_input_stub.pad, sizeof g_input_stub.pad);
     return 0;
 }

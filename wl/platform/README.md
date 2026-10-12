@@ -28,7 +28,8 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `posix.h`, `posix.c` | `wl_posix_pread`, `wl_posix_pwrite` (a seek, the transfer and a seek back under one lock, so the descriptor's position is left alone), `WlPlacedReader` (`wl_posix_placed_open`, `_pread`, `_release`, `_close`: a descriptor read at offsets that remembers where it stands, so that a read that starts where the last ended is one `read` with no seek, where `wl_posix_pread` is three, each of which on FAT follows the file's chain of clusters) and `wl_posix_pause`: the POSIX calls devkitPPC's newlib declares and does not define; `wl_posix_sysconf`, sysconf's memory and processor answers for the console; `wl_posix_thread_set_priority` and `wl_posix_thread_set_relative_priority`, a pthread's priority (devkitPPC's `pthread_create` starts every thread at libogc's lowest, 127, and ignores attributes; the definitions are `wii/thread_wii.c`'s and `host/thread_host.c`'s). `wii/posix_wii.c` defines the C library's `pread`, `pwrite`, `pause` and `sysconf` over them, as weak symbols (a newlib that gains them wins), so a program calls them by their own names |
 | `timebase.h` | the Wii's time base (60.75 MHz) and its conversions to microseconds and milliseconds with no 64-bit division (`wl_timebase_us`, `wl_timebase_ms`: long division in base 2^16 by a constant, exact for every count; `wl_udiv64_16` for another divisor under 65536), and `wl_timebase_read` (`mftbu`/`mftb` in place, without libogc's call); `wl_platform_time_us` and `wl_platform_time_ms` use them |
 | `input_shape.h`, `input_shape.c` | the raw input in the ranges an application wants, with no libogc in it: sticks over their real travel (a GameCube stick's full deflection is 87, the C stick's 74), triggers 0..255 (the Classic Controller's are 5 bits, the GameCube's start at 30), and the Remote's pointer (position across the screen, a short loss held, a play radius against tremor, a dead zone box and a turn ramp) |
-| `input_reports.h`, `input_reports.c` | a Wii Remote's reports of one frame folded into one reading, with no libogc in it: every button pressed in any report, the pointer's mean over the reports that had one, the acceleration's peak (`wii/input_wii.c` feeds it from `WPAD_ReadPending`) |
+| `input_reports.h`, `input_reports.c` | a Wii Remote's reports of one frame folded into one reading, with no libogc in it: every button pressed in any report, the pointer's mean over the reports that had one, the acceleration's peak, the Nunchuk's readings (`wii/input_wii.c` feeds it from `WPAD_ReadPending`); and a GameCube pad's samples taken at every retrace folded into the poll's look (`WlPadTracker`) |
+| `input_gesture.h`, `input_gesture.c` | a Nunchuk's forward thrust found in its accelerometer's readings by a change over a short window after a rest, not by a size; no libogc |
 | `tev.h`, `tev.c` | TEV programs as data: stages (inputs a b c d, op, bias, scale, clamp, output register, order, swap tables, konst selections), the helpers a translator allocates with (konst slots, register pool, resource merging), a validator, a software evaluator, the fixed GX recipes as programs; see below |
 | `backtrace.h`, `backtrace.c` | return-address backtraces for the 32-bit PowerPC frame layout: a portable walker over a read callback, `wl_platform_backtrace` for the running thread, `wl_platform_log_backtrace` for a "where from" log line; see below |
 | `profile.h`, `profile.c` | the sampling profiler: a ring of samples (the interrupted pc, link register, thread and the return addresses up its stack), the text dumps, the jitter; `wii/profile_wii.c` is the sampler over libogc's decrementer tick tasks; `tools/wl_profile.py` symbolizes the dumps; see below |
@@ -736,8 +737,22 @@ on the wire, reported as 0..100. Data format and IR resolution are re-applied on
 connection. A Remote that was connected and reads NOT_READY or TRANSFER (an extension plugged in) stays
 connected with nothing pressed for up to 120 polls, then counts as gone. A GameCube controller that
 answers `PAD_ERR_TRANSFER` or `PAD_ERR_NOT_READY` (libogc hands it back with nothing pressed) keeps
-its last good state, so that a held trigger is not released for a frame, until ten polls in a row
-have failed; then it counts as gone, and returns with its next good read. Sticks are -127..127 over
+its last good state, so that a held trigger is not released for a frame, until twenty samples in a row
+(a third of a second at 60 Hz) have failed; then it counts as gone, and returns with its next good read.
+The GameCube ports are read at every video retrace (`wl_input_wii_retrace`, called from the retrace
+interrupt by `video_wii.c`; `WlPadTracker` in `input_reports.h`), 60 or 50 times a second, and a poll
+takes what came in since the last one: a button seen pressed in any sample is pressed for the poll, so a
+tap shorter than a frame is not missed (it is released at the next poll), and the sticks and triggers
+are the latest sample's. The poll reads the pads itself only when no retrace has sampled them since its
+last (video not started). A second read inside one field would find no new data and answer
+`PAD_ERR_TRANSFER`, so the poll never reads again after a retrace's read. `wl_platform_input_pad_stats`
+counts the retrace samples, how many had fresh data, and the polls that read for themselves: on a
+console the fresh share should be near all of them (about one in two would mean the pads' own polling
+runs at 30 Hz). A Nunchuk's acceleration (`WPADData.exp.nunchuk.gforce`, x 100) of each report is kept
+(`WlRawRemote.nunchuk_accel`, the last 16, oldest first, `nunchuk_reports` counting all), and
+`input_gesture.h` finds a forward thrust in it: a rise of the forward axis by about 1 g within 130 ms,
+from 150 ms of rest, with the other axes quiet (a change, not a size: the Nunchuk clips near 2 g), one
+fire per thrust and a hold-off of 600 ms. Tested on synthetic traces (`test_platform_input_gesture`). Sticks are -127..127 over
 the real travel of the stick (`input_shape.h`: libogc's `PAD_Clamp` takes a GameCube stick as full at
 72, or 59 for the C stick, after a dead zone of 15 per axis, so a raw reading is full at 87 and 74; it
 is not called, because the application's own dead zone would add to it); triggers are 0..255: the

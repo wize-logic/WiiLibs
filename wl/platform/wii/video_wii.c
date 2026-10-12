@@ -19,6 +19,7 @@
 #include "wl/platform/hwcount.h"
 #include "wl/platform/present.h"
 #include "wl/platform/video_mode.h"
+#include "wl/platform/wii/input_wii.h"
 
 #define TAG "VIDEO"
 // Retraces to wait for a free XFB before deciding the GPU will not finish (a quarter second at 60 Hz)
@@ -66,6 +67,8 @@ static void on_pre_retrace(u32 retrace_count) {
 static void on_retrace(u32 retrace_count) {
     (void)retrace_count;
     g_retraces++;
+    // (the GameCube pads are read at every retrace, so that a press shorter than a frame is seen)
+    wl_input_wii_retrace();
     if (g_inited) {
         wl_present_retrace_end(&g_q, xfb_index(VIDEO_GetCurrentFramebuffer()));
     }

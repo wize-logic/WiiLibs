@@ -2,11 +2,13 @@
 // Wii input backend: WPAD (buttons, IR, accelerometer, Nunchuk, Classic), PAD
 // (GameCube ports) and the USB keyboard (libwiikeyboard) polled into WlRawInput once per frame.
 // A Wii Remote reports about every 5 ms, so each poll reads every report libogc has queued for it
-// (input_reports.h) rather than only the latest. Mapping to actions belongs to the layer above; this
+// (input_reports.h) rather than only the latest, and the GameCube pads are read at every video
+// retrace (wl_input_wii_retrace) and what came in since the last poll is handed on. Mapping to actions belongs to the layer above; this
 // file only reads devices and never blocks.
 // Only this directory may include <ogc/*.h>.
 #include <math.h>
 #include <ogc/conf.h>
+#include <ogc/irq.h>
 #include <ogc/pad.h>
 #include <string.h>
 #include <wiikeyboard/keyboard.h>
@@ -15,6 +17,7 @@
 #include "wl/platform/input_reports.h"
 #include "wl/platform/input_shape.h"
 #include "wl/platform/platform.h"
+#include "wl/platform/wii/input_wii.h"
 
 // platform.h button words are libogc's, copied unchanged: prove it at build time.
 WL_STATIC_ASSERT(WL_WM_2 == WPAD_BUTTON_2 && WL_WM_1 == WPAD_BUTTON_1 && WL_WM_B == WPAD_BUTTON_B &&
@@ -59,13 +62,13 @@ static uint8_t g_remote_extension[WL_INPUT_MAX_REMOTES];
 static uint16_t g_remote_not_ready[WL_INPUT_MAX_REMOTES]; // consecutive polls without data
 // How long (in polls) a connected Remote may go without data before it counts as gone.
 #define REMOTE_GRACE_POLLS 120u
-static bool g_pad_was[WL_INPUT_MAX_PADS];
-// A GameCube pad that answers with a momentary error (PAD_ERR_TRANSFER, PAD_ERR_NOT_READY) keeps
-// its last good state: zeroing it would release a held trigger for a frame. After
-// PAD_ERROR_GRACE_POLLS errors in a row it counts as gone.
-#define PAD_ERROR_GRACE_POLLS 10u
-static WlRawPad g_pad_last[WL_INPUT_MAX_PADS];
-static uint8_t g_pad_errors[WL_INPUT_MAX_PADS];
+// The GameCube pads are read at every video retrace (60 or 50 times a second), and a poll takes what
+// came in since the last one (input_reports.h, WlPadTracker): a press shorter than a frame is not
+// missed. A pad that answers with a momentary error (PAD_ERR_TRANSFER, PAD_ERR_NOT_READY) keeps its
+// last good state: zeroing it would release a held trigger for a frame. The trackers are shared with
+// the retrace interrupt: they are touched with the interrupts off.
+static WlPadTracker g_pad_tracker[WL_INPUT_MAX_PADS];
+static WlPadStats g_pad_stats;
 // The reports of the Remote's frame so far (filled by on_report during the poll).
 static WlRemoteReports g_reports[WL_INPUT_MAX_REMOTES];
 static bool g_pad_rumble[WL_INPUT_MAX_PADS];
@@ -101,7 +104,7 @@ void wl_platform_input_shutdown(void) {
     }
     g_kb_connected = false;
     memset(g_remote_was, 0, sizeof g_remote_was);
-    memset(g_pad_was, 0, sizeof g_pad_was);
+    memset(g_pad_tracker, 0, sizeof g_pad_tracker);
     g_init = false;
 }
 
@@ -146,6 +149,10 @@ static void on_report(s32 chan, const WPADData *d) {
     r.accel[0] = sat16(d->gforce.x * 100.0f);
     r.accel[1] = sat16(d->gforce.y * 100.0f);
     r.accel[2] = sat16(d->gforce.z * 100.0f);
+    r.nunchuk_valid = d->exp.type == EXP_NUNCHUK;
+    r.nunchuk[0] = r.nunchuk_valid ? sat16(d->exp.nunchuk.gforce.x * 100.0f) : 0;
+    r.nunchuk[1] = r.nunchuk_valid ? sat16(d->exp.nunchuk.gforce.y * 100.0f) : 0;
+    r.nunchuk[2] = r.nunchuk_valid ? sat16(d->exp.nunchuk.gforce.z * 100.0f) : 0;
     wl_remote_reports_add(&g_reports[chan], &r);
 }
 
@@ -239,39 +246,80 @@ static void poll_remote(uint32_t chan, WlRawRemote *out) {
     wl_remote_reports_finish(&g_reports[chan], out);
 }
 
-static void poll_pads(WlRawPad out[WL_INPUT_MAX_PADS]) {
+// One read of the four ports into the trackers. Called with the interrupts off (from the retrace
+// handler, or from the poll). Returns whether a pad that was there before answered with fresh data.
+static bool sample_pads(void) {
     PADStatus st[PAD_CHANMAX];
+    bool fresh = false;
     memset(st, 0, sizeof st);
     (void)PAD_Read(st);
     for (uint32_t i = 0; i < WL_INPUT_MAX_PADS; i++) {
-        memset(&out[i], 0, sizeof out[i]);
+        WlPadTracker *t = &g_pad_tracker[i];
         if (st[i].err == PAD_ERR_NONE) {
-            g_pad_was[i] = true;
-            g_pad_errors[i] = 0;
-            out[i].connected = true;
-            out[i].buttons = st[i].button;
-            wl_input_stick_pair(st[i].stickX, st[i].stickY, WL_PAD_MAIN_STICK_FULL, out[i].stick[0]);
-            wl_input_stick_pair(st[i].substickX, st[i].substickY, WL_PAD_C_STICK_FULL, out[i].stick[1]);
-            out[i].trigger[0] = wl_input_trigger(st[i].triggerL, WL_PAD_TRIGGER_FIRST, WL_PAD_TRIGGER_FULL);
-            out[i].trigger[1] = wl_input_trigger(st[i].triggerR, WL_PAD_TRIGGER_FIRST, WL_PAD_TRIGGER_FULL);
-            g_pad_last[i] = out[i];
+            WlRawPad pad;
+            memset(&pad, 0, sizeof pad);
+            pad.connected = true;
+            pad.buttons = st[i].button;
+            wl_input_stick_pair(st[i].stickX, st[i].stickY, WL_PAD_MAIN_STICK_FULL, pad.stick[0]);
+            wl_input_stick_pair(st[i].substickX, st[i].substickY, WL_PAD_C_STICK_FULL, pad.stick[1]);
+            pad.trigger[0] = wl_input_trigger(st[i].triggerL, WL_PAD_TRIGGER_FIRST, WL_PAD_TRIGGER_FULL);
+            pad.trigger[1] = wl_input_trigger(st[i].triggerR, WL_PAD_TRIGGER_FIRST, WL_PAD_TRIGGER_FULL);
+            fresh = fresh || t->was;
+            wl_pad_tracker_sample(t, WL_PAD_SAMPLE_OK, &pad);
         } else if (st[i].err == PAD_ERR_NO_CONTROLLER) {
-            g_pad_was[i] = false;
-            g_pad_errors[i] = 0;
-        } else if (g_pad_was[i]) {
+            wl_pad_tracker_sample(t, WL_PAD_SAMPLE_ABSENT, NULL);
+        } else {
             // NOT_READY and TRANSFER are momentary (libogc hands back the pad with nothing pressed):
-            // the pad stays, in the state it was last read in, until it has failed so many polls in
+            // the pad stays, in the state it was last read in, until it has failed so many samples in
             // a row that it is taken to be gone.
-            if (g_pad_errors[i] < PAD_ERROR_GRACE_POLLS) {
-                g_pad_errors[i]++;
-            }
-            if (g_pad_errors[i] < PAD_ERROR_GRACE_POLLS) {
-                out[i] = g_pad_last[i];
-            } else {
-                g_pad_was[i] = false;
-            }
+            wl_pad_tracker_sample(t, WL_PAD_SAMPLE_ERROR, NULL);
         }
     }
+    return fresh;
+}
+
+// At every video retrace (video_wii.c calls it from the retrace interrupt): a few hundred
+// instructions, sixty times a second.
+void wl_input_wii_retrace(void) {
+    if (!g_init) {
+        return;
+    }
+    bool tracked = false;
+    for (uint32_t i = 0; i < WL_INPUT_MAX_PADS; i++) {
+        tracked = tracked || g_pad_tracker[i].was;
+    }
+    bool fresh = sample_pads();
+    if (tracked) {
+        g_pad_stats.retrace_samples++;
+        if (fresh) {
+            g_pad_stats.retrace_fresh++;
+        }
+    }
+}
+
+void wl_platform_input_pad_stats(WlPadStats *out) {
+    u32 level = IRQ_Disable();
+    *out = g_pad_stats;
+    IRQ_Restore(level);
+}
+
+// What the pads did since the last poll. With no retrace sample since (the video not started) the
+// poll reads them itself.
+static void poll_pads(WlRawPad out[WL_INPUT_MAX_PADS]) {
+    u32 level = IRQ_Disable();
+    bool sampled = false;
+    for (uint32_t i = 0; i < WL_INPUT_MAX_PADS; i++) {
+        sampled = sampled || g_pad_tracker[i].samples != 0;
+    }
+    g_pad_stats.polls++;
+    if (!sampled) {
+        g_pad_stats.polls_unsampled++;
+        (void)sample_pads();
+    }
+    for (uint32_t i = 0; i < WL_INPUT_MAX_PADS; i++) {
+        wl_pad_tracker_take(&g_pad_tracker[i], &out[i], NULL);
+    }
+    IRQ_Restore(level);
 }
 
 static uint8_t kmods_from(uint16_t m) {

@@ -47,6 +47,10 @@ void wl_platform_input_poll(WlRawInput *out) {
     *out = g_next;
 }
 
+void wl_platform_input_pad_stats(WlPadStats *out) {
+    memset(out, 0, sizeof *out);
+}
+
 void wl_platform_rumble(uint8_t remote, bool on) {
     if (remote < WL_INPUT_MAX_REMOTES) {
         g_remote_rumble[remote] = on && g_rumble_allowed;
