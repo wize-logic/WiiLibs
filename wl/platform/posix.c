@@ -57,6 +57,92 @@ ssize_t wl_posix_pwrite(int fd, const void *buf, size_t count, int64_t offset) {
     return positioned(fd, (void *)(uintptr_t)buf, count, offset, true);
 }
 
+WlResult wl_posix_placed_open(WlPlacedReader *reader, int fd) {
+    if (reader == NULL || fd < 0) {
+        return WL_ERR_ARG;
+    }
+    if (reader->taken) {
+        return WL_ERR_STATE;
+    }
+    off_t home = lseek(fd, 0, SEEK_CUR);
+    if (home == (off_t)-1) {
+        return WL_ERR_IO;
+    }
+    if (pthread_mutex_init(&reader->lock, NULL) != 0) {
+        return WL_ERR_FAILED;
+    }
+    reader->fd = fd;
+    reader->home = (int64_t)home;
+    reader->place = (int64_t)home;
+    reader->seeks = 0;
+    reader->taken = true;
+    return WL_OK;
+}
+
+ssize_t wl_posix_placed_pread(WlPlacedReader *reader, void *buf, size_t count, int64_t offset) {
+    if (reader == NULL || !reader->taken) {
+        errno = EBADF;
+        return -1;
+    }
+    if (offset < 0 || count > WL_SSIZE_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    off_t target = (off_t)offset;
+    if ((int64_t)target != offset) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    pthread_mutex_lock(&reader->lock);
+    if (reader->place != offset) {
+        if (lseek(reader->fd, target, SEEK_SET) == (off_t)-1) {
+            int e = errno;
+            reader->place = -1;
+            pthread_mutex_unlock(&reader->lock);
+            errno = e;
+            return -1;
+        }
+        reader->seeks++;
+    }
+    ssize_t result = read(reader->fd, buf, count);
+    int e = errno;
+    // After a read the descriptor stands where it ended; after a failure nobody knows.
+    reader->place = result >= 0 ? offset + (int64_t)result : -1;
+    pthread_mutex_unlock(&reader->lock);
+    errno = e;
+    return result;
+}
+
+WlResult wl_posix_placed_release(WlPlacedReader *reader) {
+    if (reader == NULL) {
+        return WL_ERR_ARG;
+    }
+    if (!reader->taken) {
+        return WL_ERR_STATE;
+    }
+    pthread_mutex_lock(&reader->lock);
+    WlResult r = WL_OK;
+    if (reader->place != reader->home) {
+        if (lseek(reader->fd, (off_t)reader->home, SEEK_SET) == (off_t)-1) {
+            r = WL_ERR_IO;
+        }
+    }
+    reader->place = reader->home;
+    reader->taken = false;
+    pthread_mutex_unlock(&reader->lock);
+    pthread_mutex_destroy(&reader->lock);
+    return r;
+}
+
+void wl_posix_placed_close(WlPlacedReader *reader) {
+    if (reader != NULL && reader->taken) {
+        (void)wl_posix_placed_release(reader);
+    }
+}
+
 int wl_posix_pause(void) {
 #if defined(__wii__)
     for (;;) {

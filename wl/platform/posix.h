@@ -7,6 +7,7 @@
 #pragma once
 
 #include <pthread.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -26,6 +27,47 @@ ssize_t wl_posix_pread(int fd, void *buf, size_t count, int64_t offset);
 // The same for write(): the bytes land at `offset`, the position is restored. A write past the
 // end extends the file as lseek and write do.
 ssize_t wl_posix_pwrite(int fd, const void *buf, size_t count, int64_t offset);
+
+// ---- Reads at offsets, in order ----------------------------------------------------------------
+//
+// wl_posix_pread is a seek to the offset, the read and a seek back, which keeps the descriptor's
+// position but costs three seeks a read; on a FAT volume (libfat) a seek follows the file's chain
+// of clusters from the one the file stands at, or from its first cluster when it goes backwards,
+// so each read of a large file walked the chain to its offset and the seek back walked it again.
+// A WlPlacedReader takes a descriptor over for reads at offsets and remembers where the descriptor
+// stands: a read that starts where the last one ended (the usual way a file is read, and a map's
+// tags and then its bitmaps in the order they were asked for) is one read() with no seek, and any
+// other costs one seek. The descriptor's own position is not kept while the reader has it: it is
+// put back where it stood by wl_posix_placed_release, which the program calls before it uses the
+// descriptor by position (a read, a write, a seek) again.
+//
+// Threads may share a reader (reads take the reader's own lock); they must not use the descriptor
+// itself while the reader has it, and one descriptor has one reader.
+typedef struct WlPlacedReader {
+    int fd;
+    int64_t place;  // where the descriptor stands (the offset the next read in line starts at); -1: not known
+    int64_t home;   // where it stood when the reader took it over
+    uint32_t seeks; // the seeks made, which a program can count
+    bool taken;     // the reader has the descriptor (set by open, cleared by release)
+    pthread_mutex_t lock;
+} WlPlacedReader;
+
+// Takes `fd` over: notes its position as the one release puts back. WL_ERR_ARG for a null reader
+// or a descriptor below 0, WL_ERR_IO when the position cannot be read (a pipe), WL_ERR_STATE for
+// a reader that has a descriptor already. The reader's lock is made here and destroyed by release.
+WlResult wl_posix_placed_open(WlPlacedReader *reader, int fd);
+// As wl_posix_pread, for the reader's descriptor: up to `count` bytes at `offset`, what read()
+// returns or -1 with errno set (EINVAL for a negative offset or a count over SSIZE_MAX, EOVERFLOW
+// for an offset that does not fit off_t, EBADF for a reader that does not have its descriptor,
+// the rest from lseek and read). A count of 0 returns 0. A read at or past the end returns 0.
+ssize_t wl_posix_placed_pread(WlPlacedReader *reader, void *buf, size_t count, int64_t offset);
+// Puts the descriptor's position back where it stood at open and gives the descriptor back; the
+// reader can take a descriptor over again. WL_ERR_IO if the seek fails, WL_ERR_STATE if the reader
+// does not have one.
+WlResult wl_posix_placed_release(WlPlacedReader *reader);
+// Releases the descriptor when the reader still has it (a program that is done with a reader calls
+// this, whether or not it released). Does not close the descriptor.
+void wl_posix_placed_close(WlPlacedReader *reader);
 
 // Blocks the calling thread until a signal handler has run, then returns -1 with errno EINTR
 // (pause()). The Wii has no signals: there it blocks for ever, sleeping rather than spinning, and

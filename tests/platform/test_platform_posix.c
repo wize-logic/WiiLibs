@@ -212,6 +212,153 @@ TEST threads_do_not_disturb_each_other_or_the_position(void) {
     PASS();
 }
 
+// The placed reader: reads in order cost no seek, any other one seek, and the descriptor's own
+// position comes back at release.
+TEST placed_reader_reads_in_order_without_seeking(void) {
+    WlPlacedReader reader;
+    memset(&reader, 0, sizeof reader);
+    uint8_t buf[100];
+    ASSERT_EQ(10, lseek(g_fd, 10, SEEK_SET));
+    ASSERT_EQ(WL_OK, wl_posix_placed_open(&reader, g_fd));
+    // the first read away from where the descriptor stands: one seek
+    ASSERT_EQ((ssize_t)sizeof buf, wl_posix_placed_pread(&reader, buf, sizeof buf, 1000));
+    for (size_t i = 0; i < sizeof buf; i++) {
+        ASSERT_EQ(pattern(1000 + i), buf[i]);
+    }
+    ASSERT_EQ(1u, reader.seeks);
+    // the next in line, and the one after: none
+    ASSERT_EQ((ssize_t)sizeof buf, wl_posix_placed_pread(&reader, buf, sizeof buf, 1100));
+    ASSERT_EQ(pattern(1100), buf[0]);
+    ASSERT_EQ(50, wl_posix_placed_pread(&reader, buf, 50, 1200));
+    ASSERT_EQ(pattern(1249), buf[49]);
+    ASSERT_EQ(1u, reader.seeks);
+    // a read that goes back, and one that skips ahead: one seek each, with the right bytes
+    ASSERT_EQ((ssize_t)sizeof buf, wl_posix_placed_pread(&reader, buf, sizeof buf, 300));
+    ASSERT_EQ(pattern(300), buf[0]);
+    ASSERT_EQ(2u, reader.seeks);
+    ASSERT_EQ((ssize_t)sizeof buf, wl_posix_placed_pread(&reader, buf, sizeof buf, 3000));
+    ASSERT_EQ(pattern(3099), buf[99]);
+    ASSERT_EQ(3u, reader.seeks);
+    // the same offset again is a seek back to it (the descriptor stands after what was read)
+    ASSERT_EQ((ssize_t)sizeof buf, wl_posix_placed_pread(&reader, buf, sizeof buf, 3000));
+    ASSERT_EQ(pattern(3000), buf[0]);
+    ASSERT_EQ(4u, reader.seeks);
+    // the end: short, then nothing, and a read in line after the end is still right
+    ASSERT_EQ(10, wl_posix_placed_pread(&reader, buf, sizeof buf, FILE_SIZE - 10));
+    ASSERT_EQ(pattern(FILE_SIZE - 1), buf[9]);
+    ASSERT_EQ(0, wl_posix_placed_pread(&reader, buf, sizeof buf, FILE_SIZE));
+    ASSERT_EQ(0, wl_posix_placed_pread(&reader, buf, 0, 12));
+    // the descriptor's position goes back where it stood
+    ASSERT_EQ(WL_OK, wl_posix_placed_release(&reader));
+    ASSERT_EQ(10, lseek(g_fd, 0, SEEK_CUR));
+    uint8_t one;
+    ASSERT_EQ(1, read(g_fd, &one, 1));
+    ASSERT_EQ(pattern(10), one);
+    // released: it cannot read, and cannot be released twice
+    errno = 0;
+    ASSERT_EQ(-1, wl_posix_placed_pread(&reader, buf, sizeof buf, 0));
+    ASSERT_EQ(EBADF, errno);
+    ASSERT_EQ(WL_ERR_STATE, wl_posix_placed_release(&reader));
+    // and it takes the descriptor over again, from where it stands now
+    ASSERT_EQ(WL_OK, wl_posix_placed_open(&reader, g_fd));
+    ASSERT_EQ((ssize_t)sizeof buf, wl_posix_placed_pread(&reader, buf, sizeof buf, 11));
+    ASSERT_EQ(pattern(11), buf[0]);
+    ASSERT_EQ(0u, reader.seeks);
+    wl_posix_placed_close(&reader);
+    ASSERT_EQ(11, lseek(g_fd, 0, SEEK_CUR));
+    wl_posix_placed_close(&reader); // a second close does nothing
+    PASS();
+}
+
+TEST placed_reader_checks_its_arguments_and_failures(void) {
+    WlPlacedReader reader;
+    memset(&reader, 0, sizeof reader);
+    uint8_t buf[16];
+    ASSERT_EQ(WL_ERR_ARG, wl_posix_placed_open(NULL, g_fd));
+    ASSERT_EQ(WL_ERR_ARG, wl_posix_placed_open(&reader, -1));
+    ASSERT_EQ(WL_ERR_ARG, wl_posix_placed_release(NULL));
+    // a pipe has no position
+    int fds[2];
+    ASSERT_EQ(0, pipe(fds));
+    ASSERT_EQ(WL_ERR_IO, wl_posix_placed_open(&reader, fds[0]));
+    close(fds[0]);
+    close(fds[1]);
+    ASSERT_EQ(WL_OK, wl_posix_placed_open(&reader, g_fd));
+    ASSERT_EQ(WL_ERR_STATE, wl_posix_placed_open(&reader, g_fd));
+    errno = 0;
+    ASSERT_EQ(-1, wl_posix_placed_pread(&reader, buf, sizeof buf, -1));
+    ASSERT_EQ(EINVAL, errno);
+    errno = 0;
+    ASSERT_EQ(-1, wl_posix_placed_pread(NULL, buf, sizeof buf, 0));
+    ASSERT_EQ(EBADF, errno);
+    if (sizeof(off_t) < 8) {
+        errno = 0;
+        ASSERT_EQ(-1, wl_posix_placed_pread(&reader, buf, sizeof buf, (int64_t)INT32_MAX + 10));
+        ASSERT_EQ(EOVERFLOW, errno);
+    }
+    // a read that fails leaves the next one right: it seeks
+    int wo = open(g_path, O_WRONLY);
+    ASSERT(wo >= 0);
+    WlPlacedReader other;
+    memset(&other, 0, sizeof other);
+    ASSERT_EQ(WL_OK, wl_posix_placed_open(&other, wo));
+    errno = 0;
+    ASSERT_EQ(-1, wl_posix_placed_pread(&other, buf, sizeof buf, 100));
+    ASSERT_EQ(EBADF, errno);
+    wl_posix_placed_close(&other);
+    close(wo);
+    // the first reader is untouched by the other's failure
+    ASSERT_EQ((ssize_t)sizeof buf, wl_posix_placed_pread(&reader, buf, sizeof buf, 500));
+    ASSERT_EQ(pattern(500), buf[0]);
+    wl_posix_placed_close(&reader);
+    PASS();
+}
+
+// Threads share a reader: each reads its own slot over and over, in and out of order; every read is
+// the right bytes whichever thread had the descriptor last.
+#define PLACED_THREADS 4
+#define PLACED_ROUNDS 600
+
+static WlPlacedReader g_placed;
+static volatile int g_placed_failures;
+
+static void *placed_worker(void *arg) {
+    size_t id = (size_t)(uintptr_t)arg;
+    uint8_t in[SLOT];
+    for (int round = 0; round < PLACED_ROUNDS; round++) {
+        // slots in order for half the rounds, the others backwards
+        size_t slot = (id + (size_t)round * (round & 1 ? 3 : 1)) % (FILE_SIZE / SLOT);
+        if (wl_posix_placed_pread(&g_placed, in, SLOT, (int64_t)(slot * SLOT)) != (ssize_t)SLOT) {
+            g_placed_failures++;
+            continue;
+        }
+        for (size_t i = 0; i < SLOT; i++) {
+            if (in[i] != pattern(slot * SLOT + i)) {
+                g_placed_failures++;
+                break;
+            }
+        }
+    }
+    return NULL;
+}
+
+TEST placed_reader_is_shared_by_threads(void) {
+    memset(&g_placed, 0, sizeof g_placed);
+    ASSERT_EQ(77, lseek(g_fd, 77, SEEK_SET));
+    ASSERT_EQ(WL_OK, wl_posix_placed_open(&g_placed, g_fd));
+    pthread_t threads[PLACED_THREADS];
+    for (size_t i = 0; i < PLACED_THREADS; i++) {
+        ASSERT_EQ(0, pthread_create(&threads[i], NULL, placed_worker, (void *)(uintptr_t)i));
+    }
+    for (size_t i = 0; i < PLACED_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    ASSERT_EQ(0, g_placed_failures);
+    ASSERT_EQ(WL_OK, wl_posix_placed_release(&g_placed));
+    ASSERT_EQ(77, lseek(g_fd, 0, SEEK_CUR));
+    PASS();
+}
+
 static volatile sig_atomic_t g_signalled;
 
 static void on_alarm(int sig) {
@@ -314,6 +461,9 @@ SUITE(posix_suite) {
     RUN_TEST(pwrite_past_the_end_extends_the_file);
     RUN_TEST(errors_set_errno);
     RUN_TEST(threads_do_not_disturb_each_other_or_the_position);
+    RUN_TEST(placed_reader_reads_in_order_without_seeking);
+    RUN_TEST(placed_reader_checks_its_arguments_and_failures);
+    RUN_TEST(placed_reader_is_shared_by_threads);
     RUN_TEST(libc_names_suite);
     RUN_TEST(pause_returns_after_a_signal_handler_ran);
     RUN_TEST(sysconf_answers_for_the_console);
