@@ -77,14 +77,21 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
         GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
     }
     for (n = 0; n < 8; n++) {
+        if (layout->texcoords & (1u << n)) {
+            texgens = n + 1;
+        }
+    }
+    for (n = 0; n < texgens; n++) {
         if (!(layout->texcoords & (1u << n))) {
+            // (a coordinate no stage reads, below one that is: generated from the position, which
+            // every vertex has, rather than from an input the vertex does not send)
+            GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4, GX_TG_POS, GX_IDENTITY);
             continue;
         }
         GX_SetVtxDesc((u8)(GX_VA_TEX0 + n), GX_DIRECT);
         GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_TEX0 + n, (layout->texcoord_s & (1u << n)) ? GX_TEX_S : GX_TEX_ST, GX_F32,
                          0);
         GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4, GX_TG_TEX0 + n, GX_IDENTITY);
-        texgens = n + 1;
     }
     GX_SetNumTexGens(texgens);
     GX_SetNumChans(layout->colors);

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // The on-console test runner: the platform-independent suites (tests/platform/suite_threads.c,
-// suite_fs.c, suite_posix.c, tests/audio/suite_sseq.c) plus a GX/video smoke test, on the real Wii backends.
+// suite_fs.c, suite_posix.c, tests/audio/suite_sseq.c) plus a GX/video smoke test and the NV2A backend
+// on GX (tests/xbox/suite_nv2a.c), on the real Wii backends.
 // Built for WL_PLATFORM=wii as wl_console_tests.dol; tools/dolphin_run.py runs it in Dolphin
 // (ctest -L dolphin), and it runs the same from the Homebrew Channel on hardware.
 //
@@ -53,6 +54,7 @@ void wlt_suite_fs(void);
 void wlt_suite_posix(const char *path);
 void wlt_suite_sseq(void);
 void wlt_suite_sqrt(void);
+void wlt_suite_nv2a(void);
 
 // Close enough for an EFB colour: the EFB keeps 6 or 8 bits a channel depending on the mode.
 static bool near_rgb(uint32_t got, uint32_t want) {
@@ -920,6 +922,8 @@ int main(void) {
     check_video_gx();
     check_render_target();
     check_tev_program();
+    // the NV2A backend on GX: synthetic push buffers, the EFB read back (tests/xbox/suite_nv2a.c)
+    wlt_suite_nv2a();
     check_backtrace();
     check_profile();
     check_atomics64();
