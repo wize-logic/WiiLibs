@@ -19,14 +19,17 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "wl/platform/gx_target_internal.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/tev.h"
+#include "wl/platform/wii/gx_wii_internal.h"
 
 #define TAG "GX"
 #define WAIT_TIMEOUT_US 250000u
 #define FRAME_FENCES 8u // the end-of-frame tokens of the last frames (wl_gx_frame_retired)
 #define MAX_Z24 0x00FFFFFFu
+#define EFB_MAX_HEIGHT 528u // the EFB's rows, whatever the video mode shows of them (a copy may reach below the picture)
 
 _Static_assert(sizeof(GXTexObj) == sizeof(((WlGxTexObj *)0)->opaque), "WlGxTexObj must hold a GXTexObj");
 _Static_assert(sizeof(GXTlutObj) == sizeof(((WlGxTlut *)0)->opaque), "WlGxTlut must hold a GXTlutObj");
@@ -263,6 +266,7 @@ void wl_gx_shutdown(void) {
         return;
     }
     (void)wl_gx_sync();
+    wl_gx_target_shutdown();
     g.ready = false;
     if (wl_mem_ready()) {
         wl_mem_free(g.fifo);
@@ -378,11 +382,13 @@ void wl_gx_begin_frame(uint32_t clear_rgba) {
     }
     g.clear_frame = clear_rgba;
     g.in_frame = true;
+    wl_gx_target_frame_begun();
 }
 
 uint32_t wl_gx_end_frame(void) {
     WL_ASSERT(g.ready);
     VCHECK(g.in_frame, "end_frame outside a frame");
+    wl_gx_target_frame_ending(); // (the back buffer has the EFB for the display copy)
     // FIFO health sample before the GPU drains it.
     GXFifoObj f;
     GX_GetGPFifo(&f);
@@ -448,8 +454,8 @@ void wl_gx_copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat
     static const u8 tf[WL_GX_TEX_FORMAT_COUNT] = {GX_CTF_R4, GX_CTF_R8, GX_TF_IA4, GX_TF_IA8, GX_TF_RGB565,
                                                   GX_TF_RGB5A3, GX_TF_RGBA8, 0xFF, 0xFF, 0xFF};
     if (!VCHECK(x >= 0 && y >= 0 && w > 0 && h > 0 && ((x | y | w | h) & 1) == 0 && (uint32_t)(x + w) <= g.fb_w &&
-                    (uint32_t)(y + h) <= g.efb_h && (uintptr_t)dst % 32u == 0 && (unsigned)fmt < WL_GX_TEX_FORMAT_COUNT &&
-                    tf[fmt] != 0xFF,
+                    (uint32_t)(y + h) <= EFB_MAX_HEIGHT && (uintptr_t)dst % 32u == 0 &&
+                    (unsigned)fmt < WL_GX_TEX_FORMAT_COUNT && tf[fmt] != 0xFF,
                 "bad EFB texture copy")) {
         return;
     }
@@ -460,11 +466,28 @@ void wl_gx_copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat
         wl_gx_set_color_write(true, true);
         GX_SetCopyClear(unpack(g.clear_frame), MAX_Z24);
     }
+    wl_gx_wii_copy_filter(false);
     GX_SetTexCopySrc((u16)x, (u16)y, (u16)w, (u16)h);
     GX_SetTexCopyDst((u16)w, (u16)h, tf[fmt], GX_FALSE);
     GX_CopyTex(dst, clear ? GX_TRUE : GX_FALSE);
     GX_PixModeSync();
+    wl_gx_wii_copy_filter(true);
     GX_InvalidateTexAll();
+    g.dirty = true;
+}
+
+// The copies to textures are unfiltered: the display copy's vertical (deflicker) filter, which stays set for it,
+// would blur them.
+void wl_gx_wii_copy_filter(bool display) {
+    GXRModeObj *rm = VIDEO_GetPreferredMode(NULL);
+    if (display && rm != NULL) {
+        GX_SetCopyFilter(rm->aa, rm->sample_pattern, GX_TRUE, rm->vfilter);
+    } else {
+        GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+    }
+}
+
+void wl_gx_wii_note_commands(void) {
     g.dirty = true;
 }
 
@@ -1132,6 +1155,26 @@ void wl_gx_tex_bind(const WlGxTexObj *tex) {
 
 void wl_gx_tex_invalidate(void) {
     GX_InvalidateTexAll();
+    g.dirty = true;
+}
+
+void wl_gx_ramp_bind(uint32_t texmap) {
+    static GXTexObj ramp;
+    static bool made;
+    WL_ASSERT(g.ready);
+    if (!VCHECK(texmap < GX_MAX_TEXMAP, "ramp bound to a texture map that does not exist")) {
+        return;
+    }
+    if (!made) {
+        GX_InitTexObj(&ramp, (void *)wl_gx_ramp_image(), WL_GX_RAMP_WIDTH, WL_GX_RAMP_HEIGHT, GX_TF_I8, GX_CLAMP,
+                      GX_CLAMP, GX_FALSE);
+        GX_InitTexObjFilterMode(&ramp, GX_NEAR, GX_NEAR);
+        made = true;
+    }
+    GX_LoadTexObj(&ramp, (u8)texmap);
+    if (texmap == GX_TEXMAP0) {
+        g.known &= ~(uint32_t)K_TEX;
+    }
     g.dirty = true;
 }
 

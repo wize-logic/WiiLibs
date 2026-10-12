@@ -2,6 +2,7 @@
 // Host stub of the GX layer (gx_host.h). Also the host's video info, which the renderer reads.
 #include <string.h>
 
+#include "wl/platform/gx_target_internal.h"
 #include "wl/platform/host/gx_host.h"
 
 static WlHostGxState s;
@@ -20,6 +21,7 @@ void wl_host_gx_clear_counters(void) {
     s.draw_calls = s.vertices = s.dl_calls = s.validation_errors = s.sync_calls = 0;
     s.tlut_loads = s.tex_binds = s.slot_loads = s.texmtx_loads = 0;
     s.begin_frames = s.end_frames = 0;
+    s.ramp_binds = 0;
 }
 
 static bool check(bool cond) {
@@ -112,6 +114,7 @@ WlResult wl_gx_init(void) {
 }
 
 void wl_gx_shutdown(void) {
+    wl_gx_target_shutdown();
     s.ready = false;
 }
 
@@ -195,9 +198,18 @@ void wl_gx_begin_frame(uint32_t clear_rgba) {
     s.clear_rgba = clear_rgba;
     s.begin_frames++;
     s.in_frame = true;
+    wl_gx_target_frame_begun();
+}
+
+void wl_gx_ramp_bind(uint32_t texmap) {
+    if (check(texmap < 8u)) {
+        s.ramp_binds++;
+        s.ramp_texmap = texmap;
+    }
 }
 
 uint32_t wl_gx_end_frame(void) {
+    wl_gx_target_frame_ending();
     s.in_frame = false;
     s.end_frames++;
     g_frames_ended++;

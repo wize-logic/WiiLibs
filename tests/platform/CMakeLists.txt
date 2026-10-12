@@ -14,6 +14,8 @@ wl_add_test(test_platform_net SOURCES test_platform_net.c LIBS wl_platform LABEL
 wl_add_test(test_platform_posix SOURCES test_platform_posix.c suite_posix.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_random SOURCES test_platform_random.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_host SOURCES test_platform_host.c LIBS wl_platform LABELS unit be)
+# The render targets (the owner of the EFB, parking, resolving, clearing) and the ramp, on the host stub.
+wl_add_test(test_platform_target SOURCES test_platform_target.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_thread SOURCES test_platform_thread.c suite_threads.c LIBS wl_platform LABELS unit be)
 
 # TEV programs: the builder, validator and evaluator (portable, also on ppc-be) ...
@@ -26,6 +28,15 @@ wl_add_test(test_platform_tev_gx
             ${PROJECT_SOURCE_DIR}/wl/platform/tev.c ${PROJECT_SOURCE_DIR}/wl/platform/wii/tev_wii.c
     LIBS wl_base LABELS unit be)
 target_include_directories(test_platform_tev_gx BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub)
+
+# The render targets' GPU half (wii/gx_target_wii.c) with their bookkeeping (gx_target.c): the exact GX calls,
+# in order, against the same recording stand-in. Not wl_platform either (the stand-in provides the rest).
+wl_add_test(test_platform_target_gx
+    SOURCES test_platform_target_gx.c gx_stub/gx_stub.c
+            ${PROJECT_SOURCE_DIR}/wl/platform/gx_target.c ${PROJECT_SOURCE_DIR}/wl/platform/gx_common.c
+            ${PROJECT_SOURCE_DIR}/wl/platform/wii/gx_target_wii.c
+    LIBS wl_base LABELS unit be)
+target_include_directories(test_platform_target_gx BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub)
 
 # The spill-over heap: the portable core against a fake primary allocator ...
 wl_add_test(test_platform_heap_overflow SOURCES test_platform_heap_overflow.c LIBS wl_platform LABELS unit be)

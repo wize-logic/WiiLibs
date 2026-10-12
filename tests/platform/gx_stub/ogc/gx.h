@@ -5,6 +5,7 @@
 // values; the Wii build compares them against the real header.
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef uint8_t u8;
@@ -110,6 +111,56 @@ typedef struct {
 #define GX_REPLACE 3
 #define GX_PASSCLR 4
 
+// The rest, for the render targets (wii/gx_target_wii.c), with libogc's values
+typedef float f32;
+typedef f32 Mtx[3][4];
+typedef f32 Mtx44[4][4];
+typedef struct {
+    void *image;
+} GXTexObj;
+#define GX_TF_RGB565 0x4
+#define GX_TF_RGBA8 0x6
+#define GX_TF_Z8 0x11
+#define GX_TF_Z24X8 0x16
+#define GX_CLAMP 0
+#define GX_NEAR 0
+#define GX_TEXMAP1 1
+#define GX_TEV_SWAP0 0
+#define GX_TEVSTAGE1 1
+#define GX_ZT_DISABLE 0
+#define GX_ZT_REPLACE 2
+#define GX_QUADS 0x80
+#define GX_VTXFMT0 0
+#define GX_VA_POS 9
+#define GX_VA_TEX0 13
+#define GX_POS_XYZ 1
+#define GX_F32 4
+#define GX_TEX_ST 1
+#define GX_TG_MTX2x4 1
+#define GX_TG_TEX0 4
+#define GX_IDENTITY 60
+#define GX_PNMTX0 0
+#define GX_DIRECT 1
+#define GX_ORTHOGRAPHIC 1
+#define GX_BM_NONE 0
+#define GX_BL_ZERO 0
+#define GX_BL_ONE 1
+#define GX_LO_CLEAR 0
+#define GX_ALWAYS 7
+#define GX_AOP_AND 0
+#define GX_CULL_NONE 0
+
+// What the stub logs: one line per call, "GX_Name arguments" (gx_stub_logf), in the order called.
+// Memory a test names (gx_stub_name_memory) shows by name where a call takes it.
+#define GX_STUB_LOG_LINES 512
+#define GX_STUB_LOG_WIDTH 112
+extern char g_gx_stub_log[GX_STUB_LOG_LINES][GX_STUB_LOG_WIDTH];
+extern unsigned g_gx_stub_log_count;
+void gx_stub_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void gx_stub_name_memory(const void *address, const char *name);
+void gx_stub_clear_names(void);
+const char *gx_stub_name(const void *address);
+
 typedef struct {
     u8 texcoord;
     u32 texmap;
@@ -146,3 +197,36 @@ void GX_SetTevAlphaIn(u8 stage, u8 a, u8 b, u8 c, u8 d);
 void GX_SetTevColorOp(u8 stage, u8 op, u8 bias, u8 scale, u8 clamp, u8 reg);
 void GX_SetTevAlphaOp(u8 stage, u8 op, u8 bias, u8 scale, u8 clamp, u8 reg);
 void GX_SetTevOp(u8 stage, u8 mode);
+
+void GX_SetTexCopySrc(u16 left, u16 top, u16 w, u16 h);
+void GX_SetTexCopyDst(u16 w, u16 h, u32 format, u8 mipmap);
+void GX_CopyTex(void *dest, u8 clear);
+void GX_PixModeSync(void);
+void GX_InvalidateTexAll(void);
+void GX_SetScissor(u32 x, u32 y, u32 w, u32 h);
+void GX_LoadProjectionMtx(Mtx44 m, u8 type);
+void GX_SetViewport(f32 x, f32 y, f32 w, f32 h, f32 near, f32 far);
+void GX_SetBlendMode(u8 type, u8 src, u8 dst, u8 op);
+void GX_SetAlphaCompare(u8 comp0, u8 ref0, u8 aop, u8 comp1, u8 ref1);
+void GX_SetCullMode(u8 mode);
+void GX_SetNumIndStages(u8 num);
+void GX_SetTevDirect(u8 stage);
+void GX_SetZTexture(u8 op, u8 format, u32 bias);
+void GX_SetZCompLoc(u8 before_tex);
+void guMtxIdentity(Mtx m);
+void GX_LoadPosMtxImm(Mtx m, u32 id);
+void GX_SetCurrentMtx(u32 id);
+void GX_ClearVtxDesc(void);
+void GX_SetVtxDesc(u8 attr, u8 type);
+void GX_SetVtxAttrFmt(u8 fmt, u32 attr, u32 comp_type, u32 comp_size, u32 frac);
+void GX_SetTexCoordGen(u16 coord, u32 type, u32 src, u32 mtx);
+void GX_Begin(u8 prim, u8 fmt, u16 count);
+void GX_Position3f32(f32 x, f32 y, f32 z);
+void GX_TexCoord2f32(f32 s, f32 t);
+void GX_End(void);
+void GX_InitTexObj(GXTexObj *obj, void *image, u16 w, u16 h, u8 format, u8 wrap_s, u8 wrap_t, u8 mipmap);
+void GX_InitTexObjFilterMode(GXTexObj *obj, u8 min, u8 mag);
+void GX_LoadTexObj(GXTexObj *obj, u8 map);
+void GX_SetColorUpdate(u8 enable);
+void GX_SetAlphaUpdate(u8 enable);
+void GX_SetZMode(u8 enable, u8 func, u8 update);

@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "wl/platform/backtrace.h"
+#include "wl/platform/gx_target.h"
 #include "wl/platform/heap_overflow.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/net.h"
@@ -152,6 +153,99 @@ static void check_video_gx(void) {
     wl_gx_stats(&stats);
     wlt_check("gx_no_timeouts", stats.gpu_timeouts == 0u, "the GPU finished every frame");
     wlt_check("gx_no_validation_errors", stats.validation_errors == 0u, "no invalid GX calls");
+}
+
+// Render targets (wl/platform/gx_target.h): a triangle in the back buffer, a target that takes the
+// EFB and is cleared red, then the back buffer back. Read back: the target is red while it has the
+// EFB; its image in its memory is red in GX's RGBA8 tiles; the back buffer has its clear colour where
+// the target was drawn and its triangle, and the depth the triangle wrote (a second triangle at the
+// same depth fails a LESS test only if the parked depth was written back through the Z texture).
+static uint8_t g_target_image[64 * 64 * 4] __attribute__((aligned(32)));
+
+static void check_render_target(void) {
+    WlVideoInfo info;
+    wl_platform_video_info(&info);
+    const uint32_t clear = 0x204080ffu;
+    const uint32_t green = 0x20e040ffu;
+    const uint32_t blue = 0x2040e0ffu;
+    const uint32_t red = 0xe02020ffu;
+    char detail[128];
+
+    memset(g_target_image, 0xEE, sizeof g_target_image);
+    wl_gpu_buffer_commit(g_target_image, sizeof g_target_image);
+    WlGxTarget target = {g_target_image, g_target_image, 64, 64, WL_GX_TEX_RGBA8, 7};
+
+    float cx = (float)info.fb_width / 2.0f, cy = (float)info.efb_height / 2.0f;
+    const WlGxVertex tri_green[3] = {
+        {cx - 100.0f, cy + 80.0f, 0.0f, green, 0.0f, 0.0f},
+        {cx, cy - 100.0f, 0.0f, green, 0.0f, 0.0f},
+        {cx + 100.0f, cy + 80.0f, 0.0f, green, 0.0f, 0.0f},
+    };
+    WlGxVertex tri_blue[3];
+    memcpy(tri_blue, tri_green, sizeof tri_blue);
+    for (int i = 0; i < 3; i++) {
+        tri_blue[i].rgba = blue;
+    }
+
+    wl_gx_begin_frame(clear);
+    wl_gx_set_zmode(true, WL_GX_LEQUAL, true);
+    wl_gx_draw(WL_GX_TRIANGLES, tri_green, 3);
+    wl_gx_target_drawn();
+
+    // the target takes the EFB (the back buffer is parked) and is cleared red at the EFB's origin
+    const WlGxTarget *done = wl_gx_target_use(&target);
+    wlt_check("gx_target_taking_resolves_nothing", done == NULL, "the back buffer left, no target resolved");
+    wl_gx_target_clear(true, true, red, 1.0f, 0, 0, 64, 64);
+    uint32_t inside = wl_gx_peek_rgba(10, 10);
+    snprintf(detail, sizeof detail, "pixel 0x%08x, want 0x%08x", (unsigned)inside, (unsigned)red);
+    wlt_check("gx_target_clear_readback", near_rgb(inside, red), detail);
+
+    // the back buffer back: the target's image is copied out first
+    done = wl_gx_target_use(NULL);
+    wlt_check("gx_target_resolved_on_leaving", done != NULL && done->user == 7u && done->memory == g_target_image,
+              "the target comes back with the caller's word");
+    // RGBA8 tiles of 4 x 4: alpha and red of the 16 pixels, then green and blue
+    snprintf(detail, sizeof detail, "a %02x r %02x g %02x b %02x, want ff e0 20 20", g_target_image[0],
+             g_target_image[1], g_target_image[32], g_target_image[33]);
+    wlt_check("gx_target_image_in_gx_format",
+              near_rgb(((uint32_t)g_target_image[1] << 24) | ((uint32_t)g_target_image[32] << 16) |
+                           ((uint32_t)g_target_image[33] << 8) | g_target_image[0],
+                       red),
+              detail);
+
+    uint32_t corner = wl_gx_peek_rgba(10, 10);
+    uint32_t centre = wl_gx_peek_rgba((int)cx, (int)cy);
+    snprintf(detail, sizeof detail, "corner 0x%08x, want 0x%08x", (unsigned)corner, (unsigned)clear);
+    wlt_check("gx_target_back_buffer_colour_restored", near_rgb(corner, clear), detail);
+    snprintf(detail, sizeof detail, "centre 0x%08x, want 0x%08x", (unsigned)centre, (unsigned)green);
+    wlt_check("gx_target_back_buffer_triangle_restored", near_rgb(centre, green), detail);
+
+    // the depth: a triangle at the same depth fails a LESS test where the first one wrote it
+    wl_gx_set_zmode(true, WL_GX_LESS, true);
+    wl_gx_draw(WL_GX_TRIANGLES, tri_blue, 3);
+    centre = wl_gx_peek_rgba((int)cx, (int)cy);
+    snprintf(detail, sizeof detail, "centre 0x%08x, want 0x%08x (blue 0x%08x if the depth was lost)", (unsigned)centre,
+             (unsigned)green, (unsigned)blue);
+    wlt_check("gx_target_back_buffer_depth_restored", near_rgb(centre, green), detail);
+    wl_gx_end_frame();
+
+    // a target left with the EFB at the end of the frame is replaced by the back buffer
+    wl_gx_begin_frame(clear);
+    wl_gx_target_drawn();
+    (void)wl_gx_target_use(&target);
+    wl_gx_end_frame();
+    wlt_check("gx_target_end_frame_restores_back_buffer", wl_gx_target_current() == NULL, "the back buffer owns the EFB");
+
+    WlGxTargetStats st;
+    wl_gx_target_stats(&st, true);
+    snprintf(detail, sizeof detail, "%u parks, %u restores, %u resolves, %u skipped, %u clears", (unsigned)st.parks,
+             (unsigned)st.restores, (unsigned)st.resolves, (unsigned)st.skipped, (unsigned)st.clears);
+    wlt_check("gx_target_counts", st.parks == 2u && st.restores == 2u && st.resolves == 2u && st.skipped == 0u &&
+                                      st.clears == 1u,
+              detail);
+    WlGxStats gs;
+    wl_gx_stats(&gs);
+    wlt_check("gx_target_no_validation_errors", gs.validation_errors == 0u, "no invalid GX calls");
 }
 
 // A TEV program with no texture (konst colours, three stages, REG0 and REG1, a SUB with a bias and
@@ -812,6 +906,7 @@ int main(void) {
     wlt_check("input_init", wl_platform_input_init() == WL_OK, "wl_platform_input_init");
 
     check_video_gx();
+    check_render_target();
     check_tev_program();
     check_backtrace();
     check_profile();

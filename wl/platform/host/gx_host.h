@@ -49,6 +49,8 @@ typedef struct {
     uint32_t scissor_calls;
     uint32_t efb_copies, efb_copy_clears; // wl_gx_copy_efb_texture calls, those that cleared
     int efb_copy_rect[4];                 // the last one's x y w h
+    uint32_t ramp_binds;                  // wl_gx_ramp_bind calls
+    uint32_t ramp_texmap;                 // ...and the last one's texture map
 } WlHostGxState;
 
 // What one wl_gx_draw call drew (quads and triangles from immediate vertices): the bounding boxes of positions and of
