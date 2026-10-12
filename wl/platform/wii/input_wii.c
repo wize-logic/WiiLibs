@@ -9,6 +9,7 @@
 #include <wiikeyboard/keyboard.h>
 #include <wiiuse/wpad.h>
 
+#include "wl/platform/input_shape.h"
 #include "wl/platform/platform.h"
 
 // platform.h button words are libogc's, copied unchanged: prove it at build time.
@@ -50,6 +51,10 @@ static bool g_init;
 static bool g_kb_init;
 static bool g_kb_connected;
 static bool g_remote_was[WL_INPUT_MAX_REMOTES];
+static uint8_t g_remote_extension[WL_INPUT_MAX_REMOTES];
+static uint16_t g_remote_not_ready[WL_INPUT_MAX_REMOTES]; // consecutive polls without data
+// How long (in polls) a connected Remote may go without data before it counts as gone.
+#define REMOTE_GRACE_POLLS 120u
 static bool g_pad_was[WL_INPUT_MAX_PADS];
 static bool g_pad_rumble[WL_INPUT_MAX_PADS];
 static int g_battery_logged[WL_INPUT_MAX_REMOTES] = {-1, -1, -1, -1};
@@ -115,15 +120,26 @@ static void poll_remote(uint32_t chan, WlRawRemote *out) {
     memset(out, 0, sizeof *out);
     u32 type = 0;
     s32 res = WPAD_Probe((s32)chan, &type);
-    if (res != WPAD_ERR_NONE) {
-        g_remote_was[chan] = false; // absent, or still negotiating (NOT_READY)
+    const WPADData *d = res == WPAD_ERR_NONE ? WPAD_Data((int)chan) : NULL;
+    if (d != NULL && d->err != WPAD_ERR_NONE) {
+        res = d->err;
+        d = NULL;
+    }
+    if (d == NULL) {
+        // NOT_READY and TRANSFER are momentary (an extension plugged in, a report lost): a Remote
+        // that was connected stays connected with nothing pressed, so that a hot-plug does not
+        // read as the controller leaving and returning. A missing Remote, or one without data for
+        // REMOTE_GRACE_POLLS polls, clears it.
+        if (g_remote_was[chan] && (res == WPAD_ERR_NOT_READY || res == WPAD_ERR_TRANSFER) &&
+            ++g_remote_not_ready[chan] <= REMOTE_GRACE_POLLS) {
+            out->connected = true;
+            out->extension = g_remote_extension[chan];
+        } else {
+            g_remote_was[chan] = false;
+        }
         return;
     }
-    const WPADData *d = WPAD_Data((int)chan);
-    if (d == NULL || d->err != WPAD_ERR_NONE) {
-        g_remote_was[chan] = false;
-        return;
-    }
+    g_remote_not_ready[chan] = 0;
     if (!g_remote_was[chan]) {
         // Fresh connection: the data format does not survive a reconnect on every libogc build.
         (void)WPAD_SetDataFormat((s32)chan, WPAD_FMT_BTNS_ACC_IR);
@@ -145,6 +161,7 @@ static void poll_remote(uint32_t chan, WlRawRemote *out) {
         out->extension = WL_EXT_OTHER;
         break;
     }
+    g_remote_extension[chan] = out->extension;
     if (g_battery_logged[chan] != (int)d->battery_level) { // to settle the scale on real hardware
         g_battery_logged[chan] = (int)d->battery_level;
         WL_LOG_I("input", "remote %u battery code %u (read as 0..%u)", (unsigned)chan,
@@ -177,8 +194,10 @@ static void poll_remote(uint32_t chan, WlRawRemote *out) {
     } else if (type == WPAD_EXP_CLASSIC) {
         js_to_xy(&d->exp.classic.ljs, out->stick[0]);
         js_to_xy(&d->exp.classic.rjs, out->stick[1]);
-        out->trigger[0] = d->exp.classic.ls_raw;
-        out->trigger[1] = d->exp.classic.rs_raw;
+        // The original's analogue triggers are 5 bits; the Pro's (and the Wii U Pro's) read 0 or
+        // full, with the digital L/R bits set when pressed.
+        out->trigger[0] = wl_input_trigger(d->exp.classic.ls_raw, 0, WL_CLASSIC_TRIGGER_FULL);
+        out->trigger[1] = wl_input_trigger(d->exp.classic.rs_raw, 0, WL_CLASSIC_TRIGGER_FULL);
     }
 }
 
@@ -194,12 +213,10 @@ static void poll_pads(WlRawPad out[WL_INPUT_MAX_PADS]) {
             g_pad_was[i] = true;
             out[i].connected = true;
             out[i].buttons = st[i].button;
-            out[i].stick[0][0] = st[i].stickX;
-            out[i].stick[0][1] = st[i].stickY;
-            out[i].stick[1][0] = st[i].substickX;
-            out[i].stick[1][1] = st[i].substickY;
-            out[i].trigger[0] = st[i].triggerL;
-            out[i].trigger[1] = st[i].triggerR;
+            wl_input_stick_pair(st[i].stickX, st[i].stickY, WL_PAD_MAIN_STICK_FULL, out[i].stick[0]);
+            wl_input_stick_pair(st[i].substickX, st[i].substickY, WL_PAD_C_STICK_FULL, out[i].stick[1]);
+            out[i].trigger[0] = wl_input_trigger(st[i].triggerL, WL_PAD_TRIGGER_FIRST, WL_PAD_TRIGGER_FULL);
+            out[i].trigger[1] = wl_input_trigger(st[i].triggerR, WL_PAD_TRIGGER_FIRST, WL_PAD_TRIGGER_FULL);
         } else if (st[i].err == PAD_ERR_NO_CONTROLLER) {
             g_pad_was[i] = false;
         } else {

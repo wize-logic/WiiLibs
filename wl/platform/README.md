@@ -26,6 +26,7 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `fs.h`, `fs.c` | asynchronous file reads over the IO thread, read-speed measurement |
 | `fs_posix.inc` | the file half of `platform.h` on unbuffered POSIX fds, shared by both backends |
 | `posix.h`, `posix.c` | `wl_posix_pread`, `wl_posix_pwrite` (a seek, the transfer and a seek back under one lock, so the descriptor's position is left alone) and `wl_posix_pause`: the POSIX calls devkitPPC's newlib declares and does not define; `wl_posix_sysconf`, sysconf's memory and processor answers for the console; `wl_posix_thread_set_priority` and `wl_posix_thread_set_relative_priority`, a pthread's priority (devkitPPC's `pthread_create` starts every thread at libogc's lowest, 127, and ignores attributes; the definitions are `wii/thread_wii.c`'s and `host/thread_host.c`'s). `wii/posix_wii.c` defines the C library's `pread`, `pwrite`, `pause` and `sysconf` over them, as weak symbols (a newlib that gains them wins), so a program calls them by their own names |
+| `input_shape.h`, `input_shape.c` | the raw input in the ranges an application wants, with no libogc in it: sticks over their real travel (a GameCube stick's full deflection is 87, the C stick's 74), triggers 0..255 (the Classic Controller's are 5 bits, the GameCube's start at 30), and the Remote's pointer (position across the screen, a short loss held, a dead zone box and a turn ramp) |
 | `tev.h`, `tev.c` | TEV programs as data: stages (inputs a b c d, op, bias, scale, clamp, output register, order, swap tables, konst selections), the helpers a translator allocates with (konst slots, register pool, resource merging), a validator, a software evaluator, the fixed GX recipes as programs; see below |
 | `backtrace.h`, `backtrace.c` | return-address backtraces for the 32-bit PowerPC frame layout: a portable walker over a read callback, `wl_platform_backtrace` for the running thread, `wl_platform_log_backtrace` for a "where from" log line; see below |
 | `profile.h`, `profile.c` | the sampling profiler: a ring of samples (the interrupted pc, link register, thread and the return addresses up its stack), the text dumps, the jitter; `wii/profile_wii.c` is the sampler over libogc's decrementer tick tasks; `tools/wl_profile.py` symbolizes the dumps; see below |
@@ -509,7 +510,14 @@ nothing about hardware speed.
 IR is the bounded position when libogc has a fix, else the unbounded one, so the pointer keeps
 tracking off-screen. The accelerometer is `WPAD_GForce` x 100. The remote battery byte is 0..200
 on the wire, reported as 0..100. Data format and IR resolution are re-applied on every new
-connection. GameCube ports are absent on the Wii Family Edition, Wii mini and vWii.
+connection. A Remote that was connected and reads NOT_READY or TRANSFER (an extension plugged in) stays
+connected with nothing pressed for up to 120 polls, then counts as gone. Sticks are -127..127 over
+the real travel of the stick (`input_shape.h`: libogc's `PAD_Clamp` takes a GameCube stick as full at
+72, or 59 for the C stick, after a dead zone of 15 per axis, so a raw reading is full at 87 and 74; it
+is not called, because the application's own dead zone would add to it); triggers are 0..255: the
+Classic Controller's 5 bits scaled, the GameCube's 30..180 (`PAD_Clamp`'s) scaled. The Classic
+Controller Pro has no analogue triggers: the digital `WL_CC_L` / `WL_CC_R` bits are the sure sign
+that one is pressed (the analogue reading may stay 0), so an application ORs the two. GameCube ports are absent on the Wii Family Edition, Wii mini and vWii.
 
 **Audio output.** One stereo PCM16 voice (e.g. 32 kHz) that the DSP resamples to 48 kHz.
 AESND copies a stream buffer in 1152-byte steps (2 ms at its 144 kHz maximum rate); a buffer
