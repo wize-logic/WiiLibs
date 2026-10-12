@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Derived from xboxrecomp (https://github.com/sp00nznet/xboxrecomp), MIT, Copyright (c) 2026
+// sp00nz and contributors.
 // Ex exports: the EEPROM's settings (ExQueryNonVolatileSetting) from the configuration, saves kept
 // for the process, and the interlocked list helpers (fastcall).
 //

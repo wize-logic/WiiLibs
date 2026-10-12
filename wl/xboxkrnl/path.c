@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Derived from xboxrecomp (https://github.com/sp00nznet/xboxrecomp), MIT, Copyright (c) 2026
+// sp00nz and contributors.
 // Xbox object names to host paths: the symbolic links (\??\D: and the rest, which XAPI creates with
 // IoCreateSymbolicLink), the mount table (NT devices to wl/platform folders), and a case-blind walk
 // of the host folders (FATX is case-insensitive; a host's file system need not be).

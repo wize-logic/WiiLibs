@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Derived from xboxrecomp (https://github.com/sp00nznet/xboxrecomp), MIT, Copyright (c) 2026
+// sp00nz and contributors.
 // The kernel's data exports: variables a title reads through its thunk table (KeTickCount,
 // XboxHardwareInfo, the object types, the disk's strings, keys). They live on two pages of kernel
 // memory (window VAs); a data export's thunk slot gets the address of its variable.

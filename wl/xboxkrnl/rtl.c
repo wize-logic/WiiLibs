@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Derived from xboxrecomp (https://github.com/sp00nznet/xboxrecomp), MIT, Copyright (c) 2026
+// sp00nz and contributors.
 // Rtl exports: critical sections over the dispatcher, ANSI/Unicode strings, memory helpers, integer
 // conversions, time fields, NTSTATUS to Win32 errors, SEH unwinding of the fs:[0] chain, the printf
 // family over guest varargs, DbgPrint.

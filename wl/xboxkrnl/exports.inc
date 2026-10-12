@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Derived from xboxrecomp (https://github.com/sp00nznet/xboxrecomp), MIT, Copyright (c) 2026
+// sp00nz and contributors.
 // The Xbox kernel's exports by ordinal: name, the bytes of stack arguments the function pops
 // (stdcall), and the kind. Facts of the retail kernel's export table, as xboxrecomp records them
 // (tools/xbe_parser KERNEL_EXPORTS for the names, kernel_bridge.c stdcall_args_for_ordinal for

@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Derived from xboxrecomp (https://github.com/sp00nznet/xboxrecomp), MIT, Copyright (c) 2026
+// sp00nz and contributors.
 // HAL, AV, PHY, Dbg and Xe exports: the way out (HalReturnToFirmware), shutdown queries, the SMBus
 // and PCI stubs, the AV encoder's answers (the cable and video standard from the configuration,
 // the display mode recorded and passed to the presenter), the network PHY (no link), section

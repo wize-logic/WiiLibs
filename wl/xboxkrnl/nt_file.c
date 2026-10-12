@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Derived from xboxrecomp (https://github.com/sp00nznet/xboxrecomp), MIT, Copyright (c) 2026
+// sp00nz and contributors.
 // The NT file API over wl/platform's files: create/open with the six dispositions, reads and writes
 // at offsets (synchronous handles keep a position; overlapped ones complete at once and still signal
 // their event and queue their APC), the information classes titles query and set, volume queries,
