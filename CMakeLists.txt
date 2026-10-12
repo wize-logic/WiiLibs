@@ -59,6 +59,8 @@ if(WL_BUILD_TESTS AND NOT WL_PLATFORM STREQUAL "wii")
             add_subdirectory(tests/${m})
         endif()
     endforeach()
+    # the Xbox recompilation toolchain (the runtime header, the correctness net)
+    add_subdirectory(tests/xbox_recomp)
     if(WL_PLATFORM STREQUAL "host")
         # host tools (tools/*.py) and the CMake helpers over them; Python runs on the build machine,
         # so not under the ppc-be emulator
