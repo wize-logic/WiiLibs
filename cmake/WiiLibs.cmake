@@ -234,7 +234,9 @@ endfunction()
 # seeds, extra options). CHUNKS (default 32) is how many translation units the code is spread over.
 # NO_EXECUTABLE makes only <target>_code. The driver's Python needs capstone; set
 # WL_XBOX_RECOMP_PYTHON to choose the interpreter.
-set(WL_CMAKE_DIR ${CMAKE_CURRENT_LIST_DIR})
+# (a cache entry: a project that adds WiiLibs with add_subdirectory calls the functions below from its
+# own scope, where a plain variable of this directory is not seen)
+set(WL_CMAKE_DIR ${CMAKE_CURRENT_LIST_DIR} CACHE INTERNAL "WiiLibs' cmake directory")
 function(wl_add_xbox_title target)
     cmake_parse_arguments(A "NO_EXECUTABLE" "XBE;TITLE_CONFIG;OPT;CHUNKS" "SOURCES;RUNTIME" ${ARGN})
     if(A_UNPARSED_ARGUMENTS)
