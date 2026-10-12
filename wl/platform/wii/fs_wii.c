@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 
 #include "wl/platform/platform.h"
+#include "wl/platform/timebase.h"
 
 #define WL_USB_IOS 58
 
@@ -78,8 +79,12 @@ uint64_t wl_platform_time_us(void) {
     return wl_platform_fs_clock_us();
 }
 
+uint64_t wl_platform_time_ms(void) {
+    return wl_timebase_ms(wl_timebase_read());
+}
+
 uint64_t wl_platform_fs_clock_us(void) {
-    return (uint64_t)ticks_to_microsecs(gettime());
+    return wl_timebase_us(wl_timebase_read());
 }
 
 static WlResult fs_resolve(const char *path, char *out, size_t cap) {

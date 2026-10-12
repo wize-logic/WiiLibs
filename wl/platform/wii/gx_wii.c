@@ -23,6 +23,7 @@
 #include "wl/platform/hwcount.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/platform.h"
+#include "wl/platform/timebase.h"
 #include "wl/platform/tev.h"
 #include "wl/platform/wii/gx_wii_internal.h"
 
@@ -161,7 +162,7 @@ static void verr(const char *what) {
     (((cond) || !g.validate) ? true : (verr(what), false))
 
 static uint64_t now_us(void) {
-    return ticks_to_microsecs(gettime());
+    return wl_timebase_us(wl_timebase_read());
 }
 
 // Counts the setter call and says whether the GPU must be told (shadow unknown or different).

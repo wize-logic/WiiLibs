@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "wl/platform/platform.h"
+#include "wl/platform/timebase.h"
 #include "wl/platform/hwcount.h"
 #include "wl/platform/present.h"
 #include "wl/platform/video_mode.h"
@@ -259,7 +260,7 @@ void *wl_platform_video_back_buffer(void) {
         IRQ_Restore(level);
         if (i >= 0) {
             if (waited != 0) {
-                uint64_t us = ticks_to_microsecs(gettime()) - t0;
+                uint64_t us = wl_timebase_us(wl_timebase_read()) - t0;
                 g_waits++;
                 g_wait_us += us;
                 g_wait_us_max = us > g_wait_us_max ? us : g_wait_us_max;
@@ -267,7 +268,7 @@ void *wl_platform_video_back_buffer(void) {
             return g_xfb[i];
         }
         if (waited == 0) {
-            t0 = ticks_to_microsecs(gettime());
+            t0 = wl_timebase_us(wl_timebase_read());
         } else if (waited % WAIT_RETRACES == 0) {
             // every XFB still waits for a GPU that has not finished in a quarter second: drop the
             // oldest frame rather than hang
