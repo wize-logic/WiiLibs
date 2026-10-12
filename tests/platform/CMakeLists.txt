@@ -12,6 +12,7 @@ wl_add_test(test_platform_fs SOURCES test_platform_fs.c suite_fs.c LIBS wl_platf
 wl_add_test(test_platform_backtrace SOURCES test_platform_backtrace.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_net SOURCES test_platform_net.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_posix SOURCES test_platform_posix.c suite_posix.c LIBS wl_platform LABELS unit be)
+wl_add_test(test_platform_random SOURCES test_platform_random.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_host SOURCES test_platform_host.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_thread SOURCES test_platform_thread.c suite_threads.c LIBS wl_platform LABELS unit be)
 

@@ -66,3 +66,39 @@ int wl_posix_pause(void) {
     return pause();
 #endif
 }
+
+long wl_posix_sysconf(int name, size_t free_bytes) {
+    switch (name) {
+    case _SC_PAGESIZE:
+        return (long)WL_POSIX_PAGE_SIZE;
+    case _SC_PHYS_PAGES:
+        return (long)(WL_POSIX_PHYS_BYTES / WL_POSIX_PAGE_SIZE);
+    case _SC_AVPHYS_PAGES:
+        return (long)(free_bytes / WL_POSIX_PAGE_SIZE);
+#ifdef _SC_NPROCESSORS_CONF
+    case _SC_NPROCESSORS_CONF:
+#endif
+#ifdef _SC_NPROCESSORS_ONLN
+    case _SC_NPROCESSORS_ONLN:
+#endif
+#if defined(_SC_NPROCESSORS_CONF) || defined(_SC_NPROCESSORS_ONLN)
+        return 1;
+#endif
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+uint32_t wl_posix_priority_above_main(int steps) {
+    if (steps > WL_POSIX_PRIO_STEPS) {
+        steps = WL_POSIX_PRIO_STEPS;
+    } else if (steps < -WL_POSIX_PRIO_STEPS) {
+        steps = -WL_POSIX_PRIO_STEPS;
+    }
+    return (uint32_t)((int)WL_POSIX_PRIO_MAIN - steps);
+}
+
+WlResult wl_posix_thread_set_relative_priority(pthread_t thread, int steps) {
+    return wl_posix_thread_set_priority(thread, wl_posix_priority_above_main(steps));
+}

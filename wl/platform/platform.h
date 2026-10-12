@@ -534,6 +534,8 @@ void wl_platform_thread_sleep_ms(uint32_t ms);
 // priority. thread_wii.c defines __wrap_sched_yield as wl_platform_thread_yield; wl_platform's
 // CMake target links its users with -Wl,--wrap=sched_yield, and a program linked another way
 // passes that flag itself. Host: the C library's sched_yield, unchanged.
+// Threads made with pthread_create (the C library's) start at the lowest priority on the console:
+// posix.h's wl_posix_thread_set_priority raises them.
 
 // Stack depth measurement. wl_platform_stack_fill writes WL_STACK_FILL_BYTE over a stack before
 // a thread runs on it; wl_platform_stack_used then gives the deepest it has been, in bytes (the
@@ -629,6 +631,34 @@ WlResult wl_platform_fs_rename(const char *from, const char *to);
 WlResult wl_platform_fs_remove(const char *path);
 // Creates one directory level; an existing directory is WL_OK.
 WlResult wl_platform_fs_mkdir(const char *path);
+// True when `path` names an existing file or directory. False for a missing one, an unmounted
+// device and a path the file API refuses.
+bool wl_platform_fs_exists(const char *path);
+// Finds the folder of a Homebrew Channel application: "sd:/apps/<app_name>", or
+// "usb:/apps/<app_name>" when only the USB drive has it. `marker` is a path inside the folder
+// (relative, e.g. "maps" or "data/game.pak") that must exist for a drive to count, so that an
+// empty or stale folder on the SD card does not hide the full one on the USB drive; NULL or ""
+// asks only for the folder itself. The SD card is preferred when both qualify. Writes the folder
+// without a trailing slash to `out` and returns WL_OK, or, when neither drive has it, writes the
+// SD card's folder (where a first run would create it) and returns WL_ERR_NOT_FOUND. WL_ERR_ARG
+// for an empty `app_name` or one holding a slash or "..", an absolute or ".." `marker`, or a path
+// that does not fit `out` (`size` bytes) or WL_FS_PATH_MAX. Call after the devices are mounted
+// (an unmounted one has nothing). Host: the same, over the directories wl_host_fs_set_root gives.
+WlResult wl_platform_fs_find_app_dir(const char *app_name, const char *marker, char *out, size_t size);
+
+// ---------------------------------------------------------------------------------------------
+// Entropy
+// ---------------------------------------------------------------------------------------------
+
+// Fills `size` bytes at `buf` with unpredictable bytes. NOT cryptographic on the Wii, which has no
+// entropy source a program can reach: the bytes come from the processor's time base (its
+// free-running counter, read once per byte) put through an avalanche mixer. They suit nonces,
+// jitter, port choices and seeds for random play; they do not suit keys or anything that must stay
+// out of reach of an attacker who can watch or guess when the program started. Host: getrandom or
+// /dev/urandom, which are cryptographic. WL_ERR_ARG for a NULL `buf` with a `size` other than 0;
+// the host returns WL_ERR_IO when the system's source fails. Callable from any thread; concurrent
+// calls only mix in more.
+WlResult wl_platform_random_bytes(void *buf, size_t size);
 
 // ---------------------------------------------------------------------------------------------
 // Raw input (an action-mapping layer goes on top)

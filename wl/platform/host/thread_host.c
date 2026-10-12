@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include "wl/platform/platform.h"
+#include "wl/platform/posix.h"
 
 #define MAX_THREADS 16u
 #define MAX_SEMS 64u
@@ -107,6 +108,12 @@ WlResult wl_platform_thread_join(WlPlatformThread thread, void **out_result) {
 
 void wl_platform_thread_yield(void) {
     sched_yield();
+}
+
+// The host's scheduler decides: the priority is checked and ignored, like create's.
+WlResult wl_posix_thread_set_priority(pthread_t thread, uint32_t priority) {
+    (void)thread;
+    return priority > WL_POSIX_PRIO_MIN ? WL_ERR_ARG : WL_OK;
 }
 
 typedef struct {
