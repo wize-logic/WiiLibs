@@ -113,7 +113,8 @@ holder's next yield point, or on the service thread (above every guest priority)
 runs or the holder hands it the lock at a safe point. It always runs on the service thread's guest
 stack: a device access can come in the middle of a translated function whose `esp` the compiler
 has not stored back yet, so the interrupted stack is left alone. A guest thread that spins without
-a kernel call, an `rdtsc` or a device access holds interrupts off (see `g_xb_attention` above).
+a kernel call, an `rdtsc` or a device access holds interrupts off (see `g_xb_attention` above); the
+service thread logs which thread it is once it has waited a second for the lock.
 
 ## The GPU and the MCPX (`devices.h`)
 
