@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "input_stub.h"
+#include <ogc/conf.h>
 #include <wiikeyboard/keyboard.h>
 
 InputStub g_input_stub;
@@ -37,6 +38,7 @@ s32 WPAD_ScanPads(void) {
 
 s32 WPAD_Rumble(s32 chan, int status) {
     g_input_stub.rumble[chan] = status;
+    g_input_stub.rumble_calls++;
     return 0;
 }
 
@@ -59,6 +61,15 @@ u32 PAD_Read(PADStatus *status) {
 
 void PAD_ControlMotor(s32 chan, u32 cmd) {
     g_input_stub.motor[chan] = (int)cmd;
+    g_input_stub.motor_calls++;
+}
+
+s32 CONF_Init(void) {
+    return 0;
+}
+
+s32 CONF_GetPadMotorMode(void) {
+    return g_input_stub.motor_mode;
 }
 
 int32_t KEYBOARD_Init(keyPressCallback keypress_cb) {

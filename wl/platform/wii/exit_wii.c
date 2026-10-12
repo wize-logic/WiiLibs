@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // System buttons and exit (platform.h). The reset and power callbacks run in interrupt context:
-// they only latch a bit that the main loop collects with wl_platform_system_events. The log is
-// flushed before leaving so the SD file is whole.
+// they only latch a bit that the main loop (or the system watcher, shutdown.c) collects with
+// wl_platform_system_events. Leaving winds the program down first (shutdown.c), then flushes
+// and closes the log, and unmounts the SD card and USB drive, so that the files are whole.
 #include <gccore.h>
 #include <ogc/stm.h>
 #include <stdatomic.h>
@@ -9,6 +10,8 @@
 #include <wiiuse/wpad.h>
 
 #include "wl/platform/platform.h"
+#include "wl/platform/shutdown_internal.h"
+#include "wl/platform/shutdown_internal.h"
 
 static atomic_uint g_events;
 static bool g_sys_init;
@@ -43,8 +46,12 @@ uint32_t wl_platform_system_events(void) {
 }
 
 WL_NORETURN void wl_platform_exit(WlExitTarget target) {
+    wl_platform_shutdown_prepare(target);
     wl_platform_log_flush();
     wl_platform_log_shutdown(); // closes the SD file before the console goes down
+    // the caches of the SD card and the USB drive written out (nothing is mounted twice)
+    wl_platform_fs_unmount(WL_DEVICE_SD);
+    wl_platform_fs_unmount(WL_DEVICE_USB);
     switch (target) {
     case WL_EXIT_WII_MENU: SYS_ResetSystem(SYS_RETURNTOMENU, 0, 0); break;
     case WL_EXIT_POWER_OFF: STM_ShutdownToStandby(); break; // also ends emulation under Dolphin --batch

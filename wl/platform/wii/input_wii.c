@@ -4,6 +4,7 @@
 // Mapping to actions belongs to the layer above; this file only reads devices and never blocks.
 // Only this directory may include <ogc/*.h>.
 #include <math.h>
+#include <ogc/conf.h>
 #include <ogc/pad.h>
 #include <string.h>
 #include <wiikeyboard/keyboard.h>
@@ -57,6 +58,7 @@ static uint16_t g_remote_not_ready[WL_INPUT_MAX_REMOTES]; // consecutive polls w
 #define REMOTE_GRACE_POLLS 120u
 static bool g_pad_was[WL_INPUT_MAX_PADS];
 static bool g_pad_rumble[WL_INPUT_MAX_PADS];
+static bool g_remote_rumble[WL_INPUT_MAX_REMOTES]; // what the Remote was last told
 static int g_battery_logged[WL_INPUT_MAX_REMOTES] = {-1, -1, -1, -1};
 
 WlResult wl_platform_input_init(void) {
@@ -81,13 +83,7 @@ void wl_platform_input_shutdown(void) {
     if (!g_init) {
         return;
     }
-    for (uint8_t i = 0; i < WL_INPUT_MAX_REMOTES; i++) {
-        (void)WPAD_Rumble(i, 0);
-    }
-    for (uint8_t i = 0; i < WL_INPUT_MAX_PADS; i++) {
-        PAD_ControlMotor(i, PAD_MOTOR_STOP);
-        g_pad_rumble[i] = false;
-    }
+    wl_platform_input_stop_rumble();
     if (g_kb_init) {
         (void)KEYBOARD_Deinit();
         g_kb_init = false;
@@ -145,6 +141,7 @@ static void poll_remote(uint32_t chan, WlRawRemote *out) {
         (void)WPAD_SetDataFormat((s32)chan, WPAD_FMT_BTNS_ACC_IR);
         (void)WPAD_SetVRes((s32)chan, IR_VRES_W, IR_VRES_H);
         g_remote_was[chan] = true;
+        g_remote_rumble[chan] = false; // (a Remote that comes back is not rumbling)
     }
     out->connected = true;
     switch (type) {
@@ -279,14 +276,52 @@ void wl_platform_input_poll(WlRawInput *out) {
     poll_keyboard(&out->keyboard);
 }
 
+bool wl_platform_rumble_enabled(void) {
+    // SYSCONF's rumble setting ("BT.MOT": 1 on, 0 off; negative when it cannot be read, which
+    // allows rumble). Read at each call (a lookup in the copy libogc holds in memory), so a
+    // change is followed; the log says when it was found to change.
+    static int g_logged = -1;
+    (void)CONF_Init(); // idempotent
+    int setting = CONF_GetPadMotorMode() == 0 ? 0 : 1;
+    if (setting != g_logged) {
+        g_logged = setting;
+        WL_LOG_I("input", "the console's rumble setting: %s", setting != 0 ? "on" : "off");
+    }
+    return setting != 0;
+}
+
+void wl_platform_input_stop_rumble(void) {
+    if (!g_init) {
+        return; // (WPAD and PAD are not started: no motor can be running)
+    }
+    for (uint8_t i = 0; i < WL_INPUT_MAX_REMOTES; i++) {
+        (void)WPAD_Rumble(i, 0);
+        g_remote_rumble[i] = false;
+    }
+    for (uint8_t i = 0; i < WL_INPUT_MAX_PADS; i++) {
+        PAD_ControlMotor(i, PAD_MOTOR_STOP);
+        g_pad_rumble[i] = false;
+    }
+}
+
 void wl_platform_rumble(uint8_t remote, bool on) {
-    if (remote < WL_INPUT_MAX_REMOTES) {
+    if (remote >= WL_INPUT_MAX_REMOTES) {
+        return;
+    }
+    on = on && wl_platform_rumble_enabled();
+    // (each call to libogc is a report to the Remote: only a change is sent)
+    if (g_remote_rumble[remote] != on) {
         (void)WPAD_Rumble(remote, on ? 1 : 0);
+        g_remote_rumble[remote] = on;
     }
 }
 
 void wl_platform_pad_rumble(uint8_t pad, bool on) {
-    if (pad < WL_INPUT_MAX_PADS && g_pad_rumble[pad] != on) {
+    if (pad >= WL_INPUT_MAX_PADS) {
+        return;
+    }
+    on = on && wl_platform_rumble_enabled();
+    if (g_pad_rumble[pad] != on) {
         PAD_ControlMotor(pad, on ? PAD_MOTOR_RUMBLE : PAD_MOTOR_STOP);
         g_pad_rumble[pad] = on;
     }

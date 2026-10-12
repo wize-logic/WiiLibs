@@ -10,6 +10,7 @@
 
 static void reset(void) {
     memset(&g_input_stub, 0, sizeof g_input_stub);
+    g_input_stub.motor_mode = 1; // (the console's rumble setting: on)
     for (int i = 0; i < 4; i++) {
         g_input_stub.probe[i] = WPAD_ERR_NO_CONTROLLER;
         g_input_stub.pad[i].err = PAD_ERR_NO_CONTROLLER;
@@ -197,6 +198,82 @@ TEST rumble_reaches_the_devices(void) {
     PASS();
 }
 
+TEST rumble_off_in_the_console_settings_is_none(void) {
+    reset();
+    g_input_stub.motor_mode = 0;
+    ASSERT(!wl_platform_rumble_enabled());
+    wl_platform_rumble(0, true);
+    wl_platform_pad_rumble(0, true);
+    ASSERT_EQ(0, g_input_stub.rumble[0]);
+    ASSERT_EQ(PAD_MOTOR_STOP, g_input_stub.motor[0]);
+    // an unreadable setting allows it, as does "on"
+    g_input_stub.motor_mode = -1;
+    ASSERT(wl_platform_rumble_enabled());
+    g_input_stub.motor_mode = 1;
+    ASSERT(wl_platform_rumble_enabled());
+    wl_platform_rumble(0, true);
+    ASSERT_EQ(1, g_input_stub.rumble[0]);
+    wl_platform_rumble(0, false);
+    PASS();
+}
+
+TEST only_a_change_is_sent_to_a_motor(void) {
+    reset();
+    g_input_stub.motor_mode = 1;
+    wl_platform_rumble(2, true);
+    wl_platform_rumble(2, true);
+    wl_platform_rumble(2, true);
+    ASSERT_EQ(1u, g_input_stub.rumble_calls);
+    wl_platform_rumble(2, false);
+    wl_platform_rumble(2, false);
+    ASSERT_EQ(2u, g_input_stub.rumble_calls);
+    wl_platform_pad_rumble(3, true);
+    wl_platform_pad_rumble(3, true);
+    ASSERT_EQ(1u, g_input_stub.motor_calls);
+    wl_platform_pad_rumble(3, false);
+    PASS();
+}
+
+TEST a_remote_that_comes_back_is_told_again(void) {
+    reset();
+    g_input_stub.motor_mode = 1;
+    remote(1, WPAD_EXP_NONE, 0);
+    (void)poll();
+    wl_platform_rumble(1, true);
+    ASSERT_EQ(1, g_input_stub.rumble[1]);
+    // it goes, and returns (its motor is off then): the next request is sent although the state
+    // was "on" before
+    g_input_stub.probe[1] = WPAD_ERR_NO_CONTROLLER;
+    (void)poll();
+    remote(1, WPAD_EXP_NONE, 0);
+    (void)poll();
+    g_input_stub.rumble[1] = 0;
+    wl_platform_rumble(1, true);
+    ASSERT_EQ(1, g_input_stub.rumble[1]);
+    wl_platform_rumble(1, false);
+    PASS();
+}
+
+TEST stopping_every_motor_stops_every_motor(void) {
+    reset();
+    g_input_stub.motor_mode = 1;
+    (void)poll(); // (the input is up)
+    wl_platform_rumble(0, true);
+    wl_platform_rumble(3, true);
+    wl_platform_pad_rumble(1, true);
+    wl_platform_input_stop_rumble();
+    for (int i = 0; i < 4; i++) {
+        ASSERT_EQ(0, g_input_stub.rumble[i]);
+        ASSERT_EQ(PAD_MOTOR_STOP, g_input_stub.motor[i]);
+    }
+    // and a motor asked for again afterwards is sent (the state was forgotten with the stop)
+    wl_platform_rumble(0, true);
+    ASSERT_EQ(1, g_input_stub.rumble[0]);
+    wl_platform_input_shutdown();
+    ASSERT_EQ(0, g_input_stub.rumble[0]);
+    PASS();
+}
+
 SUITE(input_wii_suite) {
     RUN_TEST(classic_controller_sticks_and_triggers);
     RUN_TEST(classic_pro_triggers_are_the_digital_bits);
@@ -207,6 +284,10 @@ SUITE(input_wii_suite) {
     RUN_TEST(remote_stays_through_an_extension_being_plugged_in);
     RUN_TEST(remote_that_is_gone_is_gone_at_once);
     RUN_TEST(rumble_reaches_the_devices);
+    RUN_TEST(rumble_off_in_the_console_settings_is_none);
+    RUN_TEST(only_a_change_is_sent_to_a_motor);
+    RUN_TEST(a_remote_that_comes_back_is_told_again);
+    RUN_TEST(stopping_every_motor_stops_every_motor);
 }
 
 GREATEST_MAIN_DEFS();

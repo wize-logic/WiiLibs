@@ -36,6 +36,7 @@ void wl_platform_stop_screen(const char *fmt, ...) {
     wl_platform_console_report("stop", "%s\n", message);
     WL_LOG_E("stop", "stopped: %s", message);
     wl_platform_log_flush();
+    wl_platform_input_stop_rumble(); // (a motor must not run while the screen waits)
     wl_platform_stop_wait(message, false);
 }
 
