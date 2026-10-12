@@ -125,7 +125,8 @@ static void quad(float x0, float y0, float x1, float y1, const GXColor *colour, 
     wl_gx_wii_note_commands();
 }
 
-void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, uint32_t h) {
+void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, uint32_t h, uint32_t back_w,
+                             uint32_t back_h) {
     GXTexObj colour_map, depth_map;
 
     GX_InvalidateTexAll();
@@ -138,7 +139,7 @@ void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, 
     GX_SetColorUpdate(GX_TRUE);
     GX_SetAlphaUpdate(GX_TRUE);
     GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
-    quad(0.0f, 0.0f, (float)w, (float)h, NULL, 0.0f, true, true, w, h);
+    quad(0.0f, 0.0f, (float)w, (float)h, NULL, 0.0f, true, true, back_w, back_h);
 }
 
 void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int x, int y, int rw, int rh,

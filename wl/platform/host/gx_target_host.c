@@ -55,12 +55,15 @@ void wl_gx_target_be_scissor(uint32_t w, uint32_t h) {
     op->h = h;
 }
 
-void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, uint32_t h) {
+void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, uint32_t h, uint32_t back_w,
+                             uint32_t back_h) {
     WlHostTargetOp *op = next_op(WL_HOST_TARGET_RESTORE);
     op->dst = colour;
     op->depth_src = depth;
     op->w = w;
     op->h = h;
+    op->back_w = back_w;
+    op->back_h = back_h;
 }
 
 void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int x, int y, int rw, int rh,
