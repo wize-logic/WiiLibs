@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: MIT
+// The NV2A's textures (nv2a_texture.c): a texture stage's registers decoded (where the texels are,
+// their format, size, layout, levels and faces, the sampler), and a texture converted into GX's
+// formats (wl/codec's Xbox conversions where they are exact, the rest decoded to RGBA8 and encoded
+// again), a cube map made into the sphere map wl/xbox/psh samples it as. The host-side cache of
+// converted textures, keyed by (address, format, size) and checked by a hash of the texels, is
+// nv2a_texcache.h.
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "wl/codec/gx_tex.h"
+#include "wl/codec/xbox_tex.h"
+#include "wl/xbox/nv2a_kelvin.h"
+
+enum {
+    // GX's largest texture side
+    WL_NV2A_GX_MAX_SIZE = 1024,
+    // a cube map's sphere map, at most this many texels a side
+    WL_NV2A_SPHERE_MAX = 256
+};
+
+typedef struct WlNv2aTexture {
+    uint32_t phys;          // level 0's guest-physical address (face 0's for a cube map)
+    uint32_t format_word;   // SET_TEXTURE_FORMAT
+    uint32_t rect_word;     // SET_TEXTURE_IMAGE_RECT (linear textures)
+    uint32_t palette_phys;  // a P8 texture's palette (D3DCOLOR entries)
+    uint32_t palette_entries;
+    uint8_t color;          // WL_NV2A_TEX_* (the format word's bits 15:8)
+    uint8_t swizzled, compressed, linear, cube, volume;
+    uint8_t known;          // a format the conversion knows
+    uint32_t width, height, depth;
+    uint32_t levels;        // in memory (1 for a linear texture)
+    uint32_t pitch;         // a linear texture's bytes between rows
+    uint32_t texel_bytes;   // 0 for the DXT formats
+    uint32_t face_bytes;    // all levels of a face (a cube map's faces this far apart)
+    uint32_t total_bytes;   // what the texture takes in guest memory
+    // what the stage's sampler says
+    uint8_t enabled;        // CONTROL0's enable bit
+    uint8_t wrap_u, wrap_v; // WL_NV2A_WRAP_*
+    uint8_t min_filter, mag_filter; // WL_NV2A_FILTER_*
+    // what the texels hold, as wl/xbox/psh takes it (WL_XBOX_PSH_TEXTURE_*)
+    uint8_t contents;
+} WlNv2aTexture;
+
+// Stage `stage`'s texture (0..3). false when the stage has no texture to sample: its offset or
+// format unset, a size of 0.
+bool wl_nv2a_texture(const WlNv2aKelvin *k, unsigned stage, WlNv2aTexture *out);
+// the stage's texture shader program (WL_NV2A_STAGE_*)
+static inline unsigned wl_nv2a_stage_program(const WlNv2aKelvin *k, unsigned stage) {
+    return (wl_nv2a_k(k, WL_NV2A_K_SET_SHADER_STAGE_PROGRAM) >> (5u * stage)) & 0x1Fu;
+}
+
+// ---- conversion to GX -----------------------------------------------------------------------
+typedef struct WlNv2aGxLayout {
+    WlGxcFormat format;     // of the image (C8: with a TLUT)
+    uint32_t width, height; // of its first level
+    uint32_t levels;        // GX levels, one after the other in tile order
+    uint32_t first_level;   // the guest level the first GX level is (levels larger than GX's
+                            // largest are left out)
+    size_t image_bytes;     // all levels
+    // DXT3 and DXT5: their alpha as an I4 image after the colour's, image_bytes on
+    bool separate_alpha;
+    size_t alpha_bytes;
+    // a P8 texture's TLUT: tlut_entries big-endian entries of tlut_format after the images
+    WlGxcTlutFormat tlut_format;
+    uint32_t tlut_entries;
+    size_t tlut_offset;
+    // a cube map's sphere map (RGBA8, one level)
+    bool sphere;
+    size_t total_bytes;     // all of it (32-byte multiples between the parts)
+} WlNv2aGxLayout;
+
+// What the texture becomes on GX: false when it cannot (a format not known, a size GX cannot
+// show). `mipmaps`: keep the levels (the sampler uses them).
+bool wl_nv2a_texture_layout(const WlNv2aTexture *t, bool mipmaps, WlNv2aGxLayout *out);
+// Converts the texture (its guest bytes `src`, total_bytes of them; `palette` a P8's entries, or
+// NULL) into `dst` (layout->total_bytes, 32-byte aligned). `scratch` takes
+// wl_nv2a_texture_scratch_bytes of the texture for the decoding. false on bad input.
+bool wl_nv2a_texture_convert(const WlNv2aTexture *t, const WlNv2aGxLayout *layout, const uint8_t *src,
+                             const uint8_t *palette, void *dst, void *scratch);
+size_t wl_nv2a_texture_scratch_bytes(const WlNv2aTexture *t, const WlNv2aGxLayout *layout);
+
+// One texel of a linear (unswizzled) level as RGBA8: the decoder of the formats without an exact GX
+// equivalent, and the reference for the others. `row` is the level's row y.
+void wl_nv2a_texel_rgba(uint8_t color, const uint8_t *row, uint32_t x, const uint8_t *palette, uint8_t rgba[4]);
+
+// A direction's place on the sphere map a cube map becomes (the mirror ball's mapping: x / m + 1/2,
+// y / m + 1/2 with m = 2 |d + (0, 0, 1)|, d normalized), and its inverse.
+void wl_nv2a_sphere_coordinates(const float direction[3], float st[2]);
+void wl_nv2a_sphere_direction(float s, float t, float direction[3]);

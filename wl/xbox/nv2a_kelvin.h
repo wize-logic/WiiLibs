@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "wl/xbox/nv2a.h"
 #include "wl/xbox/nv2a_regs.h"
 #include "wl/xbox/psh.h"
 
