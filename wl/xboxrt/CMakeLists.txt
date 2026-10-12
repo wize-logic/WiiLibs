@@ -20,3 +20,13 @@ if(EXISTS ${PROJECT_SOURCE_DIR}/wl/xbox/nv2a.h AND TARGET wl_xbox)
     target_link_libraries(wl_xboxrt PUBLIC wl_xbox)
 endif()
 add_library(WiiLibs::xboxrt ALIAS wl_xboxrt)
+
+# The boot code (boot.h) joins the runtime to the kernel; wl_xboxrt_main is a main over it.
+add_library(wl_xboxrt_boot STATIC boot.c)
+wl_target_defaults(wl_xboxrt_boot)
+target_link_libraries(wl_xboxrt_boot PUBLIC wl_xboxrt wl_xboxkrnl wl_platform)
+add_library(WiiLibs::xboxrt_boot ALIAS wl_xboxrt_boot)
+add_library(wl_xboxrt_main STATIC boot_main.c)
+wl_target_defaults(wl_xboxrt_main)
+target_link_libraries(wl_xboxrt_main PUBLIC wl_xboxrt_boot)
+add_library(WiiLibs::xboxrt_main ALIAS wl_xboxrt_main)

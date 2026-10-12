@@ -237,7 +237,6 @@ WlResult wl_xb_threads_init(const WlXbThreadConfig *cfg, WlXbThread **out) {
         return WL_ERR_NOMEM;
     }
     strcpy(t->name, "boot");
-    g_live = 1;
     g_stats.threads_created = 1;
     wl_xb_lock(t);
     *out = t;
@@ -394,6 +393,7 @@ WlResult wl_xb_thread_create(uint32_t routine, uint32_t ctx1, uint32_t ctx2, uin
     t->start_ctx1 = ctx1;
     t->start_ctx2 = ctx2;
     t->suspend_count = suspended ? 1u : 0u;
+    t->counted = true;
     WlResult r = wl_xb_thread_setup_guest(t, stack_bytes, g_tls_data, g_tls_bytes, g_tls_zero);
     if (r != WL_OK) {
         return r;
@@ -456,11 +456,14 @@ void wl_xb_thread_exit(uint32_t status) {
     if (t->running_guest && !t->is_service && t->host.id != 0) {
         longjmp(t->exit_jmp, 1);
     }
-    // the boot thread (no host thread of ours to unwind to): it is done; the process goes on
+    // a thread with no host thread of ours to unwind to (the boot thread): it is done; the
+    // process goes on
     thread_finished(t);
     wl_platform_mutex_lock(g_m);
-    g_live--;
-    bool last = g_live == 0;
+    if (t->counted && g_live > 0) {
+        g_live--;
+    }
+    bool last = t->counted && g_live == 0;
     if (last && !g_exiting) {
         g_exiting = true;
         g_exit_code = (int)status;

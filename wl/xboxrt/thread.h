@@ -45,6 +45,7 @@ struct WlXbThread {
     uint32_t suspend_count;
     bool terminated;
     bool is_service;           // the runtime's service thread (not a guest thread)
+    bool counted;              // made by wl_xb_thread_create: the process ends when the last ends
     uint32_t exit_status;
     void *kernel;              // the kernel's per-thread state
     // runtime internals
