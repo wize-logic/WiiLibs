@@ -10,6 +10,7 @@ static WlRawInput g_next;
 static bool g_remote_rumble[WL_INPUT_MAX_REMOTES];
 static bool g_pad_rumble[WL_INPUT_MAX_PADS];
 static bool g_started;
+static bool g_rumble_allowed = true;
 
 WlResult wl_platform_input_init(void) {
     g_started = true;
@@ -17,7 +18,17 @@ WlResult wl_platform_input_init(void) {
 }
 
 void wl_platform_input_shutdown(void) {
+    wl_platform_input_stop_rumble();
     g_started = false;
+}
+
+bool wl_platform_rumble_enabled(void) {
+    return g_rumble_allowed;
+}
+
+void wl_platform_input_stop_rumble(void) {
+    memset(g_remote_rumble, 0, sizeof g_remote_rumble);
+    memset(g_pad_rumble, 0, sizeof g_pad_rumble);
 }
 
 void wl_platform_input_poll(WlRawInput *out) {
@@ -29,13 +40,13 @@ void wl_platform_input_poll(WlRawInput *out) {
 
 void wl_platform_rumble(uint8_t remote, bool on) {
     if (remote < WL_INPUT_MAX_REMOTES) {
-        g_remote_rumble[remote] = on;
+        g_remote_rumble[remote] = on && g_rumble_allowed;
     }
 }
 
 void wl_platform_pad_rumble(uint8_t pad, bool on) {
     if (pad < WL_INPUT_MAX_PADS) {
-        g_pad_rumble[pad] = on;
+        g_pad_rumble[pad] = on && g_rumble_allowed;
     }
 }
 
@@ -43,6 +54,10 @@ void wl_platform_pad_rumble(uint8_t pad, bool on) {
 
 void wl_host_input_set(const WlRawInput *raw) {
     g_next = *raw;
+}
+
+void wl_host_rumble_allowed(bool allowed) {
+    g_rumble_allowed = allowed;
 }
 
 bool wl_host_remote_rumble(uint8_t remote) {

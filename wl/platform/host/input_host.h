@@ -9,3 +9,5 @@ void wl_host_input_set(const WlRawInput *raw);
 // The last rumble request for a remote or a GameCube pad.
 bool wl_host_remote_rumble(uint8_t remote);
 bool wl_host_pad_rumble(uint8_t pad);
+// Whether the console's rumble setting allows rumble (wl_platform_rumble_enabled); true at start.
+void wl_host_rumble_allowed(bool allowed);

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "greatest.h"
+#include "wl/platform/host/input_host.h"
 #include "wl/platform/host/stop_host.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/stop.h"
@@ -52,11 +53,13 @@ TEST the_first_stop_says_its_message_and_logs_an_error(void) {
     wl_platform_log_init(NULL);
     wl_host_stop_set_hook(hook);
     g_calls = 0;
+    wl_platform_rumble(0, true);
     if (setjmp(g_escape) == 0) {
         wl_platform_stop_screen("no %s for %d", "memory", 7);
         FAIL();
     }
     ASSERT_EQ(1u, g_calls);
+    ASSERT(!wl_host_remote_rumble(0)); // (a motor does not run while the screen waits)
     ASSERT_STR_EQ("no memory for 7", g_message);
     ASSERT(!g_again);
     ASSERT(log_has("[E][stop] stopped: no memory for 7"));

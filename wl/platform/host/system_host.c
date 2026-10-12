@@ -3,6 +3,8 @@
 // (wl_host_system_raise in system_host.h); exit calls exit(0); the log sink keeps the same
 // in-memory ring as the console and prints to stderr.
 #include "wl/platform/host/system_host.h"
+#include "wl/platform/shutdown_internal.h"
+#include "wl/platform/shutdown_internal.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -24,8 +26,23 @@ void wl_host_system_raise(uint32_t events) {
     atomic_fetch_or(&g_events, events);
 }
 
+static WlHostExitHook g_exit_hook;
+
+void wl_host_exit_set_hook(WlHostExitHook hook) {
+    g_exit_hook = hook;
+}
+
+void wl_host_system_reset(void) {
+    atomic_store(&g_events, 0u);
+    wl_platform_shutdown_reset();
+}
+
 WL_NORETURN void wl_platform_exit(WlExitTarget target) {
-    (void)target;
+    wl_platform_shutdown_prepare(target);
+    wl_platform_log_flush();
+    if (g_exit_hook != NULL) {
+        g_exit_hook(target); // (a test's: it does not return)
+    }
     wl_platform_log_shutdown();
     exit(0);
 }

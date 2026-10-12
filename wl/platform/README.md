@@ -35,12 +35,14 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `net.h`, `net.c`, `net_internal.h` | IPv4 TCP and UDP sockets over IOS (libogc) or the host: addresses as host-order values, errors as results, poll for select, the network started in the background; `net.c` has the errno mapping and the address text; see below |
 | `gx_common.c` | GX helpers needing no hardware: texture sizes, sampler filter resolution, the ramp texture's image |
 | `gx_target.h`, `gx_target.c`, `gx_target_internal.h` | render targets on GX's one EFB: who owns it, parking and putting back the back buffer, resolving a target into its memory, clear quads; the portable bookkeeping over a small backend (`gx_target_internal.h`: `wii/gx_target_wii.c`, `host/gx_target_host.c`); see "Render targets" |
+| `shutdown.c`, `shutdown_internal.h` | leaving the program: the shutdown hooks (`wl_platform_shutdown_hook`), the wind-down every `wl_platform_exit` starts with (hooks newest first, the audio output and the motors stopped), and the system watcher, the thread that serves the reset and power buttons (`wl_platform_system_watch_start`); see "Leaving the program" |
+| `gx_fifo.c` | `wl_gx_fifo_bytes`: the GX command FIFO's size, from the budget of `WL_TAG_GXFIFO` |
 | `stack.c` | stack depth measurement: a fill pattern and the high-water mark (`wl_platform_stack_used`) |
 | `wii/` | libogc backends (`heap_wrap_wii.c` wraps newlib's malloc family for the overflow heap and includes no libogc header; `tev_wii.c` applies a TEV program to GX): 64-bit atomics (the libatomic calls compilers make; Broadway has no 8-byte atomic instructions), thread-local variables (`__emutls_get_address` for `-femulated-tls`), the crash report (and the backtrace it uses, `backtrace_wii.c`), the exit tracer (`trace_wii.c`), network (`net_wii.c`, libogc's `net_*`), audio (AESND/ASND), exit and system buttons, fs (libfat, IOS 58), gx (with an optional EFB alpha, `wl_gx_set_efb_alpha`; `gx_target_wii.c` is the render targets' copies and quads), input (WPAD/PAD/keyboard), log sinks, mem, entropy (`random_wii.c`: the time base, not cryptographic), threads (LWP), video |
 | `host/` | stubs: backtrace (the real chain on ppc-be, none elsewhere), net (POSIX sockets), audio (test renders blocks), fs (devices map to directories), gx (records draws; `gx_target_host.c` records the render targets' operations), input (preloaded state), mem (malloc'd regions), system and log, tev (records the last applied program), entropy (getrandom, /dev/urandom), threads (pthreads) |
 
 Host test control lives in `host/*_host.h`: `wl_host_audio_render`, `wl_host_fs_set_root`,
-`wl_host_gx_state` / `wl_host_gx_record`, `wl_host_target_ops`, `wl_host_input_set`, `wl_host_stop_set_hook`, `wl_host_system_raise`, `wl_host_tev_last`.
+`wl_host_gx_state` / `wl_host_gx_record`, `wl_host_target_ops`, `wl_host_input_set`, `wl_host_rumble_allowed`, `wl_host_stop_set_hook`, `wl_host_system_raise`, `wl_host_exit_set_hook`, `wl_host_system_reset`, `wl_host_tev_last`.
 
 ## Typical start-up
 
@@ -54,9 +56,42 @@ wl_mem_init(NULL);                      // or a WlMemConfig with application tag
 wl_platform_video_init();
 wl_gx_init();
 wl_fs_start();                          // IO thread
+wl_platform_system_watch_start(16, NULL, NULL);   // the buttons work from here on, in any stall
 // per frame: wl_platform_input_poll, wl_mem_frame_begin, wl_gx_begin_frame ... wl_gx_end_frame,
-//            wl_platform_log_flush, wl_platform_system_events
+//            wl_platform_log_flush
+// (without the watcher: wl_platform_system_events once a frame, then wl_platform_exit)
 ```
+
+## Leaving the program
+
+`wl_platform_exit(target)` winds the program down before it leaves, once, whichever thread asks
+(a second caller waits for the first): the shutdown hooks registered with
+`wl_platform_shutdown_hook(fn, user)` run, newest first, with the target (a place to let a save
+finish, or to close files held open for writing); then the audio output is stopped
+(`wl_platform_audio_stop`) and every Wii Remote's and GameCube controller's motor
+(`wl_platform_input_stop_rumble`); then the log is flushed and closed, the SD card and USB drive are
+unmounted (their caches written out) and the program leaves: `WL_EXIT_LOADER` for the Homebrew Channel,
+`WL_EXIT_WII_MENU`, `WL_EXIT_POWER_OFF` (`STM_ShutdownToStandby`).
+
+The reset and power buttons (and a Wii Remote's power button) only latch a bit, in an interrupt.
+A program that polls `wl_platform_system_events` once a frame hears nothing while it loads.
+`wl_platform_system_watch_start(period_ms, tick, user)` starts a thread (16 KiB from `WL_TAG_STACK`,
+priority above the main thread's) that collects them every `period_ms`, and leaves: power, the
+console's or a Remote's, with `WL_EXIT_POWER_OFF`, reset with `WL_EXIT_LOADER`. Its optional `tick`
+runs on the same thread between looks, a place for work that has to go on while the program stalls
+(the motors' on and off). While it runs the program must not call `wl_platform_system_events`: the
+events go to whoever asks first. The stop screen's own wait for HOME or START stays, and its
+motors are stopped.
+
+The hooks run while the program's other threads still run; a hook that must keep another thread
+from starting new work (a write to a file) has to stop it itself, and should not wait long.
+
+**Rumble.** `wl_platform_rumble` and `wl_platform_pad_rumble` honour the console's setting for
+Wii Remote vibration (SYSCONF's `BT.MOT`, libogc's `CONF_GetPadMotorMode`; `wl_platform_rumble_enabled`):
+with it off they only stop the motor. Each call that changes nothing is dropped (every real call
+is a report sent to a Remote), and a Remote that reconnects is taken to be still. A motor is
+either on or off: for a strength in between, the caller switches it on and off by frame (a duty
+cycle), and should keep the switching to some tens a second.
 
 ## TEV programs (`tev.h`)
 
@@ -394,7 +429,7 @@ by moving libogc's arena bounds (`SYS_SetArena1Hi` / `SYS_SetArena2Lo`). Default
 | Tag | Region | Default |
 |---|---|---|
 | `WL_TAG_STACK` | MEM1 | 0.5 MiB |
-| `WL_TAG_GXFIFO` | MEM1 | 1 MiB (the FIFO is `WL_GX_FIFO_BYTES`) |
+| `WL_TAG_GXFIFO` | MEM1 | 1 MiB (the FIFO is `WL_GX_FIFO_BYTES`; with a smaller budget, the largest block it holds, `wl_gx_fifo_bytes`: libogc's examples use 256 KiB, and the GP reads its FIFO from MEM1 on the console) |
 | `WL_TAG_HOT` | MEM1 | 1 MiB |
 | `WL_TAG_AUDIO` | MEM1 | 1 MiB |
 | `WL_TAG_NET` | MEM1 | 0.5 MiB |
@@ -452,7 +487,7 @@ until the frame that used it is retired (`wl_gx_frame_index` when it is drawn,
 **GX.** Fixed function: up to 16 TEV stages, 8 textures and texture-coordinate generators per
 pass, 8 hardware lights, 10 position/normal matrix slots (`wl_gx_load_matrix_slot` uses 1..9).
 The front face is clockwise (opposite of OpenGL). Directional lights are point lights far away.
-A FIFO overflow or bad state hangs real hardware: the debug validation in `gx_wii.c` catches
+The FIFO's peak fill is sampled at each `wl_gx_end_frame` (`WlGxStats.fifo_peak`) and the log says each new peak by 64 KiB steps and at `wl_gx_shutdown`: how much of a smaller `WL_TAG_GXFIFO` budget a program uses. A FIFO overflow or bad state hangs real hardware: the debug validation in `gx_wii.c` catches
 bad enums, unaligned buffers and draws with the wrong state. TMEM is about 1 MiB: prefer CMPR
 and C4/C8 textures. `wl_gx_copy_efb_texture` is the render-to-texture path; its I4/I8 copies take
 the red channel as is (the luminance copy would map black to 16 and white to 235). Copies out of

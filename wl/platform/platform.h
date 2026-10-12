@@ -37,8 +37,38 @@ typedef enum {
     WL_EXIT_POWER_OFF
 } WlExitTarget;
 
-// Flushes and closes the log file, then leaves the program. Host stub: exit(0).
+// Leaves the program. Before anything is closed it winds the program down, once, in this order:
+// the shutdown hooks (below), newest first; the audio output stopped (wl_platform_audio_stop);
+// every motor stopped (wl_platform_input_stop_rumble). Then the log is flushed and closed, and
+// the SD card and USB drive are unmounted (their caches written out). A second caller, from
+// another thread or from a hook, waits for the first to finish leaving. Host stub: the same
+// wind-down, then exit(0).
 WL_NORETURN void wl_platform_exit(WlExitTarget target);
+
+// A function wl_platform_exit calls first, with the target it was called with: the place to let
+// a save finish, close files the program holds open for writing, or tell a peer goodbye. It runs
+// on whichever thread leaves (the system watcher's, for the reset and power buttons), while the
+// program's other threads still run, so it must not wait for the thread that is waiting to
+// leave, and should not wait long (the console powers off only when the program does). Up to
+// WL_SHUTDOWN_HOOKS; they run newest first. WL_ERR_ARG for NULL, WL_ERR_LIMIT past the last.
+typedef void (*WlShutdownFn)(WlExitTarget target, void *user);
+#define WL_SHUTDOWN_HOOKS 8u
+WlResult wl_platform_shutdown_hook(WlShutdownFn fn, void *user);
+
+// Starts the thread that serves the reset and power buttons (wl_platform_system_init is called
+// if it has not been) and so works while the program is loading or stalled: every `period_ms`
+// (1..1000) it collects wl_platform_system_events and leaves, the power button (the console's
+// or a Wii Remote's) with WL_EXIT_POWER_OFF, the reset button with WL_EXIT_LOADER. Otherwise it
+// calls `tick(tick_user)` (NULL: nothing) on its own thread, a place for work that must go on
+// in a stall, such as the motors' on and off. The thread's stack is 16 KiB from WL_TAG_STACK, so
+// wl_mem_init must have run. While it runs the program must not call wl_platform_system_events
+// itself (the events are consumed by whoever asks first). WL_ERR_STATE if already started or
+// without memory, WL_ERR_ARG for a bad period, WL_ERR_NOMEM for no stack.
+typedef void (*WlSystemTickFn)(void *user);
+WlResult wl_platform_system_watch_start(uint32_t period_ms, WlSystemTickFn tick, void *tick_user);
+// Stops the thread and waits for it (for tests and programs that handle the buttons themselves
+// again). Does nothing when it is not running; not to be called from the thread's own tick.
+void wl_platform_system_watch_stop(void);
 
 // Monotonic microseconds (time base ticks on the console, CLOCK_MONOTONIC on the host); the
 // epoch is unspecified, only differences are meaningful. Works before any other call.
@@ -172,12 +202,24 @@ uint32_t wl_platform_video_dropped_count(void);
 // the textured recipes.
 // ---------------------------------------------------------------------------------------------
 
-// 1 MiB budget minus the 32-byte heap header: the largest block a 1 MiB WL_TAG_GXFIFO heap holds.
+// 1 MiB budget minus the 32-byte heap header: the largest block a 1 MiB WL_TAG_GXFIFO heap holds,
+// the FIFO's size with the default budget. A program that gives WL_TAG_GXFIFO a smaller budget
+// gets a smaller FIFO (wl_gx_fifo_bytes): libogc's examples use 256 KiB, in MEM1, where the GP
+// reads it (a FIFO in MEM2 is not supported on the console).
 #define WL_GX_FIFO_BYTES (1024u * 1024u - 32u)
+// The least GX_Init takes.
+#define WL_GX_FIFO_MIN_BYTES (64u * 1024u)
 
-// Needs wl_mem_init (the FIFO comes from WL_TAG_GXFIFO) and wl_platform_video_init. Brings up
-// GX with the FIFO, the video mode's EFB/XFB copy setup and the default state.
-// WL_ERR_STATE if already up, WL_ERR_NOMEM if the FIFO cannot be allocated.
+// The size wl_gx_init gives the FIFO: the largest block WL_TAG_GXFIFO's heap holds (its budget
+// less the 32-byte header, a multiple of 32), at most WL_GX_FIFO_BYTES; 0 if the memory system is
+// not up, the tag is disabled or its budget is below WL_GX_FIFO_MIN_BYTES.
+uint32_t wl_gx_fifo_bytes(void);
+
+// Needs wl_mem_init (the FIFO comes from WL_TAG_GXFIFO, wl_gx_fifo_bytes long) and
+// wl_platform_video_init. Brings up GX with the FIFO, the video mode's EFB/XFB copy setup and the
+// default state. The log says the FIFO's address and size, and each new peak fill (WlGxStats.
+// fifo_peak) by 64 KiB steps. WL_ERR_STATE if already up, WL_ERR_NOMEM if the FIFO cannot be
+// allocated.
 WlResult wl_gx_init(void);
 // Drains the GPU and releases the FIFO. The next wl_gx_init starts from scratch.
 void wl_gx_shutdown(void);
@@ -805,6 +847,16 @@ void wl_platform_input_shutdown(void);
 void wl_platform_input_poll(WlRawInput *out);
 void wl_platform_rumble(uint8_t remote, bool on);
 void wl_platform_pad_rumble(uint8_t pad, bool on);
+// Whether the console's settings allow rumble (the Wii's Wii Remote vibration setting, SYSCONF's
+// "BT.MOT" through libogc's CONF_GetPadMotorMode; allowed when it cannot be read). Read at each call.
+// wl_platform_rumble and wl_platform_pad_rumble do nothing but stop the motor while it is off.
+// Host stub: true unless a test says otherwise.
+bool wl_platform_rumble_enabled(void);
+// Stops every Wii Remote's and GameCube controller's motor, whatever asked for it. Safe to call
+// from any thread, before or after wl_platform_input_init (nothing is touched while the input
+// is not started). wl_platform_exit and the stop screen call it; wl_platform_input_shutdown does
+// it too.
+void wl_platform_input_stop_rumble(void);
 
 // ---------------------------------------------------------------------------------------------
 // Audio output: one stereo PCM16 stream fed by a fill callback on the audio thread.

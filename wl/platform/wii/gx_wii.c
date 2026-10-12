@@ -86,6 +86,8 @@ static struct {
     bool validate;
     bool efb_alpha; // RGBA6_Z24: a destination alpha, at 6 bits a channel
     void *fifo;
+    uint32_t fifo_bytes;
+    uint32_t fifo_peak_logged; // the highest 64 KiB step of the peak fill the log has been told
     uint32_t fb_w, efb_h;
     uint32_t known;
 
@@ -214,13 +216,14 @@ WlResult wl_gx_init(void) {
         WL_LOG_E(TAG, "memory system not initialised");
         return WL_ERR_STATE;
     }
-    void *fifo = WL_MEM_ALLOC_GPU(WL_TAG_GXFIFO, WL_GX_FIFO_BYTES);
+    uint32_t fifo_bytes = wl_gx_fifo_bytes();
+    void *fifo = fifo_bytes != 0u ? WL_MEM_ALLOC_GPU(WL_TAG_GXFIFO, fifo_bytes) : NULL;
     if (fifo == NULL) {
-        WL_LOG_E(TAG, "cannot allocate the %u byte FIFO", (unsigned)WL_GX_FIFO_BYTES);
+        WL_LOG_E(TAG, "cannot allocate the %u byte FIFO", (unsigned)fifo_bytes);
         return WL_ERR_NOMEM;
     }
-    memset(fifo, 0, WL_GX_FIFO_BYTES);
-    wl_gpu_buffer_commit(fifo, WL_GX_FIFO_BYTES);
+    memset(fifo, 0, fifo_bytes);
+    wl_gpu_buffer_commit(fifo, fifo_bytes);
 
     bool efb_alpha = g.efb_alpha; // (set before init: kept)
     memset(&g, 0, sizeof g);
@@ -229,10 +232,11 @@ WlResult wl_gx_init(void) {
     g.validate = true;
 #endif
     g.fifo = fifo;
+    g.fifo_bytes = fifo_bytes;
     g.fb_w = vi.fb_width;
     g.efb_h = vi.efb_height;
 
-    GX_Init(fifo, WL_GX_FIFO_BYTES);
+    GX_Init(fifo, fifo_bytes);
     // The mode object is the one video init selected (a pure function of SYSCONF).
     GXRModeObj *rm = VIDEO_GetPreferredMode(NULL);
     WL_ASSERT(rm != NULL && rm->fbWidth == vi.fb_width && rm->efbHeight == vi.efb_height);
@@ -256,7 +260,7 @@ WlResult wl_gx_init(void) {
     GX_CopyDisp(wl_platform_video_back_buffer(), GX_TRUE);
     g.dirty = true;
     (void)wl_gx_sync();
-    WL_LOG_I(TAG, "up: FIFO %u bytes at %p, EFB %ux%u", (unsigned)WL_GX_FIFO_BYTES, fifo,
+    WL_LOG_I(TAG, "up: FIFO %u bytes at %p, EFB %ux%u", (unsigned)fifo_bytes, fifo,
              (unsigned)g.fb_w, (unsigned)g.efb_h);
     return WL_OK;
 }
@@ -267,6 +271,8 @@ void wl_gx_shutdown(void) {
     }
     (void)wl_gx_sync();
     wl_gx_target_shutdown();
+    WL_LOG_I(TAG, "down: FIFO peak fill %u of %u bytes, %u samples above the high-water mark",
+             (unsigned)g.stats.fifo_peak, (unsigned)g.fifo_bytes, (unsigned)g.stats.fifo_hiwater);
     g.ready = false;
     if (wl_mem_ready()) {
         wl_mem_free(g.fifo);
@@ -395,6 +401,11 @@ uint32_t wl_gx_end_frame(void) {
     u32 fill = GX_GetFifoCount(&f);
     if (fill > g.stats.fifo_peak) {
         g.stats.fifo_peak = fill;
+        // (a new peak is told to the log by 64 KiB steps: how close the FIFO comes to its size)
+        if (fill / 65536u > g.fifo_peak_logged) {
+            g.fifo_peak_logged = fill / 65536u;
+            WL_LOG_I(TAG, "FIFO fill peaked at %u of %u bytes", (unsigned)fill, (unsigned)g.fifo_bytes);
+        }
     }
     u8 overhi, underlow, ridle, cidle, brk;
     GX_GetGPStatus(&overhi, &underlow, &ridle, &cidle, &brk);
