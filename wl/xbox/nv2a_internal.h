@@ -19,7 +19,7 @@ enum {
     WL_NV2A_BATCH_INLINE_BYTES = 65536,
     WL_NV2A_BATCH_IMMEDIATE = 512,
     // push buffer words a kick may read before it is taken for a loop
-    WL_NV2A_KICK_WORD_LIMIT = 64u * 1024u * 1024u,
+    WL_NV2A_KICK_WORD_LIMIT = 4u * 1024u * 1024u,
     // instance memory's pages
     WL_NV2A_RAMIN_PAGE = 65536
 };

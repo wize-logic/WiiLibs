@@ -244,6 +244,28 @@ TEST ring_wrap_through_a_jump(void) {
     PASS();
 }
 
+TEST a_jump_to_itself_is_stopped_and_the_channel_goes_on(void) {
+    TGuest g;
+    WlNv2aStats s;
+    const WlNv2aKelvin *k;
+    uint32_t at;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    k = wl_nv2a_kelvin(g.dev);
+    at = g.put;
+    t_word(&g, at | WL_NV2A_CMD_JUMP);
+    t_kick(&g);
+    wl_nv2a_stats(g.dev, &s);
+    ASSERT_EQ(1u, s.pusher_errors);
+    ASSERT_EQ(g.put, t_get(&g));
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 42);
+    t_kick(&g);
+    ASSERT_EQ(42u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    ASSERT_EQ(g.put, t_get(&g));
+    t_destroy(&g);
+    PASS();
+}
+
 // ---- objects, semaphores, notifiers, reports ------------------------------------------------------
 
 TEST objects_bound_through_ramht_and_context_dmas(void) {
@@ -512,6 +534,7 @@ SUITE(nv2a_suite) {
     RUN_TEST(a_method_header_goes_on_across_kicks);
     RUN_TEST(jumps_calls_and_returns);
     RUN_TEST(ring_wrap_through_a_jump);
+    RUN_TEST(a_jump_to_itself_is_stopped_and_the_channel_goes_on);
     RUN_TEST(objects_bound_through_ramht_and_context_dmas);
     RUN_TEST(semaphores_written_into_guest_memory);
     RUN_TEST(notify_raises_the_pgraph_interrupt);
