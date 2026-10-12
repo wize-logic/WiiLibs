@@ -102,6 +102,13 @@ is a report sent to a Remote), and a Remote that reconnects is taken to be still
 either on or off: for a strength in between, the caller switches it on and off by frame (a duty
 cycle), and should keep the switching to some tens a second.
 
+**Sound setting.** `wl_platform_sound_mode` reports the console's mono, stereo or surround setting
+(SYSCONF's `IPL.SND`, libogc's `CONF_GetSoundMode`; `WL_SOUND_MONO`, `WL_SOUND_STEREO`,
+`WL_SOUND_SURROUND`; stereo when it cannot be read). The output plays what `fill` made, so a
+program that follows the setting does so in its mixer: for mono, the mean of the two channels in
+both (a few instructions a frame), for surround, as stereo (the console's Dolby Pro Logic is not
+encoded).
+
 ## TEV programs (`tev.h`)
 
 A `WlTevProgram` describes the GX texture environment as plain data, so a translator (from the

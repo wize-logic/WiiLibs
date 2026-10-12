@@ -16,6 +16,7 @@ typedef struct {
     unsigned rumble_calls;      // WPAD_Rumble calls, all channels
     unsigned motor_calls;       // PAD_ControlMotor calls, all channels
     s32 motor_mode;     // what CONF_GetPadMotorMode reports: 1 on, 0 off, negative unreadable
+    s32 sound_mode;     // what CONF_GetSoundMode reports: 0 mono, 1 stereo, 2 surround, negative unreadable
     unsigned data_format_calls; // WPAD_SetDataFormat on one channel (a new connection)
 } InputStub;
 

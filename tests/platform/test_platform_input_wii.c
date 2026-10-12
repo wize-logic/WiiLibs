@@ -217,6 +217,24 @@ TEST rumble_off_in_the_console_settings_is_none(void) {
     PASS();
 }
 
+TEST the_consoles_sound_setting_is_mono_stereo_or_surround(void) {
+    reset();
+    g_input_stub.sound_mode = 0;
+    ASSERT_EQ(WL_SOUND_MONO, wl_platform_sound_mode());
+    g_input_stub.sound_mode = 1;
+    ASSERT_EQ(WL_SOUND_STEREO, wl_platform_sound_mode());
+    g_input_stub.sound_mode = 2;
+    ASSERT_EQ(WL_SOUND_SURROUND, wl_platform_sound_mode());
+    // read at each call; a setting that cannot be read, or is not one of these, is stereo
+    g_input_stub.sound_mode = 0;
+    ASSERT_EQ(WL_SOUND_MONO, wl_platform_sound_mode());
+    g_input_stub.sound_mode = -1;
+    ASSERT_EQ(WL_SOUND_STEREO, wl_platform_sound_mode());
+    g_input_stub.sound_mode = 7;
+    ASSERT_EQ(WL_SOUND_STEREO, wl_platform_sound_mode());
+    PASS();
+}
+
 TEST only_a_change_is_sent_to_a_motor(void) {
     reset();
     g_input_stub.motor_mode = 1;
@@ -285,6 +303,7 @@ SUITE(input_wii_suite) {
     RUN_TEST(remote_that_is_gone_is_gone_at_once);
     RUN_TEST(rumble_reaches_the_devices);
     RUN_TEST(rumble_off_in_the_console_settings_is_none);
+    RUN_TEST(the_consoles_sound_setting_is_mono_stereo_or_surround);
     RUN_TEST(only_a_change_is_sent_to_a_motor);
     RUN_TEST(a_remote_that_comes_back_is_told_again);
     RUN_TEST(stopping_every_motor_stops_every_motor);

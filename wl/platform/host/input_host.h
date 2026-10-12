@@ -11,3 +11,5 @@ bool wl_host_remote_rumble(uint8_t remote);
 bool wl_host_pad_rumble(uint8_t pad);
 // Whether the console's rumble setting allows rumble (wl_platform_rumble_enabled); true at start.
 void wl_host_rumble_allowed(bool allowed);
+// What the console's sound setting is (wl_platform_sound_mode); stereo at start.
+void wl_host_sound_mode(WlSoundMode mode);

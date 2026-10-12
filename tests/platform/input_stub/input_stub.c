@@ -72,6 +72,10 @@ s32 CONF_GetPadMotorMode(void) {
     return g_input_stub.motor_mode;
 }
 
+s32 CONF_GetSoundMode(void) {
+    return g_input_stub.sound_mode;
+}
+
 int32_t KEYBOARD_Init(keyPressCallback keypress_cb) {
     (void)keypress_cb;
     return -1; // no USB: input_wii.c carries on without a keyboard
