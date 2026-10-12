@@ -184,7 +184,7 @@ def gdb_backtrace(process) -> str:
 
 
 def dolphin_ini(sd_image: str, sd_folder: str, dump_frames: bool, gdb_port: int = 0, video: str = "",
-                panics: bool = False, single_core: bool = False) -> str:
+                panics: bool = False, single_core: bool = False, mmu: bool = False) -> str:
     lines = ["[Interface]", "ConfirmStop = False", f"UsePanicHandlers = {panics}", "ShowLogWindow = False",
              "[Analytics]", "PermissionAsked = True", "Enabled = False",
              # (the console's own clock: a person's global Dolphin.ini may overclock the CPU, which
@@ -193,6 +193,9 @@ def dolphin_ini(sd_image: str, sd_folder: str, dump_frames: bool, gdb_port: int 
              "OverclockEnable = False", "Overclock = 1.0",
              *([f"GFXBackend = {video}"] if video else []),
              *(["CPUThread = False"] if single_core else []),
+             # (full MMU emulation: page tables and the DSI a miss raises, which a program that maps
+             # memory through the page table and handles its faults needs; Dolphin skips it for speed)
+             *(["MMU = True"] if mmu else []),
              f"WiiSDCardEnableFolderSync = {'True' if sd_folder else 'False'}",
              "[General]", f"WiiSDCardPath = {sd_image}"]
     if gdb_port:
@@ -399,6 +402,8 @@ def main() -> int:
     parser.add_argument("--screenshot", type=Path, help="save the render window here (PNG)")
     parser.add_argument("--single-core", action="store_true",
                         help="the GPU emulated on the CPU's thread (slower; no CPU/GPU races)")
+    parser.add_argument("--mmu", action="store_true",
+                        help="Dolphin's full MMU emulation (page tables, and a DSI on a miss)")
     parser.add_argument("--panics", action="store_true",
                         help="show Dolphin's panic messages (they stop the emulation until answered)")
     parser.add_argument("--wii-aspect", choices=("4:3", "16:9"), default="4:3",
@@ -440,7 +445,7 @@ def main() -> int:
     (user / "Config" / "Dolphin.ini").write_text(dolphin_ini(to_windows(work / "sd.raw"), sd_folder,
                                                               bool(args.dump_frames),
                                                               GDB_PORT if args.backtrace else 0, args.video,
-                                                              args.panics, args.single_core))
+                                                              args.panics, args.single_core, args.mmu))
     (user / "Config" / "GFX.ini").write_text(gfx_ini(bool(args.dump_frames), args.wii_aspect == "16:9"))
     log = user / "Logs" / "dolphin.log"
     if log.exists():
