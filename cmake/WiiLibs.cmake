@@ -154,3 +154,54 @@ function(wl_add_hbc_package target)
     endif()
     set_target_properties(${target}_hbc PROPERTIES HBC_ZIP "${A_OUTPUT}")
 endfunction()
+
+# wl_add_fma_check(<target> [LINKED] [OBJDUMP <objdump>] [EXCLUDE <pattern>...]
+#                  [EXCLUDE_FUNCTION <pattern>...] [INCLUDE <pattern>...]
+#                  [INCLUDE_FUNCTION <pattern>...] [DISASSEMBLER_OPTIONS <options>])
+# Fails <target>'s build if its code has a fused multiply-add (tools/fma_check.py), as a step after
+# it links: for a program whose results must match another machine's bit for bit (build it with
+# wl_target_defaults(... DETERMINISTIC), which compiles with -ffp-contract=off; the check shows
+# where a compiler fused one regardless). It reads the target's own object files; with LINKED, the
+# linked file instead (the ELF, which has the libraries' code too: EXCLUDE_FUNCTION and
+# INCLUDE_FUNCTION choose among their functions). The patterns are the tool's (shell patterns on an
+# object's path or an archive member, and on function names). OBJDUMP defaults to CMAKE_OBJDUMP when
+# cross compiling, else to the tool's own search (devkitPPC's, then PowerPC Linux's).
+function(wl_add_fma_check target)
+    cmake_parse_arguments(A "LINKED" "OBJDUMP;DISASSEMBLER_OPTIONS"
+        "EXCLUDE;EXCLUDE_FUNCTION;INCLUDE;INCLUDE_FUNCTION" ${ARGN})
+    if(A_UNPARSED_ARGUMENTS)
+        message(FATAL_ERROR "wl_add_fma_check(${target}): unexpected arguments ${A_UNPARSED_ARGUMENTS}")
+    endif()
+    if(NOT TARGET ${target})
+        message(FATAL_ERROR "wl_add_fma_check(${target}): not a target")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    # (found from this file, not PROJECT_SOURCE_DIR, which is the caller's when WiiLibs is a
+    # subdirectory of another project)
+    get_filename_component(tool "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../tools/fma_check.py" ABSOLUTE)
+    set(cmd ${Python3_EXECUTABLE} ${tool} --quiet)
+    if(A_OBJDUMP)
+        list(APPEND cmd --objdump ${A_OBJDUMP})
+    elseif(CMAKE_OBJDUMP AND NOT WL_PLATFORM STREQUAL "host")
+        list(APPEND cmd --objdump ${CMAKE_OBJDUMP})
+    endif()
+    if(DEFINED A_DISASSEMBLER_OPTIONS)
+        list(APPEND cmd --disassembler-options "${A_DISASSEMBLER_OPTIONS}")
+    endif()
+    foreach(kind EXCLUDE EXCLUDE_FUNCTION INCLUDE INCLUDE_FUNCTION)
+        string(TOLOWER "${kind}" lower)
+        string(REPLACE "_" "-" flag "${lower}")
+        foreach(pattern IN LISTS A_${kind})
+            list(APPEND cmd --${flag} "${pattern}")
+        endforeach()
+    endforeach()
+    if(A_LINKED)
+        list(APPEND cmd $<TARGET_FILE:${target}>)
+    else()
+        list(APPEND cmd $<TARGET_OBJECTS:${target}>)
+    endif()
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${cmd}
+        COMMENT "Checking ${target} for fused multiply-adds"
+        COMMAND_EXPAND_LISTS VERBATIM)
+endfunction()
