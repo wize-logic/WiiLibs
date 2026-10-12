@@ -16,8 +16,12 @@ wl_target_defaults(wl_xbox_gx DETERMINISTIC)
 target_link_libraries(wl_xbox_gx PUBLIC wl_xbox wl_platform)
 add_library(WiiLibs::xbox_gx ALIAS wl_xbox_gx)
 
-# the vertex program compiler, a host tool (it includes vsh.c for its decoder's internals)
+# the vertex program compiler, a host tool (it includes vsh.c for its decoder's internals), and the
+# NV2A capture's replay (tools/xbox_nv2a_replay.c)
 if(NOT WL_PLATFORM STREQUAL "wii")
+    add_executable(xbox_nv2a_replay ${PROJECT_SOURCE_DIR}/tools/xbox_nv2a_replay.c)
+    wl_target_defaults(xbox_nv2a_replay)
+    target_link_libraries(xbox_nv2a_replay PRIVATE wl_xbox wl_gxtex)
     add_executable(xbox_vsh_codegen ${PROJECT_SOURCE_DIR}/tools/xbox_vsh_codegen.c)
     wl_target_defaults(xbox_vsh_codegen DETERMINISTIC)
     target_link_libraries(xbox_vsh_codegen PRIVATE wl_gfx m)

@@ -423,6 +423,9 @@ WlResult wl_nv2a_replay(const uint8_t *data, size_t bytes, const WlNv2aBackend *
         free(memory.bytes);
         return WL_ERR_NOMEM;
     }
+    if (hooks != NULL && hooks->created != NULL) {
+        hooks->created(hooks->user, dev);
+    }
     at = 16;
     while (at < bytes && !ended && result == WL_OK) {
         char tag = (char)data[at++];

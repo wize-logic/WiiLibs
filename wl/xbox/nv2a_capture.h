@@ -42,7 +42,10 @@ bool wl_nv2a_capture_active(const WlNv2a *dev);
 // ---- replay -----------------------------------------------------------------------------------
 typedef struct WlNv2aReplayHooks {
     void *user;
-    // after each flip record, and at the end: the model with its state then
+    // the model made, before the first record (a backend that reads guest memory attaches to it
+    // here); may be NULL
+    void (*created)(void *user, WlNv2a *dev);
+    // after each flip record: the model with its state then
     void (*flip)(void *user, WlNv2a *dev, uint32_t flip_index);
     // each MMIO write record before it runs (may be NULL)
     void (*mmio)(void *user, uint32_t offset, uint32_t value, unsigned size);

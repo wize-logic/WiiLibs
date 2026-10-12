@@ -3,11 +3,14 @@
 // frame's clear; a textured quad through the combiners' TEV program (texture times colour); depth
 // tested quads; a two-stage combiner program with per-stage constants; alpha blending; a triangle
 // through a program that divides by w; a frame handed over when the title finishes it.
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "greatest.h"
 #include "nv2a_test_util.h"
 #include "nv2a_frames.h"
+#include "wl/xbox/nv2a_capture.h"
 #include "wl/xbox/nv2a_raster.h"
 
 static WlNv2aRaster *g_raster;
@@ -187,12 +190,98 @@ TEST perspective_triangle(void) {
     PASS();
 }
 
+typedef struct Sink {
+    uint8_t *data;
+    size_t size, capacity;
+} Sink;
+
+static WlResult sink_write(void *user, const void *data, uint32_t bytes) {
+    Sink *s = user;
+    if (s->size + bytes > s->capacity) {
+        size_t capacity = (s->size + bytes) * 2;
+        uint8_t *grown = realloc(s->data, capacity);
+        if (grown == NULL) {
+            return WL_ERR_NOMEM;
+        }
+        s->data = grown;
+        s->capacity = capacity;
+    }
+    memcpy(s->data + s->size, data, bytes);
+    s->size += bytes;
+    return WL_OK;
+}
+
+static WlNv2aRaster *g_replayed;
+
+static void replay_created(void *user, WlNv2a *dev) {
+    (void)user;
+    wl_nv2a_raster_attach(g_replayed, dev);
+}
+
+// A frame drawn live with a capture running, then the capture replayed through a fresh model and
+// rasterizer: the same pixels. With WL_NV2A_CAPTURE_OUT set, the capture is written there too (the
+// replay tool's test reads it).
+TEST capture_replays_to_the_same_pixels(void) {
+    TGuest g;
+    Sink s;
+    WlNv2aCaptureSink sink;
+    WlNv2aReplayHooks hooks;
+    WlNv2aReplayInfo info;
+    WlNv2aBackend backend;
+    const uint8_t *live, *replayed;
+    uint32_t w, h, rw, rh;
+    const char *out = getenv("WL_NV2A_CAPTURE_OUT");
+
+    memset(&s, 0, sizeof s);
+    ASSERT(raster_device(&g) != NULL);
+    f_program(&g, 0, f_screen_program, 3);
+    t_kick(&g);
+    sink.user = &s;
+    sink.write = sink_write;
+    ASSERT_EQ(WL_OK, wl_nv2a_capture_begin(g.dev, &sink));
+    f_clear(&g, 0xFF102030u);
+    f_quad(&g, 10, 10, 300, 200, 0.5f, 0xFF40C0FFu);
+    f_combiner_two_stages(&g, 0xFF80FF80u, 0xFF200000u);
+    f_quad(&g, 200, 100, 500, 400, 0.4f, 0xFFFFFFFFu);
+    t_m1(&g, WL_NV2A_K_FLIP_INCREMENT_WRITE, 0);
+    t_kick(&g);
+    t_mmio(&g, WL_NV2A_PCRTC_START, F_COLOR);
+    wl_nv2a_capture_end(g.dev);
+    live = wl_nv2a_raster_surface(g_raster, F_COLOR, &w, &h);
+    ASSERT(live != NULL);
+
+    g_replayed = wl_nv2a_raster_create(NULL);
+    ASSERT(g_replayed != NULL);
+    wl_nv2a_raster_backend(g_replayed, &backend);
+    memset(&hooks, 0, sizeof hooks);
+    hooks.created = replay_created;
+    ASSERT_EQ(WL_OK, wl_nv2a_replay(s.data, s.size, &backend, &hooks, &info));
+    replayed = wl_nv2a_raster_surface(g_replayed, F_COLOR, &rw, &rh);
+    ASSERT(replayed != NULL);
+    ASSERT_EQ(w, rw);
+    ASSERT_EQ(h, rh);
+    ASSERT_EQ(0, memcmp(live, replayed, (size_t)w * h * 4u));
+    ASSERT_EQ(2u, info.stats.draws);
+    ASSERT_EQ(1u, info.flips);
+    if (out != NULL) {
+        FILE *f = fopen(out, "wb");
+        ASSERT(f != NULL);
+        ASSERT_EQ(s.size, fwrite(s.data, 1, s.size, f));
+        fclose(f);
+    }
+    wl_nv2a_raster_destroy(g_replayed);
+    free(s.data);
+    raster_done(&g);
+    PASS();
+}
+
 SUITE(raster_suite) {
     RUN_TEST(textured_quad_through_the_combiners);
     RUN_TEST(depth_test_keeps_the_nearer);
     RUN_TEST(two_combiner_stages_with_their_constants);
     RUN_TEST(alpha_blending);
     RUN_TEST(perspective_triangle);
+    RUN_TEST(capture_replays_to_the_same_pixels);
 }
 
 GREATEST_MAIN_DEFS();
