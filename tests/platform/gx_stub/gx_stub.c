@@ -140,6 +140,9 @@ void GX_SetTexCopySrc(u16 left, u16 top, u16 w, u16 h) { gx_stub_logf("GX_SetTex
 void GX_SetTexCopyDst(u16 w, u16 h, u32 format, u8 mipmap) { gx_stub_logf("GX_SetTexCopyDst %u %u %#x %u", w, h, (unsigned)format, mipmap); }
 void GX_CopyTex(void *dest, u8 clear) { gx_stub_logf("GX_CopyTex %s %u", gx_stub_name(dest), clear); }
 void GX_PixModeSync(void) { gx_stub_logf("GX_PixModeSync"); }
+void GX_SetCopyClear(GXColor color, u32 zvalue) {
+    gx_stub_logf("GX_SetCopyClear %u %u %u %u 0x%X", color.r, color.g, color.b, color.a, (unsigned)zvalue);
+}
 void GX_InvalidateTexAll(void) { gx_stub_logf("GX_InvalidateTexAll"); }
 void GX_SetScissor(u32 x, u32 y, u32 w, u32 h) { gx_stub_logf("GX_SetScissor %u %u %u %u", (unsigned)x, (unsigned)y, (unsigned)w, (unsigned)h); }
 void GX_LoadProjectionMtx(Mtx44 m, u8 type) {

@@ -24,7 +24,24 @@ WlResult wl_present_init(WlPresentQueue *q, uint32_t count, uint32_t interval, i
 }
 
 void wl_present_set_interval(WlPresentQueue *q, uint32_t interval) {
-    q->interval = (uint8_t)(interval < 1u ? 1u : interval > MAX_INTERVAL ? MAX_INTERVAL : interval);
+    wl_present_set_ratio(q, interval, 1u);
+}
+
+void wl_present_set_ratio(WlPresentQueue *q, uint32_t num, uint32_t den) {
+    den = den < 1u ? 1u : den > MAX_INTERVAL ? MAX_INTERVAL : den;
+    // (at least one retrace a frame, at most MAX_INTERVAL)
+    num = num < den ? den : num > MAX_INTERVAL * den ? MAX_INTERVAL * den : num;
+    uint32_t a = num, b = den;
+    while (b != 0u) {
+        uint32_t t = a % b;
+        a = b;
+        b = t;
+    }
+    q->rate_num = (uint8_t)(num / a);
+    q->rate_den = (uint8_t)(den / a);
+    q->interval = (uint8_t)((q->rate_num + q->rate_den - 1u) / q->rate_den);
+    // (counted from the frame on the screen, as a change of interval always was)
+    q->due = (uint64_t)q->last_latch * q->rate_den + q->rate_num;
 }
 
 int wl_present_acquire(WlPresentQueue *q) {
@@ -91,7 +108,7 @@ int wl_present_retrace_begin(WlPresentQueue *q) {
     if (q->committed >= 0 || q->queued == 0) {
         return -1;
     }
-    if (q->latched_any && q->retraces - q->last_latch < q->interval) {
+    if (q->latched_any && (uint64_t)q->retraces * q->rate_den < q->due) {
         return -1;
     }
     uint32_t i = q->queue[0];
@@ -122,6 +139,13 @@ void wl_present_retrace_end(WlPresentQueue *q, int current) {
     q->shown = q->committed;
     q->committed = -1;
     q->last_latch = q->retraces;
+    // (the next frame is due `rate_num / rate_den` retraces after this one's due time; a frame a whole
+    // retrace or more late starts from its own retrace instead, so that lateness is not made up)
+    uint64_t now = (uint64_t)q->retraces * q->rate_den;
+    if (!q->latched_any || now >= q->due + q->rate_den) {
+        q->due = now;
+    }
+    q->due += q->rate_num;
     q->latched_any = true;
     q->latched++;
 }

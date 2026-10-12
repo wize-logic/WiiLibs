@@ -11,7 +11,8 @@ typedef enum {
     WL_HOST_TARGET_COPY_END,       // ...and ends (the filter back on, the texture cache invalidated)
     WL_HOST_TARGET_SCISSOR,        // (0, 0, w, h)
     WL_HOST_TARGET_RESTORE,        // the parked colour and depth over the EFB: colour, depth, w x h
-    WL_HOST_TARGET_CLEAR           // a clear quad
+    WL_HOST_TARGET_CLEAR,          // a clear quad
+    WL_HOST_TARGET_SQUEEZE         // the finished back buffer narrowed: colour block, x, w, back buffer's size
 } WlHostTargetOpKind;
 
 typedef struct {
@@ -23,7 +24,7 @@ typedef struct {
     uint32_t back_w, back_h; // a CLEAR's back buffer
     uint32_t rgba;          // a CLEAR's colour
     float z;                // a CLEAR's depth
-    const void *dst;        // a COPY's destination; a RESTORE's colour
+    const void *dst;        // a COPY's destination; a RESTORE's and a SQUEEZE's colour block
     const void *depth_src;  // a RESTORE's depth
 } WlHostTargetOp;
 

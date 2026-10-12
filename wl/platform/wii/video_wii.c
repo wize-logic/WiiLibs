@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-// Wii video and frame pacing: preferred mode from the console configuration, two or three XFBs
-// in a display queue (present.h) that the retrace interrupt advances, so presenting never waits
-// for the display; frame / late-frame counters.
+// Wii video and frame pacing: preferred mode from the console configuration (video_mode.h chooses,
+// libogc's VIDEO_GetPreferredMode is the object that gets used and is checked against it), two or
+// three XFBs in a display queue (present.h) that the retrace interrupt advances, so presenting
+// never waits for the display; frame / late-frame counters.
 // Only this directory may include <ogc/*.h>.
 #include <ogc/cache.h>
 #include <ogc/conf.h>
@@ -10,11 +11,13 @@
 #include <ogc/system.h>
 #include <ogc/video.h>
 #include <ogc/video_types.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "wl/platform/platform.h"
 #include "wl/platform/hwcount.h"
 #include "wl/platform/present.h"
+#include "wl/platform/video_mode.h"
 
 #define TAG "VIDEO"
 // Retraces to wait for a free XFB before deciding the GPU will not finish (a quarter second at 60 Hz)
@@ -23,7 +26,11 @@
 static GXRModeObj *g_rmode;
 static void *g_xfb[WL_PRESENT_MAX_BUFFERS];
 static uint32_t g_buffers = 2;  // wl_platform_video_set_buffers, before init
-static uint32_t g_interval = 1; // wl_platform_video_set_interval
+static uint32_t g_num = 1, g_den = 1; // wl_platform_video_set_interval / set_rate: retraces a frame, as a ratio
+static uint32_t g_rate_hz;            // wl_platform_video_set_rate (0: every retrace, or an interval's)
+static WlWidescreen g_widescreen = WL_WIDESCREEN_PILLARBOX;
+static WlVideoChoice g_choice;        // what init chose
+static char g_description[200];
 static WlPresentQueue g_q;      // changed by the retrace interrupt: read and written with it disabled
 static bool g_inited;
 static volatile uint32_t g_retraces;
@@ -67,36 +74,86 @@ static bool mode_is_pal50(const GXRModeObj *m) {
     return (m->viTVMode >> 2) == VI_PAL;
 }
 
-static void fill_info(const GXRModeObj *m, bool widescreen, WlVideoInfo *out) {
-    out->fb_width = m->fbWidth;
-    out->efb_height = m->efbHeight;
-    out->xfb_height = m->xfbHeight;
-    out->pal = mode_is_pal50(m);
-    out->refresh_mhz = out->pal ? 50000u : 59940u;
-    out->progressive = (m->viTVMode & VI_NON_INTERLACE) != 0 && m->xfbMode == VI_XFBMODE_SF;
-    out->widescreen = widescreen;
+static bool mode_is_progressive(const GXRModeObj *m) {
+    return (m->viTVMode & 3) == VI_PROGRESSIVE;
+}
+
+// What the console is set to (SYSCONF through libogc, and the cable the interface sees).
+static void read_settings(WlVideoSettings *s) {
+    memset(s, 0, sizeof *s);
+    s32 video = CONF_GetVideo();
+    s->tv = video == CONF_VIDEO_PAL ? WL_TV_PAL : video == CONF_VIDEO_MPAL ? WL_TV_MPAL : WL_TV_NTSC;
+    s->progressive_setting = CONF_GetProgressiveScan() > 0;
+    s->component_cable = VIDEO_HaveComponentCable() != 0;
+    s->eurgb60_setting = CONF_GetEuRGB60() > 0;
+    s->wide_setting = CONF_GetAspectRatio() == CONF_ASPECT_16_9;
+    s8 offset = 0;
+    s->display_offset_h = CONF_GetDisplayOffsetH(&offset) == 0 ? (int)offset : 0;
+    s->widescreen = g_widescreen;
+}
+
+static void fill_info_from(const WlVideoChoice *c, WlVideoInfo *out) {
+    out->fb_width = c->fb_width;
+    out->efb_height = c->efb_height;
+    out->xfb_height = c->xfb_height;
+    out->pal = c->system == WL_VIDEO_PAL50;
+    out->refresh_mhz = (uint16_t)c->refresh_mhz;
+    out->progressive = c->progressive;
+    out->widescreen = c->wide;
+    out->pillarbox = c->pillarbox;
+    out->picture_x = c->picture_x;
+    out->picture_width = c->picture_width;
+    out->offset_h = c->offset_h;
+}
+
+// The ratio of retraces to a frame for the rate asked (an interval's whole number when none is).
+static void apply_ratio(void) {
+    uint32_t num = g_num, den = g_den;
+    if (g_rate_hz != 0u && g_inited) {
+        wl_video_rate_ratio(g_choice.refresh_mhz, g_rate_hz, &num, &den);
+    }
+    wl_present_set_ratio(&g_q, num, den);
 }
 
 WlResult wl_platform_video_init(void) {
     if (g_inited) {
         return WL_OK;
     }
+    CONF_Init(); // idempotent; VIDEO_Init reads the display position, and VIDEO_GetPreferredMode the rest, through it
     VIDEO_Init();
-    CONF_Init(); // idempotent; VIDEO_GetPreferredMode reads SYSCONF through it
     // libogc applies SYSCONF here: progressive scan only with a component cable, EuRGB60 for
-    // PAL consoles with it enabled, 50 Hz 576i otherwise, 480i for NTSC.
+    // PAL consoles with it enabled, 50 Hz 576i otherwise, 480i for NTSC. wl_video_choose says the
+    // same from the same settings (a test compares them); the mode object is libogc's own.
     g_rmode = VIDEO_GetPreferredMode(NULL);
     if (g_rmode == NULL) {
         return WL_ERR_UNSUPPORTED;
     }
-    // The preferred modes scan 640 pixels out of a 720-pixel line, which leaves black bars at the
-    // sides of a 16:9 TV. There the VI widens the same 640-wide framebuffer to 704 (centred), so
-    // the picture fills the screen; rendering is unchanged. The mode object is libogc's own static
-    // one, so later VIDEO_GetPreferredMode calls (GX setup) see the same values.
-    if (CONF_GetAspectRatio() == CONF_ASPECT_16_9) {
-        g_rmode->viWidth = 704;
-        g_rmode->viXOrigin = (VI_MAX_WIDTH_NTSC - 704) / 2;
+    WlVideoSettings settings;
+    read_settings(&settings);
+    wl_video_choose(&settings, &g_choice);
+    if (mode_is_progressive(g_rmode) != g_choice.progressive || mode_is_pal50(g_rmode) != (g_choice.system == WL_VIDEO_PAL50) ||
+        g_rmode->xfbHeight != g_choice.xfb_height || g_rmode->efbHeight != g_choice.efb_height ||
+        g_rmode->fbWidth != g_choice.fb_width) {
+        WL_LOG_W(TAG, "libogc's mode (%ux%u EFB %u, %s) differs from the settings' (%ux%u EFB %u, %s): libogc's is used",
+                 (unsigned)g_rmode->fbWidth, (unsigned)g_rmode->xfbHeight, (unsigned)g_rmode->efbHeight,
+                 mode_is_progressive(g_rmode) ? "progressive" : "interlaced", (unsigned)g_choice.fb_width,
+                 (unsigned)g_choice.xfb_height, (unsigned)g_choice.efb_height, g_choice.progressive ? "progressive" : "interlaced");
+        g_choice.fb_width = g_rmode->fbWidth;
+        g_choice.efb_height = g_rmode->efbHeight;
+        g_choice.xfb_height = g_rmode->xfbHeight;
+        g_choice.progressive = mode_is_progressive(g_rmode);
+        g_choice.pillarbox = g_choice.pillarbox && g_rmode->fbWidth == 640;
     }
+    // The preferred modes scan 640 pixels out of a 720-pixel line, which leaves black bars at the
+    // sides of a 16:9 TV. There the interface widens the same 640-wide framebuffer to 704 pixels
+    // (centred), and the picture is either stretched with it or narrowed into the middle three
+    // quarters of the framebuffer first (wl_gx_end_frame), so that it comes out 4:3. libogc adds the
+    // console's display position to the origin itself. The mode object is libogc's own static
+    // one, so later VIDEO_GetPreferredMode calls (GX setup) see the same values.
+    g_rmode->viWidth = g_choice.vi_width;
+    g_rmode->viXOrigin = g_choice.vi_x_origin;
+    wl_video_describe(&g_choice, g_description, sizeof g_description);
+    WL_LOG_I(TAG, "%s", g_description);
     for (uint32_t i = 0; i < g_buffers; i++) {
         void *p = SYS_AllocateFramebuffer(g_rmode);
         if (p == NULL) {
@@ -121,9 +178,10 @@ WlResult wl_platform_video_init(void) {
         VIDEO_WaitVSync(); // the first retrace after a mode change is not yet the new mode
     }
     u32 level = IRQ_Disable();
-    (void)wl_present_init(&g_q, g_buffers, g_interval, 0); // XFB 0 on the screen
-    g_last_present = g_retraces;
+    (void)wl_present_init(&g_q, g_buffers, 1, 0); // XFB 0 on the screen
     g_inited = true;
+    apply_ratio();
+    g_last_present = g_retraces;
     IRQ_Restore(level);
     return WL_OK;
 }
@@ -140,32 +198,54 @@ WlResult wl_platform_video_set_buffers(uint32_t count) {
 }
 
 void wl_platform_video_set_interval(uint32_t retraces) {
-    g_interval = retraces;
+    g_num = retraces < 1u ? 1u : retraces;
+    g_den = 1u;
+    g_rate_hz = 0;
     if (g_inited) {
         u32 level = IRQ_Disable();
-        wl_present_set_interval(&g_q, retraces);
+        apply_ratio();
         IRQ_Restore(level);
     }
+}
+
+void wl_platform_video_set_rate(uint32_t hz) {
+    g_rate_hz = hz;
+    if (g_inited) {
+        u32 level = IRQ_Disable();
+        apply_ratio();
+        IRQ_Restore(level);
+    }
+}
+
+WlResult wl_platform_video_set_widescreen(WlWidescreen mode) {
+    if (mode != WL_WIDESCREEN_PILLARBOX && mode != WL_WIDESCREEN_STRETCH) {
+        return WL_ERR_ARG;
+    }
+    if (g_inited) {
+        return mode == g_widescreen ? WL_OK : WL_ERR_STATE;
+    }
+    g_widescreen = mode;
+    return WL_OK;
 }
 
 void wl_platform_video_info(WlVideoInfo *out) {
     memset(out, 0, sizeof *out);
     if (g_rmode != NULL) {
-        fill_info(g_rmode, CONF_GetAspectRatio() == CONF_ASPECT_16_9, out);
+        fill_info_from(&g_choice, out);
     }
+}
+
+void wl_platform_video_describe(char *out, size_t size) {
+    snprintf(out, size, "%s", g_inited ? g_description : "");
 }
 
 void wl_platform_video_expected(WlVideoInfo *out) {
     memset(out, 0, sizeof *out);
-    s32 video = CONF_GetVideo();
-    bool prog = CONF_GetProgressiveScan() > 0 && VIDEO_HaveComponentCable();
-    bool pal = (video == CONF_VIDEO_PAL) && CONF_GetEuRGB60() <= 0;
-    out->fb_width = 640;
-    out->pal = pal;
-    out->efb_height = pal ? 528 : 480;
-    out->refresh_mhz = pal ? 50000u : 59940u;
-    out->progressive = prog;
-    out->widescreen = CONF_GetAspectRatio() == CONF_ASPECT_16_9;
+    WlVideoSettings settings;
+    WlVideoChoice choice;
+    read_settings(&settings);
+    wl_video_choose(&settings, &choice);
+    fill_info_from(&choice, out);
 }
 
 void *wl_platform_video_back_buffer(void) {

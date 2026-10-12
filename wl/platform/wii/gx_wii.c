@@ -90,6 +90,7 @@ static struct {
     uint32_t fifo_bytes;
     uint32_t fifo_peak_logged; // the highest 64 KiB step of the peak fill the log has been told
     uint32_t fb_w, efb_h;
+    uint32_t pillar_x, pillar_w; // the picture narrowed into these columns by end_frame (0: not)
     WlGxOverlayFn overlay;
     void *overlay_user;
     uint32_t known;
@@ -239,6 +240,10 @@ WlResult wl_gx_init(void) {
     wl_hwcount_set_fifo_size(fifo_bytes);
     g.fb_w = vi.fb_width;
     g.efb_h = vi.efb_height;
+    if (vi.pillarbox && vi.picture_width != 0u && vi.picture_width < vi.fb_width) {
+        g.pillar_x = vi.picture_x;
+        g.pillar_w = vi.picture_width;
+    }
 
     GX_Init(fifo, fifo_bytes);
     // The mode object is the one video init selected (a pure function of SYSCONF).
@@ -418,6 +423,11 @@ uint32_t wl_gx_end_frame(void) {
         wl_gx_reset_state();
         g.overlay(g.overlay_user, g.fb_w, g.efb_h);
         wl_gx_reset_state();
+    }
+    if (g.pillar_w != 0u) {
+        // (a 4:3 picture on a 16:9 screen: narrowed into the middle three quarters, with the bars black; the
+        // video interface then widens the framebuffer to the screen)
+        (void)wl_gx_target_squeeze(g.pillar_x, g.pillar_w);
     }
     // FIFO health sample before the GPU drains it.
     GXFifoObj f;

@@ -225,6 +225,83 @@ TEST a_buffer_scanned_behind_the_queues_back_is_avoided(void) {
     PASS();
 }
 
+// Frames always ready, 3 buffers: the retraces each frame stays for a ratio of retraces to a frame.
+static void gaps_for(uint32_t num, uint32_t den, uint32_t frames, uint32_t *gaps, uint32_t *late) {
+    Sim v;
+    sim_init(&v, 3, 1);
+    wl_present_set_ratio(&v.q, num, den);
+    uint32_t shown = 0, last = 0, n = 0, frame = 0;
+    for (uint32_t r = 0; n < frames && r < frames * 20u; r++) {
+        int b;
+        while ((b = sim_draw(&v, frame + 1)) >= 0) {
+            frame++;
+            v.gpu_done[b] = true;
+            sim_present(&v);
+        }
+        sim_retrace(&v);
+        if (v.shown_frame != shown) {
+            shown = v.shown_frame;
+            if (n != 0u) {
+                gaps[n - 1u] = v.q.retraces - last;
+            }
+            last = v.q.retraces;
+            n++;
+        }
+    }
+    *late = v.q.late;
+}
+
+TEST thirty_frames_on_fifty_hertz_alternate_two_retraces_and_one(void) {
+    uint32_t gaps[200], late;
+    gaps_for(5, 3, 100, gaps, &late);
+    uint32_t total = 0, twos = 0, ones = 0;
+    for (uint32_t i = 0; i < 99; i++) {
+        ASSERT(gaps[i] == 1u || gaps[i] == 2u);
+        twos += gaps[i] == 2u;
+        ones += gaps[i] == 1u;
+        total += gaps[i];
+    }
+    ASSERT_EQ(0u, late);
+    ASSERT_EQ(2u * ones, twos); // (two retraces twice to one retrace once)
+    // 99 gaps: 33 patterns of 5 retraces, 3 frames: 165 retraces
+    ASSERT_EQ(165u, total);
+    // the pattern repeats exactly
+    for (uint32_t i = 3; i < 99; i++) {
+        ASSERT_EQ(gaps[i - 3], gaps[i]);
+    }
+    PASS();
+}
+
+TEST a_ratio_of_whole_retraces_is_an_interval(void) {
+    uint32_t a[60], b[60], late_a, late_b;
+    gaps_for(2, 1, 50, a, &late_a);
+    gaps_for(6, 3, 50, b, &late_b); // (reduced to 2/1)
+    for (uint32_t i = 0; i < 49; i++) {
+        ASSERT_EQ(2u, a[i]);
+        ASSERT_EQ(2u, b[i]);
+    }
+    ASSERT_EQ(0u, late_a);
+    ASSERT_EQ(0u, late_b);
+    PASS();
+}
+
+TEST a_ratio_is_reduced_and_clamped(void) {
+    WlPresentQueue q;
+    ASSERT_EQ(WL_OK, wl_present_init(&q, 2, 1, 0));
+    wl_present_set_ratio(&q, 10, 6);
+    ASSERT_EQ(5u, q.rate_num);
+    ASSERT_EQ(3u, q.rate_den);
+    ASSERT_EQ(2u, q.interval); // (rounded up)
+    wl_present_set_ratio(&q, 1, 2);
+    ASSERT_EQ(1u, q.rate_num); // (not faster than every retrace)
+    ASSERT_EQ(1u, q.rate_den);
+    wl_present_set_ratio(&q, 1000, 1);
+    ASSERT_EQ(15u, q.interval);
+    wl_present_set_ratio(&q, 4, 0);
+    ASSERT_EQ(4u, q.interval);
+    PASS();
+}
+
 static uint32_t g_rng = 12345u;
 
 static uint32_t rnd(uint32_t n) {
@@ -304,6 +381,9 @@ SUITE(present_suite) {
     RUN_TEST(registers_deferred_by_libogc_commit_once);
     RUN_TEST(reclaim_drops_a_frame_the_gpu_never_finished);
     RUN_TEST(a_buffer_scanned_behind_the_queues_back_is_avoided);
+    RUN_TEST(thirty_frames_on_fifty_hertz_alternate_two_retraces_and_one);
+    RUN_TEST(a_ratio_of_whole_retraces_is_an_interval);
+    RUN_TEST(a_ratio_is_reduced_and_clamped);
     RUN_TEST(randomized_frames_keep_every_rule);
 }
 

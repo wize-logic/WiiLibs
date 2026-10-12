@@ -44,9 +44,9 @@ void wl_gx_target_be_scissor(uint32_t w, uint32_t h) {
 }
 
 // A quad over a rectangle of the back buffer's pixels: its colour and alpha from texture map 0 or a
-// constant colour, its depth from texture map 1 (a Z texture) or a constant depth.
+// constant colour, its depth from texture map 1 (a Z texture, when `z_texture`) or a constant depth.
 static void quad(float x0, float y0, float x1, float y1, const GXColor *colour, float depth, bool textured,
-                 uint32_t back_w, uint32_t back_h) {
+                 bool z_texture, uint32_t back_w, uint32_t back_h) {
     Mtx44 matrix;
     Mtx identity;
     static const float corners[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
@@ -68,21 +68,23 @@ static void quad(float x0, float y0, float x1, float y1, const GXColor *colour, 
     GX_SetTevDirect(GX_TEVSTAGE0);
     GX_SetTevDirect(GX_TEVSTAGE1);
     GX_SetNumChans(0);
-    GX_SetNumTevStages(textured ? 2 : 1);
+    GX_SetNumTevStages(textured && z_texture ? 2 : 1);
     if (textured) {
         GX_SetNumTexGens(1);
         GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
         GX_SetTevSwapMode(GX_TEVSTAGE0, GX_TEV_SWAP0, GX_TEV_SWAP0);
         GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
-        // (the Z texture is the last stage's texture; the colour passes)
-        GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORD0, GX_TEXMAP1, GX_COLORNULL);
-        GX_SetTevSwapMode(GX_TEVSTAGE1, GX_TEV_SWAP0, GX_TEV_SWAP0);
-        GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
-        GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
-        GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-        GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-        GX_SetZTexture(GX_ZT_REPLACE, GX_TF_Z24X8, 0);
-        GX_SetZCompLoc(GX_FALSE);
+        if (z_texture) {
+            // (the Z texture is the last stage's texture; the colour passes)
+            GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORD0, GX_TEXMAP1, GX_COLORNULL);
+            GX_SetTevSwapMode(GX_TEVSTAGE1, GX_TEV_SWAP0, GX_TEV_SWAP0);
+            GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
+            GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+            GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+            GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+            GX_SetZTexture(GX_ZT_REPLACE, GX_TF_Z24X8, 0);
+            GX_SetZCompLoc(GX_FALSE);
+        }
     } else {
         GX_SetNumTexGens(0);
         GX_SetTevColor(GX_TEVREG0, *colour);
@@ -115,7 +117,7 @@ static void quad(float x0, float y0, float x1, float y1, const GXColor *colour, 
         }
     }
     GX_End();
-    if (textured) {
+    if (textured && z_texture) {
         GX_SetZTexture(GX_ZT_DISABLE, GX_TF_Z8, 0);
         GX_SetZCompLoc(GX_TRUE);
     }
@@ -136,7 +138,7 @@ void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, 
     GX_SetColorUpdate(GX_TRUE);
     GX_SetAlphaUpdate(GX_TRUE);
     GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
-    quad(0.0f, 0.0f, (float)w, (float)h, NULL, 0.0f, true, w, h);
+    quad(0.0f, 0.0f, (float)w, (float)h, NULL, 0.0f, true, true, w, h);
 }
 
 void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int x, int y, int rw, int rh,
@@ -148,5 +150,31 @@ void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int 
     GX_SetAlphaUpdate(colour ? GX_TRUE : GX_FALSE);
     GX_SetZMode(depth ? GX_TRUE : GX_FALSE, GX_ALWAYS, depth ? GX_TRUE : GX_FALSE);
     GX_SetZCompLoc(GX_TRUE);
-    quad(x0, y0, x0 + (float)rw, y0 + (float)rh, &c, z, false, back_w, back_h);
+    quad(x0, y0, x0 + (float)rw, y0 + (float)rh, &c, z, false, false, back_w, back_h);
+}
+
+void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w) {
+    GXTexObj map;
+
+    // The finished picture out of the EFB, which the same copy clears to black for the bars. The
+    // clear writes colour, alpha and depth only where their updates are on.
+    GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
+    GX_SetColorUpdate(GX_TRUE);
+    GX_SetAlphaUpdate(GX_TRUE);
+    GX_SetCopyClear((GXColor){0, 0, 0, 255}, 0x00FFFFFFu);
+    wl_gx_wii_copy_filter(false);
+    wl_gpu_buffer_invalidate(colour, wl_gx_tex_bytes(WL_GX_TEX_RGBA8, back_w, back_h));
+    GX_SetTexCopySrc(0, 0, (u16)back_w, (u16)back_h);
+    GX_SetTexCopyDst((u16)back_w, (u16)back_h, GX_TF_RGBA8, GX_FALSE);
+    GX_CopyTex(colour, GX_TRUE);
+    GX_PixModeSync();
+    wl_gx_wii_copy_filter(true);
+    GX_InvalidateTexAll();
+    // ...and drawn back narrower, filtered, over the bars
+    GX_InitTexObj(&map, colour, (u16)back_w, (u16)back_h, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+    GX_InitTexObjFilterMode(&map, GX_LINEAR, GX_LINEAR);
+    GX_LoadTexObj(&map, GX_TEXMAP0);
+    GX_SetScissor(0, 0, (u32)back_w, (u32)back_h);
+    GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+    quad((float)x, 0.0f, (float)(x + w), (float)back_h, NULL, 0.0f, true, false, back_w, back_h);
 }

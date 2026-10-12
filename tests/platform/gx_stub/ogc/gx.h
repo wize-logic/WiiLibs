@@ -124,6 +124,7 @@ typedef struct {
 #define GX_TF_Z24X8 0x16
 #define GX_CLAMP 0
 #define GX_NEAR 0
+#define GX_LINEAR 1
 #define GX_TEXMAP1 1
 #define GX_TEV_SWAP0 0
 #define GX_TEVSTAGE1 1
@@ -202,6 +203,7 @@ void GX_SetTexCopySrc(u16 left, u16 top, u16 w, u16 h);
 void GX_SetTexCopyDst(u16 w, u16 h, u32 format, u8 mipmap);
 void GX_CopyTex(void *dest, u8 clear);
 void GX_PixModeSync(void);
+void GX_SetCopyClear(GXColor color, u32 zvalue);
 void GX_InvalidateTexAll(void);
 void GX_SetScissor(u32 x, u32 y, u32 w, u32 h);
 void GX_LoadProjectionMtx(Mtx44 m, u8 type);

@@ -13,6 +13,7 @@
 
 #include "wl/base/base.h"
 #include "wl/platform/present.h"
+#include "wl/platform/video_mode.h"
 
 // ---------------------------------------------------------------------------------------------
 // System events, exit and time
@@ -125,16 +126,22 @@ void wl_gpu_buffer_invalidate(void *ptr, size_t size);
 
 typedef struct {
     uint16_t fb_width;   // 640
-    uint16_t efb_height; // 480, or 528 for PAL 576i
-    uint16_t xfb_height;
-    uint16_t refresh_mhz; // 59940 (NTSC/PAL60) or 50000
+    uint16_t efb_height; // 480: the picture's rows (the EFB has 528; the rows below are scratch)
+    uint16_t xfb_height; // 480, or 576 at 50 Hz (the display copy scales the 480 rows to it)
+    uint16_t refresh_mhz; // 59940 (NTSC/EuRGB60) or 50000
     bool progressive;
-    bool widescreen; // system 16:9 setting: wider projection, same resolution
-    bool pal;
+    bool widescreen; // the console's 16:9 setting (the picture drawn is 640x480 whatever it says)
+    bool pal;        // 50 Hz
+    bool pillarbox;  // widescreen, and the picture is narrowed into picture_x.. of the framebuffer
+                     // by wl_gx_end_frame, black around it (WL_WIDESCREEN_PILLARBOX); draw 4:3 as ever
+    uint16_t picture_x, picture_width; // the picture's columns in the framebuffer (all of it unless pillarbox)
+    int16_t offset_h; // the console's display position, as applied to the picture's place on the line
 } WlVideoInfo;
 
-// Picks the console's preferred mode (480p when the setting and a component cable allow, PAL60
-// instead of 50 Hz when EuRGB60 is on), allocates the XFBs (two unless set_buffers asked for three;
+// Picks the console's preferred mode (480p when the setting and a component cable allow, EuRGB60
+// instead of 50 Hz when that setting is on; wl_video_choose, video_mode.h), sets the line the
+// picture is scanned into (a 16:9 TV's 704 pixels, shifted by the console's display position),
+// logs the choice once, allocates the XFBs (two unless set_buffers asked for three;
 // MEM1, 32-byte aligned, about 600 KB each) and starts the retrace interrupt's display queue.
 // Idempotent.
 WlResult wl_platform_video_init(void);
@@ -148,10 +155,24 @@ WlResult wl_platform_video_set_buffers(uint32_t count);
 // retrace. Clamped to 1..15; any time.
 void wl_platform_video_set_interval(uint32_t retraces);
 
+// Before init: what a 4:3 picture does on a 16:9 console setting: WL_WIDESCREEN_PILLARBOX (the
+// default; in the middle of the screen, circles round) or WL_WIDESCREEN_STRETCH (over all of it).
+// After init: WL_ERR_STATE unless it is the mode in use.
+WlResult wl_platform_video_set_widescreen(WlWidescreen mode);
+
+// The most frames a second to show (any time): the display queue holds each frame for the retraces
+// that come to it, as a ratio (video_mode.h's wl_video_rate_ratio): 30 is two retraces at 60 Hz,
+// and alternately two and one at 50 Hz, which makes 30 frames a second of uneven length, not 25.
+// 0, or at least the refresh rate: every retrace. Replaces wl_platform_video_set_interval.
+void wl_platform_video_set_rate(uint32_t hz);
+
 void wl_platform_video_info(WlVideoInfo *out);
+// One line saying what init chose (wl_video_describe's); "" before init.
+void wl_platform_video_describe(char *out, size_t size);
 
 // What the console configuration (SYSCONF) asks for, derived independently of the mode that
-// wl_platform_video_init picked (for a self-test that compares the two).
+// wl_platform_video_init picked, by wl_video_choose over the settings (for a self-test that
+// compares the two).
 void wl_platform_video_expected(WlVideoInfo *out);
 
 // The XFB being drawn this frame (the target of the display copy), the same until the next
@@ -402,6 +423,10 @@ static inline float wl_gx_ramp_coordinate(float value) {
 // since the last present like wl_platform_video_present.
 void wl_gx_begin_frame(uint32_t clear_rgba);
 uint32_t wl_gx_end_frame(void);
+// (On a 16:9 console setting with WL_WIDESCREEN_PILLARBOX, wl_gx_end_frame narrows the finished picture,
+// overlay included, into the middle three quarters of the framebuffer, black around it, before the display
+// copy (wl_gx_target_squeeze): one EFB copy of 640x480 and one filtered quad a frame, and 1.2 MiB from the
+// render targets' allocator. The program draws 4:3 as ever; WlVideoInfo.pillarbox says it is done.)
 // A frame overlay: `fn(user, width, height)` runs inside wl_gx_end_frame, after the frame's last draw and
 // before its display copy, so it draws over the finished image (a menu, a notice, a battery warning)
 // without the program's renderer knowing: it costs the frame one pointer test while none is set, and

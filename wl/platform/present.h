@@ -11,7 +11,9 @@
 //  - a frame goes to the video interface only once the GPU has finished writing it (its `done`
 //    test, polled at the retrace: a flip can only happen at a retrace anyway);
 //  - each frame stays on the screen at least `interval` retraces (1 = every retrace, 2 = 30 Hz on
-//    a 60 Hz display), counted from the retrace at which the previous one was latched;
+//    a 60 Hz display), counted from the retrace at which the previous one was latched; or, for a
+//    rate that is not a whole number of retraces (30 Hz on a 50 Hz display: 5/3), as many as the
+//    ratio of retraces to a frame adds up to, so the frames alternate between two retraces and one;
 //  - nothing here waits: the thread waits (for a retrace) only when acquire finds no free buffer.
 //
 // Concurrency: the retrace functions run in the interrupt; the thread calls the others with
@@ -36,7 +38,10 @@ typedef enum {
 
 typedef struct {
     uint8_t count;    // buffers, 2 or 3
-    uint8_t interval; // minimum retraces a frame stays on the screen (>= 1)
+    uint8_t interval; // minimum retraces a frame stays on the screen (>= 1): the ratio, rounded up
+    uint8_t rate_num; // the retraces a frame stays, on average: rate_num / rate_den (1/1 and up)
+    uint8_t rate_den;
+    uint64_t due;     // the retrace (times rate_den) the next frame may be latched at
     int8_t back;      // the buffer being drawn, -1 when none is acquired
     int8_t shown;     // the buffer on the screen, -1 when none of ours
     int8_t committed; // the buffer handed to the video interface, -1 when none
@@ -60,6 +65,10 @@ typedef struct {
 WlResult wl_present_init(WlPresentQueue *q, uint32_t count, uint32_t interval, int shown);
 // Changes the minimum retraces per frame (clamped to 1..15); takes effect at the next commit.
 void wl_present_set_interval(WlPresentQueue *q, uint32_t interval);
+// The same for a ratio of retraces to a frame: `num` / `den` (den 1..15, the whole ratio clamped to
+// 1..15; reduced if need be). A frame that is late by a retrace or more starts the count again from
+// its own retrace, as for a whole interval.
+void wl_present_set_ratio(WlPresentQueue *q, uint32_t num, uint32_t den);
 
 // Thread: the back buffer (the one already acquired, else a free one, which becomes it). -1 when
 // every buffer is on the screen or waiting to be: the caller waits for a retrace and asks again.

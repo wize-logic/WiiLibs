@@ -20,6 +20,7 @@ static struct {
     WlGxTarget resolved; // the last one wl_gx_target_use returned
     bool drawn;          // the back buffer has had something drawn or cleared this frame
     bool parked;         // its colour and depth are in `colour` and `depth`
+    bool squeeze_warned; // the lack of memory for wl_gx_target_squeeze has been told
     void *colour, *depth;
     WlGxTargetStats stats;
 } t;
@@ -109,8 +110,13 @@ static void park(void) {
         size_t bytes = wl_gx_tex_bytes(WL_GX_TEX_RGBA8, w, h);
         WlGxTargetAlloc alloc = t.alloc != NULL ? t.alloc : default_alloc;
         WlGxTargetFree release = t.release != NULL ? t.release : default_free;
-        t.colour = alloc(bytes);
-        t.depth = alloc(bytes);
+        // (the colour's block may be there already: wl_gx_target_squeeze's)
+        if (t.colour == NULL) {
+            t.colour = alloc(bytes);
+        }
+        if (t.depth == NULL) {
+            t.depth = alloc(bytes);
+        }
         if (t.colour == NULL || t.depth == NULL) {
             if (t.colour != NULL) {
                 release(t.colour);
@@ -219,6 +225,31 @@ void wl_gx_target_clear(bool colour, bool depth, uint32_t rgba, float z, int x, 
     z = z < 0.0f ? 0.0f : z > 1.0f ? 1.0f : z;
     wl_gx_target_be_clear(colour, depth, rgba, z, x, y, w, h, bw, bh);
     t.stats.clears++;
+}
+
+bool wl_gx_target_squeeze(uint32_t x, uint32_t w) {
+    uint32_t bw, bh;
+    back_size(&bw, &bh);
+    if (w == 0u || x + w > bw) {
+        return false;
+    }
+    if (t.colour == NULL) {
+        // (the block a park would copy the colour into: free at the end of a frame)
+        WlGxTargetAlloc alloc = t.alloc != NULL ? t.alloc : default_alloc;
+        t.colour = alloc(wl_gx_tex_bytes(WL_GX_TEX_RGBA8, bw, bh));
+        if (t.colour == NULL) {
+            if (!t.squeeze_warned) {
+                t.squeeze_warned = true;
+                WL_LOG_W(TAG, "no memory to narrow the picture (%u bytes): it is shown the full width",
+                         (unsigned)wl_gx_tex_bytes(WL_GX_TEX_RGBA8, bw, bh));
+            }
+            return false;
+        }
+    }
+    t.parked = false;
+    wl_gx_target_be_squeeze(t.colour, bw, bh, x, w);
+    t.stats.squeezes++;
+    return true;
 }
 
 void wl_gx_target_stats(WlGxTargetStats *out, bool reset) {

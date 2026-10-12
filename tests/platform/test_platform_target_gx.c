@@ -190,6 +190,38 @@ TEST put_the_back_buffer_back_through_a_z_texture(void) {
     PASS();
 }
 
+TEST squeeze_the_finished_picture_into_the_middle(void) {
+    start();
+    unsigned from = g_gx_stub_log_count;
+    ASSERT(wl_gx_target_squeeze(80, 480));
+    // the EFB out unfiltered into the colour block, cleared to black by the same copy (colour, alpha and depth
+    // updates on first); the display copy's filter back; the block drawn as a linearly filtered quad over
+    // columns 80 to 560 only: one stage, no Z texture
+    EXPECT(from, "GX_SetZMode 1 7 1", "GX_SetColorUpdate 1", "GX_SetAlphaUpdate 1", "GX_SetCopyClear 0 0 0 255 0xFFFFFF",
+           "copy_filter off",
+           "wl_gpu_buffer_invalidate PC 1228800", "GX_SetTexCopySrc 0 0 640 480", "GX_SetTexCopyDst 640 480 0x6 0",
+           "GX_CopyTex PC 1", "GX_PixModeSync", "copy_filter display", "GX_InvalidateTexAll",
+           "GX_InitTexObj PC 640 480 0x6 0 0 0", "GX_InitTexObjFilterMode 1 1", "GX_LoadTexObj PC 0",
+           "GX_SetScissor 0 0 640 480", "GX_SetZMode 0 7 0",
+           "GX_LoadProjectionMtx ortho 0.003125 -1 -0.00416667 1 1 0 1", "GX_SetViewport 0 0 640 480 0 1",
+           "GX_SetBlendMode 0 1 0 0", "GX_SetAlphaCompare 7 0 0 7 0", "GX_SetCullMode 0",
+           "GX_SetNumIndStages 0", "GX_SetTevDirect 0", "GX_SetTevDirect 1", "GX_SetNumChans 0",
+           "GX_SetNumTevStages 1", "GX_SetNumTexGens 1",
+           "GX_SetTevOrder 0 0 0 255", "GX_SetTevSwapMode 0 0 0",
+           "GX_SetTevColorIn 0 15 15 15 8", "GX_SetTevAlphaIn 0 7 7 7 4",
+           "GX_SetTevColorOp 0 0 0 0 1 0", "GX_SetTevAlphaOp 0 0 0 0 1 0",
+           "GX_LoadPosMtxImm identity 0", "GX_SetCurrentMtx 0", "GX_ClearVtxDesc",
+           "GX_SetVtxDesc 9 1", "GX_SetVtxAttrFmt 0 9 1 4 0",
+           "GX_SetVtxDesc 13 1", "GX_SetVtxAttrFmt 0 13 1 4 0", "GX_SetTexCoordGen 0 1 4 60",
+           "GX_Begin 0x80 0 4",
+           "GX_Position3f32 80 0 -1", "GX_TexCoord2f32 0 0",
+           "GX_Position3f32 560 0 -1", "GX_TexCoord2f32 1 0",
+           "GX_Position3f32 560 480 -1", "GX_TexCoord2f32 1 1",
+           "GX_Position3f32 80 480 -1", "GX_TexCoord2f32 0 1",
+           "GX_End", "wl_gx_invalidate_shadow");
+    PASS();
+}
+
 TEST clear_quad_colour_and_depth(void) {
     start();
     unsigned from = g_gx_stub_log_count;
@@ -250,6 +282,7 @@ SUITE(target_gx_suite) {
     RUN_TEST(park_the_back_buffer_and_take_the_efb);
     RUN_TEST(resolve_a_target_into_its_memory);
     RUN_TEST(put_the_back_buffer_back_through_a_z_texture);
+    RUN_TEST(squeeze_the_finished_picture_into_the_middle);
     RUN_TEST(clear_quad_colour_and_depth);
     RUN_TEST(clear_quad_depth_only_and_colour_only);
     RUN_TEST(copies_leave_the_display_filter_on_and_note_the_commands);

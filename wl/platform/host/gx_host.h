@@ -74,4 +74,6 @@ uint32_t wl_host_gx_recorded(void);
 const WlHostGxState *wl_host_gx_state(void);
 // Test control: video info returned by wl_platform_video_info, and the stub's counters.
 void wl_host_gx_set_widescreen(bool widescreen);
+// The rate wl_platform_video_set_rate last asked for (0: none, or an interval's).
+uint32_t wl_host_gx_rate(void);
 void wl_host_gx_clear_counters(void);

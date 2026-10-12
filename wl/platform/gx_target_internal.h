@@ -26,6 +26,12 @@ void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, 
 void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int x, int y, int rw, int rh,
                            uint32_t back_w, uint32_t back_h);
 
+// The finished back buffer narrowed into columns [x, x + w) of itself with black around it: the EFB
+// copied (unfiltered) into `colour` (a block of wl_gx_tex_bytes(RGBA8, back_w, back_h) bytes) and
+// cleared to black by the same copy, then drawn back as one linearly filtered quad. Nothing of the
+// back buffer is kept; for the end of the frame.
+void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w);
+
 // The video mode's framebuffer width and EFB height, the default back buffer.
 void wl_gx_target_be_default_size(uint32_t *w, uint32_t *h);
 

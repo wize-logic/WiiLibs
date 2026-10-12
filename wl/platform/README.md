@@ -584,10 +584,46 @@ disable one with budget 0. The host stub sizes its regions like the console (20 
 memory the GPU or DMA wrote is invalidated (`wl_gpu_buffer_invalidate`) before the CPU reads it.
 Dolphin hides a missing flush unless its write-back cache emulation is on; hardware does not.
 
-**Video.** `VIDEO_GetPreferredMode` applies SYSCONF: 480p only with progressive scan enabled and
-a component cable; PAL consoles get EuRGB60 when enabled, else 576i at 50 Hz (EFB height 528).
-Widescreen is a system setting: render at 640x480 and widen the projection. A retrace is a field
-in interlaced modes. XFBs are cleared to YUV black (0x10801080), not zero (which is green).
+**Video.** `video_mode.h` (`wl_video_choose`, a pure function, tested over every combination of the
+settings) says what the console's settings ask for, and `wl_platform_video_init` applies it to
+libogc's own mode object (`VIDEO_GetPreferredMode`, which applies SYSCONF the same way; init logs a
+warning if the two differ) and logs the choice once (`[VIDEO] 480p NTSC 59.94 Hz, ...`):
+
+| Setting | Mode |
+| --- | --- |
+| NTSC or MPAL console | 480i, 59.94 Hz |
+| progressive scan on and a component cable | 480p instead (576p at 50 Hz) |
+| PAL console with EuRGB60 on | EuRGB60: 480 lines at 59.94 Hz |
+| PAL console, EuRGB60 off | 576i at 50 Hz |
+| 16:9 | the line the interface scans is 704 pixels, not 640 |
+| display position (`CONF_GetDisplayOffsetH`) | libogc adds it to the line's origin and keeps the result on the 720-pixel line (4:3: up to 40 either way; 16:9: 8) |
+
+The picture is always 640x480: the EFB's 480 top rows, in every mode (libogc's PAL mode has a 480-row
+EFB and a 576-row XFB, so the display copy scales 480 rows to 576; the EFB's rows below the picture,
+to 528, are scratch and are never copied to the screen). A retrace is a field in interlaced modes.
+XFBs are cleared to YUV black (0x10801080), not zero (which is green).
+
+**16:9.** The interface stretches the line it scans over the whole screen, so on a 16:9 console
+setting a 4:3 picture comes out stretched 33% sideways. `wl_platform_video_set_widescreen` (before
+init) chooses: `WL_WIDESCREEN_PILLARBOX` (the default) keeps it 4:3, `WL_WIDESCREEN_STRETCH` fills the
+screen. The interface can widen a framebuffer but not narrow one (libogc's `__setScalingRegs` acts
+only when the picture is narrower than the line), so the pillarbox is made in the framebuffer:
+`wl_gx_end_frame` (after the overlay, before the display copy) copies the finished EFB into the render
+targets' colour block, clears the EFB to black in the same copy and draws the block back as one
+linearly filtered quad over columns 80 to 560 (`wl_gx_target_squeeze`); the interface then widens the
+640-wide framebuffer to 704 and the 480 columns are 3/4 of the screen, 4:3. Cost: one 640x480 RGBA8
+EFB copy and one 480x480 quad a frame, the picture 25% less sharp sideways, and the 1.2 MiB block
+(the one a park of the back buffer uses, shared with it). Without memory the picture is shown
+stretched (one warning). The program draws 4:3 and needs no change; `WlVideoInfo.pillarbox` and
+`picture_x`/`picture_width` say it is done. A real anamorphic mode (the program widening its projection
+to 16:9 and drawing all 640 columns) would be a third value of the same setting.
+
+**50 Hz.** A frame's stay on the screen is a ratio of retraces to a frame (`wl_present_set_ratio`):
+`wl_platform_video_set_interval(2)` is 30 Hz on a 60 Hz display, and 25 Hz on a 50 Hz one. To keep a
+rate in frames a second whatever the display, use `wl_platform_video_set_rate(30)`: at 60 Hz two
+retraces a frame, at 50 Hz alternately two and one (5 retraces in 3 frames: 30.0 frames a second, with
+the unevenness of 3:2 pulldown; `wl_video_rate_ratio`). A program that ticks by the clock keeps its
+speed either way; with an interval of two it would show 25 frames a second.
 
 **Presenting without waiting for the display.** The video interface takes a new framebuffer only
 at a retrace: libogc writes its registers in the retrace interrupt, after the pre-retrace callback
