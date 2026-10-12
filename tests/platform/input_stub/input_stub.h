@@ -20,6 +20,8 @@ typedef struct {
     WPADData queue[4][64]; // the reports libogc has queued per channel, oldest first (WPAD_ReadPending)
     unsigned queue_len[4];
     unsigned read_pending_calls;
+    unsigned pad_reads;         // PAD_Read calls
+    int irq_depth;              // IRQ_Disable calls not yet restored
     unsigned data_format_calls; // WPAD_SetDataFormat on one channel (a new connection)
 } InputStub;
 

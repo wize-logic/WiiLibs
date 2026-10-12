@@ -782,6 +782,8 @@ WlResult wl_platform_random_bytes(void *buf, size_t size);
 #define WL_INPUT_MAX_REMOTES 4u
 #define WL_INPUT_MAX_PADS 4u
 #define WL_INPUT_MAX_KEYS 16u
+// A Nunchuk's acceleration readings kept for a frame (WlRawRemote.nunchuk_accel)
+#define WL_NUNCHUK_SAMPLES 16u
 
 // Raw button bits. The values equal libogc's WPAD_BUTTON_* / WPAD_NUNCHUK_BUTTON_* /
 // WPAD_CLASSIC_BUTTON_* / PAD_BUTTON_* (input_wii.c asserts it at build time), so the Wii
@@ -863,6 +865,13 @@ typedef struct {
     // pointer (ir_valid false when none did), `accel` is the last report's.
     int16_t accel_peak[3]; // the frame's report of greatest acceleration, in accel's units (for gestures)
     uint8_t reports;       // reports read this frame, up to 255; 0: none came, the last state is repeated
+    // The Nunchuk's accelerometer, one entry for each of the frame's reports that carried it (the
+    // last WL_NUNCHUK_SAMPLES, oldest first), in accel's units (1 g ~ 100). `nunchuk_reports` is how
+    // many reports of the frame there were in all, which can be more than were kept; 0 when no
+    // Nunchuk is connected or none reported. wl_thrust_feed (input_gesture.h) reads these.
+    int16_t nunchuk_accel[WL_NUNCHUK_SAMPLES][3];
+    uint8_t nunchuk_samples;
+    uint8_t nunchuk_reports;
 } WlRawRemote;
 
 typedef struct {
@@ -896,6 +905,19 @@ void wl_platform_input_shutdown(void);
 
 // Once per frame on the main thread. Never blocks; absent devices read as connected == false.
 void wl_platform_input_poll(WlRawInput *out);
+// GameCube controllers are read at every video retrace (60 or 50 times a second), not only when the
+// program polls, so that a press shorter than a frame is not missed: the poll's `pads[i].buttons`
+// has every button seen pressed in any of the retraces since the last poll (the sticks and triggers
+// are the latest reading's). Where the retrace cannot read (no video started, the host) the poll reads
+// the pads itself. These counters tell how well that works on a console: samples taken at retraces,
+// how many of them carried fresh data, and polls that had to read the pads themselves.
+typedef struct {
+    uint32_t retrace_samples;
+    uint32_t retrace_fresh;
+    uint32_t polls;
+    uint32_t polls_unsampled;
+} WlPadStats;
+void wl_platform_input_pad_stats(WlPadStats *out);
 void wl_platform_rumble(uint8_t remote, bool on);
 void wl_platform_pad_rumble(uint8_t pad, bool on);
 // Whether the console's settings allow rumble (the Wii's Wii Remote vibration setting, SYSCONF's
