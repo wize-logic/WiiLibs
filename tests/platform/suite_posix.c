@@ -93,6 +93,24 @@ void wlt_suite_posix(const char *path) {
               pread(fd, check, sizeof check, 99) == (ssize_t)sizeof check && check[0] == data[99] &&
                   memcmp(check + 1, patch, sizeof patch) == 0 && check[5] == data[104],
               "bytes around 100");
+    // the placed reader (libfat's seeks, on the console): in order, then out of order, then released
+    WlPlacedReader reader;
+    memset(&reader, 0, sizeof reader);
+    wlt_check("posix_placed_seek", lseek(fd, 23, SEEK_SET) == 23, "lseek to 23");
+    wlt_check("posix_placed_open", wl_posix_placed_open(&reader, fd) == WL_OK, "open");
+    uint8_t part[100];
+    bool placed_ok = wl_posix_placed_pread(&reader, part, sizeof part, 400) == (ssize_t)sizeof part &&
+                     memcmp(part, data + 400, sizeof part) == 0 &&
+                     wl_posix_placed_pread(&reader, part, sizeof part, 500) == (ssize_t)sizeof part &&
+                     memcmp(part, data + 500, sizeof part) == 0;
+    wlt_check("posix_placed_in_order", placed_ok && reader.seeks == 1, "two reads in line, one seek");
+    placed_ok = wl_posix_placed_pread(&reader, part, sizeof part, 200) == (ssize_t)sizeof part &&
+                memcmp(part, data + 200, sizeof part) == 0 &&
+                wl_posix_placed_pread(&reader, part, sizeof part, 900) == 100 && memcmp(part, data + 900, 100) == 0 &&
+                wl_posix_placed_pread(&reader, part, sizeof part, 1000) == 0;
+    wlt_check("posix_placed_out_of_order", placed_ok && reader.seeks == 3, "back, ahead, the end");
+    wlt_check("posix_placed_release", wl_posix_placed_release(&reader) == WL_OK && lseek(fd, 0, SEEK_CUR) == 23,
+              "the position is back at 23");
     close(fd);
     wlt_check("posix_unlink", unlink(path) == 0, "unlink");
     priority_checks();
