@@ -314,64 +314,118 @@ size_t wl_gxc_encode_ci(WlGxcFormat fmt, const uint8_t *indices, uint32_t w, uin
     return total;
 }
 
+// One texel of a tile-ordered image (w wide, tiles_x tiles per row) as RGBA: the one place that knows
+// where a texel sits and what it expands to, shared by the whole-image decoder and the texel read.
+static void texel_rgba(WlGxcFormat fmt, const uint8_t *in, uint32_t tiles_x, uint32_t x, uint32_t y, uint8_t *o) {
+    uint32_t tw = k_tile[fmt][0];
+    uint32_t th = k_tile[fmt][1];
+    const uint8_t *tile = in + ((size_t)(y / th) * tiles_x + (x / tw)) * k_tile[fmt][2];
+    uint32_t lx = x % tw;
+    uint32_t ly = y % th;
+    uint32_t i = ly * tw + lx;
+    switch (fmt) {
+    case WL_GXC_I4: {
+        uint32_t v = (i & 1u) != 0 ? tile[i >> 1] & 15u : tile[i >> 1] >> 4;
+        o[0] = o[1] = o[2] = o[3] = (uint8_t)exp4(v);
+        break;
+    }
+    case WL_GXC_I8:
+        o[0] = o[1] = o[2] = o[3] = tile[i];
+        break;
+    case WL_GXC_IA4:
+        o[0] = o[1] = o[2] = (uint8_t)exp4(tile[i] & 15u);
+        o[3] = (uint8_t)exp4(tile[i] >> 4);
+        break;
+    case WL_GXC_IA8:
+        o[0] = o[1] = o[2] = tile[i * 2 + 1];
+        o[3] = tile[i * 2];
+        break;
+    case WL_GXC_RGB565:
+        wl_gxc_rgb565_decode(get_be16(tile + i * 2), o);
+        break;
+    case WL_GXC_RGB5A3:
+        wl_gxc_rgb5a3_decode(get_be16(tile + i * 2), o);
+        break;
+    case WL_GXC_RGBA8:
+        o[3] = tile[i * 2];
+        o[0] = tile[i * 2 + 1];
+        o[1] = tile[32 + i * 2];
+        o[2] = tile[32 + i * 2 + 1];
+        break;
+    default: { // CMPR
+        const uint8_t *blk = tile + ((ly >> 2) * 2u + (lx >> 2)) * 8u;
+        uint8_t pal[4][4];
+        wl_gxc_cmpr_palette(get_be16(blk), get_be16(blk + 2), pal);
+        uint32_t idx = (blk[4 + (ly & 3u)] >> (6 - 2 * (lx & 3u))) & 3u;
+        memcpy(o, pal[idx], 4);
+        break;
+    }
+    }
+}
+
 size_t wl_gxc_decode(WlGxcFormat fmt, const void *src, size_t src_len, uint32_t w, uint32_t h, uint8_t *rgba_out) {
     size_t total = fmt_ok(fmt, 0) ? wl_gxc_tex_bytes(fmt, w, h) : 0;
     if (total == 0 || src == NULL || rgba_out == NULL || src_len < total) {
         return 0;
     }
-    const uint8_t *in = src;
-    uint32_t tw = k_tile[fmt][0];
-    uint32_t th = k_tile[fmt][1];
-    uint32_t tsz = k_tile[fmt][2];
-    uint32_t tiles_x = (w + tw - 1u) / tw;
+    uint32_t tiles_x = (w + k_tile[fmt][0] - 1u) / k_tile[fmt][0];
     for (uint32_t y = 0; y < h; y++) {
         for (uint32_t x = 0; x < w; x++) {
-            const uint8_t *tile = in + ((size_t)(y / th) * tiles_x + (x / tw)) * tsz;
-            uint32_t lx = x % tw;
-            uint32_t ly = y % th;
-            uint32_t i = ly * tw + lx;
-            uint8_t *o = rgba_out + ((size_t)y * w + x) * 4u;
-            switch (fmt) {
-            case WL_GXC_I4: {
-                uint32_t v = (i & 1u) != 0 ? tile[i >> 1] & 15u : tile[i >> 1] >> 4;
-                o[0] = o[1] = o[2] = o[3] = (uint8_t)exp4(v);
-                break;
-            }
-            case WL_GXC_I8:
-                o[0] = o[1] = o[2] = o[3] = tile[i];
-                break;
-            case WL_GXC_IA4:
-                o[0] = o[1] = o[2] = (uint8_t)exp4(tile[i] & 15u);
-                o[3] = (uint8_t)exp4(tile[i] >> 4);
-                break;
-            case WL_GXC_IA8:
-                o[0] = o[1] = o[2] = tile[i * 2 + 1];
-                o[3] = tile[i * 2];
-                break;
-            case WL_GXC_RGB565:
-                wl_gxc_rgb565_decode(get_be16(tile + i * 2), o);
-                break;
-            case WL_GXC_RGB5A3:
-                wl_gxc_rgb5a3_decode(get_be16(tile + i * 2), o);
-                break;
-            case WL_GXC_RGBA8:
-                o[3] = tile[i * 2];
-                o[0] = tile[i * 2 + 1];
-                o[1] = tile[32 + i * 2];
-                o[2] = tile[32 + i * 2 + 1];
-                break;
-            default: { // CMPR
-                const uint8_t *blk = tile + ((ly >> 2) * 2u + (lx >> 2)) * 8u;
-                uint8_t pal[4][4];
-                wl_gxc_cmpr_palette(get_be16(blk), get_be16(blk + 2), pal);
-                uint32_t idx = (blk[4 + (ly & 3u)] >> (6 - 2 * (lx & 3u))) & 3u;
-                memcpy(o, pal[idx], 4);
-                break;
-            }
-            }
+            texel_rgba(fmt, src, tiles_x, x, y, rgba_out + ((size_t)y * w + x) * 4u);
         }
     }
     return total;
+}
+
+bool wl_gxc_texel_read(WlGxcFormat fmt, const void *src, size_t src_len, uint32_t w, uint32_t h, uint32_t x,
+                       uint32_t y, uint8_t rgba[4]) {
+    size_t total = fmt_ok(fmt, 0) ? wl_gxc_tex_bytes(fmt, w, h) : 0;
+    if (total == 0 || src == NULL || rgba == NULL || src_len < total || x >= w || y >= h) {
+        return false;
+    }
+    texel_rgba(fmt, src, (w + k_tile[fmt][0] - 1u) / k_tile[fmt][0], x, y, rgba);
+    return true;
+}
+
+bool wl_gxc_texel_raw(WlGxcFormat fmt, const void *src, size_t src_len, uint32_t w, uint32_t h, uint32_t x,
+                      uint32_t y, uint32_t *raw) {
+    size_t total = (unsigned)fmt < WL_GXC_FORMAT_COUNT ? wl_gxc_tex_bytes(fmt, w, h) : 0;
+    if (total == 0 || src == NULL || raw == NULL || src_len < total || x >= w || y >= h) {
+        return false;
+    }
+    uint32_t tw = k_tile[fmt][0];
+    uint32_t th = k_tile[fmt][1];
+    uint32_t tiles_x = (w + tw - 1u) / tw;
+    const uint8_t *tile = (const uint8_t *)src + ((size_t)(y / th) * tiles_x + (x / tw)) * k_tile[fmt][2];
+    uint32_t lx = x % tw;
+    uint32_t ly = y % th;
+    uint32_t i = ly * tw + lx;
+    switch (fmt) {
+    case WL_GXC_I4:
+    case WL_GXC_C4:
+        *raw = (i & 1u) != 0 ? tile[i >> 1] & 15u : tile[i >> 1] >> 4;
+        break;
+    case WL_GXC_I8:
+    case WL_GXC_IA4:
+    case WL_GXC_C8:
+        *raw = tile[i];
+        break;
+    case WL_GXC_IA8:
+    case WL_GXC_RGB565:
+    case WL_GXC_RGB5A3:
+        *raw = get_be16(tile + i * 2);
+        break;
+    case WL_GXC_RGBA8:
+        *raw = ((uint32_t)tile[i * 2] << 24) | ((uint32_t)tile[i * 2 + 1] << 16) | ((uint32_t)tile[32 + i * 2] << 8) |
+               tile[32 + i * 2 + 1];
+        break;
+    default: { // CMPR: the texel's 2-bit palette index
+        const uint8_t *blk = tile + ((ly >> 2) * 2u + (lx >> 2)) * 8u;
+        *raw = (blk[4 + (ly & 3u)] >> (6 - 2 * (lx & 3u))) & 3u;
+        break;
+    }
+    }
+    return true;
 }
 
 size_t wl_gxc_decode_ci(WlGxcFormat fmt, const void *src, size_t src_len, uint32_t w, uint32_t h, uint8_t *indices_out) {
