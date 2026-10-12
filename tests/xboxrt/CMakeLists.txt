@@ -6,20 +6,23 @@ endif()
 wl_add_test(test_xboxrt_mem SOURCES test_xboxrt_mem.c LIBS wl_xboxrt LABELS unit be)
 # The PowerPC and x86-64 decoders against a fake device (portable).
 wl_add_test(test_xboxrt_decode SOURCES test_xboxrt_decode.c LIBS wl_xboxrt LABELS unit be)
-# The register file against the generated code's header, when the header is in the tree: a type
-# that differs is a compile error (recomp_symbols.inc).
-if(EXISTS ${PROJECT_SOURCE_DIR}/wl/xboxrt/recomp/recomp_types.h)
+# The generated code's big-endian header (wl/xboxrt/recomp/recomp_types.h when the toolchain is in
+# the tree; another directory for trying one out).
+set(WL_XBRT_RECOMP_HEADER_DIR "${PROJECT_SOURCE_DIR}/wl/xboxrt/recomp" CACHE PATH
+    "Directory with the generated code's recomp_types.h (the ABI and e2e tests)")
+
+# The register file and the runtime's functions against that header: a type that differs is a
+# compile error (recomp_symbols.inc, thunk.h). The header is a system include: its own helpers are
+# not held to this project's warnings.
+if(EXISTS ${WL_XBRT_RECOMP_HEADER_DIR}/recomp_types.h)
     wl_add_test(test_xboxrt_abi SOURCES test_xboxrt_abi.c LIBS wl_xboxrt LABELS unit be)
-    target_include_directories(test_xboxrt_abi PRIVATE ${PROJECT_SOURCE_DIR}/wl/xboxrt/recomp)
+    target_include_directories(test_xboxrt_abi SYSTEM PRIVATE ${WL_XBRT_RECOMP_HEADER_DIR})
 endif()
 
 # End to end: a synthetic title (e2e/title.c) built for i386, wrapped in an XBE, lifted by
-# xboxrecomp's pipeline and run on the runtime and kernel. Needs the generated code's big-endian
-# header (agent A's wl/xboxrt/recomp/recomp_types.h, or WL_XBRT_RECOMP_HEADER_DIR), xboxrecomp's
-# tools (WL_XBOXRECOMP_DIR: third_party/xboxrecomp when it is vendored, else ~/GitHub/xboxrecomp),
-# Python and a compiler that makes i386 code (gcc -m32).
-set(WL_XBRT_RECOMP_HEADER_DIR "${PROJECT_SOURCE_DIR}/wl/xboxrt/recomp" CACHE PATH
-    "Directory with the generated code's recomp_types.h for the e2e test")
+# xboxrecomp's pipeline and run on the runtime and kernel. Needs the generated code's header
+# (above), xboxrecomp's tools (WL_XBOXRECOMP_DIR: third_party/xboxrecomp when it is vendored, else
+# ~/GitHub/xboxrecomp), Python and a compiler that makes i386 code (gcc -m32).
 if(EXISTS ${PROJECT_SOURCE_DIR}/third_party/xboxrecomp/tools/recomp)
     set(wl_xbr_default ${PROJECT_SOURCE_DIR}/third_party/xboxrecomp)
 else()
