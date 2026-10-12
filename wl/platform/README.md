@@ -30,6 +30,7 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `backtrace.h`, `backtrace.c` | return-address backtraces for the 32-bit PowerPC frame layout: a portable walker over a read callback, `wl_platform_backtrace` for the running thread, `wl_platform_log_backtrace` for a "where from" log line; see below |
 | `profile.h`, `profile.c` | the sampling profiler: a ring of samples (the interrupted pc, link register, thread and the return addresses up its stack), the text dumps, the jitter; `wii/profile_wii.c` is the sampler over libogc's decrementer tick tasks; `tools/wl_profile.py` symbolizes the dumps; see below |
 | `stop.h`, `stop.c`, `stop_backend.h` | the bring-up text console (libogc's, in one of the video's framebuffers) and the stop screen: a message on it and in the log, then a wait for HOME or START to leave; `wl_platform_missing_symbol` is what `tools/link_stubs.py` points its stubs at; `wii/stop_wii.c` and `host/stop_host.c` are the backends; see "Console and stop screen" |
+| `profile_arm.h`, `profile_arm.c` | arming the profiler from a control file (`profile.txt` in the program's folder): the settings' parser, the watcher thread that waits for the program's own readiness hooks, samples for a time and writes `profile<N>.txt`; see "Arming it from a file" under the sampling profiler |
 | `net.h`, `net.c`, `net_internal.h` | IPv4 TCP and UDP sockets over IOS (libogc) or the host: addresses as host-order values, errors as results, poll for select, the network started in the background; `net.c` has the errno mapping and the address text; see below |
 | `gx_common.c` | GX helpers needing no hardware: texture sizes, sampler filter resolution |
 | `stack.c` | stack depth measurement: a fill pattern and the high-water mark (`wl_platform_stack_used`) |
@@ -206,9 +207,34 @@ tools/wl_profile.py program.elf profile.txt --top 40 --callers update --tree 2 -
     misses and the GX FIFO and bus waits show up as the time spent on the instruction that waits.
   - A sample says nothing of time spent in other threads' interrupts (audio, IOS) except that the
     interrupted code was late.
+- **Arming it from a file (`profile_arm.h`).** A program that an emulator or the Homebrew Channel
+  starts cannot be run under a profiler by hand, so it reads `profile.txt` from its folder when it
+  starts and, if there is one, launches a watcher thread (`wl_profile_arm_config_load`, then
+  `wl_profile_arm_launch`); without the file nothing is allocated or started. The file is lines
+  of `name value` (`#` starts a comment, a value is followed by the end of the line, a blank or
+  `#`; `name=value` is the same): `seconds 20` (how long to sample), `after 10`, `skip 1`, `repeat 1`
+  (profiles one after another), `hz 500` (1 to 10000), `depth 12` (0 to 16), `log 1` (also write
+  the samples to the log) and `note words` (the dump header's note). Unknown names and non-numbers
+  go to a callback with their line number and leave the settings as they were; the values are then
+  clamped. The program supplies three hooks that read its own state from the watcher's thread and
+  must not block: `ready` (profile now? it also writes words for the header, such as the level),
+  `stop` (end this profile early?), `advanced` (the stretch just profiled is over, so wait for the
+  next one: without it a tour would profile one level `repeat` times). `after` and `skip` are the
+  hooks' to read from the settings (the watcher does not know their unit). Each run allocates
+  its ring (`seconds * hz` and a tenth over, at most `max_ring_bytes`, 4 MiB by default, with a
+  warning when it clips), samples until `seconds` have passed by the clock or `stop` says so,
+  writes `<folder>/profile<N>.txt` (`wl_profile_arm_dump_path`, N from 1) and the log lines, and
+  frees the ring. The log carries `[profile] sampling ...`, `<path>: WL_OK` and `[profile] done`
+  (a script can wait for the last in an emulator's output). The decisions are
+  `wl_profile_arm_step`, a function of the state, the hooks and a time, which returns what to
+  do (nothing, start, stop, finish); `wl_profile_arm_run` carries them out on the calling thread
+  against `WlProfileArmOps` (the clock, the sleep, the sampler; each defaults to the platform's),
+  so tests run whole tours on a fake clock and a fake sampler.
 - **Tests.** `tests/platform/test_platform_profile.c` (host and big-endian: the ring, both modes,
   the jitter, the dump format and file, a sample taken from the real stack on the big-endian
-  build), `tests/tools/test_wl_profile.py` (parser, symbols, stacks, tables, the command line over
+  build), `tests/platform/test_platform_profile_arm.c` (the control file's parser, the step function against a
+  fake program, the watcher over a fake clock and sampler, and on a thread; also big-endian),
+  `tests/tools/test_wl_profile.py` (parser, symbols, stacks, tables, the command line over
   an ELF made with the host compiler), and `check_profile` in the console runner (a busy loop and
   a second thread under the real decrementer: the samples land in the loop, name its caller and the
   thread, are about 1 ms apart and not evenly, and stop when stopped).

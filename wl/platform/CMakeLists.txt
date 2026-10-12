@@ -6,7 +6,7 @@
 #   ppc-be - the host stubs too (big-endian Linux under qemu, for tests)
 add_library(wl_platform STATIC
     mem_heap.c mem.c heap_overflow.c heap_sites.c ring.c io.c fs.c gx_common.c stack.c tev.c backtrace.c net.c
-    posix.c present.c profile.c stop.c)
+    posix.c present.c profile.c profile_arm.c stop.c)
 wl_target_defaults(wl_platform)
 target_link_libraries(wl_platform PUBLIC wl_base)
 
