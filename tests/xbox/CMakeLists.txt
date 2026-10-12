@@ -5,6 +5,12 @@ endif()
 wl_add_test(test_xbox_psh SOURCES test_xbox_psh.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_psh_cache SOURCES test_xbox_psh_cache.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_nv2a SOURCES test_xbox_nv2a.c LIBS wl_xbox LABELS unit be)
+# the register numbers against another public table, when one is checked out (test-only, read as text)
+set(WL_XBOXRECOMP_DIR "$ENV{HOME}/GitHub/xboxrecomp" CACHE PATH "an xboxrecomp checkout for test_xbox_nv2a_regs")
+wl_add_test(test_xbox_nv2a_regs SOURCES test_xbox_nv2a_regs.c LIBS wl_xbox LABELS unit be)
+target_compile_definitions(test_xbox_nv2a_regs PRIVATE
+    WL_NV2A_REGS_MINE="${PROJECT_SOURCE_DIR}/wl/xbox/nv2a_regs.h"
+    WL_NV2A_REGS_THEIRS="${WL_XBOXRECOMP_DIR}/src/nv2a/nv2a_regs.h")
 wl_add_test(test_xbox_nv2a_kelvin SOURCES test_xbox_nv2a_kelvin.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_nv2a_texture SOURCES test_xbox_nv2a_texture.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_nv2a_gx SOURCES test_xbox_nv2a_gx.c LIBS wl_xbox_gx LABELS unit be)
