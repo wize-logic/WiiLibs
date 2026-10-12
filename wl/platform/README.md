@@ -36,6 +36,9 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `backtrace.h`, `backtrace.c` | return-address backtraces for the 32-bit PowerPC frame layout: a portable walker over a read callback, `wl_platform_backtrace` for the running thread, `wl_platform_log_backtrace` for a "where from" log line; see below |
 | `profile.h`, `profile.c` | the sampling profiler: a ring of samples (the interrupted pc, link register, thread and the return addresses up its stack), the text dumps, the jitter; `wii/profile_wii.c` is the sampler over libogc's decrementer tick tasks; `tools/wl_profile.py` symbolizes the dumps; see below |
 | `overlay.h`, `overlay.c` | drawing for a frame overlay: rectangles, outlines, gauges and text in a built-in 5 by 7 font, as quads through `wl_gx_draw`; see "Frame overlay" |
+| `home_menu.h`, `home_menu.c`, `home_menu_draw.c`, `home_internal.h` | the HOME button's menu and the Wii's notices (a Remote with nothing to move with, a weak battery) as a state machine with no console in it, configured by `WlHomeConfig` (texts, an optional reset item, the Classic Controller's buttons, times), and its drawing through the overlay; see "HOME menu and wrist strap reminder" |
+| `strap_screen.h`, `strap_screen.c`, `strap_screen_draw.c` | the wrist strap reminder: a plain screen at the start, the controllers ignored for a second, A goes on; configured by `WlStrapConfig`; see the same section |
+| `home_shell.h`, `home_shell.c` | both of those joined to the console and the frame overlay: the sound fade, the leave, the overlay hooked only while something shows, the reminder before the menu, flags for a rumble thread |
 | `audio_gain.h`, `audio_gain.c` | the audio output's master gain (`wl_platform_audio_fade`): a linear ramp applied to each block after the program's fill function; see "Audio fade" |
 | `stop.h`, `stop.c`, `stop_backend.h` | the bring-up text console (libogc's, in one of the video's framebuffers) and the stop screen: a message on it and in the log, then a wait for HOME or START to leave; `wl_platform_missing_symbol` is what `tools/link_stubs.py` points its stubs at; `wii/stop_wii.c` and `host/stop_host.c` are the backends; see "Console and stop screen" |
 | `profile_arm.h`, `profile_arm.c` | arming the profiler from a control file (`profile.txt` in the program's folder): the settings' parser, the watcher thread that waits for the program's own readiness hooks, samples for a time and writes `profile<N>.txt`; see "Arming it from a file" under the sampling profiler |
@@ -553,6 +556,65 @@ test. Two calls between two blocks make one: the last wins, from where the ramp 
 three atomics, so any thread may call it; `wl_platform_audio_gain()` returns the last target. Test:
 `test_platform_audio_fade` (untouched at 1, at once for 0 ms, the ramp's shape and end, continuing from
 the middle of a ramp, clamping, set before the output starts).
+
+`wl_overlay_text_drawable(text)` says whether every character of a string has a glyph of its own (lower
+case counts, a newline counts), for checking the words a program gives its menus.
+
+## HOME menu and wrist strap reminder (`home_menu.h`, `strap_screen.h`, `home_shell.h`)
+
+What a Wii program that pauses for HOME needs, with nothing of any game in it. Three layers, each usable
+without the next.
+
+**`home_menu.h`: the menu and the notices.** `WlHomeMenu` is a state machine with no console in it:
+`wl_home_menu_step(menu, raw, extra_nav, home_extra, world, now_us, ops)` is given the controllers each time
+the program reads them (`extra_nav` and `home_extra` are for a controller the console does not have, such as
+a scripted one) and calls its `WlHomeOps` (pause, sound fade, reset, leave, a visible flag, a log line; each
+may be NULL). HOME (a Remote's, or a Classic Controller's own) opens the menu, Resume / Reset / Return to the
+loader (asked about first); HOME again or B closes it; the pause is made only if the program was not paused
+already; the buttons held as it closes are kept from the program (`wl_home_menu_blocks_input`) until let go
+or a time. The notices need no menu: a Remote with no Nunchuk or Classic Controller while a player is on it
+in play, and a weak battery (looked at every two seconds, told once per fall, a 0 before the first status
+report not counted). What a program may set is in `WlHomeConfig` (`wl_home_config_default()` fills it):
+
+| Field | Meaning |
+|---|---|
+| `title`, `resume_label`, `loader_label`, `confirm_text`, `cancel_label`, `batteries_heading`, `remote_label`, `hint_menu`, `hint_confirm` | the words (NULL: the default) |
+| `reset_label` | NULL: no reset item; else the item is there while `world.in_play`, and `ops.reset` is called after the menu has closed and resumed the program |
+| `notice_battery`, `notice_no_extension` | the notices' templates (`{port}` is the Remote's number, `{percent}` the battery); NULL: that notice is never given |
+| `classic_swap` | false: the Classic Controller's A accepts and B goes back, as the Wii's menus have them; true: swapped |
+| `stick_threshold` | a stick counts as up or down beyond this (64) |
+| `fade_ms`, `no_extension_us`, `notice_us`, `battery_check_us`, `swallow_us`, `battery_low`, `battery_good` | the times and levels (0: the default of each: 300 ms, 1.5 s, 7 s, 2 s, 1.5 s, 10 %, 15 %) |
+
+`wl_home_navigation(raw, config)` is what the controllers give the menu, as bits of `WL_HOME_NAV_*` (the
+Remote's D-pad, 1, 2, A and B; the Classic Controller's; the stick of a Nunchuk or Classic Controller; a
+GameCube pad's). `home_menu_draw.c` draws the menu and the notices with `overlay.h`
+(`wl_home_menu_draw`, `wl_home_menu_draw_notices`), between the caller's `wl_overlay_begin` and
+`wl_overlay_end`. The text is in the overlay's font; `wl_overlay_text_drawable` checks it.
+
+**`strap_screen.h`: the reminder.** `WlStrapScreen` shows a plain screen at the first look (when enabled):
+a title, up to six lines (one of them kept for a Nunchuk, shown only while one is connected) and a prompt
+that is dim until the controllers stop being ignored (a second) and lit after. A fresh press of A after
+that goes on; an A held from before, or through the second, does not; the program is kept from the A until
+it is let go (or 1.5 s). It is shown once. `WlStrapConfig` has the words, `classic_swap` and the two times.
+`wl_strap_screen_draw` draws it.
+
+**`home_shell.h`: both on the console.** `WlHomeShell` owns a menu and a reminder and does the console's
+part: `wl_platform_audio_fade` for the sound, `wl_platform_exit(WL_EXIT_LOADER)` for the leave (or the
+program's own hook), and the overlay (`wl_gx_set_overlay`) hooked only while the menu, a notice or the
+reminder shows, so a closed menu costs the frame nothing. The program fills a `WlHomeShellOps`
+(`set_paused`, `reset`, `leave_for_loader`, `log`, and two that read the program: `world`, asked for each
+look at the menu and not while the reminder is up, and `strap_enabled`, asked once at the first poll, so
+that the program's settings can be read late), calls `wl_home_shell_poll(shell, raw, now_us, extra_nav,
+home_extra)` each time it reads the controllers, and shows its game no controller while
+`wl_home_shell_blocks_input` is true and no rumble while `wl_home_shell_open` is (both safe from any
+thread). The reminder takes the controllers first: HOME does nothing under it. The shell owns the
+overlay hook and must not be moved once initialised.
+
+Tests: `test_platform_home_menu` (opening and closing, the items, the confirmation, held buttons, each
+controller's navigation, the notices' timing and debounce, the configuration, the words drawn),
+`test_platform_strap_screen` (the first second, held A, each controller, the words, the configuration),
+`test_platform_home_shell` (the overlay hooked and let go, the sound, the program's hooks, the reminder
+before the menu), all on the host backend and the big-endian build.
 
 ## Hardware facts behind the rules
 

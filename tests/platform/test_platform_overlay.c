@@ -151,6 +151,17 @@ TEST glyphs_are_the_font_and_lower_case_folds_to_capitals(void) {
     PASS();
 }
 
+TEST text_is_drawable_when_every_character_has_a_glyph(void) {
+    ASSERT(wl_overlay_text_drawable(""));
+    ASSERT(wl_overlay_text_drawable("A: CHOOSE   B OR HOME: RESUME"));
+    ASSERT(wl_overlay_text_drawable("lower case is folded\nand a newline is fine (100%)"));
+    ASSERT(!wl_overlay_text_drawable("a tilde ~ is a box"));
+    ASSERT(!wl_overlay_text_drawable("{port}"));
+    ASSERT(!wl_overlay_text_drawable("tab\there"));
+    ASSERT(!wl_overlay_text_drawable("\xC3\xA9")); // UTF-8 is not in the font
+    PASS();
+}
+
 TEST text_measures_by_cell_and_scale(void) {
     ASSERT_EQ(0, wl_overlay_text_width(2, ""));
     ASSERT_EQ(5, wl_overlay_text_width(1, "A"));               // 5 pixels of the cell's 6
@@ -218,6 +229,7 @@ SUITE(overlay_suite) {
     RUN_TEST(a_rectangle_is_a_quad_and_empty_or_clear_ones_are_not_drawn);
     RUN_TEST(an_outline_is_four_rectangles_and_a_gauge_fills_its_fraction);
     RUN_TEST(glyphs_are_the_font_and_lower_case_folds_to_capitals);
+    RUN_TEST(text_is_drawable_when_every_character_has_a_glyph);
     RUN_TEST(text_measures_by_cell_and_scale);
     RUN_TEST(text_is_runs_of_pixels_with_a_shadow_beneath);
     RUN_TEST(a_full_batch_is_sent_and_the_rest_follows);
