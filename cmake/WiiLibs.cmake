@@ -216,3 +216,117 @@ function(wl_add_fma_check target)
         COMMENT "Checking ${target} for fused multiply-adds"
         COMMAND_EXPAND_LISTS VERBATIM)
 endfunction()
+
+# wl_add_xbox_title(<target> XBE <default.xbe> [TITLE_CONFIG <json>] [OPT <-Os|-O2|...>]
+#                   [SOURCES <files>...] [RUNTIME <targets>...] [CHUNKS <n>] [NO_EXECUTABLE])
+# Recompiles an Xbox title for this platform. At build time tools/xbox_recomp.py runs xboxrecomp's
+# pipeline (vendored in third_party/xboxrecomp, WiiLibs' patches applied in the build tree) on the
+# XBE: parse, disassemble every executable section, identify, recover the calling conventions,
+# lift to C. Its output stays in the build tree (${CMAKE_CURRENT_BINARY_DIR}/<target>_recomp/:
+# derived from the title's code, never commit it); each stage reruns only when its inputs change.
+# The C is compiled into the object library <target>_code with the flags it needs
+# (-ffp-contract=off -fno-strict-aliasing -w, OPT, default -Os; on the Wii -msdata=eabi and
+# WL_XB_EA_BASE_ZERO) against WiiLibs' big-endian runtime header (wl/xboxrt/recomp/recomp_types.h,
+# README.md there lists the symbols a runtime must define). Then the executable <target>: SOURCES
+# (the title project's own code: hand-written overrides, data) plus the generated code, linked with
+# RUNTIME (default WiiLibs::xboxrt). On the Wii it also gets its .dol (ogc_create_dol).
+# TITLE_CONFIG is the title's JSON (tools/xbox_recomp.py documents the keys: manual functions,
+# seeds, extra options). CHUNKS (default 32) is how many translation units the code is spread over.
+# NO_EXECUTABLE makes only <target>_code. The driver's Python needs capstone; set
+# WL_XBOX_RECOMP_PYTHON to choose the interpreter.
+set(WL_CMAKE_DIR ${CMAKE_CURRENT_LIST_DIR})
+function(wl_add_xbox_title target)
+    cmake_parse_arguments(A "NO_EXECUTABLE" "XBE;TITLE_CONFIG;OPT;CHUNKS" "SOURCES;RUNTIME" ${ARGN})
+    if(A_UNPARSED_ARGUMENTS)
+        message(FATAL_ERROR "wl_add_xbox_title(${target}): unexpected arguments ${A_UNPARSED_ARGUMENTS}")
+    endif()
+    if(NOT A_XBE)
+        message(FATAL_ERROR "wl_add_xbox_title(${target}): XBE is required")
+    endif()
+    get_filename_component(xbe "${A_XBE}" ABSOLUTE)
+    if(NOT A_OPT)
+        set(A_OPT -Os)
+    endif()
+    if(NOT A_CHUNKS)
+        set(A_CHUNKS 32)
+    endif()
+    get_filename_component(wl_root "${WL_CMAKE_DIR}/.." ABSOLUTE)
+    set(driver ${wl_root}/tools/xbox_recomp.py)
+    if(WL_XBOX_RECOMP_PYTHON)
+        set(python ${WL_XBOX_RECOMP_PYTHON})
+    else()
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        set(python ${Python3_EXECUTABLE})
+    endif()
+    execute_process(COMMAND ${python} -c "import capstone" RESULT_VARIABLE no_capstone
+                    OUTPUT_QUIET ERROR_QUIET)
+    if(no_capstone)
+        message(FATAL_ERROR "wl_add_xbox_title(${target}): ${python} has no capstone module "
+            "(pip install capstone), which xboxrecomp's disassembler needs; or set WL_XBOX_RECOMP_PYTHON")
+    endif()
+
+    set(out ${CMAKE_CURRENT_BINARY_DIR}/${target}_recomp)
+    set(stamp ${out}/xbox_recomp.stamp)
+    set(units "")
+    math(EXPR last "${A_CHUNKS} - 1")
+    foreach(i RANGE ${last})
+        if(i LESS 10)
+            set(i "0${i}")
+        endif()
+        list(APPEND units ${out}/tu/recomp_tu_${i}.c)
+    endforeach()
+    list(APPEND units ${out}/tu/recomp_tu_dispatch.c ${out}/tu/recomp_tu_stubs.c)
+    # rerun when the pipeline, its patches or the driver change (the driver's own stage cache
+    # decides what actually reruns)
+    file(GLOB_RECURSE pipeline_files CONFIGURE_DEPENDS
+        ${wl_root}/third_party/xboxrecomp/tools/*.py ${wl_root}/third_party/xboxrecomp/patches/*.patch)
+    set(cmd ${python} ${driver} run ${xbe} -o ${out} --chunks ${A_CHUNKS} --stamp ${stamp} --quiet)
+    set(deps ${xbe} ${driver} ${wl_root}/third_party/xboxrecomp/UPSTREAM.json ${pipeline_files})
+    if(A_TITLE_CONFIG)
+        get_filename_component(config "${A_TITLE_CONFIG}" ABSOLUTE)
+        list(APPEND cmd --config ${config})
+        list(APPEND deps ${config})
+    endif()
+    add_custom_command(OUTPUT ${stamp}
+        BYPRODUCTS ${units}
+        COMMAND ${cmd}
+        DEPENDS ${deps}
+        COMMENT "Recompiling ${xbe} (xboxrecomp pipeline)"
+        VERBATIM)
+    add_custom_target(${target}_recomp DEPENDS ${stamp})
+
+    add_library(${target}_code OBJECT ${units})
+    add_dependencies(${target}_code ${target}_recomp)
+    set_source_files_properties(${units} PROPERTIES GENERATED TRUE)
+    set_target_properties(${target}_code PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+    target_include_directories(${target}_code PUBLIC ${wl_root}/wl/xboxrt/recomp ${out}/gen)
+    target_compile_options(${target}_code PRIVATE ${A_OPT} -ffp-contract=off -fno-strict-aliasing -w)
+    if(WL_PLATFORM STREQUAL "wii")
+        # guest memory is mapped at effective address 0 (the runtime's MMU setup), and the register
+        # globals are reached through r13 (devkitPPC's crt0 sets it; libogc's own code uses data)
+        target_compile_definitions(${target}_code PUBLIC WL_XB_EA_BASE_ZERO)
+        target_compile_options(${target}_code PRIVATE -msdata=eabi)
+    endif()
+    if(A_NO_EXECUTABLE)
+        return()
+    endif()
+
+    add_executable(${target} ${A_SOURCES})
+    target_link_libraries(${target} PRIVATE ${target}_code)
+    if(A_RUNTIME)
+        target_link_libraries(${target} PRIVATE ${A_RUNTIME})
+    elseif(TARGET WiiLibs::xboxrt)
+        target_link_libraries(${target} PRIVATE WiiLibs::xboxrt)
+    else()
+        # TODO(xboxrt): WiiLibs' Xbox runtime (wl/xboxrt, target WiiLibs::xboxrt: guest memory,
+        # register file, threads, kernel, devices) is being written; until it exists a title links
+        # whatever RUNTIME it passes, or its SOURCES must define the runtime ABI themselves
+        # (wl/xboxrt/recomp/README.md).
+        message(WARNING "wl_add_xbox_title(${target}): WiiLibs::xboxrt does not exist yet and no "
+            "RUNTIME was given; the link needs the runtime ABI from SOURCES")
+    endif()
+    target_link_libraries(${target} PRIVATE m)
+    if(WL_PLATFORM STREQUAL "wii")
+        ogc_create_dol(${target})
+    endif()
+endfunction()

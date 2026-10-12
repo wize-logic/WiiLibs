@@ -95,3 +95,9 @@ endif()
 add_test(NAME test_link_stubs
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_link_stubs.py ${link_stubs_library_args})
 set_tests_properties(test_link_stubs PROPERTIES LABELS unit)
+
+# the recompilation driver (tools/xbox_recomp.py) on upstream's synthetic XBE: stages, caching, the
+# title config, the patched pipeline (skipped without capstone)
+add_test(NAME test_xbox_recomp_driver
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_xbox_recomp.py)
+set_tests_properties(test_xbox_recomp_driver PROPERTIES LABELS unit SKIP_RETURN_CODE 77)

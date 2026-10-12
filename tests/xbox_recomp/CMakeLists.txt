@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # The Xbox recompilation toolchain: the runtime header generated code includes
 # (wl/xboxrt/recomp/recomp_types.h), xboxrecomp's pipeline as WiiLibs patches it, the correctness net
-# against the x86 CPU.
+# against the x86 CPU, and wl_add_xbox_title on a synthetic title.
 set(recomp_include ${PROJECT_SOURCE_DIR}/wl/xboxrt/recomp)
 
 if(NOT WL_PLATFORM STREQUAL "wii")
@@ -42,4 +42,30 @@ if(WL_PLATFORM STREQUAL "host")
         set_tests_properties(xboxrecomp_pytest xbox_recomp_conformance xbox_recomp_e2e
             PROPERTIES DISABLED TRUE)
     endif()
+endif()
+
+if(no_capstone)
+    message(STATUS "${Python3_EXECUTABLE} has no capstone: the synthetic Xbox title is skipped")
+    return()
+endif()
+
+# wl_add_xbox_title on the synthetic XBE upstream's mkxbe.py writes (five leaf functions), linked
+# with a stand-in runtime; run on the host and ppc-be, built for the Wii (with its .dol)
+set(synth_xbe ${CMAKE_CURRENT_BINARY_DIR}/synth.xbe)
+set(mkxbe ${PROJECT_SOURCE_DIR}/third_party/xboxrecomp/tools/conformance/mkxbe.py)
+add_custom_command(OUTPUT ${synth_xbe}
+    COMMAND ${Python3_EXECUTABLE} ${mkxbe} ${synth_xbe}
+    DEPENDS ${mkxbe}
+    COMMENT "Synthetic XBE (xboxrecomp's mkxbe.py)"
+    VERBATIM)
+add_library(xbox_recomp_stub_runtime STATIC title/stub_runtime.c)
+target_include_directories(xbox_recomp_stub_runtime SYSTEM PRIVATE ${recomp_include})
+if(WL_PLATFORM STREQUAL "wii")
+    target_compile_definitions(xbox_recomp_stub_runtime PRIVATE WL_XB_EA_BASE_ZERO)
+endif()
+wl_add_xbox_title(xbox_synth_title XBE ${synth_xbe} CHUNKS 4
+    SOURCES title/synth_main.c RUNTIME xbox_recomp_stub_runtime)
+if(NOT WL_PLATFORM STREQUAL "wii")
+    add_test(NAME xbox_recomp_synthetic_title COMMAND xbox_synth_title)
+    set_tests_properties(xbox_recomp_synthetic_title PROPERTIES LABELS "unit;be")
 endif()
