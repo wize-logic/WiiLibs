@@ -11,6 +11,7 @@ static bool g_remote_rumble[WL_INPUT_MAX_REMOTES];
 static bool g_pad_rumble[WL_INPUT_MAX_PADS];
 static bool g_started;
 static bool g_rumble_allowed = true;
+static WlSoundMode g_sound_mode = WL_SOUND_STEREO;
 
 WlResult wl_platform_input_init(void) {
     g_started = true;
@@ -24,6 +25,14 @@ void wl_platform_input_shutdown(void) {
 
 bool wl_platform_rumble_enabled(void) {
     return g_rumble_allowed;
+}
+
+WlSoundMode wl_platform_sound_mode(void) {
+    return g_sound_mode;
+}
+
+void wl_host_sound_mode(WlSoundMode mode) {
+    g_sound_mode = mode;
 }
 
 void wl_platform_input_stop_rumble(void) {

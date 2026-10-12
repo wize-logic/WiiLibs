@@ -290,6 +290,19 @@ bool wl_platform_rumble_enabled(void) {
     return setting != 0;
 }
 
+WlSoundMode wl_platform_sound_mode(void) {
+    // SYSCONF's "IPL.SND": 0 mono, 1 stereo, 2 surround; negative when it cannot be read.
+    (void)CONF_Init(); // idempotent
+    switch (CONF_GetSoundMode()) {
+    case 0:
+        return WL_SOUND_MONO;
+    case 2:
+        return WL_SOUND_SURROUND;
+    default:
+        return WL_SOUND_STEREO;
+    }
+}
+
 void wl_platform_input_stop_rumble(void) {
     if (!g_init) {
         return; // (WPAD and PAD are not started: no motor can be running)

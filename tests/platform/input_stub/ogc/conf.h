@@ -17,3 +17,4 @@ typedef int32_t s32;
 
 s32 CONF_Init(void);
 s32 CONF_GetPadMotorMode(void);
+s32 CONF_GetSoundMode(void);

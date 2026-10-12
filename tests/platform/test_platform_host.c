@@ -60,6 +60,10 @@ TEST input_returns_the_preloaded_state(void) {
     ASSERT(wl_host_remote_rumble(2) && !wl_host_remote_rumble(1));
     ASSERT(wl_host_pad_rumble(3));
     wl_platform_rumble(9, true); // out of range: ignored
+    ASSERT_EQ(WL_SOUND_STEREO, wl_platform_sound_mode());
+    wl_host_sound_mode(WL_SOUND_MONO);
+    ASSERT_EQ(WL_SOUND_MONO, wl_platform_sound_mode());
+    wl_host_sound_mode(WL_SOUND_STEREO);
     wl_platform_input_shutdown();
     PASS();
 }

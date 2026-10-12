@@ -869,6 +869,13 @@ void wl_platform_pad_rumble(uint8_t pad, bool on);
 // wl_platform_rumble and wl_platform_pad_rumble do nothing but stop the motor while it is off.
 // Host stub: true unless a test says otherwise.
 bool wl_platform_rumble_enabled(void);
+// The console's sound setting (Wii Settings, Sound: SYSCONF's "IPL.SND" through libogc's
+// CONF_GetSoundMode). The output plays what `fill` made; a program that honours the setting (a
+// mono downmix) does so in its mixer. Read at each call. A setting that cannot be read, or that
+// is not one of the three, is WL_SOUND_STEREO. Host stub: stereo unless a test says otherwise
+// (wl_host_sound_mode).
+typedef enum { WL_SOUND_MONO = 0, WL_SOUND_STEREO = 1, WL_SOUND_SURROUND = 2 } WlSoundMode;
+WlSoundMode wl_platform_sound_mode(void);
 // Stops every Wii Remote's and GameCube controller's motor, whatever asked for it. Safe to call
 // from any thread, before or after wl_platform_input_init (nothing is touched while the input
 // is not started). wl_platform_exit and the stop screen call it; wl_platform_input_shutdown does
