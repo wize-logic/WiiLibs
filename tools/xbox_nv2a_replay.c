@@ -6,9 +6,12 @@
 // and, with --png, each frame drawn by the software reference of the GX backend
 // (wl/xbox/nv2a_raster.h) as a PNG.
 //
-// usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png DIR] [--bilinear]
-//   -v     a line for each clear, draw, frame and flip; -vv also each draw's raster state
-//   --png  DIR/frame_NNNN.png for each frame shown
+// usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png DIR] [--bilinear] [--programs FILE]
+//   -v          a line for each clear, draw, frame and flip; -vv also each draw's raster state
+//   --png       DIR/frame_NNNN.png for each frame shown
+//   --programs  each vertex program drawn with, once, as tools/xbox_vsh_codegen.c's input (C text:
+//               a header word with the instruction count in its high half, four words an
+//               instruction), for compiling a title's programs ahead of time
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,8 +31,42 @@ static void tee_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
     t->b.clear(t->b.user, k, flags);
 }
 
+static FILE *g_programs;
+static unsigned long g_program_hashes[1024];
+static unsigned g_program_count;
+
+// a vertex program not met before, written out
+static void program_seen(const WlNv2aKelvin *k) {
+    const uint32_t *words;
+    unsigned long count, hash, i;
+
+    if (g_programs == NULL || !wl_nv2a_program_mode(k)) {
+        return;
+    }
+    wl_nv2a_program(k, &words, &count);
+    if (count == 0) {
+        return;
+    }
+    hash = wl_xbox_vsh_hash(words, count);
+    for (i = 0; i < g_program_count; i++) {
+        if (g_program_hashes[i] == hash) {
+            return;
+        }
+    }
+    if (g_program_count < sizeof g_program_hashes / sizeof g_program_hashes[0]) {
+        g_program_hashes[g_program_count++] = hash;
+    }
+    fprintf(g_programs, "/* program %u: %lu instructions, hash %08lx */\n\t0x%08lX,\n", g_program_count - 1, count,
+            hash, (count << 16) | 0x2078ul);
+    for (i = 0; i < count; i++) {
+        fprintf(g_programs, "\t0x%08X, 0x%08X, 0x%08X, 0x%08X,\n", (unsigned)words[4 * i], (unsigned)words[4 * i + 1],
+                (unsigned)words[4 * i + 2], (unsigned)words[4 * i + 3]);
+    }
+}
+
 static uint32_t tee_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
     Tee *t = user;
+    program_seen(k);
     (void)t->a.draw(t->a.user, k, draw);
     return t->b.draw(t->b.user, k, draw);
 }
@@ -100,7 +137,7 @@ static void on_created(void *user, WlNv2a *dev) {
 }
 
 static int usage(void) {
-    fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png DIR] [--bilinear]\n");
+    fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png DIR] [--bilinear] [--programs FILE]\n");
     return 2;
 }
 
@@ -129,6 +166,13 @@ int main(int argc, char **argv) {
             g_png_dir = argv[++i];
         } else if (strcmp(argv[i], "--bilinear") == 0) {
             bilinear = true;
+        } else if (strcmp(argv[i], "--programs") == 0 && i + 1 < argc) {
+            g_programs = fopen(argv[++i], "w");
+            if (g_programs == NULL) {
+                fprintf(stderr, "cannot write %s\n", argv[i]);
+                return 1;
+            }
+            fprintf(g_programs, "/* NV2A vertex programs a capture drew with (xbox_nv2a_replay --programs) */\n");
         } else if (argv[i][0] == '-' || path != NULL) {
             return usage();
         } else {
@@ -196,6 +240,10 @@ int main(int argc, char **argv) {
     printf("raster: %u draws, %u triangles (%u culled), %u pixels, %u frames, %u combiner programs beyond GX\n",
            (unsigned)rs.draws, (unsigned)rs.triangles, (unsigned)rs.culled, (unsigned)rs.pixels, (unsigned)rs.frames,
            (unsigned)rs.programs_unusable);
+    if (g_programs != NULL) {
+        printf("programs: %u distinct vertex programs written\n", g_program_count);
+        fclose(g_programs);
+    }
     wl_nv2a_raster_destroy(g_raster);
     free(data);
     return 0;

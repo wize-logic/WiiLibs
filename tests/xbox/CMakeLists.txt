@@ -21,7 +21,8 @@ if(WL_PLATFORM STREQUAL "host")
     set_tests_properties(test_xbox_nv2a_raster PROPERTIES ENVIRONMENT "WL_NV2A_CAPTURE_OUT=${nv2a_capture}"
         FIXTURES_SETUP nv2a_capture)
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay)
-    add_test(NAME xbox_nv2a_replay COMMAND xbox_nv2a_replay ${nv2a_capture} -v --png ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay)
+    add_test(NAME xbox_nv2a_replay COMMAND xbox_nv2a_replay ${nv2a_capture} -v --png ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay
+        --programs ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay/programs.inc)
     set_tests_properties(xbox_nv2a_replay PROPERTIES LABELS unit FIXTURES_REQUIRED nv2a_capture
         PASS_REGULAR_EXPRESSION "2 draws.*frame_0000.png|frame_0000.png.*2 draws")
 endif()

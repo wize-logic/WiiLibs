@@ -204,8 +204,13 @@ wl_nv2a_capture_frames(dev, &sink, 2);     // close the file once wl_nv2a_captur
 The host tool prints what was drawn and, with `--png`, each frame from the software reference:
 
 ```sh
-xbox_nv2a_replay nv2a.capture -v --png frames/
+xbox_nv2a_replay nv2a.capture -v --png frames/ --programs programs.inc
+xbox_vsh_codegen programs.inc programs.c     # the title's programs as C, for WlNv2aGxConfig.natives
 ```
+
+`--programs` writes each vertex program the capture drew with, once, as `tools/xbox_vsh_codegen.c`'s
+input: a title project compiles them ahead of time and hands the table to the GX backend, so its
+programs run as functions rather than through the interpreter.
 
 ## The NV2A's tests
 
