@@ -6,18 +6,21 @@
 #include <ogc/lwp.h>
 #include <ogc/mutex.h>
 #include <ogc/semaphore.h>
+#include <pthread.h>
 #include <time.h>
+#include <tuxedo/thread.h>
 
 #include "wl/platform/platform.h"
+#include "wl/platform/posix.h"
 
 #define MIN_STACK 4096u
 
 // LWP priority numbers (0 idle .. 127 highest), indexed by WlThreadPriority.
 static const uint8_t k_lwp_prio[] = {
-    32,  // WL_THREAD_PRIO_IO    below main
-    64,  // WL_THREAD_PRIO_MAIN
-    80,  // WL_THREAD_PRIO_NET   above main
-    100, // WL_THREAD_PRIO_AUDIO high
+    32,                 // WL_THREAD_PRIO_IO    below main
+    WL_POSIX_PRIO_MAIN, // WL_THREAD_PRIO_MAIN  (posix.h places pthreads around it)
+    80,                 // WL_THREAD_PRIO_NET   above main
+    100,                // WL_THREAD_PRIO_AUDIO high
 };
 
 static bool g_main_pinned;
@@ -140,4 +143,19 @@ void wl_platform_mutex_unlock(WlPlatformMutex mutex) {
 
 void wl_platform_mutex_destroy(WlPlatformMutex mutex) {
     (void)LWP_MutexDestroy(mutex.id);
+}
+
+// A pthread_t is libogc's thread: the block devkitPPC's pthread_create allocates begins with the
+// KThread. A thread that is not one (an id that is not a live thread's) shows as a priority past
+// the lowest, or not at all.
+WlResult wl_posix_thread_set_priority(pthread_t thread, uint32_t priority) {
+    KThread *kernel_thread = (KThread *)(uintptr_t)thread;
+    if (priority > WL_POSIX_PRIO_MIN) {
+        return WL_ERR_ARG;
+    }
+    if (kernel_thread == NULL || kernel_thread->prio > KTHR_MIN_PRIO) {
+        return WL_ERR_STATE;
+    }
+    KThreadSetPrio(kernel_thread, (u16)priority);
+    return WL_OK;
 }

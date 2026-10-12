@@ -210,3 +210,9 @@ WlResult wl_platform_fs_mkdir(const char *path) {
     }
     return fs_errno_result(e);
 }
+
+bool wl_platform_fs_exists(const char *path) {
+    char real[WL_FS_PATH_MAX + 64];
+    struct stat st;
+    return fs_resolve(path, real, sizeof real) == WL_OK && stat(real, &st) == 0;
+}

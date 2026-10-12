@@ -3,6 +3,7 @@
 #include "wl/platform/fs.h"
 
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 #define MEASURE_MIN_CHUNK 512u // one SD sector
@@ -44,6 +45,64 @@ bool wl_fs_path_device(const char *path, WlDevice *out) {
         return true;
     }
     return false;
+}
+
+// True for a relative path with no ".." component and no backslash.
+static bool path_is_plain(const char *path) {
+    const char *part = path;
+    for (;;) {
+        size_t n = strcspn(part, "/");
+        if ((n == 2 && part[0] == '.' && part[1] == '.') || memchr(part, '\\', n) != NULL) {
+            return false;
+        }
+        if (part[n] == '\0') {
+            return true;
+        }
+        part += n + 1u;
+    }
+}
+
+static WlResult copy_out(char *out, size_t size, const char *dir, WlResult result) {
+    size_t n = strlen(dir);
+    if (n >= size) {
+        return WL_ERR_ARG;
+    }
+    memcpy(out, dir, n + 1u);
+    return result;
+}
+
+WlResult wl_platform_fs_find_app_dir(const char *app_name, const char *marker, char *out, size_t size) {
+    static const char *const prefix[2] = {"sd:/apps/", "usb:/apps/"};
+    char dir[2][WL_FS_PATH_MAX];
+
+    if (app_name == NULL || out == NULL || size == 0 || app_name[0] == '\0' || app_name[0] == '.' ||
+        strchr(app_name, '/') != NULL || !path_is_plain(app_name)) {
+        return WL_ERR_ARG;
+    }
+    if (marker == NULL) {
+        marker = "";
+    }
+    if (marker[0] == '/' || !path_is_plain(marker)) {
+        return WL_ERR_ARG;
+    }
+    for (int device = 0; device < 2; device++) {
+        int n = snprintf(dir[device], sizeof dir[device], "%s%s", prefix[device], app_name);
+        if (n < 0 || (size_t)n >= sizeof dir[device]) {
+            return WL_ERR_ARG;
+        }
+    }
+    for (int device = 0; device < 2; device++) {
+        char full[WL_FS_PATH_MAX + 64];
+        int n = marker[0] != '\0' ? snprintf(full, sizeof full, "%s/%s", dir[device], marker)
+                                  : snprintf(full, sizeof full, "%s", dir[device]);
+        if (n < 0 || (size_t)n >= WL_FS_PATH_MAX) {
+            return WL_ERR_ARG;
+        }
+        if (wl_platform_fs_exists(full)) {
+            return copy_out(out, size, dir[device], WL_OK);
+        }
+    }
+    return copy_out(out, size, dir[WL_DEVICE_SD], WL_ERR_NOT_FOUND);
 }
 
 static void count_read(WlResult r, uint32_t bytes) {

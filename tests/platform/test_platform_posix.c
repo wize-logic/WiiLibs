@@ -244,6 +244,68 @@ TEST pause_returns_after_a_signal_handler_ran(void) {
     PASS();
 }
 
+TEST sysconf_answers_for_the_console(void) {
+    errno = 0;
+    ASSERT_EQ(4096, wl_posix_sysconf(_SC_PAGESIZE, 0));
+    ASSERT_EQ((88L << 20) / 4096, wl_posix_sysconf(_SC_PHYS_PAGES, 0));
+    // the free memory is counted in whole pages
+    ASSERT_EQ(0, wl_posix_sysconf(_SC_AVPHYS_PAGES, 0));
+    ASSERT_EQ(0, wl_posix_sysconf(_SC_AVPHYS_PAGES, 4095));
+    ASSERT_EQ(1, wl_posix_sysconf(_SC_AVPHYS_PAGES, 4096));
+    ASSERT_EQ(5, wl_posix_sysconf(_SC_AVPHYS_PAGES, 5u * 4096u + 100u));
+    ASSERT_EQ(1, wl_posix_sysconf(_SC_NPROCESSORS_ONLN, 0));
+    ASSERT_EQ(1, wl_posix_sysconf(_SC_NPROCESSORS_CONF, 0));
+    ASSERT_EQ(0, errno);
+    errno = 0;
+    ASSERT_EQ(-1, wl_posix_sysconf(-12345, 0));
+    ASSERT_EQ(EINVAL, errno);
+    errno = 0;
+    ASSERT_EQ(-1, wl_posix_sysconf(_SC_CLK_TCK, 0));
+    ASSERT_EQ(EINVAL, errno);
+    PASS();
+}
+
+TEST relative_priority_is_main_less_the_steps(void) {
+    ASSERT_EQ(64u, WL_POSIX_PRIO_MAIN);
+    ASSERT_EQ(64u, wl_posix_priority_above_main(0));
+    // a step above main is a smaller number: libogc runs 0 first
+    ASSERT_EQ(63u, wl_posix_priority_above_main(1));
+    ASSERT_EQ(62u, wl_posix_priority_above_main(2));
+    ASSERT_EQ(65u, wl_posix_priority_above_main(-1));
+    ASSERT_EQ(66u, wl_posix_priority_above_main(-2));
+    // clamped to 15 steps either way
+    ASSERT_EQ(49u, wl_posix_priority_above_main(15));
+    ASSERT_EQ(49u, wl_posix_priority_above_main(16));
+    ASSERT_EQ(49u, wl_posix_priority_above_main(1000000));
+    ASSERT_EQ(79u, wl_posix_priority_above_main(-15));
+    ASSERT_EQ(79u, wl_posix_priority_above_main(-16));
+    ASSERT_EQ(79u, wl_posix_priority_above_main(-1000000));
+    ASSERT_EQ(79u, wl_posix_priority_above_main(INT_MIN));
+    ASSERT_EQ(49u, wl_posix_priority_above_main(INT_MAX));
+    PASS();
+}
+
+static void *idle_thread(void *arg) {
+    (void)arg;
+    return NULL;
+}
+
+TEST thread_priority_calls_check_their_numbers(void) {
+    pthread_t thread;
+    ASSERT_EQ(0, pthread_create(&thread, NULL, idle_thread, NULL));
+    ASSERT_EQ(WL_OK, wl_posix_thread_set_priority(thread, 0));
+    ASSERT_EQ(WL_OK, wl_posix_thread_set_priority(thread, WL_POSIX_PRIO_MAIN));
+    ASSERT_EQ(WL_OK, wl_posix_thread_set_priority(thread, WL_POSIX_PRIO_MIN));
+    ASSERT_EQ(WL_ERR_ARG, wl_posix_thread_set_priority(thread, WL_POSIX_PRIO_MIN + 1u));
+    ASSERT_EQ(WL_ERR_ARG, wl_posix_thread_set_priority(thread, 0xFFFFFFFFu));
+    ASSERT_EQ(WL_OK, wl_posix_thread_set_relative_priority(thread, 0));
+    ASSERT_EQ(WL_OK, wl_posix_thread_set_relative_priority(thread, 2));
+    ASSERT_EQ(WL_OK, wl_posix_thread_set_relative_priority(thread, -100));
+    ASSERT_EQ(WL_OK, wl_posix_thread_set_relative_priority(pthread_self(), 1));
+    pthread_join(thread, NULL);
+    PASS();
+}
+
 SUITE(posix_suite) {
     make_file();
     RUN_TEST(pread_reads_at_the_offset_and_keeps_the_position);
@@ -254,6 +316,9 @@ SUITE(posix_suite) {
     RUN_TEST(threads_do_not_disturb_each_other_or_the_position);
     RUN_TEST(libc_names_suite);
     RUN_TEST(pause_returns_after_a_signal_handler_ran);
+    RUN_TEST(sysconf_answers_for_the_console);
+    RUN_TEST(relative_priority_is_main_less_the_steps);
+    RUN_TEST(thread_priority_calls_check_their_numbers);
     close(g_fd);
     unlink(g_path);
 }

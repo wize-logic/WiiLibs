@@ -1,21 +1,66 @@
 // SPDX-License-Identifier: MIT
 // The C library's pread, pwrite on a file in a given folder, through <unistd.h> as a program calls
-// them: on the Wii these are wii/posix_wii.c's weak definitions over wl_posix_*, on the host the
-// C library's own. Platform-independent: test_platform_posix.c runs it against a temp file and the
+// them (and sysconf's memory answers, a pthread's priority and the entropy): on the Wii these are
+// wii/posix_wii.c's weak definitions over wl_posix_*, on the host the C library's own. Platform-independent: test_platform_posix.c runs it against a temp file and the
 // on-console runner against the SD card (libfat's devoptab, which seeks and reads like a file).
 #define _POSIX_C_SOURCE 200809L
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "tests/platform/check.h"
+#include "wl/platform/platform.h"
+#include "wl/platform/posix.h"
 
 static uint8_t pat(uint32_t i) {
     return (uint8_t)((i * 2654435761u) >> 24);
 }
 
 void wlt_suite_posix(const char *path);
+
+static atomic_bool g_worker_ran;
+
+static void *worker(void *arg) {
+    (void)arg;
+    atomic_store(&g_worker_ran, true);
+    return NULL;
+}
+
+// A pthread starts at the lowest priority on the Wii, so a thread that yields (as the game's
+// waits do) never lets it run until the priority is raised to the yielding thread's.
+static void priority_checks(void) {
+    pthread_t thread;
+    atomic_store(&g_worker_ran, false);
+    if (pthread_create(&thread, NULL, worker, NULL) != 0) {
+        wlt_check("posix_pthread_create", false, "pthread_create");
+        return;
+    }
+    wlt_check("posix_set_priority", wl_posix_thread_set_relative_priority(thread, 0) == WL_OK, "main's priority");
+    uint64_t start = wl_platform_time_us();
+    while (!atomic_load(&g_worker_ran) && wl_platform_time_us() - start < 2000000u) {
+        sched_yield();
+    }
+    wlt_check("posix_worker_runs_while_main_yields", atomic_load(&g_worker_ran), "the worker ran within 2 s");
+    pthread_join(thread, NULL);
+}
+
+static void libc_answers_checks(void) {
+    unsigned char a[16], b[16];
+    wlt_check("posix_random", wl_platform_random_bytes(a, sizeof a) == WL_OK && wl_platform_random_bytes(b, sizeof b) == WL_OK &&
+                                  memcmp(a, b, sizeof a) != 0,
+              "two draws differ");
+#ifdef __wii__
+    wlt_check("posix_sysconf_page", sysconf(_SC_PAGESIZE) == 4096, "4096");
+    wlt_check("posix_sysconf_phys", sysconf(_SC_PHYS_PAGES) == (88L << 20) / 4096, "88 MB in pages");
+    long free_pages = sysconf(_SC_AVPHYS_PAGES);
+    wlt_check("posix_sysconf_avail", free_pages > 0 && free_pages <= sysconf(_SC_PHYS_PAGES), "some memory is free");
+#endif
+}
 
 void wlt_suite_posix(const char *path) {
     uint8_t data[1000], back[200];
@@ -50,4 +95,6 @@ void wlt_suite_posix(const char *path) {
               "bytes around 100");
     close(fd);
     wlt_check("posix_unlink", unlink(path) == 0, "unlink");
+    priority_checks();
+    libc_answers_checks();
 }
