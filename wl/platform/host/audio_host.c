@@ -2,6 +2,8 @@
 // Host stub of the audio output; see audio_host.h.
 #include "wl/platform/host/audio_host.h"
 
+#include "wl/platform/audio_gain.h"
+
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +84,7 @@ uint32_t wl_host_audio_render(int16_t *out, uint32_t frames) {
             dst = out + (size_t)done * 2u;
         }
         g.fill(g.user, dst, g.frames);
+        wl_audio_gain_apply(wl_audio_gain_master(), dst, g.frames, g.rate);
         atomic_fetch_add(&g.blocks, 1u);
         done += g.frames;
     }
@@ -98,6 +101,7 @@ static void *host_thread(void *arg) {
     int16_t *buf = malloc((size_t)g.frames * 4u);
     while (!atomic_load(&g.quit)) {
         g.fill(g.user, buf, g.frames);
+        wl_audio_gain_apply(wl_audio_gain_master(), buf, g.frames, g.rate);
         atomic_fetch_add(&g.blocks, 1u);
         wl_platform_thread_sleep_ms(1);
     }

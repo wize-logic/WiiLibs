@@ -208,8 +208,21 @@ void wl_gx_ramp_bind(uint32_t texmap) {
     }
 }
 
+static WlGxOverlayFn g_overlay;
+static void *g_overlay_user;
+
+void wl_gx_set_overlay(WlGxOverlayFn fn, void *user) {
+    g_overlay_user = user;
+    g_overlay = fn;
+}
+
 uint32_t wl_gx_end_frame(void) {
     wl_gx_target_frame_ending();
+    if (g_overlay != NULL) {
+        wl_gx_reset_state();
+        g_overlay(g_overlay_user, 640u, 480u);
+        wl_gx_reset_state();
+    }
     s.in_frame = false;
     s.end_frames++;
     g_frames_ended++;

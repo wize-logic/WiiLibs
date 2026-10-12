@@ -65,3 +65,8 @@ wl_add_test(test_platform_input_wii
     LIBS wl_base LABELS unit be)
 target_include_directories(test_platform_input_wii BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/input_stub)
 target_link_libraries(test_platform_input_wii PRIVATE m)
+
+# The frame overlay hook, its drawing helpers and font (overlay.c) on the host GX stub, and the audio
+# output's master fade (audio_gain.c).
+wl_add_test(test_platform_overlay SOURCES test_platform_overlay.c LIBS wl_platform LABELS unit be)
+wl_add_test(test_platform_audio_fade SOURCES test_platform_audio_fade.c LIBS wl_platform LABELS unit be)

@@ -35,6 +35,7 @@
 #include <asndlib.h>
 #include <stdatomic.h>
 
+#include "wl/platform/audio_gain.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/platform.h"
 
@@ -110,6 +111,7 @@ static void *audio_thread(void *arg) {
             for (uint32_t done = 0; done < g.frames; done += g.chunk) {
                 g.fill(g.user, dst + 2u * done, g.chunk);
             }
+            wl_audio_gain_apply(wl_audio_gain_master(), dst, g.frames, g.rate); // (the master fade: nothing at gain 1)
             wl_gpu_buffer_commit(dst, g.bytes);
             const uint32_t dt = (uint32_t)(wl_platform_fs_clock_us() - t0);
             atomic_fetch_add(&g.fill_us_total, dt);

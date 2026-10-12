@@ -188,6 +188,36 @@ TEST both_buttons_at_once_power_off(void) {
     PASS();
 }
 
+TEST a_simulated_button_is_logged_and_nothing_leaves(void) {
+    fresh();
+    wl_host_exit_set_hook(leave_by_thread);
+    ASSERT_EQ(WL_ERR_STATE, wl_platform_system_simulate(WL_SYS_POWER)); // (no watcher yet)
+    unsigned ticks = 0;
+    ASSERT_EQ(WL_OK, wl_platform_system_watch_start(2, ticker, &ticks));
+    wl_platform_log_init(NULL);
+    ASSERT_EQ(WL_OK, wl_platform_system_simulate(WL_SYS_POWER | WL_SYS_RESET));
+    wl_platform_thread_sleep_ms(40);
+    const unsigned left_by_the_simulation = g_left;
+    const char *lines[32];
+    const uint32_t n = wl_platform_log_tail(lines, 32);
+    bool power = false, reset = false;
+    for (uint32_t i = 0; i < n; i++) {
+        power = power || strstr(lines[i], "power button (simulated)") != NULL;
+        reset = reset || strstr(lines[i], "reset button (simulated)") != NULL;
+    }
+    // a real press after it is served as ever
+    ASSERT_EQ(WL_OK, wl_platform_sem_create(&g_left_sem, 0, 4));
+    wl_host_system_raise(WL_SYS_RESET);
+    wl_platform_sem_wait(g_left_sem);
+    const WlExitTarget target = g_left_with;
+    wl_platform_system_watch_stop();
+    wl_platform_sem_destroy(g_left_sem);
+    ASSERT_EQ(0u, left_by_the_simulation);
+    ASSERT(power && reset);
+    ASSERT_EQ(WL_EXIT_LOADER, target);
+    PASS();
+}
+
 TEST a_watcher_stopped_without_a_button_ends_cleanly(void) {
     fresh();
     unsigned ticks = 0;
@@ -249,6 +279,7 @@ SUITE(shutdown_suite) {
     RUN_TEST(the_power_button_powers_off_from_the_watcher_thread);
     RUN_TEST(the_reset_button_returns_to_the_loader);
     RUN_TEST(both_buttons_at_once_power_off);
+    RUN_TEST(a_simulated_button_is_logged_and_nothing_leaves);
     RUN_TEST(a_watcher_stopped_without_a_button_ends_cleanly);
     RUN_TEST(fifo_takes_its_heaps_budget);
 }

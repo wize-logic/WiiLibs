@@ -90,6 +90,8 @@ static struct {
     uint32_t fifo_bytes;
     uint32_t fifo_peak_logged; // the highest 64 KiB step of the peak fill the log has been told
     uint32_t fb_w, efb_h;
+    WlGxOverlayFn overlay;
+    void *overlay_user;
     uint32_t known;
 
     int viewport[4];
@@ -402,10 +404,21 @@ void wl_gx_begin_frame(uint32_t clear_rgba) {
     wl_gx_target_frame_begun();
 }
 
+void wl_gx_set_overlay(WlGxOverlayFn fn, void *user) {
+    g.overlay_user = user;
+    g.overlay = fn;
+}
+
 uint32_t wl_gx_end_frame(void) {
     WL_ASSERT(g.ready);
     VCHECK(g.in_frame, "end_frame outside a frame");
     wl_gx_target_frame_ending(); // (the back buffer has the EFB for the display copy)
+    if (g.overlay != NULL) {
+        // (the program's overlay over the finished image: the state reset before it and after)
+        wl_gx_reset_state();
+        g.overlay(g.overlay_user, g.fb_w, g.efb_h);
+        wl_gx_reset_state();
+    }
     // FIFO health sample before the GPU drains it.
     GXFifoObj f;
     GX_GetGPFifo(&f);

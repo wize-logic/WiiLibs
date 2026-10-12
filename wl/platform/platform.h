@@ -66,6 +66,11 @@ WlResult wl_platform_shutdown_hook(WlShutdownFn fn, void *user);
 // without memory, WL_ERR_ARG for a bad period, WL_ERR_NOMEM for no stack.
 typedef void (*WlSystemTickFn)(void *user);
 WlResult wl_platform_system_watch_start(uint32_t period_ms, WlSystemTickFn tick, void *tick_user);
+// Pretends the buttons of `events` (WlSystemEvent bits) were pressed, for a script that wants to
+// see the program's reaction without leaving: the watcher thread logs "reset button (simulated)" or
+// "power button (simulated)" at its next look, and leaves nothing, whichever it is; real presses
+// are served as ever. WL_ERR_STATE when the watcher is not running (nothing would see it).
+WlResult wl_platform_system_simulate(uint32_t events);
 // Stops the thread and waits for it (for tests and programs that handle the buttons themselves
 // again). Does nothing when it is not running; not to be called from the thread's own tick.
 void wl_platform_system_watch_stop(void);
@@ -397,6 +402,18 @@ static inline float wl_gx_ramp_coordinate(float value) {
 // since the last present like wl_platform_video_present.
 void wl_gx_begin_frame(uint32_t clear_rgba);
 uint32_t wl_gx_end_frame(void);
+// A frame overlay: `fn(user, width, height)` runs inside wl_gx_end_frame, after the frame's last draw and
+// before its display copy, so it draws over the finished image (a menu, a notice, a battery warning)
+// without the program's renderer knowing: it costs the frame one pointer test while none is set, and
+// nothing else. The back buffer has the EFB then (a render target that had it has been resolved), the
+// wl_gx state is reset first (wl_gx_reset_state: the whole EFB, an orthographic projection over its
+// pixels, y down, blending off), `width` and `height` are the EFB's size in pixels, and the state is
+// reset again afterwards, so the overlay needs no clean-up. The drawing helpers of overlay.h are
+// meant for it. The hook is read once per frame on the thread that ends frames; set it from that
+// thread (a pointer store, but `user` must outlive it). NULL removes it. Host stub: called the same
+// way, in end_frame.
+typedef void (*WlGxOverlayFn)(void *user, uint32_t width, uint32_t height);
+void wl_gx_set_overlay(WlGxOverlayFn fn, void *user);
 // Frame overlap (off by default): end_frame returns without waiting for the GPU, so the CPU builds
 // the next frame while the GPU finishes this one (the next frame's commands queue behind the
 // copy); it waits only for the frame before this one, so the GPU is never more than one frame
@@ -877,6 +894,16 @@ typedef void (*WlAudioFillFn)(void *user, int16_t *stereo, uint32_t frames);
 WlResult wl_platform_audio_start(uint32_t sample_rate, uint32_t block_frames, WlAudioFillFn fill,
                                  void *user);
 void wl_platform_audio_stop(void);
+// The master gain of the output, applied to what `fill` produced just before it goes to the
+// hardware (the audio thread's, in blocks of the hardware's size): ramps linearly from the
+// present gain to `gain` (0 silent to 1 untouched; clamped) over `ms` milliseconds of output (0:
+// at once), so a program can fade out for a pause menu and back without touching its mixer. Costs
+// one test a block while the gain is 1 and not ramping. Callable from any thread, before the
+// output starts (it applies from the first block) and after it stops; a new call continues from
+// where the ramp is. Host stub: applied in wl_host_audio_render and the test thread.
+void wl_platform_audio_fade(float gain, uint32_t ms);
+// The gain the output is heading for (the last `gain` given; 1 before any).
+float wl_platform_audio_gain(void);
 // Blocks the hardware needed and the mixer had not finished (a silent block was played instead).
 uint32_t wl_platform_audio_underruns(void);
 
