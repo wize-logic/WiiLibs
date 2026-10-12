@@ -32,6 +32,7 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `profile.h`, `profile.c` | the sampling profiler: a ring of samples (the interrupted pc, link register, thread and the return addresses up its stack), the text dumps, the jitter; `wii/profile_wii.c` is the sampler over libogc's decrementer tick tasks; `tools/wl_profile.py` symbolizes the dumps; see below |
 | `stop.h`, `stop.c`, `stop_backend.h` | the bring-up text console (libogc's, in one of the video's framebuffers) and the stop screen: a message on it and in the log, then a wait for HOME or START to leave; `wl_platform_missing_symbol` is what `tools/link_stubs.py` points its stubs at; `wii/stop_wii.c` and `host/stop_host.c` are the backends; see "Console and stop screen" |
 | `profile_arm.h`, `profile_arm.c` | arming the profiler from a control file (`profile.txt` in the program's folder): the settings' parser, the watcher thread that waits for the program's own readiness hooks, samples for a time and writes `profile<N>.txt`; see "Arming it from a file" under the sampling profiler |
+| `hwcount.h`, `hwcount.c`, `hwcount_app.c` | the console measuring itself: the Broadway's performance monitor (PMC1 to PMC4) and GX's counters read once a frame in rotating groups, medians a second, a verdict on what bounds the frame, marks and the FIFO's fill as a timeline; armed by `hwcount.txt`; `wii/hwcount_wii.c` is the Wii's machine; see "Hardware counters" |
 | `net.h`, `net.c`, `net_internal.h` | IPv4 TCP and UDP sockets over IOS (libogc) or the host: addresses as host-order values, errors as results, poll for select, the network started in the background; `net.c` has the errno mapping and the address text; see below |
 | `gx_common.c` | GX helpers needing no hardware: texture sizes, sampler filter resolution, the ramp texture's image |
 | `gx_target.h`, `gx_target.c`, `gx_target_internal.h` | render targets on GX's one EFB: who owns it, parking and putting back the back buffer, resolving a target into its memory, clear quads; the portable bookkeeping over a small backend (`gx_target_internal.h`: `wii/gx_target_wii.c`, `host/gx_target_host.c`); see "Render targets" |
@@ -275,6 +276,90 @@ tools/wl_profile.py program.elf profile.txt --top 40 --callers update --tree 2 -
   an ELF made with the host compiler), and `check_profile` in the console runner (a busy loop and
   a second thread under the real decrementer: the samples land in the loop, name its caller and the
   thread, are about 1 ms apart and not evenly, and stop when stopped).
+
+
+## Hardware counters (`hwcount.h`)
+
+Where the sampling profiler says which functions take the time, this says which hardware resource
+the time is spent waiting for: is a frame bound by the processor (and by its memory, its branches or
+its instruction count) or by the GPU (and by transform, fill, textures or vertex fetch)?
+
+It is off unless `hwcount.txt` is in the program's folder (`wl_hwcount_arm(folder)`; without the
+file nothing is started and every call below tests one flag). Lines of `name value`: `seconds 1` (a
+log block every so many seconds), `cpu 1`, `gp 1`, `vcache 1`, `timeline 1` (marks and the FIFO
+sampler), `fifo_hz 480`, `selftest 1`, `threshold 0` (MMCR0's THRESHOLD), `first 60` (frames to let
+go by) and `raw 0` (also log each group's raw counters, to check a mapping on a console).
+`wl_gx_begin_frame` and `wl_gx_end_frame` call the engine, and WiiLibs' own waits for the GPU
+(`wait_token`, so `wl_gx_sync`) and for a free display buffer are bracketed, so a program that
+uses `wl_gx_*` has nothing to add. A program that waits elsewhere (its own `GX_DrawDone`, a frame
+limiter) brackets that wait with `wl_hwcount_wait_begin(WL_HWWAIT_GPU)` or `WL_HWWAIT_DISPLAY` and
+`wl_hwcount_wait_end`. Marks: `wl_hwcount_mark(id)` (0 to 15; `wl_hwcount_mark_name` names one).
+
+- **The processor.** The 750CL's performance monitor (IBM, "PowerPC 750CL RISC Microprocessor
+  User's Manual", performance monitor chapter; supervisor SPRs MMCR0 952, MMCR1 956, PMC1 953, PMC2
+  954, PMC3 957, PMC4 958). MMCR0 holds THRESHOLD (bits 10 to 15), PMC1SELECT (19 to 25) and
+  PMC2SELECT (26 to 31), MMCR1 PMC3SELECT (0 to 4) and PMC4SELECT (5 to 9), with IBM's bit 0 the most
+  significant; the registers are written frozen (MMCR0 DIS), zeroed, selected, started, with no
+  interrupt. PMC1 always counts cycles; PMC2 to PMC4 take one group's events a frame, six groups in
+  turn: `ipc` (instructions completed, L1 data misses, mispredicted branches), `dcache` (L1 data miss
+  cycles above the threshold, load miss cycles, DTLB search cycles), `l2` (L2 hits, data L2 misses,
+  castouts), `branch` (speculative-branch stall cycles, LR/CTR stall cycles, instructions), `mix`
+  (dispatched, floating point, integer instructions), `tlb` (ITLB search cycles, DTLB misses, snoop
+  retries). The event numbers are in `hwcount.c`. Counted over the frame's whole period (frame begin
+  to the next begin: the game, the drawing, the sound), by every thread and interrupt, minus the
+  bracketed waits; the 32-bit counters are read as differences modulo 2^32 (they wrap in about six
+  seconds at 729 MHz, so a window is far shorter). Dolphin does not model them (they read back what
+  was written): the engine checks the cycles against the time base (12 a tick, within 30%) and marks
+  the processor's counters invalid, with one log line, after three windows that fail.
+- **The GPU.** One pair of GX's metrics a frame (`GX_SetGPMetric(perf0, perf1)`; libogc queues the
+  selection in the FIFO and `GX_ClearGPMetric` clears by a register write) in seven groups: the XF/RAS
+  group (`GX_InitXfRasMetric`: RAS busy, GP clocks, XF waiting for input, XF waiting to hand on),
+  transform clocks with vertices, lighting clocks with texels, triangles with texture-memory stalls,
+  quads with texture-cache misses, XF waiting for input with texture-unit idle, the bottom of the XF
+  pipe with vertex-cache stalls; and the vertex cache's own check/miss/stall counters every frame.
+  Fractions are shares of the GP's clocks: the XF/RAS group measures them (its clocks counter), the
+  pairs use the window's time at that measured rate (243 MHz nominal: the Hollywood bus is four times
+  the time base). libogc's `GX_ReadGPMetric` never stores through its second pointer (its first
+  instruction after the loads overwrites r4: confirmed by disassembling `libogc.a`), so the counters
+  are read from the command processor's registers, the addresses its own readers use:
+  0xCC000040/44/48/4C (32 bits in two 16-bit halves, read again if the high half moved), the vertex
+  cache at 0xCC000050/54/58 and the FIFO's read/write distance at 0xCC000030. Which slot holds
+  counter 0 and counter 1 of a pair (0xCC000040 and 0xCC000048 by libogc's reading code) is found by
+  the self-test and logged.
+- **Self-test.** `wl_hwcount_selftest_begin()` selects the vertex metric on both counters;
+  the program draws N vertices, syncs, and calls `wl_hwcount_selftest_end(N)`: the slots that read N
+  are the counters, and if none does the GPU counters are marked invalid ("gp: no counters").
+  Without that call the engine decides from the windows: a GPU group set that reads all zero over two
+  rotations is invalid. Dolphin gives zeros, and the log says so rather than printing nonsense.
+- **Timeline.** A mark sends a draw-sync token (the same sequence `wl_gx_sync` uses) and stamps the
+  time the processor gave it; the token interrupt (`GX_SetDrawSyncCallback`) stamps the time the GPU
+  passed it, and the block shows each mark's mean offset into the frame for both: the gap is how far
+  the GPU lags there. A mark flushes the write-gather pipe, so it perturbs the frame a little. The
+  FIFO's fill (the GP's read/write distance) is sampled by a tick task at `fifo_hz` and at each mark.
+- **The log.** A block a second: the frame's mean and worst time and the processor's waits for the
+  GPU and the display (`block`), two `cpu:` lines, two `gp:` lines, `fifo:`, `marks`, and a
+  `verdict:`. Medians of the samples of each metric since the last block (about five samples of each
+  group a second at 30 frames); a metric not measured shows `-`.
+- **The verdict** (`wl_hwcount_verdict`, a pure function of a `WlHwcountView`: the medians, the
+  frame's mean time, the waits and the FIFO's share). The frame *fits* when it is within 5% of the
+  target and the processor waits for the display at least 10% of it. Else the GP is *starved* (the
+  processor is the bound) when most of the witnesses agree: XF waiting for input at least 60% of the
+  clocks, the FIFO at most 10% full on average, the processor waiting for the GPU less than 10% of
+  the frame. The processor's cause is then named: memory (L1 data miss stall cycles at least 30%),
+  branches (stall cycles 15% or 15 mispredicts per 1000 instructions), pipeline stalls (IPC under 0.6
+  without those), or compute. Otherwise the GPU is the bound and the part that most exceeds its
+  threshold is named: transform (XFRM + lighting clocks 30%), fill/TEV (RAS busy 50% or XF waiting to
+  hand on 30%), texture (texture-memory stalls 15%, or 100 texture-cache misses per 1000 texels with
+  RAS at least 30% busy), vertex fetch (vertex-cache stalls 15%); *mixed* when none is over. These
+  thresholds (`WlHwcountThresholds`) are starting values read off the counters' definitions, not
+  tuned on a console: the first runs on one are what set them.
+- **Cost.** A window costs a handful of SPR reads and writes and register reads at the frame's start,
+  and the FIFO sampler's tick, a few instructions each, at `fifo_hz`. The PMC reads are about ten
+  cycles each.
+- **Tests.** `tests/platform/test_platform_hwcount.c` drives the engine with a fake machine (the
+  register encodings, the modulo arithmetic, medians, the file, the verdict on each kind of frame,
+  rotation, waits, marks and tokens, the self-tests, the log). The machine's Wii half
+  (`wii/hwcount_wii.c`) is compiled by the Wii build; what it reads is the console's to confirm.
 
 ## Console and stop screen (`stop.h`)
 
