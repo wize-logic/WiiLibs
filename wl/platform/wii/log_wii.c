@@ -27,6 +27,7 @@ static uint32_t g_ring_count; // total lines ever written
 static char g_buf[FILE_BUF];
 static uint32_t g_buf_len;
 static FILE *g_file;
+static bool g_file_tried; // open_sd_file has run once (a failed or closed file is not opened again)
 static mutex_t g_mutex;
 static bool g_inited;
 static bool g_atexit;
@@ -115,6 +116,9 @@ static void make_dirs(const char *dir) {
 }
 
 static void open_sd_file(const char *dir) {
+    if (dir != NULL) {
+        g_file_tried = true;
+    }
     if (dir == NULL || strncmp(dir, "sd:/", 4) != 0 || strlen(dir) + 16u > WL_FS_PATH_MAX) {
         return;
     }
@@ -138,6 +142,11 @@ static void open_sd_file(const char *dir) {
 
 void wl_platform_log_init(const char *sd_dir) {
     if (g_inited) {
+        // a program that must reload IOS (for USB 2.0) mounts the card after its first call, which
+        // had no directory to give: the file sink is opened by the call that has one
+        if (sd_dir != NULL && g_file == NULL && !g_file_tried) {
+            open_sd_file(sd_dir);
+        }
         return;
     }
     LWP_MutexInit(&g_mutex, false);

@@ -972,7 +972,9 @@ uint32_t wl_platform_log_tail(const char **lines, uint32_t max);
 // Installs wl_platform_log_sink with wl_log_set_sink. Idempotent. `sd_dir` (e.g.
 // "sd:/apps/myapp/logs") enables the SD file sink: the directory is created as needed and the
 // file is <sd_dir>/log-NN.log, NN the first unused run number in 00..99 (00 is overwritten when
-// all are taken). NULL, or no SD card, keeps the file sink off. Ignored by the host stub.
+// all are taken). NULL, or no SD card, keeps the file sink off. A later call with a directory
+// opens the file sink if the first had none (a program that reloads IOS first, and mounts the card
+// after it), lines logged before it not being in the file. Ignored by the host stub.
 void wl_platform_log_init(const char *sd_dir);
 // Writes buffered lines to the SD file. Call once per frame and before any exit or power-off.
 void wl_platform_log_flush(void);
