@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Host stub of the GX layer (gx_host.h). Also the host's video info, which the renderer reads.
+#include <stdio.h>
 #include <string.h>
 
 #include "wl/platform/gx_target_internal.h"
@@ -7,6 +8,7 @@
 
 static WlHostGxState s;
 static bool g_wide;
+static WlWidescreen g_widescreen = WL_WIDESCREEN_PILLARBOX;
 static bool g_validate = true;
 
 const WlHostGxState *wl_host_gx_state(void) {
@@ -38,6 +40,37 @@ void wl_platform_video_info(WlVideoInfo *out) {
     out->xfb_height = 480;
     out->refresh_mhz = 59940;
     out->widescreen = g_wide;
+    out->picture_width = 640;
+    if (g_wide && g_widescreen == WL_WIDESCREEN_PILLARBOX) {
+        out->pillarbox = true;
+        out->picture_x = 80;
+        out->picture_width = 480;
+    }
+}
+
+WlResult wl_platform_video_set_widescreen(WlWidescreen mode) {
+    if (mode != WL_WIDESCREEN_PILLARBOX && mode != WL_WIDESCREEN_STRETCH) {
+        return WL_ERR_ARG;
+    }
+    g_widescreen = mode;
+    return WL_OK;
+}
+
+static uint32_t g_rate_hz;
+
+void wl_platform_video_set_rate(uint32_t hz) {
+    g_rate_hz = hz;
+}
+
+uint32_t wl_host_gx_rate(void) {
+    return g_rate_hz;
+}
+
+void wl_platform_video_describe(char *out, size_t size) {
+    WlVideoInfo vi;
+    wl_platform_video_info(&vi);
+    (void)snprintf(out, size, "host stub: %ux%u%s", (unsigned)vi.fb_width, (unsigned)vi.xfb_height,
+                   vi.pillarbox ? ", pillarbox" : "");
 }
 
 // Video: a fixed 640x480 NTSC mode, no framebuffer memory; present counts one retrace per frame
@@ -57,6 +90,7 @@ WlResult wl_platform_video_set_buffers(uint32_t count) {
 
 void wl_platform_video_set_interval(uint32_t retraces) {
     g_interval = retraces < 1u ? 1u : retraces > 15u ? 15u : retraces;
+    g_rate_hz = 0;
 }
 
 void wl_platform_video_expected(WlVideoInfo *out) {
@@ -222,6 +256,13 @@ uint32_t wl_gx_end_frame(void) {
         wl_gx_reset_state();
         g_overlay(g_overlay_user, 640u, 480u);
         wl_gx_reset_state();
+    }
+    {
+        WlVideoInfo vi;
+        wl_platform_video_info(&vi);
+        if (vi.pillarbox) {
+            (void)wl_gx_target_squeeze(vi.picture_x, vi.picture_width);
+        }
     }
     s.in_frame = false;
     s.end_frames++;

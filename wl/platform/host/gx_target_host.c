@@ -77,3 +77,12 @@ void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int 
     op->back_w = back_w;
     op->back_h = back_h;
 }
+
+void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w) {
+    WlHostTargetOp *op = next_op(WL_HOST_TARGET_SQUEEZE);
+    op->dst = colour;
+    op->back_w = back_w;
+    op->back_h = back_h;
+    op->x = (int32_t)x;
+    op->w = w;
+}

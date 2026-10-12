@@ -406,6 +406,91 @@ TEST a_smaller_back_buffer_is_what_is_parked_and_restored(void) {
     PASS();
 }
 
+TEST squeeze_narrows_the_finished_picture_with_the_parked_colour_block(void) {
+    start();
+    uint32_t n;
+    ASSERT(!wl_gx_target_squeeze(80, 0));      // nothing to draw
+    ASSERT(!wl_gx_target_squeeze(400, 300));   // past the back buffer's width
+    ASSERT_EQ(0u, g_allocs);
+    ASSERT(wl_gx_target_squeeze(80, 480));
+    const WlHostTargetOp *o = ops(&n);
+    ASSERT_EQ(1u, n);
+    ASSERT_EQ(WL_HOST_TARGET_SQUEEZE, o[0].kind);
+    ASSERT_EQ(80, o[0].x);
+    ASSERT_EQ(480u, o[0].w);
+    ASSERT_EQ(BACK_W, o[0].back_w);
+    ASSERT_EQ(BACK_H, o[0].back_h);
+    ASSERT(o[0].dst != NULL);
+    ASSERT_EQ(1u, g_allocs); // one block, the colour's
+    const void *block = o[0].dst;
+    ASSERT(wl_gx_target_squeeze(80, 480));
+    ASSERT_EQ(1u, g_allocs); // ...kept for the next frame
+    o = ops(&n);
+    ASSERT_EQ(block, o[1].dst);
+    // a park after it takes the block it finds and asks for the depth's only
+    WlGxTarget a = target_a();
+    wl_gx_target_frame_begun();
+    wl_gx_target_drawn();
+    (void)wl_gx_target_use(&a);
+    ASSERT_EQ(2u, g_allocs);
+    o = ops(&n);
+    bool copied_into_block = false;
+    for (uint32_t i = 0; i < n; i++) {
+        copied_into_block = copied_into_block || (o[i].kind == WL_HOST_TARGET_COPY && o[i].dst == block);
+    }
+    ASSERT(copied_into_block);
+    WlGxTargetStats st;
+    wl_gx_target_stats(&st, false);
+    ASSERT_EQ(2u, st.squeezes);
+    ASSERT_EQ(1u, st.parks);
+    finish();
+    ASSERT_EQ(2u, g_frees); // both blocks given back
+    PASS();
+}
+
+TEST squeeze_without_memory_leaves_the_picture_alone(void) {
+    start();
+    g_alloc_fails = true;
+    ASSERT(!wl_gx_target_squeeze(80, 480));
+    ASSERT(!wl_gx_target_squeeze(80, 480)); // (told once; asks again)
+    uint32_t n;
+    (void)ops(&n);
+    ASSERT_EQ(0u, n);
+    g_alloc_fails = false;
+    ASSERT(wl_gx_target_squeeze(80, 480));
+    finish();
+    PASS();
+}
+
+TEST the_host_end_frame_squeezes_only_a_pillarboxed_picture(void) {
+    start();
+    wl_host_gx_set_widescreen(true);
+    wl_gx_begin_frame(0);
+    wl_host_target_clear_ops();
+    wl_gx_end_frame();
+    uint32_t n;
+    const WlHostTargetOp *o = ops(&n);
+    ASSERT_EQ(1u, n);
+    ASSERT_EQ(WL_HOST_TARGET_SQUEEZE, o[0].kind);
+    ASSERT_EQ(80, o[0].x);
+    ASSERT_EQ(480u, o[0].w);
+    ASSERT_EQ(WL_OK, wl_platform_video_set_widescreen(WL_WIDESCREEN_STRETCH));
+    wl_gx_begin_frame(0);
+    wl_host_target_clear_ops();
+    wl_gx_end_frame();
+    (void)ops(&n);
+    ASSERT_EQ(0u, n);
+    ASSERT_EQ(WL_OK, wl_platform_video_set_widescreen(WL_WIDESCREEN_PILLARBOX));
+    wl_host_gx_set_widescreen(false);
+    wl_gx_begin_frame(0);
+    wl_host_target_clear_ops();
+    wl_gx_end_frame();
+    (void)ops(&n);
+    ASSERT_EQ(0u, n); // a 4:3 setting
+    finish();
+    PASS();
+}
+
 SUITE(target_suite) {
     RUN_TEST(resolvable_and_sizes);
     RUN_TEST(back_buffer_parked_when_drawn_then_target_resolved_and_back_restored);
@@ -417,6 +502,9 @@ SUITE(target_suite) {
     RUN_TEST(the_frame_resets_the_owner_and_the_end_puts_the_back_buffer_back);
     RUN_TEST(clear_quads);
     RUN_TEST(a_smaller_back_buffer_is_what_is_parked_and_restored);
+    RUN_TEST(squeeze_narrows_the_finished_picture_with_the_parked_colour_block);
+    RUN_TEST(squeeze_without_memory_leaves_the_picture_alone);
+    RUN_TEST(the_host_end_frame_squeezes_only_a_pillarboxed_picture);
 }
 
 // ---- the ramp --------------------------------------------------------------------------------------

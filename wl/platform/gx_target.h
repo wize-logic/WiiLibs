@@ -40,6 +40,7 @@ typedef struct {
     uint32_t resolves;  // targets copied into their memory
     uint32_t skipped;   // targets left without a copy (no memory, a format or size that has none)
     uint32_t clears;    // wl_gx_target_clear quads
+    uint32_t squeezes;  // wl_gx_target_squeeze: finished pictures narrowed
 } WlGxTargetStats;
 
 // Whether a target can be resolved at all in a back buffer of `back_w` by `back_h` pixels, and the
@@ -93,5 +94,14 @@ void wl_gx_target_drawn(void);
 // texture coordinate 0 for a restore), the texture coordinate generator 0, no colour channels, one
 // or two TEV stages, and no indirect stages. The caller sets again what it needs from that.
 void wl_gx_target_clear(bool colour, bool depth, uint32_t rgba, float z, int x, int y, int w, int h);
+
+// The finished back buffer narrowed into columns [x, x + w) of itself, black on each side: the
+// picture of a 4:3 game on a 16:9 screen (video_mode.h). For the end of the frame, once the back
+// buffer owns the EFB again (wl_gx_end_frame does it before the display copy); the EFB's contents
+// are replaced and its depth cleared. It borrows the memory a park keeps for the back buffer's
+// colour (asked from the allocator at the first call if no park has; the same block, so a program
+// that parks pays the 1.2 MiB once). Returns false, leaving the EFB as it was, for a bad range or
+// when there is no memory. Leaves in GX what wl_gx_target_clear does, and the texture map 0.
+bool wl_gx_target_squeeze(uint32_t x, uint32_t w);
 
 void wl_gx_target_stats(WlGxTargetStats *out, bool reset);

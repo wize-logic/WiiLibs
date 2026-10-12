@@ -361,6 +361,11 @@ def main() -> int:
                         help="show Dolphin's panic messages (they stop the emulation until answered)")
     parser.add_argument("--wii-aspect", choices=("4:3", "16:9"), default="4:3",
                         help="the TV's shape the console's settings give programs (default 4:3)")
+    parser.add_argument("--wii-progressive", action="store_true",
+                        help="the console's 480p setting on (SYSCONF IPL.PGS; Dolphin always reports a component cable)")
+    parser.add_argument("--wii-eurgb60", choices=("on", "off"), default=None,
+                        help="the console's EuRGB60 setting (SYSCONF IPL.E60); it matters only in a PAL region "
+                             "(a PAL NAND: Dolphin's region setting), where off gives 576i at 50 Hz")
     parser.add_argument("--video", default="", help="Dolphin's video backend (D3D, D3D12, Vulkan, OGL; "
                                                     "default: Dolphin's own)")
     parser.add_argument("--dump-frames", type=Path, help="dump every frame as PNGs into this folder")
@@ -405,6 +410,9 @@ def main() -> int:
         process = subprocess.Popen([str(dolphin), "-u", to_windows(user), "-b",
                                     # (the console's TV shape, SYSCONF's IPL.AR, which programs read)
                                     "-C", f"SYSCONF.IPL.AR={1 if args.wii_aspect == '16:9' else 0}",
+                                    *(["-C", "SYSCONF.IPL.PGS=1"] if args.wii_progressive else []),
+                                    *(["-C", f"SYSCONF.IPL.E60={1 if args.wii_eurgb60 == 'on' else 0}"]
+                                      if args.wii_eurgb60 else []),
                                     "-e", to_windows(program)],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:

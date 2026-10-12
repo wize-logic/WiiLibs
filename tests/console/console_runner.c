@@ -70,9 +70,21 @@ static void check_video_gx(void) {
     wlt_check("video_init", wl_platform_video_init() == WL_OK, "wl_platform_video_init");
     WlVideoInfo info;
     wl_platform_video_info(&info);
-    wlt_report("INFO video %ux%u (xfb %u) pal=%d progressive=%d widescreen=%d", (unsigned)info.fb_width,
+    wlt_report("INFO video %ux%u (xfb %u) pal=%d progressive=%d widescreen=%d pillarbox=%d picture=%u+%u", (unsigned)info.fb_width,
                (unsigned)info.efb_height, (unsigned)info.xfb_height, info.pal, info.progressive,
-               info.widescreen);
+               info.widescreen, info.pillarbox, (unsigned)info.picture_x, (unsigned)info.picture_width);
+    {
+        // (what the settings ask for, from the console's own configuration, against the mode in use)
+        WlVideoInfo want;
+        wl_platform_video_expected(&want);
+        wlt_check("video_mode_as_set", want.fb_width == info.fb_width && want.efb_height == info.efb_height &&
+                                           want.xfb_height == info.xfb_height && want.pal == info.pal &&
+                                           want.progressive == info.progressive && want.pillarbox == info.pillarbox,
+                  "wl_platform_video_expected against wl_platform_video_info");
+        char line[200];
+        wl_platform_video_describe(line, sizeof line);
+        wlt_report("INFO video: %s", line);
+    }
     wlt_check("gx_init", wl_gx_init() == WL_OK && wl_gx_ready(), "wl_gx_init");
 
     // a cleared frame, then a triangle over the centre: both read back from the EFB

@@ -8,6 +8,8 @@ wl_add_test(test_platform_mem_limit SOURCES test_platform_mem_limit.c LIBS wl_pl
 wl_add_test(test_platform_ring SOURCES test_platform_ring.c LIBS wl_platform LABELS unit be)
 # The display queue (present.c) against a simulated video interface.
 wl_add_test(test_platform_present SOURCES test_platform_present.c LIBS wl_platform LABELS unit be)
+# The video mode the console's settings ask for (video_mode.c): every combination.
+wl_add_test(test_platform_video_mode SOURCES test_platform_video_mode.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_fs SOURCES test_platform_fs.c suite_fs.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_backtrace SOURCES test_platform_backtrace.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_net SOURCES test_platform_net.c LIBS wl_platform LABELS unit be)
