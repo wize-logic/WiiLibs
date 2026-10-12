@@ -4,6 +4,28 @@ if(NOT TARGET wl_xbox)
 endif()
 wl_add_test(test_xbox_psh SOURCES test_xbox_psh.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_psh_cache SOURCES test_xbox_psh_cache.c LIBS wl_xbox LABELS unit be)
+wl_add_test(test_xbox_nv2a SOURCES test_xbox_nv2a.c LIBS wl_xbox LABELS unit be)
+# the register numbers against another public table, when one is checked out (test-only, read as text)
+set(WL_XBOXRECOMP_DIR "$ENV{HOME}/GitHub/xboxrecomp" CACHE PATH "an xboxrecomp checkout for test_xbox_nv2a_regs")
+wl_add_test(test_xbox_nv2a_regs SOURCES test_xbox_nv2a_regs.c LIBS wl_xbox LABELS unit be)
+target_compile_definitions(test_xbox_nv2a_regs PRIVATE
+    WL_NV2A_REGS_MINE="${PROJECT_SOURCE_DIR}/wl/xbox/nv2a_regs.h"
+    WL_NV2A_REGS_THEIRS="${WL_XBOXRECOMP_DIR}/src/nv2a/nv2a_regs.h")
+wl_add_test(test_xbox_nv2a_kelvin SOURCES test_xbox_nv2a_kelvin.c LIBS wl_xbox LABELS unit be)
+wl_add_test(test_xbox_nv2a_texture SOURCES test_xbox_nv2a_texture.c LIBS wl_xbox LABELS unit be)
+wl_add_test(test_xbox_nv2a_gx SOURCES test_xbox_nv2a_gx.c LIBS wl_xbox_gx LABELS unit be)
+wl_add_test(test_xbox_nv2a_raster SOURCES test_xbox_nv2a_raster.c LIBS wl_xbox LABELS unit be)
+# the replay tool over the capture the rasterizer's test writes
+if(WL_PLATFORM STREQUAL "host")
+    set(nv2a_capture ${CMAKE_CURRENT_BINARY_DIR}/nv2a_test.capture)
+    set_tests_properties(test_xbox_nv2a_raster PROPERTIES ENVIRONMENT "WL_NV2A_CAPTURE_OUT=${nv2a_capture}"
+        FIXTURES_SETUP nv2a_capture)
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay)
+    add_test(NAME xbox_nv2a_replay COMMAND xbox_nv2a_replay ${nv2a_capture} -v --png ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay
+        --programs ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay/programs.inc)
+    set_tests_properties(xbox_nv2a_replay PROPERTIES LABELS unit FIXTURES_REQUIRED nv2a_capture
+        PASS_REGULAR_EXPRESSION "2 draws.*frame_0000.png|frame_0000.png.*2 draws")
+endif()
 wl_add_test(test_xbox_vsh SOURCES test_xbox_vsh.c LIBS wl_xbox LABELS unit be)
 target_include_directories(test_xbox_vsh PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

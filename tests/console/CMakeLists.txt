@@ -10,9 +10,10 @@ add_executable(wl_console_tests
     ${PROJECT_SOURCE_DIR}/tests/platform/suite_posix.c
     ${PROJECT_SOURCE_DIR}/tests/audio/suite_sseq.c
     ${PROJECT_SOURCE_DIR}/tests/audio/synth_fixture.c
-    ${PROJECT_SOURCE_DIR}/tests/gfx/suite_sqrt.c)
+    ${PROJECT_SOURCE_DIR}/tests/gfx/suite_sqrt.c
+    ${PROJECT_SOURCE_DIR}/tests/xbox/suite_nv2a.c)
 wl_target_defaults(wl_console_tests)
-target_link_libraries(wl_console_tests PRIVATE wl_audio wl_platform wl_gfx)
+target_link_libraries(wl_console_tests PRIVATE wl_audio wl_platform wl_gfx wl_xbox_gx)
 # every way out of the runner is logged with where it came from (wii/trace_wii.c)
 wl_platform_trace_exits(wl_console_tests)
 wl_platform_heap_overflow(wl_console_tests)
