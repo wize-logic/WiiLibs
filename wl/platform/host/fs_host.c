@@ -60,6 +60,10 @@ uint64_t wl_platform_time_us(void) {
     return wl_platform_fs_clock_us();
 }
 
+uint64_t wl_platform_time_ms(void) {
+    return wl_platform_fs_clock_us() / 1000u;
+}
+
 uint64_t wl_platform_fs_clock_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

@@ -3,11 +3,17 @@
 //   1. the in-memory ring (crash screen, overlay),
 //   2. the EXI UART via SYS_Report (Dolphin OSREPORT log; always on, harmless on hardware),
 //   3. the on-screen console via printf (debug builds only; needs CON_Init by the caller),
-//   4. <sd_dir>/log-NN.log when wl_platform_log_init was given a directory (buffered; flushed
-//      at frame end, on shutdown, and when the buffer fills). Without an SD card the file sink
-//      silently stays off.
+//   4. <sd_dir>/log-NN.log when wl_platform_log_init was given a directory (buffered; written out
+//      and synced to the card when the buffer fills, every WL_LOG_SYNC_SECONDS of the lines
+//      coming, on wl_platform_log_flush (the stop screens, the profiler, wl_platform_exit) and on
+//      shutdown). Without an SD card the file sink silently stays off.
+//      A crash (a CPU exception) does not write the buffer: the report runs in the crashed thread,
+//      which may be inside libfat holding its lock, and waiting for that would hang the report
+//      itself. What is lost is the lines of the last WL_LOG_SYNC_SECONDS; the report goes to
+//      the debug port and the screen.
 // NN is a run counter: the first free number in 00..99 (all taken: 00 is overwritten).
 // Only this directory may include <ogc/*.h>.
+#define _POSIX_C_SOURCE 200809L // (fileno)
 #include <ogc/lwp.h>
 #include <ogc/mutex.h>
 #include <ogc/system.h>
@@ -15,12 +21,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "wl/platform/platform.h"
+#include "wl/platform/timebase.h"
 
 #define RING_LINES 32u
 #define RING_LINE_LEN 160u
 #define FILE_BUF 4096u
+// The file is written out and synced at the first line that comes this long after the last
+// time: libfat keeps what is written in its cache of sectors until the file is synced or closed,
+// so that a program that ends in a crash or a power-off otherwise loses all of it.
+#define WL_LOG_SYNC_SECONDS 2u
 
 static char g_ring[RING_LINES][RING_LINE_LEN];
 static uint32_t g_ring_count; // total lines ever written
@@ -28,6 +40,7 @@ static char g_buf[FILE_BUF];
 static uint32_t g_buf_len;
 static FILE *g_file;
 static bool g_file_tried; // open_sd_file has run once (a failed or closed file is not opened again)
+static uint64_t g_synced_at; // the time base when the file was last written out and synced
 static mutex_t g_mutex;
 static bool g_inited;
 static bool g_atexit;
@@ -42,7 +55,9 @@ static void file_flush_locked(void) {
     g_buf_len = 0;
     if (g_file != NULL) {
         fflush(g_file);
+        fsync(fileno(g_file)); // (to the card, not to libfat's cache of its sectors)
     }
+    g_synced_at = wl_timebase_read();
 }
 
 void wl_platform_log_sink(void *user, WlLogLevel level, const char *tag, const char *line) {
@@ -76,6 +91,9 @@ void wl_platform_log_sink(void *user, WlLogLevel level, const char *tag, const c
             memcpy(g_buf + g_buf_len, text, len);
             g_buf[g_buf_len + len] = '\n';
             g_buf_len += (uint32_t)len + 1u;
+        }
+        if (wl_timebase_read() - g_synced_at >= (uint64_t)WL_LOG_SYNC_SECONDS * WL_TIMEBASE_HZ) {
+            file_flush_locked();
         }
     }
     if (g_inited) {
@@ -138,6 +156,7 @@ static void open_sd_file(const char *dir) {
     }
     snprintf(path, sizeof path, "%s/log-%02u.log", dir, pick);
     g_file = fopen(path, "wb");
+    g_synced_at = wl_timebase_read(); // (the first lines wait their time too)
 }
 
 void wl_platform_log_init(const char *sd_dir) {

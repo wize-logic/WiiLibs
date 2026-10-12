@@ -43,6 +43,12 @@ add_test(NAME test_wl_profile
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_wl_profile.py)
 set_tests_properties(test_wl_profile PROPERTIES LABELS unit)
 
+# the Dolphin runner's parts that need no Dolphin (tools/dolphin_run.py): the files a run changed on
+# the card and their copy out (--sd-out), and the command line's refusal of --sd-out without --sd
+add_test(NAME test_dolphin_run
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_dolphin_run.py)
+set_tests_properties(test_dolphin_run PROPERTIES LABELS unit)
+
 # the instruction counter (tools/qemu_icount.py): its log parser on both of qemu's forms, and a loop
 # counted under qemu-ppc where it and a PowerPC Linux compiler are installed (skipped otherwise)
 add_test(NAME test_qemu_icount

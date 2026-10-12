@@ -79,6 +79,9 @@ void wl_platform_system_watch_stop(void);
 // Monotonic microseconds (time base ticks on the console, CLOCK_MONOTONIC on the host); the
 // epoch is unspecified, only differences are meaningful. Works before any other call.
 uint64_t wl_platform_time_us(void);
+// The same clock in milliseconds (rounded down), for a caller that wants only those: on the
+// console one read of the time base and no 64-bit division (timebase.h).
+uint64_t wl_platform_time_ms(void);
 
 // ---------------------------------------------------------------------------------------------
 // Memory
@@ -976,11 +979,14 @@ uint32_t wl_platform_log_tail(const char **lines, uint32_t max);
 // opens the file sink if the first had none (a program that reloads IOS first, and mounts the card
 // after it), lines logged before it not being in the file. Ignored by the host stub.
 void wl_platform_log_init(const char *sd_dir);
-// Writes buffered lines to the SD file. Call once per frame and before any exit or power-off.
+// Writes buffered lines to the SD file and syncs it to the card. The sink does this itself when its
+// buffer is full and at the first line 2 s after the last time, so a program need not call it per
+// frame; call it before a power-off the program causes itself (wl_platform_exit does).
 void wl_platform_log_flush(void);
 // Flushes and closes the SD file (also registered with atexit).
 void wl_platform_log_shutdown(void);
 // The crash report: a CPU exception (an access fault, an alignment or program exception) writes
 // its kind, the registers, the return addresses up the stack and the log ring's last lines to the
-// EXI UART (Dolphin's OSREPORT) before libogc's panic screen. Idempotent; a no-op on the host.
+// EXI UART (Dolphin's OSREPORT) before libogc's panic screen; not to the SD file (it cannot be
+// written safely from the crashed thread: it may hold libfat's lock). Idempotent; a no-op on the host.
 void wl_platform_crash_report_install(void);

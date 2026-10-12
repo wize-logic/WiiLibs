@@ -15,6 +15,9 @@ Exit status: 0 when --until was seen (or not asked for) and no --fail line appea
 
 Dolphin.exe: --dolphin, else WL_DOLPHIN, else Documents/Emulators/Dolphin-x64/Dolphin.exe in a
 Windows profile.
+
+What the program wrote to the card (a log file, a save) is in the run's copy of the card, which Dolphin
+writes back when the emulation stops; --sd-out DIR copies out of it what is new or changed since --sd.
 """
 
 import argparse
@@ -282,6 +285,42 @@ def copy_tree(source: Path, destination: Path) -> None:
                 path.unlink(missing_ok=True)
 
 
+SMALL_FILE = 1 << 20
+
+
+def card_changes(source: Path, card: Path):
+    """the files of the card (a folder) that are not in source (a folder) or differ from its: a different
+    size, or for a file of 1 MiB or less different bytes. A larger file of the same size counts as the same
+    (a game's data is not read twice at every run; Dolphin may write every file back with a new time, so
+    times say nothing). Relative paths, in order."""
+    changed = []
+    for path in sorted(card.rglob("*")):
+        if path.is_dir():
+            continue
+        relative = path.relative_to(card)
+        original = source / relative
+        if not original.is_file():
+            changed.append(relative)
+            continue
+        size = path.stat().st_size
+        if size != original.stat().st_size:
+            changed.append(relative)
+        elif size <= SMALL_FILE and path.read_bytes() != original.read_bytes():
+            changed.append(relative)
+    return changed
+
+
+def copy_out(source: Path, card: Path, destination: Path):
+    """what the program changed on the card, copied to destination (the folders it is in made), nothing else
+    removed or overwritten but the files themselves; the relative paths copied"""
+    changed = card_changes(source, card)
+    for relative in changed:
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(card / relative, target)
+    return changed
+
+
 def ours(user_folder: str) -> str:
     """PowerShell for this run's Dolphin processes: those given this run's user folder (--name),
     so that runs of other programs, or other people's Dolphins, are left alone"""
@@ -354,6 +393,9 @@ def main() -> int:
     parser.add_argument("--until", help="stop once an OSREPORT line contains this text")
     parser.add_argument("--fail", help="a regular expression; an OSREPORT line matching it fails the run")
     parser.add_argument("--sd", type=Path, help="a folder synced in as the virtual SD card (sd:/)")
+    parser.add_argument("--sd-out", type=Path, metavar="DIR",
+                        help="after the run, copy here what the program wrote to the card (files new or changed "
+                             "since --sd, with their folders): a log, a save")
     parser.add_argument("--screenshot", type=Path, help="save the render window here (PNG)")
     parser.add_argument("--single-core", action="store_true",
                         help="the GPU emulated on the CPU's thread (slower; no CPU/GPU races)")
@@ -377,6 +419,8 @@ def main() -> int:
                         help="run under gdb, through Dolphin's GDB stub, with this ELF's symbols; at the end, stop "
                              "the program and print its backtrace and registers")
     args = parser.parse_args()
+    if args.sd_out and not args.sd:
+        parser.error("--sd-out needs --sd (the card it copies the changes of)")
 
     dolphin = find_dolphin(args.dolphin)
     work = windows_temp() / args.name
@@ -461,6 +505,10 @@ def main() -> int:
         process.wait(timeout=30)
     except subprocess.TimeoutExpired:
         process.kill()
+    if args.sd_out:
+        # (Dolphin wrote the card back to the run's copy as it stopped)
+        copied = copy_out(args.sd, work / "sd", args.sd_out)
+        print(f"sd out: {len(copied)} files in {args.sd_out}" + "".join(f"\n  {relative}" for relative in copied[:20]))
     if args.dump_frames:
         frames = sorted((user / "Dump" / "Frames").glob("*.png"))
         args.dump_frames.mkdir(parents=True, exist_ok=True)
