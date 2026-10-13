@@ -408,12 +408,15 @@ void wl_xb_dsi_slow(void *frame) {
             WlXbCrash c = {"guest RAM touched with interrupts off needs the swap file", NULL, va, ea, f->pc, store};
             wl_xb_crash(&c);
         }
+        // (as the fast path: the access may run into the next page; when that one is not guest RAM,
+        // the access only ran into it if the first page was mapped already)
         uint32_t last = ea + 7u;
         bool cross = (last >> 12) != (ea >> 12) && last < WL_XB_EA_SPAN;
-        uint32_t pb = cross ? phys_of(last) : 0u;
+        uint32_t pa = phys_of(ea), pb = cross ? phys_of(last) : 0u;
+        bool was_mapped = g_xb_pg_frame[pa - 1u] != 0 && pte_of(pa - 1u, ea >> 28) != NULL;
         WlResult r = page_in(ea, pb);
         if (r == WL_OK && cross) {
-            r = pb != 0 ? page_in(last, phys_of(ea)) : WL_ERR_RANGE;
+            r = pb != 0 ? page_in(last, pa) : was_mapped ? WL_ERR_RANGE : WL_OK;
         }
         if (r == WL_OK) {
             return; // the access runs again

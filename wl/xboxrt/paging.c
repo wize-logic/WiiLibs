@@ -193,11 +193,14 @@ static uint32_t slot_run(uint32_t want, uint32_t *first) {
     return 0;
 }
 
-static void batch_abandon(void) {
-    for (uint32_t i = 0; i < g_batch_n; i++) {
-        g_xb_pg_flags[g_batch[i]] &= (uint8_t)~WL_XB_PG_IO; // resident, dirty, unmapped: faults back cheaply
+// The gathered pages from `from` on stay resident (dirty, unmapped: they fault back in cheaply).
+static void batch_abandon(uint32_t from) {
+    uint32_t lv = wl_xb_mmu_lock();
+    for (uint32_t i = from; i < g_batch_n; i++) {
+        g_xb_pg_flags[g_batch[i]] &= (uint8_t)~WL_XB_PG_IO;
     }
-    g_batch_n = 0;
+    g_batch_n = from;
+    wl_xb_mmu_unlock(lv);
 }
 
 // Writes the gathered dirty pages (unmapped, marked IO) to consecutive slots and takes their
@@ -225,10 +228,7 @@ static WlResult batch_write(void) {
         wl_xb_mmu_unlock(lv);
         if (len == 0) {
             WL_LOG_E(TAG, "the swap file is full (%u pages)", (unsigned)g_slots);
-            g_batch_n = done; // what was written goes; the rest stays resident
-            for (uint32_t i = done; i < n; i++) {
-                g_xb_pg_flags[g_batch[i]] &= (uint8_t)~WL_XB_PG_IO;
-            }
+            batch_abandon(done); // what was written goes; the rest stays resident
             n = done;
             break;
         }
@@ -276,7 +276,7 @@ static WlResult frame_slow(uint32_t keep, uint32_t *out) {
         }
     }
     if (f != 0) {
-        batch_abandon(); // a clean page was had: nothing written
+        batch_abandon(0); // a clean page was had: nothing written
     } else if (g_batch_n != 0) {
         WlResult r = batch_write();
         if (r == WL_ERR_IO) {
