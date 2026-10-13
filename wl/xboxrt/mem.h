@@ -18,6 +18,14 @@
 // not committed, or a window address past the RAM, faults: a guest crash. Device addresses fault
 // too, and are emulated (mmio.h).
 //
+// Demand paging. Where the frames are fewer than the pages a title touches (the Wii: ~33 MB of
+// frames for 64 MB of guest RAM), a page's frame is taken back when none is free: a clock over the
+// frames, with the MMU's referenced bits, picks a page not used lately, preferring one with
+// nothing to write; a changed page goes to the swap file first, in batches, and comes back from it
+// on its next touch. Pinned pages (wl_xb_mem_pin) keep their frames. Any access may fault and wait
+// for the swap file, so guest memory is touched only with the guest lock held, pinned pages aside
+// (wl/xboxrt/README.md, "Demand paging").
+//
 // All functions here run with the guest lock held (thread.h) unless they say otherwise.
 #pragma once
 
@@ -170,6 +178,16 @@ typedef struct {
     // of two; the table is a cache of the page tables here, so a smaller one only costs reloads).
     WlXbFramePool frame_pools[WL_XB_MAX_FRAME_POOLS];
     uint32_t htab_bytes;
+    // The host and ppc-be: 0 lets the OS back every page (no paging); otherwise only this many
+    // bytes of frames, paged as the Wii pages (the same clock and swap file, through SIGSEGV and
+    // mprotect), to run a title or a test at the Wii's size. A multiple of 4 KB, 64 KB at least.
+    uint32_t frame_limit_bytes;
+    // The swap file changed pages go to when the frames run out: a wl/platform path
+    // ("sd:/xbox/halo/hdd/pagefile.sys"), grown to `swap_bytes` (0: the RAM's size) when it is
+    // smaller, and reused. NULL or "": none; then only pages with nothing to write can give their
+    // frames back, and when none is left a touch that needs a frame is a guest crash, as before.
+    const char *swap_path;
+    uint32_t swap_bytes;
 } WlXbMemConfig;
 
 // The defaults above (no frame pools: the Wii's caller adds them).
@@ -242,16 +260,42 @@ WlResult wl_xb_va_protect(uint32_t va, uint32_t bytes, uint32_t protect, uint32_
 // committed user VA through its page. false (and 0) when it has none.
 bool wl_xb_va_to_phys(uint32_t va, uint32_t *phys);
 
+// ---- Pinned pages ------------------------------------------------------------------------------
+// A pinned page gets its frame now and keeps it: the clock passes it by. For guest memory touched
+// where a fault could not wait for the swap file: by a host thread without the guest lock (the
+// service thread's KeTickCount), by a DMA, by code that must not fault. Pins do not nest; freeing
+// the memory unpins it. WL_ERR_RANGE when part of the range is not guest RAM, WL_ERR_NOMEM when no
+// frame can be had for it (a pin may not take more than half the frames).
+WlResult wl_xb_mem_pin(uint32_t va, uint32_t bytes);
+void wl_xb_mem_unpin(uint32_t va, uint32_t bytes);
+// Whether the page of `va` has a frame now (diagnostics and tests; false for anything else).
+bool wl_xb_mem_resident(uint32_t va);
+
 // ---- Diagnostics -------------------------------------------------------------------------------
 
 typedef struct {
     uint32_t ram_pages, used_pages;
     uint32_t user_pages, contig_pages, frames; // frames: physical pages with host memory behind them
     uint32_t relocations;                      // user pages moved for a pinned contiguous allocation
-    uint32_t faults_resolved;                  // first touches (the Wii) / 0 (the OS does it)
-    uint32_t evictions;                        // page table entries reused (the Wii)
+    uint32_t faults_resolved;                  // first touches (the Wii, or paging) / 0 (the OS does it)
+    uint32_t pte_evictions;                    // page table entries reused (the Wii's hashed table)
+    // Demand paging (0 where the OS backs every page)
+    uint32_t frames_total, frames_free;        // the pool
+    uint32_t pinned_pages;
+    uint32_t evictions;                        // frames taken back from a page for another
+    uint32_t clean_evictions;                  // of those, with nothing to write (zero, or in the swap file)
+    uint32_t fast_evictions;                   // of those, in the fault's exception context (the Wii)
+    uint32_t swap_ins, swap_outs, swap_writes; // pages read back, pages written, write calls (batches)
+    uint64_t swap_read_bytes, swap_write_bytes;
+    uint64_t swap_us;                          // time spent in swap file I/O
+    uint32_t swap_slots, swap_slots_used;      // the swap file's pages
 } WlXbMemStats;
 void wl_xb_mem_stats(WlXbMemStats *out);
+
+// Watches the paging rate; the service thread calls it about once a second (lock not held). A
+// swap-in rate above `swap_ins_per_s` (0: 128 a second, half a megabyte) is logged as thrashing,
+// at most every 10 s.
+void wl_xb_mem_watch(uint32_t swap_ins_per_s);
 
 #ifdef __cplusplus
 }

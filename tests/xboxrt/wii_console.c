@@ -2,9 +2,12 @@
 // wl/xboxrt's guest memory on the Wii's MMU, as a console program (wl_xboxrt_console.dol, run in
 // Dolphin with --mmu): the hashed page table filled by first-touch DSIs, the user and window views
 // of one physical page, a pinned contiguous allocation that moves a user page (its frame goes with
-// it), PTE groups made to overflow (evictions, and the pages fault back in), and device accesses
+// it), PTE groups made to overflow (evictions, and the pages fault back in), device accesses
 // emulated through the DSI trampoline and the PowerPC decoder, with live FP state across a thousand
-// of them. Prints "XBRT ok <name>" per check, " XBRT FAIL <name>" on a failure, and
+// of them, and demand paging: 12 MB of pages over 8 MB of frames, zero pages giving their frames
+// back in the DSI's exception context and, when a card is there for the swap file, changed pages
+// written out in batches and read back through the trampoline. Prints "XBRT ok <name>" per check,
+// " XBRT FAIL <name>" on a failure, "XBRT skip <name>" for a check that cannot run, and
 // "XBRT DONE pass=<n> fail=<n>" at the end.
 #include <malloc.h>
 #include <stdarg.h>
@@ -65,6 +68,10 @@ int main(void) {
     cfg.htab_bytes = 64u << 10; // the smallest table: 1024 PTE groups
     cfg.frame_pools[0].base = pool;
     cfg.frame_pools[0].bytes = pool_bytes;
+    // the paging checks' swap file, when there is a card (Dolphin's virtual one)
+    bool card = wl_platform_fs_mount(WL_DEVICE_SD) == WL_OK;
+    cfg.swap_path = card ? "sd:/wl_xboxrt_pagefile.sys" : NULL;
+    cfg.swap_bytes = 16u << 20;
     WlResult r = wl_xb_mem_init(&cfg);
     check("mem_init", r == WL_OK);
     if (r != WL_OK) {
@@ -125,7 +132,7 @@ int main(void) {
     }
     WlXbMemStats st2;
     wl_xb_mem_stats(&st2);
-    check("evictions_refault", ok && st2.evictions > 0);
+    check("evictions_refault", ok && st2.pte_evictions > 0);
 
     // devices: the DSI slow path, the trampoline, the decoder
     WlXbDevice dev = {"fake", DEV_VA, 0x1000u, dev_read, dev_write, NULL};
@@ -157,8 +164,52 @@ int main(void) {
     check("mmio_fp_state", g_reads - before == 1000u && acc > 1000.0 && acc < 1200.0);
     WlXbMmioStats ms;
     wl_xb_mmio_stats(&ms);
-    WL_LOG_I(TAG, "XBRT frames %u, faults %u, evictions %u, device reads %u writes %u", (unsigned)st2.frames,
-             (unsigned)st2.faults_resolved, (unsigned)st2.evictions, (unsigned)ms.reads, (unsigned)ms.writes);
+    WL_LOG_I(TAG, "XBRT frames %u, faults %u, PTE evictions %u, device reads %u writes %u", (unsigned)st2.frames,
+             (unsigned)st2.faults_resolved, (unsigned)st2.pte_evictions, (unsigned)ms.reads, (unsigned)ms.writes);
+
+    // demand paging: 12 MB of pages over the 8 MB of frames
+    const uint32_t many = 3072u;
+    uint32_t big = 0;
+    check("paging_commit", wl_xb_va_alloc(&big, many * WL_XB_PAGE, 0x02000000u, WL_XB_PROT_READWRITE) == WL_OK);
+    WlXbMemStats pg0, pg1, pg2;
+    wl_xb_mem_stats(&pg0);
+    bool zero = true;
+    for (uint32_t i = 0; i < many; i++) {
+        zero &= wl_xb_rd32(big + i * WL_XB_PAGE + 0x40u) == 0; // read, never written
+    }
+    wl_xb_mem_stats(&pg1);
+    // zero pages give their frames back in the DSI's exception context, with nothing to write
+    check("paging_zero_pages", zero && pg1.frames <= pg1.frames_total && pg1.fast_evictions > pg0.fast_evictions &&
+                                   pg1.clean_evictions - pg0.clean_evictions >= many - pg1.frames_total);
+    if (pg1.swap_slots == 0) {
+        WL_LOG_I(TAG, "XBRT skip paging_swap (no card for the swap file)");
+    } else {
+        // changed pages: written out in batches (the trampoline: the DSI's slow path) and read back
+        for (uint32_t i = 0; i < many; i++) {
+            wl_xb_wr32(big + i * WL_XB_PAGE + 0x80u, 0xB0000000u ^ (i * 0x9E3779B1u));
+            wl_xb_wr32(big + i * WL_XB_PAGE + 0xF00u, i);
+        }
+        bool same_pages = true;
+        double facc = 1.0;
+        for (uint32_t round = 0; round < 2; round++) {
+            for (uint32_t i = 0; i < many; i++) {
+                same_pages &= wl_xb_rd32(big + i * WL_XB_PAGE + 0x80u) == (0xB0000000u ^ (i * 0x9E3779B1u));
+                same_pages &= wl_xb_rd32(big + i * WL_XB_PAGE + 0xF00u) == i;
+                facc = facc * 1.0001 + 1.0; // live FP state across the swap-ins
+            }
+        }
+        uint32_t phys = 0;
+        same_pages &= wl_xb_va_to_phys(big + 5u * WL_XB_PAGE, &phys) &&
+                      wl_xb_rd32(WL_XB_WINDOW | (phys + 0xF00u)) == 5u; // the window sees the page read back
+        wl_xb_mem_stats(&pg2);
+        check("paging_swap", same_pages && pg2.swap_outs > pg1.swap_outs && pg2.swap_ins > pg1.swap_ins &&
+                                 pg2.swap_writes - pg1.swap_writes < (pg2.swap_outs - pg1.swap_outs) / 4u);
+        check("paging_fp_state", facc > 6000.0 && facc < 20000.0);
+        WL_LOG_I(TAG, "XBRT paging: %u evictions (%u clean, %u fast), %u swap-ins, %u swap-outs in %u writes, %u ms of I/O",
+                 (unsigned)pg2.evictions, (unsigned)pg2.clean_evictions, (unsigned)pg2.fast_evictions, (unsigned)pg2.swap_ins,
+                 (unsigned)pg2.swap_outs, (unsigned)pg2.swap_writes, (unsigned)(pg2.swap_us / 1000u));
+    }
+    check("paging_release", wl_xb_va_release(big, NULL) == WL_OK);
     WL_LOG_I(TAG, "XBRT DONE pass=%d fail=%d", g_pass, g_fail);
     for (;;) {
         wl_platform_thread_sleep_ms(1000);

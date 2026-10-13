@@ -153,7 +153,17 @@ void wl_xb_crash_report(const WlXbCrash *c) {
 }
 
 void wl_xb_crash(const WlXbCrash *c) {
-    wl_xb_crash_report(c);
+    // the report reads the guest stack, which may fault and page; a crash in there (the swap file
+    // failing again) is told in one line instead of a report without end
+    static volatile bool reporting;
+    if (reporting) {
+        WL_LOG_E(TAG, "GUEST CRASH while reporting one: %s (guest VA 0x%08x)", c->reason != NULL ? c->reason : "?",
+                 (unsigned)c->guest_va);
+    } else {
+        reporting = true;
+        wl_xb_crash_report(c);
+        reporting = false;
+    }
     if (g_stop != NULL) {
         g_stop(c);
     }

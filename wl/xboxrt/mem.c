@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/platform/platform.h"
 #include "wl/xboxrt/mem_internal.h"
 
 #define TAG "xbmem"
@@ -616,6 +617,96 @@ void wl_xb_mem_stats(WlXbMemStats *out) {
     out->contig_pages = g_contig_pages;
     out->relocations = g_relocations;
     if (g_ready) {
-        wl_xb_backend_stats(&out->frames, &out->faults_resolved, &out->evictions);
+        wl_xb_backend_stats(&out->frames, &out->faults_resolved, &out->pte_evictions);
+        wl_xb_pg_stats(out);
+        if (out->frames_total != 0) {
+            out->frames = out->frames_total - out->frames_free;
+        }
+    }
+}
+
+// ---- Pinned pages ------------------------------------------------------------------------------
+
+// The physical page of a VA (+ 1), 0 when it is not guest RAM.
+static uint32_t phys_page_of(uint32_t va) {
+    uint32_t phys = 0;
+    return wl_xb_va_to_phys(va, &phys) ? (phys >> WL_XB_PAGE_SHIFT) + 1u : 0u;
+}
+
+static WlResult pin_range(uint32_t va, uint32_t bytes, bool pin) {
+    if (!g_ready) {
+        return WL_ERR_STATE;
+    }
+    if (bytes == 0) {
+        return WL_OK;
+    }
+    uint32_t first = va & ~(WL_XB_PAGE - 1u);
+    uint64_t end = (uint64_t)va + bytes;
+    for (uint64_t a = first; a < end; a += WL_XB_PAGE) {
+        if (phys_page_of((uint32_t)a) == 0) {
+            return WL_ERR_RANGE;
+        }
+    }
+    for (uint64_t a = first; a < end; a += WL_XB_PAGE) {
+        WlResult r = wl_xb_pg_pin(phys_page_of((uint32_t)a) - 1u, pin);
+        if (r != WL_OK) {
+            return r;
+        }
+    }
+    return WL_OK;
+}
+
+WlResult wl_xb_mem_pin(uint32_t va, uint32_t bytes) {
+    return pin_range(va, bytes, true);
+}
+
+void wl_xb_mem_unpin(uint32_t va, uint32_t bytes) {
+    (void)pin_range(va, bytes, false);
+}
+
+bool wl_xb_mem_resident(uint32_t va) {
+    uint32_t p1 = g_ready ? phys_page_of(va) : 0u;
+    if (p1 == 0) {
+        return false;
+    }
+    return g_xb_pg_frames == 0 || g_xb_pg_frame[p1 - 1u] != 0; // without paging the OS backs every page
+}
+
+void wl_xb_mem_watch(uint32_t swap_ins_per_s) {
+    static uint64_t last_us, last_log_us;
+    static uint32_t last_ins, last_outs, last_evictions;
+    if (!g_ready || g_xb_pg_frames == 0) {
+        return;
+    }
+    WlXbMemStats st;
+    memset(&st, 0, sizeof st);
+    wl_xb_pg_stats(&st);
+    uint64_t now = wl_platform_time_us();
+    if (last_us == 0) {
+        last_us = now;
+        last_ins = st.swap_ins;
+        last_outs = st.swap_outs;
+        last_evictions = st.evictions;
+        return;
+    }
+    uint64_t span = now - last_us;
+    if (span < 500000u) {
+        return;
+    }
+    uint32_t ins = st.swap_ins - last_ins, outs = st.swap_outs - last_outs, ev = st.evictions - last_evictions;
+    last_us = now;
+    last_ins = st.swap_ins;
+    last_outs = st.swap_outs;
+    last_evictions = st.evictions;
+    uint32_t limit = swap_ins_per_s != 0 ? swap_ins_per_s : 128u;
+    uint32_t ins_s = (uint32_t)((uint64_t)ins * 1000000u / span);
+    if (ins_s > limit && (last_log_us == 0 || now - last_log_us >= 10000000u)) {
+        last_log_us = now;
+        uint32_t outs_s = (uint32_t)((uint64_t)outs * 1000000u / span);
+        uint32_t ev_s = (uint32_t)((uint64_t)ev * 1000000u / span);
+        WL_LOG_W(TAG, "thrashing: %u swap-ins/s (%u KB/s read), %u swap-outs/s, %u evictions/s; %u of %u frames free, "
+                 "%u pinned; swap I/O %u ms in all",
+                 (unsigned)ins_s, (unsigned)(ins_s * 4u), (unsigned)outs_s, (unsigned)ev_s, (unsigned)st.frames_free,
+                 (unsigned)st.frames_total, (unsigned)st.pinned_pages, (unsigned)(st.swap_us / 1000u));
     }
 }
