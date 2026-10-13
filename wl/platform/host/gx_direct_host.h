@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
-// Host stub of the direct GX layer (gx_direct.h): what was asked, kept for tests; nothing is drawn.
+// Host stub of the direct GX layer (gx_direct.h): what was asked, kept for tests; nothing is drawn
+// here, but a renderer set with wl_host_gx_set_renderer (gx_renderer_host.h) draws each primitive
+// with the state kept.
 #pragma once
 
 #include "wl/platform/gx_direct.h"
 
 enum { WL_HOST_GX_DIRECT_KEPT = 256 };
+enum { WL_HOST_GX_MAP_NONE = 0, WL_HOST_GX_MAP_TEXTURE, WL_HOST_GX_MAP_RAMP };
 
 typedef struct WlHostGxDirect {
     WlGxDirectLayout layout;
@@ -21,6 +24,12 @@ typedef struct WlHostGxDirect {
     WlGxCull cull;
     const WlGxTexObj *textures[8];
     WlGxSampler samplers[8];
+    // each texture map as GX holds it: what was loaded last (WL_HOST_GX_MAP_*), a copy of the
+    // object, and a colour-indexed one's TLUT
+    uint8_t map_kind[8];
+    WlGxTexObj map_objects[8];
+    WlGxTlut tluts[8];
+    bool tlut_loaded[8];
     uint32_t begins, invalidates;
     // primitives that got fewer vertices than they said
     uint32_t short_draws;

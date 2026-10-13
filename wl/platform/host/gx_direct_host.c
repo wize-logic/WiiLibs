@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "wl/platform/host/gx_direct_host.h"
+#include "wl/platform/host/gx_renderer_host.h"
 
 static WlHostGxDirect s;
 static bool g_flush_due, g_flush_off, g_layout_known;
@@ -101,6 +102,13 @@ void wl_gx_direct_primitive_end(void) {
     if (g_hook != NULL) {
         g_hook(g_hook_user, s.prim, g_vertices, g_received);
     }
+    {
+        const WlHostGxRenderer *r = wl_host_gx_renderer();
+
+        if (r != NULL && r->draw != NULL) {
+            r->draw(r->user, s.prim, g_vertices, g_received);
+        }
+    }
 }
 
 void wl_gx_direct_draw(WlGxDirectPrim prim, const WlGxDirectVertex *vertices, uint32_t count) {
@@ -163,17 +171,42 @@ void wl_gx_direct_cull(WlGxCull cull) {
 }
 
 void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler *sampler, const WlGxTlut *tlut) {
-    (void)tlut;
     if (map >= 8) {
         return;
     }
     s.textures[map] = tex;
     s.samplers[map] = sampler != NULL ? *sampler : tex->sampler;
+    s.map_kind[map] = WL_HOST_GX_MAP_TEXTURE;
+    s.map_objects[map] = *tex;
+    s.map_objects[map].sampler = s.samplers[map];
+    if (tlut != NULL && (tex->format == WL_GX_TEX_C4 || tex->format == WL_GX_TEX_C8)) {
+        // (a TLUT slot holds the last palette loaded into it, whichever map's object reads it)
+        unsigned other;
+
+        for (other = 0; other < 8; other++) {
+            if (s.map_kind[other] == WL_HOST_GX_MAP_TEXTURE && s.map_objects[other].tlut == tex->tlut) {
+                s.tluts[other] = *tlut;
+                s.tlut_loaded[other] = true;
+            }
+        }
+    }
     s.stats.textures++;
 }
 
+void wl_host_gx_direct_ramp(uint32_t map) {
+    if (map < 8) {
+        s.map_kind[map] = WL_HOST_GX_MAP_RAMP;
+        s.textures[map] = NULL;
+    }
+}
+
 void wl_gx_direct_texture_invalidate(void) {
+    const WlHostGxRenderer *r = wl_host_gx_renderer();
+
     s.invalidates++;
+    if (r != NULL && r->texture_invalidate != NULL) {
+        r->texture_invalidate(r->user);
+    }
 }
 
 void wl_gx_direct_stats(WlGxDirectStats *out) {

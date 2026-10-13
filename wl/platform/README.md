@@ -51,7 +51,7 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `gx_fifo.c` | `wl_gx_fifo_bytes`: the GX command FIFO's size, from the budget of `WL_TAG_GXFIFO` |
 | `stack.c` | stack depth measurement: a fill pattern and the high-water mark (`wl_platform_stack_used`) |
 | `wii/` | libogc backends (`heap_wrap_wii.c` wraps newlib's malloc family for the overflow heap and includes no libogc header; `tev_wii.c` applies a TEV program to GX): 64-bit atomics (the libatomic calls compilers make; Broadway has no 8-byte atomic instructions), thread-local variables (`__emutls_get_address` for `-femulated-tls`), the crash report (and the backtrace it uses, `backtrace_wii.c`), the exit tracer (`trace_wii.c`), network (`net_wii.c`, libogc's `net_*`), audio (AESND/ASND), exit and system buttons, fs (libfat, IOS 58), gx (with an optional EFB alpha, `wl_gx_set_efb_alpha`; `gx_target_wii.c` is the render targets' copies and quads), input (WPAD/PAD/keyboard), log sinks, mem, entropy (`random_wii.c`: the time base, not cryptographic), threads (LWP), video |
-| `host/` | stubs: backtrace (the real chain on ppc-be, none elsewhere), net (POSIX sockets), audio (test renders blocks), fs (devices map to directories), gx (records draws; `gx_target_host.c` records the render targets' operations, `gx_direct_host.c` the direct layer's), input (preloaded state), mem (malloc'd regions), system and log, tev (records the last applied program), entropy (getrandom, /dev/urandom), threads (pthreads) |
+| `host/` | stubs: backtrace (the real chain on ppc-be, none elsewhere), net (POSIX sockets), audio (test renders blocks), fs (devices map to directories), gx (records draws; `gx_target_host.c` records the render targets' operations, `gx_direct_host.c` the direct layer's, each texture map as GX holds it; a renderer set with `wl_host_gx_set_renderer` (`host/gx_renderer_host.h`) is handed every primitive, EFB copy, quad, frame and peek with the state recorded, as wl/gxsoft's software GX draws them; the render targets' quads leave the recorded state as the console's leave GX's), input (preloaded state), mem (malloc'd regions), system and log, tev (records the last applied program), entropy (getrandom, /dev/urandom), threads (pthreads) |
 
 Host test control lives in `host/*_host.h`: `wl_host_audio_render`, `wl_host_fs_set_root`,
 `wl_host_gx_state` / `wl_host_gx_record`, `wl_host_target_ops`, `wl_host_input_set`, `wl_host_rumble_allowed`, `wl_host_stop_set_hook`, `wl_host_system_raise`, `wl_host_exit_set_hook`, `wl_host_system_reset`, `wl_host_tev_last`.
@@ -182,7 +182,10 @@ if (wl_tev_validate(&p, &rep)) wl_tev_apply(&p);   // apply validates again and 
 - `wl_tev_eval` runs a program on one pixel (texels per texmap, the two rasteriser colours) in
   integers, with the hardware's 8.8 blend (`c + (c >> 7)` as the factor), 11-bit unclamped
   registers, swap tables and every konst selection; tests check numeric results with it. It
-  matches the hardware to rounding; it has not been compared bit for bit.
+  matches the hardware to rounding; it has not been compared bit for bit. `wl_tev_eval_stages` is
+  the same for a renderer (wl/gxsoft): each stage's own texel (GX gives every stage its own lookup,
+  so one map read at two coordinates is two texels), no validation (checked once by the caller;
+  codes taken within their fields, an unordered texel or colour read as 0).
 - The helpers a translator needs: `wl_tev_konst_slot` / `wl_tev_konst_external`, `wl_tev_pool_*` (a
   register pool, REG0..REG2 before PREV), `wl_tev_needs_*` (the texture, colour channel and swap
   tables a set of inputs wants from a stage, and the colour half's and alpha half's konst
