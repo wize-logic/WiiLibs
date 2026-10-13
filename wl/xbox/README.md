@@ -172,7 +172,9 @@ over in parts of whole primitives (a strip's parts even, so its winding holds).
   Direct3D's D3DCULL_CCW keeps a quad wound clockwise on the screen; GX's sense measured once at
   start); stencil draws skipped and counted. The
   EFB is the back buffer; another surface (a multisampled one among them) takes it through
-  `wl/platform/gx_target.h`, and a texture at its address then samples its image. The frame's first
+  `wl/platform/gx_target.h`, and a texture at its address then samples its image; once a title
+  samples a surface it showed (a displayed picture as a texture), each finished back buffer is
+  copied out of the EFB into a target at its address too, for the next frame. The frame's first
   full clear is GX's copy clear, others are quads. A frame is shown on FLIP_INCREMENT_WRITE, on a
   switch to another screen-sized surface, or when the display flips to the surface in the EFB.
 - **Textures** (`nv2a_texture.h`, `nv2a_texcache.h`): a stage's registers decoded (swizzled, linear,

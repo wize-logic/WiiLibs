@@ -393,6 +393,66 @@ TEST a_second_pass_over_the_same_geometry_passes_lequal(void) {
     PASS();
 }
 
+// a frame into the back buffer at `color`, shown when finished
+static void frame_into(TGuest *g, uint32_t color) {
+    t_m1(g, WL_NV2A_K_SET_SURFACE_COLOR_OFFSET, color);
+    f_clear(g, 0xFF000000u);
+}
+
+static void frame_finished(TGuest *g, uint32_t color) {
+    t_m1(g, WL_NV2A_K_FLIP_INCREMENT_WRITE, 0);
+    t_kick(g);
+    t_mmio(g, WL_NV2A_PCRTC_START, color);
+}
+
+// A title that samples a picture it showed (the surface it flipped to, as a linear 640x480
+// texture), as Halo's sun glare reads the last frame's alpha: on the NV2A that picture is in
+// memory, on GX it was only in the EFB. Once a displayed surface is read, each finished back buffer
+// is copied into a target at its address, and the next frame samples it.
+TEST a_picture_shown_is_sampled_the_next_frame(void) {
+    TGuest g;
+    unsigned frame;
+    enum { F_COLOR2 = 0x180000 };
+
+    ASSERT(pixel_device(&g) != NULL);
+    white_texture(&g);
+    f_program(&g, 0, f_screen_program, 3);
+    t_m1(&g, WL_NV2A_K_SET_DEPTH_TEST_ENABLE, 0);
+    // frames into F_COLOR and F_COLOR2 by turns: a quad of the frame's colour at (100, 100), and
+    // from the second on a quad at (300, 100) sampling the picture shown before
+    for (frame = 0; frame < 3; frame++) {
+        uint32_t back = frame & 1u ? (uint32_t)F_COLOR2 : (uint32_t)F_COLOR, shown = back == F_COLOR ? F_COLOR2 : F_COLOR;
+        uint32_t colour = frame == 1 ? 0xFF00FF00u : 0xFF0000FFu; // (ABGR: green, then red)
+
+        frame_into(&g, back);
+        f_texture(&g, F_TEXTURE, WL_NV2A_TEX_SZ_A8R8G8B8, 2, 2);
+        f_quad(&g, 100, 100, 200, 200, 0.5f, colour);
+        if (frame > 0) {
+            t_m1(&g, WL_NV2A_K_SET_TEXTURE_OFFSET, shown);
+            t_m1(&g, WL_NV2A_K_SET_TEXTURE_FORMAT, 1u | 2u << 4 | (uint32_t)WL_NV2A_TEX_LU_A8R8G8B8 << 8 | 1u << 16);
+            t_m1(&g, WL_NV2A_K_SET_TEXTURE_CONTROL1, 2560u << 16);
+            t_m1(&g, WL_NV2A_K_SET_TEXTURE_IMAGE_RECT, 640u << 16 | 480u);
+            // (a linear texture's coordinates are texels: the quad shows the picture's (100, 100)-(200, 200))
+            t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_QUADS);
+            f_vertex(&g, 300, 100, 0, 1, 100, 100, 0xFFFFFFFFu);
+            f_vertex(&g, 400, 100, 0, 1, 200, 100, 0xFFFFFFFFu);
+            f_vertex(&g, 400, 200, 0, 1, 200, 200, 0xFFFFFFFFu);
+            f_vertex(&g, 300, 200, 0, 1, 100, 200, 0xFFFFFFFFu);
+            t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+        }
+        t_kick(&g);
+        if (frame == 2) {
+            // the third frame shows the second's green quad (the first, read before any picture was
+            // kept, is not looked at)
+            ASSERT(near_rgb(pixel(150, 150), 0xFF0000FFu, 4));
+            ASSERT(near_rgb(pixel(350, 150), 0x00FF00FFu, 4));
+        }
+        frame_finished(&g, back);
+    }
+    pixel_done(&g);
+    PASS();
+}
+
 typedef struct Sink {
     uint8_t *data;
     size_t size, capacity;
@@ -511,6 +571,7 @@ SUITE(pixels_suite) {
     RUN_TEST(direct3d_culling_keeps_quads_wound_clockwise_on_the_screen);
     RUN_TEST(a_final_product_with_every_register_held_is_drawn);
     RUN_TEST(a_second_pass_over_the_same_geometry_passes_lequal);
+    RUN_TEST(a_picture_shown_is_sampled_the_next_frame);
     RUN_TEST(capture_replays_to_the_same_pixels);
 }
 

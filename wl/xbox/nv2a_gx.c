@@ -82,6 +82,9 @@ struct WlNv2aGx {
     // the EFB's owner (NULL: the back buffer) and the targets
     RenderTarget targets[TARGETS];
     RenderTarget *owner;
+    // the title samples a picture it showed (a display surface as a texture): each finished back
+    // buffer is copied into a target at its address
+    bool keep_frames;
     uint32_t view_w, view_h;
     // the draw's
     const WlNv2aTexEntry *entries[WL_NV2A_TEXTURES];
@@ -231,11 +234,14 @@ static void use_back_buffer(WlNv2aGx *gx) {
     }
 }
 
+static void frame_keep(WlNv2aGx *gx);
+
 void wl_nv2a_gx_present(WlNv2aGx *gx) {
     if (!gx->frame_open) {
         return;
     }
     use_back_buffer(gx);
+    frame_keep(gx);
     wl_gx_invalidate_shadow();
     wl_gx_end_frame();
     gx->frame_open = false;
@@ -271,25 +277,16 @@ static bool surface_is_screen(const WlNv2aGx *gx, const WlNv2aSurface *s) {
            h * 4u >= gx->cfg.height * 3u;
 }
 
-static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {
-    uint32_t w = s->clip_width / s->samples_x, h = s->clip_height / s->samples_y;
-    uint8_t format = s->color_bytes == 2 ? (uint8_t)WL_GX_TEX_RGB565 : (uint8_t)WL_GX_TEX_RGBA8;
+// the target of a surface at `phys` of `w` x `h` in `format` (a WlGxTexFormat): the one there, or
+// the least recently used slot made it (NULL without memory, or when that slot owns the EFB)
+static RenderTarget *slot_for(WlNv2aGx *gx, uint32_t phys, uint32_t w, uint32_t h, uint8_t format) {
     RenderTarget *slot = NULL;
     unsigned i;
 
-    if (s->swizzled) {
-        w = 1u << s->log2_width;
-        h = 1u << s->log2_height;
-    }
-    w = (w + 3u) & ~3u;
-    h = (h + 3u) & ~3u;
-    if (w == 0 || h == 0 || w > 1024u || h > 1024u) {
-        return NULL;
-    }
     for (i = 0; i < TARGETS; i++) {
         RenderTarget *t = &gx->targets[i];
 
-        if (t->memory != NULL && t->phys == s->color_phys && t->width == w && t->height == h && t->format == format) {
+        if (t->memory != NULL && t->phys == phys && t->width == w && t->height == h && t->format == format) {
             t->used_frame = gx->frame;
             return t;
         }
@@ -309,7 +306,7 @@ static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {
     if (slot->memory == NULL) {
         return NULL;
     }
-    slot->phys = s->color_phys;
+    slot->phys = phys;
     slot->width = w;
     slot->height = h;
     slot->format = format;
@@ -319,9 +316,46 @@ static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {
     slot->target.width = (uint16_t)w;
     slot->target.height = (uint16_t)h;
     slot->target.format = format;
-    slot->target.user = s->color_phys;
+    slot->target.user = phys;
     return slot;
 }
+
+static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {
+    uint32_t w = s->clip_width / s->samples_x, h = s->clip_height / s->samples_y;
+    uint8_t format = s->color_bytes == 2 ? (uint8_t)WL_GX_TEX_RGB565 : (uint8_t)WL_GX_TEX_RGBA8;
+
+    if (s->swizzled) {
+        w = 1u << s->log2_width;
+        h = 1u << s->log2_height;
+    }
+    w = (w + 3u) & ~3u;
+    h = (h + 3u) & ~3u;
+    if (w == 0 || h == 0 || w > 1024u || h > 1024u) {
+        return NULL;
+    }
+    return slot_for(gx, s->color_phys, w, h, format);
+}
+
+// The finished back buffer copied into a target at its address, for a title that samples a picture
+// it showed (Halo's sun glare reads the last frame's alpha, where it drew the sun's visibility):
+// on the NV2A that surface's pixels are in memory, on GX only in the EFB until the display copy.
+static void frame_keep(WlNv2aGx *gx) {
+    uint32_t w = gx->cfg.width & ~3u, h = gx->cfg.height & ~3u;
+    RenderTarget *t;
+
+    if (!gx->keep_frames || !gx->back_drawn || gx->back_phys == 0 || gx->owner != NULL) {
+        return;
+    }
+    t = slot_for(gx, gx->back_phys, w, h, (uint8_t)WL_GX_TEX_RGBA8);
+    if (t == NULL) {
+        return;
+    }
+    wl_gx_copy_efb_texture(0, 0, (int)w, (int)h, t->memory, WL_GX_TEX_RGBA8, false);
+    t->resolved = true;
+    gx->texture_memory_changed = true;
+}
+
+static bool is_display(const WlNv2aGx *gx, uint32_t phys);
 
 // The EFB for the surface the next draw or clear is into: the frame begun, the back buffer or a
 // render target its owner, the viewport and scissor. false when the surface cannot be drawn.
@@ -558,6 +592,12 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
             continue;
         }
         e = target_texture(gx, stage, &t);
+        if (e == NULL && !gx->keep_frames && is_display(gx, t.phys)) {
+            // (a picture the title showed, as a texture: kept from the next frame on)
+            gx->keep_frames = true;
+            WL_LOG_I(TAG, "a displayed surface (%08x) is read as a texture: each frame is kept as one",
+                     (unsigned)t.phys);
+        }
         if (e == NULL) {
             bool mipmaps = t.levels > 1 && t.min_filter >= WL_NV2A_FILTER_NEAREST_MIP_NEAREST &&
                            t.min_filter <= WL_NV2A_FILTER_LINEAR_MIP_LINEAR;
