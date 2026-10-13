@@ -125,6 +125,9 @@ void wl_xb_thread_set_priority(WlXbThread *t, int priority);
 
 // The thread holding the guest lock (the caller, for code that runs under it).
 WlXbThread *wl_xb_current(void);
+// Whether the calling host thread holds the guest lock (true before wl_xb_threads_init: one
+// thread). The paging slow path asks it before it waits for the swap file. Lock not necessarily held.
+bool wl_xb_lock_held(void);
 WlXbThread *wl_xb_thread_by_kthread(uint32_t kthread_va);
 WlXbThread *wl_xb_thread_by_id(uint32_t id);
 // Visits every thread (the lock held): crash reports, the kernel's bookkeeping.
