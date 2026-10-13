@@ -62,6 +62,8 @@ typedef struct WlNv2aGxStats {
     uint32_t approximations;      // draws whose combiners or blending were approximated
     uint32_t vertices_reused;     // vertices of indexed draws taken from the ones already run
     uint32_t perspective_draws;   // draws through the perspective projection
+    uint32_t fits_made;           // ...whose depth a + b / w was fitted for a transform not seen
+    uint32_t fits_shared;         // ...that used the fit kept for their transform
 } WlNv2aGxStats;
 
 // A backend over GX, which must be up (wl_gx_init). NULL when there is no memory. The device it
@@ -79,3 +81,7 @@ const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx);
 // approximated), and whether it was used (false: texture 0 times the colour instead); NULL before
 // the first draw. Valid until the next draw. For logs and tools.
 const WlXboxPshProgram *wl_nv2a_gx_last_program(const WlNv2aGx *gx, bool *used);
+// Whether the last draw went through the perspective projection, its depth a + b / w (0..1 of the
+// depth range, before the far plane's scale), and whether that was the fit kept for its transform
+// (shared with the draws of the same transform). For logs and tools.
+bool wl_nv2a_gx_last_projection(const WlNv2aGx *gx, float *a, float *b, bool *shared);

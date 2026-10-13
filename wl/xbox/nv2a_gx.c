@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/base/hash.h"
 #include "wl/platform/gx_direct.h"
 #include "wl/platform/gx_target.h"
 #include "wl/platform/platform.h"
@@ -28,18 +29,31 @@ enum {
     // indexed draws' vertices kept by index (a direct-mapped table: a strip's or list's neighbours
     // come back soon)
     MEMO = 1024,
-    // vertices looked at for the projection's fit
+    // vertices in front of the eye looked at for the projection's fit, at most
     FIT_PROBES = 24,
+    // ...among the draw's first ones (a strip may start behind the eye)
+    FIT_SCAN = 128,
     // ...of which these, spread in depth, are enough
     FIT_ENOUGH = 6,
-    // the fits kept, for draws that come back to a projection (passes over the same geometry)
-    FITS_KEPT = 4
+    // the fits kept by the transform they were made for (its signature): sets by the signature's
+    // hash, ways in a set
+    FIT_SETS = 128,
+    FIT_WAYS = 2,
+    // the inputs a draw's program is also run with for its transform's signature
+    CANONICAL_POINTS = 4
 };
 
-// how far (in the depth's 0..1) a kept fit may be from a draw's own depths and still serve it: a
-// few of the depth buffer's 24-bit steps, the rounding of a program's depth, far below what tells
-// two projections apart
+// how far (in the depth's 0..1) a fit made with the canonical points may be from a draw's own
+// depths: a few of the depth buffer's 24-bit steps, the rounding of a program's depth
 #define FIT_TOLERANCE (8.0f / 16777216.0f)
+// how far a fit kept for a transform may be from a draw of the same signature: only a sanity check.
+// The draws of one transform must share its fit exactly whatever its rounding (a fit is exact only
+// near the vertices it was made from, and a second pass may reach nearer the eye, where the depth
+// runs steep: hundreds of steps there), and a + b / w belongs to the camera's projection, not to
+// the object, so even two transforms the signature cannot tell apart (a position that also
+// depends on what the canonical inputs set) share it rightly; a fit this far off is another
+// projection
+#define SIGNATURE_TOLERANCE (1.0f / 256.0f)
 
 // the depth GX's perspective draws are scaled by: below 1 for every w while a < 1 / DEPTH_SCALE,
 // so nothing is clipped at the far plane (OpenCE-Wii's b30 horizon), the same for every draw
@@ -101,11 +115,15 @@ struct WlNv2aGx {
     float loaded_bias;
     uint32_t loaded_w, loaded_h;
     float fit_a, fit_b;
-    // the last fits (most recent first) and how many there are
-    struct {
+    // the fits kept by their transform's signature: the clip-space positions the program gives the
+    // canonical inputs, bit for bit
+    struct FitSignature {
+        uint32_t clip[CANONICAL_POINTS][4];
         float a, b;
-    } fits[FITS_KEPT];
-    unsigned fit_count;
+        uint32_t used;
+    } signatures[FIT_SETS][FIT_WAYS];
+    uint32_t signature_use;
+    bool last_shared;
     struct {
         uint32_t index, stamp;
         WlGxDirectVertex vertex;
@@ -180,6 +198,19 @@ void wl_nv2a_gx_stats(const WlNv2aGx *gx, WlNv2aGxStats *out) {
 
 const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx) {
     return &gx->textures;
+}
+
+bool wl_nv2a_gx_last_projection(const WlNv2aGx *gx, float *a, float *b, bool *shared) {
+    if (a != NULL) {
+        *a = gx->projection.a;
+    }
+    if (b != NULL) {
+        *b = gx->projection.b;
+    }
+    if (shared != NULL) {
+        *shared = gx->last_shared;
+    }
+    return gx->projection.perspective;
 }
 
 const WlXboxPshProgram *wl_nv2a_gx_last_program(const WlNv2aGx *gx, bool *used) {
@@ -709,28 +740,72 @@ static float as_depth(float z, float depth_max) {
     return depth > 1.0f ? 1.0f : depth;
 }
 
+// the inputs a draw's program is run with for its transform's signature (every input register
+// one of these), and whose w and depth widen its fit: points spread far through model space
+static const float canonical_points[CANONICAL_POINTS][4] = {
+    {0.0f, 0.0f, 0.0f, 1.0f}, {1024.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 1024.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 1024.0f, 1.0f}};
+
+// the depth a + b / w that goes through the points with the least and the greatest 1 / w
+static bool fit_two(const float *inverse_w, const float *depth, unsigned n, float *a, float *b) {
+    unsigned i, near = 0, far = 0;
+
+    for (i = 1; i < n; i++) {
+        near = inverse_w[i] < inverse_w[near] ? i : near;
+        far = inverse_w[i] > inverse_w[far] ? i : far;
+    }
+    if (n < 2 || !(inverse_w[far] - inverse_w[near] > 1.0e-6f * inverse_w[far])) {
+        return false;
+    }
+    *b = (depth[far] - depth[near]) / (inverse_w[far] - inverse_w[near]);
+    *a = depth[near] - *b * inverse_w[near];
+    return true;
+}
+
+static float fit_error(float a, float b, const float *inverse_w, const float *depth, unsigned n) {
+    float worst = 0.0f;
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        float error = fabsf(a + b * inverse_w[i] - depth[i]);
+
+        worst = error > worst || error != error ? error : worst;
+    }
+    return worst;
+}
+
 // The projection of a draw: a few of its vertices, for their w and depth (OpenCE-Wii's
 // projection_fit). A program that captures its clip-space position (divides by w) is drawn through
 // the perspective projection, its depth a + b / w; vertices all at w 1 are screen space.
 //
-// a and b come from the draw's vertices, and two draws of one camera give the same ones but for
-// the rounding of their depths: enough for a pass drawn again over the same geometry with a depth
-// test of LEQUAL or EQUAL (a shadow or a light over a base pass) to fail on GX where it passes on
-// the NV2A, in some frames and not others. So a fit kept from an earlier draw that gives this
-// draw's depths, to within a few of the depth buffer's steps, is used again as it is, the same
-// numbers; only a draw no kept fit serves is fitted anew, from the two vertices farthest apart in
-// 1 / w (the steadiest fit), and kept. With all its vertices at one w, the last fit.
+// a and b come from vertices, and two draws of one camera give the same ones but for the rounding
+// of their depths: enough for a pass drawn again over the same geometry with a depth test of
+// LEQUAL or EQUAL and no depth write (a shadow or a light over a base pass) to fail on GX where it
+// passes on the NV2A, in some frames and not others. So the fit is kept by the transform it was
+// made for, and every draw of that transform uses it, the same numbers: the transform's signature
+// is the clip-space positions the program gives four canonical inputs (every input register set
+// to one point), compared bit for bit, which two draws share whatever their vertices when their
+// programs compute the position alike from the same constants (two programs, Halo's ring and its
+// shadow pass, among them). A fit is made, for a transform not seen, from its
+// draw's vertices and the canonical points (the two farthest apart in 1 / w, for the steadiest
+// fit), or from the vertices alone where the points stray from them (a program whose depth is not
+// a + b / w everywhere). The points that count are those within the depth range (between the near
+// and far planes: what GX draws), the draw's first 24 of them among its first 128 vertices; a draw
+// with none uses its transform's fit as it is.
 static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, float depth_max) {
     Projection p = {false, gx->fit_a, gx->fit_b};
-    float inputs[WL_NV2A_ATTRIBS][4], inverse_w[FIT_PROBES], depth[FIT_PROBES];
-    uint32_t probes = draw->count < FIT_PROBES ? draw->count : FIT_PROBES, v, n = 0, near = 0, far = 0, f;
-    bool all_w1 = true;
+    float inputs[WL_NV2A_ATTRIBS][4], inverse_w[FIT_PROBES + CANONICAL_POINTS], depth[FIT_PROBES + CANONICAL_POINTS];
+    uint32_t clip[CANONICAL_POINTS][4];
+    uint32_t probes = draw->count < FIT_SCAN ? draw->count : FIT_SCAN, v, n = 0, c, i, slot = 0;
+    struct FitSignature *set;
+    float near_w = 0.0f, far_w = 0.0f, a, b, d;
+    bool all_w1 = true, in_front = false;
     WlXboxVshOutput out;
 
+    gx->last_shared = false;
     if (gx->pipeline.program == NULL) {
         return p;
     }
-    for (v = 0; v < probes; v++) {
+    for (v = 0; v < probes && n < FIT_PROBES; v++) {
         wl_nv2a_draw_fetch(draw, k, v, inputs);
         wl_nv2a_pipeline_vertex(&gx->pipeline, k, (const float (*)[4])inputs, WL_XBOX_VSH_LIVE_POSITION, &out);
         if (!out.clip_captured) {
@@ -740,60 +815,82 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
         if (!(out.clip[3] > 1.0e-4f)) {
             continue;
         }
+        in_front = true;
         all_w1 = all_w1 && fabsf(out.clip[3] - 1.0f) < 1.0e-4f;
+        d = out.position[2] / depth_max;
+        // (a vertex beyond the near or the far plane: GX clips there, its depth is never drawn, and
+        // near the eye the depth runs steep, so it is no measure of a fit)
+        if (!(d >= 0.0f && d <= 1.0f)) {
+            continue;
+        }
         inverse_w[n] = 1.0f / out.clip[3];
-        depth[n] = out.position[2] / depth_max;
-        if (inverse_w[n] < inverse_w[near]) {
-            near = n;
-        }
-        if (inverse_w[n] > inverse_w[far]) {
-            far = n;
-        }
+        depth[n] = d;
+        near_w = n == 0 || inverse_w[n] < near_w ? inverse_w[n] : near_w;
+        far_w = n == 0 || inverse_w[n] > far_w ? inverse_w[n] : far_w;
         n++;
         // (enough to tell a projection and fit one: a few vertices spread in depth)
-        if (n >= FIT_ENOUGH && inverse_w[far] - inverse_w[near] > 1.0e-3f * inverse_w[far]) {
+        if (n >= FIT_ENOUGH && far_w - near_w > 1.0e-3f * far_w) {
             break;
         }
     }
-    if (n == 0) {
+    if (!p.perspective) {
         return p;
     }
-    // (a kept fit that gives these depths: the same numbers again)
-    for (f = 0; f < gx->fit_count; f++) {
-        float worst = 0.0f;
-
-        for (v = 0; v < n; v++) {
-            float error = fabsf(gx->fits[f].a + gx->fits[f].b * inverse_w[v] - depth[v]);
-
-            worst = error > worst ? error : worst;
-        }
-        if (worst <= FIT_TOLERANCE) {
-            p.a = gx->fit_a = gx->fits[f].a;
-            p.b = gx->fit_b = gx->fits[f].b;
-            if (f != 0) {
-                float a = gx->fits[f].a, b = gx->fits[f].b;
-
-                memmove(&gx->fits[1], &gx->fits[0], f * sizeof gx->fits[0]);
-                gx->fits[0].a = a;
-                gx->fits[0].b = b;
-            }
-            return p;
-        }
-    }
-    if (fabsf(inverse_w[far] - inverse_w[near]) > 1.0e-6f * inverse_w[far]) {
-        unsigned kept = gx->fit_count < FITS_KEPT ? gx->fit_count : FITS_KEPT - 1u;
-
-        gx->fit_b = (depth[far] - depth[near]) / (inverse_w[far] - inverse_w[near]);
-        gx->fit_a = depth[near] - gx->fit_b * inverse_w[near];
-        memmove(&gx->fits[1], &gx->fits[0], kept * sizeof gx->fits[0]);
-        gx->fits[0].a = gx->fit_a;
-        gx->fits[0].b = gx->fit_b;
-        gx->fit_count = kept + 1u;
-    } else if (all_w1) {
+    if (in_front && all_w1 && !(far_w - near_w > 1.0e-6f * far_w)) {
+        // (screen space: every vertex at w 1)
         p.perspective = false;
+        return p;
     }
-    p.a = gx->fit_a;
-    p.b = gx->fit_b;
+    // the transform's signature, and the canonical points' w and depth
+    c = n;
+    for (i = 0; i < CANONICAL_POINTS; i++) {
+        for (v = 0; v < WL_NV2A_ATTRIBS; v++) {
+            memcpy(inputs[v], canonical_points[i], sizeof inputs[v]);
+        }
+        wl_nv2a_pipeline_vertex(&gx->pipeline, k, (const float (*)[4])inputs, WL_XBOX_VSH_LIVE_POSITION, &out);
+        memcpy(clip[i], out.clip, sizeof clip[i]);
+        d = out.position[2] / depth_max;
+        if (out.clip[3] > 1.0e-4f && d >= 0.0f && d <= 1.0f) {
+            inverse_w[c] = 1.0f / out.clip[3];
+            depth[c] = d;
+            c++;
+        }
+    }
+    gx->signature_use++;
+    set = gx->signatures[wl_fnv1a64(clip, sizeof clip) % FIT_SETS];
+    for (i = 0; i < FIT_WAYS; i++) {
+        if (set[i].used != 0 && memcmp(set[i].clip, clip, sizeof clip) == 0) {
+            // (no vertex in front of the eye among those looked at: the transform's fit as it is)
+            if (n == 0 || fit_error(set[i].a, set[i].b, inverse_w, depth, n) <= SIGNATURE_TOLERANCE) {
+                set[i].used = gx->signature_use;
+                p.a = gx->fit_a = set[i].a;
+                p.b = gx->fit_b = set[i].b;
+                gx->last_shared = true;
+                gx->stats.fits_shared++;
+                return p;
+            }
+            // (the same signature, another projection: made again)
+            slot = i;
+            break;
+        }
+        if (set[i].used < set[slot].used) {
+            slot = i;
+        }
+    }
+    // a fit for a transform not seen: through the vertices and the canonical points, unless they
+    // stray from the vertices; else through the vertices alone (with none in front of the eye, the
+    // canonical points alone; with neither, the last fit)
+    if (!(fit_two(inverse_w, depth, c, &a, &b) && fit_error(a, b, inverse_w, depth, n) <= FIT_TOLERANCE) &&
+        !fit_two(inverse_w, depth, n, &a, &b)) {
+        return p;
+    }
+    gx->stats.fits_made++;
+    memcpy(set[slot].clip, clip, sizeof clip);
+    set[slot].a = a;
+    set[slot].b = b;
+    set[slot].used = gx->signature_use;
+    p.a = gx->fit_a = a;
+    p.b = gx->fit_b = b;
     return p;
 }
 
