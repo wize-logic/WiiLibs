@@ -9,6 +9,7 @@
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/regfile.h"
+#include "wl/xboxrt/usb.h"
 
 #define TAG "xbdev"
 
@@ -149,10 +150,6 @@ static WlResult add_device(const char *name, uint32_t base, uint32_t size, DevRe
     return wl_xb_mmio_register(&dev);
 }
 
-static uint32_t elapsed_ms(const Dev *d) {
-    return (uint32_t)((wl_platform_time_us() - d->start_us) / 1000u);
-}
-
 // APU: the global processor's sample counter (DirectSound waits for it to move) runs at 48 kHz.
 static bool apu_read(Dev *d, uint32_t off, unsigned size, uint32_t *out) {
     (void)size;
@@ -188,51 +185,6 @@ static bool ac97_write(Dev *d, uint32_t off, uint32_t value, unsigned size) {
     return false;
 }
 
-// OHCI: revision 1.0, a reset that completes at once, a running frame number, two powered ports
-// with nothing connected, interrupt status write-one-to-clear.
-static bool ohci_read(Dev *d, uint32_t off, unsigned size, uint32_t *out) {
-    (void)size;
-    switch (off & ~3u) {
-    case 0x00:
-        *out = 0x10; // HcRevision
-        return true;
-    case 0x08:
-        *out = wl_xb_regfile_get32(&d->regs, 0x08) & ~1u; // HcCommandStatus: HCR done
-        return true;
-    case 0x34:
-        *out = wl_xb_regfile_has(&d->regs, 0x34) ? wl_xb_regfile_get32(&d->regs, 0x34) : 0x2EDFu; // HcFmInterval
-        return true;
-    case 0x3C:
-        *out = elapsed_ms(d) & 0xFFFFu; // HcFmNumber: one frame a millisecond
-        return true;
-    case 0x48:
-        *out = 0x02000002u; // HcRhDescriptorA: 2 ports, no power switching
-        return true;
-    case 0x54:
-    case 0x58:
-        *out = 0x00000100u; // HcRhPortStatus: powered, nothing connected
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool ohci_write(Dev *d, uint32_t off, uint32_t value, unsigned size) {
-    if ((off & ~3u) == 0x0Cu && size == 4) { // HcInterruptStatus: write one to clear
-        wl_xb_regfile_set32(&d->regs, 0x0C, wl_xb_regfile_get32(&d->regs, 0x0C) & ~value);
-        return true;
-    }
-    if ((off & ~3u) == 0x14u && size == 4) { // HcInterruptDisable clears enable bits
-        wl_xb_regfile_set32(&d->regs, 0x10, wl_xb_regfile_get32(&d->regs, 0x10) & ~value);
-        return true;
-    }
-    if ((off & ~3u) == 0x10u && size == 4) { // HcInterruptEnable sets them
-        wl_xb_regfile_set32(&d->regs, 0x10, wl_xb_regfile_get32(&d->regs, 0x10) | value);
-        return true;
-    }
-    return false;
-}
-
 // The flash: reads 0, writes ignored.
 static bool flash_read(Dev *d, uint32_t off, unsigned size, uint32_t *out) {
     (void)d;
@@ -250,16 +202,13 @@ static bool flash_write(Dev *d, uint32_t off, uint32_t value, unsigned size) {
     return true;
 }
 
-WlResult wl_xb_devices_register_mcpx(void) {
+WlResult wl_xb_devices_register_mcpx_usb(const WlXbUsbConfig *usb) {
     WlResult r = add_device("apu", WL_XB_APU_BASE, WL_XB_APU_SIZE, apu_read, NULL, 4096);
     if (r == WL_OK) {
         r = add_device("ac97", WL_XB_AC97_BASE, WL_XB_AC97_SIZE, ac97_read, ac97_write, 256);
     }
     if (r == WL_OK) {
-        r = add_device("usb0", WL_XB_USB0_BASE, WL_XB_USB_SIZE, ohci_read, ohci_write, 256);
-    }
-    if (r == WL_OK) {
-        r = add_device("usb1", WL_XB_USB1_BASE, WL_XB_USB_SIZE, ohci_read, ohci_write, 256);
+        r = wl_xb_usb_register(usb); // the host controllers and the gamepads (usb.h)
     }
     if (r == WL_OK) {
         r = add_device("nic", WL_XB_NIC_BASE, WL_XB_NIC_SIZE, NULL, NULL, 256);
@@ -268,6 +217,10 @@ WlResult wl_xb_devices_register_mcpx(void) {
         r = add_device("flash", WL_XB_FLASH_BASE, WL_XB_FLASH_SIZE, flash_read, flash_write, 16);
     }
     return r;
+}
+
+WlResult wl_xb_devices_register_mcpx(void) {
+    return wl_xb_devices_register_mcpx_usb(NULL);
 }
 
 // ---- The GPU -----------------------------------------------------------------------------------

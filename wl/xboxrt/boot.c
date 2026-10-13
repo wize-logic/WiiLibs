@@ -15,6 +15,7 @@
 #include "wl/xboxkrnl/xboxkrnl.h"
 #include "wl/xboxrt/boot.h"
 #include "wl/xboxrt/devices.h"
+#include "wl/xboxrt/input.h"
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/mmio.h"
@@ -30,6 +31,11 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     cfg->ram_mb = 64;
     cfg->keep_free_bytes = 14u << 20; // the host side: GX textures converted from the guest's, caches
     cfg->htab_bytes = 256u << 10;
+}
+
+static void input_vblank(void *user) {
+    (void)user;
+    wl_xb_input_frame();
 }
 
 static WlResult read_file(void *user, uint32_t offset, void *dst, uint32_t n) {
@@ -220,6 +226,13 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     if (r != WL_OK) {
         return r;
     }
+    // the controller ports (the host's controllers on the Wii) before the USB frame tick reads them
+#if defined(__wii__)
+    wl_xb_input_reset(true);
+#else
+    wl_xb_input_reset(false);
+#endif
+    wl_xb_service_add_vblank_hook(input_vblank, NULL);
     wl_xb_devices_register_mcpx();
     bool real_gpu = !cfg->gpu_stub && wl_xb_gpu_attach_nv2a() == WL_OK;
     if (!real_gpu) {

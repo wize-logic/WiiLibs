@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // The Xbox's devices for a title that has to get through its XDK libraries' initialisation without
-// sound, network or controllers yet: each answers as idle or absent hardware would, so the init
-// loops end (and DirectSoundCreate, XNetStartup, the controller enumeration fail the way a title
-// tolerates). And the GPU's place: the NV2A device and its vertical blank interrupt, wired to a
+// sound or network yet: each answers as idle or absent hardware would, so the init loops end (and
+// DirectSoundCreate and XNetStartup fail the way a title tolerates); the USB controllers and the
+// gamepads behind them are modelled (usb.h). And the GPU's place: the NV2A device and its vertical blank interrupt, wired to a
 // model through WlXbGpuOps (wl/xbox's NV2A, or the idle stub here).
 //
 // Register numbers are from public descriptions of the hardware: the OHCI 1.0a specification
@@ -30,12 +30,14 @@ extern "C" {
 #define WL_XB_FLASH_BASE 0xFF000000u
 #define WL_XB_FLASH_SIZE 0x01000000u
 
-// Registers the MCPX's idle devices: APU (registers kept, its sample counter running), AC'97 (no
-// codec ready: DirectSoundCreate gives up; the bus master's reset bits clear themselves), two
-// OHCI controllers (reset completes, frame number runs, ports powered with nothing plugged in),
-// the NIC (registers kept, nothing happens) and the flash (reads zero). Each logs the first touch
-// of a register it does not model, once.
+// Registers the MCPX's devices: APU (registers kept, its sample counter running), AC'97 (no
+// codec ready: DirectSoundCreate gives up; the bus master's reset bits clear themselves), the two
+// OHCI controllers with the gamepads (usb.h, with `usb`'s settings; NULL: the defaults), the NIC
+// (registers kept, nothing happens) and the flash (reads zero). The idle ones log the first touch
+// of a register they do not model, once.
+struct WlXbUsbConfig;
 WlResult wl_xb_devices_register_mcpx(void);
+WlResult wl_xb_devices_register_mcpx_usb(const struct WlXbUsbConfig *usb);
 
 // ---- The GPU -----------------------------------------------------------------------------------
 

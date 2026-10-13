@@ -6,7 +6,7 @@
 # the boot code that joins them is wl_xboxrt_boot (and wl_xboxrt_main, a default main).
 add_library(wl_xboxrt STATIC
     mem.c mmio.c ppc_decode.c x86_decode.c regs.c thread.c irq.c thunk.c crash.c xbe.c devices.c gpu_stub.c
-    pad.c input.c)
+    pad.c input.c usb_ohci.c usb_xid.c)
 wl_target_defaults(wl_xboxrt)
 target_link_libraries(wl_xboxrt PUBLIC wl_platform wl_base)
 if(WL_PLATFORM STREQUAL "wii")
