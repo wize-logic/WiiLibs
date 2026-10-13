@@ -668,6 +668,12 @@ static void voice_frame(WlXboxApu *apu, uint32_t v, uint8_t *rec, uint32_t list)
         ended = !voice_samples(apu, v, vs, &f, src);
     }
 
+    // a silent frame (DirectSound keeps silent looping voices running) adds nothing to any bin
+    int32_t any = 0;
+    for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
+        any |= src[0][i] | (f.channels == 2 ? src[1][i] : 0);
+    }
+
     // targets: six bins in VBIN, two in FMT; a 3D voice's first four go to the HRTF submixes
     const uint32_t vbin = wl_rd_le32(rec + WL_APU_V_VBIN);
     uint32_t bins[8] = {vbin & 31u,         (vbin >> 5) & 31u,  (vbin >> 10) & 31u,
@@ -693,7 +699,7 @@ static void voice_frame(WlXboxApu *apu, uint32_t v, uint8_t *rec, uint32_t list)
         const uint32_t g1 = ((volume_gain(vols[t]) >> 1) * (ea >> 1)) >> 15; // Q15
         const uint32_t g0 = vs->gain[t];
         vs->gain[t] = (uint16_t)g1;
-        if (g0 == 0 && g1 == 0) {
+        if ((g0 == 0 && g1 == 0) || any == 0) {
             continue;
         }
         const int32_t *s = src[t % f.channels];

@@ -87,7 +87,9 @@ mix is the sound.
 Measured with a benchmark of the model (a mix of stereo ADPCM at 44.1 kHz, mono ADPCM at 22 kHz and
 PCM16 voices): on the host (x86-64, -O2) about 0.3 us a voice a frame; on 32-bit PowerPC (-O2
 -mcpu=750, the Wii's code; instructions counted under qemu) about 1200 instructions a frame plus
-3300 a voice. Halo's main menu plays three voices.
+3500 a voice. Halo's main menu plays three voices (its music, a stereo ADPCM stream at 44.1 kHz,
+and two silent loops DirectSound keeps running, which cost little: a silent frame is not mixed):
+11 800 instructions a frame, 18 million a second, a few percent of the Wii's 729 MHz.
 
 ## Tests
 
