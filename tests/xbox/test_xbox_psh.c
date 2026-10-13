@@ -680,12 +680,13 @@ TEST random_programs_agree_with_the_combiners(void) {
             d0_exact += r == 1;
         }
     }
-    // (most are exact (813 of them); the rest beyond GX or approximated, never wrong)
+    // (most are exact (897 of them, 813 before a name written again was seen to free its register);
+    // the rest beyond GX or approximated, never wrong)
     ASSERT(exact > RANDOM_PROGRAMS / 2);
     ASSERT(d0_exact > exact * 9 / 10);
     ASSERT(approximate + untranslated > 0);
     // the same programs, field for field, on every target
-    ASSERT_EQ_FMT(0x588E6CA4u, g_digest, "%08x");
+    ASSERT_EQ_FMT(0x5E3D0355u, g_digest, "%08x");
     PASS();
 }
 

@@ -1587,6 +1587,14 @@ static bool name_read_later(const struct translation *translation, int after_sta
             if (((outputs >> 12) & 0x04) && name == _name_r0 && channel == _portion_alpha)
                 return true;
         }
+        /* written again by this stage, which does not read it: what it held
+        is read no more (a stage reads every input before it writes) */
+        outputs = state[(channel == _portion_alpha ? WL_XBOX_PSH_ALPHA_OUTPUTS0
+                                                   : WL_XBOX_PSH_RGB_OUTPUTS0) +
+                        stage];
+        if (name_of(outputs & 0x0f) == name || name_of((outputs >> 4) & 0x0f) == name ||
+            name_of((outputs >> 8) & 0x0f) == name)
+            return false;
     }
     if (!abcd && !efg)
         return name == _name_r0;
