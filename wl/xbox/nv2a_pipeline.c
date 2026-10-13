@@ -314,7 +314,8 @@ unsigned wl_nv2a_cull(const WlNv2aKelvin *k) {
         return WL_NV2A_CULLS_NONE;
     }
     face = wl_nv2a_k(k, WL_NV2A_K_SET_CULL_FACE);
-    front_positive = wl_nv2a_k(k, WL_NV2A_K_SET_FRONT_FACE) == WL_NV2A_FRONT_CCW;
+    // (CW as the screen shows it: a positive area in its y-down coordinates)
+    front_positive = wl_nv2a_k(k, WL_NV2A_K_SET_FRONT_FACE) == WL_NV2A_FRONT_CW;
     if (face == WL_NV2A_CULL_FRONT_AND_BACK) {
         return WL_NV2A_CULLS_ALL;
     }

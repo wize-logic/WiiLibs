@@ -149,8 +149,9 @@ TEST culling_by_the_nv2a_rule_and_stencil_skipped(void) {
     ASSERT(gx_device(&g) != NULL);
     f_frame_setup(&g);
     f_program(&g, 0, f_screen_program, 3);
-    // front faces CW (negative area in the screen's y-down coordinates), back faces culled: the
-    // positive-area ones (the host's measure reads 0: GX_CULL_FRONT culls positive area)
+    // front faces CW (clockwise as the screen shows it: positive area in its y-down coordinates,
+    // Direct3D's D3DCULL_CCW), back faces culled: the negative-area ones (the host's measure reads
+    // 0: GX_CULL_FRONT culls positive area, so GX_CULL_BACK the negative)
     t_m1(&g, WL_NV2A_K_SET_CULL_FACE_ENABLE, 1);
     t_m1(&g, WL_NV2A_K_SET_CULL_FACE, WL_NV2A_CULL_BACK);
     t_m1(&g, WL_NV2A_K_SET_FRONT_FACE, WL_NV2A_FRONT_CW);
@@ -161,7 +162,7 @@ TEST culling_by_the_nv2a_rule_and_stencil_skipped(void) {
     t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
     t_kick(&g);
     d = wl_host_gx_direct();
-    ASSERT_EQ(WL_GX_CULL_FRONT, d->cull);
+    ASSERT_EQ(WL_GX_CULL_BACK, d->cull);
     t_m1(&g, WL_NV2A_K_SET_FRONT_FACE, WL_NV2A_FRONT_CCW);
     t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
     f_vertex(&g, 0, 0, 0, 1, 0, 0, 0xFFFFFFFFu);
@@ -169,7 +170,7 @@ TEST culling_by_the_nv2a_rule_and_stencil_skipped(void) {
     f_vertex(&g, 0, 10, 0, 1, 0, 0, 0xFFFFFFFFu);
     t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
     t_kick(&g);
-    ASSERT_EQ(WL_GX_CULL_BACK, d->cull);
+    ASSERT_EQ(WL_GX_CULL_FRONT, d->cull);
     // a draw with the stencil test: skipped
     t_m1(&g, WL_NV2A_K_SET_STENCIL_TEST_ENABLE, 1);
     t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
