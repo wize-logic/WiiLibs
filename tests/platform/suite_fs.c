@@ -393,6 +393,83 @@ out:
     wl_mem_free(vbuf);
 }
 
+// Writes at offsets (with a gap), short reads at the end, truncation both ways, stat and fstat,
+// directory listing and rmdir.
+static void check_offsets(void) {
+    const char *dir = "sd:/" DIR_NAME "/off";
+    const char *p = "sd:/" DIR_NAME "/off/b.tmp";
+    wl_platform_fs_mkdir(dir);
+    wl_platform_fs_remove(p); // a run cut short may have left it
+    WlPlatformFile *f = NULL;
+    if (wl_platform_fs_open(p, WL_FILE_READ_WRITE, &f) != WL_OK) {
+        wlt_check("fs_off_open", false, "create");
+        return;
+    }
+    static uint8_t a[3000], b[3000];
+    fill(a, 0, sizeof a);
+    bool ok = wl_platform_fs_write_at(f, 5000, a, 1000) == WL_OK; // a gap of 5000 bytes first
+    ok &= wl_platform_fs_write_at(f, 100, a + 100, 200) == WL_OK;  // into the gap
+    ok &= wl_platform_fs_size(f) == 6000;
+    wlt_check("fs_write_at", ok, "writes at offsets grow the file to the last byte written");
+    uint32_t got = 0;
+    memset(b, 0xEE, sizeof b);
+    ok = wl_platform_fs_read_some_at(f, 4900, b, 3000, &got) == WL_OK && got == 1100;
+    bool zeros = true;
+    for (uint32_t i = 0; i < 100; i++) {
+        zeros &= b[i] == 0;
+    }
+    ok &= zeros && memcmp(b + 100, a, 1000) == 0;
+    wlt_check("fs_read_some_at", ok, "short read at the end; the gap reads as zeros");
+    ok = wl_platform_fs_read_some_at(f, 6000, b, 10, &got) == WL_OK && got == 0;
+    ok &= wl_platform_fs_read_some_at(f, 100, b, 200, &got) == WL_OK && got == 200 && memcmp(b, a + 100, 200) == 0;
+    wlt_check("fs_read_some_edges", ok, "past the end reads 0 bytes; inside reads all");
+    ok = wl_platform_fs_truncate(f, 300) == WL_OK && wl_platform_fs_size(f) == 300;
+    ok &= wl_platform_fs_truncate(f, 8192) == WL_OK && wl_platform_fs_size(f) == 8192;
+    ok &= wl_platform_fs_read_some_at(f, 250, b, 100, &got) == WL_OK && got == 100 && memcmp(b, a + 250, 50) == 0;
+    zeros = true;
+    for (uint32_t i = 50; i < 100; i++) {
+        zeros &= b[i] == 0;
+    }
+    wlt_check("fs_truncate", ok && zeros, "cut, then grown with zeros");
+    WlPlatformStat st;
+    ok = wl_platform_fs_fstat(f, &st) == WL_OK && st.size == 8192 && !st.is_dir;
+    wlt_check("fs_fstat", ok, "size of an open file");
+    wl_platform_fs_close(f);
+
+    ok = wl_platform_fs_stat(p, &st) == WL_OK && st.size == 8192 && !st.is_dir;
+    wlt_check("fs_stat_file", ok, "a file's size");
+    ok = wl_platform_fs_stat(dir, &st) == WL_OK && st.is_dir;
+    wlt_check("fs_stat_dir", ok, "a directory");
+    wlt_check("fs_stat_missing", wl_platform_fs_stat("sd:/" DIR_NAME "/off/none", &st) == WL_ERR_NOT_FOUND,
+              "a missing path");
+
+    wl_platform_fs_mkdir("sd:/" DIR_NAME "/off/sub");
+    WlPlatformDir *d = NULL;
+    ok = wl_platform_fs_dir_open(dir, &d) == WL_OK;
+    bool saw_file = false, saw_sub = false;
+    uint32_t entries = 0;
+    char name[64];
+    while (ok && wl_platform_fs_dir_next(d, name, sizeof name, &st) == WL_OK) {
+        entries++;
+        saw_file |= strcmp(name, "b.tmp") == 0 && !st.is_dir && st.size == 8192;
+        saw_sub |= strcmp(name, "sub") == 0 && st.is_dir;
+    }
+    if (ok) {
+        wl_platform_fs_dir_rewind(d);
+        uint32_t again = 0;
+        while (wl_platform_fs_dir_next(d, name, sizeof name, NULL) == WL_OK) {
+            again++;
+        }
+        ok &= again == entries;
+        wl_platform_fs_dir_close(d);
+    }
+    wlt_check("fs_dir_list", ok && entries == 2 && saw_file && saw_sub, "two entries with their kinds, and a rewind");
+    wlt_check("fs_rmdir_full", wl_platform_fs_rmdir(dir) == WL_ERR_DENIED, "a directory with entries stays");
+    ok = wl_platform_fs_rmdir("sd:/" DIR_NAME "/off/sub") == WL_OK && wl_platform_fs_remove(p) == WL_OK &&
+         wl_platform_fs_rmdir(dir) == WL_OK && !wl_platform_fs_exists(dir);
+    wlt_check("fs_rmdir", ok, "empty directories are removed");
+}
+
 void wlt_suite_fs(void);
 
 void wlt_suite_fs(void) {
@@ -427,6 +504,7 @@ void wlt_suite_fs(void) {
     check_paths();
     wl_platform_fs_mkdir("sd:/" DIR_NAME);
     check_basic();
+    check_offsets();
     check_async();
     check_speed(WL_DEVICE_SD);
     if (usb) {

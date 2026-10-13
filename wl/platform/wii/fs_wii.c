@@ -3,6 +3,7 @@
 // for USB 2.0. libfat (dvm) mounts a block device under a name; "sd:/..." and "usb:/..." then
 // work through the newlib file API, which the shared implementation (fs_posix.inc) uses. Only
 // this directory may include <ogc/*.h>.
+#define _POSIX_C_SOURCE 200809L
 #include <fat.h>
 #include <ogc/ios.h>
 #include <ogc/lwp_watchdog.h>
@@ -10,6 +11,7 @@
 #include <sdcard/wiisd_io.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 
 #include "wl/platform/platform.h"
@@ -81,6 +83,20 @@ uint64_t wl_platform_time_us(void) {
 
 uint64_t wl_platform_time_ms(void) {
     return wl_timebase_ms(wl_timebase_read());
+}
+
+// The console's clock (the RTC with the settings' bias: local time), read once through the C
+// library's time() and then advanced by the time base.
+uint64_t wl_platform_wall_time_us(void) {
+    static uint64_t anchor_wall, anchor_mono;
+    static bool anchored;
+    if (!anchored) {
+        time_t now = time(NULL);
+        anchor_wall = now > 0 ? (uint64_t)now * 1000000ull : 0;
+        anchor_mono = wl_platform_fs_clock_us();
+        anchored = true;
+    }
+    return anchor_wall + (wl_platform_fs_clock_us() - anchor_mono);
 }
 
 uint64_t wl_platform_fs_clock_us(void) {

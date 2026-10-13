@@ -45,7 +45,7 @@ add_subdirectory(third_party)
 
 # Every module is wl/<name>/ with its own CMakeLists.txt; it decides which platforms it builds
 # on. Order matters only for dependencies (base first).
-set(WL_MODULES base codec host nds ctr gcm wiidisc gs brstm sdat gxtex gfx platform audio xbox)
+set(WL_MODULES base codec host nds ctr gcm wiidisc gs brstm sdat gxtex gfx platform audio xbox xboxrt xboxkrnl)
 foreach(m IN LISTS WL_MODULES)
     if(EXISTS ${PROJECT_SOURCE_DIR}/wl/${m}/CMakeLists.txt)
         add_subdirectory(wl/${m})

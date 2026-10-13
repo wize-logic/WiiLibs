@@ -56,6 +56,33 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 Host test control lives in `host/*_host.h`: `wl_host_audio_render`, `wl_host_fs_set_root`,
 `wl_host_gx_state` / `wl_host_gx_record`, `wl_host_target_ops`, `wl_host_input_set`, `wl_host_rumble_allowed`, `wl_host_stop_set_hook`, `wl_host_system_raise`, `wl_host_exit_set_hook`, `wl_host_system_reset`, `wl_host_tev_last`.
 
+## Waits with deadlines, condition variables, files at offsets
+
+For code that carries another system's synchronisation and file API onto the console (the Xbox
+kernel in `wl/xboxkrnl` is one):
+
+- **Deadlines**: `wl_platform_sem_wait_timeout` (0 tries, `WL_WAIT_FOREVER` blocks). libogc's
+  semaphores have no timed wait, so the console tries, sleeps a millisecond and tries again.
+- **Mutexes**: `wl_platform_mutex_create_recursive`, `wl_platform_mutex_try_lock`.
+- **Condition variables** (`WlPlatformCond`): `wl_platform_cond_create`, `_wait`,
+  `_wait_timeout` (false when the deadline passed), `_signal`, `_broadcast`, `_destroy`; LWP
+  conditions on the console, pthreads on `CLOCK_MONOTONIC` on the host.
+- **Threads**: `wl_platform_thread_detach` (the console joins a detached thread's control block
+  once it has finished, at the next create or detach), `wl_platform_thread_exit`,
+  `wl_platform_thread_self_id`, `wl_platform_thread_set_priority`. The host pool holds 64 threads.
+- **Wall clock**: `wl_platform_wall_time_us`, microseconds since 1970, read once and advanced by
+  the monotonic clock (the console's clock is local time).
+- **Files**: `wl_platform_fs_write_at` (a gap reads as zeros), `wl_platform_fs_read_some_at` (a
+  short read at the end is not an error), `wl_platform_fs_truncate` (both ways),
+  `wl_platform_fs_stat` / `_fstat` (`WlPlatformStat`: size, change time, directory, read-only),
+  `wl_platform_fs_rmdir`, and directory listing (`wl_platform_fs_dir_open`, `_next`, `_rewind`,
+  `_close`; a pool of `WL_FS_MAX_DIRS`). The file pool holds `WL_FS_MAX_FILES` = 32 handles.
+- **Retrace hook**: `wl_platform_video_set_retrace_hook`, a function the retrace interrupt calls
+  (it may only wake a thread); the host stub never calls it.
+
+All of them are in `tests/platform/suite_threads.c` and `suite_fs.c`, which run on the host,
+on ppc-be and in the console runner.
+
 ## Typical start-up
 
 ```c

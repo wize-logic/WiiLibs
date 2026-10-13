@@ -64,6 +64,20 @@ uint64_t wl_platform_time_ms(void) {
     return wl_platform_fs_clock_us() / 1000u;
 }
 
+uint64_t wl_platform_wall_time_us(void) {
+    // read once, then advanced by the monotonic clock: never steps back while the program runs
+    static uint64_t anchor_wall, anchor_mono;
+    static bool anchored;
+    if (!anchored) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        anchor_wall = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000u;
+        anchor_mono = wl_platform_fs_clock_us();
+        anchored = true;
+    }
+    return anchor_wall + (wl_platform_fs_clock_us() - anchor_mono);
+}
+
 uint64_t wl_platform_fs_clock_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

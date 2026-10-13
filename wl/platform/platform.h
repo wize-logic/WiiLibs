@@ -82,6 +82,11 @@ uint64_t wl_platform_time_us(void);
 // The same clock in milliseconds (rounded down), for a caller that wants only those: on the
 // console one read of the time base and no 64-bit division (timebase.h).
 uint64_t wl_platform_time_ms(void);
+// The wall clock: microseconds since 1970-01-01 00:00:00. The console's clock is set to local
+// time and knows no time zone, so there this is the local time counted as if it were UTC; the
+// host's is UTC. Read once and then advanced by the monotonic clock, so it never steps back while
+// the program runs.
+uint64_t wl_platform_wall_time_us(void);
 
 // ---------------------------------------------------------------------------------------------
 // Memory
@@ -217,6 +222,13 @@ uint32_t wl_platform_video_shown_count(void);
 // Raw vertical retraces since init (a field in interlaced modes), counted in the retrace
 // callback; the pacing reference. Presented frames never exceed it.
 uint32_t wl_platform_video_retrace_count(void);
+
+// A function called at every retrace (the console: in the retrace interrupt, after the display
+// queue moved on, so it must be short and may only wake threads: wl_platform_sem_post). One hook;
+// NULL removes it. Any time, before or after init. Host stub: never called (it has no display;
+// a program that needs a beat there makes its own).
+typedef void (*WlRetraceHook)(void *user);
+void wl_platform_video_set_retrace_hook(WlRetraceHook fn, void *user);
 
 // Frames shown later than the interval asked (the retrace after the previous one was missed, or
 // nothing new had been presented), since init.
@@ -689,6 +701,52 @@ void wl_platform_mutex_lock(WlPlatformMutex mutex);
 void wl_platform_mutex_unlock(WlPlatformMutex mutex);
 void wl_platform_mutex_destroy(WlPlatformMutex mutex);
 
+// ---- Waits with a deadline, recursive mutexes, condition variables ---------------------------
+// For code that ports another system's synchronisation (an emulated kernel's waits, a library's
+// critical sections). Timeouts are relative milliseconds; 0 only tries, WL_WAIT_FOREVER blocks.
+#define WL_WAIT_FOREVER 0xFFFFFFFFu
+
+// A mutex the thread holding it may lock again; each lock needs its unlock. Same pool and
+// handle type as the plain ones (wl_platform_mutex_lock/unlock/destroy take it).
+WlResult wl_platform_mutex_create_recursive(WlPlatformMutex *out);
+// Locks `mutex` if no other thread holds it (or, for a recursive one, the caller does); false
+// at once otherwise.
+bool wl_platform_mutex_try_lock(WlPlatformMutex mutex);
+
+// Takes one count, waiting up to `timeout_ms` for it; false when none came in time (0: a try).
+bool wl_platform_sem_wait_timeout(WlPlatformSemaphore sem, uint32_t timeout_ms);
+
+// Condition variables over the platform's mutexes (a plain one, held once: a recursive mutex
+// held more than once is not released by a wait). A wait releases `mutex`, sleeps until a
+// signal or broadcast (or, rarely, for no reason: re-check the condition), and holds `mutex`
+// again when it returns. Console: libogc's LWP conditions; host: pthreads on CLOCK_MONOTONIC.
+typedef struct {
+    uint32_t id;
+} WlPlatformCond;
+WlResult wl_platform_cond_create(WlPlatformCond *out);
+void wl_platform_cond_wait(WlPlatformCond cond, WlPlatformMutex mutex);
+// The same with a deadline `timeout_ms` from now: false when it passed without a wake (the
+// mutex is held again either way). 0 releases and retakes the mutex without sleeping.
+bool wl_platform_cond_wait_timeout(WlPlatformCond cond, WlPlatformMutex mutex, uint32_t timeout_ms);
+// Wakes one waiter / every waiter (none waiting: nothing happens, nothing is remembered). May be
+// called with or without the mutex held.
+void wl_platform_cond_signal(WlPlatformCond cond);
+void wl_platform_cond_broadcast(WlPlatformCond cond);
+void wl_platform_cond_destroy(WlPlatformCond cond);
+
+// ---- More of a thread's life ----------------------------------------------------------------
+// A thread no one will join: its handle and (on the console) its control block are given back
+// when it ends. Its stack stays the caller's, which must outlive the thread. Not after a join.
+WlResult wl_platform_thread_detach(WlPlatformThread thread);
+// Ends the calling thread, as if its function had returned `result`. For a thread made by
+// wl_platform_thread_create; a program's main thread leaves through wl_platform_exit instead.
+WL_NORETURN void wl_platform_thread_exit(void *result);
+// The calling thread's id: not 0, the same for the thread's life, and different from every other
+// live thread's (the LWP id on the console; on the host a number the stub hands out on first use).
+uint32_t wl_platform_thread_self_id(void);
+// Moves a thread to another of the roles' priorities (the console; the host checks and ignores).
+WlResult wl_platform_thread_set_priority(WlPlatformThread thread, WlThreadPriority priority);
+
 // ---------------------------------------------------------------------------------------------
 // Files (SD and USB through libfat). Blocking: call from an IO thread (fs.h does), except small
 // reads at boot and settings writes.
@@ -725,7 +783,7 @@ typedef enum { WL_FILE_READ = 0, WL_FILE_WRITE_NEW, WL_FILE_READ_WRITE } WlPlatf
 // pool of WL_FS_MAX_FILES (WL_ERR_LIMIT when exhausted). Errors: WL_ERR_NOT_FOUND (no such file
 // or directory), WL_ERR_STATE (device not mounted), WL_ERR_ARG (no device prefix, path too
 // long), WL_ERR_IO (anything else). A handle is used by one thread at a time (reads seek).
-#define WL_FS_MAX_FILES 16u
+#define WL_FS_MAX_FILES 32u
 #define WL_FS_PATH_MAX 192u
 // WL_FILE_READ: existing file. WL_FILE_WRITE_NEW: create or truncate. WL_FILE_READ_WRITE: create
 // if missing, keep the contents.
@@ -749,6 +807,43 @@ WlResult wl_platform_fs_mkdir(const char *path);
 // True when `path` names an existing file or directory. False for a missing one, an unmounted
 // device and a path the file API refuses.
 bool wl_platform_fs_exists(const char *path);
+
+// ---- Files at offsets, sizes, directories (for code that ports another system's file API) ----
+// Writes all `size` bytes at `offset` (past the end the file grows; a gap reads as zeros) and
+// leaves the handle's position after them. WL_ERR_IO for a device error or a full card.
+WlResult wl_platform_fs_write_at(WlPlatformFile *file, uint64_t offset, const void *src, uint32_t size);
+// Reads up to `size` bytes at `offset`: fewer when the file ends first (0 at or past the end), in
+// `*got`. Not an error at the end, unlike wl_platform_fs_read_at.
+WlResult wl_platform_fs_read_some_at(WlPlatformFile *file, uint64_t offset, void *dst, uint32_t size,
+                                     uint32_t *got);
+// Sets the file's length: cut, or grown with zeros (FAT allocates the clusters).
+WlResult wl_platform_fs_truncate(WlPlatformFile *file, uint64_t size);
+
+typedef struct {
+    uint64_t size;     // bytes (0 for a directory)
+    uint64_t mtime_us; // last change, wl_platform_wall_time_us's clock; 0 when the device has none
+    bool is_dir;
+    bool read_only;
+} WlPlatformStat;
+// What `path` is. WL_ERR_NOT_FOUND for a missing one; the errors of wl_platform_fs_open else.
+WlResult wl_platform_fs_stat(const char *path, WlPlatformStat *out);
+// The same for an open file.
+WlResult wl_platform_fs_fstat(WlPlatformFile *file, WlPlatformStat *out);
+// Removes an empty directory. WL_ERR_NOT_FOUND for a missing one, WL_ERR_DENIED for one with
+// something in it.
+WlResult wl_platform_fs_rmdir(const char *path);
+
+// A directory's entries, in the order the device keeps them, without "." and "..". Handles
+// come from a pool of WL_FS_MAX_DIRS (WL_ERR_LIMIT when exhausted).
+#define WL_FS_MAX_DIRS 8u
+typedef struct WlPlatformDir WlPlatformDir;
+WlResult wl_platform_fs_dir_open(const char *path, WlPlatformDir **out);
+// The next entry's name (truncated to `name_cap` - 1 bytes and terminated) and, when `st` is not
+// NULL, what it is. WL_ERR_NOT_FOUND after the last.
+WlResult wl_platform_fs_dir_next(WlPlatformDir *dir, char *name, size_t name_cap, WlPlatformStat *st);
+// Back to the first entry.
+void wl_platform_fs_dir_rewind(WlPlatformDir *dir);
+void wl_platform_fs_dir_close(WlPlatformDir *dir);
 // Finds the folder of a Homebrew Channel application: "sd:/apps/<app_name>", or
 // "usb:/apps/<app_name>" when only the USB drive has it. `marker` is a path inside the folder
 // (relative, e.g. "maps" or "data/game.pak") that must exist for a drive to count, so that an

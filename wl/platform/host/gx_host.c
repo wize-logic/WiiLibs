@@ -137,6 +137,12 @@ uint32_t wl_platform_video_retrace_count(void) {
     return g_frames * g_interval;
 }
 
+// The host has no display to keep time: the hook is kept and never called.
+void wl_platform_video_set_retrace_hook(WlRetraceHook fn, void *user) {
+    (void)fn;
+    (void)user;
+}
+
 uint32_t wl_platform_video_dropped_count(void) {
     return 0;
 }

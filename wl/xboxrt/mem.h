@@ -1,0 +1,239 @@
+// SPDX-License-Identifier: MIT
+// Guest memory of a recompiled Xbox title: the x86's little-endian bytes behind the generated
+// code's XBOX_PTR, the guest-physical page model, the allocators the kernel builds on, and the
+// accessors runtime code reads guest memory with.
+//
+// Addresses. A guest virtual address (VA, what the title's pointers hold) becomes a host
+// effective address (EA) by WL_XB_EA: user space 0x0xxxxxxx keeps its value, the contiguous
+// window 0x8xxxxxxx and its tiled alias 0xFxxxxxxx (with the devices above 0xFC000000) land at
+// 0x1xxxxxxx. The host pointer is the EA plus g_xbox_mem_offset (the base of a 512 MB
+// reservation on the host and ppc-be; 0 on the Wii, where the EA is the address the MMU
+// translates through the page table).
+//
+// Pages. Guest RAM is ram_bytes of guest-physical pages (64 MB retail). Every committed user page
+// (the XBE image, stacks, NtAllocateVirtualMemory) is backed by a physical page from the same
+// allocator the contiguous allocations use, and the window VA 0x80000000|P shows physical page P
+// whether it is allocated or not (as the console's RAM does). A host frame backs a physical page
+// on its first touch, zero-filled, and both EAs of the page reach the same frame. A user VA that is
+// not committed, or a window address past the RAM, faults: a guest crash. Device addresses fault
+// too, and are emulated (mmio.h).
+//
+// All functions here run with the guest lock held (thread.h) unless they say otherwise.
+#pragma once
+
+#include "wl/base/base.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ---- Address transform -------------------------------------------------------------------------
+
+#define WL_XB_EA(va) ((((uint32_t)(va)) & 0x0FFFFFFFu) | ((((uint32_t)(va)) >> 3) & 0x10000000u))
+#define WL_XB_EA_SPAN 0x20000000u     // EAs 0..0x1FFFFFFF: the host reservation
+#define WL_XB_PAGE 4096u
+#define WL_XB_PAGE_SHIFT 12u
+#define WL_XB_USER_LIMIT 0x10000000u  // user VAs live below this (above it they alias low EAs)
+#define WL_XB_WINDOW 0x80000000u      // VA of physical address 0 (the contiguous window)
+#define WL_XB_TILED 0xF0000000u       // the write-combined alias of the window: the same EAs
+#define WL_XB_EA_WINDOW 0x10000000u   // EA of physical address 0
+#define WL_XB_MMIO_BASE 0xFC000000u   // guest VAs from here up are devices (EA 0x1C000000 up)
+#define WL_XB_EA_MMIO 0x1C000000u
+
+#if defined(__wii__)
+#define WL_XB_HOST_BASE ((uintptr_t)0)
+#else
+extern ptrdiff_t g_xbox_mem_offset; // the generated code's name for the host base (regs.c)
+#define WL_XB_HOST_BASE ((uintptr_t)g_xbox_mem_offset)
+#endif
+
+// The host pointer of a guest VA (no check: the access faults where the guest's would).
+static inline void *wl_xb_ptr(uint32_t va) {
+    return (void *)(WL_XB_HOST_BASE + (uintptr_t)WL_XB_EA(va));
+}
+// The host pointer of guest-physical bytes (through the window).
+static inline void *wl_xb_phys_ptr(uint32_t phys) {
+    return (void *)(WL_XB_HOST_BASE + (uintptr_t)WL_XB_EA_WINDOW + (uintptr_t)phys);
+}
+// The guest VA an EA came from: user space as it is, the window as 0x80000000|P, devices as
+// 0xFC000000 up. (0xF0000000|P aliases the window and is reported as the window.)
+uint32_t wl_xb_ea_to_va(uint32_t ea);
+
+// ---- Little-endian accessors for runtime code ------------------------------------------------
+// Byte order is the guest's on every host. Unaligned addresses are fine. Never cast guest bytes
+// to a host struct: read fields with these.
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define WL_XB_LE16(v) __builtin_bswap16(v)
+#define WL_XB_LE32(v) __builtin_bswap32(v)
+#define WL_XB_LE64(v) __builtin_bswap64(v)
+#else
+#define WL_XB_LE16(v) (v)
+#define WL_XB_LE32(v) (v)
+#define WL_XB_LE64(v) (v)
+#endif
+
+static inline uint8_t wl_xb_rd8(uint32_t va) {
+    return *(const volatile uint8_t *)wl_xb_ptr(va);
+}
+static inline uint16_t wl_xb_rd16(uint32_t va) {
+    uint16_t v;
+    __builtin_memcpy(&v, wl_xb_ptr(va), 2);
+    return WL_XB_LE16(v);
+}
+static inline uint32_t wl_xb_rd32(uint32_t va) {
+    uint32_t v;
+    __builtin_memcpy(&v, wl_xb_ptr(va), 4);
+    return WL_XB_LE32(v);
+}
+static inline uint64_t wl_xb_rd64(uint32_t va) {
+    return (uint64_t)wl_xb_rd32(va) | ((uint64_t)wl_xb_rd32(va + 4u) << 32);
+}
+static inline void wl_xb_wr8(uint32_t va, uint8_t v) {
+    *(volatile uint8_t *)wl_xb_ptr(va) = v;
+}
+static inline void wl_xb_wr16(uint32_t va, uint16_t v) {
+    v = WL_XB_LE16(v);
+    __builtin_memcpy(wl_xb_ptr(va), &v, 2);
+}
+static inline void wl_xb_wr32(uint32_t va, uint32_t v) {
+    v = WL_XB_LE32(v);
+    __builtin_memcpy(wl_xb_ptr(va), &v, 4);
+}
+static inline void wl_xb_wr64(uint32_t va, uint64_t v) {
+    wl_xb_wr32(va, (uint32_t)v);
+    wl_xb_wr32(va + 4u, (uint32_t)(v >> 32));
+}
+static inline float wl_xb_rdf(uint32_t va) {
+    uint32_t b = wl_xb_rd32(va);
+    float f;
+    __builtin_memcpy(&f, &b, 4);
+    return f;
+}
+static inline void wl_xb_wrf(uint32_t va, float f) {
+    uint32_t b;
+    __builtin_memcpy(&b, &f, 4);
+    wl_xb_wr32(va, b);
+}
+// An aligned 32-bit store that another thread may read at the same time (KeTickCount).
+static inline void wl_xb_wr32_atomic(uint32_t va, uint32_t v) {
+    *(volatile uint32_t *)wl_xb_ptr(va) = WL_XB_LE32(v);
+}
+
+// Bytes between host memory and guest memory (memcpy semantics; the ranges may cross pages).
+void wl_xb_copy_in(uint32_t va, const void *src, uint32_t n);
+void wl_xb_copy_out(void *dst, uint32_t va, uint32_t n);
+void wl_xb_fill(uint32_t va, uint8_t byte, uint32_t n);
+// A guest NUL-terminated string into `dst` (at most cap - 1 bytes, always terminated); the length
+// copied. Stops at the first byte of an address that is not valid guest memory.
+uint32_t wl_xb_read_cstr(uint32_t va, char *dst, uint32_t cap);
+
+// Whether [va, va + n) is guest memory a kernel call may touch: committed user pages, or the
+// window inside the RAM. (A device range is not.) The kernel checks the buffers it is handed with
+// it, so a bad guest pointer is a status code, not a host crash.
+bool wl_xb_range_ok(uint32_t va, uint32_t n);
+
+// ---- Set-up ----------------------------------------------------------------------------------
+
+typedef struct {
+    void *base;     // 4 KB aligned host memory the Wii's frames come from (cached MEM1 or MEM2)
+    uint32_t bytes; // a multiple of 4 KB
+} WlXbFramePool;
+
+#define WL_XB_MAX_FRAME_POOLS 4u
+
+typedef struct {
+    uint32_t ram_bytes;          // guest-physical RAM: 64 MB (retail), 128 MB (a debug kit); 4 MB steps
+    uint32_t reserved_low_bytes; // physical bytes from 0 never handed out (the retail kernel's own
+                                 // pages; titles pin buffers right above it): 0x60000 by default
+    uint32_t gpu_instance_bytes; // physical bytes at the top kept for MmClaimGpuInstanceMemory: 64 KB
+    // Wii only: where the frames come from, and the hashed page table's size (64 KB..1 MB, a power
+    // of two; the table is a cache of the page tables here, so a smaller one only costs reloads).
+    WlXbFramePool frame_pools[WL_XB_MAX_FRAME_POOLS];
+    uint32_t htab_bytes;
+} WlXbMemConfig;
+
+// The defaults above (no frame pools: the Wii's caller adds them).
+void wl_xb_mem_config_default(WlXbMemConfig *cfg);
+
+// Reserves the address space (host, ppc-be) or programs the MMU (the Wii: page table, segment
+// registers 0 and 1, the DSI handler), and sets g_xbox_mem_offset. Once per process.
+// WL_ERR_STATE when already up, WL_ERR_ARG for a bad configuration, WL_ERR_NOMEM when the
+// reservation or the table cannot be had, WL_ERR_UNSUPPORTED where neither backend exists.
+WlResult wl_xb_mem_init(const WlXbMemConfig *cfg);
+bool wl_xb_mem_ready(void);
+uint32_t wl_xb_ram_bytes(void);
+
+// ---- Physical pages --------------------------------------------------------------------------
+
+// Contiguous physical bytes inside [lowest, highest] (inclusive, as MmAllocateContiguousMemoryEx
+// takes them), aligned to `align` (0 or a power of two, at least a page), searched from the top
+// down as the console's allocator does. A range that only user pages occupy is had anyway: the
+// user pages move elsewhere (their contents and VAs stay; MmGetPhysicalAddress changes), which
+// is what lets a title pin a buffer at a fixed physical address after its image is loaded. The
+// memory is zero. `*out` is the physical address. WL_ERR_NOMEM when it cannot be had.
+WlResult wl_xb_phys_alloc(uint32_t bytes, uint32_t lowest, uint32_t highest, uint32_t align, uint32_t *out);
+// Frees an allocation by its first physical address (the size is remembered). WL_ERR_ARG when
+// `phys` does not start one.
+WlResult wl_xb_phys_free(uint32_t phys);
+// The size of the allocation starting at `phys`, 0 when none does.
+uint32_t wl_xb_phys_size(uint32_t phys);
+// Physical pages in use (all kinds) and free.
+void wl_xb_phys_usage(uint32_t *used_pages, uint32_t *free_pages);
+
+// ---- User virtual memory (below WL_XB_USER_LIMIT) --------------------------------------------
+
+#define WL_XB_PROT_NOACCESS 0x01u
+#define WL_XB_PROT_READONLY 0x02u
+#define WL_XB_PROT_READWRITE 0x04u
+#define WL_XB_PROT_EXECUTE_READWRITE 0x40u // PAGE_* values; the mapping is read-write whatever they say
+#define WL_XB_VA_GRANULE 0x10000u          // reservations start on 64 KB
+
+// Reserves [*va, *va + bytes) (page granular; `*va` 0: the lowest free 64 KB-aligned range from
+// `lowest_va` up, written back). WL_ERR_RANGE when a fixed range is taken or out of user space,
+// WL_ERR_NOMEM when no free range is big enough.
+WlResult wl_xb_va_reserve(uint32_t *va, uint32_t bytes, uint32_t lowest_va, uint32_t protect);
+// Commits the pages of [va, va + bytes) inside a reservation (each gets a physical page; already
+// committed ones keep theirs). New pages are zero. WL_ERR_RANGE outside a reservation,
+// WL_ERR_NOMEM when the RAM is exhausted (what was committed stays).
+WlResult wl_xb_va_commit(uint32_t va, uint32_t bytes, uint32_t protect);
+// Decommits pages (their physical pages are freed; the range stays reserved).
+WlResult wl_xb_va_decommit(uint32_t va, uint32_t bytes);
+// Releases the reservation that starts at `va` (decommitting what is committed). `*bytes` gets
+// its size. WL_ERR_RANGE when no reservation starts there.
+WlResult wl_xb_va_release(uint32_t va, uint32_t *bytes);
+// Reserve and commit in one: what loaders and stacks want. `*va` as in wl_xb_va_reserve.
+WlResult wl_xb_va_alloc(uint32_t *va, uint32_t bytes, uint32_t lowest_va, uint32_t protect);
+
+typedef struct {
+    uint32_t base;            // the page's region: a run of pages in the same state
+    uint32_t size;
+    uint32_t allocation_base; // the reservation's start (0 when free)
+    uint32_t allocation_protect;
+    uint32_t protect;         // of the committed pages; 0 when not committed
+    uint32_t state;           // 0x1000 committed, 0x2000 reserved, 0x10000 free (MEM_*)
+} WlXbVaInfo;
+// What NtQueryVirtualMemory reports for `va` (user space; window and device VAs too, as committed
+// or free). WL_ERR_RANGE above the user limit when it is not the window.
+WlResult wl_xb_va_query(uint32_t va, WlXbVaInfo *out);
+// Records a protection for committed pages (MmSetAddressProtect; the mapping stays read-write).
+WlResult wl_xb_va_protect(uint32_t va, uint32_t bytes, uint32_t protect, uint32_t *old_protect);
+
+// The physical address behind a VA (MmGetPhysicalAddress): a window or tiled VA by its offset, a
+// committed user VA through its page. false (and 0) when it has none.
+bool wl_xb_va_to_phys(uint32_t va, uint32_t *phys);
+
+// ---- Diagnostics -------------------------------------------------------------------------------
+
+typedef struct {
+    uint32_t ram_pages, used_pages;
+    uint32_t user_pages, contig_pages, frames; // frames: physical pages with host memory behind them
+    uint32_t relocations;                      // user pages moved for a pinned contiguous allocation
+    uint32_t faults_resolved;                  // first touches (the Wii) / 0 (the OS does it)
+    uint32_t evictions;                        // page table entries reused (the Wii)
+} WlXbMemStats;
+void wl_xb_mem_stats(WlXbMemStats *out);
+
+#ifdef __cplusplus
+}
+#endif
