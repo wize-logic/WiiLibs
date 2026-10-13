@@ -564,6 +564,45 @@ TEST device_polls_are_safe_points(void) {
     PASS();
 }
 
+// A device's periodic work (wl_xb_service_add_tick): it runs at the holder's safe points, so a
+// thread that waits on a word only the device's work changes gets past its wait (DirectSound
+// waiting for its DSP command word to be taken).
+static volatile uint32_t g_tick_runs;
+static uint32_t g_tick_word;
+
+static void tick_fn(void *user) {
+    (void)user;
+    g_tick_runs++;
+    if (g_tick_word != 0) {
+        wl_xb_wr32(g_tick_word, 0);
+    }
+}
+
+TEST device_ticks_run_at_safe_points(void) {
+    boot();
+    ASSERT(g_ready);
+    g_spin_raise_at = 0;
+    WlXbDevice dev = {"spin", SPIN_DEV_VA, 0x1000u, spin_dev_read, spin_dev_write, NULL};
+    ASSERT_EQ(WL_OK, wl_xb_mmio_register(&dev));
+    g_tick_word = gmem(4);
+    wl_xb_wr32(g_tick_word, 7);
+    ASSERT_EQ(WL_OK, wl_xb_service_add_tick(tick_fn, NULL, 2000));
+    uint64_t t0 = wl_platform_time_ms();
+    while (wl_xb_rd32(g_tick_word) != 0 && wl_platform_time_ms() - t0 < 3000u) {
+        (void)wl_xb_rd32(SPIN_DEV_VA + 0x44u);
+    }
+    ASSERT_EQ_FMT(0u, wl_xb_rd32(g_tick_word), "%u");
+    g_tick_word = 0; // the tick stays: it must not write into the next tests' scratch memory
+    const uint32_t before = g_tick_runs;
+    t0 = wl_platform_time_ms();
+    while (wl_platform_time_ms() - t0 < 60u) {
+        (void)wl_xb_rd32(SPIN_DEV_VA + 0x44u);
+    }
+    ASSERT(g_tick_runs - before >= 5u); // about 30 at 2 ms
+    ASSERT_EQ(WL_ERR_ARG, wl_xb_service_add_tick(NULL, NULL, 2000));
+    PASS();
+}
+
 // ---- Files ----------------------------------------------------------------------------------------
 
 static uint32_t g_apc_runs, g_apc_ctx, g_apc_info;
@@ -832,6 +871,7 @@ SUITE(kernel_suite) {
     RUN_TEST(events_timeouts_mutants);
     RUN_TEST(timers_dpcs_interrupts);
     RUN_TEST(device_polls_are_safe_points);
+    RUN_TEST(device_ticks_run_at_safe_points);
     RUN_TEST(files_dvd_and_overlapped);
     RUN_TEST(files_sparse_cache_drive);
     RUN_TEST(virtual_and_contiguous_memory);

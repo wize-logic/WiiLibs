@@ -54,7 +54,9 @@ resumes after the instruction:
   (`dsi_wii.c`) and runs `wl_xb_dsi_slow` in the faulting code's own context, FP state saved;
   PowerPC loads and stores of D and X forms, byte-reversed ones, update forms (`ppc_decode.h`);
 - the host: `SIGSEGV` (`fault_posix.c`), with the x86-64 decoder (`x86_decode.h`, derived from
-  xboxrecomp's `mmio_decode.h`) on x86-64 and the PowerPC one on ppc-be.
+  xboxrecomp's `mmio_decode.h`) on x86-64 and the PowerPC one on ppc-be. The handler notes the
+  faulting host PC first (`wl_xb_mmio_fault_pc`), so a device's trace can name the translated
+  function that made the access.
 
 **Every device access is a safe point** (`wl_xb_safe_point`, `thread.h`): once the device has
 answered, pending interrupt work runs and a thread waiting for the guest lock gets it. A title that
@@ -121,11 +123,38 @@ a kernel call, an `rdtsc` or a device access holds interrupts off (see `g_xb_att
 service thread logs which thread it is once it has waited a second for the lock, and on the host
 and ppc-be that thread logs its host PC and the translated functions it is in.
 
+A device with periodic work (the audio processor's frames) adds a tick
+(`wl_xb_service_add_tick(fn, user, period_us)`, up to four): the service thread marks it due at its
+period and raises `WL_XB_SVC_DEVICE`, and the work runs `fn` with the lock held before the kernel's
+handler of the same round, so an interrupt the device raised is delivered at once. Like any work it
+runs at the holder's next safe point: a thread spinning on guest memory with the generated code's
+back-edge hook gives the device its frames (DirectSound waiting for its GP command word does).
+
 ## The GPU and the MCPX (`devices.h`)
 
 `wl_xb_devices_register_mcpx` registers idle MCPX devices: the APU (its sample counter moving at
 48 kHz), AC'97 (codec not ready, so `DirectSoundCreate` fails cleanly), the USB host controllers
-(two powered ports, nothing connected), the NIC and the flash. The GPU is behind `WlXbGpuOps`
+(two powered ports, nothing connected), the NIC and the flash.
+
+**Audio** (`audio.c`, built when `wl/xboxapu` is): `wl_xb_audio_attach` puts wl/xboxapu's APU and
+AC'97 models over the idle ones (the boot code does, unless `WlXbTitleConfig.audio_off`), with
+their interrupt lines (5 and 6, level sources) and a service tick (`wl_xb_service_add_tick`, every
+4 ms) that runs the APU's frames, moves the AC'97's bus masters as far, and queues the stereo
+frames for the output. The title's own DirectSound drives the models (`wl/xboxapu/README.md`):
+nothing in a title's code is replaced, nothing is title-specific.
+
+- The Wii: the platform's audio output at 48 kHz (`wl_platform_audio_start`; the AESND voice
+  takes the rate as it is, no resampling), fed from a ring of 85 ms. The tick keeps 32 ms queued
+  ahead of the output, so the guest's audio clock follows the output's; a guest that falls far
+  behind skips time rather than catching up.
+- The host (no sound device): frames follow the wall clock. `WL_XB_AUDIO_WAV=<file>` writes
+  everything played to a 48 kHz stereo WAV (a valid file each second, whenever the run ends);
+  `WL_XB_AUDIO_TRACE=<file>` logs every APU and AC'97 access with its value and the translated
+  function that made it (`wl_xb_mmio_fault_pc` and `wl_xb_symbolize`); `WL_XB_AUDIO=0` keeps the
+  idle devices (DirectSoundCreate fails, the title runs silent).
+- Every 10 s an `xbaudio` status line: frames run (and silent), voices a frame, what a frame costs
+  in nanoseconds, notifiers, traps, GP commands, starved stream frames, clipped samples, output
+  underruns, AC'97 buffers. The GPU is behind `WlXbGpuOps`
 (`mmio_read`, `mmio_write`, `vblank`, `irq_pending`): `wl_xb_gpu_attach` registers the 16 MB at
 `0xFD000000`, the vblank hook and interrupt line 3 as a level source. `gpu_stub.c` is an idle NV2A
 (PMC boot id, PFIFO idle with GET following PUT, PTIMER, the PCRTC vblank interrupt). When

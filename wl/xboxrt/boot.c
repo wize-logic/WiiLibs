@@ -259,6 +259,13 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
         return r;
     }
     wl_xb_devices_register_mcpx();
+    WlXbAudioConfig audio;
+    wl_xb_audio_config_default(&audio);
+    audio.off = audio.off || cfg->audio_off;
+    r = wl_xb_audio_attach(&audio);
+    if (r != WL_OK && r != WL_ERR_UNSUPPORTED) {
+        WL_LOG_W(TAG, "audio: %s (the title runs silent)", wl_result_name(r));
+    }
     bool real_gpu = !cfg->gpu_stub && wl_xb_gpu_attach_nv2a() == WL_OK;
     if (!real_gpu) {
         WlXbGpuStub *stub = wl_xb_gpu_stub_create();
