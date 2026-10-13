@@ -39,7 +39,9 @@ def find_python() -> str | None:
     cands = [os.environ.get("WL_PYTEST_PYTHON"), sys.executable, shutil.which("python3"), "/usr/bin/python3"]
     for c in cands:
         if c and os.path.exists(c):
-            r = subprocess.run([c, "-c", "import pytest, capstone"], capture_output=True)
+            # (from /, and asking for pytest.main: in the test's own directory the work folder
+            # "pytest" imports as an empty namespace package, which a bare import accepts)
+            r = subprocess.run([c, "-c", "import pytest, capstone; pytest.main"], capture_output=True, cwd="/")
             if r.returncode == 0:
                 return c
     return None
