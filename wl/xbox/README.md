@@ -30,8 +30,11 @@ coordinates and colour channels its stages read, each stage's part in a bumped l
 indirect unit, and what the device must put in the vertices. `psh.c`'s comment says how: each
 product a stage, registers renamed as they are written, inputs a stage cannot reach made first,
 the colour and alpha halves sharing stages, dead halves taken out; signed dot products exact
-through TEV's lerp, bias and scale. A program beyond GX is refused (`reason`); one that only fits
-approximated says so (`approximate`, `approximation`).
+through TEV's lerp, bias and scale; a half bias negate or expand negate (0.5 - x, 1 - 2x) made in
+its product's stage, with no register of its own, and the alpha's reads of a colour's blue made
+again where they are read (Halo's title-screen logo, all four TEV registers busy, is exact so). A
+program beyond GX is refused (`reason`); one that only fits approximated says so (`approximate`,
+`approximation`); of the attempts the translation makes, the first exact one is kept.
 
 The fixed places the device and the translation agree on: the fog ramp is map 7 at texture
 coordinate 4 (`WL_XBOX_PSH_FOG_*`); a bumped lookup's offset reads the bump map as map 5, its terms
