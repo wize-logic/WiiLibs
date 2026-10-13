@@ -163,6 +163,10 @@ struct WlNv2aDraw {
 // arrays, the inline data or the immediate vertex give, a disabled attribute's current value
 void wl_nv2a_draw_fetch(const WlNv2aDraw *draw, const WlNv2aKelvin *k, uint32_t vertex,
                         float inputs[WL_NV2A_ATTRIBS][4]);
+// the same for the attributes in `attributes` alone (bit n: v[n]); the others' registers are left as
+// they were (an immediate vertex's are all copied)
+void wl_nv2a_draw_fetch_some(const WlNv2aDraw *draw, const WlNv2aKelvin *k, uint32_t vertex, uint32_t attributes,
+                             float inputs[WL_NV2A_ATTRIBS][4]);
 // one attribute's value from its data (an array element or inline), as the NV2A widens it: the
 // components the format leaves out are 0, w 1
 void wl_nv2a_attrib_decode(uint8_t type, uint8_t size, const uint8_t *data, float out[4]);

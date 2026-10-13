@@ -35,6 +35,8 @@ enum {
     FIT_SCAN = 128,
     // ...of which these, spread in depth, are enough
     FIT_ENOUGH = 6,
+    // ...run through the program this many at a time
+    FIT_BATCH = 8,
     // the fits kept by the transform they were made for (its signature): sets by the signature's
     // hash, ways in a set
     FIT_SETS = 128,
@@ -128,8 +130,26 @@ struct WlNv2aGx {
         uint32_t index, stamp;
         WlGxDirectVertex vertex;
         float x, y;
+        // (made by run `run` of the batch now being drawn: its vertex is not here yet)
+        bool pending;
+        uint8_t run;
     } memo[MEMO];
     uint32_t memo_stamp;
+    // a batch of a draw's vertices (WL_XBOX_VSH_BATCH), the program run for those not kept: what
+    // each comes from (a run, or kept: vertices[n]), the runs' vertex numbers and memo slots, their
+    // inputs, outputs and the GX vertices made of them
+    struct {
+        uint8_t from[WL_XBOX_VSH_BATCH];
+        WlGxDirectVertex vertices[WL_XBOX_VSH_BATCH];
+        float x[WL_XBOX_VSH_BATCH], y[WL_XBOX_VSH_BATCH];
+        uint32_t run_vertex[WL_XBOX_VSH_BATCH], run_index[WL_XBOX_VSH_BATCH];
+        uint16_t run_slot[WL_XBOX_VSH_BATCH];
+        float inputs[WL_XBOX_VSH_BATCH][WL_NV2A_ATTRIBS][4];
+        WlXboxVshOutput outputs[WL_XBOX_VSH_BATCH];
+        WlGxDirectVertex made[WL_XBOX_VSH_BATCH];
+        float made_x[WL_XBOX_VSH_BATCH], made_y[WL_XBOX_VSH_BATCH];
+        WlXboxVshWork work;
+    } batch;
 };
 
 // ---- creation -----------------------------------------------------------------------------------
@@ -778,44 +798,56 @@ static float fit_error(float a, float b, const float *inverse_w, const float *de
 // with none uses its transform's fit as it is.
 static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, float depth_max) {
     Projection p = {false, gx->fit_a, gx->fit_b};
-    float inputs[WL_NV2A_ATTRIBS][4], inverse_w[FIT_PROBES + CANONICAL_POINTS], depth[FIT_PROBES + CANONICAL_POINTS];
+    float inverse_w[FIT_PROBES + CANONICAL_POINTS], depth[FIT_PROBES + CANONICAL_POINTS];
     uint32_t clip[CANONICAL_POINTS][4];
-    uint32_t probes = draw->count < FIT_SCAN ? draw->count : FIT_SCAN, v, n = 0, c, i, slot = 0;
+    uint32_t probes = draw->count < FIT_SCAN ? draw->count : FIT_SCAN, v, n = 0, c, i, slot = 0, attributes, run;
     struct FitSignature *set;
     float near_w = 0.0f, far_w = 0.0f, a, b, d;
-    bool all_w1 = true, in_front = false;
-    WlXboxVshOutput out;
+    bool all_w1 = true, in_front = false, enough = false;
+    WlXboxVshOutput *outputs = gx->batch.outputs;
 
     gx->last_shared = false;
-    if (gx->pipeline.program == NULL) {
+    // (a program that never converts its position to the screen leaves no clip-space position)
+    if (gx->pipeline.program == NULL || !gx->pipeline.program->captures_clip) {
         return p;
     }
-    for (v = 0; v < probes && n < FIT_PROBES; v++) {
-        wl_nv2a_draw_fetch(draw, k, v, inputs);
-        wl_nv2a_pipeline_vertex(&gx->pipeline, k, (const float (*)[4])inputs, WL_XBOX_VSH_LIVE_POSITION, &out);
-        if (!out.clip_captured) {
-            return p;
+    // the vertices' positions, FIT_BATCH at a time (the program run for them together)
+    attributes = wl_nv2a_pipeline_inputs(&gx->pipeline, WL_XBOX_VSH_LIVE_POSITION);
+    for (v = 0; v < probes && n < FIT_PROBES && !enough; v += run) {
+        run = probes - v < FIT_BATCH ? probes - v : FIT_BATCH;
+        for (i = 0; i < run; i++) {
+            wl_nv2a_draw_fetch_some(draw, k, v + i, attributes, gx->batch.inputs[i]);
         }
-        p.perspective = true;
-        if (!(out.clip[3] > 1.0e-4f)) {
-            continue;
-        }
-        in_front = true;
-        all_w1 = all_w1 && fabsf(out.clip[3] - 1.0f) < 1.0e-4f;
-        d = out.position[2] / depth_max;
-        // (a vertex beyond the near or the far plane: GX clips there, its depth is never drawn, and
-        // near the eye the depth runs steep, so it is no measure of a fit)
-        if (!(d >= 0.0f && d <= 1.0f)) {
-            continue;
-        }
-        inverse_w[n] = 1.0f / out.clip[3];
-        depth[n] = d;
-        near_w = n == 0 || inverse_w[n] < near_w ? inverse_w[n] : near_w;
-        far_w = n == 0 || inverse_w[n] > far_w ? inverse_w[n] : far_w;
-        n++;
-        // (enough to tell a projection and fit one: a few vertices spread in depth)
-        if (n >= FIT_ENOUGH && far_w - near_w > 1.0e-3f * far_w) {
-            break;
+        wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, run,
+                                  WL_XBOX_VSH_LIVE_POSITION, outputs, &gx->batch.work);
+        for (i = 0; i < run && n < FIT_PROBES; i++) {
+            const WlXboxVshOutput *out = &outputs[i];
+
+            if (!out->clip_captured) {
+                return p;
+            }
+            p.perspective = true;
+            if (!(out->clip[3] > 1.0e-4f)) {
+                continue;
+            }
+            in_front = true;
+            all_w1 = all_w1 && fabsf(out->clip[3] - 1.0f) < 1.0e-4f;
+            d = out->position[2] / depth_max;
+            // (a vertex beyond the near or the far plane: GX clips there, its depth is never drawn, and
+            // near the eye the depth runs steep, so it is no measure of a fit)
+            if (!(d >= 0.0f && d <= 1.0f)) {
+                continue;
+            }
+            inverse_w[n] = 1.0f / out->clip[3];
+            depth[n] = d;
+            near_w = n == 0 || inverse_w[n] < near_w ? inverse_w[n] : near_w;
+            far_w = n == 0 || inverse_w[n] > far_w ? inverse_w[n] : far_w;
+            n++;
+            // (enough to tell a projection and fit one: a few vertices spread in depth)
+            if (n >= FIT_ENOUGH && far_w - near_w > 1.0e-3f * far_w) {
+                enough = true;
+                break;
+            }
         }
     }
     if (!p.perspective) {
@@ -827,16 +859,21 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
         return p;
     }
     // the transform's signature, and the canonical points' w and depth
-    c = n;
     for (i = 0; i < CANONICAL_POINTS; i++) {
         for (v = 0; v < WL_NV2A_ATTRIBS; v++) {
-            memcpy(inputs[v], canonical_points[i], sizeof inputs[v]);
+            memcpy(gx->batch.inputs[i][v], canonical_points[i], sizeof gx->batch.inputs[i][v]);
         }
-        wl_nv2a_pipeline_vertex(&gx->pipeline, k, (const float (*)[4])inputs, WL_XBOX_VSH_LIVE_POSITION, &out);
-        memcpy(clip[i], out.clip, sizeof clip[i]);
-        d = out.position[2] / depth_max;
-        if (out.clip[3] > 1.0e-4f && d >= 0.0f && d <= 1.0f) {
-            inverse_w[c] = 1.0f / out.clip[3];
+    }
+    wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs,
+                              CANONICAL_POINTS, WL_XBOX_VSH_LIVE_POSITION, outputs, &gx->batch.work);
+    c = n;
+    for (i = 0; i < CANONICAL_POINTS; i++) {
+        const WlXboxVshOutput *out = &outputs[i];
+
+        memcpy(clip[i], out->clip, sizeof clip[i]);
+        d = out->position[2] / depth_max;
+        if (out->clip[3] > 1.0e-4f && d >= 0.0f && d <= 1.0f) {
+            inverse_w[c] = 1.0f / out->clip[3];
             depth[c] = d;
             c++;
         }
@@ -937,50 +974,108 @@ typedef struct DrawPlan {
     const float *scale, *offset;
 } DrawPlan;
 
-// a vertex as GX takes it (OpenCE-Wii's vertex_store), and where it lands in EFB pixels
-static void vertex_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, uint32_t v, const DrawPlan *plan,
+// a vertex as GX takes it (OpenCE-Wii's vertex_store) from what the program left, and where it lands
+// in EFB pixels
+static void vertex_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPlan *plan, const WlXboxVshOutput *o,
                         WlGxDirectVertex *out, float *px, float *py) {
-    float inputs[WL_NV2A_ATTRIBS][4];
-    WlXboxVshOutput o;
     unsigned stage;
 
-    wl_nv2a_draw_fetch(draw, k, v, inputs);
-    wl_nv2a_pipeline_vertex(&gx->pipeline, k, (const float (*)[4])inputs, plan->live, &o);
-    if (gx->projection.perspective && o.clip_captured) {
+    if (gx->projection.perspective && o->clip_captured) {
         // (x w, y w, -w) in pixels, the pixel centres on integers as Direct3D puts them
-        float w = o.clip[3];
+        float w = o->clip[3];
 
-        out->position[0] = (o.clip[0] * plan->scale[0] + plan->offset[0] * w) / plan->sx + 0.5f * w;
-        out->position[1] = (o.clip[1] * plan->scale[1] + plan->offset[1] * w) / plan->sy + 0.5f * w;
+        out->position[0] = (o->clip[0] * plan->scale[0] + plan->offset[0] * w) / plan->sx + 0.5f * w;
+        out->position[1] = (o->clip[1] * plan->scale[1] + plan->offset[1] * w) / plan->sy + 0.5f * w;
         out->position[2] = -w;
         *px = w != 0.0f ? out->position[0] / w : 0.0f;
         *py = w != 0.0f ? out->position[1] / w : 0.0f;
     } else {
-        out->position[0] = o.position[0] / plan->sx + 0.5f;
-        out->position[1] = o.position[1] / plan->sy + 0.5f;
-        out->position[2] = as_depth(o.position[2], plan->depth_max) - 1.0f;
+        out->position[0] = o->position[0] / plan->sx + 0.5f;
+        out->position[1] = o->position[1] / plan->sy + 0.5f;
+        out->position[2] = as_depth(o->position[2], plan->depth_max) - 1.0f;
         *px = out->position[0];
         *py = out->position[1];
     }
     if (gx->channels & 1u) {
-        out->color[0][0] = color_byte(o.d0[0]);
-        out->color[0][1] = color_byte(o.d0[1]);
-        out->color[0][2] = color_byte(o.d0[2]);
-        out->color[0][3] = color_byte(o.d0[3]);
+        out->color[0][0] = color_byte(o->d0[0]);
+        out->color[0][1] = color_byte(o->d0[1]);
+        out->color[0][2] = color_byte(o->d0[2]);
+        out->color[0][3] = color_byte(o->d0[3]);
     }
     if (gx->channels & 2u) {
-        out->color[1][0] = color_byte(o.d1[0]);
-        out->color[1][1] = color_byte(o.d1[1]);
-        out->color[1][2] = color_byte(o.d1[2]);
-        out->color[1][3] = color_byte(o.d1[3]);
+        out->color[1][0] = color_byte(o->d1[0]);
+        out->color[1][1] = color_byte(o->d1[1]);
+        out->color[1][2] = color_byte(o->d1[2]);
+        out->color[1][3] = color_byte(o->d1[3]);
     }
     for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
         if (gx->texcoords & (1u << stage)) {
-            wl_nv2a_texcoord(gx->entries[stage], plan->stage_programs[stage], o.t[stage], out->texcoord[stage]);
+            wl_nv2a_texcoord(gx->entries[stage], plan->stage_programs[stage], o->t[stage], out->texcoord[stage]);
         }
     }
     if (gx->texcoords & (1u << WL_XBOX_PSH_FOG_TEXCOORD)) {
-        out->texcoord[WL_XBOX_PSH_FOG_TEXCOORD][0] = wl_gx_ramp_coordinate(wl_nv2a_fog_factor(k, o.fog));
+        out->texcoord[WL_XBOX_PSH_FOG_TEXCOORD][0] = wl_gx_ramp_coordinate(wl_nv2a_fog_factor(k, o->fog));
+    }
+}
+
+// vertices first .. first + count - 1 of a draw (count at most WL_XBOX_VSH_BATCH) as GX takes them,
+// into gx->batch: an indexed draw's vertex kept by its index (the memo) is not made again; the others
+// are fetched (the inputs the program reads alone) and run through the program together. Each comes
+// out as vertex_make makes it alone: the memo is looked at and filled in the draw's order.
+enum { FROM_KEPT = 0xFF };
+
+static void vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, uint32_t first, uint32_t count,
+                          const DrawPlan *plan, uint32_t attributes) {
+    bool indexed = draw->source == WL_NV2A_SOURCE_ARRAYS && draw->indices != NULL;
+    unsigned runs = 0, n, r;
+
+    for (n = 0; n < count; n++) {
+        uint32_t v = first + n, index = 0, slot = MEMO;
+
+        if (indexed) {
+            index = draw->indices[v];
+            slot = index & (MEMO - 1u);
+            if (gx->memo[slot].stamp == gx->memo_stamp && gx->memo[slot].index == index) {
+                if (gx->memo[slot].pending) {
+                    gx->batch.from[n] = gx->memo[slot].run;
+                } else {
+                    gx->batch.from[n] = FROM_KEPT;
+                    gx->batch.vertices[n] = gx->memo[slot].vertex;
+                    gx->batch.x[n] = gx->memo[slot].x;
+                    gx->batch.y[n] = gx->memo[slot].y;
+                }
+                gx->stats.vertices_reused++;
+                continue;
+            }
+            gx->memo[slot].stamp = gx->memo_stamp;
+            gx->memo[slot].index = index;
+            gx->memo[slot].pending = true;
+            gx->memo[slot].run = (uint8_t)runs;
+        }
+        gx->batch.from[n] = (uint8_t)runs;
+        gx->batch.run_vertex[runs] = v;
+        gx->batch.run_index[runs] = index;
+        gx->batch.run_slot[runs] = (uint16_t)slot;
+        runs++;
+    }
+    for (r = 0; r < runs; r++) {
+        wl_nv2a_draw_fetch_some(draw, k, gx->batch.run_vertex[r], attributes, gx->batch.inputs[r]);
+    }
+    wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, runs,
+                              plan->live, gx->batch.outputs, &gx->batch.work);
+    for (r = 0; r < runs; r++) {
+        uint32_t slot = gx->batch.run_slot[r];
+
+        memset(&gx->batch.made[r], 0, sizeof gx->batch.made[r]);
+        vertex_make(gx, k, plan, &gx->batch.outputs[r], &gx->batch.made[r], &gx->batch.made_x[r],
+                    &gx->batch.made_y[r]);
+        if (slot < MEMO && gx->memo[slot].pending && gx->memo[slot].run == r &&
+            gx->memo[slot].index == gx->batch.run_index[r]) {
+            gx->memo[slot].vertex = gx->batch.made[r];
+            gx->memo[slot].x = gx->batch.made_x[r];
+            gx->memo[slot].y = gx->batch.made_y[r];
+            gx->memo[slot].pending = false;
+        }
     }
 }
 
@@ -1017,7 +1112,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     DrawPlan plan;
     bool exact, count_pixels = wl_nv2a_k(k, WL_NV2A_K_SET_ZPASS_PIXEL_COUNT_ENABLE) != 0;
     float corners[3][2], area = 0.0f;
-    uint32_t v, seen = 0;
+    uint32_t v, seen = 0, first = 0, attributes;
     unsigned stage;
 
     if (wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_TEST_ENABLE)) {
@@ -1084,32 +1179,28 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
 
     wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
     gx->memo_stamp++;
+    attributes = wl_nv2a_pipeline_inputs(&gx->pipeline, plan.live);
     for (v = 0; v < draw->count; v++) {
-        WlGxDirectVertex vertex;
+        unsigned n = (v - first) % WL_XBOX_VSH_BATCH, from;
+        const WlGxDirectVertex *vertex;
         float px, py;
 
-        if (draw->source == WL_NV2A_SOURCE_ARRAYS && draw->indices != NULL) {
-            uint32_t index = draw->indices[v], slot = index & (MEMO - 1u);
-
-            if (gx->memo[slot].stamp == gx->memo_stamp && gx->memo[slot].index == index) {
-                vertex = gx->memo[slot].vertex;
-                px = gx->memo[slot].x;
-                py = gx->memo[slot].y;
-                gx->stats.vertices_reused++;
-            } else {
-                memset(&vertex, 0, sizeof vertex);
-                vertex_make(gx, k, draw, v, &plan, &vertex, &px, &py);
-                gx->memo[slot].stamp = gx->memo_stamp;
-                gx->memo[slot].index = index;
-                gx->memo[slot].vertex = vertex;
-                gx->memo[slot].x = px;
-                gx->memo[slot].y = py;
-            }
-        } else {
-            memset(&vertex, 0, sizeof vertex);
-            vertex_make(gx, k, draw, v, &plan, &vertex, &px, &py);
+        if (n == 0) {
+            first = v;
+            vertices_make(gx, k, draw, v, draw->count - v < WL_XBOX_VSH_BATCH ? draw->count - v : WL_XBOX_VSH_BATCH,
+                          &plan, attributes);
         }
-        wl_gx_direct_vertex(&vertex);
+        from = gx->batch.from[n];
+        if (from == FROM_KEPT) {
+            vertex = &gx->batch.vertices[n];
+            px = gx->batch.x[n];
+            py = gx->batch.y[n];
+        } else {
+            vertex = &gx->batch.made[from];
+            px = gx->batch.made_x[from];
+            py = gx->batch.made_y[from];
+        }
+        wl_gx_direct_vertex(vertex);
         if (count_pixels) {
             // (the triangles' areas: what a pixel count without a depth test would say)
             float here[2] = {px, py};

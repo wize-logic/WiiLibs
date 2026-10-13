@@ -45,6 +45,12 @@ bool wl_nv2a_pipeline_begin(WlNv2aPipeline *p, const WlNv2aKelvin *k);
 // 1. `out->clip_captured` says whether out->clip is the clip-space position.
 void wl_nv2a_pipeline_vertex(WlNv2aPipeline *p, const WlNv2aKelvin *k, const float inputs[WL_NV2A_ATTRIBS][4],
                              unsigned live, WlXboxVshOutput *out);
+// The same for `count` vertices (inputs[n] into out[n]), the program's interpreted together
+// (wl_xbox_vsh_run_batch, with `work` its scratch): the same results, to the bit.
+void wl_nv2a_pipeline_vertices(WlNv2aPipeline *p, const WlNv2aKelvin *k, const float (*inputs)[WL_NV2A_ATTRIBS][4],
+                               unsigned count, unsigned live, WlXboxVshOutput *out, WlXboxVshWork *work);
+// The input registers the outputs in `live` read (bit n: v[n]): the others need not be fetched.
+uint32_t wl_nv2a_pipeline_inputs(const WlNv2aPipeline *p, unsigned live);
 
 // The fog factor (1 no fog, 0 all fog) of a fog coordinate (the program's oFog) by SET_FOG_MODE
 // and SET_FOG_PARAMS (bias, multiplier): linear bias - 1 + multiplier c, exp bias - 1.5 +
