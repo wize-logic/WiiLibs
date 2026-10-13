@@ -30,6 +30,8 @@ enum {
     MEMO = 1024,
     // vertices looked at for the projection's fit
     FIT_PROBES = 24,
+    // ...of which these, spread in depth, are enough
+    FIT_ENOUGH = 6,
     // the fits kept, for draws that come back to a projection (passes over the same geometry)
     FITS_KEPT = 4
 };
@@ -748,6 +750,10 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
             far = n;
         }
         n++;
+        // (enough to tell a projection and fit one: a few vertices spread in depth)
+        if (n >= FIT_ENOUGH && inverse_w[far] - inverse_w[near] > 1.0e-3f * inverse_w[far]) {
+            break;
+        }
     }
     if (n == 0) {
         return p;
