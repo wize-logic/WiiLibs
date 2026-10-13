@@ -45,6 +45,14 @@ wl_add_test(test_platform_target_gx
     LIBS wl_base LABELS unit be)
 target_include_directories(test_platform_target_gx BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub)
 
+# The transform unit's flush for a renderer's own vertex formats (wii/gx_flush_wii.c, gx_vertex.c's sizes):
+# the bytes sent before a primitive, against the same recording stand-in (OpenCE-Wii's device draws through it).
+wl_add_test(test_platform_flush_gx
+    SOURCES test_platform_flush_gx.c gx_stub/gx_stub.c
+            ${PROJECT_SOURCE_DIR}/wl/platform/gx_vertex.c ${PROJECT_SOURCE_DIR}/wl/platform/wii/gx_flush_wii.c
+    LIBS wl_base LABELS unit be)
+target_include_directories(test_platform_flush_gx BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub)
+
 # The spill-over heap: the portable core against a fake primary allocator ...
 wl_add_test(test_platform_heap_overflow SOURCES test_platform_heap_overflow.c LIBS wl_platform LABELS unit be)
 # ... and the newlib wrap layer (wii/heap_wrap_wii.c, which includes no libogc header) against a fake newlib.
