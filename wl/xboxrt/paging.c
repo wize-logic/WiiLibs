@@ -33,6 +33,7 @@
 #define TAG "xbpage"
 #define BATCH 32u      // pages a swap write takes at most (128 KB)
 #define FAST_LOOK 256u // frames the exception context's clock looks at before it gives up
+#define SLOT_ALIGN 8u  // a batch starts on 8 slots (32 KB) when it can
 #define PAGE WL_XB_PAGE
 
 uint8_t *g_xb_pg_flags;
@@ -145,9 +146,38 @@ static void slot_free(uint32_t s) {
     g_slots_used--;
 }
 
-// The run of free slots at the first free slot from the cursor (wrapping once), at most `want`
-// long, taken. Its length (0: the file is full); its first slot in `*first`.
+// Takes the free slots from `s` on, at most `want`; how many.
+static uint32_t slot_take(uint32_t s, uint32_t want) {
+    uint32_t len = 0;
+    while (len < want && s + len < g_slots && !slot_is_used(s + len)) {
+        g_slot_used[(s + len) >> 5] |= 1u << ((s + len) & 31u);
+        len++;
+    }
+    g_slots_used += len;
+    g_slot_cursor = s + len >= g_slots ? 0 : s + len;
+    return len;
+}
+
+// A run of free slots, at most `want` long, taken: its length (0: the file is full), its first slot
+// in `*first`. From the cursor on, wrapping once; first at a free group of SLOT_ALIGN slots (32 KB:
+// an SD card's FAT cluster, so that a batch's write goes to the card whole rather than through the
+// file system's cache), else at the first free slot.
 static uint32_t slot_run(uint32_t want, uint32_t *first) {
+    uint32_t groups = g_slots / SLOT_ALIGN;
+    uint32_t need = want < SLOT_ALIGN ? want : SLOT_ALIGN;
+    for (uint32_t n = 0, s = g_slot_cursor & ~(SLOT_ALIGN - 1u); n < groups; n++, s += SLOT_ALIGN) {
+        if (s >= groups * SLOT_ALIGN) {
+            s = 0;
+        }
+        uint32_t k = 0;
+        while (k < need && !slot_is_used(s + k)) {
+            k++;
+        }
+        if (k == need) {
+            *first = s;
+            return slot_take(s, want);
+        }
+    }
     for (uint32_t scanned = 0, s = g_slot_cursor; scanned < g_slots; scanned++, s = s + 1u >= g_slots ? 0 : s + 1u) {
         if ((s & 31u) == 0 && g_slot_used[s >> 5] == 0xFFFFFFFFu && scanned + 32u <= g_slots) {
             scanned += 31u; // a full word
@@ -157,15 +187,8 @@ static uint32_t slot_run(uint32_t want, uint32_t *first) {
         if (slot_is_used(s)) {
             continue;
         }
-        uint32_t len = 0;
-        while (len < want && s + len < g_slots && !slot_is_used(s + len)) {
-            g_slot_used[(s + len) >> 5] |= 1u << ((s + len) & 31u);
-            len++;
-        }
-        g_slots_used += len;
-        g_slot_cursor = s + len >= g_slots ? 0 : s + len;
         *first = s;
-        return len;
+        return slot_take(s, want);
     }
     return 0;
 }
