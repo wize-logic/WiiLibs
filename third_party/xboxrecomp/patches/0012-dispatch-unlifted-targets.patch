@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Tue, 13 Oct 2026 11:34:10 -0400
+Subject: [PATCH] recomp: reach an address with no function through dispatch by
+ address
+
+What is still a direct jump or call to an address with no function after
+the code a function reaches is lifted into it -- bytes that do not decode,
+a target outside every section, a jump from bytes nothing reaches -- was
+named as a function anyway and given an unresolved stub. A stub is
+entered by calls (a return address pushed) and by tail jumps (nothing
+pushed) alike, so its `g_esp += 4` (+ N for a `ret N` it found ahead) is
+right for one and walks esp off for the other, and either way it returned
+without a word.
+
+BatchTranslator now tells the lifter which addresses have a C function
+(lifter.entry_starts, every function it lifts or the project writes by
+hand). A direct jump, conditional jump, fall-through or call to any other
+address goes through RECOMP_ITAIL: whatever the runtime has registered at
+that address runs with the stack as the jump or call left it, and a miss
+goes through recomp_icall_fail_log, which reports it (and where a runtime
+records misses as seeds, feeds the next generation). It is never named,
+so it needs no stub. Within a function's range, a target with no
+instruction now goes the same way instead of being a goto to a missing
+label, dropped as dead code. A caller that lifts single functions (no set
+of functions) keeps the old behaviour.
+
+The stub file remains for a run that leaves functions out (--category,
+--max-funcs): their callers still call them by name. Each stub now
+dispatches by address instead of popping.
+
+tests: test_interior_targets.py (an unreachable jump, a target outside
+every section, the stub of an untranslated function).
+---
+ tools/recomp/lifter.py                | 86 +++++++++++++++++++++++----
+ tools/recomp/test_interior_targets.py | 58 ++++++++++++++++--
+ tools/recomp/translator.py            | 42 ++++++-------
+ 3 files changed, 146 insertions(+), 40 deletions(-)
+
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index cad8da9..b41e431 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -1111,6 +1111,10 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
+             return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; "
+                     f"RECOMP_ITAIL(0x{target:08X}u); return; }}"
+                     f" /* {jcc}: {desc}, manual tail */")
++        if lifter._dispatched(target):
++            return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; "
++                    f"RECOMP_ITAIL(0x{target:08X}u); return; }}"
++                    f" /* {jcc}: {desc}, not lifted: by address */")
+         name = lifter._call_target_name(target)
+         return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
+                 f" /* {jcc}: {desc} */")
+@@ -1416,6 +1420,13 @@ class Lifter:
+         # outside the set is another function's code. None: the range alone
+         # decides, as for a caller that lifts single functions.
+         self.body_addrs = None
++        # The addresses that have a C function of their own (generated or
++        # hand-written), when the translator knows them. A direct jump or call
++        # to any other address has no symbol to call: it goes through the
++        # runtime's dispatch by address (RECOMP_ITAIL), which runs whatever is
++        # registered there and reports a miss, instead of a stub that returns
++        # without running anything. None: every target is called by name.
++        self.entry_starts = None
+         # Tables (VA -> arms) whose arms the translator lifted into the
+         # current body from outside its range; see _analyze_switch_table.
+         self.absorbed_tables = set()
+@@ -1425,6 +1436,20 @@ class Lifter:
+         return ((self.func_start <= addr < self.func_end)
+                 or (self.body_addrs is not None and addr in self.body_addrs))
+ 
++    def _dispatched(self, addr):
++        """Whether a direct target has no C function and goes by address."""
++        return (self.entry_starts is not None
++                and addr not in self.entry_starts
++                and addr not in self.manual_functions)
++
++    def _tail_call(self, addr):
++        """The C call that continues at another function's address, with no
++        return address pushed (a conditional tail jump, a fall-through): by
++        name, or by address when no C function starts there."""
++        if self._dispatched(addr):
++            return f"RECOMP_ITAIL(0x{addr:08X}u)"
++        return f"{self._call_target_name(addr)}()"
++
+     def _call_target_name(self, addr):
+         """Get the name for a call target address.
+ 
+@@ -2446,7 +2471,11 @@ class Lifter:
+         # value -- so writing the true address costs nothing at the return side.
+         ret_va = insn.end_address
+         if insn.call_target:
+-            name = self._call_target_name(insn.call_target)
++            # Named only when called by name: naming records the address as a
++            # symbol the batch must define (or stub).
++            name = (None if self._dispatched(insn.call_target)
++                    and insn.call_target not in (self.SETJMP_FN, self.LONGJMP_FN)
++                    else self._call_target_name(insn.call_target))
+             lines = []
+             # Re-publish this function's frame before every call, not just once
+             # at `mov ebp, esp`. g_ebp is "the last frame established anywhere",
+@@ -2499,6 +2528,18 @@ class Lifter:
+                     f"{safe_macro}(0x{insn.call_target:08X}u, "
+                     "_icall_esp); "
+                     f"/* manual call 0x{insn.call_target:08X} */")
++            elif self._dispatched(insn.call_target):
++                # No generated function starts here (the translator gives
++                # every address reachable code calls inside lifted code one,
++                # so this is code it could not decode, or a call from bytes
++                # it never reaches). Dispatch by address: whatever the runtime
++                # has registered there runs, and a miss is reported and
++                # returns like a ret, instead of a stub doing the same
++                # without a word.
++                lines.append(
++                    f"PUSH32(esp, 0x{ret_va:08X}u); "
++                    f"RECOMP_ITAIL(0x{insn.call_target:08X}u); "
++                    f"/* call 0x{insn.call_target:08X}, not lifted: by address */")
+             else:
+                 # Routed through RECOMP_ABI_CALL so -DRECOMP_ABI_CHECK covers
+                 # direct calls too. Without it the check sees only indirect
+@@ -2618,13 +2659,18 @@ class Lifter:
+     def _is_external_target(self, addr):
+         """Check if a jump target is outside the current function.
+ 
+-        A body can hold code outside its range: the translator lifts the
+-        code a jump reaches past the range into it
+-        (FunctionTranslator._absorb), so an address the body holds an
+-        instruction for is inside it wherever it is."""
++        With the body's instruction set known, a target the body holds no
++        instruction for is outside it even within the range: a goto there
++        would name a label that does not exist, and it used to be dropped as
++        dead code, which skipped the jump without a word. (The translator
++        lifts every such target reachable code jumps to into the body, so
++        what is left comes from bytes nothing reaches; without the set of
++        functions to dispatch by, it stays the old dead goto.)"""
+         if self.body_addrs is not None and addr in self.body_addrs:
+             return False
+-        return not (self.func_start <= addr < self.func_end)
++        if self.func_start <= addr < self.func_end:
++            return self.body_addrs is not None and self.entry_starts is not None
++        return True
+ 
+     def _read_jump_table(self, table_va, max_entries=256):
+         """Read 32-bit jump table entries from the XBE at a given VA.
+@@ -2683,7 +2729,7 @@ class Lifter:
+             # A table the translator read with bounds and whose arms it
+             # lifted into this body (FunctionTranslator._absorb): every arm
+             # the body holds is a goto, wherever it sits in the table; the
+-            # rest go through the indirect tail jump.
++            # rest go by address.
+             inside = [target for target in targets if self._in_body(target)]
+         # Two arms is the smallest thing worth calling a switch; one is more
+         # likely a coincidence than a jump table.
+@@ -2755,6 +2801,24 @@ class Lifter:
+                             tail,
+                         ]
+                     return [self._forced_tail(tail)]
++                if self._dispatched(insn.jump_target):
++                    # No generated function starts there: dispatch by
++                    # address, which reports a miss. The translator lifts
++                    # every reachable target inside lifted code into the
++                    # jumping function's own body, so this is code it could
++                    # not decode, or a jump from bytes it never reaches.
++                    tail = (
++                        f"g_seh_ebp = ebp; "
++                        f"RECOMP_ITAIL(0x{insn.jump_target:08X}u); return; "
++                        f"/* tail jmp 0x{insn.jump_target:08X}, not lifted: by address */"
++                    )
++                    if self.trace_exit_name:
++                        return [
++                            f'RECOMP_TRACE_ESP("{self.trace_exit_name}", '
++                            f'"tail 0x{insn.jump_target:08X}");',
++                            tail,
++                        ]
++                    return [self._forced_tail(tail)]
+                 name = self._call_target_name(insn.jump_target)
+                 tail = (f"g_seh_ebp = ebp; {name}(); return; "
+                         f"/* tail jmp 0x{insn.jump_target:08X} */")
+@@ -2819,8 +2883,8 @@ class Lifter:
+             cond = "ecx == 0" if jcc == "jecxz" else "LO16(ecx) == 0"
+             if target:
+                 if self._is_external_target(target):
+-                    name = self._call_target_name(target)
+-                    return [f"if ({cond}) {{ g_seh_ebp = ebp; {name}(); return; }} /* {jcc} */"]
++                    call = self._tail_call(target)
++                    return [f"if ({cond}) {{ g_seh_ebp = ebp; {call}; return; }} /* {jcc} */"]
+                 return [f"if ({cond}) goto loc_{target:08X}; /* {jcc} */"]
+             return [f"/* {jcc} - no target */"]
+ 
+@@ -2845,8 +2909,8 @@ class Lifter:
+ 
+         if target:
+             if self._is_external_target(target):
+-                name = self._call_target_name(target)
+-                return [f"if ({cond} /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
++                call = self._tail_call(target)
++                return [f"if ({cond} /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {call}; return; }}"]
+             return [f"if ({cond} /* {jcc}: {desc} */) goto loc_{target:08X};"]
+         return [f"/* {jcc}: {desc} - no target */"]
+ 
+diff --git a/tools/recomp/test_interior_targets.py b/tools/recomp/test_interior_targets.py
+index 0fc897b..0fd805a 100644
+--- a/tools/recomp/test_interior_targets.py
++++ b/tools/recomp/test_interior_targets.py
+@@ -10,8 +10,9 @@ a false start at 0xE66A0 (an immediate the disassembler took for an address);
+ its `je 0xE66B6` returned through such a stub, skipping its epilogue, and a
+ level script later crashed with esi pointing into the script stack.
+ 
+-The code a jump reaches is now lifted into the jumping function's own body, and
+-a called address inside a body gets a function of its own.
++The code a jump reaches is now lifted into the jumping function's own body, a
++called address inside a body gets a function of its own, and a target that
++still has no code goes through dispatch by address, which reports a miss.
+ 
+ The x86 here (assembled with GNU as, at BASE):
+ 
+@@ -41,10 +42,12 @@ The x86 here (assembled with GNU as, at BASE):
+        S_rest:  xor eax,0x3c3c; ret               ; ...but its code does not
+ """
+ 
++import json
++
+ import pytest
+ 
+ from . import config
+-from .translator import FunctionTranslator
++from .translator import BatchTranslator, FunctionTranslator
+ 
+ BASE = 0x10000
+ CODE = {
+@@ -134,6 +137,7 @@ def test_called_address_inside_a_body_gets_a_function():
+     core = subject.translate_function(B_CORE, entry)
+     assert "eax = MEM32(esp + 4);" in core, core
+     assert "ebx = (uint32_t)((int32_t)ebx * (int32_t)7);" in core
++    assert B_CORE in subject.lifter.entry_starts
+ 
+ 
+ def test_false_start_keeps_its_owner_whole():
+@@ -177,4 +181,50 @@ def test_runs_off_its_range_into_code_no_function_covers():
+ def test_bytes_nothing_reaches_are_not_followed():
+     subject, code = lift(X, prepass=True)
+     assert f"loc_{B_BODY:08X}: ;" not in code, code
+-    assert "imul" not in code
++    # A jump that is never taken still has a meaning if it were: by address.
++    assert f"RECOMP_ITAIL(0x{B_BODY:08X}u); return; }}" in code
++    assert B_BODY not in subject.lifter.referenced_calls
++
++
++def test_target_outside_every_section_goes_by_address():
++    subject = FunctionTranslator(image(), database())
++    subject.discover_interior_entries()
++    subject.lifter.func_start, subject.lifter.func_end = A, A + 0xC
++    subject.lifter.body_addrs = {A}
++    from .disasm import Instruction, Operand
++    jump = Instruction(address=A, size=5, mnemonic="jmp", op_str="0x900000",
++                       bytes_hex="e9", jump_target=0x900000,
++                       operands=[Operand(type="imm", imm=0x900000)])
++    call = Instruction(address=A, size=5, mnemonic="call", op_str="0x900000",
++                       bytes_hex="e8", call_target=0x900000,
++                       operands=[Operand(type="imm", imm=0x900000)])
++    tail = subject.lifter.lift_instruction(jump)
++    assert any("RECOMP_ITAIL(0x00900000u); return;" in line for line in tail), tail
++    called = subject.lifter.lift_instruction(call)
++    assert any("PUSH32(esp, 0x00010005u); RECOMP_ITAIL(0x00900000u);" in line
++               for line in called), called
++    assert 0x900000 not in subject.lifter.referenced_calls
++
++
++def test_untranslated_function_stub_dispatches(tmp_path):
++    xbe = tmp_path / "synthetic.xbe"
++    functions = tmp_path / "functions.json"
++    xbe.write_bytes(image())
++    entries = []
++    for start, end, method in FUNCTIONS:
++        entries.append({"start": hex(start), "end": hex(end),
++                        "detection_method": method, "section": ".text"})
++    functions.write_text(json.dumps(entries), encoding="utf-8")
++    batch = BatchTranslator(xbe, functions)
++    assert batch.translator.interior_entry_starts == {B_CORE}
++    # A run that leaves the alternate entry out: D's call has nothing to link to.
++    chosen = [(addr, info) for addr, info in batch.get_functions_by_category()
++              if addr != B_CORE]
++    stats = batch.translate_batch_split(chosen, str(tmp_path / "gen"),
++                                        chunk_size=100, runtime_header="none")
++    assert stats["unresolved_stubs"] == 1
++    stub = (tmp_path / "gen" / "recomp_stubs_unresolved.c").read_text()
++    # a stub dispatches by address (reached by a call or a jump alike); it
++    # never pops a return address it cannot know was pushed
++    assert f"void sub_{B_CORE:08X}(void) {{ RECOMP_ITAIL(0x{B_CORE:08X}u);" in stub
++    assert "g_esp +=" not in stub
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 0393cd3..7bfd81c 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -1585,6 +1585,7 @@ class FunctionTranslator:
+                 created.add(target)
+                 pending.append(target)
+         self.interior_entry_starts = created
++        self.lifter.entry_starts = frozenset(entries | created)
+         if created:
+             print(f"Gave {len(created)} called addresses inside lifted code "
+                   f"a function of their own", file=sys.stderr)
+@@ -2964,8 +2965,8 @@ class FunctionTranslator:
+                                  f"0x{target:08X} */")
+                 else:
+                     lines.append(f"    g_seh_ebp = ebp; "
+-                                 f"{self.lifter._call_target_name(target)}();"
+-                                 f" return; /* falls into 0x{target:08X} */")
++                                 f"{self.lifter._tail_call(target)}; return;"
++                                 f" /* falls into 0x{target:08X} */")
+ 
+             lines.append(f"")
+ 
+@@ -3628,38 +3629,29 @@ class BatchTranslator:
+             stub_lines = [
+                 "/**",
+                 " * Unresolved call target stubs",
+-                f" * {len(unresolved)} addresses called by translated code but not",
+-                " * detected as functions - typically mid-function entry points.",
+-                " * Auto-generated by tools/recomp.",
++                f" * {len(unresolved)} addresses translated code calls by name but",
++                " * this run did not translate (a --category or --max-funcs run",
++                " * leaves functions out). Auto-generated by tools/recomp.",
+                 " */",
+                 "",
+                 "#define RECOMP_GENERATED_CODE",
+                 f'#include "{header_name}"',
+                 "",
+             ]
+-            stub_lines.append(
+-                "/* Each stub consumes the return address its caller pushed,")
+-            stub_lines.append(
+-                " * exactly as a real 'ret' would. An empty body leaves esp 4 bytes")
+-            stub_lines.append(
+-                " * low, and the caller then reads every subsequent stack slot off by")
+-            stub_lines.append(
+-                " * one - which surfaces far from here, as corrupted callee-saved")
+-            stub_lines.append(
+-                " * registers or a garbage local. Args are not popped: the callee's")
+-            stub_lines.append(
+-                " * stdcall byte count is read from the target's own bytes where")
+-            stub_lines.append(
+-                " * they end in a `ret N` -- guessing cdecl there silently walks")
+-            stub_lines.append(
+-                " * esp off by N on every call. */")
+-            stub_lines.append("")
++            # A stub is reached both by a call (the return address pushed)
++            # and by a tail jump (nothing pushed), so it cannot pretend to be
++            # a ret: popping four bytes is right for one and walks esp off for
++            # the other, and either way the target's code never runs. It
++            # dispatches by address instead, as an indirect tail jump would:
++            # whatever the runtime has registered there runs with the stack
++            # as the jump or call left it, and a miss goes through
++            # recomp_icall_fail_log, so it is reported, not silent.
+             for addr in sorted(unresolved):
+                 popped = self.translator._stub_ret_bytes(addr)
+-                note = (f"ret {popped}" if popped else "not detected")
++                note = (f"ends in ret {popped}" if popped else "not translated")
+                 stub_lines.append(
+-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+-                    f"/* 0x{addr:08X}: {note} */ }}"
++                    f"void {unresolved[addr]}(void) {{ "
++                    f"RECOMP_ITAIL(0x{addr:08X}u); /* {note} */ }}"
+                 )
+             stub_lines.append("")
+ 

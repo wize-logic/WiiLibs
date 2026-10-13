@@ -1,0 +1,801 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Tue, 13 Oct 2026 11:32:51 -0400
+Subject: [PATCH] recomp: lift the code a jump reaches outside its function
+ into it
+
+A function is lifted from its range, and a direct jump out of the range
+was a tail call to the function starting at the target. When no function
+starts there -- the middle of another body, the rest of this function past
+a false function start, bytes no function covers -- the call went to a stub
+that popped a return address and returned: the code never ran, and esp was
+off by four, since a jump pushes nothing.
+
+Halo 2276 had 270 such stubs inside lifted code, almost all reached by a
+jcc or a jmp (407 and 140 sites, 3 calls). Its hs `and` evaluator at
+0xE6600 is cut by a false start at 0xE66A0 (an immediate the disassembler
+took for an address): `je 0xE66B6` returned through a stub, its epilogue
+never ran, and a level script later crashed with esi in the script stack.
+Most of the rest are alternate entries (tail_jump_alias bodies) whose
+loops jump back into the part of their owner before them.
+
+The translator now follows the code a function reaches: from its entry,
+its switch arms and the continuations it jumps through, along
+fall-through, direct jumps and switch arms. An address outside the
+function's own instructions that no function starts at is decoded from
+there and lifted into the function's body, as labels and gotos. That is
+the x86's own behaviour (same stack, frame and flags), a loop that crosses
+a false start stays a loop instead of a chain of host calls, and no
+function is split, shortened or merged, so coalescence's evidence rules
+are not involved. Decoding stops at a function start, which stays a tail
+call. Bytes nothing reaches (a jump table decoded as code) are not
+followed.
+
+A switch whose arms lie past the function's end (a false start inside
+it) has its table read with bounds: between the function starts with
+structural evidence around the jump (prologue, call target, padding
+boundary), and before the table when it follows the jump. The arms the
+body holds become gotos wherever they sit in the table.
+
+The lifter judges "outside" by the body's instructions instead of the
+range: a target in the range with no instruction (it used to be a goto to
+a missing label, dropped as dead code) is followed like any other.
+
+Blocks are emitted in address order, so code lifted from below the entry
+is reached by a goto to the entry, a block whose fall-through is not the
+next block continues with a goto, and one that runs into a function start
+tail-calls it. Functions that reach nothing outside themselves lift as
+before. Halo: 314 functions gain 33,732 instructions (2,204 at most), and
+the generated C grows 5.7%.
+
+tests: test_interior_targets.py (a jcc and a jmp into another body, a
+false start inside a loop with a switch, an alternate entry that jumps
+back into its owner, a range that ends before its code, unreachable
+bytes).
+---
+ tools/recomp/lifter.py                |  36 ++-
+ tools/recomp/test_interior_targets.py | 166 ++++++++++++
+ tools/recomp/translator.py            | 374 +++++++++++++++++++++++++-
+ 3 files changed, 560 insertions(+), 16 deletions(-)
+ create mode 100644 tools/recomp/test_interior_targets.py
+
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index c5114c7..cad8da9 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -1408,6 +1408,22 @@ class Lifter:
+         # Addresses loaded as immediates into a register inside the current
+         # function, used to resolve `jmp <reg>`. See _lift_jmp.
+         self.imm_code_refs = set()
++        # The addresses of the instructions the current function's C body
++        # holds, set per function by the translator. A body is more than its
++        # [func_start, func_end) range when the translator lifts the code a
++        # jump reaches past that range into it (FunctionTranslator._absorb),
++        # and less when the range has bytes no instruction starts at. A target
++        # outside the set is another function's code. None: the range alone
++        # decides, as for a caller that lifts single functions.
++        self.body_addrs = None
++        # Tables (VA -> arms) whose arms the translator lifted into the
++        # current body from outside its range; see _analyze_switch_table.
++        self.absorbed_tables = set()
++
++    def _in_body(self, addr):
++        """Whether the current function's body holds addr (range or set)."""
++        return ((self.func_start <= addr < self.func_end)
++                or (self.body_addrs is not None and addr in self.body_addrs))
+ 
+     def _call_target_name(self, addr):
+         """Get the name for a call target address.
+@@ -2600,7 +2616,14 @@ class Lifter:
+             f" return;", 1)
+ 
+     def _is_external_target(self, addr):
+-        """Check if a jump target is outside the current function."""
++        """Check if a jump target is outside the current function.
++
++        A body can hold code outside its range: the translator lifts the
++        code a jump reaches past the range into it
++        (FunctionTranslator._absorb), so an address the body holds an
++        instruction for is inside it wherever it is."""
++        if self.body_addrs is not None and addr in self.body_addrs:
++            return False
+         return not (self.func_start <= addr < self.func_end)
+ 
+     def _read_jump_table(self, table_va, max_entries=256):
+@@ -2655,6 +2678,13 @@ class Lifter:
+         # none of them, the indexed jump became an unresolvable indirect call,
+         # and sprintf silently produced the wrong string.
+         inside = self._leading_arms(targets)
++        if (self.body_addrs is not None and table_va in self.jump_table_targets
++                and table_va in self.absorbed_tables):
++            # A table the translator read with bounds and whose arms it
++            # lifted into this body (FunctionTranslator._absorb): every arm
++            # the body holds is a goto, wherever it sits in the table; the
++            # rest go through the indirect tail jump.
++            inside = [target for target in targets if self._in_body(target)]
+         # Two arms is the smallest thing worth calling a switch; one is more
+         # likely a coincidence than a jump table.
+         if len(inside) >= 2:
+@@ -2692,7 +2722,7 @@ class Lifter:
+         """Entries up to the first one outside the current function."""
+         inside = []
+         for target in targets:
+-            if not (self.func_start <= target < self.func_end):
++            if not self._in_body(target):
+                 break
+             inside.append(target)
+         return inside
+@@ -2763,7 +2793,7 @@ class Lifter:
+             # the same shape the memory-operand switch above emits.
+             if ops[0].type == "reg" and self.imm_code_refs:
+                 inside = sorted(t for t in self.imm_code_refs
+-                                if self.func_start <= t < self.func_end)
++                                if self._in_body(t))
+                 if inside:
+                     target_expr = _fmt_operand_read(ops[0])
+                     lines = [f"{{ uint32_t _jt = {target_expr};"
+diff --git a/tools/recomp/test_interior_targets.py b/tools/recomp/test_interior_targets.py
+new file mode 100644
+index 0000000..260b911
+--- /dev/null
++++ b/tools/recomp/test_interior_targets.py
+@@ -0,0 +1,166 @@
++"""Jumps and calls into code no function starts at.
++
++A function is lifted from its range, and a direct jump out of the range used to
++be a tail call to whatever function started at the target. When none did -- the
++middle of another body, the rest of this function past a false function start,
++bytes no function covers -- the call went to a stub that popped a return
++address and returned: the code at the target never ran, and esp was four bytes
++off since a jump pushes nothing. Halo's hs `and` evaluator (0xE6600) is split by
++a false start at 0xE66A0 (an immediate the disassembler took for an address);
++its `je 0xE66B6` returned through such a stub, skipping its epilogue, and a
++level script later crashed with esi pointing into the script stack.
++
++The code a jump reaches is now lifted into the jumping function's own body;
++nothing is split or shortened.
++
++The x86 here (assembled with GNU as, at BASE):
++
++    A  (0x000)  mov eax,[esp+4]; test eax,eax; jl B_body; xor eax,0x77; ret
++    C  (0x020)  mov eax,[esp+4]; add eax,3; jmp B_body
++    B  (0x040)  mov eax,[esp+4]; lea eax,[eax+eax*4]; jmp B_body
++       B_core:  mov eax,[esp+4]                   ; an alternate entry
++       B_body:  push ebx; mov ebx,eax; imul ebx,ebx,7; mov eax,ebx; pop ebx; ret
++    D  (0x080)  push dword [esp+4]; call B_core; add esp,4; ret
++    F  (0x100)  push esi; xor esi,esi; mov ecx,[esp+8]
++       F_loop:  test ecx,ecx; jz F_done; mov eax,ecx; and eax,3
++                jmp [F_table + eax*4]
++       F_arm0:  add esi,1; jmp F_next
++    G  F_arm1:  add esi,2; jmp F_next             ; a false start (immediate)
++       F_arm2:  add esi,3; jmp F_next
++       F_arm3:  add esi,4
++       F_next:  dec ecx; jmp F_loop
++       F_done:  mov eax,esi; pop esi; ret
++       F_table: F_arm0, F_arm1, F_arm2, F_arm3     ; right after the code
++    O  (0x200)  push esi; mov esi,[esp+8]; xor eax,eax
++       O_top:   dec esi; jz O_out; add eax,3
++       O_alias: add eax,esi; test esi,1; jnz O_top; jmp O_top
++       O_out:   pop esi; ret
++    X  (0x280)  jmp X_ret; jne B_body             ; a jump nothing reaches
++       X_ret:   ret
++    S  (0x2A0)  mov eax,[esp+4]; add eax,eax      ; its range ends here...
++       S_rest:  xor eax,0x3c3c; ret               ; ...but its code does not
++"""
++
++import pytest
++
++from . import config
++from .translator import FunctionTranslator
++
++BASE = 0x10000
++CODE = {
++    0x000: "8b44240485c07c4583f077c3",
++    0x020: "8b44240483c003eb24",
++    0x040: "8b4424048d0480eb048b4424045389c36bdb0789d85bc3",
++    0x080: "ff742404e8c0ffffff83c404c3",
++    0x100: ("5631f68b4c240885c9742189c883e003ff24853001010083c601eb0d83c602eb08"
++            "83c603eb0383c60449ebdb89f05ec3170101001c0101002101010026010100"),
++    0x200: "568b74240831c04e740f83c00301f0f7c60100000075f0ebee5ec3",
++    0x280: "eb060f85c5fdffffc3",
++    0x2A0: "8b44240401c0353c3c0000c3",
++}
++A, C, B, D = BASE, BASE + 0x20, BASE + 0x40, BASE + 0x80
++B_CORE, B_BODY = BASE + 0x49, BASE + 0x4D
++F, F_LOOP, F_ARM0, G = BASE + 0x100, BASE + 0x107, BASE + 0x117, BASE + 0x11C
++F_ARM2, F_ARM3, F_NEXT, F_DONE, F_TABLE = (BASE + 0x121, BASE + 0x126,
++                                           BASE + 0x129, BASE + 0x12C,
++                                           BASE + 0x130)
++O, O_TOP, O_ALIAS, O_OUT = BASE + 0x200, BASE + 0x207, BASE + 0x20D, BASE + 0x219
++X, S, S_REST = BASE + 0x280, BASE + 0x2A0, BASE + 0x2A6
++# (start, end, detection method): F's range stops at the false start G.
++FUNCTIONS = [
++    (A, A + 0xC, "call_target"), (C, C + 9, "call_target"),
++    (B, B + 0x17, "call_target"), (D, D + 0xD, "call_target"),
++    (F, G, "call_target"), (G, F_TABLE, "imm_ref_target"),
++    (O, O + 0x1B, "call_target"), (O_ALIAS, O + 0x1B, "tail_jump_alias"),
++    (X, X + 9, "call_target"), (S, S_REST, "call_target"),
++]
++
++
++@pytest.fixture(autouse=True)
++def layout(monkeypatch):
++    monkeypatch.setattr(config, "_SECTIONS", [
++        config.Section(".text", BASE, 0x400, 0, 0x400, True),
++    ])
++
++
++def image():
++    raw = bytearray(b"\xcc" * 0x400)
++    for offset, code in CODE.items():
++        data = bytes.fromhex(code)
++        raw[offset:offset + len(data)] = data
++    return bytes(raw)
++
++
++def database():
++    return {start: {"_addr": start, "start": hex(start), "end": end,
++                    "size": end - start, "section": ".text",
++                    "name": f"sub_{start:08X}", "detection_method": method}
++            for start, end, method in FUNCTIONS}
++
++
++def lift(start):
++    subject = FunctionTranslator(image(), database())
++    code = subject.translate_function(start, subject.func_db[start])
++    return subject, code
++
++
++def test_conditional_jump_into_another_body_is_lifted_in_place():
++    subject, code = lift(A)
++    assert f"goto loc_{B_BODY:08X};" in code, code
++    assert f"loc_{B_BODY:08X}: ;" in code
++    assert "ebx = (uint32_t)((int32_t)ebx * (int32_t)7);" in code
++    # no call to a symbol nobody defines
++    assert f"sub_{B_BODY:08X}" not in code
++    assert B_BODY not in subject.lifter.referenced_calls
++
++
++def test_tail_jump_into_another_body_is_lifted_in_place():
++    subject, code = lift(C)
++    assert f"goto loc_{B_BODY:08X};" in code, code
++    assert f"sub_{B_BODY:08X}" not in code
++    # the shared code returns from C itself: one ret, popping only C's return address
++    assert code.count("esp += 4; return; /* ret */") == 1
++
++
++def test_false_start_keeps_its_owner_whole():
++    subject, code = lift(F)
++    # The switch's arms past the false start are this body's labels; the one at
++    # the false start is a function, reached by address.
++    for arm in (F_ARM0, F_ARM2, F_ARM3):
++        assert f"if (_jt == 0x{arm:08X}u) goto loc_{arm:08X};" in code, code
++    assert f"goto loc_{G:08X}" not in code
++    assert "RECOMP_ITAIL(_jt)" in code
++    # The loop stays a loop and the epilogue is F's own.
++    assert f"goto loc_{F_LOOP:08X};" in code
++    assert f"loc_{F_DONE:08X}: ;" in code
++    for target in (F_NEXT, F_DONE):
++        assert f"sub_{target:08X}" not in code
++    # G is untouched: still a function of its own.
++    assert subject.func_db[G]["end"] == F_TABLE
++    other = subject.translate_function(G, subject.func_db[G])
++    assert f"goto loc_{G:08X}; /* the entry" in other, other
++    assert f"if (_jt == 0x{F_ARM0:08X}u) goto loc_{F_ARM0:08X};" in other
++
++
++def test_alternate_entry_jumps_back_into_its_owner():
++    subject, code = lift(O_ALIAS)
++    # O_top lies below the entry: the body starts by going to the entry.
++    lines = code.splitlines()
++    first = next(i for i, line in enumerate(lines) if "goto loc_" in line)
++    assert f"goto loc_{O_ALIAS:08X}; /* the entry" in lines[first], code
++    assert f"loc_{O_ALIAS:08X}: ;" in code
++    assert f"loc_{O_TOP:08X}: ;" in code
++    assert f"sub_{O_TOP:08X}" not in code
++    assert "esi--;" in code
++
++
++def test_runs_off_its_range_into_code_no_function_covers():
++    subject, code = lift(S)
++    assert "eax = eax ^ 0x3C3C;" in code, code
++    assert f"sub_{S_REST:08X}" not in code
++
++
++def test_bytes_nothing_reaches_are_not_followed():
++    subject, code = lift(X)
++    assert f"loc_{B_BODY:08X}: ;" not in code, code
++    assert "imul" not in code
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index c98dca7..95789a6 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -437,6 +437,16 @@ def load_label_db(labels_json_path):
+             label_db[int(lbl["address"], 16)] = lbl["name"]
+     return label_db
+ 
++class _AnyOf:
++    """Membership in any of several containers, without merging them."""
++
++    def __init__(self, *containers):
++        self.containers = containers
++
++    def __contains__(self, item):
++        return any(item in container for container in self.containers)
++
++
+ class FunctionTranslator:
+     """Translates individual x86 functions to C source code."""
+ 
+@@ -1275,6 +1285,244 @@ class FunctionTranslator:
+                     cfg_targets.update(targets)
+                 return instructions, jump_tables, cfg_targets
+ 
++    # ── Code a function reaches outside its own range ──────────────────
++    #
++    # A function is lifted from its range [start, end), and a direct jump out
++    # of that range is a tail call to the function that starts at the target.
++    # That is right for a real tail call. It is wrong when the target is not a
++    # function start: the middle of another body, the rest of this function
++    # past a false function start (an immediate the disassembler took for an
++    # address), or bytes no function covers. There was nothing to call there,
++    # so the translator emitted a stub that popped a return address and
++    # returned, and the rest of the jumping function never ran -- with esp off
++    # by four, since a jump pushes nothing.
++    #
++    # Instead, the code a jump reaches is lifted into the jumping function's
++    # own body: every direct jump, conditional jump, fall-through and switch
++    # arm that leaves the range for an address no function starts at is
++    # decoded from there, as far as it goes, and becomes labels and gotos.
++    # That is exactly the x86's behaviour (same stack, same frame, same
++    # flags), it keeps a loop that crosses a false start a loop rather than a
++    # chain of host calls, and it never splits or shrinks another function.
++    # Decoding stops at the start of a function, which stays a tail call.
++    #
++    # Only code the function can reach is followed: its entry, its switch
++    # arms and the continuations it loads as immediates, then fall-through
++    # and direct edges. A range also holds bytes nothing reaches (a jump
++    # table decoded as instructions), and their "jumps" are not followed.
++    #
++    # Upper bound on the instructions one function gains from outside its
++    # range. The real reach is the rest of one function; the cap only stops a
++    # jump decoded from data from lifting a section's worth of garbage.
++    ABSORB_LIMIT = 4096
++
++    _LEAVES = frozenset(("ret", "retn", "retf", "jmp", "iret", "iretd",
++                         "ud2"))
++
++    def _entry_set(self):
++        """Addresses a direct transfer reaches as a function: every function
++        start the translator lifts (not the weak starts a CFG owner took)."""
++        entries = getattr(self, "_entries", None)
++        if entries is not None:
++            return entries
++        key = (len(self.func_db), len(self.owned_function_starts))
++        cached = getattr(self, "_entry_cache", None)
++        if cached is None or cached[0] != key:
++            cached = self._entry_cache = (key, frozenset(
++                addr for addr in self.func_db
++                if addr not in self.owned_function_starts))
++        return cached[1]
++
++    def _code_limit(self, va):
++        """End of the backed bytes of the code section holding va, or None."""
++        for section in _config._SECTIONS:
++            if (section.is_code and section.va <= va
++                    < section.va + min(section.va_size, section.raw_size)):
++                return section.va + min(section.va_size, section.raw_size)
++        return None
++
++    def _is_padding_at(self, va):
++        """Whether va holds an int3 or a nop (alignment padding)."""
++        offset = va_to_file_offset(va)
++        return (offset is not None and offset < len(self.xbe_data)
++                and self.xbe_data[offset] in (0xCC, 0x90))
++
++    def _decode_stream(self, va, stop, budget):
++        """Decode straight-line code from va until it leaves or joins.
++
++        Stops after a ret, jmp, iret or ud2; before an address in
++        `stop` (a function start, or an instruction already decoded), before
++        an int3 that is not an int 0x2d's slide byte, at undecodable bytes,
++        at the end of the section and after `budget` instructions."""
++        limit = self._code_limit(va)
++        out = []
++        if limit is None:
++            return out
++        pos = va
++        previous = None
++        while pos < limit and len(out) < budget:
++            offset = va_to_file_offset(pos)
++            if offset is None:
++                break
++            chunk = self.xbe_data[offset:offset + min(0x400, limit - pos)]
++            progressed = False
++            for cs_insn in self.disasm._cs.disasm(chunk, pos):
++                if cs_insn.address != va and cs_insn.address in stop:
++                    return out
++                insn = self.disasm._decode_instruction(cs_insn)
++                if insn.mnemonic == "int3" and not (
++                        previous is not None and previous.mnemonic == "int"
++                        and previous.operands
++                        and previous.operands[0].type == "imm"
++                        and previous.operands[0].imm == 0x2D):
++                    return out
++                out.append(insn)
++                previous = insn
++                pos = insn.end_address
++                progressed = True
++                if insn.mnemonic in self._LEAVES or len(out) >= budget:
++                    return out
++            if not progressed:
++                break
++        return out
++
++    # Detection methods that mark where a function really begins. The others
++    # (an immediate, a data word, a jump or a seed that landed somewhere) can
++    # sit inside a body, so they do not bound the switch a body dispatches.
++    REGION_STARTS = frozenset((
++        None, "entry_point", "call_target", "prologue", "prologue_alt",
++        "gap_prologue", "cc_boundary", "indirect_call_slot",
++        "external_coalescence"))
++
++    def _switch_region(self, va):
++        """[lower, upper): the function body va belongs to, for bounding a
++        switch's arms, from the function starts with structural evidence
++        around it (REGION_STARTS) and the code section's bytes."""
++        strong = getattr(self, "_region_starts", None)
++        if strong is None or self._region_count != len(self.func_db):
++            strong = self._region_starts = sorted(
++                start for start, info in self.func_db.items()
++                if info.get("detection_method") in self.REGION_STARTS)
++            self._region_count = len(self.func_db)
++        section = next((sec for sec in _config._SECTIONS
++                        if sec.is_code and sec.va <= va
++                        < sec.va + min(sec.va_size, sec.raw_size)), None)
++        if section is None:
++            return None
++        lower = section.va
++        upper = section.va + min(section.va_size, section.raw_size)
++        index = bisect.bisect_right(strong, va)
++        if index:
++            lower = max(lower, strong[index - 1])
++        if index < len(strong):
++            upper = min(upper, strong[index])
++        return lower, upper
++
++    def _table_arms(self, insn):
++        """The arms of `jmp [index*4 + table]`, read with bounds, or None.
++
++        The arms must lie in the body the jump belongs to (_switch_region),
++        before the table when the table follows the jump inside it (where
++        MSVC puts it); read as the contiguous run of such pointers around
++        the table address, as a recovered CFG reads them."""
++        if (insn.mnemonic != "jmp" or insn.jump_target is not None
++                or not insn.operands or insn.operands[0].type != "mem"):
++            return None
++        operand = insn.operands[0]
++        if (operand.mem_seg == "fs" or operand.mem_base or not operand.mem_index
++                or operand.mem_scale != 4 or not operand.mem_disp):
++            return None
++        table = operand.mem_disp & 0xFFFFFFFF
++        region = self._switch_region(insn.address)
++        if region is None or va_to_file_offset(table) is None:
++            return None
++        lower, upper = region
++        if insn.address < table < upper:
++            upper = table
++        # A table right after its jump must not take the jump's own
++        # displacement for an arm when it scans backward.
++        arms = self._read_local_jump_table(
++            table, lower, upper,
++            min_entry_va=insn.end_address if insn.address < table else None)
++        return (table, arms) if arms else None
++
++    def _absorb(self, start, base, leaders, edges):
++        """The code `base` reaches outside itself; see the comment above.
++
++        base: the function's own instructions; leaders: addresses inside it
++        that are entered other than by fall-through or a direct jump (switch
++        arms, immediates it jumps through); edges: computed jump edges.
++        Returns (instructions, tables, calls): the decoded instructions
++        outside base, the switch tables (VA -> arms) whose arms were followed
++        out of base, and the direct call targets of reachable code."""
++        entries = self._entry_set()
++        have = {insn.address: insn for insn in base}
++        absorbed = {}
++        tables = {}
++        calls = set()
++        # A switch the function's recovered CFG already validated (or
++        # deliberately did not) is not read again.
++        census = (self.lifter.jump_table_targets
++                  if start in self._recovered_cfg else {})
++
++        # One walk over what the entry reaches: the function's own
++        # instructions, and from any address outside them that no function
++        # starts at, the straight-line code there (which may lead back in).
++        work = [start, *leaders]
++        for targets in edges.values():
++            work.extend(targets)
++        seen = set()
++        while work:
++            addr = work.pop()
++            if addr in seen:
++                continue
++            seen.add(addr)
++            insn = have.get(addr) or absorbed.get(addr)
++            if insn is None:
++                if (addr in entries
++                        or len(absorbed) >= self.ABSORB_LIMIT):
++                    continue
++                stream = self._decode_stream(
++                    addr, _AnyOf(entries, have, absorbed),
++                    self.ABSORB_LIMIT - len(absorbed))
++                if not stream:
++                    continue
++                for decoded in stream:
++                    absorbed[decoded.address] = decoded
++                insn = stream[0]
++            if insn.is_call and insn.call_target is not None:
++                calls.add(insn.call_target)
++            if insn.is_branch and insn.jump_target is not None:
++                work.append(insn.jump_target)
++            if (insn.mnemonic == "jmp" and insn.jump_target is None
++                    and not (insn.operands and insn.operands[0].type == "mem"
++                             and insn.operands[0].mem_disp in census)):
++                read = self._table_arms(insn)
++                if read is not None:
++                    table, arms = read
++                    if insn.address not in have or any(
++                            arm not in have for arm in arms):
++                        tables[table] = arms
++                    work.extend(arms)
++            if insn.mnemonic not in self._LEAVES:
++                following = insn.end_address
++                if (following not in have and following not in absorbed
++                        and self._is_padding_at(following)):
++                    continue  # runs into padding: a call that does not return
++                work.append(following)
++        return ([absorbed[addr] for addr in sorted(absorbed)], tables, calls)
++
++    def _absorbed_for(self, start, base, leaders, edges):
++        """(instructions, tables) _absorb finds for this function, cached
++        when a pass has fixed the set of functions (self._absorb_cache)."""
++        cache = getattr(self, "_absorb_cache", None)
++        if cache is not None and start in cache:
++            return cache[start][:2]
++        result = self._absorb(start, base, leaders, edges)
++        if cache is not None:
++            cache[start] = result
++        return result[:2]
++
+     def _stub_ret_bytes(self, addr, max_insns=48):
+         """Bytes the code at `addr` would have popped beyond the return address.
+ 
+@@ -1968,7 +2216,14 @@ class FunctionTranslator:
+                 debug_slide_bypasses, switch_leaders)
+ 
+     def decode_function(self, start, end):
+-        """Recover instructions and blocks, including indirect-entry leaders."""
++        """Recover instructions and blocks, including indirect-entry leaders.
++
++        The instructions are the function's own (its range, or its recovered
++        CFG) followed, in address order, by the code its jumps reach outside
++        them (_absorb); self._base_instructions keeps the function's own."""
++        self.lifter.body_addrs = None
++        self.lifter.absorbed_tables = set()
++        self._base_instructions = []
+         recovered = self._recovered_cfg.get(start)
+         if recovered:
+             end = recovered["end"]
+@@ -2026,10 +2281,50 @@ class FunctionTranslator:
+ 
+         self.lifter.imm_code_refs = imm_refs
+ 
++        # The code this function's jumps reach outside its own instructions,
++        # lifted into its body (see _absorb).
++        self._base_instructions = instructions
++        absorbed, tables = self._absorbed_for(
++            start, instructions, switch_leaders, computed_jump_edges)
++        lower, upper = start, end
++        leaders = switch_leaders
++        if absorbed:
++            # The entry starts a block even when the code lifted from
++            # below it runs straight into it.
++            leaders = set(switch_leaders) | {start}
++            instructions = sorted(instructions + absorbed,
++                                  key=lambda insn: insn.address)
++            lower = min(lower, instructions[0].address)
++            upper = max(upper, max(insn.end_address for insn in absorbed))
++            addresses = {insn.address for insn in instructions}
++            for table, arms in tables.items():
++                self.lifter.jump_table_targets[table] = list(arms)
++                self.lifter.absorbed_tables.add(table)
++            for insn in instructions:
++                operand = (insn.operands[0] if insn.mnemonic == "jmp"
++                           and insn.jump_target is None and insn.operands
++                           else None)
++                if (operand is not None and operand.type == "mem"
++                        and operand.mem_disp in tables):
++                    arms = {arm for arm in tables[operand.mem_disp]
++                            if arm in addresses}
++                    computed_jump_edges.setdefault(
++                        insn.address, set()).update(arms)
++                    leaders.update(arms)
++            # Bytes between streams, and streams that overlap: a block must
++            # not run across a gap, and a fall-through into the middle of the
++            # next instruction in address order needs a label to go to.
++            for previous, current in zip(instructions, instructions[1:]):
++                if previous.end_address != current.address:
++                    leaders.add(current.address)
++                    if previous.end_address in addresses:
++                        leaders.add(previous.end_address)
++        self.lifter.body_addrs = {insn.address for insn in instructions}
++
+         # Build basic blocks
+         blocks = self.disasm.build_basic_blocks(
+-            instructions, start, end,
+-            extra_leaders=switch_leaders if switch_leaders else None,
++            instructions, lower, upper,
++            extra_leaders=leaders if leaders else None,
+             stop_mnemonics=("ud2", "hlt", "iret", "iretd")
+             if coalesced else ("iret", "iretd"))
+         block_starts = {block.start for block in blocks}
+@@ -2074,6 +2369,11 @@ class FunctionTranslator:
+         name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
+         size = end - start
+         instructions, blocks = self.decode_function(start, end)
++        # The function's own instructions; `instructions` adds the code its
++        # jumps reach outside them, when there is any (see _absorb).
++        base = self._base_instructions
++        absorbed = len(instructions) != len(base)
++        body = self.lifter.body_addrs or set()
+         # Classify the actual immediately following guest instruction;
+         # generated ADD snapshots must not hide caller cleanup.
+         self.lifter.caller_cleanup_sites = {
+@@ -2105,7 +2405,7 @@ class FunctionTranslator:
+         # Determine which registers are used
+         used_regs = self._find_used_registers(instructions)
+         used_xmm = self._find_used_xmm(instructions)
+-        has_prologue = self._func_has_prologue(instructions)
++        has_prologue = self._func_has_prologue(base)
+         has_fpu = any(insn.mnemonic.startswith("f") for insn in instructions)
+ 
+         # Volatile registers (eax, ecx, edx, esp) are globals - don't declare
+@@ -2129,11 +2429,11 @@ class FunctionTranslator:
+         # Only an address that is itself a translated function start is a
+         # usable target; anything else is an analysis boundary gap with no
+         # callable symbol.
+-        last_insn = instructions[-1]
++        last_insn = base[-1]
+         coalesced = start in self.coalesced_function_starts
+         (_, _, debug_slide_int3s,
+          debug_slide_bypasses, switch_leaders) = self._control_flow_census(
+-             instructions, start, end, coalesced,
++             base, start, end, coalesced,
+              jump_table_targets=(self.lifter.jump_table_targets
+                                  if coalesced and start in self._recovered_cfg
+                                  else None))
+@@ -2147,20 +2447,25 @@ class FunctionTranslator:
+         if ((continues_past_end or bypasses_to_end) and end in self.func_db
+                 and end not in self.owned_function_starts):
+             fallthrough_target = end
++        if absorbed:
++            # Every block that runs into code it is not followed by gets its
++            # continuation below, the end of the range included.
++            fallthrough_target = None
+ 
+         # Ensure ebp tracked if function has tail jumps (lifter emits
+         # g_seh_ebp = ebp before external jmp, external jcc, and indirect jmp,
+         # and translate_function emits it before a fallthrough tail call).
+         has_tail_jump = any(
+             (insn.mnemonic == "jmp" and (
+-                (insn.jump_target and not (start <= insn.jump_target < end))
++                (insn.jump_target
++                 and self.lifter._is_external_target(insn.jump_target))
+                 or not insn.jump_target  # indirect jmp
+             ))
+             or (insn.is_cond_jump and insn.jump_target
+-                and not (start <= insn.jump_target < end))
++                and self.lifter._is_external_target(insn.jump_target))
+             for insn in instructions
+         )
+-        if has_tail_jump or fallthrough_target is not None:
++        if has_tail_jump or fallthrough_target is not None or absorbed:
+             used_regs.add("ebp")
+ 
+ 
+@@ -2283,7 +2588,7 @@ class FunctionTranslator:
+         # would still hold. Deliberately not the same as making ebp global:
+         # that also changes save/restore, and a callee that fails to restore
+         # then corrupts its caller (tried; esp underflowed inside XapiStartup).
+-        if "ebp" in used_regs and self._func_has_prologue(instructions):
++        if "ebp" in used_regs and self._func_has_prologue(base):
+             # The prologue's first PUSH saves the incoming register before
+             # MOV establishes this function's frame. It must not push an
+             # uninitialized C local into the guest's saved-frame chain.
+@@ -2356,7 +2661,7 @@ class FunctionTranslator:
+         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
+         # idiom MSVC emits for odd trailing elements.
+         self.lifter.needs_cf = has_carry
+-        self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
++        self.lifter.publishes_ebp = self._func_owns_a_frame(base)
+ 
+         # SSE and MMX are architectural state, declared globally by the
+         # runtime exactly like the GPRs and the x87 stack. Declaring either
+@@ -2395,8 +2700,26 @@ class FunctionTranslator:
+                 label_addrs.add(succ)
+         # Also add any jump targets within the function
+         for insn in instructions:
+-            if insn.jump_target and start <= insn.jump_target < end:
++            if insn.jump_target and (start <= insn.jump_target < end
++                                     or insn.jump_target in body):
+                 label_addrs.add(insn.jump_target)
++        # A block whose fall-through is not the block after it (code lifted
++        # from outside the range sits in address order) continues there with
++        # a goto, or leaves for the function that starts there.
++        fall_edges = {}
++        if absorbed:
++            for i, bb in enumerate(blocks):
++                last = bb.last_insn
++                if last is None or last.is_ret or last.mnemonic in (
++                        "jmp", "ud2", "iret", "iretd") or (
++                        last.mnemonic == "int3"
++                        and last.address not in debug_slide_int3s
++                        and coalesced):
++                    continue
++                following = blocks[i + 1].start if i + 1 < len(blocks) else None
++                if following != last.end_address:
++                    fall_edges[bb.start] = last.end_address
++            label_addrs.update(t for t in fall_edges.values() if t in body)
+         label_addrs |= self.lifter.imm_code_refs
+         label_addrs.update(debug_slide_bypasses.values())
+         label_addrs.update(switch_leaders)
+@@ -2427,7 +2750,14 @@ class FunctionTranslator:
+                 "jmp", "ud2", "hlt", "iret", "iretd")
+                       or (last.mnemonic == "int3"
+                           and last.address not in debug_slide_int3s))
+-            if not leaves and i + 1 < len(blocks):
++            if absorbed:
++                # Blocks are in address order, not flow order.
++                if bb.start in fall_edges:
++                    if fall_edges[bb.start] in preds:
++                        preds[fall_edges[bb.start]].add(bb.start)
++                elif not leaves and i + 1 < len(blocks):
++                    preds[blocks[i + 1].start].add(bb.start)
++            elif not leaves and i + 1 < len(blocks):
+                 preds[blocks[i + 1].start].add(bb.start)
+ 
+         # Settle the flag state before emitting anything.
+@@ -2486,6 +2816,13 @@ class FunctionTranslator:
+                 unseen_entries.update(self.lifter._analyze_switch_table(insn.operands))
+         edge_vars, edge_sets, block_lines = [], [], {}
+ 
++        # Blocks are emitted in address order, and code lifted from below the
++        # range (an alternate entry's jump back into its owner) comes before
++        # the entry: start there.
++        if blocks and blocks[0].start != start:
++            lines.append(f"    goto loc_{start:08X}; /* the entry; code below "
++                         f"it comes first */")
++
+         for bb in blocks:
+             # Emit label if this block is a branch target
+             if bb.start in label_addrs or bb.start == start:
+@@ -2540,6 +2877,17 @@ class FunctionTranslator:
+                          or (bb.last_insn.mnemonic == "int3"
+                              and bb.last_insn.address not in debug_slide_int3s))):
+                 lines.append("    return; /* trap ends recovered control flow */")
++            elif bb.start in fall_edges:
++                target = fall_edges[bb.start]
++                if target in body:
++                    lines.append(f"    goto loc_{target:08X}; /* falls through */")
++                elif self._is_padding_at(target):
++                    lines.append(f"    return; /* runs into padding at "
++                                 f"0x{target:08X} */")
++                else:
++                    lines.append(f"    g_seh_ebp = ebp; "
++                                 f"{self.lifter._call_target_name(target)}();"
++                                 f" return; /* falls into 0x{target:08X} */")
+ 
+             lines.append(f"")
+ 

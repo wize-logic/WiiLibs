@@ -61,6 +61,9 @@ template header, and add conformance cases; upstream's own tests pass with them 
 | `0007-parity-setcc.patch` | `setp`/`setnp`/`cmovp`/`cmovnp` lifted (float equality after `fucomip`/`ucomiss` read a stale register) |
 | `0008-backedge-hook.patch` | `RECOMP_BACKEDGE()` before every backward jump (a nothing in the template): a runtime that serialises guest threads or delivers interrupts between guest operations gets a break-in point in loops that only poll memory |
 | `0009-port-io.patch` | `in`/`out` lifted through `RECOMP_PORT_IN`/`RECOMP_PORT_OUT` (Direct3D reads the TV encoder's field from port 0x80C0; they were no-ops that left the register as it was) |
+| `0010-interior-jump-targets.patch` | the code a jump, conditional jump, fall-through or switch arm reaches outside its function, where no function starts, is lifted into the function's own body (it was a call to a stub that popped four bytes a jump never pushed and returned, skipping the rest: Halo had 270 inside lifted code, its hs `and` evaluator among them, split by a false function start); switch tables read with bounds; nothing is split or merged |
+| `0011-interior-call-entries.patch` | a called address inside lifted code that no function starts at gets a function of its own (its code from there, and what that reaches), in the dispatch table too |
+| `0012-dispatch-unlifted-targets.patch` | a direct target that still has no function (undecodable, outside every section, from bytes nothing reaches) goes through `RECOMP_ITAIL`, which runs what the runtime has there or reports the miss through `recomp_icall_fail_log`; stubs (only for functions a run leaves out) dispatch the same way instead of popping |
 
 To change one: `tools/xboxrecomp_sync.py patch-repo DIR` makes a git repository of the pristine copy
 with each patch as a commit; edit there (amend, rebase), then `tools/xboxrecomp_sync.py
