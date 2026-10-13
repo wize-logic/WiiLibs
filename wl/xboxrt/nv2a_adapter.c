@@ -65,8 +65,30 @@ static void a_write(void *gpu, uint32_t offset, uint32_t value, unsigned size) {
     wl_nv2a_mmio_write(gpu, offset, value, size);
 }
 
+// every 10 s (600 vertical blanks): what the GPU did, for the log
+static void gpu_status(void) {
+    if (g_gx == NULL) {
+        return;
+    }
+    WlNv2aGxStats gs;
+    wl_nv2a_gx_stats(g_gx, &gs);
+    WlNv2aTexCacheStats ts;
+    wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+    WL_LOG_I(TAG, "status: %u frames, %u draws (%u perspective, %u into targets, %u target-less, %u stencil "
+             "skipped, %u programs beyond GX, %u approximated); textures %u KB kept, %u converted, %u failed, "
+             "%u evicted",
+             (unsigned)gs.frames, (unsigned)gs.draws, (unsigned)gs.perspective_draws, (unsigned)gs.target_draws,
+             (unsigned)gs.target_skipped, (unsigned)gs.stencil_skipped, (unsigned)gs.programs_unusable,
+             (unsigned)gs.approximations, (unsigned)(ts.bytes / 1024u), (unsigned)ts.converted,
+             (unsigned)ts.failed, (unsigned)ts.evicted);
+}
+
 static void a_vblank(void *gpu) {
     wl_nv2a_vblank(gpu);
+    static uint32_t vblanks;
+    if (++vblanks % 600u == 0) {
+        gpu_status();
+    }
     if (g_cap.armed && ++g_cap.vblanks >= g_cap.after) {
         g_cap.armed = false;
         if (wl_platform_fs_open(g_cap.path, WL_FILE_WRITE_NEW, &g_cap.file) == WL_OK) {
