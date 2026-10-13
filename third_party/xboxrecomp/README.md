@@ -60,6 +60,7 @@ template header, and add conformance cases; upstream's own tests pass with them 
 | `0006-runtime-header-option.patch` | `--runtime-header template|none|PATH`: a runtime can supply its own `recomp_types.h` without editing generated output |
 | `0007-parity-setcc.patch` | `setp`/`setnp`/`cmovp`/`cmovnp` lifted (float equality after `fucomip`/`ucomiss` read a stale register) |
 | `0008-backedge-hook.patch` | `RECOMP_BACKEDGE()` before every backward jump (a nothing in the template): a runtime that serialises guest threads or delivers interrupts between guest operations gets a break-in point in loops that only poll memory |
+| `0009-port-io.patch` | `in`/`out` lifted through `RECOMP_PORT_IN`/`RECOMP_PORT_OUT` (Direct3D reads the TV encoder's field from port 0x80C0; they were no-ops that left the register as it was) |
 
 To change one: `tools/xboxrecomp_sync.py patch-repo DIR` makes a git repository of the pristine copy
 with each patch as a commit; edit there (amend, rebase), then `tools/xboxrecomp_sync.py

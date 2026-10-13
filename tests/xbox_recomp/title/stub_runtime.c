@@ -13,6 +13,7 @@ uint32_t g_xbox_code_lo, g_xbox_code_hi;
 int g_force_return;
 RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
 volatile uint32_t g_xb_attention; void wl_xb_safe_point(void); void wl_xb_safe_point(void) {} /* RECOMP_BACKEDGE (no other threads here) */
+uint32_t wl_xb_port_in(uint32_t port, unsigned size); uint32_t wl_xb_port_in(uint32_t port, unsigned size) { (void)port; (void)size; return 0; } void wl_xb_port_out(uint32_t port, uint32_t value, unsigned size); void wl_xb_port_out(uint32_t port, uint32_t value, unsigned size) { (void)port; (void)value; (void)size; } /* RECOMP_PORT_IN/OUT */
 RECOMP_TLS uint32_t g_ebp, g_seh_ebp, g_fs_base;
 RECOMP_TLS int g_df;
 RECOMP_TLS double g_fp_stack[8];

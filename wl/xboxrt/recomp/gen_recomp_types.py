@@ -26,6 +26,8 @@ WiiLibs' copy (wl/xboxrt/recomp/recomp_types.h) is that template, with WiiLibs' 
   9. MMX_CVT_F2I rounds with recomp_cvt_si32 (nearest-even, not the host's rounding mode)
  10. RecompMmx and the g_mm0..7 declarations move out of the RECOMP_GENERATED_CODE block, so the
      runtime can define the MMX registers without the generated code's register-name macros
+ 12. RECOMP_PORT_IN / RECOMP_PORT_OUT (patch 0009 lifts in/out to them) are wl/xboxrt's
+     wl_xb_port_in / wl_xb_port_out
  11. RECOMP_BACKEDGE (patch 0008 calls it before every backward jump) is wl/xboxrt's safe point:
      a load of g_xb_attention and a branch, and wl_xb_safe_point() when another guest thread or
      interrupt work is waiting (a loop that only polls memory would otherwise hold the guest lock
@@ -349,6 +351,25 @@ void wl_xb_safe_point(void);
 """
 
 
+PORT_OLD = """#ifndef RECOMP_PORT_IN
+#define RECOMP_PORT_IN(port, size) ((void)(port), (void)(size), 0u)
+#endif
+#ifndef RECOMP_PORT_OUT
+#define RECOMP_PORT_OUT(port, value, size) ((void)(port), (void)(value), (void)(size))
+#endif
+"""
+PORT_NEW = """/* WiiLibs: the console's x86 I/O ports are wl/xboxrt's (thunk.h) */
+uint32_t wl_xb_port_in(uint32_t port, unsigned size);
+void wl_xb_port_out(uint32_t port, uint32_t value, unsigned size);
+#ifndef RECOMP_PORT_IN
+#define RECOMP_PORT_IN(port, size) wl_xb_port_in((port), (size))
+#endif
+#ifndef RECOMP_PORT_OUT
+#define RECOMP_PORT_OUT(port, value, size) wl_xb_port_out((port), (value), (size))
+#endif
+"""
+
+
 def transform(src: str, commit: str, release: str, patches: list[str]) -> str:
     src = replace_once(src, "#define RECOMP_TYPES_H\n", GUARD, "compiler guard")
     src = replace_once(src, TLS_OLD, TLS_NEW, "RECOMP_TLS")
@@ -367,6 +388,7 @@ def transform(src: str, commit: str, release: str, patches: list[str]) -> str:
         src = replace_once(src, old, new, old)
     src = hoist_mmx(src)
     src = replace_once(src, BACKEDGE_OLD, BACKEDGE_NEW, "RECOMP_BACKEDGE safe point")
+    src = replace_once(src, PORT_OLD, PORT_NEW, "RECOMP_PORT_IN/OUT")
     for needle in ("__thread", "_InterlockedExchangeAdd", "(*(volatile uint32_t *)XBOX_PTR"):
         if needle in src:
             raise AnchorError(f"after the edits the header still has {needle!r}: an edit missed a new copy")

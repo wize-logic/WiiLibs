@@ -77,6 +77,7 @@ Functions:
 | `void recomp_unimpl(const char *text, uint32_t va)` | an instruction the lifter could not translate was reached |
 | `uint64_t xbox_ReadTimeStampCounter(void)` | `rdtsc`, at the Xbox's 733.33 MHz |
 | `volatile uint32_t g_xb_attention`, `void wl_xb_safe_point(void)` | `RECOMP_BACKEDGE()` before every backward jump (patch 0008): when the flag is set (another guest thread or interrupt work waits for the guest lock) the loop gives way at its back edge |
+| `uint32_t wl_xb_port_in(uint32_t port, unsigned size)`, `void wl_xb_port_out(uint32_t port, uint32_t value, unsigned size)` | x86 `in`/`out` (patch 0009) |
 
 From the C library and libgcc: `memcpy`, `memset`, `calloc` (only `recomp_dispatch_init`), libm
 (`sqrt`, `floor`, `floorf`, `ceil`, `ceilf`, `trunc`, `truncf`, `fmod`, `frexp`, `ldexp`, `log`, `exp2`,
