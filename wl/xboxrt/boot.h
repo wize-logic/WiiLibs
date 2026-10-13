@@ -35,12 +35,21 @@ typedef struct {
     uint32_t keep_free_bytes;    // the Wii: 14 MB by default
     uint32_t htab_bytes;         // the Wii's page table: 256 KB by default
     bool trace_kernel_calls;     // log every kernel call
+    const char *play;            // the play harness's setting (play.h: "script:<file>", "bot:<seed>",
+                                 // "look:<seed>"); NULL: none, or on the Wii the first line of
+                                 // <title_dir>/play.cfg when there is one
+    const char *play_out;        // where its screenshots go (NULL: beside the script)
     void (*kernel_config)(WlXkConfig *cfg, void *user); // edits the kernel's settings before init
     void (*before_entry)(void *user); // after the image is loaded and the kernel is up
     void *user;
 } WlXbTitleConfig;
 
 void wl_xb_title_config_default(WlXbTitleConfig *cfg);
+
+// wl_xboxrt_main calls this before the boot with the configuration it made: a weak default that
+// does nothing, which a title project's own source replaces to change the configuration and to
+// register what it tells the play harness (play.h).
+void wl_xb_title_setup(WlXbTitleConfig *cfg);
 
 // Runs the title; returns its exit code (HalReturnToFirmware's routine, or 0), or a negative
 // WlResult when it could not start (a missing XBE, no memory).

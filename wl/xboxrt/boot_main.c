@@ -30,6 +30,10 @@ static void platform_path(const char *host, char *out, size_t cap) {
 }
 #endif
 
+__attribute__((weak)) void wl_xb_title_setup(WlXbTitleConfig *cfg) {
+    (void)cfg;
+}
+
 int main(int argc, char **argv) {
     WlXbTitleConfig cfg;
     wl_xb_title_config_default(&cfg);
@@ -52,6 +56,28 @@ int main(int argc, char **argv) {
     }
     if (getenv("WL_XB_TRACE") != NULL) {
         cfg.trace_kernel_calls = true;
+    }
+#endif
+    wl_xb_title_setup(&cfg);
+#if !defined(__wii__)
+    // the play harness from the environment (play.h): WL_XB_PLAY=script:<host path>|bot:<n>|look:<n>,
+    // WL_XB_PLAY_OUT=<host folder> for its screenshots
+    static char play[600], play_out[512];
+    const char *env = getenv("WL_XB_PLAY");
+    if (env != NULL && env[0] != '\0') {
+        if (strncmp(env, "script:", 7) == 0) {
+            char path[512];
+            platform_path(env + 7, path, sizeof path);
+            snprintf(play, sizeof play, "script:%s", path);
+        } else {
+            snprintf(play, sizeof play, "%s", env);
+        }
+        cfg.play = play;
+    }
+    env = getenv("WL_XB_PLAY_OUT");
+    if (env != NULL && env[0] != '\0') {
+        platform_path(env, play_out, sizeof play_out);
+        cfg.play_out = play_out;
     }
 #endif
     int code = wl_xb_boot_run(&cfg);

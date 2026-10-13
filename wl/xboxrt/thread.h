@@ -106,6 +106,14 @@ WlResult wl_xb_thread_setup_guest(WlXbThread *t, uint32_t stack_bytes, uint32_t 
 // the process's (wl_xb_thread_set_tls_template). `*out` stays valid for the process's life.
 WlResult wl_xb_thread_create(uint32_t routine, uint32_t ctx1, uint32_t ctx2, uint32_t stack_bytes, int priority,
                              bool suspended, WlXbThread **out);
+// A runtime thread that runs C code as a guest thread: `fn(self, user)` runs holding the guest lock,
+// with a guest stack of `stack_bytes`, a KPCR and the title's TLS, at `priority`, so it may read
+// and write guest memory, call guest code (wl_xb_call_guest) and wait (wl_xb_wait) like a title
+// thread; it never runs at the same time as guest code. It does not count as one of the title's
+// threads (the process does not wait for it). The play harness (play.h) runs on one.
+typedef void (*WlXbHostThreadFn)(WlXbThread *self, void *user);
+WlResult wl_xb_thread_create_host(const char *name, WlXbHostThreadFn fn, void *user, uint32_t stack_bytes, int priority,
+                                  WlXbThread **out);
 // The TLS layout every new thread gets (from the XBE's TLS directory).
 void wl_xb_thread_set_tls_template(uint32_t data_va, uint32_t data_bytes, uint32_t zero_bytes);
 // Lowers the suspend count; the thread starts (or goes on) at 0. Returns the count before.

@@ -183,10 +183,12 @@ static bool first_time(uint32_t va) {
 
 // The targets that had no translated function, kept as a seed file for the next run of the
 // pipeline (tools/xbox_recomp.py's "seed_functions"; entries marked observed, which the
-// disassembler trusts): recompiling with it translates them. Rewritten whole on each new one.
+// disassembler trusts): recompiling with it translates them. A new one is appended to the file as
+// it is, whatever else it holds (a title project's seed file also keeps entries of its own, with
+// their notes, and may be far longer than what a run adds).
 static char g_seed_path[WL_FS_PATH_MAX];
-static uint32_t g_seeds[512];
-static uint32_t g_seed_count;
+static uint32_t *g_seeds;
+static uint32_t g_seed_count, g_seed_cap;
 
 static bool seed_known(uint32_t va) {
     for (uint32_t i = 0; i < g_seed_count; i++) {
@@ -197,22 +199,67 @@ static bool seed_known(uint32_t va) {
     return false;
 }
 
-static void seeds_write(void) {
+static void seed_note(uint32_t va) {
+    if (g_seed_count == g_seed_cap) {
+        uint32_t cap = g_seed_cap != 0 ? g_seed_cap * 2u : 512u;
+        uint32_t *more = realloc(g_seeds, cap * sizeof *more);
+        if (more == NULL) {
+            return;
+        }
+        g_seeds = more;
+        g_seed_cap = cap;
+    }
+    g_seeds[g_seed_count++] = va;
+}
+
+// the whole file, NUL-terminated (malloc'd; NULL when there is none)
+static char *seeds_read(uint32_t *len) {
+    WlPlatformFile *f = NULL;
+    if (wl_platform_fs_open(g_seed_path, WL_FILE_READ, &f) != WL_OK) {
+        return NULL;
+    }
+    uint64_t size = wl_platform_fs_size(f);
+    char *text = size < (16u << 20) ? malloc((size_t)size + 1u) : NULL;
+    if (text != NULL && wl_platform_fs_read_at(f, 0, text, (uint32_t)size) != WL_OK) {
+        free(text);
+        text = NULL;
+    }
+    wl_platform_fs_close(f);
+    if (text != NULL) {
+        text[size] = '\0';
+        *len = (uint32_t)size;
+    }
+    return text;
+}
+
+static void seeds_append(uint32_t va) {
+    uint32_t len = 0;
+    char *text = seeds_read(&len);
+    char *close = text != NULL ? strrchr(text, ']') : NULL;
     char tmp[WL_FS_PATH_MAX + 8];
     snprintf(tmp, sizeof tmp, "%s.tmp", g_seed_path);
     WlPlatformFile *f = NULL;
     if (wl_platform_fs_open(tmp, WL_FILE_WRITE_NEW, &f) != WL_OK) {
+        free(text);
         return;
     }
-    char line[96];
-    wl_platform_fs_write(f, "[\n", 2);
-    for (uint32_t i = 0; i < g_seed_count; i++) {
-        int n = snprintf(line, sizeof line, " {\"start\": \"0x%08X\", \"observed\": true, \"note\": \"observed at runtime: indirect call\"}%s\n",
-                         (unsigned)g_seeds[i], i + 1u < g_seed_count ? "," : "");
-        wl_platform_fs_write(f, line, (uint32_t)n);
+    char line[128];
+    int n = snprintf(line, sizeof line, " {\"start\": \"0x%08X\", \"observed\": true, \"note\": \"observed at runtime: indirect call\"}\n]\n",
+                     (unsigned)va);
+    if (close != NULL) {
+        char *end = close;
+        while (end > text && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) {
+            end--;
+        }
+        bool entries = memchr(text, '{', (size_t)(end - text)) != NULL;
+        wl_platform_fs_write(f, text, (uint32_t)(end - text));
+        wl_platform_fs_write(f, entries ? ",\n" : "\n", entries ? 2u : 1u);
+    } else {
+        wl_platform_fs_write(f, "[\n", 2);
     }
-    wl_platform_fs_write(f, "]\n", 2);
+    wl_platform_fs_write(f, line, (uint32_t)n);
     wl_platform_fs_close(f);
+    free(text);
     wl_platform_fs_remove(g_seed_path);
     wl_platform_fs_rename(tmp, g_seed_path);
 }
@@ -223,36 +270,25 @@ void wl_xb_set_seed_file(const char *path) {
     if (g_seed_path[0] == '\0') {
         return;
     }
-    // keep what earlier runs recorded: every "0x" number in the file
-    WlPlatformFile *f = NULL;
-    if (wl_platform_fs_open(g_seed_path, WL_FILE_READ, &f) != WL_OK) {
-        return;
-    }
-    static char text[16384];
-    uint64_t size = wl_platform_fs_size(f);
-    if (size >= sizeof text) {
-        size = sizeof text - 1u;
-    }
-    if (wl_platform_fs_read_at(f, 0, text, (uint32_t)size) == WL_OK) {
-        text[size] = '\0';
-        for (const char *c = strstr(text, "0x"); c != NULL && g_seed_count < 512u; c = strstr(c + 2, "0x")) {
-            uint32_t va = (uint32_t)strtoul(c, NULL, 16);
-            if (va != 0 && !seed_known(va)) {
-                g_seeds[g_seed_count++] = va;
-            }
+    // what earlier runs and the title recorded: every "0x" number in the file
+    uint32_t len = 0;
+    char *text = seeds_read(&len);
+    for (const char *c = text != NULL ? strstr(text, "0x") : NULL; c != NULL; c = strstr(c + 2, "0x")) {
+        uint32_t va = (uint32_t)strtoul(c, NULL, 16);
+        if (va != 0 && !seed_known(va)) {
+            seed_note(va);
         }
     }
-    wl_platform_fs_close(f);
+    free(text);
 }
 
 void recomp_icall_fail_log(uint32_t va) {
     if (first_time(va)) {
         WL_LOG_E(TAG, "indirect call to 0x%08x: no translated function there (esp 0x%08x)", (unsigned)va, (unsigned)g_esp);
     }
-    if (g_seed_path[0] != '\0' && va >= g_xbox_code_lo && va < g_xbox_code_hi && !seed_known(va) &&
-        g_seed_count < 512u) {
-        g_seeds[g_seed_count++] = va;
-        seeds_write();
+    if (g_seed_path[0] != '\0' && va >= g_xbox_code_lo && va < g_xbox_code_hi && !seed_known(va)) {
+        seed_note(va);
+        seeds_append(va);
         WL_LOG_I(TAG, "0x%08x added to %s: recompile with it as a seed to translate it", (unsigned)va, g_seed_path);
     }
 }

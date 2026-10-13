@@ -5,7 +5,8 @@
 # the vertical blank, the kernel thunk dispatcher, crash reports. The kernel itself is wl_xboxkrnl;
 # the boot code that joins them is wl_xboxrt_boot (and wl_xboxrt_main, a default main).
 add_library(wl_xboxrt STATIC
-    mem.c mmio.c ppc_decode.c x86_decode.c regs.c thread.c irq.c thunk.c crash.c xbe.c devices.c gpu_stub.c)
+    mem.c mmio.c ppc_decode.c x86_decode.c regs.c thread.c irq.c thunk.c crash.c xbe.c devices.c gpu_stub.c
+    pad.c input.c usb_ohci.c usb_xid.c play.c)
 wl_target_defaults(wl_xboxrt)
 target_link_libraries(wl_xboxrt PUBLIC wl_platform wl_base)
 if(WL_PLATFORM STREQUAL "wii")
@@ -18,6 +19,11 @@ if(EXISTS ${PROJECT_SOURCE_DIR}/wl/xbox/nv2a.h AND TARGET wl_xbox AND TARGET wl_
     target_sources(wl_xboxrt PRIVATE nv2a_adapter.c)
     target_compile_definitions(wl_xboxrt PRIVATE WL_XBRT_HAVE_NV2A=1)
     target_link_libraries(wl_xboxrt PUBLIC wl_xbox wl_xbox_gx)
+endif()
+# the play harness's screenshots on the host: wl/gxsoft draws a frame, wl/gxtex writes the PNG
+if(TARGET wl_gxsoft AND TARGET wl_gxtex)
+    target_compile_definitions(wl_xboxrt PRIVATE WL_XBRT_HAVE_GXSOFT=1)
+    target_link_libraries(wl_xboxrt PUBLIC wl_gxsoft wl_gxtex)
 endif()
 # wl/xboxapu's APU and AC'97 models, when they are there, as the audio devices (devices.h)
 if(TARGET wl_xboxapu)
