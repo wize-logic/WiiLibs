@@ -12,6 +12,8 @@
 #include "wl/base/endian.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/platform.h"
+#include "wl/platform/hwcount.h"
+#include "wl/platform/profile_arm.h"
 #include "wl/xboxkrnl/xboxkrnl.h"
 #include "wl/xboxrt/boot.h"
 #include "wl/xboxrt/devices.h"
@@ -32,6 +34,37 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     cfg->ram_mb = 64;
     cfg->keep_free_bytes = 20u << 20; // the host side: GX textures converted from the guest's, caches
     cfg->htab_bytes = 256u << 10;
+}
+
+// The sampling profiler, armed by profile.txt in the title's folder (profile_arm.h): a profile
+// begins once the title has run `after` seconds; the dumps go beside the control file.
+static WlProfileArm g_profile_arm;
+static uint64_t g_boot_us;
+
+static bool profile_ready(void *user, const WlProfileArmSettings *s, uint32_t run, char *note, size_t size) {
+    (void)user;
+    uint64_t up_s = (wl_platform_time_us() - g_boot_us) / 1000000u;
+    if (up_s < (uint64_t)s->after + (uint64_t)run * s->seconds) {
+        return false;
+    }
+    snprintf(note, size, "uptime %u s", (unsigned)up_s);
+    return true;
+}
+
+static void profile_issue(void *user, WlProfileArmIssue issue, const char *key, uint32_t line) {
+    (void)user;
+    WL_LOG_W(TAG, "profile.txt line %u: %s %s", (unsigned)line,
+             issue == WL_PROFILE_ARM_UNKNOWN_KEY ? "no such setting" : "no number for", key);
+}
+
+static void profile_arm(const char *folder) {
+    (void)wl_hwcount_arm(folder); // hwcount.txt (not found: not armed)
+    WlProfileArmConfig config;
+    if (wl_profile_arm_config_load(&config, folder, profile_issue, NULL) != WL_OK) {
+        return;
+    }
+    config.hooks.ready = profile_ready;
+    wl_profile_arm_launch(&g_profile_arm, &config);
 }
 
 static void input_vblank(void *user) {
@@ -363,6 +396,8 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     if (cfg->before_entry != NULL) {
         cfg->before_entry(cfg->user);
     }
+    g_boot_us = wl_platform_time_us();
+    profile_arm(cfg->title_dir);
 
     // ---- the entry point on a guest thread of its own -------------------------------------------
     WlXbThread *entry = NULL;
