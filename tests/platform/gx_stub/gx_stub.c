@@ -171,8 +171,35 @@ void GX_LoadPosMtxImm(Mtx m, u32 id) {
     gx_stub_logf("GX_LoadPosMtxImm %s %u", identity ? "identity" : "other", (unsigned)id);
 }
 void GX_SetCurrentMtx(u32 id) { gx_stub_logf("GX_SetCurrentMtx %u", (unsigned)id); }
-void GX_ClearVtxDesc(void) { gx_stub_logf("GX_ClearVtxDesc"); }
-void GX_SetVtxDesc(u8 attr, u8 type) { gx_stub_logf("GX_SetVtxDesc %u %u", attr, type); }
+void GX_ClearVtxDesc(void) {
+    memset(g_gx_stub.desc, 0, sizeof g_gx_stub.desc);
+    gx_stub_logf("GX_ClearVtxDesc");
+}
+void GX_SetVtxDesc(u8 attr, u8 type) {
+    if (attr <= GX_VA_TEX7) {
+        g_gx_stub.desc[attr] = type;
+    }
+    gx_stub_logf("GX_SetVtxDesc %u %u", attr, type);
+}
+// (as libogc lists it: every attribute up to GX_VA_TEX7 with its input, then the end)
+void GX_GetVtxDescv(GXVtxDesc *attr_list) {
+    unsigned attribute;
+
+    for (attribute = 0; attribute <= GX_VA_TEX7; attribute++) {
+        attr_list[attribute].attr = (u8)attribute;
+        attr_list[attribute].type = g_gx_stub.desc[attribute];
+    }
+    attr_list[attribute].attr = GX_VA_NULL;
+    attr_list[attribute].type = 0;
+}
+void GX_Color1u32(u32 clr) {
+    g_gx_stub.fifo_bytes += 4;
+    gx_stub_logf("GX_Color1u32 %#x", (unsigned)clr);
+}
+void GX_Position1x8(u8 index) {
+    g_gx_stub.fifo_bytes += 1;
+    gx_stub_logf("GX_Position1x8 %u", index);
+}
 void GX_SetVtxAttrFmt(u8 fmt, u32 attr, u32 comp_type, u32 comp_size, u32 frac) {
     gx_stub_logf("GX_SetVtxAttrFmt %u %u %u %u %u", fmt, (unsigned)attr, (unsigned)comp_type, (unsigned)comp_size,
                  (unsigned)frac);

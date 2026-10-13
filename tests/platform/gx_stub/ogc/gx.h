@@ -151,6 +151,40 @@ typedef struct {
 #define GX_AOP_AND 0
 #define GX_CULL_NONE 0
 
+// The vertex descriptor and formats (wii/gx_flush_wii.c), with libogc's values
+#define GX_TRIANGLES 0x90
+#define GX_TRIANGLESTRIP 0x98
+#define GX_VA_PNMTXIDX 0
+#define GX_VA_TEX7MTXIDX 8
+#define GX_VA_NRM 10
+#define GX_VA_CLR0 11
+#define GX_VA_CLR1 12
+#define GX_VA_TEX7 20
+#define GX_VA_MAXATTR 26
+#define GX_VA_NULL 0xff
+#define GX_MAX_VTXDESC_LISTSIZE (GX_VA_MAXATTR + 1)
+#define GX_NONE 0
+#define GX_INDEX8 2
+#define GX_INDEX16 3
+#define GX_U8 0
+#define GX_S8 1
+#define GX_U16 2
+#define GX_S16 3
+#define GX_RGB565 0
+#define GX_RGBA8 5
+#define GX_POS_XY 0
+#define GX_NRM_XYZ 0
+#define GX_TEX_S 0
+#define GX_CLR_RGBA 1
+typedef struct {
+    u8 attr;
+    u8 type;
+} GXVtxDesc;
+void GX_GetVtxDescv(GXVtxDesc *attr_list);
+// the FIFO's vertex writes: logged with the bytes written so far (g_gx_stub.fifo_bytes)
+void GX_Color1u32(u32 clr);
+void GX_Position1x8(u8 index);
+
 // What the stub logs: one line per call, "GX_Name arguments" (gx_stub_logf), in the order called.
 // Memory a test names (gx_stub_name_memory) shows by name where a call takes it.
 #define GX_STUB_LOG_LINES 512
@@ -178,6 +212,9 @@ typedef struct {
     GXColor kcolor[4];
     GXColor reg[4];
     unsigned calls;
+    // the vertex descriptor (GX_SetVtxDesc), and the vertex bytes written into the FIFO
+    u8 desc[GX_VA_TEX7 + 1];
+    unsigned long fifo_bytes;
 } GxStub;
 
 extern GxStub g_gx_stub;

@@ -104,3 +104,67 @@ typedef struct WlGxDirectStats {
     uint32_t draws, vertices, flushes, layouts, textures;
 } WlGxDirectStats;
 void wl_gx_direct_stats(WlGxDirectStats *out);
+
+// ---- the flush for a renderer's own vertex formats ---------------------------------------------
+// A renderer that sets GX's vertex descriptors and formats itself (indexed arrays, matrix indices,
+// normals, any vertex format: a Direct3D device's, OpenCE-Wii's d3d8_gx.c) keeps the transform
+// unit's flush through these. Each attribute format it sends directly is set through
+// wl_gx_direct_vertex_format, which remembers its size; before a primitive,
+// wl_gx_direct_flush_pending sends the flush if one is due (wl_gx_direct_flush_after, on unless
+// wl_gx_direct_set_xf_flush turned it off): a strip of eight vertices of zeros in the primitive's
+// own format, whose size is the vertex descriptor as GX_Begin will send it (GX_GetVtxDescv) and
+// the sizes remembered. Where an attribute's size is not known, no flush is sent. The flushes count
+// in wl_gx_direct_stats' and wl_gx_direct_flushes.
+
+// GX's numbering of the vertex attributes, their inputs and formats (GX_VA_*, GX_NONE ..
+// GX_INDEX16, GX_U8 .. GX_F32, GX_RGB565 .. GX_RGBA8, GX_POS_XY, GX_NRM_XYZ, GX_TEX_S)
+enum {
+    WL_GX_VA_PNMTXIDX = 0,
+    WL_GX_VA_TEX7MTXIDX = 8,
+    WL_GX_VA_POS = 9,
+    WL_GX_VA_NRM = 10,
+    WL_GX_VA_CLR0 = 11,
+    WL_GX_VA_CLR1 = 12,
+    WL_GX_VA_TEX0 = 13,
+    WL_GX_VA_TEX7 = 20,
+    WL_GX_VA_ATTRIBUTES = 26, // GX_VA_MAXATTR
+    WL_GX_VA_END = 0xFF       // GX_VA_NULL: a descriptor list's end
+};
+enum { WL_GX_IN_NONE = 0, WL_GX_IN_DIRECT, WL_GX_IN_INDEX8, WL_GX_IN_INDEX16 };
+enum { WL_GX_TYPE_U8 = 0, WL_GX_TYPE_S8, WL_GX_TYPE_U16, WL_GX_TYPE_S16, WL_GX_TYPE_F32 };
+enum { WL_GX_COUNT_POS_XY = 0, WL_GX_COUNT_POS_XYZ, WL_GX_COUNT_NRM_XYZ = 0, WL_GX_COUNT_TEX_S = 0 };
+
+// one entry of a vertex descriptor list (libogc's GXVtxDesc)
+typedef struct WlGxVtxDesc {
+    uint8_t attr, type;
+} WlGxVtxDesc;
+
+// The bytes an attribute sent directly takes in a vertex, by its format (GX_SetVtxAttrFmt's count
+// and type); 0 for one not sized here (a normal other than XYZ, a type beyond the table).
+uint8_t wl_gx_attribute_bytes(uint32_t attribute, uint32_t count, uint32_t type);
+// The bytes of a vertex as GX_Begin sends it: the descriptor list (up to WL_GX_VA_END or `count`
+// entries) and each directly sent attribute's bytes (`bytes`, by attribute); a matrix index is a
+// byte, an index one or two. 0 when a direct attribute's size is not known.
+uint32_t wl_gx_vertex_bytes(const WlGxVtxDesc *desc, unsigned count, const uint8_t bytes[WL_GX_VA_ATTRIBUTES]);
+// Whether GX reads a vertex of this descriptor right: it misreads one whose attributes are its
+// position and matrix indices alone (a vertex carrying a matrix index must send another attribute
+// with it, a colour no channel reads where it needs none).
+bool wl_gx_vertex_shape_ok(const WlGxVtxDesc *desc, unsigned count);
+
+// GX_SetVtxAttrFmt, its size remembered for the flush (format 0..7)
+void wl_gx_direct_vertex_format(uint8_t format, uint32_t attribute, uint32_t count, uint32_t type, uint32_t frac);
+// The bytes of a vertex of `format` as the current descriptor sends it (0: a size not known).
+uint32_t wl_gx_direct_vertex_bytes(uint8_t format);
+// Whether GX reads the current descriptor's vertices right (wl_gx_vertex_shape_ok).
+bool wl_gx_direct_vertex_shape_ok(void);
+typedef enum {
+    WL_GX_FLUSH_NOT_DUE = 0, // none due, or the flush turned off
+    WL_GX_FLUSH_SENT,
+    WL_GX_FLUSH_SIZE_UNKNOWN // due, but a direct attribute's size is not known: none sent
+} WlGxFlushResult;
+// The flush before a primitive of `format`, if one is due; none is due after it.
+WlGxFlushResult wl_gx_direct_flush_pending(uint8_t format);
+// GX_Begin (GX's primitive, GX_TRIANGLES ..), after the flush if one is due.
+void wl_gx_direct_begin_format(uint8_t gx_primitive, uint8_t format, uint16_t count);
+// the flushes sent, by wl_gx_direct_draw and wl_gx_direct_flush_pending
+uint32_t wl_gx_direct_flushes(void);
