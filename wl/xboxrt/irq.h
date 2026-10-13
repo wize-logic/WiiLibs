@@ -28,6 +28,7 @@ extern "C" {
 #define WL_XB_IRQ_NIC 4u
 #define WL_XB_IRQ_APU 5u
 #define WL_XB_IRQ_AC97 6u
+#define WL_XB_IRQ_USB1 9u
 
 // Work reasons the handler is told about (bits).
 #define WL_XB_SVC_IRQ 0x1u     // a line is asserted
@@ -42,6 +43,11 @@ void wl_xb_service_set_handler(WlXbServiceFn fn, void *user);
 // GPU line). Lock held.
 typedef void (*WlXbVblankFn)(void *user);
 void wl_xb_service_set_vblank(WlXbVblankFn fn, void *user);
+// More work at each vertical blank, after that hook and in the order added (the controller ports,
+// the USB frame tick, the play harness). WL_ERR_LIMIT past 8.
+WlResult wl_xb_service_add_vblank_hook(WlXbVblankFn fn, void *user);
+// Vertical blanks so far (the guest's frame clock: the play harness counts them).
+uint32_t wl_xb_vblank_count(void);
 
 typedef struct {
     uint32_t vblank_hz_milli; // the host's vblank rate: 59940 (the Wii follows the display)

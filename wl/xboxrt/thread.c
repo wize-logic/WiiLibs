@@ -527,6 +527,65 @@ WlResult wl_xb_thread_create(uint32_t routine, uint32_t ctx1, uint32_t ctx2, uin
     return WL_OK;
 }
 
+typedef struct {
+    WlXbThread *t;
+    WlXbHostThreadFn fn;
+    void *user;
+} HostStart;
+
+static void *host_thread_main(void *arg) {
+    HostStart start = *(HostStart *)arg;
+    free(arg);
+    WlXbThread *t = start.t;
+    wl_xb_lock(t);
+    if (setjmp(t->exit_jmp) == 0) {
+        t->running_guest = true;
+        start.fn(t, start.user);
+    }
+    t->running_guest = false;
+    t->terminated = true;
+    wl_xb_unlock(t);
+    return NULL;
+}
+
+WlResult wl_xb_thread_create_host(const char *name, WlXbHostThreadFn fn, void *user, uint32_t stack_bytes, int priority,
+                                  WlXbThread **out) {
+    if (fn == NULL) {
+        return WL_ERR_ARG;
+    }
+    WlXbThread *t = new_thread(priority);
+    HostStart *start = malloc(sizeof *start);
+    if (t == NULL || start == NULL) {
+        free(start);
+        return WL_ERR_NOMEM;
+    }
+    snprintf(t->name, sizeof t->name, "%s", name != NULL ? name : "host");
+    WlResult r = wl_xb_thread_setup_guest(t, stack_bytes, g_tls_data, g_tls_bytes, g_tls_zero);
+    if (r != WL_OK) {
+        free(start);
+        return r;
+    }
+    size_t host = 256u << 10;
+    t->host_stack = aligned_alloc(64, host);
+    if (t->host_stack == NULL) {
+        free(start);
+        return WL_ERR_NOMEM;
+    }
+    start->t = t;
+    start->fn = fn;
+    start->user = user;
+    r = wl_platform_thread_create(&t->host, host_thread_main, start, t->host_stack, host, WL_THREAD_PRIO_MAIN);
+    if (r != WL_OK) {
+        free(start);
+        return r;
+    }
+    wl_platform_thread_detach(t->host);
+    if (out != NULL) {
+        *out = t;
+    }
+    return WL_OK;
+}
+
 uint32_t wl_xb_thread_resume(WlXbThread *t) {
     wl_platform_mutex_lock(g_m);
     uint32_t before = t->suspend_count;
