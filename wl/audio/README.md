@@ -65,7 +65,10 @@ nibble), then 14 signed 4-bit samples, high nibble first.
 `s = clamp16((nibble * (2048 << scale) + 1024 + c0 * h1 + c1 * h2) >> 11)` with `h1`, `h2` the
 previous two outputs and `(c0, c1)` the pair (8 pairs per channel, units of 1/2048). The decoder
 accumulates in 64 bits and supports a partial-frame start (mid-frame loops). Also the DS flavour of
-IMA-ADPCM (low nibble first; the caller parses the block header).
+IMA-ADPCM (low nibble first; the caller parses the block header), and Xbox ADPCM blocks (Microsoft's IMA
+block layout, format 0x0069: 36 bytes a channel, a 4-byte header, then 4-byte groups of 8 nibbles
+per channel in turn; 65 samples decode from a block, the Xbox plays 64: the header's and the first
+63 nibbles', the last nibble's sample being the next header; `wl_xbox_adpcm_*`).
 
 ## PWST and PWSF containers (`fmt.h`)
 

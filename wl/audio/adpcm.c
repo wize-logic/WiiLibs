@@ -50,3 +50,26 @@ void wl_ima_decode(WlImaState *st, const uint8_t *data, uint32_t samples, int16_
         out[i] = wl_ima_step(st, (i & 1u) ? (byte >> 4) : (byte & 15u));
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Xbox ADPCM blocks (Microsoft's IMA block layout; see adpcm.h)
+// ---------------------------------------------------------------------------------------------
+
+int16_t wl_xbox_adpcm_header(const uint8_t *block, uint32_t ch, WlImaState *st) {
+    const uint8_t *h = block + 4u * ch;
+    const int16_t pred = (int16_t)(uint16_t)(h[0] | (uint32_t)h[1] << 8);
+    const int32_t index = (int8_t)h[2]; // signed: 0x80..0xFF are negative and clamp to 0
+    st->pred = pred;
+    st->index = (uint8_t)(index < 0 ? 0 : index > 88 ? 88 : index);
+    return pred;
+}
+
+void wl_xbox_adpcm_decode_block(const uint8_t *block, uint32_t channels, int16_t *out) {
+    for (uint32_t ch = 0; ch < channels; ch++) {
+        WlImaState st;
+        out[ch] = wl_xbox_adpcm_header(block, ch, &st);
+        for (uint32_t k = 0; k < 64u; k++) {
+            out[(k + 1u) * channels + ch] = wl_ima_step(&st, wl_xbox_adpcm_nibble(block, channels, ch, k));
+        }
+    }
+}
