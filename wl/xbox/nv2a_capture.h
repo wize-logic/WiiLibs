@@ -49,6 +49,10 @@ typedef struct WlNv2aReplayHooks {
     void (*flip)(void *user, WlNv2a *dev, uint32_t flip_index);
     // each MMIO write record before it runs (may be NULL)
     void (*mmio)(void *user, uint32_t offset, uint32_t value, unsigned size);
+    // a memory record that changed guest memory, once its bytes are in (may be NULL): the span
+    // from its first byte that differs to its last (what the title wrote since the capture last
+    // read it, as far as the capture saw)
+    void (*memory)(void *user, uint32_t phys, uint32_t bytes);
 } WlNv2aReplayHooks;
 
 typedef struct WlNv2aReplayInfo {

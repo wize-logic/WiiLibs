@@ -23,10 +23,16 @@
 //   --programs  each vertex program drawn with, once, as tools/xbox_vsh_codegen.c's input (C text:
 //               a header word with the instruction count in its high half, four words an
 //               instruction), for compiling a title's programs ahead of time
+//   --textures-mb N  the GX backend's converted textures in an arena of N MiB, as the runtime
+//               keeps them (without it: the backend's default budget, from the heap)
+//   --watch     the converted textures checked through a write watch, as the runtime's MMU gives
+//               it on the Wii: a page counts as stored to when one of the capture's memory blocks
+//               lands in it (the blocks are what the title wrote, as the capture read it)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/base/endian.h"
 #include "wl/codec/gx_tex.h"
 #include "wl/gxsoft/gxsoft.h"
 #include "wl/gxtex/gxtex.h"
@@ -55,6 +61,9 @@ static unsigned g_png_count;
 static WlNv2aRecorder g_recorder;
 static WlNv2aGx *g_gx;
 static uint32_t g_backend_draws;
+// the write watch over the replay's guest memory (--watch): each page's epoch of its last block
+static uint32_t *g_page_epoch;
+static uint32_t g_epoch = 1, g_page_count;
 static struct {
     uint32_t draw;
     const char *dir;
@@ -367,6 +376,40 @@ static void on_flip(void *user, WlNv2a *dev, uint32_t index) {
 }
 
 // (the GX backend reads guest memory through the model the replay makes)
+static void on_memory(void *user, uint32_t phys, uint32_t bytes) {
+    uint32_t p;
+
+    (void)user;
+    if (g_page_epoch == NULL || bytes == 0) {
+        return;
+    }
+    g_epoch++;
+    for (p = phys >> 12; p <= (phys + bytes - 1u) >> 12 && p < g_page_count; p++) {
+        g_page_epoch[p] = g_epoch;
+    }
+}
+
+static uint32_t watch_arm(void *user, uint32_t phys, uint32_t bytes) {
+    (void)user;
+    (void)bytes;
+    return (phys >> 12) < g_page_count ? g_epoch : 0u;
+}
+
+static bool watch_written(void *user, uint32_t phys, uint32_t bytes, uint32_t stamp) {
+    uint32_t p;
+
+    (void)user;
+    if (stamp == 0 || bytes == 0) {
+        return true;
+    }
+    for (p = phys >> 12; p <= (phys + bytes - 1u) >> 12; p++) {
+        if (p >= g_page_count || g_page_epoch[p] > stamp) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void on_created(void *user, WlNv2a *dev) {
     (void)user;
     if (g_gx != NULL) {
@@ -376,7 +419,7 @@ static void on_created(void *user, WlNv2a *dev) {
 
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
-                    "[--psh-dump N] [--programs FILE]\n");
+                    "[--psh-dump N] [--programs FILE] [--textures-mb N] [--watch]\n");
     return 2;
 }
 
@@ -392,7 +435,11 @@ int main(int argc, char **argv) {
     WlNv2aReplayHooks hooks;
     WlNv2aReplayInfo info;
     WlResult result;
+    WlNv2aGxConfig gcfg;
+    void *arena = NULL;
+    bool watch = false;
 
+    memset(&gcfg, 0, sizeof gcfg);
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0) {
             g_verbosity = 1;
@@ -419,6 +466,12 @@ int main(int argc, char **argv) {
                 return 1;
             }
             fprintf(g_programs, "/* NV2A vertex programs a capture drew with (xbox_nv2a_replay --programs) */\n");
+        } else if (strcmp(argv[i], "--textures-mb") == 0 && i + 1 < argc) {
+            gcfg.textures.arena_bytes = (size_t)strtoul(argv[++i], NULL, 0) << 20;
+            arena = gcfg.textures.arena_bytes != 0 ? malloc(gcfg.textures.arena_bytes) : NULL;
+            gcfg.textures.arena = arena;
+        } else if (strcmp(argv[i], "--watch") == 0) {
+            watch = true;
         } else if (argv[i][0] == '-' || path != NULL) {
             return usage();
         } else {
@@ -451,7 +504,11 @@ int main(int argc, char **argv) {
         memset(&scfg, 0, sizeof scfg);
         scfg.frame = on_gx_frame;
         scfg.draw = on_gx_draw;
-        if (wl_gx_init() != WL_OK || wl_gxsoft_attach(&scfg) != WL_OK || (g_gx = wl_nv2a_gx_create(NULL)) == NULL) {
+        if (watch) {
+            gcfg.textures.watch = watch_arm;
+            gcfg.textures.written = watch_written;
+        }
+        if (wl_gx_init() != WL_OK || wl_gxsoft_attach(&scfg) != WL_OK || (g_gx = wl_nv2a_gx_create(&gcfg)) == NULL) {
             fprintf(stderr, "no memory for the GX backend\n");
             return 1;
         }
@@ -469,6 +526,11 @@ int main(int argc, char **argv) {
     memset(&hooks, 0, sizeof hooks);
     hooks.created = on_created;
     hooks.flip = on_flip;
+    if (watch && size >= 16) {
+        g_page_count = wl_rd_le32(data + 12) >> 12; // (the header's RAM size)
+        g_page_epoch = calloc(g_page_count != 0 ? g_page_count : 1u, sizeof *g_page_epoch);
+        hooks.memory = on_memory;
+    }
     result = wl_nv2a_replay(data, (size_t)size, &backend, &hooks, &info);
     if (result != WL_OK) {
         fprintf(stderr, "%s: %s\n", path, wl_result_name(result));
@@ -496,6 +558,17 @@ int main(int argc, char **argv) {
 
         wl_nv2a_gx_present(g_gx);
         wl_nv2a_gx_stats(g_gx, &gs);
+        {
+            WlNv2aTexCacheStats ts;
+
+            wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+            printf("textures: %u lookups, %u checks (%u by the write watch), %u hashes (%llu bytes), %u converted, "
+                   "%u made again, %u evicted, %u failed (%u for memory); %u KB kept, %u KB drawn in a frame at most\n",
+                   (unsigned)ts.lookups, (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed,
+                   (unsigned long long)ts.hashed_bytes, (unsigned)ts.converted, (unsigned)ts.reconverted,
+                   (unsigned)ts.evicted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)(ts.bytes >> 10),
+                   (unsigned)(ts.peak_frame_bytes >> 10));
+        }
         wl_gxsoft_stats(&ss);
         printf("gx backend: %u draws, %u perspective (%u fits made, %u shared), %u into targets (%u without one), "
                "%u stencil skipped, %u programs beyond GX, %u approximated, %u clears (%u quads), %u frames\n",
@@ -521,5 +594,7 @@ int main(int argc, char **argv) {
         fclose(g_programs);
     }
     free(data);
+    free(arena);
+    free(g_page_epoch);
     return 0;
 }
