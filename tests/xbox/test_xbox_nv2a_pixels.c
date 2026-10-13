@@ -48,6 +48,7 @@ static WlNv2aGx *g_gx;
 static uint8_t *g_frame;
 static uint32_t g_frame_w, g_frame_h;
 static unsigned g_frames_seen;
+static WlGxSoftDraw g_last_draw;
 
 static void on_frame(void *user, const uint8_t *rgba, uint32_t w, uint32_t h) {
     (void)user;
@@ -61,12 +62,18 @@ static void on_frame(void *user, const uint8_t *rgba, uint32_t w, uint32_t h) {
     g_frames_seen++;
 }
 
+static void on_draw(void *user, const WlGxSoftDraw *d) {
+    (void)user;
+    g_last_draw = *d;
+}
+
 static WlNv2a *pixel_device(TGuest *g) {
     WlGxSoftConfig cfg;
     WlNv2aBackend backend;
 
     memset(&cfg, 0, sizeof cfg);
     cfg.frame = on_frame;
+    cfg.draw = on_draw;
     g_frames_seen = 0;
     if (wl_gx_init() != WL_OK || wl_gxsoft_attach(&cfg) != WL_OK) {
         return NULL;
@@ -343,6 +350,49 @@ TEST a_final_product_with_every_register_held_is_drawn(void) {
     PASS();
 }
 
+// A second pass over part of the same geometry (some of the base pass's triangles, the same
+// vertices) with the depth test LEQUAL and no depth write, a shadow or a light blended over a base
+// pass: on the NV2A its depths equal the base pass's, so it passes everywhere it covers; on GX it
+// must too, in every frame. The perspective projection's depth a + b / w was fitted from each
+// draw's own vertices, so the two passes' fits differed in their rounding and the second failed
+// the test over some or all of the first (Halo's ring flickered between shadowed and bright).
+TEST a_second_pass_over_the_same_geometry_passes_lequal(void) {
+    TGuest g;
+    unsigned i, pass;
+    // (x, y, z) of two triangles reaching far into the distance, w from 1.37 to 61.9: the base
+    // pass draws both, the second pass the second
+    static const float corners[6][3] = {{-1.73f, -0.61f, 1.37f}, {37.1f, -9.3f, 61.9f}, {-29.3f, 21.7f, 43.3f},
+                                        {-29.3f, 21.7f, 43.3f},  {37.1f, -9.3f, 61.9f}, {13.7f, 29.1f, 7.31f}};
+
+    ASSERT(pixel_device(&g) != NULL);
+    white_texture(&g);
+    // the clip program's transform with Direct3D's depth: z' = A z + B, w = z (near 0.1, far 1000)
+    f_perspective(&g);
+    f_constant(&g, 98, 0, 0, 1000.0f / 999.9f, -100.0f / 999.9f);
+    f_clear(&g, 0xFF000000u);
+    for (pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            // blue added over the red where the depth is not greater
+            t_m1(&g, WL_NV2A_K_SET_DEPTH_MASK, 0);
+            t_m1(&g, WL_NV2A_K_SET_BLEND_ENABLE, 1);
+            t_m1(&g, WL_NV2A_K_SET_BLEND_FUNC_SFACTOR, WL_NV2A_BLEND_ONE);
+            t_m1(&g, WL_NV2A_K_SET_BLEND_FUNC_DFACTOR, WL_NV2A_BLEND_ONE);
+            t_m1(&g, WL_NV2A_K_SET_BLEND_EQUATION, WL_NV2A_BLEND_EQ_ADD);
+        }
+        t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+        for (i = pass ? 3u : 0u; i < 6u; i++) {
+            f_vertex(&g, corners[i][0], corners[i][1], corners[i][2], 1, 0, 0, pass ? 0xFFFF0000u : 0xFF0000FFu);
+        }
+        t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+        t_kick(&g);
+    }
+    ASSERT(g_last_draw.pixels > 1000u);
+    ASSERT_EQ(0u, g_last_draw.z_failed);
+    ASSERT_EQ(g_last_draw.pixels, g_last_draw.written);
+    pixel_done(&g);
+    PASS();
+}
+
 typedef struct Sink {
     uint8_t *data;
     size_t size, capacity;
@@ -460,6 +510,7 @@ SUITE(pixels_suite) {
     RUN_TEST(perspective_triangle);
     RUN_TEST(direct3d_culling_keeps_quads_wound_clockwise_on_the_screen);
     RUN_TEST(a_final_product_with_every_register_held_is_drawn);
+    RUN_TEST(a_second_pass_over_the_same_geometry_passes_lequal);
     RUN_TEST(capture_replays_to_the_same_pixels);
 }
 

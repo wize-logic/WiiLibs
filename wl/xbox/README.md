@@ -162,7 +162,9 @@ over in parts of whole primitives (a strip's parts even, so its winding holds).
   reorganized around the NV2A's state. Vertices through the title's program on the processor, sent
   in screen space through an orthographic projection with the depth range, or, for a program that
   divides by w, as (x w, y w, -w) through a perspective projection whose depth a + b / w is fitted
-  from the draw (the far plane moved so nothing is clipped there); indexed draws reuse the vertices
+  from the draw (a fit kept from an earlier draw used again, the same numbers, where it gives the
+  draw's depths, so that a pass over the same geometry with an EQUAL or LEQUAL test passes as on the
+  NV2A; the far plane moved so nothing is clipped there); indexed draws reuse the vertices
   run. The combiners through psh's cache (with a title's `WlXboxPshRecipe`), the fog psh's ramp, a
   program beyond GX texture 0 times colour. Blending, depth, alpha test and colour masks on GX
   (constant colours, MIN/MAX and src - dst approximated and counted); culling by the NV2A's rule on
