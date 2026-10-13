@@ -188,6 +188,10 @@ over in parts of whole primitives (a strip's parts even, so its winding holds).
 - **The pipeline** (`nv2a_pipeline.h`) is what the GX backend does on the processor: programs
   compiled and kept, vertices run (or the fixed function's composite matrix), the NV2A's fog modes,
   what psh is told of the textures, each stage's GX coordinates, the GX mappings of the raster state.
+  Those mappings (compare functions, blending, culling) also take the values themselves
+  (`wl_nv2a_gx_blend_of`, `wl_nv2a_cull_of`, Direct3D's cull modes `wl_nv2a_cull_d3d`, GX's cull mode
+  of the measured winding `wl_nv2a_gx_cull`) in `nv2a_raster.c`, which needs nothing else of wl_xbox:
+  an Xbox Direct3D device's render states are the NV2A's values, and OpenCE-Wii's takes them so.
 - **The recorder** (`nv2a_record.h`) digests and describes every clear, draw, frame and flip.
 
 On the host, the GX backend's calls reach wl/platform's host backend, which records them; with

@@ -14,6 +14,10 @@ target_compile_definitions(test_xbox_nv2a_regs PRIVATE
 wl_add_test(test_xbox_nv2a_kelvin SOURCES test_xbox_nv2a_kelvin.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_nv2a_texture SOURCES test_xbox_nv2a_texture.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_nv2a_gx SOURCES test_xbox_nv2a_gx.c LIBS wl_xbox_gx LABELS unit be)
+# the raster state's mappings from values alone (nv2a_raster.c), linked without the rest of wl_xbox as a
+# Direct3D device's harness links it (OpenCE-Wii's draw bench)
+wl_add_test(test_xbox_nv2a_raster SOURCES test_xbox_nv2a_raster.c ${PROJECT_SOURCE_DIR}/wl/xbox/nv2a_raster.c
+    LIBS wl_base LABELS unit be)
 # the GX backend drawn by the host's software GX (wl/gxsoft): the console suite's frames and pixel
 # tests; and the replay tool over the capture it writes
 if(TARGET wl_gxsoft)
