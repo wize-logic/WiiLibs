@@ -31,9 +31,13 @@ typedef struct {
     bool gpu_stub;               // the idle NV2A even when wl/xbox's model is built in
     bool audio_off;              // the idle APU and AC'97 even when wl/xboxapu's models are built in
     uint32_t frame_pool_bytes;   // the Wii: host memory for guest frames (0: as much as can be had,
-                                 // leaving `keep_free_bytes`)
+                                 // leaving `keep_free_bytes`). The host and ppc-be: 0 lets the OS
+                                 // back every page; else a frame limit paged as the Wii pages
+                                 // (WL_XB_FRAME_MB or WL_XB_FRAME_KB in the environment win)
     uint32_t keep_free_bytes;    // the Wii: 14 MB by default
     uint32_t htab_bytes;         // the Wii's page table: 256 KB by default
+    const char *swap_path;       // the paging's swap file (NULL: <data_dir>/pagefile.sys; "": none)
+    uint32_t swap_bytes;         // its size (0: the guest RAM's)
     bool trace_kernel_calls;     // log every kernel call
     void (*kernel_config)(WlXkConfig *cfg, void *user); // edits the kernel's settings before init
     void (*before_entry)(void *user); // after the image is loaded and the kernel is up
