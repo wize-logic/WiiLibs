@@ -81,5 +81,12 @@ int main(int argc, char **argv) {
     }
 #endif
     int code = wl_xb_boot_run(&cfg);
+#if defined(__wii__)
+    // the title has left (or never started): wound down, the log and the card closed, then back
+    // to the loader, or off where nothing loaded us (Dolphin booting the DOL itself)
+    WL_LOG_I("xbmain", "the title left with %d", code);
+    wl_platform_exit(WL_EXIT_LOADER);
+#else
     return code < 0 ? 1 : code;
+#endif
 }

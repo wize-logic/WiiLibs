@@ -7,6 +7,7 @@
 #include <ogc/stm.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wiiuse/wpad.h>
 
 #include "wl/platform/platform.h"
@@ -45,7 +46,17 @@ uint32_t wl_platform_system_events(void) {
     return atomic_exchange(&g_events, 0u);
 }
 
+// The Homebrew Channel (and the loaders that copy it) leave a reload stub at 0x80001800 with
+// "STUBHAXX" after its first word; libogc's exit jumps there. Without one (Dolphin booting the DOL
+// itself) there is nothing to go back to and the jump lands at 0, so leaving powers off instead.
+static bool loader_stub(void) {
+    return memcmp((const void *)0x80001804, "STUBHAXX", 8) == 0;
+}
+
 WL_NORETURN void wl_platform_exit(WlExitTarget target) {
+    if (target == WL_EXIT_LOADER && !loader_stub()) {
+        target = WL_EXIT_POWER_OFF;
+    }
     wl_platform_shutdown_prepare(target);
     wl_platform_log_flush();
     wl_platform_log_shutdown(); // closes the SD file before the console goes down
