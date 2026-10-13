@@ -27,6 +27,7 @@ static WlPlatformMutex g_m;
 static WlPlatformCond g_proc_cond;
 static bool g_ready_init;
 static WlXbThreadConfig g_cfg;
+static WlXbThread *volatile g_boosted; // handed the lock for starving: keeps it one quantum
 static WlXbThread *volatile g_owner;
 static WlXbThread *volatile g_ready; // the ready queue's head (read without g_m as a hint)
 static WlXbThread *g_all;
@@ -44,6 +45,7 @@ volatile uint32_t g_xb_attention;
 
 void wl_xb_thread_config_default(WlXbThreadConfig *cfg) {
     cfg->quantum_ms = 10;
+    cfg->starve_ms = 30;
     cfg->host_stack_bytes = 1u << 20;
     cfg->default_stack_bytes = 64u << 10;
 }
@@ -66,6 +68,7 @@ static void enqueue(WlXbThread *t) {
     t->next_ready = *pp;
     *pp = t;
     t->ready = true;
+    t->ready_since_us = wl_platform_time_us();
     g_xb_attention = 1; // the holder gives the lock up at its next safe point when this one outranks it
 }
 
@@ -206,9 +209,52 @@ static bool yield_if_due(WlXbThread *self) {
     if (self == NULL || head == NULL || wl_xb_in_service()) {
         return false;
     }
+    uint64_t now = wl_platform_time_us();
+    bool boosted = self == g_boosted && now - g_quantum_start < (uint64_t)g_cfg.quantum_ms * 1000u;
+    if (boosted && !head->is_service) {
+        return false; // a starved thread keeps the lock for one quantum, as NT's boost gives it
+    }
+    g_boosted = NULL;
     if (head->priority > self->priority ||
-        (head->priority == self->priority && wl_platform_time_us() - g_quantum_start >= (uint64_t)g_cfg.quantum_ms * 1000u)) {
+        (head->priority == self->priority && now - g_quantum_start >= (uint64_t)g_cfg.quantum_ms * 1000u)) {
         requeue(self);
+        return true;
+    }
+    // A thread kept waiting past starve_ms goes first, for one quantum (the holder may be
+    // busy-waiting for something only a lower-priority thread or the vertical blank brings, as a
+    // title's frame throttle does, while a loader thread below it never runs). The waiter's time
+    // alone decides: the holder's quantum restarts after every interrupt, which the service
+    // thread takes the lock for, so a holder interrupted each vertical blank never finishes one.
+    if (g_cfg.starve_ms != 0) {
+        wl_platform_mutex_lock(g_m);
+        WlXbThread *volatile *pp = &g_ready;
+        while (*pp != NULL && now - (*pp)->ready_since_us < (uint64_t)g_cfg.starve_ms * 1000u) {
+            pp = &(*pp)->next_ready;
+        }
+        WlXbThread *starved = *pp;
+        if (starved == NULL || starved == self || starved->is_service) {
+            wl_platform_mutex_unlock(g_m);
+            return false;
+        }
+        // straight to it: queued by priority, the caller would come back ahead of it
+        *pp = starved->next_ready;
+        starved->next_ready = NULL;
+        starved->ready = false;
+        g_stats.starved_handoffs++;
+        g_boosted = starved;
+        wl_xb_cpu_save(&self->cpu);
+        g_cur = NULL;
+        enqueue(self);
+        g_owner = starved;
+        g_stats.handoffs++;
+        wl_platform_cond_signal(starved->cond);
+        while (g_owner != self) {
+            wl_platform_cond_wait(self->cond, g_m);
+        }
+        g_quantum_start = wl_platform_time_us();
+        wl_platform_mutex_unlock(g_m);
+        g_cur = self;
+        wl_xb_cpu_load(&self->cpu);
         return true;
     }
     return false;

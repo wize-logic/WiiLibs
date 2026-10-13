@@ -168,3 +168,12 @@ const WlXbGpuOps *wl_xb_gpu_stub_ops(void) {
 void wl_xb_gpu_stub_stats(const WlXbGpuStub *gpu, WlXbGpuStubStats *out) {
     *out = gpu->stats;
 }
+
+#if !defined(WL_XBRT_HAVE_NV2A)
+// without wl/xbox's model there is nothing to capture
+void wl_xb_gpu_capture(const char *path, uint32_t frames, uint32_t after_vblanks) {
+    (void)path;
+    (void)frames;
+    (void)after_vblanks;
+}
+#endif

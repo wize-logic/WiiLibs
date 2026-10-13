@@ -53,6 +53,7 @@ struct WlXbThread {
     WlPlatformCond cond;       // the thread sleeps here
     void *host_stack;
     bool ready;                // in the ready queue
+    uint64_t ready_since_us;   // when it was queued
     bool woken;                // a wake arrived while it slept (wl_xb_wake)
     bool running_guest;        // between its routine's start and its end
     uint32_t kernel_depth;     // > 0 while in a kernel call (thunk.c): device accesses are no safe points
@@ -73,6 +74,10 @@ struct WlXbThread {
 
 typedef struct {
     uint32_t quantum_ms;          // how long a thread keeps the lock past a ready thread: 10
+    uint32_t starve_ms;           // a ready thread that has waited this long gets the lock at the
+                                  // holder's next safe point whatever the priorities (NT boosts a
+                                  // starved thread so; a busy-waiting holder would otherwise keep
+                                  // lower-priority threads out for good): 30
     uint32_t host_stack_bytes;    // each guest thread's host stack (the Wii; recompiled frames
                                   // are C frames): 1 MB
     uint32_t default_stack_bytes; // a guest stack when the title asks for 0: 64 KB
@@ -187,6 +192,7 @@ typedef struct {
     uint32_t handoffs;      // the lock changed hands
     uint32_t waits, wakes, timeouts;
     uint32_t safe_points;   // wl_xb_safe_point calls that held the lock in guest code
+    uint32_t starved_handoffs; // the lock given to a thread that waited past starve_ms
     uint32_t safe_yields;   // of those, the ones that gave the lock to a waiting thread
     uint32_t service_starved; // the service thread waited a second or more for the lock (logged)
 } WlXbThreadStats;

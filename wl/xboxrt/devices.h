@@ -72,6 +72,11 @@ void wl_xb_gpu_stub_stats(const WlXbGpuStub *gpu, WlXbGpuStubStats *out);
 // creates the model with phys_ptr = the guest's window and attaches it. WL_ERR_UNSUPPORTED in a
 // build without it.
 WlResult wl_xb_gpu_attach_nv2a(void);
+// Captures `frames` frames of the GPU's work (push buffers and the guest memory they read;
+// wl/xbox/nv2a_capture.h) into `path`, starting `after_vblanks` vertical blanks from now, for
+// tools/xbox_nv2a_replay. On the host the WL_XB_CAPTURE environment variable sets it too:
+// "path[,frames[,after vblanks]]". Nothing when wl/xbox's NV2A model is not built in.
+void wl_xb_gpu_capture(const char *path, uint32_t frames, uint32_t after_vblanks);
 
 #ifdef __cplusplus
 }

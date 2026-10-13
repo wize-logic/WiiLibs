@@ -157,7 +157,10 @@ XkObject *xk_thread_object(WlXbThread *t);
 // ---- Dispatcher --------------------------------------------------------------------------------
 // One kernel-side record per guest thread (WlXbThread.kernel).
 #define XK_MAX_WAIT 64u
-#define XK_MAX_APCS 64u
+// NT queues user APCs without a bound; a thread that issues many reads with completion routines
+// before its next alertable wait (XAPI's ReadFileEx completes through NtUserIoApcDispatcher) can
+// have hundreds pending. A ring of 2048 (32 KB a thread) keeps every one.
+#define XK_MAX_APCS 2048u
 typedef struct {
     uint32_t routine, context, arg1, arg2; // a user APC: routine(context, arg1, arg2)
 } XkApc;
@@ -165,8 +168,8 @@ typedef struct {
     uint32_t wait_count;
     uint32_t wait_objects[XK_MAX_WAIT];
     bool waiting;
-    XkApc apcs[XK_MAX_APCS];
-    uint32_t apc_count;
+    XkApc apcs[XK_MAX_APCS]; // a ring: apc_count entries from apc_head
+    uint32_t apc_head, apc_count;
     XkObject *object; // its thread object
 } XkThread;
 XkThread *xk_thread_state(WlXbThread *t);

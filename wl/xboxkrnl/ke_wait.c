@@ -75,8 +75,8 @@ bool xk_apc_deliver(WlXbThread *t) {
     XkThread *k = xk_thread_state(t);
     bool any = false;
     while (k != NULL && k->apc_count > 0) {
-        XkApc apc = k->apcs[0];
-        memmove(&k->apcs[0], &k->apcs[1], (k->apc_count - 1u) * sizeof k->apcs[0]);
+        XkApc apc = k->apcs[k->apc_head];
+        k->apc_head = (k->apc_head + 1u) % XK_MAX_APCS;
         k->apc_count--;
         uint32_t args[3] = {apc.context, apc.arg1, apc.arg2};
         wl_xb_call_guest_preserving(apc.routine, 3, args);
@@ -95,7 +95,8 @@ void xk_apc_queue(WlXbThread *t, uint32_t routine, uint32_t context, uint32_t ar
         WL_LOG_E(XK_TAG, "thread %u: APC queue full, APC to 0x%08x dropped", (unsigned)t->id, (unsigned)routine);
         return;
     }
-    k->apcs[k->apc_count++] = (XkApc){routine, context, arg1, arg2};
+    k->apcs[(k->apc_head + k->apc_count) % XK_MAX_APCS] = (XkApc){routine, context, arg1, arg2};
+    k->apc_count++;
     if (k->waiting) {
         wl_xb_wake(t);
     }
