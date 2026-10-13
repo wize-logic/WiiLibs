@@ -826,8 +826,44 @@ TEST a_bumped_lookup_goes_through_the_indirect_unit(void) {
     PASS();
 }
 
+// The final combiner's product E*F when four values are alive and every TEV register holds one:
+// r0 = t0^2, r1 = r0^2, then v0 = v0 * t0 and v1 = (1 - v0) * v1.a (the colours renamed into
+// registers), and the final combiner v1 * (r0 * r1) + v0, its alpha v0's. E*F goes into r0's
+// register, which nothing reads after it (TEV reads a stage's inputs before it writes); a glow
+// sprite's program of this shape was refused as having "no free register".
+TEST a_final_product_with_every_register_held(void) {
+    uint32_t state[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures;
+    WlXboxPshProgram program;
+    const char *why = NULL;
+
+    memset(state, 0, sizeof state);
+    state[WL_XBOX_PSH_COMBINER_COUNT] = 3;
+    state[WL_XBOX_PSH_RGB_INPUTS0 + 0] = 0x08080000u;  // A t0, B t0
+    state[WL_XBOX_PSH_RGB_OUTPUTS0 + 0] = 0x000000C0u; // AB to r0
+    state[WL_XBOX_PSH_RGB_INPUTS0 + 1] = 0x0C0C0000u;  // A r0, B r0
+    state[WL_XBOX_PSH_RGB_OUTPUTS0 + 1] = 0x000000D0u; // AB to r1
+    state[WL_XBOX_PSH_RGB_INPUTS0 + 2] = 0x04082415u;  // A v0, B t0, C 1 - v0, D v1.a
+    state[WL_XBOX_PSH_RGB_OUTPUTS0 + 2] = 0x00000045u; // AB to v0, CD to v1
+    state[WL_XBOX_PSH_FINAL_INPUTS_ABCD] = 0x050F0004u; // A v1, B E*F, C 0, D v0
+    state[WL_XBOX_PSH_FINAL_INPUTS_EFG] = 0x0C0D1400u;  // E r0, F r1, G v0.a
+    g_fog_on = 0;
+    g_d0_alpha_map = 0;
+    textures_make(&textures, 1u);
+    ASSERT(wl_xbox_psh_translate(state, &textures, NULL, &program));
+    ASSERT(program.reason == NULL);
+    ASSERT(program.tev.stage_count <= 8u);
+    ASSERT_EQ(1, check(state, 1u, &why));
+    // ...and the sum v1 + r0 the same way: A v1, B the sum, C 0, D v0
+    state[WL_XBOX_PSH_FINAL_INPUTS_ABCD] = 0x050E0004u;
+    ASSERT(wl_xbox_psh_translate(state, &textures, NULL, &program));
+    ASSERT_EQ(1, check(state, 1u, &why));
+    PASS();
+}
+
 SUITE(psh_suite) {
     RUN_TEST(random_programs_agree_with_the_combiners);
+    RUN_TEST(a_final_product_with_every_register_held);
     RUN_TEST(a_modulation);
     RUN_TEST(a_recipe_comes_first);
     RUN_TEST(fog_reads_the_ramp);
