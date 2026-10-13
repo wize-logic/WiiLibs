@@ -99,7 +99,23 @@ TEST contiguous_allocator(void) {
     ASSERT_EQ(WL_OK, wl_xb_phys_alloc(0x345000u, 0x61000u, 0x61000u + 0x345000u - 1u, 0, &b));
     ASSERT_EQ_FMT(0x61000u, b, "%x");
     ASSERT_EQ(WL_ERR_NOMEM, wl_xb_phys_alloc(0x1000u, 0x61000u, 0x61FFFu, 0, &c)); // taken
-    ASSERT_EQ(WL_ERR_NOMEM, wl_xb_phys_alloc(0x1000u, 0, 0x5FFFFu, 0, &c));          // the reserved low pages
+    // the reserved low pages (the retail kernel's) are lent when nothing else in the range is
+    // free: Halo pins 0x61000 up past 16 MB and D3D then asks for a page below 16 MB
+    uint32_t big = 0;
+    ASSERT_EQ(WL_OK, wl_xb_phys_alloc(0x1000000u - 0x3A6000u, 0x3A6000u, 0xFFFFFFu, 0, &big));
+    ASSERT_EQ_FMT(0x3A6000u, big, "%x");
+    ASSERT_EQ(WL_OK, wl_xb_phys_alloc(0x1000u, 0, 0xFFFFFFu, 0, &c));
+    ASSERT(c >= 0x1000u && c <= 0x60000u); // (the page between the reserved ones and the pin first)
+    uint32_t c3 = 0;
+    ASSERT_EQ(WL_OK, wl_xb_phys_alloc(0x1000u, 0, 0xFFFFFFu, 0, &c3));
+    ASSERT(c3 >= 0x1000u && c3 < 0x60000u && c3 != c);
+    uint32_t c2 = 0;
+    ASSERT_EQ(WL_OK, wl_xb_phys_alloc(0x2000u, 0, 0x5FFFFu, 0x2000u, &c2));
+    ASSERT(c2 >= 0x2000u && c2 < 0x60000u && (c2 & 0x1FFFu) == 0 && (c2 + 0x2000u <= c3 || c2 >= c3 + 0x1000u));
+    ASSERT_EQ(WL_OK, wl_xb_phys_free(c2));
+    ASSERT_EQ(WL_OK, wl_xb_phys_free(c3));
+    ASSERT_EQ(WL_OK, wl_xb_phys_free(c));
+    ASSERT_EQ(WL_OK, wl_xb_phys_free(big));
     ASSERT_EQ(WL_OK, wl_xb_phys_free(b));
     ASSERT_EQ(WL_ERR_ARG, wl_xb_phys_free(b));
     ASSERT_EQ(WL_OK, wl_xb_phys_free(a));
