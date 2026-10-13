@@ -8,7 +8,7 @@
 # recorder. Builds everywhere; no fused multiply-adds,
 # so a vertex program gives the same bits on every target, interpreted or compiled.
 add_library(wl_xbox STATIC psh.c psh_cache.c vsh.c
-    nv2a.c nv2a_kelvin.c nv2a_capture.c nv2a_texture.c nv2a_texcache.c nv2a_pipeline.c nv2a_record.c)
+    nv2a.c nv2a_kelvin.c nv2a_capture.c nv2a_texture.c nv2a_texcache.c nv2a_pipeline.c nv2a_raster.c nv2a_record.c)
 wl_target_defaults(wl_xbox DETERMINISTIC)
 target_link_libraries(wl_xbox PUBLIC wl_platform wl_gfx wl_codec m)
 add_library(WiiLibs::xbox ALIAS wl_xbox)

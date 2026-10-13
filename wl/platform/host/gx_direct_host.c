@@ -8,6 +8,10 @@
 
 static WlHostGxDirect s;
 static bool g_flush_due, g_flush_off, g_layout_known;
+// a renderer's own vertex formats: the sizes set, and the descriptor a test gives
+static uint8_t g_format_bytes[8][WL_GX_VA_ATTRIBUTES];
+static WlGxVtxDesc g_descriptor[WL_GX_VA_ATTRIBUTES + 1];
+static unsigned g_descriptor_count;
 static void (*g_hook)(void *user, WlGxDirectPrim prim, const WlGxDirectVertex *vertices, uint32_t count);
 static void *g_hook_user;
 
@@ -17,7 +21,9 @@ const WlHostGxDirect *wl_host_gx_direct(void) {
 
 void wl_host_gx_direct_reset(void) {
     memset(&s, 0, sizeof s);
+    memset(g_format_bytes, 0, sizeof g_format_bytes);
     g_flush_due = g_layout_known = false;
+    g_descriptor_count = 0;
 }
 
 void wl_host_gx_direct_hook(void (*hook)(void *user, WlGxDirectPrim prim, const WlGxDirectVertex *vertices,
@@ -211,4 +217,58 @@ void wl_gx_direct_texture_invalidate(void) {
 
 void wl_gx_direct_stats(WlGxDirectStats *out) {
     *out = s.stats;
+}
+
+// ---- a renderer's own vertex formats ---------------------------------------------------------------
+
+void wl_host_gx_direct_descriptor(const WlGxVtxDesc *desc, unsigned count) {
+    if (count > WL_GX_VA_ATTRIBUTES + 1) {
+        count = WL_GX_VA_ATTRIBUTES + 1;
+    }
+    memcpy(g_descriptor, desc, count * sizeof *desc);
+    g_descriptor_count = count;
+}
+
+void wl_gx_direct_vertex_format(uint8_t format, uint32_t attribute, uint32_t count, uint32_t type, uint32_t frac) {
+    (void)frac;
+    if (attribute < WL_GX_VA_ATTRIBUTES) {
+        g_format_bytes[format & 7u][attribute] = wl_gx_attribute_bytes(attribute, count, type);
+    }
+}
+
+uint32_t wl_gx_direct_vertex_bytes(uint8_t format) {
+    return wl_gx_vertex_bytes(g_descriptor, g_descriptor_count, g_format_bytes[format & 7u]);
+}
+
+bool wl_gx_direct_vertex_shape_ok(void) {
+    return wl_gx_vertex_shape_ok(g_descriptor, g_descriptor_count);
+}
+
+WlGxFlushResult wl_gx_direct_flush_pending(uint8_t format) {
+    bool send = g_flush_due && !g_flush_off;
+    uint32_t bytes;
+
+    g_flush_due = false;
+    if (!send) {
+        return WL_GX_FLUSH_NOT_DUE;
+    }
+    bytes = wl_gx_direct_vertex_bytes(format) * 8u;
+    if (bytes == 0) {
+        return WL_GX_FLUSH_SIZE_UNKNOWN;
+    }
+    s.stats.flushes++;
+    s.flush_bytes = bytes;
+    return WL_GX_FLUSH_SENT;
+}
+
+void wl_gx_direct_begin_format(uint8_t gx_primitive, uint8_t format, uint16_t count) {
+    wl_gx_direct_flush_pending(format);
+    s.format_begins++;
+    s.format_primitive = gx_primitive;
+    s.format = format;
+    s.format_count = count;
+}
+
+uint32_t wl_gx_direct_flushes(void) {
+    return s.stats.flushes;
 }

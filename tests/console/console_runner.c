@@ -218,7 +218,12 @@ static void check_render_target(void) {
     done = wl_gx_target_use(NULL);
     wlt_check("gx_target_resolved_on_leaving", done != NULL && done->user == 7u && done->memory == g_target_image,
               "the target comes back with the caller's word");
-    // RGBA8 tiles of 4 x 4: alpha and red of the 16 pixels, then green and blue
+    // RGBA8 tiles of 4 x 4: alpha and red of the 16 pixels, then green and blue. The copy is a
+    // command the GPU has yet to run when wl_gx_target_use returns (the layer resolves for GX's
+    // own reads, which follow it in the FIFO): the CPU reads it once the GPU is done, and past
+    // its cache.
+    (void)wl_gx_sync();
+    wl_gpu_buffer_invalidate(g_target_image, sizeof g_target_image);
     snprintf(detail, sizeof detail, "a %02x r %02x g %02x b %02x, want ff e0 20 20", g_target_image[0],
              g_target_image[1], g_target_image[32], g_target_image[33]);
     wlt_check("gx_target_image_in_gx_format",

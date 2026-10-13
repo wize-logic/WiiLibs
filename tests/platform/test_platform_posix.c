@@ -413,22 +413,22 @@ TEST sysconf_answers_for_the_console(void) {
 }
 
 TEST relative_priority_is_main_less_the_steps(void) {
-    ASSERT_EQ(64u, WL_POSIX_PRIO_MAIN);
-    ASSERT_EQ(64u, wl_posix_priority_above_main(0));
+    ASSERT_EQ(63u, WL_POSIX_PRIO_MAIN); // the kernel's KTHR_MAIN_PRIO
+    ASSERT_EQ(63u, wl_posix_priority_above_main(0));
     // a step above main is a smaller number: libogc runs 0 first
-    ASSERT_EQ(63u, wl_posix_priority_above_main(1));
-    ASSERT_EQ(62u, wl_posix_priority_above_main(2));
-    ASSERT_EQ(65u, wl_posix_priority_above_main(-1));
-    ASSERT_EQ(66u, wl_posix_priority_above_main(-2));
+    ASSERT_EQ(62u, wl_posix_priority_above_main(1));
+    ASSERT_EQ(61u, wl_posix_priority_above_main(2));
+    ASSERT_EQ(64u, wl_posix_priority_above_main(-1));
+    ASSERT_EQ(65u, wl_posix_priority_above_main(-2));
     // clamped to 15 steps either way
-    ASSERT_EQ(49u, wl_posix_priority_above_main(15));
-    ASSERT_EQ(49u, wl_posix_priority_above_main(16));
-    ASSERT_EQ(49u, wl_posix_priority_above_main(1000000));
-    ASSERT_EQ(79u, wl_posix_priority_above_main(-15));
-    ASSERT_EQ(79u, wl_posix_priority_above_main(-16));
-    ASSERT_EQ(79u, wl_posix_priority_above_main(-1000000));
-    ASSERT_EQ(79u, wl_posix_priority_above_main(INT_MIN));
-    ASSERT_EQ(49u, wl_posix_priority_above_main(INT_MAX));
+    ASSERT_EQ(48u, wl_posix_priority_above_main(15));
+    ASSERT_EQ(48u, wl_posix_priority_above_main(16));
+    ASSERT_EQ(48u, wl_posix_priority_above_main(1000000));
+    ASSERT_EQ(78u, wl_posix_priority_above_main(-15));
+    ASSERT_EQ(78u, wl_posix_priority_above_main(-16));
+    ASSERT_EQ(78u, wl_posix_priority_above_main(-1000000));
+    ASSERT_EQ(78u, wl_posix_priority_above_main(INT_MIN));
+    ASSERT_EQ(48u, wl_posix_priority_above_main(INT_MAX));
     PASS();
 }
 

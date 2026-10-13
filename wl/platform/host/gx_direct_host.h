@@ -38,6 +38,12 @@ typedef struct WlHostGxDirect {
     uint32_t count;
     WlGxDirectVertex vertices[WL_HOST_GX_DIRECT_KEPT];
     WlGxDirectStats stats;
+    // a renderer's own vertex formats: its primitives begun (wl_gx_direct_begin_format), the last's
+    // GX primitive, format and count, and the bytes of the last flush sent before one
+    uint32_t format_begins;
+    uint8_t format_primitive, format;
+    uint16_t format_count;
+    uint32_t flush_bytes;
 } WlHostGxDirect;
 
 const WlHostGxDirect *wl_host_gx_direct(void);
@@ -46,3 +52,6 @@ void wl_host_gx_direct_reset(void);
 void wl_host_gx_direct_hook(void (*hook)(void *user, WlGxDirectPrim prim, const WlGxDirectVertex *vertices,
                                          uint32_t count),
                             void *user);
+// the vertex descriptor GX would hold (GX_GetVtxDescv's list), for a test of the flush before a
+// renderer's own vertex formats: the host has no GX_SetVtxDesc
+void wl_host_gx_direct_descriptor(const WlGxVtxDesc *desc, unsigned count);

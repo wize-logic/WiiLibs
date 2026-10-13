@@ -94,12 +94,15 @@ long wl_posix_sysconf(int name, size_t free_bytes);
 // devkitPPC's pthread_create starts every thread at libogc's lowest priority (127) and takes none
 // from its attributes. libogc's scheduler is strict: such a thread never runs while a thread above
 // it is ready, so a program that makes threads with pthread_create and waits on them (or yields to
-// them) hangs. These set a pthread's priority afterwards. The numbers are libogc's: 0 runs first,
-// 127 last; the program's main thread runs at WL_POSIX_PRIO_MAIN (the same value as
-// WL_THREAD_PRIO_MAIN's, wii/thread_wii.c). On the host the scheduler is the C library's and the
-// numbers are checked and then ignored (wl_platform_thread_priorities_real() says which).
+// them) hangs. These set a pthread's priority afterwards. The numbers are libogc's kernel's
+// (tuxedo/thread.h's KThreadSetPrio): 0 runs first, 127 last; the program's main thread runs at
+// WL_POSIX_PRIO_MAIN, the kernel's KTHR_MAIN_PRIO. (LWP_CreateThread and LWP_SetThreadPriority
+// number the other way, 0 idle to 127 highest, and pass 127 less theirs to the kernel: main's LWP
+// number, WL_THREAD_PRIO_MAIN's in wii/thread_wii.c, is 64.) On the host the scheduler is the C
+// library's and the numbers are checked and then ignored (wl_platform_thread_priorities_real() says
+// which).
 
-#define WL_POSIX_PRIO_MAIN 64u
+#define WL_POSIX_PRIO_MAIN 63u
 #define WL_POSIX_PRIO_MIN 127u // the lowest priority: where pthread_create leaves every thread
 #define WL_POSIX_PRIO_STEPS 15 // how far set_relative_priority goes above or below main
 

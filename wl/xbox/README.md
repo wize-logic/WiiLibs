@@ -30,8 +30,11 @@ coordinates and colour channels its stages read, each stage's part in a bumped l
 indirect unit, and what the device must put in the vertices. `psh.c`'s comment says how: each
 product a stage, registers renamed as they are written, inputs a stage cannot reach made first,
 the colour and alpha halves sharing stages, dead halves taken out; signed dot products exact
-through TEV's lerp, bias and scale. A program beyond GX is refused (`reason`); one that only fits
-approximated says so (`approximate`, `approximation`).
+through TEV's lerp, bias and scale; a half bias negate or expand negate (0.5 - x, 1 - 2x) made in
+its product's stage, with no register of its own, and the alpha's reads of a colour's blue made
+again where they are read (Halo's title-screen logo, all four TEV registers busy, is exact so). A
+program beyond GX is refused (`reason`); one that only fits approximated says so (`approximate`,
+`approximation`); of the attempts the translation makes, the first exact one is kept.
 
 The fixed places the device and the translation agree on: the fog ramp is map 7 at texture
 coordinate 4 (`WL_XBOX_PSH_FOG_*`); a bumped lookup's offset reads the bump map as map 5, its terms
@@ -188,6 +191,10 @@ over in parts of whole primitives (a strip's parts even, so its winding holds).
 - **The pipeline** (`nv2a_pipeline.h`) is what the GX backend does on the processor: programs
   compiled and kept, vertices run (or the fixed function's composite matrix), the NV2A's fog modes,
   what psh is told of the textures, each stage's GX coordinates, the GX mappings of the raster state.
+  Those mappings (compare functions, blending, culling) also take the values themselves
+  (`wl_nv2a_gx_blend_of`, `wl_nv2a_cull_of`, Direct3D's cull modes `wl_nv2a_cull_d3d`, GX's cull mode
+  of the measured winding `wl_nv2a_gx_cull`) in `nv2a_raster.c`, which needs nothing else of wl_xbox:
+  an Xbox Direct3D device's render states are the NV2A's values, and OpenCE-Wii's takes them so.
 - **The recorder** (`nv2a_record.h`) digests and describes every clear, draw, frame and flip.
 
 On the host, the GX backend's calls reach wl/platform's host backend, which records them; with

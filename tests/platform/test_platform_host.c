@@ -6,6 +6,7 @@
 
 #include "greatest.h"
 #include "wl/platform/host/audio_host.h"
+#include "wl/platform/host/gx_direct_host.h"
 #include "wl/platform/host/gx_host.h"
 #include "wl/platform/host/input_host.h"
 #include "wl/platform/host/system_host.h"
@@ -147,6 +148,34 @@ static void fill_ramp(void *user, int16_t *stereo, uint32_t frames) {
     g_fill_calls++;
 }
 
+// the direct layer's flush for a renderer's own vertex formats, as the host records it: sized by the
+// descriptor a test gives and the formats set, sent once after wl_gx_direct_flush_after
+TEST gx_direct_stub_flushes_a_renderers_own_format(void) {
+    static const WlGxVtxDesc desc[] = {{WL_GX_VA_PNMTXIDX, WL_GX_IN_DIRECT},
+                                       {WL_GX_VA_POS, WL_GX_IN_INDEX16},
+                                       {WL_GX_VA_CLR0, WL_GX_IN_DIRECT},
+                                       {WL_GX_VA_END, 0}};
+
+    wl_host_gx_direct_reset();
+    wl_gx_direct_set_xf_flush(true);
+    wl_host_gx_direct_descriptor(desc, 4);
+    ASSERT_EQ(0, wl_gx_direct_vertex_bytes(6));
+    wl_gx_direct_vertex_format(6, WL_GX_VA_CLR0, 1, 5 /* GX_RGBA8 */, 0);
+    ASSERT_EQ(7, wl_gx_direct_vertex_bytes(6));
+    ASSERT(wl_gx_direct_vertex_shape_ok());
+    wl_gx_direct_flush_after();
+    wl_gx_direct_begin_format(0x90, 6, 3);
+    ASSERT_EQ(1, wl_gx_direct_flushes());
+    ASSERT_EQ(56, wl_host_gx_direct()->flush_bytes);
+    ASSERT_EQ(1, wl_host_gx_direct()->format_begins);
+    ASSERT_EQ(0x90, wl_host_gx_direct()->format_primitive);
+    ASSERT_EQ(3, wl_host_gx_direct()->format_count);
+    wl_gx_direct_begin_format(0x90, 6, 3);
+    ASSERT_EQ(1, wl_gx_direct_flushes());
+    wl_host_gx_direct_reset();
+    PASS();
+}
+
 TEST audio_stub_renders_through_the_fill_callback(void) {
     uint32_t next = 0;
     ASSERT_EQ(WL_ERR_ARG, wl_platform_audio_start(32000, 256, NULL, NULL));
@@ -177,6 +206,7 @@ SUITE(host_suite) {
     RUN_TEST(tex_bytes_follow_the_tile_sizes);
     RUN_TEST(filter_override_resolution);
     RUN_TEST(gx_stub_records_frames_and_draws);
+    RUN_TEST(gx_direct_stub_flushes_a_renderers_own_format);
     RUN_TEST(audio_stub_renders_through_the_fill_callback);
 }
 

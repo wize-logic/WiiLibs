@@ -212,6 +212,11 @@ def gfx_ini(dump_frames: bool, widescreen: bool = False) -> str:
     # CPU access to the EFB on (Dolphin may skip it for speed, and peeks then read 0): programs
     # and tests read pixels back
     text = "[Hacks]\nEFBAccessEnable = True\n"
+    # EFB copies to textures written to RAM, as the console does (Dolphin's default keeps them
+    # in its own texture cache only and zeroes the RAM they were to go to, so a copy the CPU
+    # reads, such as a render target's image, reads 0), and when the copy runs, not deferred to a
+    # later synchronization
+    text += "EFBToTextureEnable = False\nDeferEFBCopies = False\n"
     # (the window, and so the capture, in the TV's shape: 1 forces 16:9, 2 forces 4:3)
     text += f"[Settings]\nAspectRatio = {1 if widescreen else 2}\n"
     if dump_frames:
