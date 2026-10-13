@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Tue, 13 Oct 2026 11:33:36 -0400
+Subject: [PATCH] recomp: give a called address inside lifted code a function
+ of its own
+
+A call needs a symbol to call. A direct call to an address inside a body
+that no function starts at (an alternate entry: hand-written code entered
+at two points, a helper the disassembler kept inside its caller) had only
+the unresolved stub, which popped the return address and returned without
+running anything.
+
+discover_interior_entries, run last by BatchTranslator, works out what
+each function reaches (and caches it for translation), collects the
+direct calls of reachable code, and gives each called address that is
+code but no function start an entry of its own (detection_method
+"interior_entry", called_by its callers): its straight-line code from
+there plus whatever that code reaches -- exactly what the x86 runs when
+called there. Iterated, since a new entry can call further in. A weak
+start a CFG owner took over becomes a function again when something calls
+it. The entries are in the dispatch table, so an indirect call there
+resolves too.
+
+New entries do not stop another function's lifting: a jump to one is
+still lifted into the jumping function's body.
+
+tests: test_interior_targets.py (a call to an alternate entry).
+---
+ tools/recomp/test_interior_targets.py | 22 ++++++--
+ tools/recomp/translator.py            | 81 ++++++++++++++++++++++++++-
+ 2 files changed, 98 insertions(+), 5 deletions(-)
+
+diff --git a/tools/recomp/test_interior_targets.py b/tools/recomp/test_interior_targets.py
+index 260b911..0fc897b 100644
+--- a/tools/recomp/test_interior_targets.py
++++ b/tools/recomp/test_interior_targets.py
+@@ -10,8 +10,8 @@ a false start at 0xE66A0 (an immediate the disassembler took for an address);
+ its `je 0xE66B6` returned through such a stub, skipping its epilogue, and a
+ level script later crashed with esi pointing into the script stack.
+ 
+-The code a jump reaches is now lifted into the jumping function's own body;
+-nothing is split or shortened.
++The code a jump reaches is now lifted into the jumping function's own body, and
++a called address inside a body gets a function of its own.
+ 
+ The x86 here (assembled with GNU as, at BASE):
+ 
+@@ -98,8 +98,10 @@ def database():
+             for start, end, method in FUNCTIONS}
+ 
+ 
+-def lift(start):
++def lift(start, prepass=False):
+     subject = FunctionTranslator(image(), database())
++    if prepass:
++        subject.discover_interior_entries()
+     code = subject.translate_function(start, subject.func_db[start])
+     return subject, code
+ 
+@@ -122,6 +124,18 @@ def test_tail_jump_into_another_body_is_lifted_in_place():
+     assert code.count("esp += 4; return; /* ret */") == 1
+ 
+ 
++def test_called_address_inside_a_body_gets_a_function():
++    subject, code = lift(D, prepass=True)
++    assert subject.interior_entry_starts == {B_CORE}
++    entry = subject.func_db[B_CORE]
++    assert entry["detection_method"] == "interior_entry"
++    assert entry["called_by"] == [f"0x{D:08X}"]
++    assert f"RECOMP_ABI_CALL(0x{B_CORE:08X}u, sub_{B_CORE:08X});" in code, code
++    core = subject.translate_function(B_CORE, entry)
++    assert "eax = MEM32(esp + 4);" in core, core
++    assert "ebx = (uint32_t)((int32_t)ebx * (int32_t)7);" in core
++
++
+ def test_false_start_keeps_its_owner_whole():
+     subject, code = lift(F)
+     # The switch's arms past the false start are this body's labels; the one at
+@@ -161,6 +175,6 @@ def test_runs_off_its_range_into_code_no_function_covers():
+ 
+ 
+ def test_bytes_nothing_reaches_are_not_followed():
+-    subject, code = lift(X)
++    subject, code = lift(X, prepass=True)
+     assert f"loc_{B_BODY:08X}: ;" not in code, code
+     assert "imul" not in code
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 95789a6..0393cd3 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -491,6 +491,7 @@ class FunctionTranslator:
+         self.coalesced_function_starts = set()
+         self.protected_function_starts = set()
+         self.jump_table_entry_starts = set()
++        self.interior_entry_starts = set()
+         self._recovered_cfg = {}
+         self._ownership_ready = False
+ 
+@@ -1311,6 +1312,9 @@ class FunctionTranslator:
+     # and direct edges. A range also holds bytes nothing reaches (a jump
+     # table decoded as instructions), and their "jumps" are not followed.
+     #
++    # A called address inside lifted code gets a function of its own
++    # (discover_interior_entries), since a call needs a symbol to call.
++
+     # Upper bound on the instructions one function gains from outside its
+     # range. The real reach is the rest of one function; the cap only stops a
+     # jump decoded from data from lifting a section's worth of garbage.
+@@ -1512,9 +1516,83 @@ class FunctionTranslator:
+                 work.append(following)
+         return ([absorbed[addr] for addr in sorted(absorbed)], tables, calls)
+ 
++    def discover_interior_entries(self):
++        """Give every address reachable code calls a function to call.
++
++        A call to an address inside lifted code that no function starts at
++        (an alternate entry into a body, a helper the disassembler kept
++        inside its caller) had only a stub that popped the return address and
++        returned. The address gets a function of its own: its straight-line
++        code from there, plus whatever that code reaches (_absorb), exactly
++        what the x86 runs when called there. A weak start a CFG owner took is
++        made a function again when something calls it.
++
++        Run last: it fixes the set of functions, then works out and caches
++        what each one reaches outside its range. Returns the new entries."""
++        self._entries = None
++        self._absorb_cache = None
++        entries = self._entry_set()
++        self._entries = entries
++        self._absorb_cache = {}
++        created = set()
++        pending = sorted(entries)
++        while pending:
++            wanted = {}
++            for start in pending:
++                info = self.func_db[start]
++                end = info.get("end", start)
++                if end <= start and start not in self._recovered_cfg:
++                    continue
++                self.decode_function(start, end)
++                _, _, calls = self._absorb_cache.get(start, ((), {}, set()))
++                for target in calls:
++                    if (target in entries or target in created
++                            or self._code_limit(target) is None
++                            or self._is_padding_at(target)):
++                        continue
++                    wanted.setdefault(target, set()).add(start)
++            pending = []
++            for target, callers in sorted(wanted.items()):
++                stream = self._decode_stream(target, entries, 0x10000)
++                if not stream:
++                    continue
++                info = self.func_db.get(target)
++                if info is None:
++                    section = next((sec.name for sec in _config._SECTIONS
++                                    if sec.va <= target < sec.va + sec.va_size),
++                                   "")
++                    info = self.func_db[target] = {
++                        "_addr": target,
++                        "start": f"0x{target:08X}",
++                        "name": self.label_db.get(target, f"sub_{target:08X}"),
++                        "section": section,
++                        "confidence": 0.9,
++                        "detection_method": "interior_entry",
++                        "has_prologue": self._func_has_prologue(stream),
++                        "calls_to": [],
++                    }
++                else:
++                    self.owned_function_starts.discard(target)
++                end = max(insn.end_address for insn in stream)
++                if (target not in self._recovered_cfg
++                        and info.get("end", target) <= target):
++                    info["end"] = end
++                    info["size"] = end - target
++                    info["num_instructions"] = len(stream)
++                info["called_by"] = sorted(
++                    set(info.get("called_by") or [])
++                    | {f"0x{caller:08X}" for caller in callers})
++                created.add(target)
++                pending.append(target)
++        self.interior_entry_starts = created
++        if created:
++            print(f"Gave {len(created)} called addresses inside lifted code "
++                  f"a function of their own", file=sys.stderr)
++        return created
++
+     def _absorbed_for(self, start, base, leaders, edges):
+         """(instructions, tables) _absorb finds for this function, cached
+-        when a pass has fixed the set of functions (self._absorb_cache)."""
++        once discover_interior_entries has fixed the set of functions."""
+         cache = getattr(self, "_absorb_cache", None)
+         if cache is not None and start in cache:
+             return cache[start][:2]
+@@ -3143,6 +3221,7 @@ class BatchTranslator:
+             self.translator.discover_static_indirect_targets()
+         self.translator.discover_cfg_ownership()
+         self.translator.discover_jump_table_entries()
++        self.translator.discover_interior_entries()
+ 
+     def get_functions_by_category(self, categories=None, exclude_categories=None):
+         """

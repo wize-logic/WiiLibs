@@ -4,13 +4,15 @@
 
 The conformance cases test instructions one block at a time; these test what a title is made of:
 calls and returns on the guest stack, jump tables, indirect calls through the dispatch table,
-libgcc's 64-bit division, x87 and SSE maths, MMX, atomics, rep string instructions. Each program
-in e2e/ is compiled freestanding with gcc -m32 and linked at 0x10000 (where an XBE's image sits),
-then:
+libgcc's 64-bit division, x87 and SSE maths, MMX, atomics, rep string instructions, and (in
+assembly, prog_interior.S) jumps and calls into other functions' bodies and false function starts.
+Each program in e2e/ is compiled freestanding with gcc -m32 and linked at 0x10000 (where an XBE's
+image sits), then:
 
   - the oracle: e2e/loader.c maps the image at 0x10000 in a 32-bit process and calls run(seed) on
     the CPU (x87 at precision control 53, the model's precision);
-  - the lifted side: every function the image's symbol table names goes through the patched
+  - the lifted side: every function the image's symbol table names (and every called address
+    inside one, which discover_interior_entries makes a function) goes through the patched
     pipeline's FunctionTranslator (as tools.recomp would lift it), and the C is compiled with
     WiiLibs' runtime header for big-endian PowerPC Linux (run under qemu-ppc) and for the host,
     with a small runtime that loads the image into guest memory and calls the lifted run(seed).
@@ -45,6 +47,8 @@ PROGRAMS = {
     "prog_int": dict(flags=["-mfpmath=387"], nout=12),
     "prog_x87": dict(flags=["-mfpmath=387", "-mno-sse"], nout=31),
     "prog_sse": dict(flags=["-mmmx", "-msse", "-mfpmath=sse"], nout=92),
+    # assembly: jumps and calls into other functions' bodies, false function starts (*_false)
+    "prog_interior": dict(src="prog_interior.S", flags=[], nout=10),
 }
 SEEDS = [1, 12345, 0xDEADBEEF, 7, 0x80000000, 0x0F0F0F0F]
 # Programs (and why) that may not match on a target. Keep empty unless understood.
@@ -110,7 +114,7 @@ def run(cmd, cwd=None, check=True):
 
 
 def build_image(name, spec, work: Path):
-    src = HERE / "e2e" / f"{name}.c"
+    src = HERE / "e2e" / spec.get("src", f"{name}.c")
     flags = X86 + spec["flags"]
     libgcc = run(["gcc", "-m32", "-print-libgcc-file-name"]).strip()
     run(["gcc"] + flags + ["-c", str(src), "-o", f"{name}.o"], cwd=work)
@@ -136,15 +140,22 @@ def lift(name, work: Path, funcs, pipe: Path):
     from tools.recomp.translator import FunctionTranslator
     image = (work / f"{name}.bin").read_bytes()
     text_end = max(a + s for a, s, _ in funcs)
-    data_start = (text_end + 15) & ~15
+    data_start = text_end  # .rodata follows .text directly (a jump table may sit at text_end + 3)
     config._install(
         [config.Section(".text", BASE, text_end - BASE, 0, text_end - BASE, True),
          config.Section(".rdata", data_start, len(image) - (data_start - BASE), data_start - BASE,
                         len(image) - (data_start - BASE), False)],
         entry_point=BASE, kernel_thunk_addr=BASE, origin="e2e")
-    db = {a: {"start": f"0x{a:08X}", "end": a + s, "_addr": a, "size": s, "name": f"sub_{a:08X}"}
-          for a, s, _ in funcs}
+    # A *_false symbol stands for a false function start (one a disassembler took from an immediate).
+    db = {}
+    for a, s, sym in funcs:
+        db[a] = {"start": f"0x{a:08X}", "end": a + s, "_addr": a, "size": s, "name": f"sub_{a:08X}"}
+        if sym.endswith("_false"):
+            db[a]["detection_method"] = "imm_ref_target"
     ft = FunctionTranslator(image, db)
+    # as tools.recomp does last: a called address inside a body gets a function of its own
+    ft.discover_interior_entries()
+    db = {a: info for a, info in ft.func_db.items() if a not in ft.owned_function_starts}
     gen = work / f"{name}_gen"
     gen.mkdir(exist_ok=True)
     chunks, protos = [], []
