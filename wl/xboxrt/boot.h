@@ -29,6 +29,7 @@ typedef struct {
     bool thunk_look_behind;      // resolve a run of thunks just below the declared table
     WlXbManualLookup manual_lookup; // the title's hand-written functions (recomp_lookup_manual)
     bool gpu_stub;               // the idle NV2A even when wl/xbox's model is built in
+    bool audio_off;              // the idle APU and AC'97 even when wl/xboxapu's models are built in
     uint32_t frame_pool_bytes;   // the Wii: host memory for guest frames (0: as much as can be had,
                                  // leaving `keep_free_bytes`)
     uint32_t keep_free_bytes;    // the Wii: 14 MB by default

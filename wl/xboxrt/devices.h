@@ -37,6 +37,29 @@ extern "C" {
 // of a register it does not model, once.
 WlResult wl_xb_devices_register_mcpx(void);
 
+// ---- The audio hardware ------------------------------------------------------------------------
+
+// wl/xboxapu's APU and AC'97 models in place of the idle ones (audio.c, built when wl/xboxapu is):
+// the devices at 0xFE800000 and 0xFEC00000, their interrupt lines (5 and 6), a service tick that
+// runs the APU's frames and moves the AC'97's bus masters, and the output: the platform's audio
+// at 48 kHz (the Wii), a WAV file (the host). The host reads its settings from the environment:
+// WL_XB_AUDIO_WAV=<file> writes everything played, WL_XB_AUDIO_TRACE=<file> logs every APU and
+// AC'97 access with the translated function that made it, WL_XB_AUDIO=0 keeps the idle devices.
+typedef struct {
+    uint32_t tick_us;         // how often the frames run: 4000 (6 frames)
+    uint32_t latency_frames;  // frames queued ahead of the platform output: 48 (32 ms)
+    bool output;              // start the platform's audio output (true)
+    bool off;                 // keep the idle devices: DirectSoundCreate fails, the title is silent
+    const char *wav_path;     // the host: a WAV of the output (NULL: none)
+    const char *trace_path;   // the host: the MMIO trace (NULL: none)
+} WlXbAudioConfig;
+void wl_xb_audio_config_default(WlXbAudioConfig *cfg);
+// Call after wl_xb_devices_register_mcpx. WL_ERR_UNSUPPORTED in a build without wl/xboxapu.
+WlResult wl_xb_audio_attach(const WlXbAudioConfig *cfg);
+// One line: frames run, voices a frame, the time a frame costs, notifiers, traps, underruns (also
+// logged every 10 s while the title runs).
+void wl_xb_audio_log_status(void);
+
 // ---- The GPU -----------------------------------------------------------------------------------
 
 // A GPU model behind 0xFD000000 (offsets from it), its vertical blank, and its interrupt line.
