@@ -4,11 +4,13 @@
 // vertex_bytes, gx_flush_pending, gx_begin). It calls libogc's GX alone, so a renderer's host
 // harness over a stand-in of GX (OpenCE-Wii's tools/wii_draw_bench.py) links it as it is.
 #include <ogc/gx.h>
+#include <stddef.h>
 
 #include "wl/platform/gx_direct.h"
 #include "wl/platform/wii/gx_flush_wii.h"
 
 #define XF_FLUSH_VERTICES 8
+#define FORMAT_SET 0x80u
 
 _Static_assert(WL_GX_VA_TEX7MTXIDX == GX_VA_TEX7MTXIDX && WL_GX_VA_POS == GX_VA_POS &&
                    WL_GX_VA_NRM == GX_VA_NRM && WL_GX_VA_CLR0 == GX_VA_CLR0 &&
@@ -23,14 +25,18 @@ _Static_assert(WL_GX_TYPE_U8 == GX_U8 && WL_GX_TYPE_S16 == GX_S16 && WL_GX_TYPE_
                    WL_GX_COUNT_POS_XY == GX_POS_XY && WL_GX_COUNT_POS_XYZ == GX_POS_XYZ &&
                    WL_GX_COUNT_NRM_XYZ == GX_NRM_XYZ && WL_GX_COUNT_TEX_S == GX_TEX_S,
                "vertex formats are GX's");
-_Static_assert(sizeof(GXVtxDesc) == sizeof(WlGxVtxDesc), "a descriptor entry is two bytes");
+_Static_assert(sizeof(GXVtxDesc) == sizeof(WlGxVtxDesc) &&
+                   offsetof(GXVtxDesc, attr) == offsetof(WlGxVtxDesc, attr) &&
+                   offsetof(GXVtxDesc, type) == offsetof(WlGxVtxDesc, type),
+               "a descriptor entry is its attribute and input, a byte each");
 
 static struct {
     bool due, off;
     uint32_t flushes;
-    // the bytes of each attribute sent directly, by vertex format, as wl_gx_direct_vertex_format
-    // set them (0: not set through it)
-    uint8_t bytes[8][WL_GX_VA_ATTRIBUTES];
+    // each attribute's format, by vertex format, as wl_gx_direct_vertex_format set it: its count
+    // and type as they are (FORMAT_SET | count << 4 | type; 0: not set through it), sized only for
+    // a flush, which is rare, where a format may be set before every draw
+    uint8_t formats[8][WL_GX_VA_ATTRIBUTES];
 } f;
 
 void wl_gx_direct_flush_after(void) {
@@ -64,35 +70,45 @@ void wl_gx_direct_vertex_format(uint8_t format, uint32_t attribute, uint32_t cou
                                 uint32_t frac) {
     GX_SetVtxAttrFmt(format, attribute, count, type, frac);
     if (attribute < WL_GX_VA_ATTRIBUTES) {
-        f.bytes[format & 7u][attribute] = wl_gx_attribute_bytes(attribute, count, type);
+        f.formats[format & 7u][attribute] =
+            (uint8_t)(FORMAT_SET | (count & 7u) << 4 | (type & 15u));
     }
 }
 
-// the descriptor as GX_Begin will send it (libogc's own record of it)
-static unsigned descriptor(WlGxVtxDesc out[GX_MAX_VTXDESC_LISTSIZE]) {
-    GXVtxDesc list[GX_MAX_VTXDESC_LISTSIZE];
-    unsigned i;
+// the bytes of each attribute of a vertex format, as set
+static void format_bytes(uint8_t format, uint8_t bytes[WL_GX_VA_ATTRIBUTES]) {
+    unsigned attribute;
 
-    GX_GetVtxDescv(list);
-    for (i = 0; i < GX_MAX_VTXDESC_LISTSIZE; i++) {
-        out[i].attr = list[i].attr;
-        out[i].type = list[i].type;
+    for (attribute = 0; attribute < WL_GX_VA_ATTRIBUTES; attribute++) {
+        uint8_t set = f.formats[format & 7u][attribute];
+
+        bytes[attribute] =
+            set != 0 ? wl_gx_attribute_bytes(attribute, (set >> 4) & 7u, set & 15u) : 0;
     }
-    return GX_MAX_VTXDESC_LISTSIZE;
 }
+
+// the descriptor as GX_Begin will send it, libogc's own record of it (read in place: an entry of
+// either is its attribute and input, a byte each; this is before every primitive of a renderer that
+// checks its descriptors)
+typedef union {
+    GXVtxDesc gx[GX_MAX_VTXDESC_LISTSIZE];
+    WlGxVtxDesc wl[GX_MAX_VTXDESC_LISTSIZE];
+} Descriptor;
 
 uint32_t wl_gx_direct_vertex_bytes(uint8_t format) {
-    WlGxVtxDesc list[GX_MAX_VTXDESC_LISTSIZE];
-    unsigned count = descriptor(list);
+    Descriptor list;
+    uint8_t bytes[WL_GX_VA_ATTRIBUTES];
 
-    return wl_gx_vertex_bytes(list, count, f.bytes[format & 7u]);
+    GX_GetVtxDescv(list.gx);
+    format_bytes(format, bytes);
+    return wl_gx_vertex_bytes(list.wl, GX_MAX_VTXDESC_LISTSIZE, bytes);
 }
 
 bool wl_gx_direct_vertex_shape_ok(void) {
-    WlGxVtxDesc list[GX_MAX_VTXDESC_LISTSIZE];
-    unsigned count = descriptor(list);
+    Descriptor list;
 
-    return wl_gx_vertex_shape_ok(list, count);
+    GX_GetVtxDescv(list.gx);
+    return wl_gx_vertex_shape_ok(list.wl, GX_MAX_VTXDESC_LISTSIZE);
 }
 
 WlGxFlushResult wl_gx_direct_flush_pending(uint8_t format) {
