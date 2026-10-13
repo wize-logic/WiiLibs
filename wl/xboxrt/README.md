@@ -47,10 +47,11 @@ pages (128 for a debug kit); a user page and its window alias are one page of me
 
 ## Demand paging (`paging.c`)
 
-The Wii has ~33 MB of frames for 64 MB of guest RAM (MEM2 and what MEM1 spares beside a 12 MB
-DOL and the host side's `keep_free_bytes`), and a title touches more than that (Halo's menu ~34 MB,
-a level its 22 MB tag cache, 22 MB texture cache and 4 MB sound cache on top). When no frame is free
-one is taken back from a page and the page goes to a swap file, to be read back on its next touch.
+The Wii has ~21 MB of frames for 64 MB of guest RAM (MEM2 and what MEM1 spares beside a 12 MB
+DOL, the host side's `keep_free_bytes` and the GPU's texture arena), and a title touches more than
+that (Halo's menu ~34 MB, a level its 22 MB tag cache, 22 MB texture cache and 4 MB sound cache on
+top). When no frame is free one is taken back from a page and the page goes to a swap file, to be
+read back on its next touch.
 The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV` and `mprotect`.
 
 - **States.** A physical page is *zero* (no frame, no swap slot: never touched, freed, or given up
@@ -356,8 +357,9 @@ the address of its variable, and an ordinal with no body a slot whose first call
 
 `wl_xb_boot_run(&cfg)` brings it all up and runs the title: on the Wii `wl_mem` (heaps only: the
 rest stays malloc's), the SD card, the log and the crash screen; the XBE's header; guest memory (the
-Wii's frame pools: the two largest blocks malloc gives, less `keep_free_bytes`; the host's frame
-limit, if any; the swap file `<hard disk folder>/pagefile.sys`); threads; the
+Wii's frame pools: the two largest blocks malloc gives, less `keep_free_bytes` and `texture_bytes`;
+the host's frame limit, if any; the swap file `<hard disk folder>/pagefile.sys`); the converted
+textures' arena (`texture_bytes`, 14 MB; `WL_XB_TEXTURE_MB` on the host); threads; the
 image; the kernel (`wl/xboxkrnl`); the thunks; the MCPX devices and the GPU (wl/xbox's model when
 it is built in, else the stub); the service thread; then the entry point on a guest thread of its
 own. It returns the process's exit code. `wl_xboxrt_main` is a `main`: on the host

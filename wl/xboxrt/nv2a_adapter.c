@@ -57,6 +57,17 @@ static void *phys_ptr(void *user, uint32_t phys, uint32_t bytes) {
     return wl_xb_phys_ptr(phys);
 }
 
+// the write watch (mem.h): a converted texture is only read again once its pages were stored to
+static uint32_t tex_watch(void *user, uint32_t phys, uint32_t bytes) {
+    (void)user;
+    return wl_xb_phys_watch(phys, bytes);
+}
+
+static bool tex_written(void *user, uint32_t phys, uint32_t bytes, uint32_t stamp) {
+    (void)user;
+    return wl_xb_phys_written(phys, bytes, stamp);
+}
+
 static uint32_t a_read(void *gpu, uint32_t offset, unsigned size) {
     return wl_nv2a_mmio_read(gpu, offset, size);
 }
@@ -79,9 +90,13 @@ static void gpu_status(void) {
              (unsigned)gs.perspective_draws, (unsigned)gs.target_draws, (unsigned)gs.target_skipped,
              (unsigned)gs.stencil_skipped, (unsigned)gs.stencil_ignored, (unsigned)gs.programs_unusable,
              (unsigned)gs.approximations);
-    WL_LOG_I(TAG, "status: depth fits %u made, %u shared; textures %u KB kept, %u converted, %u failed, %u evicted",
+    WL_LOG_I(TAG, "status: depth fits %u made, %u shared; textures %u KB kept (%u KB drawn in the last frame, "
+             "%u KB at most), %u converted, %u made again, %u failed (%u for memory), %u evicted; %u checks, %u by "
+             "the write watch, %u hashes (%u KB)",
              (unsigned)gs.fits_made, (unsigned)gs.fits_shared, (unsigned)(ts.bytes / 1024u),
-             (unsigned)ts.converted, (unsigned)ts.failed, (unsigned)ts.evicted);
+             (unsigned)(ts.frame_bytes / 1024u), (unsigned)(ts.peak_frame_bytes / 1024u), (unsigned)ts.converted,
+             (unsigned)ts.reconverted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.evicted,
+             (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed, (unsigned)(ts.hashed_bytes >> 10));
 }
 
 static void a_vblank(void *gpu) {
@@ -114,7 +129,7 @@ static bool a_irq(const void *gpu) {
 
 static const WlXbGpuOps k_ops = {a_read, a_write, a_vblank, a_irq};
 
-WlResult wl_xb_gpu_attach_nv2a(void) {
+WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
     // the draws go to GX (over libogc on the Wii, the host's recorder elsewhere)
     if (!wl_gx_ready() && wl_gx_init() != WL_OK) {
         WL_LOG_E(TAG, "GX did not start: the title's frames are not drawn");
@@ -124,8 +139,20 @@ WlResult wl_xb_gpu_attach_nv2a(void) {
     if (wl_gx_ready()) {
         WlNv2aGxConfig gcfg;
         memset(&gcfg, 0, sizeof gcfg);
-        gcfg.textures.budget = 8u << 20; // a title's menu alone keeps several MB of textures
+        // the textures in an arena of their own (the boot's): a texture makes room by evicting
+        // others, and the host's other memory is not fragmented by them
+        size_t bytes = texture_bytes != 0 ? texture_bytes : 8u << 20;
+        if (texture_arena != NULL) {
+            gcfg.textures.arena = texture_arena;
+            gcfg.textures.arena_bytes = bytes;
+        } else {
+            gcfg.textures.budget = bytes;
+        }
+        gcfg.textures.watch = tex_watch;
+        gcfg.textures.written = tex_written;
         g_gx = wl_nv2a_gx_create(&gcfg);
+        WL_LOG_I(TAG, "textures: %u KB %s; checked through the write watch where the guest is paged",
+                 (unsigned)(bytes >> 10), texture_arena != NULL ? "in an arena of their own" : "of the heap");
         if (g_gx != NULL) {
             wl_nv2a_gx_backend(g_gx, &backend);
         }

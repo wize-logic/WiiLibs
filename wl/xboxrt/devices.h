@@ -94,9 +94,11 @@ typedef struct {
 void wl_xb_gpu_stub_stats(const WlXbGpuStub *gpu, WlXbGpuStubStats *out);
 
 // wl/xbox's NV2A model behind the same interface (nv2a_adapter.c, built when wl/xbox has it):
-// creates the model with phys_ptr = the guest's window and attaches it. WL_ERR_UNSUPPORTED in a
+// creates the model with phys_ptr = the guest's window and attaches it, its converted textures
+// kept in `texture_arena` (`texture_bytes`, 32-byte aligned; NULL: the heap, within
+// `texture_bytes` or 8 MB) and checked through the write watch (mem.h). WL_ERR_UNSUPPORTED in a
 // build without it.
-WlResult wl_xb_gpu_attach_nv2a(void);
+WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes);
 // Captures `frames` frames of the GPU's work (push buffers and the guest memory they read;
 // wl/xbox/nv2a_capture.h) into `path`, starting `after_vblanks` vertical blanks from now, for
 // tools/xbox_nv2a_replay. On the host the WL_XB_CAPTURE environment variable sets it too:
