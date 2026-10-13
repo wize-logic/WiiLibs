@@ -45,6 +45,7 @@ static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *p
         memcpy(r.xmm, mc->fpregs->_xmm, sizeof r.xmm);
     }
     *pc = (uintptr_t)r.rip;
+    wl_xb_mmio_set_fault_pc(*pc);
     uint32_t len = wl_xb_x86_emulate((const uint8_t *)(uintptr_t)r.rip, &r, va, what);
     if (len == 0) {
         return false;
@@ -65,6 +66,7 @@ static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *p
     unsigned long *g = uc->uc_mcontext.uc_regs->gregs;
     uint32_t nip = (uint32_t)g[PPC_NIP];
     *pc = nip;
+    wl_xb_mmio_set_fault_pc(*pc);
     uint32_t insn = *(const uint32_t *)(uintptr_t)nip;
     WlXbPpcAccess a;
     WlXbPpcDecode d = wl_xb_ppc_decode(insn, &a);

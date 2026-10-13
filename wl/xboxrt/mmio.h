@@ -44,6 +44,12 @@ const WlXbDevice *wl_xb_mmio_find(uint32_t va);
 bool wl_xb_mmio_read(uint32_t va, unsigned size, uint64_t *value);
 bool wl_xb_mmio_write(uint32_t va, uint64_t value, unsigned size);
 
+// The host PC of the guest access being emulated, as the fault handler saw it (0 when it does not
+// say: the Wii's handler, or a call from C): a device's trace names the translated function with
+// it (crash.h's wl_xb_symbolize).
+void wl_xb_mmio_set_fault_pc(uintptr_t pc);
+uintptr_t wl_xb_mmio_fault_pc(void);
+
 // Counters for tests and reports.
 typedef struct {
     uint32_t reads, writes, unclaimed;
