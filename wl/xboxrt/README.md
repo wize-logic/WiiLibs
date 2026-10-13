@@ -4,10 +4,12 @@ Target `wl_xboxrt` (alias `WiiLibs::xboxrt`) depends on `wl_platform` and `wl_ba
 lifted from x86 to C (xboxrecomp's pipeline; the generated code's header is
 `wl/xboxrt/recomp/recomp_types.h`) runs on it: guest memory at the Xbox's addresses, devices behind
 faults, the register file the generated code reads, guest threads under one guest lock,
-interrupts, the kernel thunk dispatcher, crash reports. The kernel itself is `wl/xboxkrnl`. The boot
-code that joins them is `wl_xboxrt_boot` (`boot.h`), and `wl_xboxrt_main` is a `main` over it.
+interrupts, the kernel thunk dispatcher, crash reports, the USB controllers with the gamepads, and a
+play harness that drives them from a script. The kernel itself is `wl/xboxkrnl`. The boot code
+that joins them is `wl_xboxrt_boot` (`boot.h`), and `wl_xboxrt_main` is a `main` over it.
 Headers: `mem.h`, `mmio.h`, `regs.h`, `thread.h`, `irq.h`, `thunk.h`, `crash.h`, `xbe.h`,
-`devices.h`, `boot.h`, and the decoders `ppc_decode.h` and `x86_decode.h`.
+`devices.h`, `usb.h`, `pad.h`, `input.h`, `play.h`, `boot.h`, and the decoders `ppc_decode.h` and
+`x86_decode.h`.
 
 Builds on the Wii (the MMU backend), on the host and on ppc-be (a reservation and `SIGSEGV`). Every
 guest access is little-endian whatever the host's byte order (`wl_xb_rd32` and the rest; the
@@ -176,7 +178,9 @@ next holder is the highest-priority ready thread, first come first served within
 `wl_xb_thread_setup_guest` gives a thread its guest stack (with a guard page), its KPCR (NtTib with
 the SEH chain end, StackBase/StackLimit, Prcb, IRQL, CurrentThread) and KTHREAD, and its TLS block
 laid out as xboxrecomp does (the slot XAPI reads at StackBase). `wl_xb_call_guest` calls guest code
-from C (stdcall or cdecl).
+from C (stdcall or cdecl). `wl_xb_thread_create_host` runs a C routine as a guest thread (its own
+guest stack, KPCR and TLS, under the lock, not one of the title's threads): runtime code that reads
+guest memory, calls guest code or waits as a title thread would (the play harness).
 
 ## Interrupts (`irq.h`)
 
@@ -191,6 +195,10 @@ a kernel call, an `rdtsc` or a device access holds interrupts off (see `g_xb_att
 service thread logs which thread it is once it has waited a second for the lock, and on the host
 and ppc-be that thread logs its host PC and the translated functions it is in.
 
+Work at each vertical blank beyond the GPU's (the controller ports, the USB frame tick, the play
+harness) is added with `wl_xb_service_add_vblank_hook` (up to eight, run in order after the GPU's);
+`wl_xb_vblank_count` is the guest's frame clock.
+
 A device with periodic work (the audio processor's frames) adds a tick
 (`wl_xb_service_add_tick(fn, user, period_us)`, up to four): the service thread marks it due at its
 period and raises `WL_XB_SVC_DEVICE`, and the work runs `fn` with the lock held before the kernel's
@@ -200,9 +208,9 @@ back-edge hook gives the device its frames (DirectSound waiting for its GP comma
 
 ## The GPU and the MCPX (`devices.h`)
 
-`wl_xb_devices_register_mcpx` registers idle MCPX devices: the APU (its sample counter moving at
-48 kHz), AC'97 (codec not ready, so `DirectSoundCreate` fails cleanly), the USB host controllers
-(two powered ports, nothing connected), the NIC and the flash.
+`wl_xb_devices_register_mcpx` registers the MCPX's devices: the APU (idle, its sample counter
+moving at 48 kHz), AC'97 (idle, codec not ready, so `DirectSoundCreate` fails cleanly), the USB host
+controllers with the gamepads (below), the NIC and the flash (idle).
 
 **Audio** (`audio.c`, built when `wl/xboxapu` is): `wl_xb_audio_attach` puts wl/xboxapu's APU and
 AC'97 models over the idle ones (the boot code does, unless `WlXbTitleConfig.audio_off`), with
@@ -222,7 +230,9 @@ nothing in a title's code is replaced, nothing is title-specific.
   idle devices (DirectSoundCreate fails, the title runs silent).
 - Every 10 s an `xbaudio` status line: frames run (and silent), voices a frame, what a frame costs
   in nanoseconds, notifiers, traps, GP commands, starved stream frames, clipped samples, output
-  underruns, AC'97 buffers. The GPU is behind `WlXbGpuOps`
+  underruns, AC'97 buffers.
+
+**The GPU** is behind `WlXbGpuOps`
 (`mmio_read`, `mmio_write`, `vblank`, `irq_pending`): `wl_xb_gpu_attach` registers the 16 MB at
 `0xFD000000`, the vblank hook and interrupt line 3 as a level source. `gpu_stub.c` is an idle NV2A
 (PMC boot id, PFIFO idle with GET following PUT, PTIMER, the PCRTC vblank interrupt). When
@@ -239,6 +249,90 @@ bool wl_nv2a_irq_pending(const WlNv2a *gpu);
 
 `phys_ptr` returns `wl_xb_phys_ptr(phys)`, the window's host address of guest-physical memory. On
 the Wii that is an MMU-mapped EA: the CPU may use it, GX and DMA may not.
+
+## The controllers (`usb.h`, `pad.h`, `input.h`)
+
+Retail titles link the XDK's XAPI and drive the USB host controllers themselves: `XInputOpen`,
+`XInputGetState`, `XInputSetState` and `XGetDeviceChanges` end in endpoint and transfer descriptors
+the title builds in its memory (Halo's `input_update`, `sub_000E3750`, calls all four; its rumble
+thread `XInputSetState`). So the gamepads are hardware here, not a replaced API:
+
+- **The host controllers** (`usb_ohci.c`, `usb.h`): two OHCI 1.0a controllers, 0xFED00000 on
+  interrupt line 1 and 0xFED08000 on line 9, behind the device faults. The registers keep their
+  set/clear and write-one-to-clear semantics; the control, bulk and periodic lists are walked in
+  guest memory (physical addresses through the window, little-endian), one done queue per pass and
+  never while the driver owns the last, short IN packets as DATAUNDERRUN with the endpoint halted;
+  the interrupt is a level source. The lists are walked at each vertical blank (one packet per
+  interrupt endpoint: a report a frame) and, for control and bulk transfers, as soon as the title
+  fills them or acknowledges a done queue, so enumeration does not wait for frames.
+- **The gamepads** (`usb_xid.c`): a Controller S each (045E:0289, interface class 0x58 subclass
+  0x42): the standard descriptors, the XID descriptor and capabilities (XAPI's test of "is this a
+  controller"), GET_REPORT, the 20-byte report on interrupt endpoint 1, rumble from endpoint 2 or
+  SET_REPORT. Xbox port p sits on root hub port 3, 4, 1, 2 as on the console; a pad is plugged in
+  once the driver runs with the root hub's change interrupt on (its own scan clears an earlier
+  change), one at a time, and unplugged when its port goes.
+- **The gamepad as data** (`pad.h`): `WlXboxPad` (XINPUT_GAMEPAD's layout: a digital word, eight
+  analogue buttons, two sticks), its report both ways, the rumble report, and the Wii's controllers
+  mapped onto it as OpenCE-Wii maps them for Halo (`xinput_wii_map.c`, CC0): the GameCube
+  controller; the Classic Controller; the Wii Remote with a Nunchuk, whose IR pointer is the right
+  stick (a dead zone in the middle, a squared ramp to full turn at the edge, `wl_pointer_turn`).
+  Rumble (two 16-bit motors) is duty-cycled onto an on/off motor.
+- **The ports** (`input.h`): each port's state is what the host's controllers press (the Wii's
+  Remote, extension and GameCube controller of the same number; none on the host) laid over by what
+  the play harness presses; port 1 always has a controller, the others while the host has one,
+  unless a script plugs or unplugs them. Rumble goes back to the host controller of the same number.
+  `wl_xb_input_frame` runs at each vertical blank (the boot code adds it).
+
+Provenance: `usb_ohci.c` and `usb_xid.c` derive from xboxrecomp's `src/usb` (MIT; the register
+semantics, the list walking, the descriptors and the lessons in their comments), restructured over
+the device faults and the vertical blank.
+
+## The play harness (`play.h`)
+
+A scripted player, so that runs without a person go through the menus, into levels and through
+them, and are checked from their logs: OpenCE-Wii's `port/linux/src/test_input.c` (CC0) rebuilt for
+any recompiled title. Started with a setting: `WlXbTitleConfig.play`, on the host `WL_XB_PLAY`
+(a host path after `script:`; `WL_XB_PLAY_OUT=<folder>` for screenshots), on the Wii the first line
+of `<title folder>/play.cfg`:
+
+| Setting | |
+|---|---|
+| `script:<file>` | the steps of a file (relative to the title folder, or absolute) |
+| `bot:<seed>` | controller 1 plays as the bot (walks, turns, looks, fires every 3 s, jumps every 5, a grenade every 7) |
+| `look:<seed>` | controller 1 only turns and looks up and down |
+
+The steps (play.h lists them with their arguments): `wait`, `frames`, `vblanks`; `press`, `hold`,
+`down`/`up`/`release`, `stick`, `trigger`; `screen`, `focus`, `select`, `play`, `ticks`,
+`checkpoint`, `until <predicate>`, `memory <address>[:size] [&mask] <op> <value>`, `peek`;
+`do <action>`, `load <map>`; `bot`, `look`; a title's long steps (`objective 3600`); `log`,
+`screenshot`, `capture`; `player <n>`, `<n>: <step>`, `connect`, `disconnect`, `bot <n> <seed>`;
+`repeat`/`end`; `quit`. Durations are seconds, `<n>f` frames or `<n>t` the title's ticks; a wait
+gives up at its timeout (120 s unless given) and stops the script. Every line it logs starts with
+`test_input:` (tag `play`): each step as it begins with the script's clock, what the title reports
+as it changes (screen, focus, in or out of a game, checkpoints), and the end (`script finished`,
+or `script stopped at line N (...): why` with what was shown).
+
+- **Frames** run on a runtime guest thread (`wl_xb_thread_create_host`, priority 31) woken at each
+  vertical blank, or, once a title calls `wl_xb_play_frame_point` from its own game loop (Halo does,
+  from a function its main loop calls once a frame, through the generated code's trace hook), at
+  that point, on the title's thread between two frames. Either way under the guest lock: a title's
+  callbacks read guest memory and may call guest code (`wl_xb_call_guest`).
+- **What a title registers** (from `wl_xb_title_setup`, a weak hook `wl_xboxrt_main` calls before
+  the boot, which a title project's source replaces): text values (`screen`, `focus`), numbers
+  (`tick`, -1 outside a game; `tick_rate`; `checkpoints`; `frame`; `menu`; `menu_busy`;
+  `player_x_mm`..., logged with `log`), predicates (`play`, any `until <name>`), actions
+  (`load`, any `do <name>`), long steps (`wl_xb_play_register_step`: begin, a frame callback that
+  fills the controller and says running, done or failed, end; timed out at the line's last number,
+  counted in the title's ticks in a game), and a per-frame hook.
+- **Timing**: a press holds and releases for at least 100 ms, 4 reports to the title and 2 of its
+  `frame`s each; the script's clock counts vertical blanks (59.94 a second, a stall of loading
+  counted as a quarter second); in a game, holds and the bot count the title's ticks, so a slower
+  host moves as far and the bot's input at a given tick is the same on every run.
+- **Screenshots**: on the host wl/gxsoft draws the next two frames (the first may begin mid-frame)
+  and the second becomes `<out>/<name>.png`; on the Wii a one-frame GPU capture (`<name>.cap`, for
+  `tools/xbox_nv2a_replay CAP --png-gx DIR`). `capture <frames>` takes a longer capture on both.
+- **Not deterministic**: the guest's clocks are the host's, so how many game ticks a frame runs
+  depends on the host's speed; only the input is tied to the game's ticks.
 
 ## The XBE loader (`xbe.h`)
 
@@ -257,8 +351,11 @@ limit, if any; the swap file `<hard disk folder>/pagefile.sys`); threads; the
 image; the kernel (`wl/xboxkrnl`); the thunks; the MCPX devices and the GPU (wl/xbox's model when
 it is built in, else the stub); the service thread; then the entry point on a guest thread of its
 own. It returns the process's exit code. `wl_xboxrt_main` is a `main`: on the host
-`prog <title folder> [hdd folder]` (`WL_XB_TRACE=1` logs every kernel call), on the Wii
-`sd:/xbox/<WL_XB_TITLE_NAME>`.
+`prog <title folder> [hdd folder]` (`WL_XB_TRACE=1` logs every kernel call; `WL_XB_PLAY`,
+`WL_XB_PLAY_OUT` start the play harness), on the Wii `sd:/xbox/<WL_XB_TITLE_NAME>`; it calls
+`wl_xb_title_setup(&cfg)` first, a weak hook a title's own source may define. The seed file
+(`<hdd folder>/recomp_seeds.json`) gets every indirect-call target that had no translated function,
+appended to what the file holds.
 
 ## Crash reports (`crash.h`)
 
@@ -278,6 +375,15 @@ Wii, `abort` elsewhere; `wl_xb_crash_set_stop` replaces it).
   buffers larger than the pool; built again without a swap file (`test_xboxrt_paging_no_swap`).
 - `tests/xboxrt/test_xboxrt_decode.c`: the PowerPC decoder over a matrix of forms, the x86-64
   decoder over byte strings (portable).
+- `tests/xboxrt/test_xboxrt_pad.c`: the gamepad's report both ways, rumble, merging, the
+  GameCube, Classic and Remote mappings (the pointer as the right stick), the rumble's duty cycle,
+  and the ports over the host stub's input (portable).
+- `tests/xboxrt/test_xboxrt_usb.c`: the host controller and a gamepad driven as XAPI drives them:
+  bring-up, the plug-in on root hub port 3, port reset, enumeration (descriptors, address,
+  configuration, XID, a stalled string), DATAUNDERRUN, the report on the periodic list, rumble on
+  endpoint 2 and SET_REPORT, unplugging and plugging two pads one at a time (host, ppc-be).
+- `tests/xboxrt/test_xboxrt_play.c`: the harness against a pretend title (every kind of step,
+  frames from the title's frame point, the "test_input:" lines), the parser's errors, the bot.
 - `tests/xboxrt/test_xboxrt_abi.c`: the register file and the runtime's functions against the
   generated code's header, when `WL_XBRT_RECOMP_HEADER_DIR` has one.
 - `tests/xboxrt/e2e/`: a synthetic title written in C, built for i386, wrapped in an XBE, lifted by
@@ -306,4 +412,8 @@ python3 tools/dolphin_run.py build/wii/tests/console/wl_xboxrt_console.dol \
   the IOS's DMA cannot reach.
 - A misaligned access that crosses a page maps both pages on the Wii's first-touch path.
 - `KeQueryPerformanceFrequency` is 3 375 000 Hz and `rdtsc` 733.33 MHz, the retail console's.
-- Provenance: `x86_decode.c`/`.h` derive from xboxrecomp (MIT); `third_party/README.md` lists it.
+- The physical allocator keeps the low 0x60000 bytes (the retail kernel's image) out of normal
+  allocations, and lends them only to a contiguous request nothing else satisfies: Halo pins
+  0x61000..0x19A6000, and D3D's handle tables then ask for a page below 16 MB as a10 loads.
+- Provenance: `x86_decode.c`/`.h`, `usb_ohci.c` and `usb_xid.c` derive from xboxrecomp (MIT);
+  `third_party/README.md` lists them. `pad.c`'s mappings and `play.c` come from OpenCE-Wii (CC0).

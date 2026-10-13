@@ -26,6 +26,13 @@ static struct {
 } g_tick[WL_XB_MAX_TICKS];
 static uint32_t g_tick_count;
 static WlXbServiceConfig g_cfg;
+#define MAX_VBLANK_HOOKS 8u
+static struct {
+    WlXbVblankFn fn;
+    void *user;
+} g_vblank_hooks[MAX_VBLANK_HOOKS];
+static uint32_t g_vblank_hook_count;
+static volatile uint32_t g_vblank_count;
 
 static WlPlatformMutex g_sm; // g_pending, g_deadline, the service thread's sleep
 static WlPlatformCond g_sc;
@@ -66,6 +73,23 @@ void wl_xb_service_set_handler(WlXbServiceFn fn, void *user) {
 void wl_xb_service_set_vblank(WlXbVblankFn fn, void *user) {
     g_vblank_user = user;
     g_vblank_fn = fn;
+}
+
+WlResult wl_xb_service_add_vblank_hook(WlXbVblankFn fn, void *user) {
+    if (fn == NULL) {
+        return WL_ERR_ARG;
+    }
+    if (g_vblank_hook_count == MAX_VBLANK_HOOKS) {
+        return WL_ERR_LIMIT;
+    }
+    g_vblank_hooks[g_vblank_hook_count].user = user;
+    g_vblank_hooks[g_vblank_hook_count].fn = fn;
+    g_vblank_hook_count++;
+    return WL_OK;
+}
+
+uint32_t wl_xb_vblank_count(void) {
+    return g_vblank_count;
 }
 
 WlResult wl_xb_service_add_tick(WlXbTickFn fn, void *user, uint32_t period_us) {
@@ -215,9 +239,15 @@ static void run_service(void) {
             g_deadline = 0;
             reasons |= WL_XB_SVC_TIMER;
         }
-        if ((reasons & WL_XB_SVC_VBLANK) && g_vblank_fn != NULL) {
+        if (reasons & WL_XB_SVC_VBLANK) {
             g_stats.vblanks++;
-            g_vblank_fn(g_vblank_user);
+            g_vblank_count++;
+            if (g_vblank_fn != NULL) {
+                g_vblank_fn(g_vblank_user);
+            }
+            for (uint32_t i = 0; i < g_vblank_hook_count; i++) {
+                g_vblank_hooks[i].fn(g_vblank_hooks[i].user);
+            }
         }
         if (reasons & WL_XB_SVC_DEVICE) {
             run_ticks();

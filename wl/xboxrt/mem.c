@@ -32,6 +32,7 @@ static Region *g_regions;   // reservations, sorted by base
 static uint32_t g_region_count;
 static uint32_t g_top_hint; // no free page above this one
 static uint32_t g_used, g_user_pages, g_contig_pages, g_relocations;
+static uint32_t g_low_pages; // the reserved low pages (the retail kernel's), lent as a last resort
 
 void wl_xb_mem_config_default(WlXbMemConfig *cfg) {
     memset(cfg, 0, sizeof *cfg);
@@ -91,6 +92,7 @@ WlResult wl_xb_mem_init(const WlXbMemConfig *cfg) {
     uint32_t top = cfg->gpu_instance_bytes >> WL_XB_PAGE_SHIFT;
     mark(0, low, K_RESERVED);
     mark(pages - top, top, K_RESERVED);
+    g_low_pages = low;
     g_used = low + top;
     g_top_hint = pages - top;
     uintptr_t base = 0;
@@ -221,6 +223,39 @@ WlResult wl_xb_phys_alloc(uint32_t bytes, uint32_t lowest, uint32_t highest, uin
                 break;
             }
             start -= align_pages;
+        }
+    }
+    // The last resort: the low pages the retail kernel's image would hold, which titles never pin
+    // (they pin right above them) and nothing here uses. A request that must lie low finds the
+    // rest of that range pinned by the title: Halo pins physical 0x61000..0x19A6000, and D3D's
+    // handle tables then ask for a page below 16 MB (MmAllocateContiguousMemoryEx(0x1000, 0,
+    // 0xFFFFFF) from 0x001810AD) when a10 loads. Page 0 stays out.
+    uint32_t low_end = end_page < g_low_pages ? end_page : g_low_pages;
+    uint32_t low_lo = lo_page > 1u ? lo_page : (align_pages > 1u ? align_pages : 1u);
+    if (low_end >= low_lo + pages) {
+        for (uint32_t start = (low_end - pages) / align_pages * align_pages; start >= low_lo; start -= align_pages) {
+            bool free_run = true;
+            for (uint32_t p = start; p < start + pages && free_run; p++) {
+                free_run = g_kind[p] == K_RESERVED && g_run[p] == 0;
+            }
+            if (free_run) {
+                for (uint32_t p = start; p < start + pages; p++) {
+                    g_kind[p] = K_CONTIG;
+                }
+                g_run[start] = pages;
+                g_contig_pages += pages;
+                static bool logged;
+                if (!logged) {
+                    logged = true;
+                    WL_LOG_I(TAG, "contiguous 0x%x in [0x%08x, 0x%08x]: lent the kernel's reserved low pages (0x%08x)",
+                             (unsigned)bytes, (unsigned)lowest, (unsigned)highest, (unsigned)(start << WL_XB_PAGE_SHIFT));
+                }
+                *out = start << WL_XB_PAGE_SHIFT;
+                return WL_OK;
+            }
+            if (start < align_pages + low_lo) {
+                break;
+            }
         }
     }
     return WL_ERR_NOMEM;
