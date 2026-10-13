@@ -28,6 +28,10 @@ recomp_func_t recomp_lookup(uint32_t xbox_va);        // generated (recomp_dispa
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va); // weak default here: the title's hook, else NULL
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va); // here: the thunk dispatcher for 0xFE000000 + slot * 4
 void recomp_icall_fail_log(uint32_t va);
+// Where the indirect-call targets that had no translated function are recorded (a JSON seed file for
+// tools/xbox_recomp.py's "seed_functions": recompiling with it translates them); NULL or "": none.
+// What an earlier run recorded there is kept.
+void wl_xb_set_seed_file(const char *path);
 void recomp_icall_not_code_log(uint32_t va);
 void recomp_debug_service(uint32_t service, uint32_t arg_va);
 uint64_t xbox_ReadTimeStampCounter(void);

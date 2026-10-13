@@ -81,6 +81,11 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     wl_platform_fs_mount(WL_DEVICE_SD);
 #endif
     WL_LOG_I(TAG, "title %s, data %s", xbe_path, data_dir);
+    {
+        char seeds[sizeof data_dir + 24];
+        snprintf(seeds, sizeof seeds, "%s/recomp_seeds.json", data_dir);
+        wl_xb_set_seed_file(seeds);
+    }
 
     // ---- the XBE's headers ----------------------------------------------------------------------
     WlPlatformFile *file = NULL;

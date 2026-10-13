@@ -2,6 +2,7 @@
 // The runtime functions generated code calls, and the kernel thunk dispatcher (thunk.h).
 #include <setjmp.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "wl/platform/platform.h"
@@ -180,9 +181,79 @@ static bool first_time(uint32_t va) {
     return true;
 }
 
+// The targets that had no translated function, kept as a seed file for the next run of the
+// pipeline (tools/xbox_recomp.py's "seed_functions"; entries marked observed, which the
+// disassembler trusts): recompiling with it translates them. Rewritten whole on each new one.
+static char g_seed_path[WL_FS_PATH_MAX];
+static uint32_t g_seeds[512];
+static uint32_t g_seed_count;
+
+static bool seed_known(uint32_t va) {
+    for (uint32_t i = 0; i < g_seed_count; i++) {
+        if (g_seeds[i] == va) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void seeds_write(void) {
+    char tmp[WL_FS_PATH_MAX + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", g_seed_path);
+    WlPlatformFile *f = NULL;
+    if (wl_platform_fs_open(tmp, WL_FILE_WRITE_NEW, &f) != WL_OK) {
+        return;
+    }
+    char line[96];
+    wl_platform_fs_write(f, "[\n", 2);
+    for (uint32_t i = 0; i < g_seed_count; i++) {
+        int n = snprintf(line, sizeof line, " {\"start\": \"0x%08X\", \"observed\": true, \"note\": \"observed at runtime: indirect call\"}%s\n",
+                         (unsigned)g_seeds[i], i + 1u < g_seed_count ? "," : "");
+        wl_platform_fs_write(f, line, (uint32_t)n);
+    }
+    wl_platform_fs_write(f, "]\n", 2);
+    wl_platform_fs_close(f);
+    wl_platform_fs_remove(g_seed_path);
+    wl_platform_fs_rename(tmp, g_seed_path);
+}
+
+void wl_xb_set_seed_file(const char *path) {
+    g_seed_count = 0;
+    snprintf(g_seed_path, sizeof g_seed_path, "%s", path != NULL ? path : "");
+    if (g_seed_path[0] == '\0') {
+        return;
+    }
+    // keep what earlier runs recorded: every "0x" number in the file
+    WlPlatformFile *f = NULL;
+    if (wl_platform_fs_open(g_seed_path, WL_FILE_READ, &f) != WL_OK) {
+        return;
+    }
+    static char text[16384];
+    uint64_t size = wl_platform_fs_size(f);
+    if (size >= sizeof text) {
+        size = sizeof text - 1u;
+    }
+    if (wl_platform_fs_read_at(f, 0, text, (uint32_t)size) == WL_OK) {
+        text[size] = '\0';
+        for (const char *c = strstr(text, "0x"); c != NULL && g_seed_count < 512u; c = strstr(c + 2, "0x")) {
+            uint32_t va = (uint32_t)strtoul(c, NULL, 16);
+            if (va != 0 && !seed_known(va)) {
+                g_seeds[g_seed_count++] = va;
+            }
+        }
+    }
+    wl_platform_fs_close(f);
+}
+
 void recomp_icall_fail_log(uint32_t va) {
     if (first_time(va)) {
         WL_LOG_E(TAG, "indirect call to 0x%08x: no translated function there (esp 0x%08x)", (unsigned)va, (unsigned)g_esp);
+    }
+    if (g_seed_path[0] != '\0' && va >= g_xbox_code_lo && va < g_xbox_code_hi && !seed_known(va) &&
+        g_seed_count < 512u) {
+        g_seeds[g_seed_count++] = va;
+        seeds_write();
+        WL_LOG_I(TAG, "0x%08x added to %s: recompile with it as a seed to translate it", (unsigned)va, g_seed_path);
     }
 }
 
