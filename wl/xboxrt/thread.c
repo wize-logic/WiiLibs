@@ -493,7 +493,17 @@ WlResult wl_xb_thread_create(uint32_t routine, uint32_t ctx1, uint32_t ctx2, uin
     if (r != WL_OK) {
         return r;
     }
-    size_t host = g_cfg.host_stack_bytes;
+    // the host stack follows what the title asked for its guest stack (a recompiled guest frame is
+    // a C frame, of about twice the guest's bytes), within [192 KB, host_stack_bytes]: Halo's
+    // workers ask 16 KB and its main thread 512 KB, and seven 1 MB stacks were a quarter of what
+    // the Wii's host side has
+    size_t host = (size_t)(stack_bytes != 0 ? stack_bytes : g_cfg.default_stack_bytes) * 2u;
+    if (host < (192u << 10)) {
+        host = 192u << 10;
+    }
+    if (host > g_cfg.host_stack_bytes) {
+        host = g_cfg.host_stack_bytes;
+    }
     t->host_stack = aligned_alloc(64, host);
     if (t->host_stack == NULL) {
         return WL_ERR_NOMEM;

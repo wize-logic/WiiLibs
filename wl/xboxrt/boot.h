@@ -31,7 +31,7 @@ typedef struct {
     bool gpu_stub;               // the idle NV2A even when wl/xbox's model is built in
     uint32_t frame_pool_bytes;   // the Wii: host memory for guest frames (0: as much as can be had,
                                  // leaving `keep_free_bytes`)
-    uint32_t keep_free_bytes;    // the Wii: 8 MB by default
+    uint32_t keep_free_bytes;    // the Wii: 14 MB by default
     uint32_t htab_bytes;         // the Wii's page table: 256 KB by default
     bool trace_kernel_calls;     // log every kernel call
     void (*kernel_config)(WlXkConfig *cfg, void *user); // edits the kernel's settings before init

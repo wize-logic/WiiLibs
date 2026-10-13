@@ -151,6 +151,12 @@ void wl_platform_mutex_destroy(WlPlatformMutex mutex) {
 }
 
 // ---- Detached threads, exit, ids, priorities ------------------------------------------------
+// An lwp_t is the bitwise complement of its KThread's address (LWP_JoinThread does
+// KThreadJoin((KThread *)~t)), not the address itself.
+static KThread *kthread_of(lwp_t t) {
+    return (KThread *)(uintptr_t)~t;
+}
+
 // An LWP thread's control block (a KThread, which LWP_CreateThread allocates; the lwp_t is its
 // address) is freed by LWP_JoinThread. A detached thread is remembered here and joined once it
 // has finished, at the next detach or create: no thread waits for it.
@@ -160,7 +166,7 @@ static lwp_t g_detached[MAX_DETACHED];
 static void reap_detached(void) {
     for (uint32_t i = 0; i < MAX_DETACHED; i++) {
         lwp_t t = g_detached[i];
-        if (t != 0 && ((KThread *)(uintptr_t)t)->state == KTHR_STATE_FINISHED) {
+        if (t != 0 && kthread_of(t)->state == KTHR_STATE_FINISHED) {
             g_detached[i] = 0;
             (void)LWP_JoinThread(t, NULL); // finished: returns at once and frees the block
         }

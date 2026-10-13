@@ -28,7 +28,7 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     memset(cfg, 0, sizeof *cfg);
     cfg->xbe_name = "default.xbe";
     cfg->ram_mb = 64;
-    cfg->keep_free_bytes = 8u << 20;
+    cfg->keep_free_bytes = 14u << 20; // the host side: GX textures converted from the guest's, caches
     cfg->htab_bytes = 256u << 10;
 }
 
@@ -49,6 +49,7 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
 
     // ---- platform: the card, the log ------------------------------------------------------------
 #if defined(__wii__)
+    WlResult mem_result = WL_OK; // logged once the log is open (it is not yet)
     if (!wl_mem_ready()) {
         // wl_mem takes only what its heaps need (MEM1's budgets and arenas, a small MEM2 asset
         // heap): the rest stays malloc's, for the guest's frames and the host-side buffers. Its
@@ -61,11 +62,13 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
         wl_mem_config_default(&mcfg);
         mcfg.tags = tags;
         mcfg.tag_count = WL_TAG_BUILTIN_COUNT;
+        // (the per-frame arenas and the scene stack are a game engine's; the runtime does not use
+        // them, and MEM1 beside a recompiled title's ~12 MB of code has ~7 MB to give)
+        mcfg.frame_arena_size = 64u * 1024u;
+        mcfg.scene_stack_size = 64u * 1024u;
         mcfg.claim[WL_MEM1] = WL_MEM_CLAIM_NEEDED;
         mcfg.claim[WL_MEM2] = WL_MEM_CLAIM_NEEDED;
-        if (wl_mem_init(&mcfg) != WL_OK) {
-            WL_LOG_E(TAG, "wl_mem_init failed");
-        }
+        mem_result = wl_mem_init(&mcfg);
     }
     wl_platform_fs_mount(WL_DEVICE_SD);
     if (cfg->log_dir == NULL) {
@@ -74,6 +77,10 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
         snprintf(log_dir, sizeof log_dir, "%s", cfg->log_dir);
     }
     wl_platform_log_init(log_dir[0] != '\0' ? log_dir : NULL);
+    if (mem_result != WL_OK || !wl_mem_ready()) {
+        WL_LOG_E(TAG, "wl_mem_init: %s (ready %d): GX and the heaps that need it will not start",
+                 wl_result_name(mem_result), (int)wl_mem_ready());
+    }
     wl_platform_crash_report_install();
     wl_platform_video_init();
 #else

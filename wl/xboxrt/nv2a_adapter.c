@@ -101,6 +101,7 @@ WlResult wl_xb_gpu_attach_nv2a(void) {
     if (wl_gx_ready()) {
         WlNv2aGxConfig gcfg;
         memset(&gcfg, 0, sizeof gcfg);
+        gcfg.textures.budget = 8u << 20; // a title's menu alone keeps several MB of textures
         g_gx = wl_nv2a_gx_create(&gcfg);
         if (g_gx != NULL) {
             wl_nv2a_gx_backend(g_gx, &backend);

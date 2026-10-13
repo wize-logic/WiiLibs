@@ -78,8 +78,9 @@ typedef struct {
                                   // holder's next safe point whatever the priorities (NT boosts a
                                   // starved thread so; a busy-waiting holder would otherwise keep
                                   // lower-priority threads out for good): 30
-    uint32_t host_stack_bytes;    // each guest thread's host stack (the Wii; recompiled frames
-                                  // are C frames): 1 MB
+    uint32_t host_stack_bytes;    // the most a guest thread's host stack gets (recompiled frames
+                                  // are C frames; each gets twice its guest stack, 192 KB at
+                                  // least): 1 MB
     uint32_t default_stack_bytes; // a guest stack when the title asks for 0: 64 KB
 } WlXbThreadConfig;
 void wl_xb_thread_config_default(WlXbThreadConfig *cfg);

@@ -3,7 +3,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <malloc.h>
+
 #include "wl/platform/platform.h"
+
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/thread.h"
@@ -206,10 +209,28 @@ void wl_xb_service_poll_levels(void) {
     poll(true);
 }
 
+// Every 10 s: the guest's memory (pages committed, frames behind them) and the host's free memory,
+// the numbers a title's memory knobs (WlXbTitleConfig) are set from.
+static void status_report(void) {
+    WlXbMemStats m;
+    wl_xb_mem_stats(&m);
+#if defined(__GLIBC__)
+    struct mallinfo2 mi = mallinfo2();
+#else
+    struct mallinfo mi = mallinfo();
+#endif
+    WL_LOG_I(TAG, "status: guest %u of %u pages used (user %u, contiguous %u), %u frames (%u KB), "
+             "%u first touches, %u evictions; host malloc %u KB free of %u KB",
+             (unsigned)m.used_pages, (unsigned)m.ram_pages, (unsigned)m.user_pages, (unsigned)m.contig_pages,
+             (unsigned)m.frames, (unsigned)(m.frames * 4u), (unsigned)m.faults_resolved, (unsigned)m.evictions,
+             (unsigned)(mi.fordblks / 1024), (unsigned)(mi.arena / 1024));
+}
+
 static void *service_main(void *arg) {
     (void)arg;
     uint64_t vblank_period = g_cfg.vblank_hz_milli > 0 ? 1000000000ull / g_cfg.vblank_hz_milli : 16683u;
     uint64_t next_vblank = wl_platform_time_us() + vblank_period;
+    uint64_t next_status = wl_platform_time_us() + 10000000u;
     bool host_vblank = g_cfg.vblank;
 #if defined(__wii__)
     host_vblank = false; // the retrace makes them (relay_main)
@@ -237,6 +258,10 @@ static void *service_main(void *arg) {
         }
         update_tick();
         now = wl_platform_time_us();
+        if (now >= next_status) {
+            next_status = now + 10000000u;
+            status_report();
+        }
         if (host_vblank && now >= next_vblank) {
             next_vblank += vblank_period;
             if (next_vblank < now) {
