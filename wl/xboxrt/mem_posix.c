@@ -205,11 +205,18 @@ WlResult wl_xb_backend_page_fault(uint32_t ea) {
     }
     if (g_xb_pg_frame[p] == 0) {
         if (!wl_xb_lock_held()) {
-            return WL_ERR_DENIED; // only the lock's holder may wait for the swap file
+            return WL_ERR_DENIED; // only the lock's holder may change the tables (no mmu lock here)
         }
-        WlResult r = wl_xb_pg_fault(p, 0);
-        if (r != WL_OK) {
-            return r;
+        // as the Wii's DSI does: a zero page first through the exception-safe path (a free frame or
+        // a clean page's), the rest through the slow one
+        uint32_t f = g_xb_pg_slot[p] == 0 ? wl_xb_pg_frame_fast(p, 0) : 0u;
+        if (f != 0) {
+            wl_xb_mmu_frame_zero(p, f);
+        } else {
+            WlResult r = wl_xb_pg_fault(p, 0);
+            if (r != WL_OK) {
+                return r;
+            }
         }
     }
     uint8_t fl = g_xb_pg_flags[p];

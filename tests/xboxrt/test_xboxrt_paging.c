@@ -123,6 +123,7 @@ TEST zero_pages_go_for_nothing(void) {
     ASSERT(b.frames <= FRAMES);
     ASSERT(b.evictions - a.evictions >= 3u * FRAMES - 8u);
     ASSERT_EQ(b.evictions - a.evictions, b.clean_evictions - a.clean_evictions);
+    ASSERT(b.fast_evictions - a.fast_evictions >= FRAMES); // the exception-safe path's (the Wii's DSI)
     ASSERT_EQ(a.swap_outs, b.swap_outs);
     ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
     PASS();
