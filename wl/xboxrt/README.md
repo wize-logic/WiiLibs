@@ -105,6 +105,16 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
   reads guest memory (file I/O goes through bounce buffers, GX gets textures and vertices from
   host-side copies, the audio output from a host ring). Pin anything a future backend lets a DMA
   or an unlocked thread read.
+- **The write watch** (`wl_xb_phys_watch`, `wl_xb_phys_written`): whether a range of guest memory
+  was stored to since a stamp, from the same C bits, so that a cache of something made from guest
+  memory (the GPU's converted textures) need not read or hash it again. Each page has a write epoch,
+  set from a global count when a store to it is seen (a C bit harvested anywhere, the host's write
+  fault) or its bytes change otherwise (freed, moved); arming harvests and clears the pages' C bits
+  (with the `tlbie`: the TLB keeps C too) and takes the count; a look harvests and clears them
+  again and compares. A watched page's PTE never carries C ahead of a store, and the host opens a
+  watched page for writing only on a write. A swap-out and read back keep the page's bytes and its
+  epoch. Not where the MMU does not record C, and never for a pinned page on the host (open for
+  writing for good): there the caller compares the bytes.
 - **Statistics.** `WlXbMemStats` (evictions, the clean ones and those made in the fault, swap-ins,
   swap-outs and their write calls, bytes, time in swap I/O, slots), a second `[xbirq] status:` line
   every 10 s when paging, and a `thrashing:` warning when more than 128 pages a second (512 KB/s)

@@ -21,6 +21,13 @@
 // writes or reads; a touch that needs I/O goes to the slow path, in normal context with the guest
 // lock held.
 //
+// The write watch (mem.h, wl_xb_phys_watch) rides on the same C bits: each page has a write epoch,
+// set from a global count whenever a store to it is seen (a C bit harvested here or by the backend,
+// the host's write fault) or its contents change otherwise (freed: zero; moved). Arming a watch
+// harvests and clears the pages' C bits and takes the count as its stamp; a later look harvests
+// and clears them again and compares the epochs with the stamp. A watched page's PTE never carries
+// C ahead of a store (WL_XB_PG_WATCH), and a swap-out and read back keep its bytes and its epoch.
+//
 // Locking: the tables change with the guest lock held, and on the Wii inside wl_xb_mmu_lock
 // (interrupts off) for each step, so a DSI on another thread (the service thread's pinned
 // KeTickCount, a PTE reload) sees them whole; the I/O runs outside, its pages marked IO.
@@ -40,6 +47,8 @@ uint8_t *g_xb_pg_flags;
 uint16_t *g_xb_pg_frame;
 uint16_t *g_xb_pg_slot;
 uint32_t g_xb_pg_frames;
+uint32_t *g_xb_pg_wgen;
+uint32_t g_xb_pg_epoch = 1;
 
 static uint16_t *g_owner;  // [frames + 1] the page holding each frame, + 1 (0: free)
 static uint16_t *g_free;   // a stack of free frames
@@ -355,6 +364,7 @@ void wl_xb_pg_release(uint32_t p, uint32_t pages) {
             g_pinned--;
         }
         g_xb_pg_flags[k] = 0;
+        wl_xb_pg_wrote(k); // (zero from now on)
         wl_xb_mmu_unlock(lv);
     }
 }
@@ -376,6 +386,8 @@ void wl_xb_pg_move(uint32_t from, uint32_t to) {
     g_xb_pg_slot[from] = 0;
     g_xb_pg_flags[to] = g_xb_pg_flags[from];
     g_xb_pg_flags[from] = 0;
+    wl_xb_pg_wrote(from);
+    wl_xb_pg_wrote(to);
     if ((g_xb_pg_flags[to] & WL_XB_PG_PINNED) != 0) {
         wl_xb_mmu_pinned(to);
     }
@@ -417,6 +429,35 @@ WlResult wl_xb_pg_pin(uint32_t p, bool pin) {
     wl_xb_mmu_pinned(p);
     wl_xb_mmu_unlock(lv);
     return WL_OK;
+}
+
+uint32_t wl_xb_pg_watch(uint32_t p, uint32_t pages) {
+    if (g_xb_pg_frames == 0 || pages == 0 || p >= g_xb_ram_pages || pages > g_xb_ram_pages - p) {
+        return 0;
+    }
+    bool seen = true;
+    uint32_t lv = wl_xb_mmu_lock();
+    for (uint32_t k = p; k < p + pages; k++) {
+        g_xb_pg_flags[k] |= WL_XB_PG_WATCH;
+        seen = wl_xb_mmu_watch(k) && seen;
+    }
+    uint32_t stamp = g_xb_pg_epoch;
+    wl_xb_mmu_unlock(lv);
+    return seen ? stamp : 0u;
+}
+
+bool wl_xb_pg_written(uint32_t p, uint32_t pages, uint32_t stamp) {
+    if (stamp == 0 || g_xb_pg_frames == 0 || pages == 0 || p >= g_xb_ram_pages || pages > g_xb_ram_pages - p) {
+        return true;
+    }
+    bool written = false;
+    uint32_t lv = wl_xb_mmu_lock();
+    for (uint32_t k = p; k < p + pages && !written; k++) {
+        g_xb_pg_flags[k] |= WL_XB_PG_WATCH; // (a page freed since lost it)
+        written = !wl_xb_mmu_watch(k) || g_xb_pg_wgen[k] > stamp;
+    }
+    wl_xb_mmu_unlock(lv);
+    return written;
 }
 
 void wl_xb_pg_stats(WlXbMemStats *out) {
@@ -485,7 +526,9 @@ WlResult wl_xb_pg_init(const WlXbMemConfig *cfg, uint32_t frames) {
     g_xb_pg_slot = calloc(pages, sizeof *g_xb_pg_slot);
     g_owner = calloc(frames + 1u, sizeof *g_owner);
     g_free = calloc(frames, sizeof *g_free);
-    if (g_xb_pg_flags == NULL || g_xb_pg_frame == NULL || g_xb_pg_slot == NULL || g_owner == NULL || g_free == NULL) {
+    g_xb_pg_wgen = calloc(pages, sizeof *g_xb_pg_wgen);
+    if (g_xb_pg_flags == NULL || g_xb_pg_frame == NULL || g_xb_pg_slot == NULL || g_owner == NULL || g_free == NULL ||
+        g_xb_pg_wgen == NULL) {
         return WL_ERR_NOMEM;
     }
     for (uint32_t f = frames; f >= 1u; f--) {

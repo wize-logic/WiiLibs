@@ -15,6 +15,9 @@
 // again, and the next touch marks it used (the R bit). A page's bytes are always the object's;
 // the runtime reaches them through a third mapping (`g_door`) whatever the guest EAs allow; a
 // frame given back is punched out of the object, so the frames in use are what the host holds.
+// The write watch (paging.c) closes a watched page's EAs that are open for writing back to
+// read-only; its next write faults, which marks it written, and a watched page is only opened for
+// writing by a write.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -131,6 +134,18 @@ void wl_xb_mmu_harvest(uint32_t p, bool clear_ref) {
     }
 }
 
+bool wl_xb_mmu_watch(uint32_t p) {
+    if ((g_xb_pg_flags[p] & WL_XB_PG_PINNED) != 0) {
+        return false; // open for writing for good
+    }
+    for (uint32_t a = 0; a < 2u; a++) {
+        if (g_prot[a][p] == (PROT_READ | PROT_WRITE)) {
+            set_prot(p, a, PROT_READ, false);
+        }
+    }
+    return true;
+}
+
 void wl_xb_mmu_unmap(uint32_t p) {
     set_prot(p, 0, PROT_NONE, false);
     set_prot(p, 1, PROT_NONE, false);
@@ -221,10 +236,14 @@ WlResult wl_xb_backend_page_fault(uint32_t ea) {
     }
     uint8_t fl = g_xb_pg_flags[p];
     uint8_t cur = g_prot[a][p];
-    if (cur == PROT_READ) {
-        fl |= WL_XB_PG_DIRTY; // open for reading, so this was a write: the C bit
+    bool write = cur == PROT_READ; // open for reading, so this was a write: the C bit
+    if (write) {
+        fl |= WL_XB_PG_DIRTY;
+        wl_xb_pg_wrote(p);
     }
-    bool rw = (fl & (WL_XB_PG_DIRTY | WL_XB_PG_PINNED)) != 0;
+    // (a watched page opens for writing only on a write, so that each write after its watch was
+    // armed is seen)
+    bool rw = (fl & WL_XB_PG_PINNED) != 0 || write || ((fl & WL_XB_PG_DIRTY) != 0 && (fl & WL_XB_PG_WATCH) == 0);
     g_xb_pg_flags[p] = (uint8_t)(fl | WL_XB_PG_REF);
     // (already open as wanted: the mapping was replaced behind the table's back; set it again)
     set_prot(p, a, rw ? PROT_READ | PROT_WRITE : PROT_READ, cur == (rw ? (PROT_READ | PROT_WRITE) : PROT_READ));

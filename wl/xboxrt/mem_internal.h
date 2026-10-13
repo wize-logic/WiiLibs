@@ -47,11 +47,23 @@ WlResult wl_xb_backend_page_fault(uint32_t ea);
 #define WL_XB_PG_DIRTY 0x02u  // changed since its zero fill or its last copy in the swap file (C bits)
 #define WL_XB_PG_PINNED 0x04u // never gives its frame back
 #define WL_XB_PG_IO 0x08u     // its frame is being filled or written out: neither mapped nor taken
+#define WL_XB_PG_WATCH 0x10u  // a write watch covers it (wl_xb_pg_watch): its mappings see every store
+                              // (the Wii: a PTE never carries C ahead of a store)
 
 extern uint8_t *g_xb_pg_flags;  // [ram pages]
 extern uint16_t *g_xb_pg_frame; // [ram pages] 1..frames, 0: none
 extern uint16_t *g_xb_pg_slot;  // [ram pages] swap slot + 1, 0: none
 extern uint32_t g_xb_pg_frames; // frames in the pool; 0: paging is off (the OS backs every page)
+// The write watch: each page's write epoch, the epoch a store to it (a C bit harvested, the host's
+// write fault) or a change of its contents (freed, moved) was last seen at; the epoch counts up
+// from 1 with each such sighting. A watch's stamp is the epoch when it was armed.
+extern uint32_t *g_xb_pg_wgen;  // [ram pages]
+extern uint32_t g_xb_pg_epoch;
+
+// Page `p` was seen written (exception-safe; the MMU lock or exception context).
+static inline void wl_xb_pg_wrote(uint32_t p) {
+    g_xb_pg_wgen[p] = ++g_xb_pg_epoch;
+}
 
 // Starts the core over `frames` frames (at most 65535) and opens the swap file the configuration
 // names. Once, from the backend's init.
@@ -74,6 +86,11 @@ void wl_xb_pg_move(uint32_t from, uint32_t to);
 WlResult wl_xb_pg_pin(uint32_t p, bool pin);
 // The paging fields of the statistics.
 void wl_xb_pg_stats(WlXbMemStats *out);
+// The write watch over pages [p, p + pages) (mem.h, wl_xb_phys_watch): armed, its stamp (0 when the
+// MMU cannot see the stores to one of them); whether one was written since `stamp` (re-armed as it
+// is looked at). Lock held; no I/O, the pages are not touched.
+uint32_t wl_xb_pg_watch(uint32_t p, uint32_t pages);
+bool wl_xb_pg_written(uint32_t p, uint32_t pages, uint32_t stamp);
 
 // The backend's MMU, for the core. On the Wii they run in exception context too: no locks, no I/O.
 // The R and C bits of `p`'s live mappings into its flags (WL_XB_PG_REF, WL_XB_PG_DIRTY); with
@@ -90,6 +107,10 @@ void wl_xb_mmu_frame_drop(uint32_t p, uint32_t f);
 // Frame `f` goes from page `from` to page `to`, both unmapped (wl_xb_pg_move): a backend whose
 // frames are tied to pages (the host's) moves the bytes.
 void wl_xb_mmu_frame_move(uint32_t from, uint32_t to, uint32_t f);
+// Page `p`'s stores from now on are seen: a C bit its mappings have is harvested (the page seen
+// written: wl_xb_pg_wrote) and cleared, so that the next store sets it again. false when the MMU
+// cannot see the page's stores (no C bits; the host keeps a pinned page open).
+bool wl_xb_mmu_watch(uint32_t p);
 // Page `p` was pinned and has its frame: map it wherever a fault must not be needed (the host maps
 // both EAs read-write; the Wii's fast path maps a resident page without I/O, so nothing).
 void wl_xb_mmu_pinned(uint32_t p);
