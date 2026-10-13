@@ -5,14 +5,38 @@
 
 #include "wl/platform/gx_target_internal.h"
 #include "wl/platform/host/gx_host.h"
+#include "wl/platform/host/gx_renderer_host.h"
 
 static WlHostGxState s;
+static WlHostGxRenderer g_renderer;
+static bool g_renderer_set;
 static bool g_wide;
 static WlWidescreen g_widescreen = WL_WIDESCREEN_PILLARBOX;
 static bool g_validate = true;
 
 const WlHostGxState *wl_host_gx_state(void) {
     return &s;
+}
+
+void wl_host_gx_set_renderer(const WlHostGxRenderer *renderer) {
+    if (renderer != NULL) {
+        g_renderer = *renderer;
+    } else {
+        memset(&g_renderer, 0, sizeof g_renderer);
+    }
+    g_renderer_set = renderer != NULL;
+}
+
+const WlHostGxRenderer *wl_host_gx_renderer(void) {
+    return g_renderer_set ? &g_renderer : NULL;
+}
+
+// (a host texture object keeps its image's address in its opaque words)
+const void *wl_host_gx_tex_image(const WlGxTexObj *tex) {
+    const void *image;
+
+    memcpy(&image, tex->opaque, sizeof image);
+    return image;
 }
 
 void wl_host_gx_set_widescreen(bool widescreen) {
@@ -167,7 +191,9 @@ void wl_gx_set_validation(bool on) {
 }
 
 void wl_gx_set_efb_alpha(bool on) {
-    (void)on;
+    if (g_renderer_set && g_renderer.efb_alpha != NULL) {
+        g_renderer.efb_alpha(g_renderer.user, on);
+    }
 }
 
 void wl_gx_stats(WlGxStats *out) {
@@ -239,12 +265,16 @@ void wl_gx_begin_frame(uint32_t clear_rgba) {
     s.begin_frames++;
     s.in_frame = true;
     wl_gx_target_frame_begun();
+    if (g_renderer_set && g_renderer.frame_begin != NULL) {
+        g_renderer.frame_begin(g_renderer.user, clear_rgba);
+    }
 }
 
 void wl_gx_ramp_bind(uint32_t texmap) {
     if (check(texmap < 8u)) {
         s.ramp_binds++;
         s.ramp_texmap = texmap;
+        wl_host_gx_direct_ramp(texmap);
     }
 }
 
@@ -269,6 +299,9 @@ uint32_t wl_gx_end_frame(void) {
         if (vi.pillarbox) {
             (void)wl_gx_target_squeeze(vi.picture_x, vi.picture_width);
         }
+        if (g_renderer_set && g_renderer.frame_end != NULL) {
+            g_renderer.frame_end(g_renderer.user, vi.fb_width, vi.efb_height);
+        }
     }
     s.in_frame = false;
     s.end_frames++;
@@ -278,8 +311,9 @@ uint32_t wl_gx_end_frame(void) {
 }
 
 uint32_t wl_gx_peek_rgba(int x, int y) {
-    (void)x;
-    (void)y;
+    if (g_renderer_set && g_renderer.peek != NULL) {
+        return g_renderer.peek(g_renderer.user, x, y);
+    }
     return 0;
 }
 
@@ -289,7 +323,11 @@ void wl_gx_copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat
     if (!check(w > 0 && h > 0 && ((x | y | w | h) & 1) == 0 && ((uintptr_t)dst % 32u) == 0 && (unsigned)fmt < WL_GX_TEX_FORMAT_COUNT)) {
         return;
     }
-    memset(dst, 0, wl_gx_tex_bytes(fmt, (uint32_t)w, (uint32_t)h)); // the stub draws nothing: an empty image
+    if (g_renderer_set && g_renderer.copy != NULL) {
+        g_renderer.copy(g_renderer.user, x, y, (uint32_t)w, (uint32_t)h, dst, (unsigned)fmt, clear);
+    } else {
+        memset(dst, 0, wl_gx_tex_bytes(fmt, (uint32_t)w, (uint32_t)h)); // the stub draws nothing: an empty image
+    }
     s.efb_copies++;
     s.efb_copy_clears += clear ? 1u : 0u;
     s.efb_copy_rect[0] = x;
@@ -518,6 +556,7 @@ WlResult wl_gx_tex_init_ex(WlGxTexObj *tex, const WlGxTexDesc *d) {
         return WL_ERR_ARG;
     }
     memset(tex, 0, sizeof *tex);
+    memcpy(tex->opaque, &d->image, sizeof d->image);
     tex->sampler = d->sampler;
     tex->width = d->width;
     tex->height = d->height;
@@ -588,4 +627,8 @@ void wl_gx_tex_bind(const WlGxTexObj *tex) {
     wl_gx_tex_bind_ex(tex, NULL, NULL);
 }
 
-void wl_gx_tex_invalidate(void) {}
+void wl_gx_tex_invalidate(void) {
+    if (g_renderer_set && g_renderer.texture_invalidate != NULL) {
+        g_renderer.texture_invalidate(g_renderer.user);
+    }
+}

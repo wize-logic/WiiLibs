@@ -9,7 +9,7 @@ device that executes the title's push buffers ("The NV2A as a device", below). G
 game's own knowledge (programs it recognizes and makes by hand, its list of vertex programs) stays
 with the game. Headers: `wl/xbox/psh.h`, `wl/xbox/psh_cache.h`, `wl/xbox/vsh.h`,
 `wl/xbox/vsh_native.h`, and the NV2A's `nv2a.h`, `nv2a_regs.h`, `nv2a_kelvin.h`, `nv2a_capture.h`,
-`nv2a_texture.h`, `nv2a_texcache.h`, `nv2a_pipeline.h`, `nv2a_record.h`, `nv2a_raster.h`. Built with
+`nv2a_texture.h`, `nv2a_texcache.h`, `nv2a_pipeline.h`, `nv2a_record.h`. Built with
 `-ffp-contract=off` (`DETERMINISTIC`), so a vertex program gives the same bits interpreted or
 compiled, on every target.
 
@@ -128,7 +128,7 @@ time (the guest lock); backend callbacks run inside the MMIO write that kicked t
 - **Semaphores, notifiers, reports** are written into guest memory: the 3D class's back-end
   semaphore release (0x1D6C/0x1D70, Direct3D's fences), NOTIFY's notifier (and PGRAPH's NOTIFY
   interrupt for a NOTIFY of 1), GET_REPORT's pixel count (what the backend says it drew while
-  counting: the GX backend estimates the area, the software reference counts).
+  counting: the GX backend estimates the area).
 - **Traps.** NO_OPERATION with a parameter raises PGRAPH's ERROR interrupt with the method and data
   in TRAPPED_ADDR/DATA, as nxdk's pbkit uses it for callbacks; with the interrupt enabled the channel
   stops after it, as the GPU stalls, and goes on once the ISR clears it.
@@ -162,13 +162,19 @@ over in parts of whole primitives (a strip's parts even, so its winding holds).
   reorganized around the NV2A's state. Vertices through the title's program on the processor, sent
   in screen space through an orthographic projection with the depth range, or, for a program that
   divides by w, as (x w, y w, -w) through a perspective projection whose depth a + b / w is fitted
-  from the draw (the far plane moved so nothing is clipped there); indexed draws reuse the vertices
+  from the draw (a fit kept from an earlier draw used again, the same numbers, where it gives the
+  draw's depths, so that a pass over the same geometry with an EQUAL or LEQUAL test passes as on the
+  NV2A; the far plane moved so nothing is clipped there); indexed draws reuse the vertices
   run. The combiners through psh's cache (with a title's `WlXboxPshRecipe`), the fog psh's ramp, a
   program beyond GX texture 0 times colour. Blending, depth, alpha test and colour masks on GX
   (constant colours, MIN/MAX and src - dst approximated and counted); culling by the NV2A's rule on
-  the screen winding (GX's sense measured once at start); stencil draws skipped and counted. The
+  the screen winding (`wl_nv2a_cull`: SET_FRONT_FACE's CW is clockwise as the screen shows it, so
+  Direct3D's D3DCULL_CCW keeps a quad wound clockwise on the screen; GX's sense measured once at
+  start); stencil draws skipped and counted. The
   EFB is the back buffer; another surface (a multisampled one among them) takes it through
-  `wl/platform/gx_target.h`, and a texture at its address then samples its image. The frame's first
+  `wl/platform/gx_target.h`, and a texture at its address then samples its image; once a title
+  samples a surface it showed (a displayed picture as a texture), each finished back buffer is
+  copied out of the EFB into a target at its address too, for the next frame. The frame's first
   full clear is GX's copy clear, others are quads. A frame is shown on FLIP_INCREMENT_WRITE, on a
   switch to another screen-sized surface, or when the display flips to the surface in the EFB.
 - **Textures** (`nv2a_texture.h`, `nv2a_texcache.h`): a stage's registers decoded (swizzled, linear,
@@ -177,13 +183,16 @@ over in parts of whole primitives (a strip's parts even, so its winding holds).
   smooth; DXT3/5's alpha a separate I4; P8 as C8 with a TLUT; a cube map made into psh's sphere
   map), kept by (address, format, size, palette) within a budget (4 MiB by default) and checked by a
   hash of the guest's texels once a frame (every use once found rewritten).
-- **The pipeline** (`nv2a_pipeline.h`) is what both drawing backends do on the processor: programs
+- **The pipeline** (`nv2a_pipeline.h`) is what the GX backend does on the processor: programs
   compiled and kept, vertices run (or the fixed function's composite matrix), the NV2A's fog modes,
   what psh is told of the textures, each stage's GX coordinates, the GX mappings of the raster state.
 - **The recorder** (`nv2a_record.h`) digests and describes every clear, draw, frame and flip.
-- **The software reference** (`nv2a_raster.h`) draws what the GX backend is asked to into RGBA8
-  surfaces: the same pipeline and textures, the combiners as the same TEV program (`wl_tev_eval`),
-  GX's blending; for pictures of a capture without a Wii, and tests from push buffer to pixel.
+
+On the host, the GX backend's calls reach wl/platform's host backend, which records them; with
+wl/gxsoft's software GX attached (`wl_gxsoft_attach`, `wl/gxsoft/README.md`) they are also drawn,
+as the console's GX draws them, so a host build or a replayed capture shows the frames a Wii would
+show (checked against the console suite's Dolphin pixels and against Dolphin's frame dumps of a
+title). `wl_nv2a_gx_last_program` says what psh made of the last draw's combiners, for tools.
 
 ## Captures (`nv2a_capture.h`) and `tools/xbox_nv2a_replay.c`
 
@@ -201,12 +210,22 @@ wl_nv2a_capture_frames(dev, &sink, 2);     // close the file once wl_nv2a_captur
 ```
 
 `wl_nv2a_replay` runs a capture through a new model and any backend over a guest memory of its own.
-The host tool prints what was drawn and, with `--png`, each frame from the software reference:
+The host tool prints what was drawn and, with `--png-gx`, each frame GX shows: the GX backend over
+the host's software GX (wl/gxsoft), the display copy of its EFB.
 
 ```sh
-xbox_nv2a_replay nv2a.capture -v --png frames/ --programs programs.inc
+xbox_nv2a_replay nv2a.capture -v --png-gx frames/ --programs programs.inc
 xbox_vsh_codegen programs.inc programs.c     # the title's programs as C, for WlNv2aGxConfig.natives
 ```
+
+With `-v` and `--png-gx`, each draw also says what its GX primitives covered and wrote (triangles
+culled and clipped, pixels failing the depth or alpha test, the bounds written, a state GX takes as
+it is though probably not what was meant: a colour channel or texture coordinate a stage reads that
+the layout does not send, an empty texture map) and whether psh's program was beyond GX or
+approximated. To look closer: `--efb-after N DIR` writes the EFB after the replay's draw N,
+`--gx-dump N` prints what GX is handed for its primitive N (projection, viewport, raster state,
+texture maps, the TEV program, the first vertices) and `--gx-textures DIR` writes those maps,
+`--psh-dump N` prints draw N's combiner words and psh's program.
 
 `--programs` writes each vertex program the capture drew with, once, as `tools/xbox_vsh_codegen.c`'s
 input: a title project compiles them ahead of time and hands the table to the GX backend, so its
@@ -220,10 +239,12 @@ reports, the vblank and flips, a trap, a capture replayed (`test_xbox_nv2a.c`); 
 each kind of draw, long batches, the windows, the combiner words, the surface (`_kelvin`); texture
 registers, conversions sampled against the texel decoders, levels, DXT and P8, sphere maps, the
 cache (`_texture`); the GX backend over the host's recorder: vertices as GX gets them, the TEV
-program, textures, the perspective path, culling, stencil, clears, render targets (`_gx`); the
-software reference from push buffer to pixel, and a capture replayed to the same pixels (`_raster`);
-the numbers against another table (`_regs`). The replay tool runs over the capture the raster test
-writes. On the console, `tests/xbox/suite_nv2a.c` (in `wl_console_tests.dol`) draws synthetic frames
+program, textures, the perspective path, culling, stencil, clears, render targets (`_gx`); the GX
+backend drawn by the host's software GX from push buffer to pixel: the console suite whole, with
+its Dolphin expectations, Direct3D's culling of screen-space quads, a program whose final product
+needs every TEV register, and a capture replayed to the same pixels (`_pixels`); the numbers
+against another table (`_regs`). The replay tool runs over the capture the pixel test writes. On
+the console, `tests/xbox/suite_nv2a.c` (in `wl_console_tests.dol`) draws synthetic frames
 through the GX backend on the Wii's GX and reads the EFB back.
 
 ## Not handled yet

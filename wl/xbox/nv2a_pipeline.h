@@ -71,8 +71,9 @@ WlGxCompare wl_nv2a_gx_compare(uint32_t func);
 bool wl_nv2a_gx_blend(const WlNv2aKelvin *k, WlGxBlendMode *mode, WlGxBlendFactor *source,
                       WlGxBlendFactor *destination);
 // what culling discards, by the NV2A's rule: the front face is the winding SET_FRONT_FACE names
-// (CCW: a positive area in the screen's coordinates, as OpenGL defines it), the face culled
-// SET_CULL_FACE's
+// as the screen shows it, its window coordinates running down (CW: clockwise on the screen, a
+// positive area in its y-down coordinates; Direct3D's D3DCULL_CCW sets front CW and culls the
+// back, so a quad wound clockwise on the screen is drawn), the face culled SET_CULL_FACE's
 enum { WL_NV2A_CULLS_NONE, WL_NV2A_CULLS_POSITIVE, WL_NV2A_CULLS_NEGATIVE, WL_NV2A_CULLS_ALL };
 unsigned wl_nv2a_cull(const WlNv2aKelvin *k);
 // a clear's colour (0xRRGGBBAA, from SET_COLOR_CLEAR_VALUE in the surface's format) and depth

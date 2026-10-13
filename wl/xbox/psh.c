@@ -1587,6 +1587,14 @@ static bool name_read_later(const struct translation *translation, int after_sta
             if (((outputs >> 12) & 0x04) && name == _name_r0 && channel == _portion_alpha)
                 return true;
         }
+        /* written again by this stage, which does not read it: what it held
+        is read no more (a stage reads every input before it writes) */
+        outputs = state[(channel == _portion_alpha ? WL_XBOX_PSH_ALPHA_OUTPUTS0
+                                                   : WL_XBOX_PSH_RGB_OUTPUTS0) +
+                        stage];
+        if (name_of(outputs & 0x0f) == name || name_of((outputs >> 4) & 0x0f) == name ||
+            name_of((outputs >> 8) & 0x0f) == name)
+            return false;
     }
     if (!abcd && !efg)
         return name == _name_r0;
@@ -2498,6 +2506,68 @@ static struct operand final_input(struct translation *translation, unsigned long
     return folded(value);
 }
 
+/* the names the final combiner's colour still reads through its inputs
+`abcd` (those made already marked 0x80), but for the input at `skip` (a
+shift: the product or sum being made), directly or through the product E*F
+or the sum v1 + r0 */
+static unsigned final_color_reads(uint32_t abcd, uint32_t efg, int skip) {
+    unsigned reads = 0;
+    int shift, name;
+
+    for (shift = 0; shift < 32; shift += 8) {
+        unsigned long input = (abcd >> shift) & 0xff;
+
+        if ((input & 0x80) || shift == skip)
+            continue;
+        if ((input & 0x0f) == _register_ef_product) {
+            if ((name = name_of((efg >> 24) & 0x0f)) >= 0)
+                reads |= 1u << name;
+            if ((name = name_of((efg >> 16) & 0x0f)) >= 0)
+                reads |= 1u << name;
+        } else if ((input & 0x0f) == _register_v1r0_sum) {
+            reads |= 1u << _name_v1 | 1u << _name_r0;
+        } else if ((name = name_of(input & 0x0f)) >= 0) {
+            reads |= 1u << name;
+        }
+    }
+    return reads;
+}
+
+/* A register for the final combiner's product or sum: a free one, or else
+one that holds only names the rest of the final combiner does not read
+(`reads`): the product's own inputs among them, as TEV reads a stage's
+inputs before it writes (E*F into E's register, say, when nothing else reads
+E). -1 when there is none. */
+static int final_register(struct translation *translation, unsigned reads) {
+    int reg = register_allocate(translation, _portion_color), candidate, name;
+
+    if (reg >= 0)
+        return reg;
+    for (candidate = 0; candidate < 4; candidate++) {
+        unsigned held = 0, holders = 0;
+
+        for (name = 0; name < NUMBER_OF_NAMES; name++) {
+            const struct operand *location = &translation->names[_portion_color][name];
+
+            if (location->kind == _kind_register && location->index == candidate &&
+                location_pool(_portion_color, location) == _portion_color) {
+                held |= 1u << name;
+                holders++;
+            }
+        }
+        if (held == 0 || (held & reads) != 0 ||
+            translation->pools[_portion_color].holders[candidate] != holders)
+            continue;
+        /* (the names' holds on it pass to the value made: read no more) */
+        for (name = 0; name < NUMBER_OF_NAMES; name++) {
+            if (held & (1u << name))
+                translation->names[_portion_color][name] = zero;
+        }
+        return candidate;
+    }
+    return -1;
+}
+
 static void final_combiner(struct translation *translation) {
     const uint32_t *state = translation->state;
     uint32_t abcd = state[WL_XBOX_PSH_FINAL_INPUTS_ABCD];
@@ -2546,7 +2616,7 @@ static void final_combiner(struct translation *translation) {
                                   (((abcd >> shift) & 0x30UL) << shift));
                 continue;
             }
-            reg = register_allocate(translation, _portion_color);
+            reg = final_register(translation, final_color_reads(abcd, efg, shift));
             if (reg < 0) {
                 fail(translation, "no free register");
                 return;
@@ -2560,7 +2630,7 @@ static void final_combiner(struct translation *translation) {
                 register_operand(translation, _register_v1, false, _portion_color, -1);
             struct operand r0 =
                 register_operand(translation, _register_r0, false, _portion_color, -1);
-            int reg = register_allocate(translation, _portion_color);
+            int reg = final_register(translation, final_color_reads(abcd, efg, shift));
 
             if (reg < 0) {
                 fail(translation, "no free register");

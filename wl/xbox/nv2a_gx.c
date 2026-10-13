@@ -29,8 +29,17 @@ enum {
     // come back soon)
     MEMO = 1024,
     // vertices looked at for the projection's fit
-    FIT_PROBES = 24
+    FIT_PROBES = 24,
+    // ...of which these, spread in depth, are enough
+    FIT_ENOUGH = 6,
+    // the fits kept, for draws that come back to a projection (passes over the same geometry)
+    FITS_KEPT = 4
 };
+
+// how far (in the depth's 0..1) a kept fit may be from a draw's own depths and still serve it: a
+// few of the depth buffer's 24-bit steps, the rounding of a program's depth, far below what tells
+// two projections apart
+#define FIT_TOLERANCE (8.0f / 16777216.0f)
 
 // the depth GX's perspective draws are scaled by: below 1 for every w while a < 1 / DEPTH_SCALE,
 // so nothing is clipped at the far plane (OpenCE-Wii's b30 horizon), the same for every draw
@@ -59,6 +68,9 @@ struct WlNv2aGx {
     WlNv2aTexCache textures;
     WlXboxPshCache psh;
     WlNv2aGxStats stats;
+    // the last draw's pixel program, and whether it was used
+    const WlXboxPshProgram *last_program;
+    bool last_used;
 
     // the frame
     bool frame_open, back_drawn;
@@ -72,6 +84,9 @@ struct WlNv2aGx {
     // the EFB's owner (NULL: the back buffer) and the targets
     RenderTarget targets[TARGETS];
     RenderTarget *owner;
+    // the title samples a picture it showed (a display surface as a texture): each finished back
+    // buffer is copied into a target at its address
+    bool keep_frames;
     uint32_t view_w, view_h;
     // the draw's
     const WlNv2aTexEntry *entries[WL_NV2A_TEXTURES];
@@ -86,6 +101,11 @@ struct WlNv2aGx {
     float loaded_bias;
     uint32_t loaded_w, loaded_h;
     float fit_a, fit_b;
+    // the last fits (most recent first) and how many there are
+    struct {
+        float a, b;
+    } fits[FITS_KEPT];
+    unsigned fit_count;
     struct {
         uint32_t index, stamp;
         WlGxDirectVertex vertex;
@@ -162,6 +182,13 @@ const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx) {
     return &gx->textures;
 }
 
+const WlXboxPshProgram *wl_nv2a_gx_last_program(const WlNv2aGx *gx, bool *used) {
+    if (used != NULL) {
+        *used = gx->last_used;
+    }
+    return gx->last_program;
+}
+
 // ---- the frame ----------------------------------------------------------------------------------
 
 // what wl/platform's quads and the frame's start leave: everything set again before the next draw
@@ -209,11 +236,14 @@ static void use_back_buffer(WlNv2aGx *gx) {
     }
 }
 
+static void frame_keep(WlNv2aGx *gx);
+
 void wl_nv2a_gx_present(WlNv2aGx *gx) {
     if (!gx->frame_open) {
         return;
     }
     use_back_buffer(gx);
+    frame_keep(gx);
     wl_gx_invalidate_shadow();
     wl_gx_end_frame();
     gx->frame_open = false;
@@ -249,25 +279,16 @@ static bool surface_is_screen(const WlNv2aGx *gx, const WlNv2aSurface *s) {
            h * 4u >= gx->cfg.height * 3u;
 }
 
-static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {
-    uint32_t w = s->clip_width / s->samples_x, h = s->clip_height / s->samples_y;
-    uint8_t format = s->color_bytes == 2 ? (uint8_t)WL_GX_TEX_RGB565 : (uint8_t)WL_GX_TEX_RGBA8;
+// the target of a surface at `phys` of `w` x `h` in `format` (a WlGxTexFormat): the one there, or
+// the least recently used slot made it (NULL without memory, or when that slot owns the EFB)
+static RenderTarget *slot_for(WlNv2aGx *gx, uint32_t phys, uint32_t w, uint32_t h, uint8_t format) {
     RenderTarget *slot = NULL;
     unsigned i;
 
-    if (s->swizzled) {
-        w = 1u << s->log2_width;
-        h = 1u << s->log2_height;
-    }
-    w = (w + 3u) & ~3u;
-    h = (h + 3u) & ~3u;
-    if (w == 0 || h == 0 || w > 1024u || h > 1024u) {
-        return NULL;
-    }
     for (i = 0; i < TARGETS; i++) {
         RenderTarget *t = &gx->targets[i];
 
-        if (t->memory != NULL && t->phys == s->color_phys && t->width == w && t->height == h && t->format == format) {
+        if (t->memory != NULL && t->phys == phys && t->width == w && t->height == h && t->format == format) {
             t->used_frame = gx->frame;
             return t;
         }
@@ -287,7 +308,7 @@ static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {
     if (slot->memory == NULL) {
         return NULL;
     }
-    slot->phys = s->color_phys;
+    slot->phys = phys;
     slot->width = w;
     slot->height = h;
     slot->format = format;
@@ -297,9 +318,46 @@ static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {
     slot->target.width = (uint16_t)w;
     slot->target.height = (uint16_t)h;
     slot->target.format = format;
-    slot->target.user = s->color_phys;
+    slot->target.user = phys;
     return slot;
 }
+
+static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {
+    uint32_t w = s->clip_width / s->samples_x, h = s->clip_height / s->samples_y;
+    uint8_t format = s->color_bytes == 2 ? (uint8_t)WL_GX_TEX_RGB565 : (uint8_t)WL_GX_TEX_RGBA8;
+
+    if (s->swizzled) {
+        w = 1u << s->log2_width;
+        h = 1u << s->log2_height;
+    }
+    w = (w + 3u) & ~3u;
+    h = (h + 3u) & ~3u;
+    if (w == 0 || h == 0 || w > 1024u || h > 1024u) {
+        return NULL;
+    }
+    return slot_for(gx, s->color_phys, w, h, format);
+}
+
+// The finished back buffer copied into a target at its address, for a title that samples a picture
+// it showed (Halo's sun glare reads the last frame's alpha, where it drew the sun's visibility):
+// on the NV2A that surface's pixels are in memory, on GX only in the EFB until the display copy.
+static void frame_keep(WlNv2aGx *gx) {
+    uint32_t w = gx->cfg.width & ~3u, h = gx->cfg.height & ~3u;
+    RenderTarget *t;
+
+    if (!gx->keep_frames || !gx->back_drawn || gx->back_phys == 0 || gx->owner != NULL) {
+        return;
+    }
+    t = slot_for(gx, gx->back_phys, w, h, (uint8_t)WL_GX_TEX_RGBA8);
+    if (t == NULL) {
+        return;
+    }
+    wl_gx_copy_efb_texture(0, 0, (int)w, (int)h, t->memory, WL_GX_TEX_RGBA8, false);
+    t->resolved = true;
+    gx->texture_memory_changed = true;
+}
+
+static bool is_display(const WlNv2aGx *gx, uint32_t phys);
 
 // The EFB for the surface the next draw or clear is into: the frame begun, the back buffer or a
 // render target its owner, the viewport and scissor. false when the surface cannot be drawn.
@@ -536,6 +594,12 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
             continue;
         }
         e = target_texture(gx, stage, &t);
+        if (e == NULL && !gx->keep_frames && is_display(gx, t.phys)) {
+            // (a picture the title showed, as a texture: kept from the next frame on)
+            gx->keep_frames = true;
+            WL_LOG_I(TAG, "a displayed surface (%08x) is read as a texture: each frame is kept as one",
+                     (unsigned)t.phys);
+        }
         if (e == NULL) {
             bool mipmaps = t.levels > 1 && t.min_filter >= WL_NV2A_FILTER_NEAREST_MIP_NEAREST &&
                            t.min_filter <= WL_NV2A_FILTER_LINEAR_MIP_LINEAR;
@@ -606,6 +670,8 @@ static bool tev_setup(WlNv2aGx *gx, const WlNv2aKelvin *k) {
     wl_nv2a_psh_words(k, words);
     program = wl_xbox_psh_cache_program(&gx->psh, words, wl_nv2a_k(k, WL_NV2A_K_SET_SHADER_STAGE_PROGRAM), &textures,
                                         &usable, &translated);
+    gx->last_program = program;
+    gx->last_used = usable;
     if (usable) {
         wl_xbox_psh_apply(program);
         gx->texcoords = program->texcoords;
@@ -645,19 +711,26 @@ static float as_depth(float z, float depth_max) {
 
 // The projection of a draw: a few of its vertices, for their w and depth (OpenCE-Wii's
 // projection_fit). A program that captures its clip-space position (divides by w) is drawn through
-// the perspective projection, its depth a + b / w fitted from two vertices of different w (the last
-// fit's when all have one w); vertices all at w 1 are screen space.
+// the perspective projection, its depth a + b / w; vertices all at w 1 are screen space.
+//
+// a and b come from the draw's vertices, and two draws of one camera give the same ones but for
+// the rounding of their depths: enough for a pass drawn again over the same geometry with a depth
+// test of LEQUAL or EQUAL (a shadow or a light over a base pass) to fail on GX where it passes on
+// the NV2A, in some frames and not others. So a fit kept from an earlier draw that gives this
+// draw's depths, to within a few of the depth buffer's steps, is used again as it is, the same
+// numbers; only a draw no kept fit serves is fitted anew, from the two vertices farthest apart in
+// 1 / w (the steadiest fit), and kept. With all its vertices at one w, the last fit.
 static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, float depth_max) {
     Projection p = {false, gx->fit_a, gx->fit_b};
-    float inputs[WL_NV2A_ATTRIBS][4], first_w = 0.0f, first_depth = 0.0f;
-    bool have_first = false, fitted = false;
-    uint32_t probes = draw->count < FIT_PROBES ? draw->count : FIT_PROBES, v;
+    float inputs[WL_NV2A_ATTRIBS][4], inverse_w[FIT_PROBES], depth[FIT_PROBES];
+    uint32_t probes = draw->count < FIT_PROBES ? draw->count : FIT_PROBES, v, n = 0, near = 0, far = 0, f;
+    bool all_w1 = true;
     WlXboxVshOutput out;
 
     if (gx->pipeline.program == NULL) {
         return p;
     }
-    for (v = 0; v < probes && !fitted; v++) {
+    for (v = 0; v < probes; v++) {
         wl_nv2a_draw_fetch(draw, k, v, inputs);
         wl_nv2a_pipeline_vertex(&gx->pipeline, k, (const float (*)[4])inputs, WL_XBOX_VSH_LIVE_POSITION, &out);
         if (!out.clip_captured) {
@@ -667,23 +740,56 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
         if (!(out.clip[3] > 1.0e-4f)) {
             continue;
         }
-        if (!have_first) {
-            first_w = out.clip[3];
-            first_depth = out.position[2] / depth_max;
-            have_first = true;
-        } else {
-            float inverse_difference = 1.0f / out.clip[3] - 1.0f / first_w;
-
-            if (fabsf(inverse_difference) > 1.0e-6f * (1.0f / first_w)) {
-                float depth = out.position[2] / depth_max;
-
-                gx->fit_b = (depth - first_depth) / inverse_difference;
-                gx->fit_a = first_depth - gx->fit_b / first_w;
-                fitted = true;
-            }
+        all_w1 = all_w1 && fabsf(out.clip[3] - 1.0f) < 1.0e-4f;
+        inverse_w[n] = 1.0f / out.clip[3];
+        depth[n] = out.position[2] / depth_max;
+        if (inverse_w[n] < inverse_w[near]) {
+            near = n;
+        }
+        if (inverse_w[n] > inverse_w[far]) {
+            far = n;
+        }
+        n++;
+        // (enough to tell a projection and fit one: a few vertices spread in depth)
+        if (n >= FIT_ENOUGH && inverse_w[far] - inverse_w[near] > 1.0e-3f * inverse_w[far]) {
+            break;
         }
     }
-    if (!fitted && have_first && fabsf(first_w - 1.0f) < 1.0e-4f) {
+    if (n == 0) {
+        return p;
+    }
+    // (a kept fit that gives these depths: the same numbers again)
+    for (f = 0; f < gx->fit_count; f++) {
+        float worst = 0.0f;
+
+        for (v = 0; v < n; v++) {
+            float error = fabsf(gx->fits[f].a + gx->fits[f].b * inverse_w[v] - depth[v]);
+
+            worst = error > worst ? error : worst;
+        }
+        if (worst <= FIT_TOLERANCE) {
+            p.a = gx->fit_a = gx->fits[f].a;
+            p.b = gx->fit_b = gx->fits[f].b;
+            if (f != 0) {
+                float a = gx->fits[f].a, b = gx->fits[f].b;
+
+                memmove(&gx->fits[1], &gx->fits[0], f * sizeof gx->fits[0]);
+                gx->fits[0].a = a;
+                gx->fits[0].b = b;
+            }
+            return p;
+        }
+    }
+    if (fabsf(inverse_w[far] - inverse_w[near]) > 1.0e-6f * inverse_w[far]) {
+        unsigned kept = gx->fit_count < FITS_KEPT ? gx->fit_count : FITS_KEPT - 1u;
+
+        gx->fit_b = (depth[far] - depth[near]) / (inverse_w[far] - inverse_w[near]);
+        gx->fit_a = depth[near] - gx->fit_b * inverse_w[near];
+        memmove(&gx->fits[1], &gx->fits[0], kept * sizeof gx->fits[0]);
+        gx->fits[0].a = gx->fit_a;
+        gx->fits[0].b = gx->fit_b;
+        gx->fit_count = kept + 1u;
+    } else if (all_w1) {
         p.perspective = false;
     }
     p.a = gx->fit_a;

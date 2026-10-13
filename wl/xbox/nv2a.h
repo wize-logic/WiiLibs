@@ -5,8 +5,8 @@
 // DMA pusher's jumps, calls and returns, the puller's object binding and semaphores, the Kelvin 3D
 // class's methods through the state tracker, nv2a_kelvin.h), writes the semaphores, notifiers and
 // reports the title waits on into guest memory, latches the interrupts its ISR reads, and hands
-// the draws, clears and flips to a backend: GX on the Wii (nv2a_gx.h), a recorder or a software
-// rasterizer on the host (nv2a_record.h, nv2a_raster.h).
+// the draws, clears and flips to a backend: GX (nv2a_gx.h; on the host, drawn by wl/gxsoft's
+// software GX) or a recorder (nv2a_record.h).
 //
 // Pure C11, no platform calls: guest memory is reached only through the caller's phys_ptr, which
 // gives host pointers to guest-physical bytes (little-endian, contiguous for the length asked).
