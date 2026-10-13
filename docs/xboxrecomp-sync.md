@@ -130,6 +130,7 @@ Wii (devkitPPC 16.1, the flags above), not linked.
 
 | Upstream | Configuration | Functions (detected / translated) | Unresolved call targets | Unimplemented instructions | `.text` -Os | `.text` -O2 |
 |---|---|---|---|---|---|---|
+| v0.13.1 + patches 0001-0012 | all executable sections (the driver's default) | 7,474 / 7,493 | 0 (60 jumps in bytes nothing reaches go by address) | 90 (29 mnemonics) | 12,192,978 (11.63 MiB) | |
 | v0.13.1 + patches 0001-0007 | all executable sections (the driver's default) | 7,474 / 7,493 | 294 | 106 (29 mnemonics) | 11,319,192 (10.79 MiB) | 15,741,715 (15.01 MiB) |
 | v0.13.1 + patches 0001-0007 | `.text` only (`"text_only": true`) | 6,948 / 6,961 | 599 | 71 (21 mnemonics) | 10,963,718 (10.46 MiB) | |
 | v0.13.1 unpatched, a byte-swapping probe header (research, r2) | `.text` only | 6,948 / 6,961 | 599 | 71 | 10,775,590 (10.28 MiB) | 17,119,463 (16.33 MiB) |
@@ -150,5 +151,12 @@ reports each one reached).
   not help: it treats those entries as having independent evidence and refuses them (1 of 562
   candidate owners passed its checks in a probe). Removing the duplication needs multi-entry
   functions in the lifter.
+- Upstream lifts a function from its range and makes every direct jump out of it a tail call to the
+  function at the target; where none starts (the middle of another body, the rest of a function past
+  a false start from an immediate), the target got an "unresolved" stub that popped four bytes and
+  returned. WiiLibs' patch 0010 lifts the code such a jump reaches into the jumping function's body
+  instead (Halo: 314 functions gain 33,732 instructions, 2,204 at most), 0011 gives a called interior
+  address a function, and 0012 sends what is left through `RECOMP_ITAIL`, which reports a miss. A
+  loop that runs through two function starts is still a chain of host tail calls (none in Halo).
 - Upstream's Halo work used the debug build `cachebeta.xbe`, not retail; addresses in upstream's
   code and docs are that build's.
