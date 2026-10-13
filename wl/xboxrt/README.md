@@ -43,6 +43,72 @@ pages (128 for a debug kit); a user page and its window alias are one page of me
   touch from frame pools the boot code takes from malloc; frames are zeroed with `dcbz` when first
   mapped; a full PTE group evicts round-robin and the evicted page faults back in.
 
+## Demand paging (`paging.c`)
+
+The Wii has ~33 MB of frames for 64 MB of guest RAM (MEM2 and what MEM1 spares beside a 12 MB
+DOL and the host side's `keep_free_bytes`), and a title touches more than that (Halo's menu ~34 MB,
+a level its 22 MB tag cache, 22 MB texture cache and 4 MB sound cache on top). When no frame is free
+one is taken back from a page and the page goes to a swap file, to be read back on its next touch.
+The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV` and `mprotect`.
+
+- **States.** A physical page is *zero* (no frame, no swap slot: never touched, freed, or given up
+  while still zero; a touch gives it a zeroed frame), *resident* (a frame) or *swapped* (a slot in
+  the swap file, read back on a touch). A resident page is DIRTY once it changed since its zero fill
+  or its read back, and keeps its slot while it is clean, so giving its frame back costs nothing.
+- **Victims: a clock over the frames** with the MMU's referenced bits. The Broadway's MMU sets R and
+  C in each PTE (a store that hits a TLB entry with C clear searches the table to set it); a clean
+  page's PTE is inserted with C clear. The runtime harvests R and C into its own flags whenever a
+  PTE goes (a full PTE group, an unmap) and when the clock passes; clearing R also drops the TLB
+  entry so the next use sets it again. Each page remembers the PTE group of its two PTEs, so the
+  clock finds them without hashing. At each frame: a pinned page or one in I/O is passed; a page
+  used since the last round gets its second chance; a clean page gives its frame back at once; a
+  dirty one is left for a write. On the host the referenced bit is a fault (clearing it closes the
+  page's EAs, the next touch opens them) and the changed bit too (a clean page is opened read-only,
+  its first write faults and marks it).
+- **Writes are batched; clean victims first.** The SD card is slow at small writes: the slow path
+  gathers the unused dirty pages the clock passes, and only when a whole look finds no clean page
+  writes up to 32 of them (128 KB) in one write to consecutive free slots, then takes their frames,
+  which leaves free frames for the next touches. A page read back is read alone (4 KB): only what
+  is touched.
+- **The swap file**: `<the title's hard disk folder>/pagefile.sys` (`WlXbTitleConfig.swap_path`, ""
+  for none), the guest RAM's size by default, grown once (the card allocates its clusters then, not
+  during play) and kept; its contents mean nothing across runs. Slots are pages; a bit map says
+  which are taken, and a dirty page gets a new slot each time it is written (its old one freed).
+  Without a swap file only zero and clean pages give frames back, and a touch that needs a frame
+  when none can be had is a guest crash ("no frame left"), as before paging.
+- **Fault paths (the Wii).** The DSI handler's exception context keeps the fast cases: a first
+  touch with a free frame, a first touch that takes a clean page's frame (a look of at most 256
+  frames, no I/O), a resident page whose PTE was evicted from the table. A touch that needs I/O (a
+  page to read back, or no clean page at hand so a batch must be written) returns to the
+  trampoline the device faults use, and `wl_xb_dsi_slow` runs the paging core in the faulting
+  thread's own context, which holds the guest lock: it waits for the card there and the access
+  runs again. Its table changes run with interrupts off a step at a time, so the fast path on
+  another thread (a PTE reload of a pinned page) sees them whole; pages being written or read are
+  marked and neither mapped nor taken meanwhile. A slow-path touch from a thread without the guest
+  lock, or with interrupts off, is a crash report that says so.
+- **Re-entrancy.** The NV2A and APU models and the kernel read guest memory through host pointers
+  under the guest lock; any of their accesses may fault and swap, in the middle of a device's
+  emulation (itself inside the trampoline: the trampoline nests). That is safe because the paging
+  code never touches guest EAs (it reaches frames through the cached BAT view on the Wii, a second
+  mapping of the RAM object on the host), its file I/O goes through its own buffer, and the
+  kernel's own file I/O only touches guest memory outside the card's driver (its bounce buffer).
+  A pointer the host holds stays valid when its page goes: the next access faults it back in. The
+  only thing a fault must not take is the other page of an access across two, which it keeps.
+- **Pinned pages** (`wl_xb_mem_pin`): never evicted; at most half the frames. The runtime pins
+  KeTickCount's page (the service thread writes it without the guest lock). Nothing else needs it
+  now: the fault path's own state (host stacks, the DSI frames, the tables) is host memory, not
+  guest memory; guest stacks and TLS are touched only by their thread, holding the lock; no DMA
+  reads guest memory (file I/O goes through bounce buffers, GX gets textures and vertices from
+  host-side copies, the audio output from a host ring). Pin anything a future backend lets a DMA
+  or an unlocked thread read.
+- **Statistics.** `WlXbMemStats` (evictions, the clean ones and those made in the fault, swap-ins,
+  swap-outs and their write calls, bytes, time in swap I/O, slots), a second `[xbirq] status:` line
+  every 10 s when paging, and a `thrashing:` warning when more than 128 pages a second (512 KB/s)
+  are read back (`wl_xb_mem_watch`, once a second on the service thread).
+- **The host at the Wii's size.** `WlXbMemConfig.frame_limit_bytes` (`WlXbTitleConfig.frame_pool_bytes`,
+  or `WL_XB_FRAME_MB` / `WL_XB_FRAME_KB` in the environment) pages a host run as the Wii would:
+  `WL_XB_FRAME_KB=33792 build/halo-host/halo <title folder> <hard disk folder>`.
+
 ## Devices and faults (`mmio.h`, `ppc_decode.h`, `x86_decode.h`)
 
 `wl_xb_mmio_register` claims a range of guest VAs above `0xFC000000` with read and write callbacks
@@ -184,7 +250,8 @@ the address of its variable, and an ordinal with no body a slot whose first call
 
 `wl_xb_boot_run(&cfg)` brings it all up and runs the title: on the Wii `wl_mem` (heaps only: the
 rest stays malloc's), the SD card, the log and the crash screen; the XBE's header; guest memory (the
-Wii's frame pools: the two largest blocks malloc gives, less `keep_free_bytes`); threads; the
+Wii's frame pools: the two largest blocks malloc gives, less `keep_free_bytes`; the host's frame
+limit, if any; the swap file `<hard disk folder>/pagefile.sys`); threads; the
 image; the kernel (`wl/xboxkrnl`); the thunks; the MCPX devices and the GPU (wl/xbox's model when
 it is built in, else the stub); the service thread; then the entry point on a guest thread of its
 own. It returns the process's exit code. `wl_xboxrt_main` is a `main`: on the host
@@ -203,6 +270,10 @@ Wii, `abort` elsewhere; `wl_xb_crash_set_stop` replaces it).
 
 - `tests/xboxrt/test_xboxrt_mem.c`: addresses, aliasing, lazy backing, pinned allocations that move
   user pages, reservations, device faults through the host's decoder, the crash path (host, ppc-be).
+- `tests/xboxrt/test_xboxrt_paging.c`: demand paging under a frame limit of 64 frames (host, ppc-be):
+  zero pages, swap-outs in batches and swap-ins, clean pages going for nothing, both EAs of a page,
+  pinned pages, relocations and frees of swapped pages, accesses across pages and copies between
+  buffers larger than the pool; built again without a swap file (`test_xboxrt_paging_no_swap`).
 - `tests/xboxrt/test_xboxrt_decode.c`: the PowerPC decoder over a matrix of forms, the x86-64
   decoder over byte strings (portable).
 - `tests/xboxrt/test_xboxrt_abi.c`: the register file and the runtime's functions against the
@@ -214,8 +285,11 @@ Wii, `abort` elsewhere; `wl_xb_crash_set_stop` replaces it).
   threads under the lock, and an ISR and a thread switch delivered to a loop that only polls a
   device register.
 - `tests/xboxrt/wii_console.c`, the Wii only: `wl_xboxrt_console.dol` checks the page table, first
-  touches, evictions, a relocation and device accesses through the DSI trampoline on the console's
-  MMU. Dolphin needs its full MMU emulation to run it:
+  touches, PTE evictions, a relocation and device accesses through the DSI trampoline on the
+  console's MMU, then demand paging: 12 MB of pages over 8 MB of frames, zero pages given back in
+  the DSI's exception context and, with a card for `sd:/wl_xboxrt_pagefile.sys`, changed pages
+  written out in batches and read back through the trampoline (with FP state live across them).
+  Dolphin needs its full MMU emulation to run it:
 
 ```sh
 python3 tools/dolphin_run.py build/wii/tests/console/wl_xboxrt_console.dol \
