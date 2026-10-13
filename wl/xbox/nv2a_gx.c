@@ -1021,9 +1021,15 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     unsigned stage;
 
     if (wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_TEST_ENABLE)) {
-        // (a shadow volume's passes, and what they mask: neither means anything without a stencil)
-        gx->stats.stencil_skipped++;
-        return 0;
+        // GX has no stencil. A pass that writes only the stencil (no colour, no depth) draws
+        // nothing GX can keep, and is skipped; any other is drawn as if its test passed, as
+        // OpenCE-Wii's Direct3D device on GX does for the same game: skipping them lost about half
+        // of Halo's a10 (its level geometry is drawn with the stencil test on)
+        if (wl_nv2a_k(k, WL_NV2A_K_SET_COLOR_MASK) == 0 && wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_MASK) == 0) {
+            gx->stats.stencil_skipped++;
+            return 0;
+        }
+        gx->stats.stencil_ignored++;
     }
     if (gx->dev == NULL || !wl_nv2a_pipeline_begin(&gx->pipeline, k)) {
         return 0;

@@ -55,7 +55,8 @@ typedef struct WlNv2aGxConfig {
 
 typedef struct WlNv2aGxStats {
     uint32_t draws, vertices, clears, quad_clears, frames;
-    uint32_t stencil_skipped;     // draws with the stencil test
+    uint32_t stencil_skipped;     // draws with the stencil test that write only the stencil (skipped)
+    uint32_t stencil_ignored;     // draws with the stencil test drawn as if it passed
     uint32_t target_draws;        // draws into a surface other than the back buffer
     uint32_t target_skipped;      // ... that had no render target (no memory, a size or format GX has not)
     uint32_t programs_unusable;   // draws whose combiners GX cannot hold (texture 0 times colour)

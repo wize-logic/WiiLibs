@@ -171,8 +171,10 @@ TEST culling_by_the_nv2a_rule_and_stencil_skipped(void) {
     t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
     t_kick(&g);
     ASSERT_EQ(WL_GX_CULL_FRONT, d->cull);
-    // a draw with the stencil test: skipped
+    // a draw with the stencil test that writes colour: drawn as if the test passed
     t_m1(&g, WL_NV2A_K_SET_STENCIL_TEST_ENABLE, 1);
+    t_m1(&g, WL_NV2A_K_SET_COLOR_MASK, 0x01010101u);
+    t_m1(&g, WL_NV2A_K_SET_DEPTH_MASK, 1);
     t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
     f_vertex(&g, 0, 0, 0, 1, 0, 0, 0xFFFFFFFFu);
     f_vertex(&g, 10, 0, 0, 1, 0, 0, 0xFFFFFFFFu);
@@ -180,7 +182,20 @@ TEST culling_by_the_nv2a_rule_and_stencil_skipped(void) {
     t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
     t_kick(&g);
     wl_nv2a_gx_stats(g_gx, &stats);
-    ASSERT_EQ(2u, stats.draws);
+    ASSERT_EQ(3u, stats.draws);
+    ASSERT_EQ(1u, stats.stencil_ignored);
+    ASSERT_EQ(0u, stats.stencil_skipped);
+    // one that writes only the stencil (no colour, no depth): skipped
+    t_m1(&g, WL_NV2A_K_SET_COLOR_MASK, 0);
+    t_m1(&g, WL_NV2A_K_SET_DEPTH_MASK, 0);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+    f_vertex(&g, 0, 0, 0, 1, 0, 0, 0xFFFFFFFFu);
+    f_vertex(&g, 10, 0, 0, 1, 0, 0, 0xFFFFFFFFu);
+    f_vertex(&g, 0, 10, 0, 1, 0, 0, 0xFFFFFFFFu);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+    t_kick(&g);
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT_EQ(3u, stats.draws);
     ASSERT_EQ(1u, stats.stencil_skipped);
     gx_done(&g);
     PASS();
