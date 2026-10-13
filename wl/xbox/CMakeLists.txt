@@ -4,11 +4,11 @@
 # vertex programs decoded, analysed and run on the processor (vsh.h, with the programs compiled
 # ahead of time by tools/xbox_vsh_codegen.c: vsh_native.h); and the NV2A as a device that runs a
 # title's push buffers (nv2a.h: the MMIO registers, the pusher and puller, the 3D state, vertex
-# fetch, captures), the textures converted for GX and kept, the processor's vertex pipeline, a
-# recorder and a software reference of the GX backend. Builds everywhere; no fused multiply-adds,
+# fetch, captures), the textures converted for GX and kept, the processor's vertex pipeline and a
+# recorder. Builds everywhere; no fused multiply-adds,
 # so a vertex program gives the same bits on every target, interpreted or compiled.
 add_library(wl_xbox STATIC psh.c psh_cache.c vsh.c
-    nv2a.c nv2a_kelvin.c nv2a_capture.c nv2a_texture.c nv2a_texcache.c nv2a_pipeline.c nv2a_record.c nv2a_raster.c)
+    nv2a.c nv2a_kelvin.c nv2a_capture.c nv2a_texture.c nv2a_texcache.c nv2a_pipeline.c nv2a_record.c)
 wl_target_defaults(wl_xbox DETERMINISTIC)
 target_link_libraries(wl_xbox PUBLIC wl_platform wl_gfx wl_codec m)
 add_library(WiiLibs::xbox ALIAS wl_xbox)
@@ -21,11 +21,11 @@ target_link_libraries(wl_xbox_gx PUBLIC wl_xbox wl_platform)
 add_library(WiiLibs::xbox_gx ALIAS wl_xbox_gx)
 
 # the vertex program compiler, a host tool (it includes vsh.c for its decoder's internals), and the
-# NV2A capture's replay (tools/xbox_nv2a_replay.c)
+# NV2A capture's replay (tools/xbox_nv2a_replay.c: the GX backend drawn by the host's software GX)
 if(NOT WL_PLATFORM STREQUAL "wii")
     add_executable(xbox_nv2a_replay ${PROJECT_SOURCE_DIR}/tools/xbox_nv2a_replay.c)
     wl_target_defaults(xbox_nv2a_replay)
-    target_link_libraries(xbox_nv2a_replay PRIVATE wl_xbox wl_gxtex)
+    target_link_libraries(xbox_nv2a_replay PRIVATE wl_xbox wl_xbox_gx wl_gxsoft wl_gxtex)
     add_executable(xbox_vsh_codegen ${PROJECT_SOURCE_DIR}/tools/xbox_vsh_codegen.c)
     wl_target_defaults(xbox_vsh_codegen DETERMINISTIC)
     target_link_libraries(xbox_vsh_codegen PRIVATE wl_gfx m)

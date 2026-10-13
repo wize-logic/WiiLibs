@@ -59,6 +59,9 @@ struct WlNv2aGx {
     WlNv2aTexCache textures;
     WlXboxPshCache psh;
     WlNv2aGxStats stats;
+    // the last draw's pixel program, and whether it was used
+    const WlXboxPshProgram *last_program;
+    bool last_used;
 
     // the frame
     bool frame_open, back_drawn;
@@ -160,6 +163,13 @@ void wl_nv2a_gx_stats(const WlNv2aGx *gx, WlNv2aGxStats *out) {
 
 const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx) {
     return &gx->textures;
+}
+
+const WlXboxPshProgram *wl_nv2a_gx_last_program(const WlNv2aGx *gx, bool *used) {
+    if (used != NULL) {
+        *used = gx->last_used;
+    }
+    return gx->last_program;
 }
 
 // ---- the frame ----------------------------------------------------------------------------------
@@ -606,6 +616,8 @@ static bool tev_setup(WlNv2aGx *gx, const WlNv2aKelvin *k) {
     wl_nv2a_psh_words(k, words);
     program = wl_xbox_psh_cache_program(&gx->psh, words, wl_nv2a_k(k, WL_NV2A_K_SET_SHADER_STAGE_PROGRAM), &textures,
                                         &usable, &translated);
+    gx->last_program = program;
+    gx->last_used = usable;
     if (usable) {
         wl_xbox_psh_apply(program);
         gx->texcoords = program->texcoords;

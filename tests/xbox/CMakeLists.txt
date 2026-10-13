@@ -14,17 +14,21 @@ target_compile_definitions(test_xbox_nv2a_regs PRIVATE
 wl_add_test(test_xbox_nv2a_kelvin SOURCES test_xbox_nv2a_kelvin.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_nv2a_texture SOURCES test_xbox_nv2a_texture.c LIBS wl_xbox LABELS unit be)
 wl_add_test(test_xbox_nv2a_gx SOURCES test_xbox_nv2a_gx.c LIBS wl_xbox_gx LABELS unit be)
-wl_add_test(test_xbox_nv2a_raster SOURCES test_xbox_nv2a_raster.c LIBS wl_xbox LABELS unit be)
-# the replay tool over the capture the rasterizer's test writes
+# the GX backend drawn by the host's software GX (wl/gxsoft): the console suite's frames and pixel
+# tests; and the replay tool over the capture it writes
+if(TARGET wl_gxsoft)
+    wl_add_test(test_xbox_nv2a_pixels SOURCES test_xbox_nv2a_pixels.c suite_nv2a.c LIBS wl_xbox_gx wl_gxsoft
+        LABELS unit be)
+endif()
 if(WL_PLATFORM STREQUAL "host")
     set(nv2a_capture ${CMAKE_CURRENT_BINARY_DIR}/nv2a_test.capture)
-    set_tests_properties(test_xbox_nv2a_raster PROPERTIES ENVIRONMENT "WL_NV2A_CAPTURE_OUT=${nv2a_capture}"
+    set_tests_properties(test_xbox_nv2a_pixels PROPERTIES ENVIRONMENT "WL_NV2A_CAPTURE_OUT=${nv2a_capture}"
         FIXTURES_SETUP nv2a_capture)
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay)
-    add_test(NAME xbox_nv2a_replay COMMAND xbox_nv2a_replay ${nv2a_capture} -v --png ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay
+    add_test(NAME xbox_nv2a_replay COMMAND xbox_nv2a_replay ${nv2a_capture} -v --png-gx ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay
         --programs ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay/programs.inc)
     set_tests_properties(xbox_nv2a_replay PROPERTIES LABELS unit FIXTURES_REQUIRED nv2a_capture
-        PASS_REGULAR_EXPRESSION "2 draws.*frame_0000.png|frame_0000.png.*2 draws")
+        PASS_REGULAR_EXPRESSION "frame_0000.png.*2 draws.*software GX: [0-9]+ primitives")
 endif()
 wl_add_test(test_xbox_vsh SOURCES test_xbox_vsh.c LIBS wl_xbox LABELS unit be)
 target_include_directories(test_xbox_vsh PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

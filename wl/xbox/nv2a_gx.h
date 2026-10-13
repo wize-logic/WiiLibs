@@ -75,3 +75,7 @@ void wl_nv2a_gx_backend(WlNv2aGx *gx, WlNv2aBackend *out);
 void wl_nv2a_gx_present(WlNv2aGx *gx);
 void wl_nv2a_gx_stats(const WlNv2aGx *gx, WlNv2aGxStats *out);
 const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx);
+// The pixel program the last draw was made with (psh's: its reason when it is beyond GX, what it
+// approximated), and whether it was used (false: texture 0 times the colour instead); NULL before
+// the first draw. Valid until the next draw. For logs and tools.
+const WlXboxPshProgram *wl_nv2a_gx_last_program(const WlNv2aGx *gx, bool *used);

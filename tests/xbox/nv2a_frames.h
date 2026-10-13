@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Synthetic NV2A frames the backend tests share (the host's GX recorder, the software reference, the
-// Wii console test): push buffers as a title's Direct3D would write them for a 640x480 A8R8G8B8 back
+// Synthetic NV2A frames the backend tests share (the host's GX recorder, the GX backend drawn by the
+// host's software GX, the Wii console test): push buffers as a title's Direct3D would write them for a 640x480 A8R8G8B8 back
 // buffer with a Z24S8 depth, vertex programs (assembled with tests/xbox/vsh_programs.py's assembler),
 // combiner programs, textures in guest memory, immediate vertices. Needs nv2a_test_util.h first.
 #pragma once
