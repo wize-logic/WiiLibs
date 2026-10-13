@@ -393,6 +393,86 @@ TEST a_second_pass_over_the_same_geometry_passes_lequal(void) {
     PASS();
 }
 
+// The same second pass with draws of six other projections between it and its base pass (the
+// sky's, a view model's, another camera's: their depth ranges unlike the base pass's), and drawn
+// by another program that computes the same position. A fit kept by recency (four of them) had
+// let the base pass's go by then, and the second pass's own fit, from other vertices, differed in
+// its rounding; the fit is now kept by the transform it was made for, which the second pass shares.
+TEST a_second_pass_after_other_projections_passes_lequal(void) {
+    TGuest g;
+    unsigned i, other;
+    static const float corners[6][3] = {{-1.73f, -0.61f, 1.37f}, {37.1f, -9.3f, 61.9f}, {-29.3f, 21.7f, 43.3f},
+                                        {-29.3f, 21.7f, 43.3f},  {37.1f, -9.3f, 61.9f}, {13.7f, 29.1f, 7.31f}};
+    // the clip program again with its instructions in another order: the same position
+    static const uint32_t clip_again[][4] = {
+        {0x00000000, 0x00EC601B, 0x0836186C, 0x01C00000}, // dp4 r12.w, v0, c[3]
+        {0x00000000, 0x00EC401B, 0x0836186C, 0x02C00000}, // dp4 r12.z, v0, c[2]
+        {0x00000000, 0x00EC001B, 0x0836186C, 0x08C00000}, // dp4 r12.x, v0, c[0]
+        {0x00000000, 0x00EC201B, 0x0836186C, 0x04C00000}, // dp4 r12.y, v0, c[1]
+        {0x00000000, 0x0600001B, 0x003603FF, 0x10180000}, // ircc r1.x, r12.w
+        {0x00000000, 0x0040001B, 0xC400286C, 0x0EC00000}, // mul r12.xyz, r12, r1.x
+        {0x00000000, 0x0027601B, 0x0C36006C, 0x0F200000}, // mov r2, c[-37]
+        {0x00000000, 0x0087401B, 0xC436186C, 0x9000E800}, // mad oPos.xyz, r12, c[-38], r2
+        {0x00000000, 0x0020061B, 0x0836006C, 0x0000F818}, // mov oD0, v3
+        {0x00000000, 0x0020121B, 0x0836006C, 0x0000F849}, // mov oT0, v9
+    };
+
+    ASSERT(pixel_device(&g) != NULL);
+    white_texture(&g);
+    f_perspective(&g);
+    f_constant(&g, 98, 0, 0, 1000.0f / 999.9f, -100.0f / 999.9f);
+    f_clear(&g, 0xFF000000u);
+    // the base pass: both triangles, writing depth
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+    for (i = 0; i < 6u; i++) {
+        f_vertex(&g, corners[i][0], corners[i][1], corners[i][2], 1, 0, 0, 0xFF0000FFu);
+    }
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+    // six other projections (near 0.2 .. 0.7, far 300 .. 800), a small triangle each at the left,
+    // their depth not written
+    t_m1(&g, WL_NV2A_K_SET_DEPTH_MASK, 0);
+    for (other = 0; other < 6u; other++) {
+        float near = 0.2f + 0.1f * (float)other, far = 300.0f + 100.0f * (float)other;
+
+        f_constant(&g, 98, 0, 0, far / (far - near), -near * far / (far - near));
+        t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+        f_vertex(&g, -3.0f, -1.0f, 2.0f + (float)other, 1, 0, 0, 0xFF00FF00u);
+        f_vertex(&g, -2.0f, 1.0f, 30.0f, 1, 0, 0, 0xFF00FF00u);
+        f_vertex(&g, -3.0f, 1.0f, 9.0f, 1, 0, 0, 0xFF00FF00u);
+        t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+    }
+    // the second pass: the base pass's projection again, the other program, blue added where the
+    // depth is not greater
+    f_constant(&g, 98, 0, 0, 1000.0f / 999.9f, -100.0f / 999.9f);
+    f_program(&g, 40, clip_again, 10);
+    t_m1(&g, WL_NV2A_K_SET_BLEND_ENABLE, 1);
+    t_m1(&g, WL_NV2A_K_SET_BLEND_FUNC_SFACTOR, WL_NV2A_BLEND_ONE);
+    t_m1(&g, WL_NV2A_K_SET_BLEND_FUNC_DFACTOR, WL_NV2A_BLEND_ONE);
+    t_m1(&g, WL_NV2A_K_SET_BLEND_EQUATION, WL_NV2A_BLEND_EQ_ADD);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+    for (i = 3; i < 6u; i++) {
+        f_vertex(&g, corners[i][0], corners[i][1], corners[i][2], 1, 0, 0, 0xFFFF0000u);
+    }
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+    t_kick(&g);
+    ASSERT(g_last_draw.pixels > 1000u);
+    ASSERT_EQ(0u, g_last_draw.z_failed);
+    ASSERT_EQ(g_last_draw.pixels, g_last_draw.written);
+    {
+        // (by the fit kept for the base pass's transform, which the other program's draw shares)
+        bool shared = false;
+        WlNv2aGxStats stats;
+
+        ASSERT(wl_nv2a_gx_last_projection(g_gx, NULL, NULL, &shared));
+        ASSERT(shared);
+        wl_nv2a_gx_stats(g_gx, &stats);
+        ASSERT_EQ(8u, stats.perspective_draws);
+        ASSERT_EQ(1u, stats.fits_shared);
+    }
+    pixel_done(&g);
+    PASS();
+}
+
 // a frame into the back buffer at `color`, shown when finished
 static void frame_into(TGuest *g, uint32_t color) {
     t_m1(g, WL_NV2A_K_SET_SURFACE_COLOR_OFFSET, color);
@@ -571,6 +651,7 @@ SUITE(pixels_suite) {
     RUN_TEST(direct3d_culling_keeps_quads_wound_clockwise_on_the_screen);
     RUN_TEST(a_final_product_with_every_register_held_is_drawn);
     RUN_TEST(a_second_pass_over_the_same_geometry_passes_lequal);
+    RUN_TEST(a_second_pass_after_other_projections_passes_lequal);
     RUN_TEST(a_picture_shown_is_sampled_the_next_frame);
     RUN_TEST(capture_replays_to_the_same_pixels);
 }

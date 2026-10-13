@@ -176,8 +176,14 @@ static uint32_t tee_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         }
     }
     if (g_gx != NULL && g_verbosity != 0) {
-        bool used;
+        bool used, shared;
         const WlXboxPshProgram *program = wl_nv2a_gx_last_program(g_gx, &used);
+        float a, b;
+
+        if (wl_nv2a_gx_last_projection(g_gx, &a, &b, &shared)) {
+            printf("    projection: depth %.9g + %.9g / w%s\n", (double)a, (double)b,
+                   shared ? " (the fit kept for its transform)" : "");
+        }
 
         if (program != NULL && !used) {
             printf("    psh: beyond GX (%s): texture 0 times the colour\n",
@@ -491,9 +497,10 @@ int main(int argc, char **argv) {
         wl_nv2a_gx_present(g_gx);
         wl_nv2a_gx_stats(g_gx, &gs);
         wl_gxsoft_stats(&ss);
-        printf("gx backend: %u draws, %u perspective, %u into targets (%u without one), %u stencil skipped, "
-               "%u programs beyond GX, %u approximated, %u clears (%u quads), %u frames\n",
-               (unsigned)gs.draws, (unsigned)gs.perspective_draws, (unsigned)gs.target_draws,
+        printf("gx backend: %u draws, %u perspective (%u fits made, %u shared), %u into targets (%u without one), "
+               "%u stencil skipped, %u programs beyond GX, %u approximated, %u clears (%u quads), %u frames\n",
+               (unsigned)gs.draws, (unsigned)gs.perspective_draws, (unsigned)gs.fits_made, (unsigned)gs.fits_shared,
+               (unsigned)gs.target_draws,
                (unsigned)gs.target_skipped, (unsigned)gs.stencil_skipped, (unsigned)gs.programs_unusable,
                (unsigned)gs.approximations, (unsigned)gs.clears, (unsigned)gs.quad_clears, (unsigned)gs.frames);
         printf("software GX: %u primitives, %u triangles (%u culled, %u clipped), %u pixels, %u written, %u copies, "
