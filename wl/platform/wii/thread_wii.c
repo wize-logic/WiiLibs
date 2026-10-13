@@ -20,10 +20,14 @@
 // LWP priority numbers (0 idle .. 127 highest), indexed by WlThreadPriority.
 static const uint8_t k_lwp_prio[] = {
     32,                 // WL_THREAD_PRIO_IO    below main
-    WL_POSIX_PRIO_MAIN, // WL_THREAD_PRIO_MAIN  (posix.h places pthreads around it)
+    WL_POSIX_PRIO_MIN - WL_POSIX_PRIO_MAIN, // WL_THREAD_PRIO_MAIN  64: the kernel's main (posix.h places pthreads around it)
     80,                 // WL_THREAD_PRIO_NET   above main
     100,                // WL_THREAD_PRIO_AUDIO high
 };
+
+// (an LWP number is 127 less the kernel's, which posix.h's numbers are)
+_Static_assert(WL_POSIX_PRIO_MAIN == KTHR_MAIN_PRIO && WL_POSIX_PRIO_MIN == KTHR_MIN_PRIO,
+               "posix.h's priorities are the kernel's");
 
 static bool g_main_pinned;
 

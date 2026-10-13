@@ -47,7 +47,8 @@ class DriverTest(unittest.TestCase):
     def test_outputs(self):
         tu = sorted(p.name for p in (self.out / "tu").iterdir())
         self.assertEqual(tu, ["recomp_tu_00.c", "recomp_tu_01.c", "recomp_tu_02.c",
-                              "recomp_tu_dispatch.c", "recomp_tu_stubs.c"])
+                              "recomp_tu_dispatch.c", "recomp_tu_patches.c", "recomp_tu_stubs.c"])
+        self.assertIn("wl_xb_title_patch_count = 0u", (self.out / "tu" / "recomp_tu_patches.c").read_text())
         self.assertIn('#include "../gen/recomp_0000.c"', (self.out / "tu" / "recomp_tu_00.c").read_text())
         self.assertIn("recomp_tu_01_empty", (self.out / "tu" / "recomp_tu_01.c").read_text())
         rep = json.loads((self.out / "xbox_recomp.json").read_text())
@@ -78,6 +79,35 @@ class DriverTest(unittest.TestCase):
         self.assertNotIn("void my_bits(void)\n{", code)          # written by hand, not generated
         self.assertIn("my_bits", (out / "gen" / "recomp_funcs.h").read_text())
         self.assertIn("Synth", code)
+
+    def xbe_bytes_at(self, va, n):
+        d = self.xbe.read_bytes()
+        u32 = lambda o: int.from_bytes(d[o:o + 4], "little")
+        base, count, table = u32(0x104), u32(0x11C), u32(0x120) - u32(0x104)
+        for i in range(count):
+            o = table + i * 56
+            sva, raw, rawsize = u32(o + 4), u32(o + 12), u32(o + 16)
+            if sva <= va and va + n <= sva + rawsize:
+                return d[raw + va - sva:raw + va - sva + n]
+        raise AssertionError(f"0x{va:08X} not in the XBE")
+
+    def test_patches_are_checked_applied_and_tabled(self):
+        here = self.xbe_bytes_at(0x00011020, 2)
+        cfg = self.td / "patch.json"
+        cfg.write_text(json.dumps({"patches": [{"va": "0x00011020", "from": here.hex(), "to": here.hex(),
+                                                "why": "a no-op patch"}]}))
+        out = self.td / "patched"
+        run("run", str(self.xbe), "-o", str(out), "--chunks", "2", "--config", str(cfg))
+        self.assertTrue((out / "xbe" / "patched.xbe").is_file())
+        table = (out / "tu" / "recomp_tu_patches.c").read_text()
+        self.assertIn("0x00011020u, 2u", table)
+        self.assertIn("wl_xb_title_patch_count = 1u", table)
+        # bytes the XBE does not have: refused, naming what it has
+        wrong = bytes(b ^ 0xFF for b in here)
+        cfg.write_text(json.dumps({"patches": [{"va": "0x00011020", "from": wrong.hex(), "to": here.hex()}]}))
+        r = run("run", str(self.xbe), "-o", str(out), "--chunks", "2", "--config", str(cfg), check=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f"the XBE has {here.hex()}", r.stderr)
 
     def test_runtime_header_template(self):
         out = self.td / "tpl"

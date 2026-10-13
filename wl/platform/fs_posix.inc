@@ -349,7 +349,10 @@ WlResult wl_platform_fs_rmdir(const char *path) {
         return WL_OK;
     }
     int e = errno;
-    return (e == ENOTEMPTY || e == EEXIST || e == EBUSY) ? WL_ERR_DENIED : fs_errno_result(e);
+    // (libfat answers a directory with entries in it with EPERM, not ENOTEMPTY; FAT has no other
+    // permission than the read-only attribute, which also means the directory stays)
+    return (e == ENOTEMPTY || e == EEXIST || e == EBUSY || e == EPERM || e == EACCES) ? WL_ERR_DENIED
+                                                                                    : fs_errno_result(e);
 }
 
 struct WlPlatformDir {

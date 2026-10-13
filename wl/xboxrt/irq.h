@@ -35,6 +35,7 @@ extern "C" {
 #define WL_XB_SVC_TIMER 0x2u   // the deadline set by wl_xb_service_set_deadline passed
 #define WL_XB_SVC_DPC 0x4u     // the kernel queued deferred work
 #define WL_XB_SVC_VBLANK 0x8u  // a vertical blank happened (after the vblank hook ran)
+#define WL_XB_SVC_DEVICE 0x10u // a device's periodic work ran (wl_xb_service_add_tick)
 
 // The kernel's handler: runs timers, ISRs and DPCs. Called with the lock held, never nested.
 typedef void (*WlXbServiceFn)(void *user, uint32_t reasons);
@@ -48,6 +49,12 @@ void wl_xb_service_set_vblank(WlXbVblankFn fn, void *user);
 WlResult wl_xb_service_add_vblank_hook(WlXbVblankFn fn, void *user);
 // Vertical blanks so far (the guest's frame clock: the play harness counts them).
 uint32_t wl_xb_vblank_count(void);
+// A device's periodic work (the audio processor's frames): `fn` runs about every `period_us`
+// microseconds, lock held, before the handler in the same round (an interrupt it raises is
+// delivered at once). Up to WL_XB_MAX_TICKS; before or after wl_xb_service_start.
+#define WL_XB_MAX_TICKS 4u
+typedef void (*WlXbTickFn)(void *user);
+WlResult wl_xb_service_add_tick(WlXbTickFn fn, void *user, uint32_t period_us);
 
 typedef struct {
     uint32_t vblank_hz_milli; // the host's vblank rate: 59940 (the Wii follows the display)

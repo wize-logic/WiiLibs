@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "wl/platform/gx_direct.h"
+#include "wl/platform/wii/gx_flush_wii.h"
 #include "wl/platform/wii/gx_wii_internal.h"
 
 #define DIRECT_FORMAT GX_VTXFMT7
@@ -22,8 +23,6 @@ _Static_assert((int)WL_GX_CULL_BACK == GX_CULL_BACK && (int)WL_GX_CULL_FRONT == 
 static struct {
     WlGxDirectLayout layout;
     bool layout_known;
-    bool flush_due;
-    bool flush_off;
     bool in_primitive;
     WlGxDirectStats stats;
 } d;
@@ -35,7 +34,7 @@ void wl_gx_direct_begin(void) {
     wl_gx_invalidate_shadow();
     wl_gx_tlut_invalidate();
     d.layout_known = false;
-    d.flush_due = true;
+    wl_gx_direct_flush_after();
     guMtxIdentity(identity);
     GX_LoadPosMtxImm(identity, GX_PNMTX0);
     GX_SetCurrentMtx(GX_PNMTX0);
@@ -44,16 +43,8 @@ void wl_gx_direct_begin(void) {
     for (stage = 0; stage < GX_MAX_TEVSTAGE; stage++) {
         GX_SetTevDirect((u8)stage);
     }
-    GX_SetMisc(GX_MT_XF_FLUSH, d.flush_off ? GX_XF_FLUSH_NONE : GX_XF_FLUSH_SAFE);
+    GX_SetMisc(GX_MT_XF_FLUSH, wl_gx_flush_wii_off() ? GX_XF_FLUSH_NONE : GX_XF_FLUSH_SAFE);
     wl_gx_wii_note_commands();
-}
-
-void wl_gx_direct_flush_after(void) {
-    d.flush_due = true;
-}
-
-void wl_gx_direct_set_xf_flush(bool on) {
-    d.flush_off = !on;
 }
 
 void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
@@ -131,7 +122,7 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     if (count == 0 || count > 65535u || (unsigned)prim >= sizeof prims || !d.layout_known) {
         return;
     }
-    if (d.flush_due && !d.flush_off) {
+    if (wl_gx_flush_wii_take()) {
         static const WlGxDirectVertex zero;
 
         GX_Begin(GX_TRIANGLESTRIP, DIRECT_FORMAT, XF_FLUSH_VERTICES);
@@ -139,9 +130,8 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
             emit(&zero);
         }
         GX_End();
-        d.stats.flushes++;
+        wl_gx_flush_wii_count();
     }
-    d.flush_due = false;
     GX_Begin(prims[prim], DIRECT_FORMAT, (u16)count);
     d.in_primitive = true;
     d.stats.draws++;
@@ -255,4 +245,5 @@ void wl_gx_direct_texture_invalidate(void) {
 
 void wl_gx_direct_stats(WlGxDirectStats *out) {
     *out = d.stats;
+    out->flushes = wl_gx_direct_flushes();
 }

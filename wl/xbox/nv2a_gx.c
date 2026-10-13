@@ -454,8 +454,6 @@ static bool states_apply(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aSurfac
     bool depth_test = depth && wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_TEST_ENABLE) != 0;
     WlGxBlendMode mode;
     WlGxBlendFactor source, destination;
-    WlGxCull negative = gx->cull_positive == WL_GX_CULL_BACK ? WL_GX_CULL_FRONT : WL_GX_CULL_BACK;
-    static const WlGxCull none = WL_GX_CULL_NONE, all = WL_GX_CULL_ALL;
 
     exact = wl_nv2a_gx_blend(k, &mode, &source, &destination);
     wl_gx_direct_blend(mode, source, destination);
@@ -472,20 +470,7 @@ static bool states_apply(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aSurfac
     // (the depth test after texturing when the alpha test may discard, so a discarded texel writes
     // no depth)
     wl_gx_direct_zcompare_early(!alpha_test);
-    switch (wl_nv2a_cull(k)) {
-    case WL_NV2A_CULLS_POSITIVE:
-        wl_gx_direct_cull(gx->cull_positive);
-        break;
-    case WL_NV2A_CULLS_NEGATIVE:
-        wl_gx_direct_cull(negative);
-        break;
-    case WL_NV2A_CULLS_ALL:
-        wl_gx_direct_cull(all);
-        break;
-    default:
-        wl_gx_direct_cull(none);
-        break;
-    }
+    wl_gx_direct_cull(wl_nv2a_gx_cull(wl_nv2a_cull(k), gx->cull_positive));
     return exact;
 }
 

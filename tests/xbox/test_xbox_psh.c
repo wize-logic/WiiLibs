@@ -16,7 +16,9 @@
 #include "greatest.h"
 #include "wl/xbox/psh.h"
 
-static uint32_t g_rng;
+// (the programs from one sequence, the inputs they are checked with from another: a program's
+// outcome does not change the programs after it)
+static uint32_t g_rng, g_trial_rng;
 static uint32_t rnd(void) {
     g_rng = g_rng * 1664525u + 1013904223u;
     return g_rng >> 8;
@@ -618,6 +620,8 @@ static int check(const uint32_t *state, unsigned present, const char **why) {
     if (program.approximate) {
         return -2;
     }
+    uint32_t programs_rng = g_rng;
+    g_rng = g_trial_rng;
     for (int trial = 0; trial < 50; trial++) {
         Inputs in;
         V4 maps[8];
@@ -645,48 +649,78 @@ static int check(const uint32_t *state, unsigned present, const char **why) {
         for (int ch = 0; ch < 4; ch++) {
             if (fabsf(want.c[ch] - got.c[ch]) > 0.01f) {
                 *why = "the TEV program differs from the combiners";
+                g_rng = programs_rng;
                 return 0;
             }
         }
     }
+    g_trial_rng = g_rng;
+    g_rng = programs_rng;
     return 1;
 }
 
 enum { RANDOM_PROGRAMS = 1500 };
 
-TEST random_programs_agree_with_the_combiners(void) {
+typedef struct {
+    int exact, approximate, untranslated, d0_exact;
+    const char *why; // the first difference
+} Outcomes;
+
+// `count` random programs from `seed`, translated and checked
+static Outcomes random_programs(uint32_t seed, int count) {
     static uint32_t state[WL_XBOX_PSH_WORDS];
-    int exact = 0, approximate = 0, untranslated = 0, d0_exact = 0;
-    g_rng = 0x5EED1234u;
-    g_digest = 2166136261u;
-    for (int n = 0; n < RANDOM_PROGRAMS; n++) {
+    Outcomes o = {0, 0, 0, 0, NULL};
+    g_rng = seed;
+    g_trial_rng = seed ^ 0x9E3779B9u;
+    for (int n = 0; n < count && o.why == NULL; n++) {
         const char *why = NULL;
         program_random(state);
         int r = check(state, 0x7u, &why);
         if (r == 0) {
-            FAILm(why);
+            o.why = why;
         }
-        exact += r == 1;
-        approximate += r == -2;
-        untranslated += r == -1;
+        o.exact += r == 1;
+        o.approximate += r == -2;
+        o.untranslated += r == -1;
         if (r == 1) {
             // the same with D0's alpha from a texture (map 7, or 6 where the fog ramp has 7)
             g_d0_alpha_map = g_fog_on ? 6u : 7u;
             r = check(state, 0x7u, &why);
             g_d0_alpha_map = 0;
             if (r == 0) {
-                FAILm(why);
+                o.why = why;
             }
-            d0_exact += r == 1;
+            o.d0_exact += r == 1;
         }
     }
-    // (most are exact (897 of them, 813 before a name written again was seen to free its register);
-    // the rest beyond GX or approximated, never wrong)
-    ASSERT(exact > RANDOM_PROGRAMS / 2);
-    ASSERT(d0_exact > exact * 9 / 10);
-    ASSERT(approximate + untranslated > 0);
+    return o;
+}
+
+TEST random_programs_agree_with_the_combiners(void) {
+    g_digest = 2166136261u;
+    Outcomes o = random_programs(0x5EED1234u, RANDOM_PROGRAMS);
+    if (o.why != NULL) {
+        FAILm(o.why);
+    }
+    // (most are exact: 991 of them, 888 before the negated mappings were made in their products'
+    // stages and the alpha's blues of products in the stages that read them; 339 approximated
+    // (416) and 170 beyond GX (196), never wrong)
+    ASSERT(o.exact > RANDOM_PROGRAMS / 2);
+    ASSERT(o.d0_exact > o.exact * 9 / 10);
+    ASSERT(o.approximate + o.untranslated > 0);
     // the same programs, field for field, on every target
-    ASSERT_EQ_FMT(0x5E3D0355u, g_digest, "%08x");
+    ASSERT_EQ_FMT(0x613B54DDu, g_digest, "%08x");
+    PASS();
+}
+
+// more of them, from other seeds: none differs
+TEST more_random_programs_agree_with_the_combiners(void) {
+    for (uint32_t seed = 1; seed <= 4; seed++) {
+        Outcomes o = random_programs(seed, 4000);
+        if (o.why != NULL) {
+            FAILm(o.why);
+        }
+    }
     PASS();
 }
 
@@ -862,8 +896,90 @@ TEST a_final_product_with_every_register_held(void) {
     PASS();
 }
 
+// a title-screen logo's shimmer: two scrolling copies of a texture, each scaled by a constant, their
+// difference about one half (t1.a + (0.5 - t0), the alpha t0.b + (0.5 - t1.b)) squared and chosen
+// by the mux. Every TEV register holds a value when the half bias negates are read: each is made in
+// the stage of its sum, and the alpha's blues of t0 and t1 (products of a texture and a constant)
+// are made again in the stages that read them, so the program is exact
+static void shimmer(uint32_t *state) {
+    memset(state, 0, WL_XBOX_PSH_WORDS * sizeof *state);
+    state[WL_XBOX_PSH_COMBINER_COUNT] = 5u | 0x1000u | 0x10000u;
+    state[WL_XBOX_PSH_RGB_INPUTS0 + 0] = 0x08010902u;   // t0 * c0, t1 * c1
+    state[WL_XBOX_PSH_RGB_OUTPUTS0 + 0] = 0x00000089u;  // to t0, t1
+    state[WL_XBOX_PSH_ALPHA_INPUTS0 + 0] = 0x18111912u; // their alphas
+    state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + 0] = 0x00000089u;
+    state[WL_XBOX_PSH_RGB_INPUTS0 + 1] = 0x0A010804u;   // t2 * c0, t0 * v0
+    state[WL_XBOX_PSH_RGB_OUTPUTS0 + 1] = 0x000000ACu;  // to t2, r0
+    state[WL_XBOX_PSH_ALPHA_INPUTS0 + 1] = 0x1A111814u;
+    state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + 1] = 0x000000ACu;
+    state[WL_XBOX_PSH_RGB_INPUTS0 + 2] = 0x1920B820u;   // t1.a * 1 + (0.5 - t0) * 1
+    state[WL_XBOX_PSH_RGB_OUTPUTS0 + 2] = 0x00000C00u;  // to r0
+    state[WL_XBOX_PSH_ALPHA_INPUTS0 + 2] = 0x0820A920u; // t0.b * 1 + (0.5 - t1.b) * 1
+    state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + 2] = 0x00000C00u;
+    state[WL_XBOX_PSH_ALPHA_INPUTS0 + 3] = 0x1C1C0C0Cu; // r0.a^2 or r0.b^2, by r0.a, times 4
+    state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + 3] = 0x00024C00u;
+    state[WL_XBOX_PSH_RGB_INPUTS0 + 4] = 0x0C010A04u;   // r0 * c0 + t2 * v0
+    state[WL_XBOX_PSH_RGB_OUTPUTS0 + 4] = 0x00000C00u;
+    state[WL_XBOX_PSH_ALPHA_INPUTS0 + 4] = 0x1C201A20u; // r0.a + t2.a
+    state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + 4] = 0x00000C00u;
+    state[WL_XBOX_PSH_FINAL_INPUTS_ABCD] = 0x0000000Cu; // r0
+    state[WL_XBOX_PSH_FINAL_INPUTS_EFG] = 0x00001C00u;  // r0.a
+}
+
+TEST negated_mappings_take_no_register_of_their_own(void) {
+    uint32_t state[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures;
+    static WlXboxPshProgram program;
+    const char *why = NULL;
+
+    g_fog_on = 0;
+    g_d0_alpha_map = 0;
+    g_rng = 0x10C0u;
+    g_trial_rng = 0x5111u;
+    for (int n = 0; n < 16; n++) {
+        shimmer(state);
+        for (int i = 0; i < 8; i++) {
+            // (and some constants 0, as a title's are where the shimmer is off)
+            state[WL_XBOX_PSH_CONSTANT0_0 + i] = n % 4 == 3 && i >= 4 ? 0u : rnd() * 2654435761u;
+            state[WL_XBOX_PSH_CONSTANT1_0 + i] = rnd() * 40503u * 65537u;
+        }
+        textures_make(&textures, 0x7u);
+        ASSERT(wl_xbox_psh_translate(state, &textures, NULL, &program));
+        ASSERTm(program.approximation, !program.approximate);
+        ASSERT_EQ(1, check(state, 0x7u, &why));
+    }
+    PASS();
+}
+
+// an expand negate, 1 - 2x, made with its product and the output's halving in one stage (and r0
+// then moved to PREV: two)
+TEST an_expand_negate_is_one_stage(void) {
+    uint32_t state[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures;
+    static WlXboxPshProgram program;
+    const char *why = NULL;
+
+    memset(state, 0, sizeof state);
+    state[WL_XBOX_PSH_COMBINER_COUNT] = 1;
+    state[WL_XBOX_PSH_RGB_INPUTS0] = 0x68040000u;    // A 1 - 2 t0, B v0
+    state[WL_XBOX_PSH_RGB_OUTPUTS0] = 0x000300C0u;   // AB, halved, to r0
+    state[WL_XBOX_PSH_ALPHA_INPUTS0] = 0x78340000u;  // A 1 - 2 t0.a, B 1 - v0.a
+    state[WL_XBOX_PSH_ALPHA_OUTPUTS0] = 0x000300C0u;
+    g_fog_on = 0;
+    g_d0_alpha_map = 0;
+    textures_make(&textures, 1u);
+    ASSERT(wl_xbox_psh_translate(state, &textures, NULL, &program));
+    ASSERT(!program.approximate);
+    ASSERT_EQ(2u, program.tev.stage_count);
+    ASSERT_EQ(1, check(state, 1u, &why));
+    PASS();
+}
+
 SUITE(psh_suite) {
     RUN_TEST(random_programs_agree_with_the_combiners);
+    RUN_TEST(more_random_programs_agree_with_the_combiners);
+    RUN_TEST(negated_mappings_take_no_register_of_their_own);
+    RUN_TEST(an_expand_negate_is_one_stage);
     RUN_TEST(a_final_product_with_every_register_held);
     RUN_TEST(a_modulation);
     RUN_TEST(a_recipe_comes_first);

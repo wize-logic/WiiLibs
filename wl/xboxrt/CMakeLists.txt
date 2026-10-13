@@ -25,6 +25,12 @@ if(TARGET wl_gxsoft AND TARGET wl_gxtex)
     target_compile_definitions(wl_xboxrt PRIVATE WL_XBRT_HAVE_GXSOFT=1)
     target_link_libraries(wl_xboxrt PUBLIC wl_gxsoft wl_gxtex)
 endif()
+# wl/xboxapu's APU and AC'97 models, when they are there, as the audio devices (devices.h)
+if(TARGET wl_xboxapu)
+    target_sources(wl_xboxrt PRIVATE audio.c)
+    target_compile_definitions(wl_xboxrt PRIVATE WL_XBRT_HAVE_APU=1)
+    target_link_libraries(wl_xboxrt PUBLIC wl_xboxapu)
+endif()
 add_library(WiiLibs::xboxrt ALIAS wl_xboxrt)
 
 # The boot code (boot.h) joins the runtime to the kernel; wl_xboxrt_main is a main over it.

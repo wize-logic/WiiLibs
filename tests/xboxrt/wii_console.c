@@ -30,8 +30,10 @@ static void check(const char *name, bool ok) {
     }
 }
 
-static uint32_t g_regs[64];
-static uint32_t g_reads, g_writes;
+// volatile: the compiler cannot see that a load from the device's address runs dev_read, so it
+// would move the test's own stores to these past the faulting access (and its checks before it)
+static volatile uint32_t g_regs[64];
+static volatile uint32_t g_reads, g_writes;
 
 static uint32_t dev_read(void *user, uint32_t off, unsigned size) {
     (void)user;
@@ -44,7 +46,7 @@ static uint32_t dev_read(void *user, uint32_t off, unsigned size) {
 static void dev_write(void *user, uint32_t off, uint32_t v, unsigned size) {
     (void)user;
     g_writes++;
-    uint32_t *w = &g_regs[(off >> 2) & 63u];
+    volatile uint32_t *w = &g_regs[(off >> 2) & 63u];
     uint32_t shift = (off & 3u) * 8u;
     uint32_t mask = size == 4 ? 0xFFFFFFFFu : ((size == 2 ? 0xFFFFu : 0xFFu) << shift);
     *w = (*w & ~mask) | ((v << (size == 4 ? 0 : shift)) & mask);

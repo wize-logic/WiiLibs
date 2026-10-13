@@ -270,7 +270,80 @@ TEST ima_roundtrip_of_a_sine(void) {
     PASS();
 }
 
+// ---- Xbox ADPCM blocks ----------------------------------------------------------------------
+
+// Reference: the block layout as the format text gives it, byte by byte. Channel c's header at
+// 4c; then for each group of 8 samples g, channel c's 4 bytes at 4*channels*(1+g) + 4c.
+static void ref_xbox_block(const uint8_t *b, int channels, int16_t *out) {
+    for (int c = 0; c < channels; c++) {
+        int pred = (int16_t)(b[4 * c] | b[4 * c + 1] << 8);
+        int index = (int8_t)b[4 * c + 2];
+        index = index < 0 ? 0 : index > 88 ? 88 : index;
+        out[c] = (int16_t)pred;
+        for (int g = 0; g < 8; g++) {
+            const uint8_t *grp = b + 4 * channels * (1 + g) + 4 * c;
+            for (int j = 0; j < 8; j++) {
+                const int code = (j & 1) ? grp[j / 2] >> 4 : grp[j / 2] & 15;
+                out[(1 + g * 8 + j) * channels + c] = (int16_t)ref_ima(&pred, &index, code);
+            }
+        }
+    }
+}
+
+TEST xbox_adpcm_blocks_match_the_layout(void) {
+    for (int channels = 1; channels <= 2; channels++) {
+        for (int trial = 0; trial < 2000; trial++) {
+            uint8_t blk[72];
+            for (int i = 0; i < 36 * channels; i++) {
+                blk[i] = (uint8_t)rnd();
+            }
+            int16_t a[130], b[130];
+            wl_xbox_adpcm_decode_block(blk, (uint32_t)channels, a);
+            ref_xbox_block(blk, channels, b);
+            ASSERT_MEM_EQ(b, a, sizeof(int16_t) * 65u * (unsigned)channels);
+        }
+    }
+    PASS();
+}
+
+TEST xbox_adpcm_header_rules(void) {
+    // The header sample is the first output; the reserved byte is ignored; an index byte above
+    // 127 is negative (clamps to 0), one of 100 clamps to 88.
+    uint8_t blk[36];
+    memset(blk, 0x77, sizeof blk); // every nibble 7: the largest positive step
+    blk[0] = 0x34;
+    blk[1] = 0x12; // predictor 0x1234
+    blk[2] = 200;  // -56 as a signed byte
+    blk[3] = 0x08; // reserved, as a title's padding leaves it
+    int16_t out[65];
+    wl_xbox_adpcm_decode_block(blk, 1, out);
+    ASSERT_EQ(0x1234, out[0]);
+    ASSERT_EQ(0x1234 + (7 >> 3) + 7 + 3 + 1, out[1]); // index 0: step 7
+    blk[3] = 0xFF;
+    int16_t out2[65];
+    wl_xbox_adpcm_decode_block(blk, 1, out2);
+    ASSERT_MEM_EQ(out, out2, sizeof out);
+    blk[2] = 100;
+    WlImaState st;
+    ASSERT_EQ(0x1234, wl_xbox_adpcm_header(blk, 0, &st));
+    ASSERT_EQ(88, st.index);
+    // stereo: the right channel's header is the second word and its nibbles the odd groups
+    uint8_t st2[72];
+    memset(st2, 0, sizeof st2);
+    st2[4] = 0x10; // right predictor 16
+    st2[12] = 0x07; // right channel, first group: sample 1 = nibble 7
+    int16_t o[130];
+    wl_xbox_adpcm_decode_block(st2, 2, o);
+    ASSERT_EQ(0, o[0]);
+    ASSERT_EQ(16, o[1]);
+    ASSERT_EQ(16 + 11, o[3]);
+    ASSERT_EQ(0, o[2]); // left: nibble 0 adds step >> 3 = 0
+    PASS();
+}
+
 SUITE(adpcm_suite) {
+    RUN_TEST(xbox_adpcm_blocks_match_the_layout);
+    RUN_TEST(xbox_adpcm_header_rules);
     RUN_TEST(dsp_matches_reference_on_random_frames);
     RUN_TEST(dsp_decode_many_frames_matches_fixture_decoder);
     RUN_TEST(dsp_partial_frame_start_resumes_mid_frame);

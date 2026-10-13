@@ -18,6 +18,13 @@ static WlXbServiceFn g_handler;
 static void *g_handler_user;
 static WlXbVblankFn g_vblank_fn;
 static void *g_vblank_user;
+static struct {
+    WlXbTickFn fn;
+    void *user;
+    uint64_t period_us, next_us; // next_us: the service thread's
+    volatile uint32_t due;       // set by the service thread, taken by the work
+} g_tick[WL_XB_MAX_TICKS];
+static uint32_t g_tick_count;
 static WlXbServiceConfig g_cfg;
 #define MAX_VBLANK_HOOKS 8u
 static struct {
@@ -83,6 +90,51 @@ WlResult wl_xb_service_add_vblank_hook(WlXbVblankFn fn, void *user) {
 
 uint32_t wl_xb_vblank_count(void) {
     return g_vblank_count;
+}
+
+WlResult wl_xb_service_add_tick(WlXbTickFn fn, void *user, uint32_t period_us) {
+    if (fn == NULL || period_us == 0) {
+        return WL_ERR_ARG;
+    }
+    if (g_tick_count >= WL_XB_MAX_TICKS) {
+        return WL_ERR_LIMIT;
+    }
+    g_tick[g_tick_count].fn = fn;
+    g_tick[g_tick_count].user = user;
+    g_tick[g_tick_count].period_us = period_us;
+    g_tick[g_tick_count].next_us = wl_platform_time_us() + period_us;
+    __atomic_store_n(&g_tick_count, g_tick_count + 1u, __ATOMIC_RELEASE);
+    return WL_OK;
+}
+
+// The service thread: marks the ticks whose time came; returns the earliest next one (or `wake`).
+static uint64_t ticks_due(uint64_t now, uint64_t wake) {
+    const uint32_t n = __atomic_load_n(&g_tick_count, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < n; i++) {
+        if (now >= g_tick[i].next_us) {
+            g_tick[i].next_us += g_tick[i].period_us;
+            if (g_tick[i].next_us < now) {
+                g_tick[i].next_us = now + g_tick[i].period_us; // fell behind: no burst
+            }
+            __atomic_store_n(&g_tick[i].due, 1u, __ATOMIC_RELEASE);
+            __atomic_fetch_or(&g_pending, WL_XB_SVC_DEVICE, __ATOMIC_SEQ_CST);
+            g_xb_attention = 1;
+        }
+        if (g_tick[i].next_us < wake) {
+            wake = g_tick[i].next_us;
+        }
+    }
+    return wake;
+}
+
+// The work: the ticks marked due, lock held.
+static void run_ticks(void) {
+    const uint32_t n = __atomic_load_n(&g_tick_count, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < n; i++) {
+        if (__atomic_exchange_n(&g_tick[i].due, 0u, __ATOMIC_ACQ_REL) != 0) {
+            g_tick[i].fn(g_tick[i].user);
+        }
+    }
 }
 
 bool wl_xb_in_service(void) {
@@ -192,6 +244,9 @@ static void run_service(void) {
                 g_vblank_hooks[i].fn(g_vblank_hooks[i].user);
             }
         }
+        if (reasons & WL_XB_SVC_DEVICE) {
+            run_ticks();
+        }
         if (wl_xb_irq_lines() != 0) {
             reasons |= WL_XB_SVC_IRQ;
         }
@@ -275,6 +330,7 @@ static void *service_main(void *arg) {
         if (deadline != 0 && deadline < wake) {
             wake = deadline;
         }
+        wake = ticks_due(now, wake);
         wl_platform_mutex_lock(g_sm);
         if (g_pending == 0 && g_running) {
             uint32_t ms = wake > now ? (uint32_t)((wake - now + 999u) / 1000u) : 0;
@@ -288,6 +344,7 @@ static void *service_main(void *arg) {
         }
         update_tick();
         now = wl_platform_time_us();
+        ticks_due(now, now);
         if (now >= next_status) {
             next_status = now + 10000000u;
             status_report();

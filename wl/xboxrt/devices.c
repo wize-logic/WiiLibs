@@ -269,3 +269,17 @@ WlResult wl_xb_gpu_attach_nv2a(void) {
     return WL_ERR_UNSUPPORTED;
 }
 #endif
+
+#if !defined(WL_XBRT_HAVE_APU)
+void wl_xb_audio_config_default(WlXbAudioConfig *cfg) {
+    memset(cfg, 0, sizeof *cfg);
+}
+
+WlResult wl_xb_audio_attach(const WlXbAudioConfig *cfg) {
+    (void)cfg;
+    return WL_ERR_UNSUPPORTED;
+}
+
+void wl_xb_audio_log_status(void) {
+}
+#endif

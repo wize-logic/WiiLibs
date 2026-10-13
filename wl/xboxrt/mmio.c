@@ -73,6 +73,16 @@ bool wl_xb_mmio_write(uint32_t va, uint64_t value, unsigned size) {
     return true;
 }
 
+static uintptr_t g_fault_pc;
+
+void wl_xb_mmio_set_fault_pc(uintptr_t pc) {
+    g_fault_pc = pc;
+}
+
+uintptr_t wl_xb_mmio_fault_pc(void) {
+    return g_fault_pc;
+}
+
 void wl_xb_mmio_stats(WlXbMmioStats *out) {
     *out = g_stats;
 }

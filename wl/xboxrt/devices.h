@@ -2,8 +2,8 @@
 // The Xbox's devices for a title that has to get through its XDK libraries' initialisation without
 // sound or network yet: each answers as idle or absent hardware would, so the init loops end (and
 // DirectSoundCreate and XNetStartup fail the way a title tolerates); the USB controllers and the
-// gamepads behind them are modelled (usb.h). And the GPU's place: the NV2A device and its vertical blank interrupt, wired to a
-// model through WlXbGpuOps (wl/xbox's NV2A, or the idle stub here).
+// gamepads behind them are modelled (usb.h). And the GPU's place: the NV2A device and its vertical
+// blank interrupt, wired to a model through WlXbGpuOps (wl/xbox's NV2A, or the idle stub here).
 //
 // Register numbers are from public descriptions of the hardware: the OHCI 1.0a specification
 // (USB), Intel's AC'97 2.3 bus-master interface (the MCPX ACI follows it), envytools' NV register
@@ -38,6 +38,29 @@ extern "C" {
 struct WlXbUsbConfig;
 WlResult wl_xb_devices_register_mcpx(void);
 WlResult wl_xb_devices_register_mcpx_usb(const struct WlXbUsbConfig *usb);
+
+// ---- The audio hardware ------------------------------------------------------------------------
+
+// wl/xboxapu's APU and AC'97 models in place of the idle ones (audio.c, built when wl/xboxapu is):
+// the devices at 0xFE800000 and 0xFEC00000, their interrupt lines (5 and 6), a service tick that
+// runs the APU's frames and moves the AC'97's bus masters, and the output: the platform's audio
+// at 48 kHz (the Wii), a WAV file (the host). The host reads its settings from the environment:
+// WL_XB_AUDIO_WAV=<file> writes everything played, WL_XB_AUDIO_TRACE=<file> logs every APU and
+// AC'97 access with the translated function that made it, WL_XB_AUDIO=0 keeps the idle devices.
+typedef struct {
+    uint32_t tick_us;         // how often the frames run: 4000 (6 frames)
+    uint32_t latency_frames;  // frames queued ahead of the platform output: 48 (32 ms)
+    bool output;              // start the platform's audio output (true)
+    bool off;                 // keep the idle devices: DirectSoundCreate fails, the title is silent
+    const char *wav_path;     // the host: a WAV of the output (NULL: none)
+    const char *trace_path;   // the host: the MMIO trace (NULL: none)
+} WlXbAudioConfig;
+void wl_xb_audio_config_default(WlXbAudioConfig *cfg);
+// Call after wl_xb_devices_register_mcpx. WL_ERR_UNSUPPORTED in a build without wl/xboxapu.
+WlResult wl_xb_audio_attach(const WlXbAudioConfig *cfg);
+// One line: frames run, voices a frame, the time a frame costs, notifiers, traps, underruns (also
+// logged every 10 s while the title runs).
+void wl_xb_audio_log_status(void);
 
 // ---- The GPU -----------------------------------------------------------------------------------
 
