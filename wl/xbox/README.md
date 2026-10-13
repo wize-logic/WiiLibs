@@ -66,6 +66,19 @@ leaving the screen-space position, the clip-space position before the conversion
 (`clip_captured`), the colours, texture coordinates, fog and point size. `wl_xbox_vsh_run_live`
 computes only the outputs a draw reads (`WL_XBOX_VSH_LIVE_*`), the same bits.
 
+The interpreter does no decoding as it runs: compile resolves each instruction once into a step
+(`WlXboxVshStep`: each operand's register file, index, swizzle and sign, the registers and masks
+each unit writes, the output written) and finds, backwards from the end, the outputs each one's
+results reach (`wl_xbox_vsh_live_needs`, which the compiled functions skip by too). A run skips the
+steps that reach no output the draw reads. `wl_xbox_vsh_run_batch` runs many vertices, 16 at a
+time (`WL_XBOX_VSH_BATCH`, the registers in the caller's `WlXboxVshWork`), an instruction at a time
+for all of them: a constant operand is made once for the batch, a temporary or input read in place
+(swizzled or negated ones gathered first), each result written with its mask for every vertex.
+Each vertex gets the same operations in the same order as a run of the program for it alone, so the
+bits are the same (`test_xbox_vsh_batch.c` holds the plain interpreter and checks the batch against
+it on random programs). `wl_xbox_vsh_inputs_read` says which input registers the steps a draw runs
+read: the GX backend fetches only those.
+
 The analysis (`wl_xbox_vsh_analyze`, `_uniform`, `_constants`) walks a program with sets of input
 registers in place of numbers: each output component's inputs, whether it is an affine function of
 them (then GX's matrices can compute it), whether it reads a constant (one that does not is the

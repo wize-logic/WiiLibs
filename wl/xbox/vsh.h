@@ -84,6 +84,52 @@ typedef struct WlXboxVshNative {
     WlXboxVshPositionsProc positions;
 } WlXboxVshNative;
 
+/* an instruction as the interpreter runs it, its fields resolved once by
+wl_xbox_vsh_compile: each operand's register file (WL_XBOX_VSH_FILE_...,
+with WL_XBOX_VSH_NEGATE), its index (a temporary 0..12, 12 the position;
+an input; a constant, kept in range unless relative) and its swizzle (two
+bits a component, x's lowest); the registers the units write (12 the
+position) with their masks (0: no write); the output written
+(WL_XBOX_VSH_TO_...) and its mask; and the outputs its results reach
+(WL_XBOX_VSH_LIVE_...: a draw that reads none of them skips it) */
+enum {
+    WL_XBOX_VSH_FILE_ZERO,
+    WL_XBOX_VSH_FILE_TEMPORARY,
+    WL_XBOX_VSH_FILE_INPUT,
+    WL_XBOX_VSH_FILE_CONSTANT,
+    WL_XBOX_VSH_FILE_RELATIVE,
+    WL_XBOX_VSH_NEGATE = 0x80
+};
+enum {
+    WL_XBOX_VSH_TO_NONE,
+    WL_XBOX_VSH_TO_POSITION,
+    WL_XBOX_VSH_TO_D0,
+    WL_XBOX_VSH_TO_D1,
+    WL_XBOX_VSH_TO_B0,
+    WL_XBOX_VSH_TO_B1,
+    WL_XBOX_VSH_TO_FOG,
+    WL_XBOX_VSH_TO_POINT_SIZE,
+    WL_XBOX_VSH_TO_T0
+};
+enum {
+    /* (flags) */
+    WL_XBOX_VSH_STEP_CAPTURES_CLIP = 1,
+    WL_XBOX_VSH_STEP_ARL = 2,
+    WL_XBOX_VSH_STEP_FROM_ILU = 4
+};
+
+typedef struct WlXboxVshStepOperand {
+    unsigned char file, index, swizzle;
+} WlXboxVshStepOperand;
+
+typedef struct WlXboxVshStep {
+    unsigned char mac, ilu, flags;
+    unsigned char mac_register, mac_mask, ilu_register, ilu_mask;
+    unsigned char output, output_mask;
+    unsigned short reaches;
+    WlXboxVshStepOperand operands[3];
+} WlXboxVshStep;
+
 typedef struct WlXboxVshProgram {
     unsigned long count;
     /* (wl_xbox_vsh_hash: the generated programs' names) */
@@ -94,8 +140,27 @@ typedef struct WlXboxVshProgram {
     WlXboxVshColorsProc native_colors;
     /* (its position for four values of v0; NULL on the interpreter) */
     WlXboxVshPositionsProc native_positions;
+    /* the temporaries read before they are written (bit n: r[n]), which
+    the interpreter clears for each vertex */
+    unsigned short exposed;
+    /* an instruction captures the clip-space position (the run of any
+    vertex for its position sets clip_captured) */
+    unsigned char captures_clip;
     WlXboxVshInstruction instructions[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+    WlXboxVshStep steps[WL_XBOX_VSH_MAX_INSTRUCTIONS];
 } WlXboxVshProgram;
+
+/* the vertices the interpreter runs together (wl_xbox_vsh_run_batch): each
+instruction is decoded for all of them at once, and its registers are
+this scratch, the caller's (for a thread whose stack is small) */
+enum { WL_XBOX_VSH_BATCH = 16 };
+typedef struct WlXboxVshWork {
+    float r[WL_XBOX_VSH_BATCH][13][4];
+    float mac[WL_XBOX_VSH_BATCH][4], ilu[WL_XBOX_VSH_BATCH][4];
+    /* (the operands A, B and C, swizzled and signed) */
+    float operands[3][WL_XBOX_VSH_BATCH][4];
+    int a0[WL_XBOX_VSH_BATCH];
+} WlXboxVshWork;
 
 /* what a vertex leaves: the screen-space position the program computes
 (pixels, and depth scaled by the viewport), the clip-space position before
@@ -154,6 +219,20 @@ the same, bit for bit, the others undefined */
 void wl_xbox_vsh_run_live(const WlXboxVshProgram *program, const float (*constants)[4],
                           const float (*inputs)[4], float point_size, WlXboxVshOutput *output,
                           unsigned live);
+/* wl_xbox_vsh_run_live for count vertices (inputs[n], outputs[n]), on the
+interpreter WL_XBOX_VSH_BATCH at a time: the same results, to the bit */
+void wl_xbox_vsh_run_batch(const WlXboxVshProgram *program, const float (*constants)[4],
+                           const float (*inputs)[WL_XBOX_VSH_INPUT_COUNT][4], unsigned count,
+                           float point_size, WlXboxVshOutput *outputs, unsigned live,
+                           WlXboxVshWork *work);
+/* the input registers the instructions that reach the outputs in live read
+(bit n: v[n]): the others may hold anything for wl_xbox_vsh_run_live and
+wl_xbox_vsh_run_batch */
+unsigned long wl_xbox_vsh_inputs_read(const WlXboxVshProgram *program, unsigned live);
+/* the outputs each instruction's results reach (needs[n] for instruction n,
+WL_XBOX_VSH_LIVE_...), found backwards from the end a register's
+component at a time */
+void wl_xbox_vsh_live_needs(const WlXboxVshProgram *program, unsigned *needs);
 /* a vertex's colours (d0, d1) and fog alone: the compiled colours function
 where there is one, else all of the program */
 void wl_xbox_vsh_run_colors(const WlXboxVshProgram *program, const float (*constants)[4],

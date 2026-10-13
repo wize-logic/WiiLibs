@@ -280,109 +280,8 @@ static void instruction_code(FILE *out, const WlXboxVshInstruction *instruction,
     (void)component_letters;
 }
 
-/* the outputs each instruction's results reach (WL_XBOX_VSH_LIVE_...), found
-backwards from the end a register's component at a time: a draw that reads
-none of them skips the instruction, and what it runs is the same, so the
-outputs it reads are too */
-static unsigned temporary_index(unsigned temporary) {
-    return temporary == 12 ? 12 : temporary < 12 ? temporary : 0;
-}
-
-static void live_needs(const WlXboxVshProgram *program, unsigned *needs) {
-    unsigned need[13][4], need_a0 = 0;
-    long index;
-    int component, which;
-
-    memset(need, 0, sizeof(need));
-    /* (the position is p as the program ends) */
-    for (component = 0; component < 4; component++)
-        need[12][component] = WL_XBOX_VSH_LIVE_POSITION;
-    for (index = (long)program->count - 1; index >= 0; index--) {
-        const WlXboxVshInstruction *instruction = &program->instructions[index];
-        unsigned reaches = 0, kills[13] = {0};
-
-        /* what its writes reach */
-        if (instruction->mac == _mac_arl)
-            reaches |= need_a0;
-        else if (instruction->mac != _mac_nop && instruction->mac_mask)
-            kills[temporary_index(instruction->temporary)] |= instruction->mac_mask;
-        if (instruction->ilu != _ilu_nop && instruction->ilu_mask)
-            kills[temporary_index(instruction->mac != _mac_nop ? 1 : instruction->temporary)] |=
-                instruction->ilu_mask;
-        if (instruction->output_mask && instruction->output_is_register &&
-            (instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0) {
-            switch (instruction->output_address) {
-            case _output_position:
-                kills[12] |= instruction->output_mask;
-                break;
-            case _output_d0:
-                reaches |= WL_XBOX_VSH_LIVE_D0;
-                break;
-            case _output_d1:
-                reaches |= WL_XBOX_VSH_LIVE_D1;
-                break;
-            case _output_b0:
-            case _output_b1:
-                reaches |= WL_XBOX_VSH_LIVE_BACK;
-                break;
-            case _output_fog:
-                if (instruction->output_mask & 8)
-                    reaches |= WL_XBOX_VSH_LIVE_FOG;
-                break;
-            case _output_point_size:
-                if (instruction->output_mask & 8)
-                    reaches |= WL_XBOX_VSH_LIVE_POINT_SIZE;
-                break;
-            default:
-                if (instruction->output_address >= _output_t0 &&
-                    instruction->output_address < _output_t0 + 4)
-                    reaches |= WL_XBOX_VSH_LIVE_T0 << (instruction->output_address - _output_t0);
-                break;
-            }
-        }
-        for (which = 0; which < 13; which++)
-            for (component = 0; component < 4; component++)
-                if (kills[which] & (8u >> component)) {
-                    reaches |= need[which][component];
-                    need[which][component] = 0;
-                }
-        if (instruction->mac == _mac_arl)
-            need_a0 = 0;
-        /* (the clip-space position: p before this instruction's writes) */
-        if (instruction->captures_clip) {
-            reaches |= WL_XBOX_VSH_LIVE_POSITION;
-            for (component = 0; component < 4; component++)
-                need[12][component] |= WL_XBOX_VSH_LIVE_POSITION;
-        }
-        /* what it reads: its operands, whole */
-        if (reaches) {
-            int reads[3] = {0, 0, 0};
-
-            if (instruction->mac != _mac_nop) {
-                reads[0] = 1;
-                if (instruction->mac != _mac_mov && instruction->mac != _mac_arl &&
-                    instruction->mac != _mac_add)
-                    reads[1] = 1;
-            }
-            if (instruction->ilu != _ilu_nop || instruction->mac == _mac_add ||
-                instruction->mac == _mac_mad)
-                reads[2] = 1;
-            for (which = 0; which < 3; which++) {
-                const WlXboxVshOperand *operand = &instruction->operands[which];
-
-                if (!reads[which])
-                    continue;
-                if (operand->mux == _mux_temporary)
-                    for (component = 0; component < 4; component++)
-                        need[temporary_index(operand->index)][operand->swizzle[component] & 3] |=
-                            reaches;
-                else if (operand->mux == _mux_constant && instruction->relative)
-                    need_a0 |= reaches;
-            }
-        }
-        needs[index] = reaches;
-    }
-}
+/* (the outputs each instruction's results reach: wl_xbox_vsh_live_needs,
+which the interpreter also skips by) */
 
 /* the outputs' components no instruction writes, as wl_xbox_vsh_run leaves
 them (but the point size, which wl_xbox_vsh_run_live sets) */
@@ -508,7 +407,7 @@ static void constant_free_comment(FILE *out, const WlXboxVshProgram *program) {
 }
 
 /* writing a program's positions function: the instructions that reach the
-position (live_needs), for four values of v0 at once. An instruction that
+position (wl_xbox_vsh_live_needs), for four values of v0 at once. An instruction that
 reads nothing of v0 (through its operands, the registers written from it,
 or a0 made from it) is the same in every lane: written once, from lane 0's
 registers, and what it writes copied to the others; one that does is
@@ -742,7 +641,7 @@ int main(int argc, char **argv) {
                 "r;\n\t(void)live;\n",
                 hash);
         live_defaults(out, &program);
-        live_needs(&program, needs);
+        wl_xbox_vsh_live_needs(&program, needs);
         {
             unsigned open = 0;
 

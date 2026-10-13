@@ -44,5 +44,8 @@ add_custom_command(OUTPUT ${vsh_generated}
     COMMAND xbox_vsh_codegen ${CMAKE_CURRENT_SOURCE_DIR}/vsh_programs.inc ${vsh_generated} test_vsh_natives
     DEPENDS xbox_vsh_codegen ${CMAKE_CURRENT_SOURCE_DIR}/vsh_programs.inc
     VERBATIM)
+# the batch interpreter against the plain one, on random programs
+wl_add_test(test_xbox_vsh_batch SOURCES test_xbox_vsh_batch.c LIBS wl_xbox LABELS unit be)
+target_include_directories(test_xbox_vsh_batch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 wl_add_test(test_xbox_vsh_native SOURCES test_xbox_vsh_native.c ${vsh_generated} LIBS wl_xbox LABELS unit be)
 target_include_directories(test_xbox_vsh_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
