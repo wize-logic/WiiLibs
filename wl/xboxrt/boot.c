@@ -30,7 +30,7 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     memset(cfg, 0, sizeof *cfg);
     cfg->xbe_name = "default.xbe";
     cfg->ram_mb = 64;
-    cfg->keep_free_bytes = 14u << 20; // the host side: GX textures converted from the guest's, caches
+    cfg->keep_free_bytes = 20u << 20; // the host side: GX textures converted from the guest's, caches
     cfg->htab_bytes = 256u << 10;
 }
 
@@ -299,6 +299,15 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     WlXbAudioConfig audio;
     wl_xb_audio_config_default(&audio);
     audio.off = audio.off || cfg->audio_off;
+    {
+        // a file "noaudio" in the title's folder turns the models off too, for an A/B on the console
+        char flag[sizeof data_dir + 32];
+        snprintf(flag, sizeof flag, "%s/noaudio", cfg->title_dir);
+        if (wl_platform_fs_exists(flag)) {
+            audio.off = true;
+            WL_LOG_I(TAG, "audio: off (%s)", flag);
+        }
+    }
     r = wl_xb_audio_attach(&audio);
     if (r != WL_OK && r != WL_ERR_UNSUPPORTED) {
         WL_LOG_W(TAG, "audio: %s (the title runs silent)", wl_result_name(r));

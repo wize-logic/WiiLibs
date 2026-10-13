@@ -304,6 +304,11 @@ void wl_xb_service_poll_levels(void) {
 static void status_report(void) {
     WlXbMemStats m;
     wl_xb_mem_stats(&m);
+    if (g_tick_va != 0) {
+        // what the guest's clock reads against the host's (a title times its frames by it)
+        WL_LOG_I(TAG, "status: KeTickCount %u ms, host clock %u ms", (unsigned)wl_xb_rd32(g_tick_va),
+                 (unsigned)wl_xb_tick_ms());
+    }
 #if defined(__GLIBC__)
     struct mallinfo2 mi = mallinfo2();
 #else

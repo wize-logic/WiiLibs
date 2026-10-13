@@ -84,16 +84,19 @@ bool wl_xb_input_connected(uint32_t port) {
     }
 }
 
+// A port the play harness drives is the harness's alone, as OpenCE's scripted controller 1 is: the
+// console's own controllers are not merged in (in Dolphin an emulated Wii Remote's pointer reads as
+// the right stick, and one stray input in Halo's menu cancels the map change a script just asked
+// for, so a load that runs on the host never ran on the Wii).
 static void compose(Port *p) {
     WlXboxPad s;
     memset(&s, 0, sizeof s);
-    if (p->host_pad_on) {
+    if (p->script_on) {
+        s = p->script;
+    } else if (p->host_pad_on) {
         s = p->host_pad;
     } else if (p->host_present) {
         s = p->host;
-    }
-    if (p->script_on) {
-        wl_xbox_pad_merge(&s, &p->script);
     }
     p->state = s;
 }

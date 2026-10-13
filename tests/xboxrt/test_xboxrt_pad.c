@@ -163,13 +163,16 @@ TEST ports(void) {
     WlXboxPad st;
     wl_xb_input_state(2, &st);
     ASSERT_EQ(255, st.analog[WL_XBOX_PAD_B]);
-    // the harness's presses lie over the host's
+    // a port the harness drives is the harness's alone: the host's B is not merged in
     WlXboxPad s;
     memset(&s, 0, sizeof s);
     s.analog[WL_XBOX_PAD_A] = 255;
     wl_xb_input_set_script(2, &s);
     wl_xb_input_state(2, &st);
     ASSERT_EQ(255, st.analog[WL_XBOX_PAD_A]);
+    ASSERT_EQ(0, st.analog[WL_XBOX_PAD_B]);
+    wl_xb_input_set_script(2, NULL); // and the host's comes back once it lets go
+    wl_xb_input_state(2, &st);
     ASSERT_EQ(255, st.analog[WL_XBOX_PAD_B]);
     wl_xb_input_set_mode(2, WL_XB_PORT_OFF);
     ASSERT_FALSE(wl_xb_input_connected(2));
