@@ -3,8 +3,9 @@
 // (wl/xboxrt/recomp/recomp_types.h). Both sides declare every data symbol (recomp_symbols.inc
 // through regs.h, the header's externs) and every function the runtime provides (thunk.h, the
 // header's prototypes) in this one file, so a type that differs is a compile error rather than a
-// silent mismatch at link time. At run time: the register unions' little-endian lanes, the header's
-// address transform against the runtime's, and its MEM macros against the runtime's accessors.
+// silent mismatch at link time; thread.h's back-edge hook too, once the header declares it. At run
+// time: the register unions' little-endian lanes, the header's address transform against the
+// runtime's, and its MEM macros against the runtime's accessors.
 //
 // The runtime's transform is defined first, token for token as mem.h has it: the header uses a
 // WL_XB_EA that is already there, and mem.h's identical definition is then no redefinition.
@@ -14,6 +15,7 @@
 #include "greatest.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/regs.h"
+#include "wl/xboxrt/thread.h" // g_xb_attention, wl_xb_safe_point: the back-edge hook
 #include "wl/xboxrt/thunk.h"
 
 // The header's register unions are the ones regs.c stores: the same lanes, little-endian.
@@ -27,6 +29,7 @@ static void *const k_runtime_fns[] = {
     (void *)recomp_icall_not_code_log, (void *)recomp_debug_service, (void *)xbox_ReadTimeStampCounter,
     (void *)recomp_setjmp_slot,   (void *)recomp_guest_longjmp,  (void *)recomp_unimpl,
     (void *)recomp_trace_enter,   (void *)recomp_trace_exit,     (void *)recomp_trace_esp,
+    (void *)wl_xb_safe_point,
 };
 
 TEST unions_are_little_endian(void) {
