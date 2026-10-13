@@ -87,9 +87,13 @@ compiles the list against the generated code's header so a type that differs doe
 | `recomp_unimpl`, `recomp_trace_*`, `recomp_abi_violation_log`, `recomp_call_profile_hit` | weak defaults here | the lifter's optional diagnostics |
 | `wl_xb_port_in`/`wl_xb_port_out` | here | x86 port I/O: reads give 0 (the video encoder's field flag at `0x80C0`: progressive), writes are dropped |
 
-Optional hook for the generator: `g_xb_attention` is non-zero while a safe point has work. A loop
-that spins on plain guest memory has no device access or kernel call to stop at; generated code may
-test the flag at loop back edges: `if (g_xb_attention) wl_xb_safe_point();`.
+The hook the generator should emit at loop back edges: `g_xb_attention` is non-zero while a safe
+point has work, and `if (g_xb_attention) wl_xb_safe_point();` before a backward jump costs a load
+and a branch. A loop that polls plain guest memory has no device access or kernel call to stop at,
+and D3D has several that wait for what an interrupt does: on Halo, the flip throttle at
+`0x00185694` and the wait at `0x00189325` hold the guest lock forever without it, and with the hook
+before each of the title's 6298 backward jumps (tried by hand on a local build) it runs on into its
+frame loop.
 
 ## Threads and the guest lock (`thread.h`)
 
@@ -114,7 +118,8 @@ runs or the holder hands it the lock at a safe point. It always runs on the serv
 stack: a device access can come in the middle of a translated function whose `esp` the compiler
 has not stored back yet, so the interrupted stack is left alone. A guest thread that spins without
 a kernel call, an `rdtsc` or a device access holds interrupts off (see `g_xb_attention` above); the
-service thread logs which thread it is once it has waited a second for the lock.
+service thread logs which thread it is once it has waited a second for the lock, and on the host
+and ppc-be that thread logs its host PC and the translated functions it is in.
 
 ## The GPU and the MCPX (`devices.h`)
 
