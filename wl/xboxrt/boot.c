@@ -36,6 +36,43 @@ static WlResult read_file(void *user, uint32_t offset, void *dst, uint32_t n) {
     return wl_platform_fs_read_at(user, offset, dst, n);
 }
 
+// The title config's XBE patches (tools/xbox_recomp.py writes the table into the title's own
+// code; weak, so a runtime built without one links): the code was lifted from the patched bytes,
+// and the loaded image gets the same, each checked against what it replaces.
+typedef struct {
+    uint32_t va, bytes;
+    const uint8_t *from, *to;
+} WlXbTitlePatch;
+extern const WlXbTitlePatch wl_xb_title_patches[] __attribute__((weak));
+extern const uint32_t wl_xb_title_patch_count __attribute__((weak));
+
+static void apply_title_patches(void) {
+    // (the count's address alone: GCC holds an array's address non-null even when weak)
+    const uint32_t *count = &wl_xb_title_patch_count;
+    __asm__("" : "+r"(count)); // not folded: weak, so it may be null
+    if (count == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < wl_xb_title_patch_count; i++) {
+        const WlXbTitlePatch *p = &wl_xb_title_patches[i];
+        uint8_t now[64];
+        if (p->bytes == 0 || p->bytes > sizeof now || !wl_xb_range_ok(p->va, p->bytes)) {
+            WL_LOG_E(TAG, "patch %u at 0x%08x: bad size or address, skipped", (unsigned)i, (unsigned)p->va);
+            continue;
+        }
+        wl_xb_copy_out(now, p->va, p->bytes);
+        if (memcmp(now, p->from, p->bytes) != 0) {
+            WL_LOG_E(TAG, "patch %u at 0x%08x: the image does not have the expected bytes, skipped",
+                     (unsigned)i, (unsigned)p->va);
+            continue;
+        }
+        wl_xb_copy_in(p->va, p->to, p->bytes);
+    }
+    if (wl_xb_title_patch_count != 0) {
+        WL_LOG_I(TAG, "%u title patches applied", (unsigned)wl_xb_title_patch_count);
+    }
+}
+
 int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     if (cfg == NULL || cfg->title_dir == NULL) {
         return WL_ERR_ARG;
@@ -196,6 +233,7 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     if (r != WL_OK) {
         return r;
     }
+    apply_title_patches();
     WlXkConfig kc;
     wl_xk_config_default(&kc);
     kc.title_dir = cfg->title_dir;

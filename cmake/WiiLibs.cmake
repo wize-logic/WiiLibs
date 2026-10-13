@@ -277,7 +277,7 @@ function(wl_add_xbox_title target)
         endif()
         list(APPEND units ${out}/tu/recomp_tu_${i}.c)
     endforeach()
-    list(APPEND units ${out}/tu/recomp_tu_dispatch.c ${out}/tu/recomp_tu_stubs.c)
+    list(APPEND units ${out}/tu/recomp_tu_dispatch.c ${out}/tu/recomp_tu_stubs.c ${out}/tu/recomp_tu_patches.c)
     # rerun when the pipeline, its patches or the driver change (the driver's own stage cache
     # decides what actually reruns)
     file(GLOB_RECURSE pipeline_files CONFIGURE_DEPENDS
