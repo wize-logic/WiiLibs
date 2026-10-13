@@ -23,3 +23,8 @@ void wl_xb_backend_release_phys(uint32_t phys, uint32_t pages);
 void wl_xb_backend_move_phys(uint32_t from, uint32_t to, uint32_t va);
 // Frames (host memory behind physical pages), first-touch faults resolved, table evictions.
 void wl_xb_backend_stats(uint32_t *frames, uint32_t *faults, uint32_t *evictions);
+// The calling host thread as the fault backend names it (the host: its pthread_t; the Wii: 0).
+uintptr_t wl_xb_backend_thread_handle(void);
+// Logs where the host thread `handle` is running: on the host a signal makes it log its PC and the
+// translated function there; nothing on the Wii. A diagnostic for a thread that keeps the guest lock.
+void wl_xb_backend_probe(uintptr_t handle);

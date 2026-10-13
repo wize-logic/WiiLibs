@@ -340,6 +340,14 @@ void wl_xb_backend_stats(uint32_t *frames, uint32_t *faults, uint32_t *evictions
     *evictions = g_evictions;
 }
 
+uintptr_t wl_xb_backend_thread_handle(void) {
+    return 0;
+}
+
+void wl_xb_backend_probe(uintptr_t handle) {
+    (void)handle; // another LWP's PC is not looked at here
+}
+
 WlResult wl_xb_fault_install(void) {
     return WL_OK; // the DSI handler is part of wl_xb_backend_init
 }

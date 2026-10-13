@@ -10,8 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/xboxrt/crash.h"
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
+#include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/thread.h"
 #include "wl/xboxrt/thunk.h"
 
@@ -110,6 +112,9 @@ static void take(WlXbThread *self) {
                          "interrupts held off for %u ms: thread %u (%s) keeps the guest lock without a safe point "
                          "(a kernel call, rdtsc or a device access)",
                          (unsigned)waited, (unsigned)holder->id, holder->name);
+                WlXbSymbol sym;
+                (void)wl_xb_symbolize(0, &sym); // builds the table here, not in the probed thread
+                wl_xb_backend_probe(holder->host_handle);
             }
         }
     }
@@ -118,6 +123,7 @@ static void take(WlXbThread *self) {
 
 void wl_xb_lock(WlXbThread *self) {
     self->host_tid = wl_platform_thread_self_id();
+    self->host_handle = wl_xb_backend_thread_handle();
     wl_platform_mutex_lock(g_m);
     take(self);
     wl_platform_mutex_unlock(g_m);

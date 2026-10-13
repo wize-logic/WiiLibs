@@ -10,12 +10,17 @@
 // safe point refuses kernel calls and other threads), which holds no host locks; SA_NODEFER lets
 // the ISR's own device accesses fault again, and the interrupted registers stay in the ucontext.
 #define _GNU_SOURCE
+#include <pthread.h>
 #include <signal.h>
+#if defined(__GLIBC__)
+#include <execinfo.h>
+#endif
 #include <string.h>
 #include <ucontext.h>
 
 #include "wl/xboxrt/crash.h"
 #include "wl/xboxrt/mem.h"
+#include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/ppc_decode.h"
 #include "wl/xboxrt/thread.h"
@@ -132,6 +137,67 @@ static void on_fault(int sig, siginfo_t *si, void *ctx) {
     WlXbCrash c = {va >= WL_XB_MMIO_BASE ? "access to an address no device claims" : "access to guest memory that is not there",
                    NULL, va, ea, pc, false};
     wl_xb_crash(&c);
+}
+
+// ---- The starvation probe ---------------------------------------------------------------------
+
+uintptr_t wl_xb_backend_thread_handle(void) {
+    return (uintptr_t)pthread_self();
+}
+
+static uintptr_t context_pc(void *ctx) {
+#if defined(__x86_64__)
+    return (uintptr_t)((ucontext_t *)ctx)->uc_mcontext.gregs[REG_RIP];
+#elif defined(__powerpc__) && !defined(__powerpc64__)
+    return (uintptr_t)((ucontext_t *)ctx)->uc_mcontext.uc_regs->gregs[32];
+#else
+    (void)ctx;
+    return 0;
+#endif
+}
+
+static void on_probe(int sig, siginfo_t *si, void *ctx) {
+    (void)sig;
+    (void)si;
+    uintptr_t pc = context_pc(ctx);
+    WlXbSymbol sym;
+    if (pc != 0 && wl_xb_symbolize(pc, &sym)) {
+        WL_LOG_W("xbthread", "  it runs at host PC %p, in sub_%08X+0x%x", (void *)pc, (unsigned)sym.guest_va,
+                 (unsigned)(pc - sym.host));
+    } else {
+        WL_LOG_W("xbthread", "  it runs at host PC %p (not in a translated function)", (void *)pc);
+    }
+#if defined(__GLIBC__)
+    // the translated callers above it (the loop is often a caller of a small function)
+    void *frames[24];
+    int n = backtrace(frames, 24);
+    int shown = 0;
+    for (int i = 1; i < n && shown < 6; i++) {
+        uintptr_t ra = (uintptr_t)frames[i];
+        if (ra != pc && wl_xb_symbolize(ra, &sym) && ra - sym.host < 0x20000u) {
+            WL_LOG_W("xbthread", "    called from sub_%08X+0x%x", (unsigned)sym.guest_va, (unsigned)(ra - sym.host));
+            shown++;
+        }
+    }
+#endif
+}
+
+void wl_xb_backend_probe(uintptr_t handle) {
+    static bool installed;
+    if (!installed) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = on_probe;
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGURG, &sa, NULL) != 0) {
+            return;
+        }
+        installed = true;
+    }
+    if (handle != 0) {
+        pthread_kill((pthread_t)handle, SIGURG);
+    }
 }
 
 WlResult wl_xb_fault_install(void) {

@@ -57,6 +57,7 @@ struct WlXbThread {
     bool running_guest;        // between its routine's start and its end
     uint32_t kernel_depth;     // > 0 while in a kernel call (thunk.c): device accesses are no safe points
     uint32_t host_tid;         // wl_platform_thread_self_id of its host thread (set when it takes the lock)
+    uintptr_t host_handle;     // the fault backend's name for that thread (the starvation probe)
     jmp_buf exit_jmp;          // where wl_xb_thread_exit lands
     WlXbThread *next_ready;
     WlXbThread *next_all;
