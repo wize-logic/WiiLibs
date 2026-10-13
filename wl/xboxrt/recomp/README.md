@@ -76,6 +76,7 @@ Functions:
 | `void recomp_debug_service(uint32_t service, uint32_t arg_va)` | `int 0x2d`, the kernel debug trap (service 1 prints the ANSI_STRING at `arg_va`) |
 | `void recomp_unimpl(const char *text, uint32_t va)` | an instruction the lifter could not translate was reached |
 | `uint64_t xbox_ReadTimeStampCounter(void)` | `rdtsc`, at the Xbox's 733.33 MHz |
+| `volatile uint32_t g_xb_attention`, `void wl_xb_safe_point(void)` | `RECOMP_BACKEDGE()` before every backward jump (patch 0008): when the flag is set (another guest thread or interrupt work waits for the guest lock) the loop gives way at its back edge |
 
 From the C library and libgcc: `memcpy`, `memset`, `calloc` (only `recomp_dispatch_init`), libm
 (`sqrt`, `floor`, `floorf`, `ceil`, `ceilf`, `trunc`, `truncf`, `fmod`, `frexp`, `ldexp`, `log`, `exp2`,

@@ -26,6 +26,10 @@ WiiLibs' copy (wl/xboxrt/recomp/recomp_types.h) is that template, with WiiLibs' 
   9. MMX_CVT_F2I rounds with recomp_cvt_si32 (nearest-even, not the host's rounding mode)
  10. RecompMmx and the g_mm0..7 declarations move out of the RECOMP_GENERATED_CODE block, so the
      runtime can define the MMX registers without the generated code's register-name macros
+ 11. RECOMP_BACKEDGE (patch 0008 calls it before every backward jump) is wl/xboxrt's safe point:
+     a load of g_xb_attention and a branch, and wl_xb_safe_point() when another guest thread or
+     interrupt work is waiting (a loop that only polls memory would otherwise hold the guest lock
+     forever)
 
 On a little-endian host the storage-order attribute does nothing and the byte swaps are
 identities, so the same header serves host tests.
@@ -330,6 +334,21 @@ def hoist_mmx(src: str) -> str:
     return src[:k] + note + block + "\n" + src[k:]
 
 
+BACKEDGE_OLD = """#ifndef RECOMP_BACKEDGE
+#define RECOMP_BACKEDGE() ((void)0)
+#endif
+"""
+BACKEDGE_NEW = """/* WiiLibs: a backward jump is a safe point of wl/xboxrt's guest lock (wl/xboxrt/thread.h): one
+ * load and a branch, unless another guest thread or interrupt work waits for the lock. A loop
+ * that only polls memory (a flip counter, a fence word) would otherwise never let them run. */
+extern volatile uint32_t g_xb_attention;
+void wl_xb_safe_point(void);
+#ifndef RECOMP_BACKEDGE
+#define RECOMP_BACKEDGE() do { if (__builtin_expect(g_xb_attention != 0, 0)) wl_xb_safe_point(); } while (0)
+#endif
+"""
+
+
 def transform(src: str, commit: str, release: str, patches: list[str]) -> str:
     src = replace_once(src, "#define RECOMP_TYPES_H\n", GUARD, "compiler guard")
     src = replace_once(src, TLS_OLD, TLS_NEW, "RECOMP_TLS")
@@ -347,6 +366,7 @@ def transform(src: str, commit: str, release: str, patches: list[str]) -> str:
     for old, new in UNION_EDITS:
         src = replace_once(src, old, new, old)
     src = hoist_mmx(src)
+    src = replace_once(src, BACKEDGE_OLD, BACKEDGE_NEW, "RECOMP_BACKEDGE safe point")
     for needle in ("__thread", "_InterlockedExchangeAdd", "(*(volatile uint32_t *)XBOX_PTR"):
         if needle in src:
             raise AnchorError(f"after the edits the header still has {needle!r}: an edit missed a new copy")

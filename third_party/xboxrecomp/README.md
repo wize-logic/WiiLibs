@@ -59,6 +59,7 @@ template header, and add conformance cases; upstream's own tests pass with them 
 | `0005-x87-m80.patch` | `fld m80`/`fstp m80` lifted through `recomp_ld80`/`recomp_st80` (they read 4 bytes as a float, and stored nothing and did not pop) |
 | `0006-runtime-header-option.patch` | `--runtime-header template|none|PATH`: a runtime can supply its own `recomp_types.h` without editing generated output |
 | `0007-parity-setcc.patch` | `setp`/`setnp`/`cmovp`/`cmovnp` lifted (float equality after `fucomip`/`ucomiss` read a stale register) |
+| `0008-backedge-hook.patch` | `RECOMP_BACKEDGE()` before every backward jump (a nothing in the template): a runtime that serialises guest threads or delivers interrupts between guest operations gets a break-in point in loops that only poll memory |
 
 To change one: `tools/xboxrecomp_sync.py patch-repo DIR` makes a git repository of the pristine copy
 with each patch as a commit; edit there (amend, rebase), then `tools/xboxrecomp_sync.py

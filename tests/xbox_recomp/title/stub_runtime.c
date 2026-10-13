@@ -12,6 +12,7 @@ ptrdiff_t g_xbox_mem_offset;
 uint32_t g_xbox_code_lo, g_xbox_code_hi;
 int g_force_return;
 RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
+volatile uint32_t g_xb_attention; void wl_xb_safe_point(void); void wl_xb_safe_point(void) {} /* RECOMP_BACKEDGE (no other threads here) */
 RECOMP_TLS uint32_t g_ebp, g_seh_ebp, g_fs_base;
 RECOMP_TLS int g_df;
 RECOMP_TLS double g_fp_stack[8];

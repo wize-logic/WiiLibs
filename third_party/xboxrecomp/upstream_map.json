@@ -297,7 +297,7 @@
     "xboxrecomp_pytest",
     "xbox_recomp_conformance"
    ],
-   "notes": "patch 0006 (--runtime-header)"
+   "notes": "patches 0006 (--runtime-header), 0008 (RECOMP_BACKEDGE before backward jumps)"
   },
   {
    "upstream": "tools/recomp/__main__.py",
@@ -387,7 +387,7 @@
     "xbox_recomp_header",
     "xbox_recomp_conformance"
    ],
-   "notes": "the generated-code ABI. WiiLibs' big-endian header is generated from the patched template by wl/xboxrt/recomp/gen_recomp_types.py; the xbox_recomp_header test fails until it is regenerated"
+   "notes": "the generated-code ABI (patch 0008 adds the RECOMP_BACKEDGE default, which WiiLibs' header makes wl/xboxrt's safe point). WiiLibs' big-endian header is generated from the patched template by wl/xboxrt/recomp/gen_recomp_types.py; the xbox_recomp_header test fails until it is regenerated"
   },
   {
    "upstream": "templates/runtime/**",
