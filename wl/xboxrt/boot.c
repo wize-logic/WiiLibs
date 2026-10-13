@@ -19,6 +19,7 @@
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/mmio.h"
+#include "wl/xboxrt/play.h"
 #include "wl/xboxrt/thread.h"
 #include "wl/xboxrt/xbe.h"
 
@@ -250,6 +251,37 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     r = wl_xb_service_start(&sc);
     if (r != WL_OK) {
         return r;
+    }
+    // the play harness: the title's setting, or on the Wii a file on the card
+    {
+        const char *play = cfg->play;
+#if defined(__wii__)
+        static char line[160];
+        if (play == NULL) {
+            char path[WL_FS_PATH_MAX];
+            WlPlatformFile *pf = NULL;
+            snprintf(path, sizeof path, "%s/play.cfg", cfg->title_dir);
+            if (wl_platform_fs_open(path, WL_FILE_READ, &pf) == WL_OK) {
+                uint32_t got = 0;
+                wl_platform_fs_read_some_at(pf, 0, line, sizeof line - 1u, &got);
+                wl_platform_fs_close(pf);
+                line[got] = '\0';
+                line[strcspn(line, "\r\n")] = '\0';
+                play = line;
+            }
+        }
+#endif
+        if (play != NULL && play[0] != '\0') {
+            char out[WL_FS_PATH_MAX];
+            if (cfg->play_out == NULL) {
+                snprintf(out, sizeof out, "%s/play", cfg->title_dir);
+                wl_platform_fs_mkdir(out);
+            }
+            r = wl_xb_play_start(play, cfg->title_dir, cfg->play_out != NULL ? cfg->play_out : out);
+            if (r != WL_OK) {
+                WL_LOG_E(TAG, "the play harness did not start (%s): %s", play, wl_result_name(r));
+            }
+        }
     }
     if (cfg->before_entry != NULL) {
         cfg->before_entry(cfg->user);
