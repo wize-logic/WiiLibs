@@ -156,6 +156,11 @@ void wl_xb_service_set_tick_va(uint32_t va) {
     if (g_tick_start_us == 0) {
         g_tick_start_us = wl_platform_time_us();
     }
+    // the service thread writes it without the guest lock (update_tick): its page must never wait
+    // for the swap file
+    if (va != 0 && wl_xb_mem_pin(va, 4) != WL_OK) {
+        WL_LOG_E(TAG, "cannot pin KeTickCount's page (0x%08x)", (unsigned)va);
+    }
     g_tick_va = va;
     update_tick();
 }
@@ -305,10 +310,20 @@ static void status_report(void) {
     struct mallinfo mi = mallinfo();
 #endif
     WL_LOG_I(TAG, "status: guest %u of %u pages used (user %u, contiguous %u), %u frames (%u KB), "
-             "%u first touches, %u evictions; host malloc %u KB free of %u KB",
+             "%u faults resolved, %u PTE evictions; host malloc %u KB free of %u KB",
              (unsigned)m.used_pages, (unsigned)m.ram_pages, (unsigned)m.user_pages, (unsigned)m.contig_pages,
-             (unsigned)m.frames, (unsigned)(m.frames * 4u), (unsigned)m.faults_resolved, (unsigned)m.evictions,
+             (unsigned)m.frames, (unsigned)(m.frames * 4u), (unsigned)m.faults_resolved, (unsigned)m.pte_evictions,
              (unsigned)(mi.fordblks / 1024), (unsigned)(mi.arena / 1024));
+    if (m.frames_total != 0) {
+        // demand paging: what the frames' shortage costs
+        WL_LOG_I(TAG, "status: paging %u of %u frames free, %u pinned; %u evictions (%u clean, %u in the fault), "
+                 "%u swap-ins (%u KB), %u swap-outs (%u KB in %u writes), swap I/O %u ms; %u of %u swap pages used",
+                 (unsigned)m.frames_free, (unsigned)m.frames_total, (unsigned)m.pinned_pages, (unsigned)m.evictions,
+                 (unsigned)m.clean_evictions, (unsigned)m.fast_evictions, (unsigned)m.swap_ins,
+                 (unsigned)(m.swap_read_bytes >> 10), (unsigned)m.swap_outs, (unsigned)(m.swap_write_bytes >> 10),
+                 (unsigned)m.swap_writes, (unsigned)(m.swap_us / 1000u), (unsigned)m.swap_slots_used,
+                 (unsigned)m.swap_slots);
+    }
 }
 
 static void *service_main(void *arg) {
@@ -316,6 +331,7 @@ static void *service_main(void *arg) {
     uint64_t vblank_period = g_cfg.vblank_hz_milli > 0 ? 1000000000ull / g_cfg.vblank_hz_milli : 16683u;
     uint64_t next_vblank = wl_platform_time_us() + vblank_period;
     uint64_t next_status = wl_platform_time_us() + 10000000u;
+    uint64_t next_watch = wl_platform_time_us() + 1000000u;
     bool host_vblank = g_cfg.vblank;
 #if defined(__wii__)
     host_vblank = false; // the retrace makes them (relay_main)
@@ -348,6 +364,10 @@ static void *service_main(void *arg) {
         if (now >= next_status) {
             next_status = now + 10000000u;
             status_report();
+        }
+        if (now >= next_watch) {
+            next_watch = now + 1000000u;
+            wl_xb_mem_watch(0); // the paging rate: thrashing is logged
         }
         if (host_vblank && now >= next_vblank) {
             next_vblank += vblank_period;

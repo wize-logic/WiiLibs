@@ -4,6 +4,11 @@ if(NOT TARGET wl_xboxrt)
 endif()
 # Guest memory on the host / ppc-be backend, with the faults through the host's decoder.
 wl_add_test(test_xboxrt_mem SOURCES test_xboxrt_mem.c LIBS wl_xboxrt LABELS unit be)
+# Demand paging under a frame limit (the Wii's model through SIGSEGV and mprotect): with a swap
+# file, and without one.
+wl_add_test(test_xboxrt_paging SOURCES test_xboxrt_paging.c LIBS wl_xboxrt LABELS unit be)
+wl_add_test(test_xboxrt_paging_no_swap SOURCES test_xboxrt_paging.c LIBS wl_xboxrt LABELS unit be)
+target_compile_definitions(test_xboxrt_paging_no_swap PRIVATE WL_XBRT_PAGING_NO_SWAP=1)
 # The gamepad state, its reports, the Wii controllers' mappings and the ports (portable).
 wl_add_test(test_xboxrt_pad SOURCES test_xboxrt_pad.c LIBS wl_xboxrt LABELS unit be)
 # The USB host controllers and the gamepads, driven as a title's XAPI drives them.

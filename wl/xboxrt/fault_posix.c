@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
-// The host and ppc-be fault handler (mmio.h): SIGSEGV inside the guest EA span. A device address
-// is emulated through the decoder of the host's instruction set (x86_decode.h on x86-64,
-// ppc_decode.h on 32-bit PowerPC) and the thread resumes after the instruction; anything else is
-// a guest crash report. A fault outside the span goes to the handler that was there before.
+// The host and ppc-be fault handler (mmio.h): SIGSEGV inside the guest EA span. Guest RAM under a
+// frame limit is paged first (mem_posix.c: a frame, maybe read back from the swap file, and the
+// EA opened; the access then runs again). A device address is emulated through the decoder of the
+// host's instruction set (x86_decode.h on x86-64, ppc_decode.h on 32-bit PowerPC) and the thread
+// resumes after the instruction; anything else is a guest crash report. A fault outside the span
+// goes to the handler that was there before.
 //
 // After the device has answered, the access is a safe point (thread.h's wl_xb_safe_point): pending
 // interrupt work runs and a waiting thread gets the lock, from inside the handler. That is sound
@@ -112,6 +114,8 @@ static void chain(int sig, siginfo_t *si, void *ctx) {
     signal(sig, SIG_DFL); // returning re-runs the access, which now kills the process normally
 }
 
+static uintptr_t context_pc(void *ctx);
+
 static void on_fault(int sig, siginfo_t *si, void *ctx) {
     uintptr_t addr = (uintptr_t)si->si_addr;
     uintptr_t base = WL_XB_HOST_BASE;
@@ -123,6 +127,23 @@ static void on_fault(int sig, siginfo_t *si, void *ctx) {
     uint32_t va = wl_xb_ea_to_va(ea);
     const char *what = NULL;
     uintptr_t pc = 0;
+    if (va < WL_XB_MMIO_BASE) {
+        // guest RAM under a frame limit: a frame, the page read back, its EA opened (mem_posix.c)
+        WlResult r = wl_xb_backend_page_fault(ea);
+        if (r == WL_OK) {
+            return;
+        }
+        if (r != WL_ERR_UNSUPPORTED) {
+            WlXbCrash c = {r == WL_ERR_DENIED  ? "guest RAM touched without the guest lock needs the swap file (pin it: "
+                                                 "wl_xb_mem_pin)"
+                           : r == WL_ERR_NOMEM ? "guest RAM: no frame left (every frame pinned or changed, and no swap "
+                                                 "file to write to)"
+                           : r == WL_ERR_IO    ? "guest RAM: the swap file failed"
+                                               : "guest RAM: a fault inside the paging code (a page in I/O touched)",
+                           NULL, va, ea, context_pc(ctx), false};
+            wl_xb_crash(&c);
+        }
+    }
     if (va >= WL_XB_MMIO_BASE && wl_xb_mmio_find(va) != NULL) {
         if (emulate((ucontext_t *)ctx, va, &what, &pc)) {
             wl_xb_safe_point();

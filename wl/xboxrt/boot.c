@@ -173,6 +173,29 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     wl_xb_mem_config_default(&mc);
     mc.ram_bytes = (cfg->ram_mb != 0 ? cfg->ram_mb : 64u) << 20;
     mc.htab_bytes = cfg->htab_bytes != 0 ? cfg->htab_bytes : mc.htab_bytes;
+    // the swap file the paging writes changed pages to when the frames run out (the title's hard
+    // disk folder: on the card on the Wii)
+    char swap_path[sizeof data_dir + 16];
+    snprintf(swap_path, sizeof swap_path, "%s/pagefile.sys", data_dir);
+    mc.swap_path = cfg->swap_path != NULL ? cfg->swap_path : swap_path;
+    mc.swap_bytes = cfg->swap_bytes;
+#if !defined(__wii__)
+    {
+        // a frame limit: the host pages as the Wii does (for a title run at the Wii's size)
+        mc.frame_limit_bytes = cfg->frame_pool_bytes & ~(WL_XB_PAGE - 1u);
+        const char *mb = getenv("WL_XB_FRAME_MB");
+        const char *kb = getenv("WL_XB_FRAME_KB");
+        if (kb != NULL && kb[0] != '\0') {
+            mc.frame_limit_bytes = (uint32_t)strtoul(kb, NULL, 10) << 10;
+        } else if (mb != NULL && mb[0] != '\0') {
+            mc.frame_limit_bytes = (uint32_t)strtoul(mb, NULL, 10) << 20;
+        }
+        mc.frame_limit_bytes &= ~(WL_XB_PAGE - 1u);
+        if (mc.frame_limit_bytes != 0) {
+            WL_LOG_I(TAG, "guest frames: %u KB (a frame limit: paged as on the Wii)", (unsigned)(mc.frame_limit_bytes >> 10));
+        }
+    }
+#endif
 #if defined(__wii__)
     {
         uint32_t want = cfg->frame_pool_bytes & ~(WL_XB_PAGE - 1u);

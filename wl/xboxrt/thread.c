@@ -58,6 +58,14 @@ WlXbThread *wl_xb_current(void) {
     return g_cur;
 }
 
+bool wl_xb_lock_held(void) {
+    if (!g_ready_init) {
+        return true;
+    }
+    WlXbThread *self = g_cur;
+    return self != NULL && self->host_tid == wl_platform_thread_self_id();
+}
+
 // ---- Ready queue (g_m held) ------------------------------------------------------------------
 
 static void enqueue(WlXbThread *t) {
