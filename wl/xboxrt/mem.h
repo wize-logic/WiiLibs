@@ -76,14 +76,25 @@ uint32_t wl_xb_ea_to_va(uint32_t ea);
 static inline uint8_t wl_xb_rd8(uint32_t va) {
     return *(const volatile uint8_t *)wl_xb_ptr(va);
 }
+// An aligned access is one volatile load or store of its width: a device's register (the MMIO
+// window faults and is emulated) must see one access, which a memcpy does not promise (the
+// compiler may split it into bytes, or newlib's memcpy use string moves the fault decoder refuses).
 static inline uint16_t wl_xb_rd16(uint32_t va) {
     uint16_t v;
-    __builtin_memcpy(&v, wl_xb_ptr(va), 2);
+    if ((va & 1u) == 0) {
+        v = *(const volatile uint16_t *)wl_xb_ptr(va);
+    } else {
+        __builtin_memcpy(&v, wl_xb_ptr(va), 2);
+    }
     return WL_XB_LE16(v);
 }
 static inline uint32_t wl_xb_rd32(uint32_t va) {
     uint32_t v;
-    __builtin_memcpy(&v, wl_xb_ptr(va), 4);
+    if ((va & 3u) == 0) {
+        v = *(const volatile uint32_t *)wl_xb_ptr(va);
+    } else {
+        __builtin_memcpy(&v, wl_xb_ptr(va), 4);
+    }
     return WL_XB_LE32(v);
 }
 static inline uint64_t wl_xb_rd64(uint32_t va) {
@@ -94,11 +105,19 @@ static inline void wl_xb_wr8(uint32_t va, uint8_t v) {
 }
 static inline void wl_xb_wr16(uint32_t va, uint16_t v) {
     v = WL_XB_LE16(v);
-    __builtin_memcpy(wl_xb_ptr(va), &v, 2);
+    if ((va & 1u) == 0) {
+        *(volatile uint16_t *)wl_xb_ptr(va) = v;
+    } else {
+        __builtin_memcpy(wl_xb_ptr(va), &v, 2);
+    }
 }
 static inline void wl_xb_wr32(uint32_t va, uint32_t v) {
     v = WL_XB_LE32(v);
-    __builtin_memcpy(wl_xb_ptr(va), &v, 4);
+    if ((va & 3u) == 0) {
+        *(volatile uint32_t *)wl_xb_ptr(va) = v;
+    } else {
+        __builtin_memcpy(wl_xb_ptr(va), &v, 4);
+    }
 }
 static inline void wl_xb_wr64(uint32_t va, uint64_t v) {
     wl_xb_wr32(va, (uint32_t)v);
