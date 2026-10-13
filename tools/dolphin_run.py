@@ -184,7 +184,8 @@ def gdb_backtrace(process) -> str:
 
 
 def dolphin_ini(sd_image: str, sd_folder: str, dump_frames: bool, gdb_port: int = 0, video: str = "",
-                panics: bool = False, single_core: bool = False, mmu: bool = False) -> str:
+                panics: bool = False, single_core: bool = False, mmu: bool = False,
+                unthrottled: bool = False) -> str:
     lines = ["[Interface]", "ConfirmStop = False", f"UsePanicHandlers = {panics}", "ShowLogWindow = False",
              "[Analytics]", "PermissionAsked = True", "Enabled = False",
              # (the console's own clock: a person's global Dolphin.ini may overclock the CPU, which
@@ -196,6 +197,9 @@ def dolphin_ini(sd_image: str, sd_folder: str, dump_frames: bool, gdb_port: int 
              # (full MMU emulation: page tables and the DSI a miss raises, which a program that maps
              # memory through the page table and handles its faults needs; Dolphin skips it for speed)
              *(["MMU = True"] if mmu else []),
+             # (no speed limit: the console's clock and everything the program sees are the same, the
+             # emulated hours only pass sooner where the host has the speed to spare)
+             *(["EmulationSpeed = 0.0"] if unthrottled else []),
              f"WiiSDCardEnableFolderSync = {'True' if sd_folder else 'False'}",
              "[General]", f"WiiSDCardPath = {sd_image}"]
     if gdb_port:
@@ -409,6 +413,8 @@ def main() -> int:
                         help="the GPU emulated on the CPU's thread (slower; no CPU/GPU races)")
     parser.add_argument("--mmu", action="store_true",
                         help="Dolphin's full MMU emulation (page tables, and a DSI on a miss)")
+    parser.add_argument("--unthrottled", action="store_true",
+                        help="no speed limit: a long run finishes sooner, the program sees no difference")
     parser.add_argument("--panics", action="store_true",
                         help="show Dolphin's panic messages (they stop the emulation until answered)")
     parser.add_argument("--wii-aspect", choices=("4:3", "16:9"), default="4:3",
@@ -450,7 +456,8 @@ def main() -> int:
     (user / "Config" / "Dolphin.ini").write_text(dolphin_ini(to_windows(work / "sd.raw"), sd_folder,
                                                               bool(args.dump_frames),
                                                               GDB_PORT if args.backtrace else 0, args.video,
-                                                              args.panics, args.single_core, args.mmu))
+                                                              args.panics, args.single_core, args.mmu,
+                                                              args.unthrottled))
     (user / "Config" / "GFX.ini").write_text(gfx_ini(bool(args.dump_frames), args.wii_aspect == "16:9"))
     log = user / "Logs" / "dolphin.log"
     if log.exists():
