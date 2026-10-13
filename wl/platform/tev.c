@@ -590,7 +590,7 @@ static void konst_color(const WlTevProgram *p, uint8_t sel, uint32_t out[3]) {
             out[c] = konst_comp(p, sel & 3u, c);
         }
     } else {
-        uint32_t v = konst_comp(p, sel & 3u, ((uint32_t)sel - 0x10u) >> 2);
+        uint32_t v = sel <= 0x1Fu ? konst_comp(p, sel & 3u, ((uint32_t)sel - 0x10u) >> 2) : 0u;
         out[0] = out[1] = out[2] = v;
     }
 }
@@ -598,6 +598,9 @@ static void konst_color(const WlTevProgram *p, uint8_t sel, uint32_t out[3]) {
 static uint32_t konst_alpha(const WlTevProgram *p, uint8_t sel) {
     if (sel < 8u) {
         return k_fraction[sel];
+    }
+    if (sel < 0x10u || sel > 0x1Fu) {
+        return 0; // (no meaning: the validator's WL_TEV_E_KSEL)
     }
     return konst_comp(p, sel & 3u, ((uint32_t)sel - 0x10u) >> 2);
 }
@@ -659,105 +662,137 @@ static void swapped(const uint8_t texel[4], const uint8_t table[4], int32_t out[
     }
 }
 
-void wl_tev_eval(const WlTevProgram *p, const WlTevPixel *px, WlTevRegValue regs[WL_TEV_REG_COUNT]) {
-    int32_t reg[WL_TEV_REG_COUNT][4];
+// The stages on one pixel, each stage's texel given (stage_tex[i], read when stage i orders a
+// texture map), the program taken as it is: codes are masked into their fields' ranges, so a
+// program the validator rejects computes something rather than reading out of bounds.
+static void eval_core(const WlTevProgram *p, const uint8_t (*stage_tex)[4], const uint8_t (*ras_in)[4],
+                      int32_t reg[WL_TEV_REG_COUNT][4]) {
+    uint32_t count = p->stage_count <= WL_TEV_MAX_STAGES ? p->stage_count : WL_TEV_MAX_STAGES;
+    for (uint32_t si = 0; si < count; si++) {
+        const WlTevStage *s = &p->stages[si];
+        int32_t tex[4] = {0, 0, 0, 0};
+        int32_t ras[4] = {0, 0, 0, 0};
+        if (s->texmap != WL_TEV_NONE && stage_tex != NULL) {
+            swapped(stage_tex[si], p->swap[s->tex_swap & 3u], tex);
+        }
+        if ((s->channel == WL_TEV_CH_COLOR0A0 || s->channel == WL_TEV_CH_COLOR1A1) && ras_in != NULL) {
+            swapped(ras_in[s->channel - WL_TEV_CH_COLOR0A0], p->swap[s->ras_swap & 3u], ras);
+        }
+        uint32_t kc[3];
+        konst_color(p, s->kcsel, kc);
+
+        // colour inputs, three channels each
+        int32_t in[4][3];
+        for (uint32_t i = 0; i < 4; i++) {
+            uint8_t code = s->color.in[i] & 15u;
+            for (uint32_t c = 0; c < 3; c++) {
+                int32_t v;
+                if (code <= WL_TEV_CC_A2) {
+                    const int32_t *rv = reg[code >> 1];
+                    v = (code & 1u) != 0 ? rv[3] : rv[c];
+                } else {
+                    switch (code) {
+                    case WL_TEV_CC_TEXC: v = tex[c]; break;
+                    case WL_TEV_CC_TEXA: v = tex[3]; break;
+                    case WL_TEV_CC_RASC: v = ras[c]; break;
+                    case WL_TEV_CC_RASA: v = ras[3]; break;
+                    case WL_TEV_CC_ONE: v = 255; break;
+                    case WL_TEV_CC_HALF: v = 128; break;
+                    case WL_TEV_CC_KONST: v = (int32_t)kc[c]; break;
+                    default: v = 0; break;
+                    }
+                }
+                in[i][c] = i < 3 ? (v & 255) : v; // a, b, c are 8 bits; d is the register's signed value
+            }
+        }
+        int32_t cout[3];
+        if (s->color.op >= WL_TEV_COMP_R8_GT) {
+            compare(in[0], in[1], in[2], in[3], &s->color, cout);
+        } else {
+            for (uint32_t c = 0; c < 3; c++) {
+                cout[c] = blend(in[0][c], in[1][c], in[2][c], in[3][c], &s->color);
+            }
+        }
+
+        // alpha inputs
+        int32_t ain[4];
+        for (uint32_t i = 0; i < 4; i++) {
+            uint8_t code = s->alpha.in[i] & 7u;
+            int32_t v;
+            switch (code) {
+            case WL_TEV_CA_APREV:
+            case WL_TEV_CA_A0:
+            case WL_TEV_CA_A1:
+            case WL_TEV_CA_A2: v = reg[code][3]; break;
+            case WL_TEV_CA_TEXA: v = tex[3]; break;
+            case WL_TEV_CA_RASA: v = ras[3]; break;
+            case WL_TEV_CA_KONST: v = (int32_t)konst_alpha(p, s->kasel); break;
+            default: v = 0; break;
+            }
+            ain[i] = i < 3 ? (v & 255) : v;
+        }
+        int32_t aout;
+        if (s->alpha.op >= WL_TEV_COMP_R8_GT) {
+            const int32_t ac[3][3] = {{ain[0], 0, 0}, {ain[1], 0, 0}, {ain[2], 0, 0}};
+            const int32_t ad[3] = {ain[3], 0, 0};
+            int32_t o[3];
+            WlTevHalf h = s->alpha;
+            h.op = (uint8_t)((h.op & 1u) != 0 ? WL_TEV_COMP_R8_EQ : WL_TEV_COMP_R8_GT);
+            compare(ac[0], ac[1], ac[2], ad, &h, o);
+            aout = o[0];
+        } else {
+            aout = blend(ain[0], ain[1], ain[2], ain[3], &s->alpha);
+        }
+
+        // write after every input was read
+        for (uint32_t c = 0; c < 3; c++) {
+            reg[s->color.dest & 3u][c] = cout[c];
+        }
+        reg[s->alpha.dest & 3u][3] = aout;
+    }
+}
+
+static void eval_preload(const WlTevProgram *p, int32_t reg[WL_TEV_REG_COUNT][4]) {
     for (uint32_t r = 0; r < WL_TEV_REG_COUNT; r++) {
         for (uint32_t c = 0; c < 4; c++) {
             reg[r][c] = (p->preload_mask & (1u << r)) != 0 ? (int32_t)((p->preload[r] >> (24u - 8u * c)) & 0xFFu) : 0;
         }
     }
-    if (wl_tev_validate(p, NULL)) {
-        for (uint32_t si = 0; si < p->stage_count; si++) {
-            const WlTevStage *s = &p->stages[si];
-            int32_t tex[4] = {0, 0, 0, 0};
-            int32_t ras[4] = {0, 0, 0, 0};
-            if (s->texmap != WL_TEV_NONE) {
-                swapped(px->tex[s->texmap], p->swap[s->tex_swap], tex);
-            }
-            if (s->channel == WL_TEV_CH_COLOR0A0 || s->channel == WL_TEV_CH_COLOR1A1) {
-                swapped(px->ras[s->channel - WL_TEV_CH_COLOR0A0], p->swap[s->ras_swap], ras);
-            }
-            uint32_t kc[3];
-            konst_color(p, s->kcsel, kc);
+}
 
-            // colour inputs, three channels each
-            int32_t in[4][3];
-            for (uint32_t i = 0; i < 4; i++) {
-                uint8_t code = s->color.in[i];
-                for (uint32_t c = 0; c < 3; c++) {
-                    int32_t v;
-                    if (code <= WL_TEV_CC_A2) {
-                        const int32_t *rv = reg[code >> 1];
-                        v = (code & 1u) != 0 ? rv[3] : rv[c];
-                    } else {
-                        switch (code) {
-                        case WL_TEV_CC_TEXC: v = tex[c]; break;
-                        case WL_TEV_CC_TEXA: v = tex[3]; break;
-                        case WL_TEV_CC_RASC: v = ras[c]; break;
-                        case WL_TEV_CC_RASA: v = ras[3]; break;
-                        case WL_TEV_CC_ONE: v = 255; break;
-                        case WL_TEV_CC_HALF: v = 128; break;
-                        case WL_TEV_CC_KONST: v = (int32_t)kc[c]; break;
-                        default: v = 0; break;
-                        }
-                    }
-                    in[i][c] = i < 3 ? (v & 255) : v; // a, b, c are 8 bits; d is the register's signed value
-                }
-            }
-            int32_t cout[3];
-            if (s->color.op >= WL_TEV_COMP_R8_GT) {
-                compare(in[0], in[1], in[2], in[3], &s->color, cout);
-            } else {
-                for (uint32_t c = 0; c < 3; c++) {
-                    cout[c] = blend(in[0][c], in[1][c], in[2][c], in[3][c], &s->color);
-                }
-            }
-
-            // alpha inputs
-            int32_t ain[4];
-            for (uint32_t i = 0; i < 4; i++) {
-                uint8_t code = s->alpha.in[i];
-                int32_t v;
-                switch (code) {
-                case WL_TEV_CA_APREV:
-                case WL_TEV_CA_A0:
-                case WL_TEV_CA_A1:
-                case WL_TEV_CA_A2: v = reg[code][3]; break;
-                case WL_TEV_CA_TEXA: v = tex[3]; break;
-                case WL_TEV_CA_RASA: v = ras[3]; break;
-                case WL_TEV_CA_KONST: v = (int32_t)konst_alpha(p, s->kasel); break;
-                default: v = 0; break;
-                }
-                ain[i] = i < 3 ? (v & 255) : v;
-            }
-            int32_t aout;
-            if (s->alpha.op >= WL_TEV_COMP_R8_GT) {
-                const int32_t ac[3][3] = {{ain[0], 0, 0}, {ain[1], 0, 0}, {ain[2], 0, 0}};
-                const int32_t ad[3] = {ain[3], 0, 0};
-                int32_t o[3];
-                WlTevHalf h = s->alpha;
-                h.op = (uint8_t)(h.op == WL_TEV_COMP_A8_EQ ? WL_TEV_COMP_R8_EQ : WL_TEV_COMP_R8_GT);
-                compare(ac[0], ac[1], ac[2], ad, &h, o);
-                aout = o[0];
-            } else {
-                aout = blend(ain[0], ain[1], ain[2], ain[3], &s->alpha);
-            }
-
-            // write after every input was read
-            for (uint32_t c = 0; c < 3; c++) {
-                reg[s->color.dest][c] = cout[c];
-            }
-            reg[s->alpha.dest][3] = aout;
-        }
-    } else {
-        memset(reg, 0, sizeof reg);
-    }
+static void eval_out(int32_t reg[WL_TEV_REG_COUNT][4], WlTevRegValue regs[WL_TEV_REG_COUNT]) {
     for (uint32_t r = 0; r < WL_TEV_REG_COUNT; r++) {
         regs[r].r = (int16_t)reg[r][0];
         regs[r].g = (int16_t)reg[r][1];
         regs[r].b = (int16_t)reg[r][2];
         regs[r].a = (int16_t)reg[r][3];
     }
+}
+
+void wl_tev_eval(const WlTevProgram *p, const WlTevPixel *px, WlTevRegValue regs[WL_TEV_REG_COUNT]) {
+    int32_t reg[WL_TEV_REG_COUNT][4];
+    eval_preload(p, reg);
+    if (wl_tev_validate(p, NULL)) {
+        uint8_t stage_tex[WL_TEV_MAX_STAGES][4];
+        memset(stage_tex, 0, sizeof stage_tex);
+        for (uint32_t si = 0; si < p->stage_count; si++) {
+            if (p->stages[si].texmap < WL_TEV_TEXMAPS) {
+                memcpy(stage_tex[si], px->tex[p->stages[si].texmap], 4);
+            }
+        }
+        eval_core(p, (const uint8_t (*)[4])stage_tex, (const uint8_t (*)[4])px->ras, reg);
+    } else {
+        memset(reg, 0, sizeof reg);
+    }
+    eval_out(reg, regs);
+}
+
+void wl_tev_eval_stages(const WlTevProgram *p, const uint8_t (*stage_tex)[4], const uint8_t (*ras)[4],
+                        WlTevRegValue regs[WL_TEV_REG_COUNT]) {
+    int32_t reg[WL_TEV_REG_COUNT][4];
+    eval_preload(p, reg);
+    eval_core(p, stage_tex, ras, reg);
+    eval_out(reg, regs);
 }
 
 uint32_t wl_tev_eval_rgba(const WlTevProgram *p, const WlTevPixel *px) {

@@ -286,6 +286,15 @@ typedef struct {
 // factor is exact; it is not guaranteed bit-exact with hardware in the last unit for other
 // factors. The program should have passed wl_tev_validate; an invalid one evaluates to 0s.
 void wl_tev_eval(const WlTevProgram *p, const WlTevPixel *px, WlTevRegValue regs[WL_TEV_REG_COUNT]);
+// The stages on one pixel as GX's TEV runs them, each stage reading its own texel: stage_tex[i]
+// is what stage i's order samples (its texture map at its texture coordinate; GX gives every stage
+// its own lookup, so one map read at two coordinates is two texels), read when the stage orders a
+// map; ras the two colour channels (r, g, b, a bytes). No validation, for a renderer that checked
+// the program once: every code is taken within its field's range, a stage reading a texel or a
+// colour it does not order reads 0, a konst selection with no meaning reads 0. NULL stage_tex or
+// ras: all 0.
+void wl_tev_eval_stages(const WlTevProgram *p, const uint8_t (*stage_tex)[4], const uint8_t (*ras)[4],
+                        WlTevRegValue regs[WL_TEV_REG_COUNT]);
 // PREV clamped to 0..255 per channel, packed 0xRRGGBBAA.
 uint32_t wl_tev_eval_rgba(const WlTevProgram *p, const WlTevPixel *px);
 
