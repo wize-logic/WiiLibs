@@ -60,7 +60,9 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
   page's PTE is inserted with C clear. The runtime harvests R and C into its own flags whenever a
   PTE goes (a full PTE group, an unmap) and when the clock passes; clearing R also drops the TLB
   entry so the next use sets it again. Each page remembers the PTE group of its two PTEs, so the
-  clock finds them without hashing. At each frame: a pinned page or one in I/O is passed; a page
+  clock finds them without hashing. The init checks that the MMU records them (a page read, then
+  written, with both clear); one that does not (an emulator's) gets fallbacks, logged: without R a
+  page's use is its fault (the clock drops its PTEs), without C every page mapped counts as changed. At each frame: a pinned page or one in I/O is passed; a page
   used since the last round gets its second chance; a clean page gives its frame back at once; a
   dirty one is left for a write. On the host the referenced bit is a fault (clearing it closes the
   page's EAs, the next touch opens them) and the changed bit too (a clean page is opened read-only,

@@ -63,6 +63,10 @@ static uint32_t g_pteg_mask;
 static Pool g_pools[WL_XB_MAX_FRAME_POOLS];
 static uint16_t *g_hint[2]; // [ram pages] the PTE group (+ 1) of the page's user / window PTE
 static uint32_t g_faults, g_pte_evictions, g_evict_rr;
+// Whether the MMU records R and C in the table (the 750CL does; an emulator might not): measured
+// once at init (mmu_selftest). Without R, "used" is a fault: clearing it drops the page's PTEs.
+// Without C, every page that gets a PTE counts as changed.
+static bool g_hw_ref = true, g_hw_changed = true;
 
 static inline void tlbie(uint32_t ea) {
     __asm__ volatile("tlbie %0; sync" ::"r"(ea) : "memory");
@@ -155,12 +159,16 @@ static volatile uint32_t *pte_of(uint32_t p, uint32_t a) {
     return NULL;
 }
 
+// A valid PTE's R and C bits as page flags (R only when the hardware records it).
+static inline uint8_t bits_flags(uint32_t w1) {
+    return (uint8_t)(((w1 & PTE_R) != 0 && g_hw_ref ? WL_XB_PG_REF : 0u) | ((w1 & PTE_C) != 0 ? WL_XB_PG_DIRTY : 0u));
+}
+
 // A valid PTE's R and C bits into its page's flags.
 static void harvest_bits(uint32_t ea, uint32_t w1) {
     uint32_t p1 = phys_of(ea);
-    if (p1 != 0 && (w1 & (PTE_R | PTE_C)) != 0) {
-        g_xb_pg_flags[p1 - 1u] |=
-            (uint8_t)(((w1 & PTE_R) != 0 ? WL_XB_PG_REF : 0u) | ((w1 & PTE_C) != 0 ? WL_XB_PG_DIRTY : 0u));
+    if (p1 != 0) {
+        g_xb_pg_flags[p1 - 1u] |= bits_flags(w1);
     }
 }
 
@@ -172,9 +180,10 @@ static void pte_drop(volatile uint32_t *w0p, uint32_t ea) {
     tlbie(ea);
 }
 
-static void pte_insert(uint32_t ea, uint32_t frame, uint32_t p, bool changed) {
+// A PTE for `ea` (page `p`) mapping `frame`, with R and C as `rc` has them (PTE_R, PTE_C).
+static void pte_insert(uint32_t ea, uint32_t frame, uint32_t p, uint32_t rc) {
     uint32_t hash = primary_hash(ea);
-    uint32_t w1 = (rpn_of(frame) << 12) | PTE_R | (changed ? PTE_C : 0u) | PTE_PP_RW;
+    uint32_t w1 = (rpn_of(frame) << 12) | rc | PTE_PP_RW;
     uint32_t a = ea >> 28;
     for (uint32_t h = 0; h < 2; h++) {
         uint32_t index = (h ? ~hash : hash) & g_pteg_mask;
@@ -203,6 +212,17 @@ static void pte_insert(uint32_t ea, uint32_t frame, uint32_t p, bool changed) {
     g_hint[a][p] = (uint16_t)(index + 1u);
 }
 
+// The PTE for a touch of page `p` at `ea`: R set (it is being used now), C when the page is known
+// changed (no table search for its first store) or the hardware does not record C (the page then
+// counts as changed from now on).
+static void pte_map(uint32_t ea, uint32_t frame, uint32_t p) {
+    if (!g_hw_changed) {
+        g_xb_pg_flags[p] |= WL_XB_PG_DIRTY;
+    }
+    pte_insert(ea & ~(WL_XB_PAGE - 1u), frame, p, PTE_R | ((g_xb_pg_flags[p] & WL_XB_PG_DIRTY) != 0 ? PTE_C : 0u));
+    g_xb_pg_flags[p] |= WL_XB_PG_REF;
+}
+
 static void zero_frame(uint32_t frame) {
     uint8_t *p = (uint8_t *)(0x80000000u + (rpn_of(frame) << 12));
     for (uint32_t off = 0; off < WL_XB_PAGE; off += 32u) {
@@ -213,15 +233,18 @@ static void zero_frame(uint32_t frame) {
 // ---- The paging core's MMU (exception-safe) ------------------------------------------------------
 
 void wl_xb_mmu_harvest(uint32_t p, bool clear_ref) {
+    bool drop = clear_ref && !g_hw_ref && (g_xb_pg_flags[p] & WL_XB_PG_REF) != 0;
     for (uint32_t a = 0; a < 2u; a++) {
         volatile uint32_t *w0p = pte_of(p, a);
         if (w0p == NULL) {
             continue;
         }
         uint32_t w1 = w0p[1];
-        g_xb_pg_flags[p] |=
-            (uint8_t)(((w1 & PTE_R) != 0 ? WL_XB_PG_REF : 0u) | ((w1 & PTE_C) != 0 ? WL_XB_PG_DIRTY : 0u));
-        if (clear_ref && (w1 & PTE_R) != 0) {
+        g_xb_pg_flags[p] |= bits_flags(w1);
+        if (drop) {
+            // no R from the hardware: "used" is a fault since the last pass, so the PTE goes
+            pte_drop(w0p, pte_ea(*w0p, pteg_index(w0p)));
+        } else if (clear_ref && g_hw_ref && (w1 & PTE_R) != 0) {
             // R cleared in the table and the TLB entry dropped, so the next use searches the table
             // and sets R again (the hardware only records R on a table search)
             w0p[1] = w1 & ~PTE_R;
@@ -302,8 +325,7 @@ static uint32_t map_page(uint32_t ea, uint32_t keep) {
         }
         zero_frame(frame);
     }
-    pte_insert(ea & ~(WL_XB_PAGE - 1u), frame, p, (g_xb_pg_flags[p] & WL_XB_PG_DIRTY) != 0);
-    g_xb_pg_flags[p] |= WL_XB_PG_REF;
+    pte_map(ea, frame, p);
     g_faults++;
     return 1;
 }
@@ -353,7 +375,7 @@ static WlResult page_in(uint32_t ea, uint32_t keep) {
     }
     uint32_t level = IRQ_Disable();
     if (g_xb_pg_frame[p] != 0 && pte_of(p, ea >> 28) == NULL) {
-        pte_insert(ea & ~(WL_XB_PAGE - 1u), g_xb_pg_frame[p], p, (g_xb_pg_flags[p] & WL_XB_PG_DIRTY) != 0);
+        pte_map(ea, g_xb_pg_frame[p], p);
         g_faults++;
     }
     g_xb_pg_flags[p] |= WL_XB_PG_REF;
@@ -431,6 +453,42 @@ void wl_xb_dsi_slow(void *frame) {
 
 // ---- Set-up and the core's backend operations ----------------------------------------------------
 
+// Whether the MMU records R and C in the page table: physical page 0 (the retail kernel's reserved
+// low pages, which nothing here uses) gets a frame and a PTE with both clear, is read, then
+// written, and the PTE looked at after each. The 750CL records both; an MMU that does not (an
+// emulator's) gets the fallbacks (g_hw_ref, g_hw_changed) rather than pages lost as clean.
+static void mmu_selftest(void) {
+    const uint32_t ea = WL_XB_EA_WINDOW;
+    uint32_t level = IRQ_Disable();
+    uint32_t f = wl_xb_pg_frame_fast(0, 0);
+    if (f == 0) {
+        IRQ_Restore(level);
+        return;
+    }
+    zero_frame(f);
+    pte_insert(ea, f, 0, 0);
+    tlbie(ea);
+    volatile uint32_t *word = (volatile uint32_t *)(uintptr_t)ea;
+    (void)*word;
+    __asm__ volatile("sync" ::: "memory");
+    volatile uint32_t *w0p = pte_of(0, 1);
+    bool r = w0p != NULL && (w0p[1] & PTE_R) != 0;
+    *word = 0;
+    __asm__ volatile("sync" ::: "memory");
+    bool c = w0p != NULL && (w0p[1] & PTE_C) != 0;
+    IRQ_Restore(level);
+    wl_xb_pg_release(0, 1);
+    g_hw_ref = r;
+    g_hw_changed = c;
+    if (r && c) {
+        WL_LOG_I(TAG, "the MMU records R and C in the page table: the clock uses them");
+    } else {
+        WL_LOG_W(TAG, "the MMU records R: %s, C: %s; %s%s", r ? "yes" : "no", c ? "yes" : "no",
+                 r ? "" : "a page's use is its fault (the clock drops its PTEs); ",
+                 c ? "" : "every page mapped counts as changed (written out when it goes)");
+    }
+}
+
 WlResult wl_xb_backend_init(const WlXbMemConfig *cfg, uintptr_t *base_out) {
     uint32_t htab = cfg->htab_bytes;
     if (htab < (64u << 10) || htab > (1u << 20) || (htab & (htab - 1u)) != 0) {
@@ -484,6 +542,7 @@ WlResult wl_xb_backend_init(const WlXbMemConfig *cfg, uintptr_t *base_out) {
     PPCExcptSetHandler(PPC_EXCPT_DSI, wl_xb_dsi_entry);
     IRQ_Restore(level);
     WL_LOG_I(TAG, "page table %u KB at %p, frames %u KB in pools", (unsigned)(htab >> 10), t, (unsigned)(total >> 10));
+    mmu_selftest();
     *base_out = 0;
     return WL_OK;
 }
