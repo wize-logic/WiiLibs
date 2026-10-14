@@ -33,6 +33,12 @@ if(WL_PLATFORM STREQUAL "host")
         --programs ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay/programs.inc)
     set_tests_properties(xbox_nv2a_replay PROPERTIES LABELS unit FIXTURES_REQUIRED nv2a_capture
         PASS_REGULAR_EXPRESSION "frame_0000.png.*2 draws.*software GX: [0-9]+ primitives")
+    # the replay streamed into a caller's memory (as the runtime's capture bench makes it) is the same
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay_stream)
+    add_test(NAME xbox_nv2a_replay_stream COMMAND ${CMAKE_COMMAND} -DTOOL=$<TARGET_FILE:xbox_nv2a_replay>
+        -DCAPTURE=${nv2a_capture} -DDIR=${CMAKE_CURRENT_BINARY_DIR}/nv2a_replay_stream
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/replay_stream.cmake)
+    set_tests_properties(xbox_nv2a_replay_stream PROPERTIES LABELS unit FIXTURES_REQUIRED nv2a_capture)
 endif()
 wl_add_test(test_xbox_vsh SOURCES test_xbox_vsh.c LIBS wl_xbox LABELS unit be)
 target_include_directories(test_xbox_vsh PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

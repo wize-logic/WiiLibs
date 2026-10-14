@@ -245,6 +245,9 @@ wl_nv2a_capture_frames(dev, &sink, 2);     // close the file once wl_nv2a_captur
 ```
 
 `wl_nv2a_replay` runs a capture through a new model and any backend over a guest memory of its own.
+`wl_nv2a_replay_stream` reads the capture from a source a piece at a time and may take the caller's
+guest memory (its `phys_ptr`), into which the memory records go a 4 KB piece at a time where they
+differ: the runtime's capture bench (wl/xboxrt's `bench.h`) replays over the title's paged memory so.
 The host tool prints what was drawn and, with `--png-gx`, each frame GX shows: the GX backend over
 the host's software GX (wl/gxsoft), the display copy of its EFB.
 
@@ -274,7 +277,11 @@ programs run as functions rather than through the interpreter.
 
 `--bench N` replays the capture N times through the GX backend alone (no software GX, no recorder;
 the textures kept from one run to the next) and prints the best and the mean time a frame: the
-vertex programs, the fetch, the translation, what the Wii's processor does for a frame.
+vertex programs, the fetch, the translation, what the Wii's processor does for a frame. The same on
+the console: wl/xboxrt's capture bench (`replay:<file> <runs>` in a title's `play.cfg`).
+
+`--stream` replays through `wl_nv2a_replay_stream`, the capture read in odd-sized pieces into a guest
+memory given as the caller's; the output is the same (the test `xbox_nv2a_replay_stream`).
 
 ## The NV2A's tests
 

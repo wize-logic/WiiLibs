@@ -53,12 +53,17 @@ typedef struct WlNv2aReplayHooks {
     // from its first byte that differs to its last (what the title wrote since the capture last
     // read it, as far as the capture saw)
     void (*memory)(void *user, uint32_t phys, uint32_t bytes);
+    // a clock (any unit; may be NULL): the replay then counts in `memory_time` how long putting
+    // the memory records' bytes in took (reading them from a source not counted)
+    uint64_t (*clock)(void *user);
 } WlNv2aReplayHooks;
 
 typedef struct WlNv2aReplayInfo {
     uint32_t ram_bytes;
     uint32_t writes, vblanks, blocks, flips;
     uint64_t block_bytes;
+    uint64_t changed_bytes; // a memory of the caller's (below): the bytes of the 4 KB pieces written
+    uint64_t memory_time;   // hooks->clock's time in the memory records
     WlNv2aStats stats; // the model's, at the end
 } WlNv2aReplayInfo;
 
@@ -67,3 +72,28 @@ typedef struct WlNv2aReplayInfo {
 // or ends inside a record, WL_ERR_VERSION, WL_ERR_NOMEM.
 WlResult wl_nv2a_replay(const uint8_t *data, size_t bytes, const WlNv2aBackend *backend,
                         const WlNv2aReplayHooks *hooks, WlNv2aReplayInfo *info);
+
+// A capture read as it is replayed, a piece at a time (a file too large to hold beside the guest).
+typedef struct WlNv2aReplaySource {
+    void *user;
+    // the capture's next bytes, up to `bytes` of them, into `dst`, and how many in `*got` (fewer
+    // only at its end); an error ends the replay with it
+    WlResult (*read)(void *user, void *dst, uint32_t bytes, uint32_t *got);
+} WlNv2aReplaySource;
+
+// A guest memory of the caller's (a runtime's, paged): the host pointer of guest-physical bytes,
+// for the model and its backend as WlNv2aConfig's phys_ptr, and where the memory records go (NULL
+// outside it). The records' bytes are compared with it a 4 KB piece of guest memory at a time and
+// only the pieces that differ are written, so that a write watch over it (the MMU's changed bits)
+// sees what the title changed and nothing else.
+typedef struct WlNv2aReplayMemory {
+    void *user;
+    WlNv2aPhysPtr phys_ptr;
+    uint32_t ram_bytes; // the capture's RAM size may not be larger
+} WlNv2aReplayMemory;
+
+// wl_nv2a_replay with the capture from `source` and the guest memory `memory` (NULL: one of its
+// own, as wl_nv2a_replay's). WL_ERR_RANGE for a capture whose RAM is larger than `memory`'s.
+WlResult wl_nv2a_replay_stream(const WlNv2aReplaySource *source, const WlNv2aReplayMemory *memory,
+                               const WlNv2aBackend *backend, const WlNv2aReplayHooks *hooks,
+                               WlNv2aReplayInfo *info);
