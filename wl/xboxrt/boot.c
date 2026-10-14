@@ -15,6 +15,7 @@
 #include "wl/platform/hwcount.h"
 #include "wl/platform/profile_arm.h"
 #include "wl/xboxkrnl/xboxkrnl.h"
+#include "wl/xboxrt/bench.h"
 #include "wl/xboxrt/boot.h"
 #include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/input.h"
@@ -118,105 +119,18 @@ static void apply_title_patches(void) {
     }
 }
 
-int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
-    if (cfg == NULL || cfg->title_dir == NULL) {
-        return WL_ERR_ARG;
-    }
-    char data_dir[192], xbe_path[256], log_dir[192];
-    snprintf(data_dir, sizeof data_dir, "%s", cfg->data_dir != NULL ? cfg->data_dir : "");
-    if (cfg->data_dir == NULL) {
-        snprintf(data_dir, sizeof data_dir, "%s/hdd", cfg->title_dir);
-    }
-    snprintf(xbe_path, sizeof xbe_path, "%s/%s", cfg->title_dir, cfg->xbe_name != NULL ? cfg->xbe_name : "default.xbe");
-
-    // ---- platform: the card, the log ------------------------------------------------------------
-#if defined(__wii__)
-    WlResult mem_result = WL_OK; // logged once the log is open (it is not yet)
-    if (!wl_mem_ready()) {
-        // wl_mem takes only what its heaps need (MEM1's budgets and arenas, a small MEM2 asset
-        // heap): the rest stays malloc's, for the guest's frames and the host-side buffers. Its
-        // default would claim both regions whole and leave no room for the frame pools.
-        static WlMemTagDef tags[WL_TAG_BUILTIN_COUNT];
-        memcpy(tags, wl_mem_builtin_tags(), sizeof tags);
-        tags[WL_TAG_ASSET].budget = 2u << 20;
-        tags[WL_TAG_AUDIO_BANK].budget = 0;
-        WlMemConfig mcfg;
-        wl_mem_config_default(&mcfg);
-        mcfg.tags = tags;
-        mcfg.tag_count = WL_TAG_BUILTIN_COUNT;
-        // (the per-frame arenas and the scene stack are a game engine's; the runtime does not use
-        // them, and MEM1 beside a recompiled title's ~12 MB of code has ~7 MB to give)
-        mcfg.frame_arena_size = 64u * 1024u;
-        mcfg.scene_stack_size = 64u * 1024u;
-        mcfg.claim[WL_MEM1] = WL_MEM_CLAIM_NEEDED;
-        mcfg.claim[WL_MEM2] = WL_MEM_CLAIM_NEEDED;
-        mem_result = wl_mem_init(&mcfg);
-    }
-    wl_platform_fs_mount(WL_DEVICE_SD);
-    if (cfg->log_dir == NULL) {
-        snprintf(log_dir, sizeof log_dir, "%s/logs", cfg->title_dir);
-    } else {
-        snprintf(log_dir, sizeof log_dir, "%s", cfg->log_dir);
-    }
-    wl_platform_log_init(log_dir[0] != '\0' ? log_dir : NULL);
-    if (mem_result != WL_OK || !wl_mem_ready()) {
-        WL_LOG_E(TAG, "wl_mem_init: %s (ready %d): GX and the heaps that need it will not start",
-                 wl_result_name(mem_result), (int)wl_mem_ready());
-    }
-    wl_platform_crash_report_install();
-    wl_platform_video_init();
-#else
-    (void)log_dir;
-    wl_platform_fs_mount(WL_DEVICE_SD);
-#endif
-    WL_LOG_I(TAG, "title %s, data %s", xbe_path, data_dir);
-    {
-        char seeds[sizeof data_dir + 24];
-        snprintf(seeds, sizeof seeds, "%s/recomp_seeds.json", data_dir);
-        wl_xb_set_seed_file(seeds);
-        // (the vertex programs drawn with, for the title's build to compile ahead of time)
-        snprintf(seeds, sizeof seeds, "%s/vsh_programs.inc", data_dir);
-        wl_xb_gpu_set_program_list(seeds);
-    }
-
-    // ---- the XBE's headers ----------------------------------------------------------------------
-    WlPlatformFile *file = NULL;
-    WlResult r = wl_platform_fs_open(xbe_path, WL_FILE_READ, &file);
-    if (r != WL_OK) {
-        WL_LOG_E(TAG, "cannot open %s: %s", xbe_path, wl_result_name(r));
-        return r;
-    }
-    uint64_t file_size = wl_platform_fs_size(file);
-    uint32_t head_bytes = file_size < HEAD_BYTES ? (uint32_t)file_size : HEAD_BYTES;
-    uint8_t *head = malloc(HEAD_BYTES);
-    WlXbe *xbe = calloc(1, sizeof *xbe);
-    if (head == NULL || xbe == NULL || wl_platform_fs_read_at(file, 0, head, head_bytes) != WL_OK) {
-        WL_LOG_E(TAG, "cannot read %s", xbe_path);
-        return WL_ERR_IO;
-    }
-    r = wl_xbe_parse(head, head_bytes, xbe);
-    if (r == WL_ERR_RANGE && head_bytes >= 0x10Cu) {
-        uint32_t need = wl_rd_le32(head + 0x108);
-        uint8_t *bigger = need <= file_size ? realloc(head, need) : NULL;
-        if (bigger != NULL && wl_platform_fs_read_at(file, 0, bigger, need) == WL_OK) {
-            head = bigger;
-            r = wl_xbe_parse(head, need, xbe);
-        }
-    }
-    free(head);
-    if (r != WL_OK) {
-        WL_LOG_E(TAG, "%s is not an XBE we can load: %s", xbe_path, wl_result_name(r));
-        return r;
-    }
-
-    // ---- guest memory -------------------------------------------------------------------------------
+// Guest memory (the Wii's frames from the heap), the GPU's textures' arena (when `want_textures`)
+// and the guest threads with the calling thread as the boot thread, holding the guest lock: what
+// the title and the capture bench both need.
+static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, bool want_textures, void **arena,
+                             uint32_t *arena_bytes, WlXbThread **boot) {
     WlXbMemConfig mc;
     wl_xb_mem_config_default(&mc);
     mc.ram_bytes = (cfg->ram_mb != 0 ? cfg->ram_mb : 64u) << 20;
     mc.htab_bytes = cfg->htab_bytes != 0 ? cfg->htab_bytes : mc.htab_bytes;
     // the swap file the paging writes changed pages to when the frames run out (the title's hard
     // disk folder: on the card on the Wii)
-    char swap_path[sizeof data_dir + 16];
+    char swap_path[WL_FS_PATH_MAX + 16];
     snprintf(swap_path, sizeof swap_path, "%s/pagefile.sys", data_dir);
     mc.swap_path = cfg->swap_path != NULL ? cfg->swap_path : swap_path;
     mc.swap_bytes = cfg->swap_bytes;
@@ -294,7 +208,7 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
 #endif
     texture_bytes &= ~31u;
     void *texture_arena = NULL;
-    if (!cfg->gpu_stub && texture_bytes != 0) {
+    if (want_textures && texture_bytes != 0) {
 #if defined(__wii__)
         texture_arena = memalign(32, texture_bytes);
 #else
@@ -304,21 +218,176 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
             WL_LOG_W(TAG, "no %u KB for the textures' arena: they share the heap", (unsigned)(texture_bytes >> 10));
         }
     }
-    r = wl_xb_mem_init(&mc);
+    *arena = texture_arena;
+    *arena_bytes = texture_bytes;
+    WlResult r = wl_xb_mem_init(&mc);
     if (r == WL_OK) {
         r = wl_xb_fault_install();
     }
-    WlXbThread *boot = NULL;
     if (r == WL_OK) {
         WlXbThreadConfig tc;
         wl_xb_thread_config_default(&tc);
-        r = wl_xb_threads_init(&tc, &boot);
+        r = wl_xb_threads_init(&tc, boot);
     }
     if (r == WL_OK) {
-        r = wl_xb_thread_setup_guest(boot, 0x10000u, 0, 0, 0);
+        r = wl_xb_thread_setup_guest(*boot, 0x10000u, 0, 0, 0);
     }
     if (r != WL_OK) {
         WL_LOG_E(TAG, "guest memory: %s", wl_result_name(r));
+    }
+    return r;
+}
+
+// The play harness's setting (play.h): the title's, or on the Wii the first line of play.cfg in the
+// title's folder when there is one.
+static const char *play_setting(const WlXbTitleConfig *cfg) {
+    const char *play = cfg->play;
+#if defined(__wii__)
+    static char line[160];
+    if (play == NULL) {
+        char path[WL_FS_PATH_MAX];
+        WlPlatformFile *pf = NULL;
+        snprintf(path, sizeof path, "%s/play.cfg", cfg->title_dir);
+        if (wl_platform_fs_open(path, WL_FILE_READ, &pf) == WL_OK) {
+            uint32_t got = 0;
+            wl_platform_fs_read_some_at(pf, 0, line, sizeof line - 1u, &got);
+            wl_platform_fs_close(pf);
+            line[got] = '\0';
+            line[strcspn(line, "\r\n")] = '\0';
+            play = line;
+        }
+    }
+#endif
+    return play;
+}
+
+// The capture bench (bench.h) in place of the title: guest memory and the GPU as the title has
+// them, then the replays; no image, kernel, devices or service thread.
+static int bench_boot(const WlXbTitleConfig *cfg, const char *data_dir, const char *play) {
+    void *texture_arena = NULL;
+    uint32_t texture_bytes = 0;
+    WlXbThread *boot = NULL;
+    WL_LOG_I(TAG, "the capture bench: %s", play);
+    WlResult r = guest_memory(cfg, data_dir, true, &texture_arena, &texture_bytes, &boot);
+    if (r != WL_OK) {
+        return r;
+    }
+    r = wl_xb_gpu_attach_nv2a(texture_arena, texture_bytes);
+    if (r != WL_OK) {
+        WL_LOG_E(TAG, "the GPU: %s (the bench needs wl/xbox's NV2A)", wl_result_name(r));
+        return r;
+    }
+    g_boot_us = wl_platform_time_us();
+    profile_arm(cfg->title_dir);
+    int code = wl_xb_bench_run(play, cfg->title_dir);
+    WL_LOG_I(TAG, "the capture bench ended with %d", code);
+#if defined(__wii__)
+    wl_platform_log_flush();
+#endif
+    return code;
+}
+
+int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
+    if (cfg == NULL || cfg->title_dir == NULL) {
+        return WL_ERR_ARG;
+    }
+    char data_dir[192], xbe_path[256], log_dir[192];
+    snprintf(data_dir, sizeof data_dir, "%s", cfg->data_dir != NULL ? cfg->data_dir : "");
+    if (cfg->data_dir == NULL) {
+        snprintf(data_dir, sizeof data_dir, "%s/hdd", cfg->title_dir);
+    }
+    snprintf(xbe_path, sizeof xbe_path, "%s/%s", cfg->title_dir, cfg->xbe_name != NULL ? cfg->xbe_name : "default.xbe");
+
+    // ---- platform: the card, the log ------------------------------------------------------------
+#if defined(__wii__)
+    WlResult mem_result = WL_OK; // logged once the log is open (it is not yet)
+    if (!wl_mem_ready()) {
+        // wl_mem takes only what its heaps need (MEM1's budgets and arenas, a small MEM2 asset
+        // heap): the rest stays malloc's, for the guest's frames and the host-side buffers. Its
+        // default would claim both regions whole and leave no room for the frame pools.
+        static WlMemTagDef tags[WL_TAG_BUILTIN_COUNT];
+        memcpy(tags, wl_mem_builtin_tags(), sizeof tags);
+        tags[WL_TAG_ASSET].budget = 2u << 20;
+        tags[WL_TAG_AUDIO_BANK].budget = 0;
+        WlMemConfig mcfg;
+        wl_mem_config_default(&mcfg);
+        mcfg.tags = tags;
+        mcfg.tag_count = WL_TAG_BUILTIN_COUNT;
+        // (the per-frame arenas and the scene stack are a game engine's; the runtime does not use
+        // them, and MEM1 beside a recompiled title's ~12 MB of code has ~7 MB to give)
+        mcfg.frame_arena_size = 64u * 1024u;
+        mcfg.scene_stack_size = 64u * 1024u;
+        mcfg.claim[WL_MEM1] = WL_MEM_CLAIM_NEEDED;
+        mcfg.claim[WL_MEM2] = WL_MEM_CLAIM_NEEDED;
+        mem_result = wl_mem_init(&mcfg);
+    }
+    wl_platform_fs_mount(WL_DEVICE_SD);
+    if (cfg->log_dir == NULL) {
+        snprintf(log_dir, sizeof log_dir, "%s/logs", cfg->title_dir);
+    } else {
+        snprintf(log_dir, sizeof log_dir, "%s", cfg->log_dir);
+    }
+    wl_platform_log_init(log_dir[0] != '\0' ? log_dir : NULL);
+    if (mem_result != WL_OK || !wl_mem_ready()) {
+        WL_LOG_E(TAG, "wl_mem_init: %s (ready %d): GX and the heaps that need it will not start",
+                 wl_result_name(mem_result), (int)wl_mem_ready());
+    }
+    wl_platform_crash_report_install();
+    wl_platform_video_init();
+#else
+    (void)log_dir;
+    wl_platform_fs_mount(WL_DEVICE_SD);
+#endif
+    WL_LOG_I(TAG, "title %s, data %s", xbe_path, data_dir);
+    const char *play = play_setting(cfg);
+    if (wl_xb_bench_setting(play)) {
+        return bench_boot(cfg, data_dir, play);
+    }
+    {
+        char seeds[sizeof data_dir + 24];
+        snprintf(seeds, sizeof seeds, "%s/recomp_seeds.json", data_dir);
+        wl_xb_set_seed_file(seeds);
+        // (the vertex programs drawn with, for the title's build to compile ahead of time)
+        snprintf(seeds, sizeof seeds, "%s/vsh_programs.inc", data_dir);
+        wl_xb_gpu_set_program_list(seeds);
+    }
+
+    // ---- the XBE's headers ----------------------------------------------------------------------
+    WlPlatformFile *file = NULL;
+    WlResult r = wl_platform_fs_open(xbe_path, WL_FILE_READ, &file);
+    if (r != WL_OK) {
+        WL_LOG_E(TAG, "cannot open %s: %s", xbe_path, wl_result_name(r));
+        return r;
+    }
+    uint64_t file_size = wl_platform_fs_size(file);
+    uint32_t head_bytes = file_size < HEAD_BYTES ? (uint32_t)file_size : HEAD_BYTES;
+    uint8_t *head = malloc(HEAD_BYTES);
+    WlXbe *xbe = calloc(1, sizeof *xbe);
+    if (head == NULL || xbe == NULL || wl_platform_fs_read_at(file, 0, head, head_bytes) != WL_OK) {
+        WL_LOG_E(TAG, "cannot read %s", xbe_path);
+        return WL_ERR_IO;
+    }
+    r = wl_xbe_parse(head, head_bytes, xbe);
+    if (r == WL_ERR_RANGE && head_bytes >= 0x10Cu) {
+        uint32_t need = wl_rd_le32(head + 0x108);
+        uint8_t *bigger = need <= file_size ? realloc(head, need) : NULL;
+        if (bigger != NULL && wl_platform_fs_read_at(file, 0, bigger, need) == WL_OK) {
+            head = bigger;
+            r = wl_xbe_parse(head, need, xbe);
+        }
+    }
+    free(head);
+    if (r != WL_OK) {
+        WL_LOG_E(TAG, "%s is not an XBE we can load: %s", xbe_path, wl_result_name(r));
+        return r;
+    }
+
+    // ---- guest memory -------------------------------------------------------------------------------
+    void *texture_arena = NULL;
+    uint32_t texture_bytes = 0;
+    WlXbThread *boot = NULL;
+    r = guest_memory(cfg, data_dir, !cfg->gpu_stub, &texture_arena, &texture_bytes, &boot);
+    if (r != WL_OK) {
         return r;
     }
 
@@ -394,25 +463,8 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     if (r != WL_OK) {
         return r;
     }
-    // the play harness: the title's setting, or on the Wii a file on the card
+    // the play harness (its setting read above)
     {
-        const char *play = cfg->play;
-#if defined(__wii__)
-        static char line[160];
-        if (play == NULL) {
-            char path[WL_FS_PATH_MAX];
-            WlPlatformFile *pf = NULL;
-            snprintf(path, sizeof path, "%s/play.cfg", cfg->title_dir);
-            if (wl_platform_fs_open(path, WL_FILE_READ, &pf) == WL_OK) {
-                uint32_t got = 0;
-                wl_platform_fs_read_some_at(pf, 0, line, sizeof line - 1u, &got);
-                wl_platform_fs_close(pf);
-                line[got] = '\0';
-                line[strcspn(line, "\r\n")] = '\0';
-                play = line;
-            }
-        }
-#endif
         if (play != NULL && play[0] != '\0') {
             char out[WL_FS_PATH_MAX];
             if (cfg->play_out == NULL) {

@@ -17,6 +17,27 @@ wl_add_test(test_xboxrt_usb SOURCES test_xboxrt_usb.c LIBS wl_xboxrt LABELS unit
 wl_add_test(test_xboxrt_play SOURCES test_xboxrt_play.c LIBS wl_xboxrt LABELS unit be)
 # The PowerPC and x86-64 decoders against a fake device (portable).
 wl_add_test(test_xboxrt_decode SOURCES test_xboxrt_decode.c LIBS wl_xboxrt LABELS unit be)
+# The capture bench (wl/xboxrt/bench.h): the capture test_xbox_nv2a_pixels writes, replayed through
+# the runtime's guest memory and GX backend by a title with no code of its own (bench_title.c) and
+# timed; then with 1 MB of guest frames, paged as the Wii pages, the textures checked through the
+# write watch.
+if(WL_PLATFORM STREQUAL "host" AND TARGET test_xbox_nv2a_pixels AND TARGET wl_xboxkrnl)
+    add_executable(xboxrt_bench_title bench_title.c)
+    wl_target_defaults(xboxrt_bench_title)
+    target_link_libraries(xboxrt_bench_title PRIVATE wl_xboxrt_main)
+    set(bench_dir ${CMAKE_CURRENT_BINARY_DIR}/bench_title)
+    file(MAKE_DIRECTORY ${bench_dir}/hdd)
+    set(nv2a_capture ${PROJECT_BINARY_DIR}/tests/xbox/nv2a_test.capture)
+    add_test(NAME xboxrt_capture_bench COMMAND xboxrt_bench_title ${bench_dir})
+    add_test(NAME xboxrt_capture_bench_paged COMMAND xboxrt_bench_title ${bench_dir})
+    set_tests_properties(xboxrt_capture_bench PROPERTIES ENVIRONMENT "WL_XB_PLAY=replay:${nv2a_capture} 3"
+        PASS_REGULAR_EXPRESSION "run 3: 1 frames, 2 draws.*summary: 3 runs of 1 frames")
+    set_tests_properties(xboxrt_capture_bench_paged PROPERTIES
+        ENVIRONMENT "WL_XB_PLAY=replay:${nv2a_capture} 2;WL_XB_FRAME_KB=1024"
+        PASS_REGULAR_EXPRESSION "summary: 2 runs of 1 frames.*by the write watch")
+    set_tests_properties(xboxrt_capture_bench xboxrt_capture_bench_paged PROPERTIES LABELS unit
+        FIXTURES_REQUIRED nv2a_capture FAIL_REGULAR_EXPRESSION "\\[E\\]\\[xbbench\\]|replay failed")
+endif()
 # The generated code's big-endian header (wl/xboxrt/recomp/recomp_types.h when the toolchain is in
 # the tree; another directory for trying one out).
 set(WL_XBRT_RECOMP_HEADER_DIR "${PROJECT_SOURCE_DIR}/wl/xboxrt/recomp" CACHE PATH

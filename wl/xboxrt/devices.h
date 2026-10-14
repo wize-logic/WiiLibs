@@ -99,6 +99,10 @@ void wl_xb_gpu_stub_stats(const WlXbGpuStub *gpu, WlXbGpuStubStats *out);
 // `texture_bytes` or 8 MB) and checked through the write watch (mem.h). WL_ERR_UNSUPPORTED in a
 // build without it.
 WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes);
+// The GX backend wl_xb_gpu_attach_nv2a made (wl/xbox/nv2a_gx.h), which the capture bench (bench.h)
+// replays through: NULL before, when GX did not start, or without wl/xbox's model (not defined).
+struct WlNv2aGx;
+struct WlNv2aGx *wl_xb_gpu_nv2a_gx(void);
 // Captures `frames` frames of the GPU's work (push buffers and the guest memory they read;
 // wl/xbox/nv2a_capture.h) into `path`, starting `after_vblanks` vertical blanks from now, for
 // tools/xbox_nv2a_replay. On the host the WL_XB_CAPTURE environment variable sets it too:

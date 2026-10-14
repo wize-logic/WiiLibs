@@ -247,6 +247,10 @@ static bool a_irq(const void *gpu) {
 
 static const WlXbGpuOps k_ops = {a_read, a_write, a_vblank, a_irq};
 
+WlNv2aGx *wl_xb_gpu_nv2a_gx(void) {
+    return g_gx;
+}
+
 WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
     // the draws go to GX (over libogc on the Wii, the host's recorder elsewhere)
     if (!wl_gx_ready() && wl_gx_init() != WL_OK) {

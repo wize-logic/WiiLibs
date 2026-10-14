@@ -4,11 +4,12 @@ Target `wl_xboxrt` (alias `WiiLibs::xboxrt`) depends on `wl_platform` and `wl_ba
 lifted from x86 to C (xboxrecomp's pipeline; the generated code's header is
 `wl/xboxrt/recomp/recomp_types.h`) runs on it: guest memory at the Xbox's addresses, devices behind
 faults, the register file the generated code reads, guest threads under one guest lock,
-interrupts, the kernel thunk dispatcher, crash reports, the USB controllers with the gamepads, and a
-play harness that drives them from a script. The kernel itself is `wl/xboxkrnl`. The boot code
+interrupts, the kernel thunk dispatcher, crash reports, the USB controllers with the gamepads, a
+play harness that drives them from a script, and a bench that replays GPU captures through the
+runtime's own GPU. The kernel itself is `wl/xboxkrnl`. The boot code
 that joins them is `wl_xboxrt_boot` (`boot.h`), and `wl_xboxrt_main` is a `main` over it.
 Headers: `mem.h`, `mmio.h`, `regs.h`, `thread.h`, `irq.h`, `thunk.h`, `crash.h`, `xbe.h`,
-`devices.h`, `usb.h`, `pad.h`, `input.h`, `play.h`, `boot.h`, and the decoders `ppc_decode.h` and
+`devices.h`, `usb.h`, `pad.h`, `input.h`, `play.h`, `bench.h`, `boot.h`, and the decoders `ppc_decode.h` and
 `x86_decode.h`.
 
 Builds on the Wii (the MMU backend), on the host and on ppc-be (a reservation and `SIGSEGV`). Every
@@ -345,6 +346,36 @@ or `script stopped at line N (...): why` with what was shown).
 - **Not deterministic**: the guest's clocks are the host's, so how many game ticks a frame runs
   depends on the host's speed; only the input is tied to the game's ticks.
 
+## The capture bench (`bench.h`)
+
+Exact console numbers for chosen spots of a title, without playing to them: a GPU capture (the play
+harness's `capture <frames>` step, `WL_XB_CAPTURE` on the host; wl/xbox's `nv2a_capture.h`, tens of
+MB for a few frames of a level) replayed several times through the runtime's own GPU. The play
+setting `replay:<file> [runs]` (the first line of `play.cfg` on the Wii, `WL_XB_PLAY` on the host;
+the file relative to the title folder, 5 runs unless given) has the boot set up guest memory, the
+textures' arena and the GPU as for the title, and then, instead of loading the XBE and starting the
+kernel and the entry point, run the bench and leave with its code (the Wii's main then powers off
+where no loader started it, which ends a Dolphin run):
+
+```
+play.cfg:  replay:play/a10_g1.cap 5
+host:      WL_XB_PLAY="replay:a10_g1.cap 5" WL_XB_FRAME_MB=33 ./halo <title folder>
+```
+
+Each run replays the capture through a fresh NV2A model (`wl_nv2a_replay_stream`) over the guest
+memory the title runs in: the file is read 256 KB at a time (never held whole), its memory records
+written into guest-physical memory through the window a 4 KB piece at a time where they differ (so
+the MMU's changed bits, the write watch the texture cache checks through, see what the title changed
+and nothing more), its register writes driving the model and the GX backend the title draws with
+(`wl_xb_gpu_nv2a_gx`), the frames shown. The converted textures are kept from one run to the next, as
+from one frame to the next. Lines tagged `xbbench`: each frame's time (the GPU's part: the model and
+the backend, without reading the file and putting its memory in; the draws' and the presents'
+share), each run's time a frame with its phases (`pusher`: the model's methods and reads; `draws`,
+`clears`, `present`: the backend's calls, a present waiting for the console's GPU to finish the
+frame; besides: `memory`, `reading`), and a summary (the best run and the mean; the texture cache's
+counts; the paging's). The clock is the time base on the Wii. `profile.txt` and `hwcount.txt` in the
+title folder arm the profiler and the counters for a bench as for a title.
+
 ## The XBE loader (`xbe.h`)
 
 `wl_xbe_parse` reads the image header (entry point and thunk table decoded with the retail or debug
@@ -362,7 +393,8 @@ the host's frame limit, if any; the swap file `<hard disk folder>/pagefile.sys`)
 textures' arena (`texture_bytes`, 14 MB; `WL_XB_TEXTURE_MB` on the host); threads; the
 image; the kernel (`wl/xboxkrnl`); the thunks; the MCPX devices and the GPU (wl/xbox's model when
 it is built in, else the stub); the service thread; then the entry point on a guest thread of its
-own. It returns the process's exit code. `wl_xboxrt_main` is a `main`: on the host
+own. It returns the process's exit code. A play setting `replay:...` runs the capture bench instead,
+after guest memory and the GPU (above). `wl_xboxrt_main` is a `main`: on the host
 `prog <title folder> [hdd folder]` (`WL_XB_TRACE=1` logs every kernel call; `WL_XB_PLAY`,
 `WL_XB_PLAY_OUT` start the play harness), on the Wii `sd:/xbox/<WL_XB_TITLE_NAME>`; it calls
 `wl_xb_title_setup(&cfg)` first, a weak hook a title's own source may define. The seed file
@@ -400,6 +432,9 @@ Wii, `abort` elsewhere; `wl_xb_crash_set_stop` replaces it).
   endpoint 2 and SET_REPORT, unplugging and plugging two pads one at a time (host, ppc-be).
 - `tests/xboxrt/test_xboxrt_play.c`: the harness against a pretend title (every kind of step,
   frames from the title's frame point, the "test_input:" lines), the parser's errors, the bot.
+- `tests/xboxrt/bench_title.c`: a title with no code of its own over `wl_xboxrt_main`, which the
+  capture bench's tests run on the capture the NV2A pixel test writes (`xboxrt_capture_bench`;
+  `_paged`: 1 MB of guest frames, the textures checked through the write watch) (host).
 - `tests/xboxrt/test_xboxrt_abi.c`: the register file and the runtime's functions against the
   generated code's header, when `WL_XBRT_RECOMP_HEADER_DIR` has one.
 - `tests/xboxrt/e2e/`: a synthetic title written in C, built for i386, wrapped in an XBE, lifted by

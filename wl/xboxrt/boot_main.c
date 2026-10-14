@@ -61,7 +61,8 @@ int main(int argc, char **argv) {
     wl_xb_title_setup(&cfg);
 #if !defined(__wii__)
     // the play harness from the environment (play.h): WL_XB_PLAY=script:<host path>|bot:<n>|look:<n>,
-    // WL_XB_PLAY_OUT=<host folder> for its screenshots
+    // WL_XB_PLAY_OUT=<host folder> for its screenshots; or the capture bench (bench.h):
+    // WL_XB_PLAY="replay:<host path> [runs]"
     static char play[600], play_out[512];
     const char *env = getenv("WL_XB_PLAY");
     if (env != NULL && env[0] != '\0') {
@@ -69,6 +70,17 @@ int main(int argc, char **argv) {
             char path[512];
             platform_path(env + 7, path, sizeof path);
             snprintf(play, sizeof play, "script:%s", path);
+        } else if (strncmp(env, "replay:", 7) == 0) {
+            char host[512], path[512];
+            snprintf(host, sizeof host, "%s", env + 7);
+            const char *runs = "";
+            char *space = strrchr(host, ' ');
+            if (space != NULL && space[1] != '\0' && strspn(space + 1, "0123456789") == strlen(space + 1)) {
+                runs = env + 7 + (space - host);
+                *space = '\0';
+            }
+            platform_path(host, path, sizeof path);
+            snprintf(play, sizeof play, "replay:%s%s", path, runs);
         } else {
             snprintf(play, sizeof play, "%s", env);
         }
