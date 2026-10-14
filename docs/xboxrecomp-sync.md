@@ -130,6 +130,8 @@ Wii (devkitPPC 16.1, the flags above), not linked.
 
 | Upstream | Configuration | Functions (detected / translated) | Unresolved call targets | Unimplemented instructions | `.text` -Os | `.text` -O2 |
 |---|---|---|---|---|---|---|
+| v0.13.1 + patches 0001-0013 (`--x87-locals`) | all executable sections (the driver's default) | 7,474 / 7,493 | 0 | 90 (29 mnemonics) | 12,367,796 (11.79 MiB) | |
+| v0.13.1 + patches 0001-0012, the header as of the x87 change (inline EA, inline MEMF_SET) | all executable sections | 7,474 / 7,493 | 0 | 90 (29 mnemonics) | 13,524,568 (12.90 MiB) | |
 | v0.13.1 + patches 0001-0012 | all executable sections (the driver's default) | 7,474 / 7,493 | 0 (60 jumps in bytes nothing reaches go by address) | 90 (29 mnemonics) | 12,192,978 (11.63 MiB) | |
 | v0.13.1 + patches 0001-0007 | all executable sections (the driver's default) | 7,474 / 7,493 | 294 | 106 (29 mnemonics) | 11,319,192 (10.79 MiB) | 15,741,715 (15.01 MiB) |
 | v0.13.1 + patches 0001-0007 | `.text` only (`"text_only": true`) | 6,948 / 6,961 | 599 | 71 (21 mnemonics) | 10,963,718 (10.46 MiB) | |

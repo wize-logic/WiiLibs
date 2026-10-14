@@ -29,6 +29,11 @@ so each wrapper holds at most one chunk; an unused wrapper is empty.
 By default gen/ gets no recomp_types.h (the recomp stage's --runtime-header none): the build puts
 WiiLibs' big-endian header, wl/xboxrt/recomp/recomp_types.h, on the include path.
 
+The recomp stage keeps each function's x87 stack, control word and compare result in C locals,
+written back to the g_fp_* globals only where control leaves the function (--x87-locals, patch
+0013: the memory model's loads and stores were most of the time of x87 code on PowerPC; results are
+identical). A title's config can turn it off with "x87_locals": false.
+
 A title's own knowledge is data, passed with --config (JSON; relative paths are relative to it):
 
     {
@@ -51,6 +56,8 @@ A title's own knowledge is data, passed with --config (JSON; relative paths are 
                                              lists them, compiled to C at build time (not this
                                              tool's: wl_add_xbox_title's, tools/xbox_vsh_codegen.c)
       "split": 250,                          a fixed chunk size instead of the computed one
+      "x87_locals": false,                   the x87 state in memory at every operation (the default
+                                             true keeps it in locals inside a function)
       "disasm_args": [], "func_id_args": [], "abi_args": [], "recomp_args": []   passed through
     }
 
@@ -307,6 +314,8 @@ class Run:
                 "--game-name", c.get("name", "Xbox title"), "-o", str(out / "recomp"),
                 "--gen-dir", str(gen), "--disasm-dir", str(disasm), "--func-id-dir", str(func_id),
                 "--abi-dir", str(abi.parent), "--runtime-header", self.args.runtime_header]
+        if c.get("x87_locals", True):
+            rcmd.append("--x87-locals")
         rin = [self.xbe, functions, disasm / "labels.json", func_id / "identified_functions.json", abi]
         if c.get("icall_sites"):
             rcmd += ["--icall-sites", str(self.cfg_path(c["icall_sites"]))]
@@ -457,6 +466,9 @@ class Run:
             "chunks": stats.get("num_chunks"), "split": split,
             "lines_of_c": stats.get("total_lines"),
         }
+        if "x87_locals" in stats:
+            # functions using the x87: how many keep its state in locals, and why the rest do not
+            rep["x87_locals"] = stats["x87_locals"]
         self.log("%(functions_translated)s/%(functions_detected)s functions translated "
                  "(%(functions_failed)s failed), %(unresolved_call_targets)s unresolved call targets, "
                  "%(unimplemented_instructions)s unimplemented instructions, %(chunks)s chunks" % rep)
