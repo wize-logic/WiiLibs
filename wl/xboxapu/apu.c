@@ -572,8 +572,12 @@ uint32_t wl_xbox_apu_run(WlXboxApu *apu, uint32_t frames, int16_t *out) {
             wl_apu_set_reg(apu, WL_APU_XGSCNT, wl_apu_reg(apu, WL_APU_XGSCNT) + WL_XBOX_APU_FRAME);
         }
         apu->stats.frames++;
-        if (out != NULL) {
-            mix_out(apu, out + done * WL_XBOX_APU_FRAME * 2u);
+        int16_t *frame_out = out != NULL ? out + done * WL_XBOX_APU_FRAME * 2u : NULL;
+        if (frame_out != NULL) {
+            mix_out(apu, frame_out);
+        }
+        if (apu->cfg.on_frame != NULL) {
+            apu->cfg.on_frame(apu->cfg.on_frame_user, &apu->mix[0][0], frame_out);
         }
         if (apu->trap_pending) {
             done++;

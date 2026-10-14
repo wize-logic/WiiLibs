@@ -17,7 +17,7 @@ and where they come from.
 `wl_xbox_apu_create(&cfg)` (`cfg.phys_ptr` gives the host address of guest-physical memory),
 `wl_xbox_apu_read`/`write` for the 512 KB register window, `wl_xbox_apu_irq` for the interrupt
 line, and `wl_xbox_apu_run(apu, frames, out)`, which runs frames of 32 samples at 48 kHz and writes
-the stereo result.
+the stereo result (`cfg.on_frame` sees each frame's 32 mixbins and output: checksums, captures).
 
 What the model does:
 

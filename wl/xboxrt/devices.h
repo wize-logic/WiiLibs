@@ -46,7 +46,9 @@ WlResult wl_xb_devices_register_mcpx_usb(const struct WlXbUsbConfig *usb);
 // runs the APU's frames and moves the AC'97's bus masters, and the output: the platform's audio
 // at 48 kHz (the Wii), a WAV file (the host). The host reads its settings from the environment:
 // WL_XB_AUDIO_WAV=<file> writes everything played, WL_XB_AUDIO_TRACE=<file> logs every APU and
-// AC'97 access with the translated function that made it, WL_XB_AUDIO=0 keeps the idle devices.
+// AC'97 access with the translated function that made it, WL_XB_AUDIO_HASH=<file> writes running
+// checksums of the APU's mixbins and output once a second of audio (two runs of the deterministic
+// mode compare line by line), WL_XB_AUDIO=0 keeps the idle devices.
 typedef struct {
     uint32_t tick_us;         // how often the frames run: 4000 (6 frames)
     uint32_t latency_frames;  // frames queued ahead of the platform output: 48 (32 ms)
@@ -54,6 +56,7 @@ typedef struct {
     bool off;                 // keep the idle devices: DirectSoundCreate fails, the title is silent
     const char *wav_path;     // the host: a WAV of the output (NULL: none)
     const char *trace_path;   // the host: the MMIO trace (NULL: none)
+    const char *hash_path;    // the host: the mixbin and output checksums (NULL: none)
 } WlXbAudioConfig;
 void wl_xb_audio_config_default(WlXbAudioConfig *cfg);
 // Call after wl_xb_devices_register_mcpx. WL_ERR_UNSUPPORTED in a build without wl/xboxapu.

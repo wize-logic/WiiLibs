@@ -42,6 +42,11 @@ typedef struct {
     // are left out.
     uint16_t mix_left[WL_XBOX_APU_BINS];
     uint16_t mix_right[WL_XBOX_APU_BINS];
+    // Called after each frame wl_xbox_apu_run makes, with its 32 mixbins (bin * 32 + sample) and
+    // its stereo output (32 interleaved pairs; NULL when the run drops them): checksums, captures.
+    // NULL: none.
+    void (*on_frame)(void *user, const int32_t *bins, const int16_t *out);
+    void *on_frame_user;
 } WlXboxApuConfig;
 
 void wl_xbox_apu_config_default(WlXboxApuConfig *cfg);
