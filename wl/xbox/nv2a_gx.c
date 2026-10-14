@@ -156,6 +156,15 @@ struct WlNv2aGx {
     } batch;
     // the draw's fetch
     WlNv2aFetchPlan fetch;
+    // the transform unit's state this backend left (the position matrix set; the coordinates with a
+    // generator of their own), and the last program's verdict (by its compile count and outputs)
+    bool xf_position;
+    uint8_t xf_texgens;
+    const WlXboxVshProgram *xf_program;
+    uint32_t xf_compiled;
+    unsigned xf_live;
+    bool xf_eligible, xf_full;
+    WlXboxVshDependencies xf_dependencies;
 };
 
 // ---- creation -----------------------------------------------------------------------------------
@@ -254,6 +263,8 @@ const WlXboxPshProgram *wl_nv2a_gx_last_program(const WlNv2aGx *gx, bool *used) 
 static void device_state(WlNv2aGx *gx) {
     wl_gx_direct_begin();
     gx->projection_loaded = false;
+    gx->xf_position = false;
+    gx->xf_texgens = 0;
 }
 
 static void cull_measure(WlNv2aGx *gx, uint32_t clear_rgba);
@@ -1015,7 +1026,36 @@ typedef struct DrawPlan {
     StagePlan stages[WL_NV2A_TEXTURES];
     // the stages whose coordinates are sent, in order
     unsigned stage_count, stage_list[WL_NV2A_TEXTURES];
+    // the transform unit's draw (NULL: the processor's)
+    const struct XfPlan *xf;
 } DrawPlan;
+
+// ---- the transform unit's draws ----------------------------------------------------------------------
+// A program whose outputs the draw reads are, for the draw's constants, affine functions of their
+// inputs leaves its work to GX's transform unit: the position through a matrix (with the viewport and
+// the samples folded in, so the eye vector is what vertex_pack makes, for the same projection), each
+// texture coordinate through a generator from its one input (the vertex's coordinate sent as fetched,
+// or its position), the colours a vertex input passed as it is, or a constant. The matrices come from
+// the program run for five probe vertices (every input register (0, 0, 0, 0), (0, 0, 0, 1), (1, 0, 0,
+// 1), (0, 1, 0, 1), (0, 0, 1, 1)): an output affine in its register r is then known everywhere r's w
+// is 1. Not to the bit: the transform unit's arithmetic is its own.
+
+enum { XF_PROBES = 8, XF_MIN_VERTICES = 1 };
+
+typedef struct XfPlan {
+    // every live output the transform unit's (the program not run), or the position alone (the
+    // program run for the others, which are sent as the processor makes them)
+    bool full;
+    float position[3][4];
+    unsigned attributes; // the input registers fetched (bit n: v[n])
+    // each colour: the input register passed as it is (-1: a constant, word)
+    int color_source[2];
+    uint32_t color_word[2];
+    // each stage: its source register (WL_XBOX_VSH_INPUT_COUNT: the position, generated) and matrix
+    unsigned stage_source[WL_NV2A_TEXTURES];
+    float stage_matrix[WL_NV2A_TEXTURES][2][4];
+    unsigned words;
+} XfPlan;
 
 static void stage_plan(StagePlan *s, const WlNv2aTexEntry *entry, unsigned stage_program) {
     memset(s, 0, sizeof *s);
@@ -1058,11 +1098,16 @@ static inline uint32_t color_word(const float c[4]) {
 // a vertex as GX takes it (OpenCE-Wii's vertex_store) from what the program left, in the draw's
 // layout, and where it lands in EFB pixels
 static void vertex_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPlan *plan, const WlXboxVshOutput *o,
-                        PackedVertex *out) {
+                        const float (*inputs)[4], PackedVertex *out) {
     float position[3];
     unsigned stage, i = 3;
 
-    if (gx->projection.perspective && o->clip_captured) {
+    if (plan->xf != NULL) {
+        // (the transform unit's: the position as the vertex has it)
+        position[0] = inputs[0][0];
+        position[1] = inputs[0][1];
+        position[2] = inputs[0][2];
+    } else if (gx->projection.perspective && o->clip_captured) {
         // (x w, y w, -w) in pixels, the pixel centres on integers as Direct3D puts them
         float w = o->clip[3];
 
@@ -1104,6 +1149,28 @@ static void vertex_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPla
     }
 }
 
+// a vertex for the transform unit: its position and the stages' sources as fetched, the colours
+static void vertex_pack_xf(const DrawPlan *plan, const float (*inputs)[4], PackedVertex *out) {
+    const XfPlan *xf = plan->xf;
+    unsigned stage, i = 3, c;
+
+    put_float(&out->w[0], inputs[0][0]);
+    put_float(&out->w[1], inputs[0][1]);
+    put_float(&out->w[2], inputs[0][2]);
+    for (c = 0; c < plan->colors; c++) {
+        out->w[i++] = xf->color_source[c] < 0 ? xf->color_word[c] : color_word(inputs[xf->color_source[c]]);
+    }
+    for (stage = 0; stage < plan->stage_count; stage++) {
+        unsigned source = xf->stage_source[plan->stage_list[stage]];
+
+        if (source < WL_XBOX_VSH_INPUT_COUNT) {
+            put_float(&out->w[i++], inputs[source][0]);
+            put_float(&out->w[i++], inputs[source][1]);
+        }
+    }
+    out->x = out->y = 0.0f;
+}
+
 // vertices first .. first + count - 1 of a draw (count at most WL_XBOX_VSH_BATCH) as GX takes them:
 // gx->batch.vertices[n]. An indexed draw's vertex kept by its index (the memo) is not made again; the
 // others are fetched (the inputs the program reads alone) and run through the program together, and
@@ -1142,11 +1209,249 @@ static void vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
         runs++;
     }
     wl_nv2a_fetch_vertices(&gx->fetch, draw, gx->batch.run_vertex, runs, gx->batch.inputs);
-    wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, runs,
-                              plan->live, gx->batch.outputs, &gx->batch.work);
-    for (r = 0; r < runs; r++) {
-        vertex_pack(gx, k, plan, &gx->batch.outputs[r], gx->batch.run_vertices[r]);
+    if (plan->xf != NULL && plan->xf->full) {
+        for (r = 0; r < runs; r++) {
+            vertex_pack_xf(plan, (const float (*)[4])gx->batch.inputs[r], gx->batch.run_vertices[r]);
+        }
+        return;
     }
+    // (the transform unit's position: the program run for the other outputs alone)
+    wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, runs,
+                              plan->xf != NULL ? plan->live & ~(unsigned)WL_XBOX_VSH_LIVE_POSITION : plan->live,
+                              gx->batch.outputs, &gx->batch.work);
+    for (r = 0; r < runs; r++) {
+        vertex_pack(gx, k, plan, &gx->batch.outputs[r], (const float (*)[4])gx->batch.inputs[r],
+                    gx->batch.run_vertices[r]);
+    }
+}
+
+// the one input register (bit) an output's components read, 0 for none, ~0u for more or not affine
+static unsigned xf_source(const unsigned long *components, unsigned count) {
+    unsigned long all = 0;
+    unsigned c;
+
+    for (c = 0; c < count; c++) {
+        all |= components[c];
+    }
+    if (all & WL_XBOX_VSH_NOT_AFFINE) {
+        return ~0u;
+    }
+    all &= 0xFFFFu;
+    return (all & (all - 1u)) != 0 ? ~0u : (unsigned)all;
+}
+
+static unsigned bit_index(unsigned bit) {
+    unsigned n = 0;
+
+    while (bit > 1u) {
+        bit >>= 1;
+        n++;
+    }
+    return n;
+}
+
+// the program's verdict for the outputs a draw reads: whether its position may go to the transform
+// unit (an affine function of v0), and whether all of them may (*full)
+static bool xf_structure(WlNv2aGx *gx, unsigned live, bool *full) {
+    const WlXboxVshProgram *program = gx->pipeline.program;
+    const WlXboxVshDependencies *d = &gx->xf_dependencies;
+    unsigned stage;
+
+    if (program == gx->xf_program && gx->pipeline.compiled == gx->xf_compiled && live == gx->xf_live) {
+        *full = gx->xf_full;
+        return gx->xf_eligible;
+    }
+    gx->xf_program = program;
+    gx->xf_compiled = gx->pipeline.compiled;
+    gx->xf_live = live;
+    gx->xf_eligible = gx->xf_full = *full = false;
+    wl_xbox_vsh_analyze(program, &gx->xf_dependencies);
+    // (the clip-space position, or a screen-space one, from v0 alone)
+    if (xf_source(d->clip_captured ? d->clip : d->position, 4) != 1u) {
+        return false;
+    }
+    gx->xf_eligible = true;
+    gx->xf_full = !(live & (WL_XBOX_VSH_LIVE_FOG | WL_XBOX_VSH_LIVE_POINT_SIZE | WL_XBOX_VSH_LIVE_BACK)) &&
+                  !((live & WL_XBOX_VSH_LIVE_D0) && xf_source(d->d0, 4) == ~0u) &&
+                  !((live & WL_XBOX_VSH_LIVE_D1) && xf_source(d->d1, 4) == ~0u);
+    for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
+        if ((live & ((unsigned)WL_XBOX_VSH_LIVE_T0 << stage)) && xf_source(d->t[stage], 4) == ~0u) {
+            gx->xf_full = false;
+        }
+    }
+    *full = gx->xf_full;
+    return true;
+}
+
+static bool same4(const float *a, float x, float y, float z, float w) {
+    return a[0] == x && a[1] == y && a[2] == z && a[3] == w;
+}
+
+// The draw's transform unit plan, or false for the processor's: the structure, then the probes (the
+// position's w 1 where the draw is in screen space; each colour passed as it is or constant; no
+// sphere map; a projected stage's q 1; a stage's input the position or a coordinate of two
+// components). The fetch's registers are written by the probes: called before the draw's fetch.
+static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, const DrawPlan *plan,
+                       bool count_pixels, XfPlan *xf) {
+    // (the probes: every input register the same; Z the zero vector, X Y Z W the basis, then the
+    // basis's x, y and z with w 1. A linear form of v0 gives each column exactly at X, Y, Z, W, so two
+    // programs that compute the same transform give the same matrix: their passes over the same
+    // geometry keep the same depths)
+    enum { P_ZERO, P_X, P_Y, P_Z, P_W, P_X1, P_Y1, P_Z1 };
+    static const float probe[XF_PROBES][4] = {
+        {0.0f, 0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f},
+        {0.0f, 0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 1.0f, 1.0f}};
+    const WlXboxVshDependencies *d = &gx->xf_dependencies;
+    const WlXboxVshOutput *o = gx->batch.outputs;
+    unsigned n, a, stage, c, row;
+    float rows[4][4];
+    bool full;
+
+    if (gx->cfg.no_xf || gx->pipeline.program == NULL || count_pixels || draw->count < XF_MIN_VERTICES ||
+        draw->source == WL_NV2A_SOURCE_IMMEDIATE || !xf_structure(gx, plan->live, &full)) {
+        return false;
+    }
+    // (the position an F3 array: w 1 for every vertex)
+    if (!(draw->streamed & 1u) || draw->attribs[0].type != WL_NV2A_VTX_F || draw->attribs[0].size != 3) {
+        return false;
+    }
+    for (n = 0; n < XF_PROBES; n++) {
+        for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
+            memcpy(gx->batch.inputs[n][a], probe[n], sizeof probe[n]);
+        }
+    }
+    wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, XF_PROBES,
+                              plan->live, gx->batch.outputs, &gx->batch.work);
+    memset(xf, 0, sizeof *xf);
+    xf->attributes = 1u;
+    if (gx->projection.perspective) {
+        // (x w, y w, -w) in pixels, as vertex_pack makes them from the clip-space position
+        float to_x = plan->to_sx != 0.0f ? plan->scale[0] * plan->to_sx : plan->scale[0] / plan->sx;
+        float to_y = plan->to_sy != 0.0f ? plan->scale[1] * plan->to_sy : plan->scale[1] / plan->sy;
+        float w_x = (plan->to_sx != 0.0f ? plan->offset[0] * plan->to_sx : plan->offset[0] / plan->sx) + 0.5f;
+        float w_y = (plan->to_sy != 0.0f ? plan->offset[1] * plan->to_sy : plan->offset[1] / plan->sy) + 0.5f;
+
+        if (!o[P_W].clip_captured) {
+            return false;
+        }
+        for (row = 0; row < 4; row++) {
+            for (c = 0; c < 3; c++) {
+                rows[row][c] = o[P_X + c].clip[row] - o[P_ZERO].clip[row];
+            }
+            rows[row][3] = o[P_W].clip[row];
+        }
+        for (c = 0; c < 4; c++) {
+            xf->position[0][c] = rows[0][c] * to_x + rows[3][c] * w_x;
+            xf->position[1][c] = rows[1][c] * to_y + rows[3][c] * w_y;
+            xf->position[2][c] = -rows[3][c];
+        }
+    } else {
+        // (screen space: w 1 for the vertices, each a point with w 1; the depth not clamped)
+        for (row = 0; row < 4; row++) {
+            for (c = 0; c < 3; c++) {
+                rows[row][c] = o[P_X1 + c].position[row] - o[P_W].position[row];
+            }
+            rows[row][3] = o[P_W].position[row];
+        }
+        if (d->clip_captured) {
+            for (n = P_W; n < XF_PROBES; n++) {
+                if (o[n].clip[3] != 1.0f) {
+                    return false;
+                }
+            }
+        }
+        for (c = 0; c < 4; c++) {
+            xf->position[0][c] = rows[0][c] / plan->sx;
+            xf->position[1][c] = rows[1][c] / plan->sy;
+            xf->position[2][c] = rows[2][c] / plan->depth_max;
+        }
+        xf->position[0][3] += 0.5f;
+        xf->position[1][3] += 0.5f;
+        xf->position[2][3] -= 1.0f;
+    }
+    xf->full = full;
+    xf->words = plan->words;
+    if (!full) {
+        return true;
+    }
+    // the colours: an input passed as it is, or the same at every probe
+    for (c = 0; c < plan->colors; c++) {
+        const unsigned long *dc = c == 0 ? d->d0 : d->d1;
+        unsigned source = xf_source(dc, 4);
+
+        if (c == 0 ? !(plan->channels & 1u) : !(plan->channels & 2u)) {
+            xf->color_source[c] = -1;
+            xf->color_word[c] = 0;
+            continue;
+        }
+        if (source == 0) {
+            xf->color_source[c] = -1;
+            xf->color_word[c] = color_word(c == 0 ? o[0].d0 : o[0].d1);
+            continue;
+        }
+        for (n = 0; n < XF_PROBES; n++) {
+            const float *value = c == 0 ? o[n].d0 : o[n].d1;
+
+            if (!same4(value, probe[n][0], probe[n][1], probe[n][2], probe[n][3])) {
+                xf->full = false;
+                return true;
+            }
+        }
+        xf->color_source[c] = (int)bit_index(source);
+        xf->attributes |= source;
+    }
+    // the stages
+    xf->words = 3u + plan->colors;
+    for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
+        const StagePlan *sp = &plan->stages[stage];
+        unsigned source, r;
+
+        if (!(plan->texcoords & (1u << stage))) {
+            continue;
+        }
+        source = xf_source(d->t[stage], 4);
+        if (sp->sphere || source == ~0u) {
+            xf->full = false;
+            break;
+        }
+        if (sp->projective) {
+            for (n = P_W; n < XF_PROBES && o[n].t[stage][3] == 1.0f; n++) {
+            }
+            if (n < XF_PROBES) {
+                xf->full = false;
+                break;
+            }
+        }
+        if (source == 1u || source == 0u) {
+            // (from the position, or a constant: a generator from the position)
+            xf->stage_source[stage] = WL_XBOX_VSH_INPUT_COUNT;
+        } else {
+            r = bit_index(source);
+            // (a coordinate of more than two components is beyond the vertex's s, t)
+            if (!(draw->streamed & source) || draw->attribs[r].size > 2u) {
+                xf->full = false;
+                break;
+            }
+            xf->stage_source[stage] = r;
+            xf->attributes |= source;
+            xf->words += 2u;
+        }
+        for (row = 0; row < 2; row++) {
+            float scale = !sp->linear ? 1.0f : row == 0 ? sp->to_s : sp->to_t;
+            float base = o[P_ZERO].t[stage][row];
+
+            xf->stage_matrix[stage][row][0] = (o[P_X].t[stage][row] - base) * scale;
+            xf->stage_matrix[stage][row][1] = (o[P_Y].t[stage][row] - base) * scale;
+            xf->stage_matrix[stage][row][2] =
+                xf->stage_source[stage] == WL_XBOX_VSH_INPUT_COUNT ? (o[P_Z].t[stage][row] - base) * scale : 0.0f;
+            xf->stage_matrix[stage][row][3] = o[P_W].t[stage][row] * scale;
+        }
+    }
+    if (!xf->full) {
+        xf->words = plan->words;
+        xf->attributes = 1u;
+    }
+    return true;
 }
 
 static WlGxDirectPrim gx_primitive(uint32_t primitive) {
@@ -1180,7 +1485,8 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     WlNv2aSurface surface;
     WlGxDirectLayout layout;
     DrawPlan plan;
-    bool exact, count_pixels = wl_nv2a_k(k, WL_NV2A_K_SET_ZPASS_PIXEL_COUNT_ENABLE) != 0;
+    XfPlan xf;
+    bool exact, xf_ok, count_pixels = wl_nv2a_k(k, WL_NV2A_K_SET_ZPASS_PIXEL_COUNT_ENABLE) != 0;
     float corners[3][2], area = 0.0f;
     uint32_t v, seen = 0, first = 0, attributes;
     unsigned stage;
@@ -1216,9 +1522,9 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     layout.colors = (gx->channels & 2u) ? 2u : (gx->channels & 1u) ? 1u : 0u;
     layout.texcoords = (uint8_t)(gx->texcoords & 0x1Fu);
     layout.texcoord_s = (uint8_t)(1u << WL_XBOX_PSH_FOG_TEXCOORD);
-    wl_gx_direct_layout(&layout);
 
     plan.live = WL_XBOX_VSH_LIVE_POSITION;
+    plan.xf = NULL;
     plan.stage_count = 0;
     plan.colors = layout.colors;
     plan.channels = gx->channels;
@@ -1257,11 +1563,70 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     }
     projection_load(gx, k, &gx->projection);
 
+    // the transform unit's draw, or the processor's (the transform unit's matrices then the identity)
+    xf_ok = xf_prepare(gx, k, draw, &plan, count_pixels, &xf);
+    if (xf_ok && !xf.full) {
+        // (the position alone: the layout and the coordinates as the processor makes them)
+        plan.xf = &xf;
+        wl_gx_direct_layout(&layout);
+        wl_gx_direct_position_matrix((const float (*)[4])xf.position);
+        gx->xf_position = true;
+        for (stage = 0; gx->xf_texgens != 0 && stage < 8; stage++) {
+            if (gx->xf_texgens & (1u << stage)) {
+                wl_gx_direct_texgen(stage, WL_GX_DIRECT_TG_TEXCOORD, NULL);
+            }
+        }
+        gx->xf_texgens = 0;
+        gx->stats.xf_position_draws++;
+    } else if (xf_ok) {
+        plan.xf = &xf;
+        plan.words = xf.words;
+        layout.texcoords = 0;
+        for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
+            if (plan.texcoords & (1u << stage)) {
+                if (xf.stage_source[stage] < WL_XBOX_VSH_INPUT_COUNT) {
+                    layout.texcoords |= (uint8_t)(1u << stage);
+                } else {
+                    layout.texcoords_generated |= (uint8_t)(1u << stage);
+                }
+            }
+        }
+        wl_gx_direct_layout(&layout);
+        wl_gx_direct_position_matrix((const float (*)[4])xf.position);
+        gx->xf_position = true;
+        for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
+            if (plan.texcoords & (1u << stage)) {
+                wl_gx_direct_texgen(stage,
+                                    xf.stage_source[stage] < WL_XBOX_VSH_INPUT_COUNT ? WL_GX_DIRECT_TG_TEXCOORD
+                                                                                      : WL_GX_DIRECT_TG_POSITION,
+                                    (const float (*)[4])xf.stage_matrix[stage]);
+                gx->xf_texgens |= (uint8_t)(1u << stage);
+            }
+        }
+        gx->stats.xf_draws++;
+        gx->stats.xf_vertices += draw->count;
+    } else {
+        memset(&xf, 0, sizeof xf);
+        wl_gx_direct_layout(&layout);
+        if (gx->xf_position) {
+            wl_gx_direct_position_matrix(NULL);
+            gx->xf_position = false;
+        }
+        for (stage = 0; gx->xf_texgens != 0 && stage < 8; stage++) {
+            if (gx->xf_texgens & (1u << stage)) {
+                wl_gx_direct_texgen(stage, WL_GX_DIRECT_TG_TEXCOORD, NULL);
+            }
+        }
+        gx->xf_texgens = 0;
+    }
+
     wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
     gx->memo_stamp++;
     // (the fetch decided once for the draw: the attributes the program reads, the current values'
     // written once into every run's inputs)
-    attributes = wl_nv2a_pipeline_inputs(&gx->pipeline, plan.live);
+    attributes = plan.xf == NULL ? wl_nv2a_pipeline_inputs(&gx->pipeline, plan.live)
+                 : xf.full         ? xf.attributes
+                                   : wl_nv2a_pipeline_inputs(&gx->pipeline, plan.live) | 1u;
     wl_nv2a_fetch_plan(draw, attributes, &gx->fetch);
     wl_nv2a_fetch_constants(&gx->fetch, k, gx->batch.inputs, WL_XBOX_VSH_BATCH);
     for (v = 0; v < draw->count; v++) {

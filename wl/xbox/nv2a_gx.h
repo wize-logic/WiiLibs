@@ -55,6 +55,9 @@ typedef struct WlNv2aGxConfig {
     // keep the EFB without a destination alpha (RGB8_Z24; default: RGBA6_Z24, 6 bits a channel, as
     // a title that blends by the destination's alpha needs)
     bool no_efb_alpha;
+    // every vertex through the program on the processor, never GX's transform unit (the draws whose
+    // live outputs are affine in their inputs otherwise go to the transform unit: not to the bit)
+    bool no_xf;
 } WlNv2aGxConfig;
 
 typedef struct WlNv2aGxStats {
@@ -69,6 +72,9 @@ typedef struct WlNv2aGxStats {
     uint32_t perspective_draws;   // draws through the perspective projection
     uint32_t fits_made;           // ...whose depth a + b / w was fitted for a transform not seen
     uint32_t fits_shared;         // ...that used the fit kept for their transform
+    uint32_t xf_draws;            // draws whose vertices GX's transform unit transformed
+    uint32_t xf_vertices;         // ...and their vertices
+    uint32_t xf_position_draws;   // draws whose positions alone it transformed (the rest the program's)
 } WlNv2aGxStats;
 
 // A backend over GX, which must be up (wl_gx_init). NULL when there is no memory. The device it

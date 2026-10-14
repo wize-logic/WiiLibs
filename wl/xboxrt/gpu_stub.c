@@ -180,4 +180,8 @@ void wl_xb_gpu_capture(const char *path, uint32_t frames, uint32_t after_vblanks
 void wl_xb_gpu_set_program_list(const char *path) {
     (void)path;
 }
+
+void wl_xb_gpu_set_transform_unit(bool on) {
+    (void)on;
+}
 #endif

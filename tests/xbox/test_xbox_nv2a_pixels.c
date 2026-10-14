@@ -5,7 +5,10 @@
 // a textured quad through the combiners' TEV program, the depth test, two combiner stages with
 // their constants, alpha blending, a triangle through a program that divides by w, Direct3D's
 // culling of screen-space quads, a program whose final product needs every TEV register, and a
-// capture replayed to the same pixels (written out for the replay tool's test).
+// capture replayed to the same pixels (written out for the replay tool's test). Draws from vertex
+// arrays through GX's transform unit against the same draws on the processor, within a tolerance,
+// and a second pass over them by a program whose colour the processor computes (the transform unit
+// still doing its position) passing LEQUAL everywhere.
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +70,9 @@ static void on_draw(void *user, const WlGxSoftDraw *d) {
     g_last_draw = *d;
 }
 
+// (the next pixel_device's GX backend never uses the transform unit)
+static bool g_no_xf;
+
 static WlNv2a *pixel_device(TGuest *g) {
     WlGxSoftConfig cfg;
     WlNv2aBackend backend;
@@ -78,7 +84,13 @@ static WlNv2a *pixel_device(TGuest *g) {
     if (wl_gx_init() != WL_OK || wl_gxsoft_attach(&cfg) != WL_OK) {
         return NULL;
     }
-    g_gx = wl_nv2a_gx_create(NULL);
+    {
+        WlNv2aGxConfig gcfg;
+
+        memset(&gcfg, 0, sizeof gcfg);
+        gcfg.no_xf = g_no_xf;
+        g_gx = wl_nv2a_gx_create(&gcfg);
+    }
     if (g_gx == NULL) {
         return NULL;
     }
@@ -641,6 +653,135 @@ TEST capture_replays_to_the_same_pixels(void) {
     PASS();
 }
 
+// ---- the transform unit's draws ----------------------------------------------------------------------
+
+// the clip program with its colour squared: the processor's (not affine), the position the same
+static const uint32_t f_clip_program_squared[][4] = {
+    {0x00000000, 0x00EC001B, 0x0836186C, 0x08C00000}, // dp4 r12.x, v0, c[0]
+    {0x00000000, 0x00EC201B, 0x0836186C, 0x04C00000}, // dp4 r12.y, v0, c[1]
+    {0x00000000, 0x00EC401B, 0x0836186C, 0x02C00000}, // dp4 r12.z, v0, c[2]
+    {0x00000000, 0x00EC601B, 0x0836186C, 0x01C00000}, // dp4 r12.w, v0, c[3]
+    {0x00000000, 0x0600001B, 0x003603FF, 0x10180000}, // ircc r1.x, r12.w
+    {0x00000000, 0x0040001B, 0xC400286C, 0x0EC00000}, // mul r12.xyz, r12, r1.x
+    {0x00000000, 0x0027601B, 0x0C36006C, 0x0F200000}, // mov r2, c[-37]
+    {0x00000000, 0x0087401B, 0xC436186C, 0x9000E800}, // mad oPos.xyz, r12, c[-38], r2
+    {0x00000000, 0x0040061B, 0x0836106C, 0x0000F818}, // mul oD0, v3, v3
+    {0x00000000, 0x0020121B, 0x0836006C, 0x0000F849}, // mov oT0, v9
+};
+
+enum { XF_ARRAY = 0x70000, XF_VERTICES = 12 };
+
+// twelve vertices of four triangles reaching from w 1.4 to 60 (position F3, colour D3DCOLOR,
+// texture coordinate F2: 24 bytes a vertex), drawn from the arrays
+static void xf_arrays(TGuest *g) {
+    static const float corners[XF_VERTICES][3] = {
+        {-1.73f, -0.61f, 1.37f}, {37.1f, -9.3f, 59.9f},  {-29.3f, 21.7f, 43.3f}, {-29.3f, 21.7f, 43.3f},
+        {37.1f, -9.3f, 59.9f},   {13.7f, 29.1f, 7.31f},  {-3.1f, -2.2f, 2.5f},   {4.4f, -2.9f, 5.1f},
+        {0.3f, 3.3f, 3.9f},      {-7.1f, 1.9f, 9.2f},    {-2.2f, -5.5f, 4.0f},   {-1.1f, 0.7f, 1.9f}};
+    unsigned v;
+
+    for (v = 0; v < XF_VERTICES; v++) {
+        uint32_t at = XF_ARRAY + 24u * v;
+
+        t_w32(g, at, t_f(corners[v][0]));
+        t_w32(g, at + 4, t_f(corners[v][1]));
+        t_w32(g, at + 8, t_f(corners[v][2]));
+        t_w32(g, at + 12, 0xFF000000u | (v * 20u) << 16 | (255u - v * 20u) << 8 | 0x60u);
+        t_w32(g, at + 16, t_f((float)(v % 3) * 0.5f));
+        t_w32(g, at + 20, t_f((float)(v % 2)));
+    }
+    t_m1(g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT, 24u << 8 | 3u << 4 | WL_NV2A_VTX_F);
+    t_m1(g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_OFFSET, XF_ARRAY);
+    t_m1(g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT + 4 * 3, 24u << 8 | 4u << 4 | WL_NV2A_VTX_UB_D3D);
+    t_m1(g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_OFFSET + 4 * 3, XF_ARRAY + 12);
+    t_m1(g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT + 4 * 9, 24u << 8 | 2u << 4 | WL_NV2A_VTX_F);
+    t_m1(g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_OFFSET + 4 * 9, XF_ARRAY + 16);
+    t_m1(g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+    t_m1(g, WL_NV2A_K_DRAW_ARRAYS, (uint32_t)(XF_VERTICES - 1) << 24);
+    t_m1(g, WL_NV2A_K_SET_BEGIN_END, 0);
+}
+
+// the EFB after the arrays' draw, with or without the transform unit; a second pass by the squared
+// program (depth mask off, LEQUAL) when asked, which must pass wherever it draws
+static int xf_frame(uint32_t *efb, bool no_xf, bool second_pass, WlNv2aGxStats *stats) {
+    TGuest g;
+    int x, y;
+
+    g_no_xf = no_xf;
+    if (pixel_device(&g) == NULL) {
+        g_no_xf = false;
+        return 0;
+    }
+    g_no_xf = false;
+    f_perspective(&g);
+    f_constant(&g, 98, 0, 0, 1000.0f / 999.9f, -100.0f / 999.9f);
+    f_clear(&g, 0xFF000000u);
+    xf_arrays(&g);
+    t_kick(&g);
+    if (second_pass) {
+        f_program(&g, 8, f_clip_program_squared, 10);
+        t_m1(&g, WL_NV2A_K_SET_DEPTH_MASK, 0);
+        t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+        t_m1(&g, WL_NV2A_K_DRAW_ARRAYS, (uint32_t)(XF_VERTICES - 1) << 24);
+        t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+        t_kick(&g);
+    }
+    for (y = 0; y < 480; y++) {
+        for (x = 0; x < 640; x++) {
+            efb[y * 640 + x] = pixel(x, y);
+        }
+    }
+    wl_nv2a_gx_stats(g_gx, stats);
+    pixel_done(&g);
+    return 1;
+}
+
+TEST arrays_through_the_transform_unit_land_as_on_the_processor(void) {
+    static uint32_t cpu[640 * 480], xf[640 * 480];
+    WlNv2aGxStats cpu_stats, xf_stats;
+    unsigned i, covered = 0, beyond = 0;
+
+    ASSERT(xf_frame(cpu, true, false, &cpu_stats));
+    ASSERT(xf_frame(xf, false, false, &xf_stats));
+    ASSERT_EQ(0u, cpu_stats.xf_draws);
+    // (position, colour passed, coordinate passed: all of it the transform unit's)
+    ASSERT_EQ(1u, xf_stats.xf_draws);
+    for (i = 0; i < 640u * 480u; i++) {
+        if ((cpu[i] & 0xFFFFFF00u) != 0) {
+            covered++;
+        }
+        if (!near_rgb(cpu[i], xf[i], 8)) {
+            beyond++;
+        }
+    }
+    ASSERT(covered > 20000u);
+    // (the edges' pixels may fall the other way)
+    ASSERTm("pixels beyond the tolerance", beyond * 200u < covered);
+    PASS();
+}
+
+TEST a_second_pass_by_the_processor_passes_over_the_transform_units_depths(void) {
+    static uint32_t efb[640 * 480];
+    WlNv2aGxStats stats;
+    uint32_t cpu_failed, cpu_pixels, xf_failed, xf_pixels;
+
+    // (the triangles cover each other: where a nearer one is, the farther fails on the processor too)
+    ASSERT(xf_frame(efb, true, true, &stats));
+    cpu_failed = g_last_draw.z_failed;
+    cpu_pixels = g_last_draw.pixels;
+    ASSERT(xf_frame(efb, false, true, &stats));
+    xf_failed = g_last_draw.z_failed;
+    xf_pixels = g_last_draw.pixels;
+    ASSERT_EQ(1u, stats.xf_draws);
+    ASSERT_EQ(1u, stats.xf_position_draws);
+    ASSERT(xf_pixels > 20000u);
+    // (the pass over the transform unit's depths fails where the processor's does, and nowhere else
+    // but at the edges)
+    ASSERT((xf_failed > cpu_failed ? xf_failed - cpu_failed : cpu_failed - xf_failed) * 200u < cpu_pixels);
+    ASSERT((xf_pixels > cpu_pixels ? xf_pixels - cpu_pixels : cpu_pixels - xf_pixels) * 200u < cpu_pixels);
+    PASS();
+}
+
 SUITE(pixels_suite) {
     RUN_TEST(console_suite_on_the_software_gx);
     RUN_TEST(textured_quad_through_the_combiners);
@@ -654,6 +795,8 @@ SUITE(pixels_suite) {
     RUN_TEST(a_second_pass_after_other_projections_passes_lequal);
     RUN_TEST(a_picture_shown_is_sampled_the_next_frame);
     RUN_TEST(capture_replays_to_the_same_pixels);
+    RUN_TEST(arrays_through_the_transform_unit_land_as_on_the_processor);
+    RUN_TEST(a_second_pass_by_the_processor_passes_over_the_transform_units_depths);
 }
 
 GREATEST_MAIN_DEFS();

@@ -115,6 +115,11 @@ void wl_xb_gpu_capture(const char *path, uint32_t frames, uint32_t after_vblanks
 // of the interpreter. NULL or "": no list. Call it before wl_xb_gpu_attach_nv2a. Nothing when
 // wl/xbox's NV2A model is not built in.
 void wl_xb_gpu_set_program_list(const char *path);
+// Whether the GX backend may leave a draw's vertices to GX's transform unit (wl/xbox/nv2a_gx.h's
+// no_xf; on by default): off, every vertex goes through the program on the processor, to the bit.
+// The boot code turns it off for a file "noxf" in the title's folder (and WL_XB_NO_XF on the host).
+// Call it before wl_xb_gpu_attach_nv2a.
+void wl_xb_gpu_set_transform_unit(bool on);
 
 #ifdef __cplusplus
 }

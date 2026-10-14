@@ -261,6 +261,20 @@ static const char *play_setting(const WlXbTitleConfig *cfg) {
     return play;
 }
 
+// The GPU's options from the title's folder: a file "noxf" (or WL_XB_NO_XF on the host) keeps GX's
+// transform unit out of the vertices, for an A/B on the console.
+static void gpu_options(const WlXbTitleConfig *cfg) {
+    char flag[WL_FS_PATH_MAX];
+    bool no_xf;
+
+    snprintf(flag, sizeof flag, "%s/noxf", cfg->title_dir);
+    no_xf = wl_platform_fs_exists(flag);
+#if !defined(__wii__)
+    no_xf = no_xf || getenv("WL_XB_NO_XF") != NULL;
+#endif
+    wl_xb_gpu_set_transform_unit(!no_xf);
+}
+
 // The capture bench (bench.h) in place of the title: guest memory and the GPU as the title has
 // them, then the replays; no image, kernel, devices or service thread.
 static int bench_boot(const WlXbTitleConfig *cfg, const char *data_dir, const char *play) {
@@ -272,6 +286,7 @@ static int bench_boot(const WlXbTitleConfig *cfg, const char *data_dir, const ch
     if (r != WL_OK) {
         return r;
     }
+    gpu_options(cfg);
     r = wl_xb_gpu_attach_nv2a(texture_arena, texture_bytes);
     if (r != WL_OK) {
         WL_LOG_E(TAG, "the GPU: %s (the bench needs wl/xbox's NV2A)", wl_result_name(r));
@@ -446,6 +461,7 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     if (r != WL_OK && r != WL_ERR_UNSUPPORTED) {
         WL_LOG_W(TAG, "audio: %s (the title runs silent)", wl_result_name(r));
     }
+    gpu_options(cfg);
     bool real_gpu = !cfg->gpu_stub && wl_xb_gpu_attach_nv2a(texture_arena, texture_bytes) == WL_OK;
     if (!real_gpu) {
         WlXbGpuStub *stub = wl_xb_gpu_stub_create();
