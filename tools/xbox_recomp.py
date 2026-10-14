@@ -485,7 +485,7 @@ def load_config(path):
         raise Failure(f"{path}: the title config must be a JSON object")
     known = {"name", "seed_functions", "extra_sections", "text_only", "manual_functions",
              "coalesce_functions", "trace_functions", "split", "disasm_args", "func_id_args",
-             "abi_args", "recomp_args", "icall_sites", "patches", "comment", "vertex_programs"}
+             "abi_args", "recomp_args", "icall_sites", "patches", "comment", "vertex_programs", "x87_locals"}
     unknown = sorted(set(cfg) - known)
     if unknown:
         raise Failure(f"{path}: unknown keys {unknown} (known: {sorted(known)})")
