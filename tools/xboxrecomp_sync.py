@@ -940,7 +940,9 @@ def cmd_check_map(ctx: Ctx, args) -> int:
         for f in r.get("wl", []):
             if r.get("status") == "planned" or " " in f or "(" in f:
                 continue
-            if not (ctx.wl / f).exists():
+            # (a pattern names files that must exist: at least one match)
+            present = any(ctx.wl.glob(f)) if any(ch in f for ch in "*?[") else (ctx.wl / f).exists()
+            if not present:
                 problems.append(f"rule {r['upstream']}: WiiLibs file {f} does not exist")
     bad, extra, _ = integrity(ctx)
     problems += [f"copy: {b}" for b in bad] + [f"copy: not vendored: {e}" for e in extra]
