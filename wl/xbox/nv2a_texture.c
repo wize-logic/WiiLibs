@@ -467,7 +467,9 @@ static bool pow2(uint32_t v) {
     return v != 0 && (v & (v - 1u)) == 0;
 }
 
-bool wl_nv2a_texture_layout(const WlNv2aTexture *t, bool mipmaps, WlNv2aGxLayout *out) {
+// the layout with `skip` of the largest levels GX could show left out besides (a cube map's sphere
+// halved as many times, down to 8 x 8): false when the texture has no such smaller image
+static bool layout_make(const WlNv2aTexture *t, bool mipmaps, uint32_t skip, WlNv2aGxLayout *out) {
     FormatInfo info = format_info(t->color);
     uint32_t w = t->width, h = t->height, l;
 
@@ -484,6 +486,12 @@ bool wl_nv2a_texture_layout(const WlNv2aTexture *t, bool mipmaps, WlNv2aGxLayout
         if (size < 8u) {
             size = 8u;
         }
+        for (l = 0; l < skip; l++) {
+            if (size <= 8u) {
+                return false;
+            }
+            size >>= 1;
+        }
         out->sphere = true;
         out->format = WL_GXC_RGBA8;
         out->width = out->height = size;
@@ -499,6 +507,16 @@ bool wl_nv2a_texture_layout(const WlNv2aTexture *t, bool mipmaps, WlNv2aGxLayout
     }
     if (w > WL_NV2A_GX_MAX_SIZE || h > WL_NV2A_GX_MAX_SIZE) {
         return false;
+    }
+    for (l = 0; l < skip; l++) {
+        // (a level the guest keeps, of 8 texels a side at least; not a linear texture's, whose
+        // coordinates count its texels)
+        if (t->linear || out->first_level + 1u >= t->levels || (w >> 1) < 8u || (h >> 1) < 8u) {
+            return false;
+        }
+        out->first_level++;
+        w >>= 1;
+        h >>= 1;
     }
     out->format = (WlGxcFormat)info.gx;
     out->width = w;
@@ -521,6 +539,14 @@ bool wl_nv2a_texture_layout(const WlNv2aTexture *t, bool mipmaps, WlNv2aGxLayout
         out->total_bytes += round32(2u * out->tlut_entries);
     }
     return out->image_bytes != 0;
+}
+
+bool wl_nv2a_texture_layout(const WlNv2aTexture *t, bool mipmaps, WlNv2aGxLayout *out) {
+    return layout_make(t, mipmaps, 0, out);
+}
+
+bool wl_nv2a_texture_layout_reduced(const WlNv2aTexture *t, bool mipmaps, uint32_t skip, WlNv2aGxLayout *out) {
+    return layout_make(t, mipmaps, skip, out);
 }
 
 size_t wl_nv2a_texture_scratch_bytes(const WlNv2aTexture *t, const WlNv2aGxLayout *layout) {

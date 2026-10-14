@@ -5,8 +5,8 @@
 // decoders of the rest), mip levels, a cube map's sphere map, and the cache: kept, found changed,
 // evicted within its budget; checked through a write watch (no texels read while its pages see no
 // store), its images in an arena of its own (room made by evicting, a texture without room not
-// tried again in the frame); a capture begun inside a frame reads the textures checked before it
-// again.
+// tried again in the frame, one with smaller levels kept from them and made whole again later); a
+// capture begun inside a frame reads the textures checked before it again.
 #include <math.h>
 #include <string.h>
 
@@ -592,6 +592,105 @@ TEST cache_arena_window(void) {
     PASS();
 }
 
+// No room for a texture with mip levels, even with every image not drawn in the frame given back:
+// kept from its next level (normalized coordinates, the same texture smaller) rather than not at
+// all, and made whole again once textures not drawn for long enough give theirs back.
+TEST cache_keeps_smaller_for_want_of_memory(void) {
+    static WlNv2aTexCache cache;
+    // room for one 32x32 RGBA8 image (4 KiB) and two 16x16 ones (1 KiB), each with its heap header
+    static uint8_t arena[(4096 + 32) + 2 * (1024 + 32) + 32];
+    TGuest g;
+    WlNv2aTexCacheConfig cfg;
+    WlNv2aTexture t, big, other[3];
+    WlNv2aTexCacheStats s;
+    WlNv2aGxLayout layout;
+    const WlNv2aTexEntry *e;
+    uint8_t rgba[4];
+    bool made;
+    unsigned i, f;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    // a swizzled A8R8G8B8 32x32 of three levels: level 0 red, level 1 green, level 2 blue
+    for (i = 0; i < 32 * 32; i++) {
+        wl_wr_le32(&g.ram[0x200000 + 4 * i], 0xFFFF0000u);
+    }
+    for (i = 0; i < 16 * 16; i++) {
+        wl_wr_le32(&g.ram[0x200000 + 4096 + 4 * i], 0xFF00FF00u);
+    }
+    for (i = 0; i < 8 * 8; i++) {
+        wl_wr_le32(&g.ram[0x200000 + 4096 + 1024 + 4 * i], 0xFF0000FFu);
+    }
+    set_texture(&g, 0, 0x100000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 4, 4, 1, false));
+    set_texture(&g, 1, 0x200000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 5, 5, 3, false));
+    t_kick(&g);
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 0, &t));
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 1, &big));
+
+    // the layouts: levels left out, none under 8 texels a side, a linear texture never
+    ASSERT(wl_nv2a_texture_layout_reduced(&big, false, 1, &layout));
+    ASSERT_EQ(16u, layout.width);
+    ASSERT_EQ(1u, layout.first_level);
+    ASSERT_EQ(1024u, (unsigned)layout.image_bytes);
+    ASSERT(wl_nv2a_texture_layout_reduced(&big, true, 2, &layout));
+    ASSERT_EQ(8u, layout.width);
+    ASSERT_EQ(1u, layout.levels);
+    ASSERT_FALSE(wl_nv2a_texture_layout_reduced(&big, false, 3, &layout));
+    ASSERT_FALSE(wl_nv2a_texture_layout_reduced(&t, false, 1, &layout));
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.arena = arena;
+    cfg.arena_bytes = sizeof arena;
+    wl_nv2a_texcache_init(&cache, &cfg);
+    for (i = 0; i < 3; i++) {
+        other[i] = t;
+        other[i].phys = 0x100000 + 0x1000 * i;
+        other[i].format_word ^= i << 28; // (another key)
+    }
+    // three 16x16 drawn in the frame: the 32x32 has no room whole, and is kept from level 1
+    for (i = 0; i < 3; i++) {
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made) != NULL);
+    }
+    e = wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made);
+    ASSERT(e != NULL);
+    ASSERT(made);
+    ASSERT_EQ(1u, (unsigned)e->reduced);
+    ASSERT_EQ(16u, e->layout.width);
+    ASSERT_EQ(32u, (unsigned)e->width); // (the guest's size)
+    ASSERT(wl_gxc_texel_read(WL_GXC_RGBA8, e->image, e->layout.image_bytes, 16, 16, 3, 5, rgba));
+    ASSERT_EQ(0, rgba[0]);
+    ASSERT_EQ(255, rgba[1]);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(1u, s.reduced);
+    ASSERT_EQ(0u, s.no_memory);
+    // drawn alone in the frames after: whole again only once the others have not been drawn for
+    // WL_NV2A_TEXCACHE_RESTORE_FRAMES frames (their images then give way)
+    for (f = 1; f < WL_NV2A_TEXCACHE_RESTORE_FRAMES; f++) {
+        wl_nv2a_texcache_frame_done(&cache);
+        e = wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made);
+        ASSERT(e != NULL);
+        ASSERT_FALSE(made);
+        ASSERT_EQ(1u, (unsigned)e->reduced);
+    }
+    wl_nv2a_texcache_frame_done(&cache);
+    e = wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made);
+    ASSERT(e != NULL);
+    ASSERT(made);
+    ASSERT_EQ(0u, (unsigned)e->reduced);
+    ASSERT_EQ(32u, e->layout.width);
+    ASSERT(wl_gxc_texel_read(WL_GXC_RGBA8, e->image, e->layout.image_bytes, 32, 32, 7, 9, rgba));
+    ASSERT_EQ(255, rgba[0]);
+    ASSERT_EQ(0, rgba[1]);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(1u, s.restored);
+    ASSERT(s.evicted >= 1 && s.evicted <= 3);
+    ASSERT_EQ(4096u + 1024u * (3u - s.evicted), (unsigned)s.bytes);
+    ASSERT(wl_heap_check(&cache.heap));
+    wl_nv2a_texcache_clear(&cache);
+    ASSERT_EQ(0u, cache.heap.live);
+    t_destroy(&g);
+    PASS();
+}
+
 static WlResult sink_count(void *user, const void *data, uint32_t bytes) {
     (void)data;
     *(uint32_t *)user += bytes;
@@ -643,6 +742,7 @@ SUITE(texture_suite) {
     RUN_TEST(cache_keeps_finds_changes_and_evicts);
     RUN_TEST(cache_watched_and_in_an_arena);
     RUN_TEST(cache_arena_window);
+    RUN_TEST(cache_keeps_smaller_for_want_of_memory);
     RUN_TEST(cache_reads_again_when_a_capture_begins);
 }
 

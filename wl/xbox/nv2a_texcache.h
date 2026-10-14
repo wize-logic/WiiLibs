@@ -13,6 +13,12 @@
 // were is hashed (a large one is made again). Without a watch, or while a capture runs (it must see
 // the texels read), the texels are hashed: a texture of at most WL_NV2A_TEXCACHE_FULL_HASH bytes
 // whole, a larger one at spread samples.
+//
+// Memory. A texture that finds no room even with the images not drawn in the frame given back is
+// kept smaller (wl_nv2a_texture_layout_reduced: its largest levels left out, a level at a time, up
+// to WL_NV2A_TEXCACHE_REDUCE_MAX) rather than not at all, and made whole again at its first use in
+// a later frame (one in WL_NV2A_TEXCACHE_RESTORE_FRAMES) when there is room for it: free memory, or
+// the images of textures not drawn for as many frames given back (never one the frames draw now).
 #pragma once
 
 #include <stdbool.h>
@@ -31,7 +37,11 @@ enum {
     // textures that found no memory, not tried again in the same frame
     WL_NV2A_TEXCACHE_REFUSED = 16,
     // the decoders' scratch kept between conversions at most (a larger one is had for one)
-    WL_NV2A_TEXCACHE_SCRATCH_KEPT = 256 * 1024
+    WL_NV2A_TEXCACHE_SCRATCH_KEPT = 256 * 1024,
+    // a texture kept smaller for want of memory: levels left out at most, and how often it tries
+    // to be made whole again
+    WL_NV2A_TEXCACHE_REDUCE_MAX = 3,
+    WL_NV2A_TEXCACHE_RESTORE_FRAMES = 60
 };
 
 typedef struct WlNv2aTexCacheConfig {
@@ -72,7 +82,9 @@ typedef struct WlNv2aTexEntry {
     uint32_t stamp;  // the write watch's over its texels and palette since it was checked (0: none)
     uint32_t serial; // changes when the image is made anew
     uint8_t dynamic; // found changed once: checked at every use
+    uint8_t reduced; // levels left out for want of memory (0: whole)
     uint16_t next;   // in its bucket, + 1
+    uint32_t restore_frame; // a reduced one's last try to be made whole
 } WlNv2aTexEntry;
 
 typedef struct WlNv2aTexCacheStats {
@@ -80,6 +92,8 @@ typedef struct WlNv2aTexCacheStats {
     uint32_t checks;      // lookups that looked at the texture (not its frame's first check again)
     uint32_t watched;     // of those, answered by the write watch (unchanged, nothing read)
     uint32_t no_memory;   // of the failures, for want of memory
+    uint32_t reduced;     // textures kept smaller for want of memory (converted or made again so)
+    uint32_t restored;    // of those, made whole again later
     uint64_t hashed_bytes;
     size_t bytes;         // images kept now
     size_t frame_bytes;   // of those, drawn in the last frame finished
