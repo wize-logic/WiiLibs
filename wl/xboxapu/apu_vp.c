@@ -219,46 +219,74 @@ static int32_t pcm16(const uint8_t *p, uint32_t container, uint32_t sample) {
     }
 }
 
-// IMA's difference for each step index and the low three bits of a nibble, as wl_ima_step makes
-// it (step / 8 + step for bit 2 + step / 2 for bit 1 + step / 4 for bit 0, each term truncated).
-static int16_t k_ima_diff[89][8];
+// IMA's step as one table lookup: for each step index and nibble, the signed difference it adds
+// (as wl_ima_step makes it: step / 8 + step for bit 2 + step / 2 for bit 1 + step / 4 for bit 0,
+// each term truncated, negated for bit 3; but in 16 bits, as this model has always kept it) times
+// 2^13, plus the next step index (clamped to 0..88) as the byte offset of its row (index x 64).
+#define IMA_ROW 64u // bytes a row: 16 int32 entries
+static int32_t k_ima[89][16];
 
 void wl_apu_vp_init(void) {
     for (uint32_t i = 0; i < 89u; i++) {
         const int32_t step = wl_ima_step_table[i];
-        for (uint32_t n = 0; n < 8u; n++) {
-            k_ima_diff[i][n] = (int16_t)((step >> 3) + ((n & 4u) ? step : 0) +
-                                         ((n & 2u) ? step >> 1 : 0) + ((n & 1u) ? step >> 2 : 0));
+        for (uint32_t n = 0; n < 16u; n++) {
+            // in 16 bits: at the top step indices a difference above 32767 wraps (where
+            // wl_ima_step's does not)
+            const int32_t diff = (int16_t)((step >> 3) + ((n & 4u) ? step : 0) +
+                                           ((n & 2u) ? step >> 1 : 0) + ((n & 1u) ? step >> 2 : 0));
+            int32_t next = (int32_t)i + wl_ima_index_table[n & 7u];
+            next = next < 0 ? 0 : next > 88 ? 88 : next;
+            k_ima[i][n] = ((n & 8u) ? -diff : diff) * 8192 + next * (int32_t)IMA_ROW;
         }
     }
 }
 
+// One nibble (bits sh..sh+3 of word): the row (row_off) gives its entry, the entry the
+// difference and the next row; the prediction clamps to 16 bits.
+#define IMA_NIBBLE(word, sh, out)                                                                  \
+    do {                                                                                           \
+        const int32_t e_ =                                                                         \
+            *(const int32_t *)(const void *)(tab + row_off + ((((word) >> (sh)) & 15u) << 2));     \
+        pred += e_ >> 13;                                                                          \
+        pred = pred > 32767 ? 32767 : pred < -32768 ? -32768 : pred;                               \
+        row_off = (uint32_t)e_ & 0x1FFFu;                                                          \
+        (out) = (int16_t)pred;                                                                     \
+    } while (0)
+
 // Decodes the 64 samples the Xbox plays of a block (the header's and the first 63 nibbles'; the
 // 64th nibble's sample is the next block's header again) into pcm, interleaved by channel. The IMA
-// step is wl/audio's (wl_ima_step), inlined over its tables.
+// step is wl/audio's (wl_ima_step), over the table above.
 static void adpcm_block(const uint8_t *blk, uint32_t channels, int16_t *pcm) {
+    const uint8_t *tab = (const uint8_t *)k_ima;
     for (uint32_t ch = 0; ch < channels; ch++) {
         WlImaState st;
         int32_t pred = wl_xbox_adpcm_header(blk, ch, &st);
-        int32_t index = st.index;
+        uint32_t row_off = st.index * IMA_ROW;
         pcm[ch] = (int16_t)pred;
-        for (uint32_t g = 0; g < 8u; g++) { // groups of 8 nibbles: 4 bytes of this channel
-            const uint8_t *q = blk + 4u * channels * (1u + g) + 4u * ch;
+        int16_t *o = pcm + channels + ch; // sample 1 on
+        const uint32_t c = channels;      // 1 or 2: o[k * c]
+        const uint8_t *q = blk + 4u * channels + 4u * ch;
+        for (uint32_t g = 0; g < 7u; g++) {      // groups of 8 nibbles: 4 bytes of this channel
             const uint32_t word = wl_rd_le32(q); // nibble k at bits 4k
-            for (uint32_t k = 0; k < 8u; k++) {
-                const uint32_t n = 8u * g + k;
-                if (n == 63u) {
-                    break; // the 64th: the next header's sample
-                }
-                const uint32_t nib = (word >> (4u * k)) & 15u;
-                const int32_t diff = k_ima_diff[index][nib & 7u];
-                pred += (nib & 8u) ? -diff : diff;
-                pred = pred > 32767 ? 32767 : pred < -32768 ? -32768 : pred;
-                index += wl_ima_index_table[nib & 7u];
-                index = index < 0 ? 0 : index > 88 ? 88 : index;
-                pcm[(n + 1u) * channels + ch] = (int16_t)pred;
-            }
+            IMA_NIBBLE(word, 0, o[0]);
+            IMA_NIBBLE(word, 4, o[c]);
+            IMA_NIBBLE(word, 8, o[2u * c]);
+            IMA_NIBBLE(word, 12, o[3u * c]);
+            IMA_NIBBLE(word, 16, o[4u * c]);
+            IMA_NIBBLE(word, 20, o[5u * c]);
+            IMA_NIBBLE(word, 24, o[6u * c]);
+            IMA_NIBBLE(word, 28, o[7u * c]);
+            o += 8u * c;
+            q += 4u * channels;
         }
+        const uint32_t word = wl_rd_le32(q); // the last group: 7 nibbles (the 64th is not played)
+        IMA_NIBBLE(word, 0, o[0]);
+        IMA_NIBBLE(word, 4, o[c]);
+        IMA_NIBBLE(word, 8, o[2u * c]);
+        IMA_NIBBLE(word, 12, o[3u * c]);
+        IMA_NIBBLE(word, 16, o[4u * c]);
+        IMA_NIBBLE(word, 20, o[5u * c]);
+        IMA_NIBBLE(word, 24, o[6u * c]);
     }
 }
 
