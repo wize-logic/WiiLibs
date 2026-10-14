@@ -140,12 +140,19 @@ void wl_nv2a_pipeline_vertices(WlNv2aPipeline *p, const WlNv2aKelvin *k, const f
     wl_xbox_vsh_run_batch(p->program, (const float (*)[4])k->constants, inputs, count, p->point_size, out, live, work);
 }
 
-uint32_t wl_nv2a_pipeline_inputs(const WlNv2aPipeline *p, unsigned live) {
+uint32_t wl_nv2a_pipeline_inputs(WlNv2aPipeline *p, unsigned live) {
     if (p->program == NULL) {
         // (the fixed function's: the position, the colours, the fog coordinate, the texture coordinates)
         return 1u << 0 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 9 | 1u << 10 | 1u << 11 | 1u << 12;
     }
-    return (uint32_t)wl_xbox_vsh_inputs_read(p->program, live);
+    // (the same program, not replaced since, and the same outputs: the same answer)
+    if (p->program != p->inputs_program || p->compiled != p->inputs_compiled || live != p->inputs_live) {
+        p->inputs_program = p->program;
+        p->inputs_compiled = p->compiled;
+        p->inputs_live = live;
+        p->inputs = (uint32_t)wl_xbox_vsh_inputs_read(p->program, live);
+    }
+    return p->inputs;
 }
 
 float wl_nv2a_fog_factor(const WlNv2aKelvin *k, float coordinate) {

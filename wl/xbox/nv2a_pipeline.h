@@ -37,6 +37,10 @@ typedef struct WlNv2aPipeline {
     // the natives: a title's programs listed for compiling ahead of time (NULL: none)
     void (*decoded)(void *user, const uint32_t *words, unsigned long count, bool native);
     void *decoded_user;
+    // the last answer of wl_nv2a_pipeline_inputs: for this program (and compile count) and live set
+    const WlXboxVshProgram *inputs_program;
+    uint32_t inputs_compiled, inputs;
+    unsigned inputs_live;
 } WlNv2aPipeline;
 
 void wl_nv2a_pipeline_init(WlNv2aPipeline *p, const WlXboxVshNative *natives, unsigned long native_count);
@@ -54,7 +58,7 @@ void wl_nv2a_pipeline_vertex(WlNv2aPipeline *p, const WlNv2aKelvin *k, const flo
 void wl_nv2a_pipeline_vertices(WlNv2aPipeline *p, const WlNv2aKelvin *k, const float (*inputs)[WL_NV2A_ATTRIBS][4],
                                unsigned count, unsigned live, WlXboxVshOutput *out, WlXboxVshWork *work);
 // The input registers the outputs in `live` read (bit n: v[n]): the others need not be fetched.
-uint32_t wl_nv2a_pipeline_inputs(const WlNv2aPipeline *p, unsigned live);
+uint32_t wl_nv2a_pipeline_inputs(WlNv2aPipeline *p, unsigned live);
 
 // The fog factor (1 no fog, 0 all fog) of a fog coordinate (the program's oFog) by SET_FOG_MODE
 // and SET_FOG_PARAMS (bias, multiplier): linear bias - 1 + multiplier c, exp bias - 1.5 +

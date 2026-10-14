@@ -151,6 +151,167 @@ void wl_nv2a_draw_fetch_some(const WlNv2aDraw *draw, const WlNv2aKelvin *k, uint
     }
 }
 
+// ---- a draw's fetch decided once ---------------------------------------------------------------
+
+enum {
+    FETCH_F1,
+    FETCH_F2,
+    FETCH_F3,
+    FETCH_F4,
+    FETCH_D3DCOLOR,
+    FETCH_CMP,
+    FETCH_S1,    // (size 1 to 4)
+    FETCH_UB,    // bytes in order, normalized (size 1 to 4)
+    FETCH_GENERIC // wl_nv2a_attrib_decode's
+};
+
+void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetchPlan *plan) {
+    unsigned a;
+
+    plan->source = draw->source;
+    plan->count = 0;
+    plan->constants = 0;
+    plan->indices = draw->indices;
+    plan->index_base = draw->index_base;
+    if (draw->source == WL_NV2A_SOURCE_IMMEDIATE) {
+        return;
+    }
+    for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
+        const WlNv2aAttrib *attrib = &draw->attribs[a];
+
+        if (!(attributes & (1u << a))) {
+            continue;
+        }
+        if (!(draw->streamed & (1u << a))) {
+            plan->constants |= 1u << a;
+            continue;
+        }
+        plan->streamed[plan->count].attribute = (uint8_t)a;
+        plan->streamed[plan->count].type = attrib->type;
+        plan->streamed[plan->count].size = attrib->size;
+        if (draw->source == WL_NV2A_SOURCE_ARRAYS) {
+            plan->streamed[plan->count].data = attrib->data;
+            plan->streamed[plan->count].stride = attrib->stride;
+        } else {
+            plan->streamed[plan->count].data = draw->inline_data + attrib->inline_offset;
+            plan->streamed[plan->count].stride = draw->inline_stride;
+        }
+        if (attrib->type == WL_NV2A_VTX_F && attrib->size >= 1 && attrib->size <= 4) {
+            plan->streamed[plan->count].format = (uint8_t)(FETCH_F1 + attrib->size - 1u);
+        } else if (attrib->type == WL_NV2A_VTX_UB_D3D && attrib->size == 4) {
+            plan->streamed[plan->count].format = FETCH_D3DCOLOR;
+        } else if (attrib->type == WL_NV2A_VTX_CMP) {
+            plan->streamed[plan->count].format = FETCH_CMP;
+        } else if (attrib->type == WL_NV2A_VTX_S1 && attrib->size >= 1 && attrib->size <= 4) {
+            plan->streamed[plan->count].format = FETCH_S1;
+        } else if ((attrib->type == WL_NV2A_VTX_UB_OGL || attrib->type == WL_NV2A_VTX_UB_D3D) && attrib->size >= 1 &&
+                   attrib->size <= 4) {
+            plan->streamed[plan->count].format = FETCH_UB;
+        } else {
+            plan->streamed[plan->count].format = FETCH_GENERIC;
+        }
+        plan->count++;
+    }
+}
+
+void wl_nv2a_fetch_constants(const WlNv2aFetchPlan *plan, const WlNv2aKelvin *k, float (*inputs)[WL_NV2A_ATTRIBS][4],
+                             unsigned count) {
+    unsigned a, n;
+
+    for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
+        if (plan->constants & (1u << a)) {
+            for (n = 0; n < count; n++) {
+                memcpy(inputs[n][a], k->current[a], sizeof inputs[n][a]);
+            }
+        }
+    }
+}
+
+void wl_nv2a_fetch_vertex(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, uint32_t vertex,
+                          float inputs[WL_NV2A_ATTRIBS][4]) {
+    uint32_t element;
+    unsigned i;
+
+    if (plan->source == WL_NV2A_SOURCE_IMMEDIATE) {
+        memcpy(inputs, draw->immediate[vertex], sizeof(float) * WL_NV2A_ATTRIBS * 4);
+        return;
+    }
+    // (the element: an array's index from the least, an inline vertex's number)
+    element = plan->source != WL_NV2A_SOURCE_ARRAYS ? vertex
+              : plan->indices != NULL                ? plan->indices[vertex] - plan->index_base
+                                                     : vertex;
+    for (i = 0; i < plan->count; i++) {
+        const uint8_t *data = plan->streamed[i].data + (size_t)element * plan->streamed[i].stride;
+        float *out = inputs[plan->streamed[i].attribute];
+
+        // (as wl_nv2a_attrib_decode widens them: the components left out 0, w 1)
+        switch (plan->streamed[i].format) {
+        case FETCH_F4:
+            out[3] = word_float(wl_rd_le32(data + 12));
+            out[2] = word_float(wl_rd_le32(data + 8));
+            out[1] = word_float(wl_rd_le32(data + 4));
+            out[0] = word_float(wl_rd_le32(data));
+            break;
+        case FETCH_F3:
+            out[0] = word_float(wl_rd_le32(data));
+            out[1] = word_float(wl_rd_le32(data + 4));
+            out[2] = word_float(wl_rd_le32(data + 8));
+            out[3] = 1.0f;
+            break;
+        case FETCH_F2:
+            out[0] = word_float(wl_rd_le32(data));
+            out[1] = word_float(wl_rd_le32(data + 4));
+            out[2] = 0.0f;
+            out[3] = 1.0f;
+            break;
+        case FETCH_F1:
+            out[0] = word_float(wl_rd_le32(data));
+            out[1] = out[2] = 0.0f;
+            out[3] = 1.0f;
+            break;
+        case FETCH_D3DCOLOR:
+            // a D3DCOLOR: bytes B, G, R, A
+            out[0] = data[2] * (1.0f / 255.0f);
+            out[1] = data[1] * (1.0f / 255.0f);
+            out[2] = data[0] * (1.0f / 255.0f);
+            out[3] = data[3] * (1.0f / 255.0f);
+            break;
+        case FETCH_CMP: {
+            uint32_t word = wl_rd_le32(data);
+
+            out[0] = normalized(sign_extend(word & 0x7FFu, 11), 1023.0f);
+            out[1] = normalized(sign_extend((word >> 11) & 0x7FFu, 11), 1023.0f);
+            out[2] = normalized(sign_extend(word >> 22, 10), 511.0f);
+            out[3] = 1.0f;
+            break;
+        }
+        case FETCH_S1: {
+            unsigned c, size = plan->streamed[i].size;
+
+            out[1] = out[2] = 0.0f;
+            out[3] = 1.0f;
+            for (c = 0; c < size; c++) {
+                out[c] = normalized((int16_t)wl_rd_le16(data + 2 * c), 32767.0f);
+            }
+            break;
+        }
+        case FETCH_UB: {
+            unsigned c, size = plan->streamed[i].size;
+
+            out[1] = out[2] = 0.0f;
+            out[3] = 1.0f;
+            for (c = 0; c < size; c++) {
+                out[c] = data[c] * (1.0f / 255.0f);
+            }
+            break;
+        }
+        default:
+            wl_nv2a_attrib_decode(plan->streamed[i].type, plan->streamed[i].size, data, out);
+            break;
+        }
+    }
+}
+
 void wl_nv2a_prim_info(uint32_t primitive, WlNv2aPrimInfo *out) {
     memset(out, 0, sizeof *out);
     switch (primitive) {

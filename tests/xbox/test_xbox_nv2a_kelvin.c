@@ -4,7 +4,8 @@
 // DRAW_ARRAYS, ARRAY_ELEMENT16 and ARRAY_ELEMENT32, from inline arrays and from immediate vertices
 // (each kind of SET_VERTEX_DATA*), disabled attributes reading their current value; long batches
 // handed over in whole primitives; the vertex program and constant windows; the viewport in
-// c[58]/c[59]; the combiners as psh's 57 words; the surface decoded.
+// c[58]/c[59]; the combiners as psh's 57 words; the surface decoded. A draw's fetch plan against the
+// fetch of each vertex alone, on random formats, data and attribute sets, bit for bit.
 #include <math.h>
 #include <string.h>
 
@@ -433,6 +434,80 @@ TEST surface_decoded(void) {
     PASS();
 }
 
+// ---- the fetch decided once a draw -------------------------------------------------------------------
+
+static uint32_t g_rng = 0x51ED270Bu;
+static uint32_t rnd(void) {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 17;
+    g_rng ^= g_rng << 5;
+    return g_rng;
+}
+
+enum { SLOTS = 16 };
+
+TEST fetch_plan_matches_the_fetch_of_each_vertex(void) {
+    static const uint8_t types[] = {WL_NV2A_VTX_UB_D3D, WL_NV2A_VTX_S1,   WL_NV2A_VTX_F,
+                                    WL_NV2A_VTX_UB_OGL, WL_NV2A_VTX_S32K, WL_NV2A_VTX_CMP};
+    static uint8_t data[64 * 1024];
+    static WlNv2aKelvin k;
+    static uint32_t indices[64];
+    static float want[SLOTS][WL_NV2A_ATTRIBS][4], got[SLOTS][WL_NV2A_ATTRIBS][4];
+    WlNv2aDraw draw;
+    WlNv2aFetchPlan plan;
+    unsigned trial, a, v, c;
+
+    for (trial = 0; trial < 2000; trial++) {
+        uint32_t attributes = rnd() & 0xFFFFu;
+
+        for (c = 0; c < sizeof data; c++) {
+            data[c] = (uint8_t)rnd();
+        }
+        for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
+            for (c = 0; c < 4; c++) {
+                k.current[a][c] = (float)(int)(rnd() % 2001u - 1000u) / 8.0f;
+            }
+        }
+        memset(&draw, 0, sizeof draw);
+        draw.source = (uint8_t)(rnd() % 2u == 0 ? WL_NV2A_SOURCE_ARRAYS : WL_NV2A_SOURCE_INLINE);
+        draw.count = 1u + rnd() % 64u;
+        draw.streamed = rnd() & 0xFFFFu;
+        draw.index_base = rnd() % 16u;
+        draw.indices = rnd() % 2u == 0 ? indices : NULL;
+        for (v = 0; v < 64; v++) {
+            indices[v] = draw.index_base + rnd() % 128u;
+        }
+        draw.inline_data = data;
+        draw.inline_stride = 64;
+        for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
+            WlNv2aAttrib *attrib = &draw.attribs[a];
+
+            attrib->type = types[rnd() % sizeof types];
+            attrib->size = (uint8_t)(rnd() % 5u);
+            if (attrib->type == WL_NV2A_VTX_F && rnd() % 4u == 0) {
+                attrib->size = 7; // (FLOAT2H)
+            }
+            attrib->stride = 16u + 4u * (rnd() % 60u);
+            attrib->data = data + 4u * (rnd() % 64u);
+            attrib->inline_offset = (uint16_t)(4u * (rnd() % 12u));
+        }
+        wl_nv2a_fetch_plan(&draw, attributes, &plan);
+        wl_nv2a_fetch_constants(&plan, &k, got, SLOTS);
+        for (v = 0; v < draw.count; v++) {
+            unsigned slot = v % SLOTS;
+
+            wl_nv2a_draw_fetch_some(&draw, &k, v, attributes, want[slot]);
+            wl_nv2a_fetch_vertex(&plan, &draw, v, got[slot]);
+            for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
+                if (attributes & (1u << a)) {
+                    ASSERT_MEM_EQm("an attribute", want[slot][a], got[slot][a], sizeof want[slot][a]);
+                }
+            }
+        }
+    }
+    PASS();
+}
+
 SUITE(kelvin_suite) {
     RUN_TEST(every_array_format_decodes);
     RUN_TEST(draw_arrays_and_elements);
@@ -443,6 +518,7 @@ SUITE(kelvin_suite) {
     RUN_TEST(program_and_constant_windows);
     RUN_TEST(combiners_as_the_pixel_shader_words);
     RUN_TEST(surface_decoded);
+    RUN_TEST(fetch_plan_matches_the_fetch_of_each_vertex);
 }
 
 GREATEST_MAIN_DEFS();
