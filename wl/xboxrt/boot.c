@@ -169,6 +169,9 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
         char seeds[sizeof data_dir + 24];
         snprintf(seeds, sizeof seeds, "%s/recomp_seeds.json", data_dir);
         wl_xb_set_seed_file(seeds);
+        // (the vertex programs drawn with, for the title's build to compile ahead of time)
+        snprintf(seeds, sizeof seeds, "%s/vsh_programs.inc", data_dir);
+        wl_xb_gpu_set_program_list(seeds);
     }
 
     // ---- the XBE's headers ----------------------------------------------------------------------

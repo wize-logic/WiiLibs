@@ -55,6 +55,9 @@ bool wl_nv2a_pipeline_begin(WlNv2aPipeline *p, const WlNv2aKelvin *k) {
     p->program = &p->programs[slot].program;
     p->program_generation = k->program_generation;
     p->compiled++;
+    if (p->decoded != NULL) {
+        p->decoded(p->decoded_user, words, count, p->program->native != NULL);
+    }
     return true;
 }
 

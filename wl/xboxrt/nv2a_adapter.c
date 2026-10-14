@@ -49,6 +49,124 @@ void wl_xb_gpu_capture(const char *path, uint32_t frames, uint32_t after_vblanks
     g_cap.armed = g_cap.path[0] != '\0';
 }
 
+// The vertex programs the title draws with, listed for compiling ahead of time
+// (wl_xb_gpu_set_program_list): those the file holds, by their hash, and the file
+static struct {
+    char path[WL_FS_PATH_MAX];
+    unsigned long hashes[512];
+    unsigned count;
+} g_programs;
+
+// the title's vertex programs compiled ahead of time (wl_add_xbox_title's vertex_programs: the
+// generated table's accessor; weak, so a title without them links)
+extern const WlXboxVshNative *wl_xb_title_vsh_natives(unsigned long *count) __attribute__((weak));
+
+static bool program_listed(unsigned long hash) {
+    for (unsigned i = 0; i < g_programs.count; i++) {
+        if (g_programs.hashes[i] == hash) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void program_note(unsigned long hash) {
+    if (g_programs.count < sizeof g_programs.hashes / sizeof g_programs.hashes[0]) {
+        g_programs.hashes[g_programs.count++] = hash;
+    }
+}
+
+// the programs of the list's text (tools/xbox_vsh_codegen.c's input: hexadecimal words outside
+// comments, each program a header word with its instruction count in the high half, then four
+// words an instruction), noted by their hash
+static void programs_parse(const char *text) {
+    uint32_t words[1 + WL_XBOX_VSH_MAX_INSTRUCTIONS * 4];
+    unsigned have = 0, want = 0;
+    bool comment = false;
+
+    for (const char *c = text; *c != '\0';) {
+        if (comment) {
+            const char *end = strstr(c, "*/");
+            if (end == NULL) {
+                break;
+            }
+            comment = false;
+            c = end + 2;
+        } else if (c[0] == '/' && c[1] == '*') {
+            comment = true;
+            c += 2;
+        } else if (c[0] == '0' && (c[1] == 'x' || c[1] == 'X')) {
+            char *end;
+            uint32_t word = (uint32_t)strtoul(c, &end, 16);
+            c = end;
+            if (have == 0) {
+                want = 1u + (word >> 16) * 4u;
+                if (want == 1u || want > sizeof words / sizeof words[0]) {
+                    want = 0;
+                    continue;
+                }
+            }
+            words[have++] = word;
+            if (have == want) {
+                program_note(wl_xbox_vsh_hash(words + 1, (word = words[0] >> 16)));
+                have = 0;
+            }
+        } else {
+            c++;
+        }
+    }
+}
+
+void wl_xb_gpu_set_program_list(const char *path) {
+    snprintf(g_programs.path, sizeof g_programs.path, "%s", path != NULL ? path : "");
+    g_programs.count = 0;
+    WlPlatformFile *f = NULL;
+    if (g_programs.path[0] == '\0' || wl_platform_fs_open(g_programs.path, WL_FILE_READ, &f) != WL_OK) {
+        return;
+    }
+    uint64_t size = wl_platform_fs_size(f);
+    char *text = size < (16u << 20) ? malloc((size_t)size + 1u) : NULL;
+    if (text != NULL && wl_platform_fs_read_at(f, 0, text, (uint32_t)size) == WL_OK) {
+        text[size] = '\0';
+        programs_parse(text);
+    }
+    free(text);
+    wl_platform_fs_close(f);
+}
+
+// a program the pipeline decoded: one neither compiled into the title nor listed is appended
+static void program_decoded(void *user, const uint32_t *words, unsigned long count, bool native) {
+    (void)user;
+    unsigned long hash = wl_xbox_vsh_hash(words, count);
+    if (native || g_programs.path[0] == '\0' || program_listed(hash)) {
+        return;
+    }
+    program_note(hash);
+    WlPlatformFile *f = NULL;
+    if (wl_platform_fs_open(g_programs.path, WL_FILE_READ_WRITE, &f) != WL_OK) {
+        WL_LOG_E(TAG, "cannot write the vertex program list %s", g_programs.path);
+        return;
+    }
+    static const char heading[] = "/* NV2A vertex programs the title drew with (wl/xboxrt), for "
+                                  "tools/xbox_vsh_codegen.c */\n";
+    uint64_t at = wl_platform_fs_size(f);
+    char line[96];
+    WlResult r = at == 0 ? wl_platform_fs_write_at(f, 0, heading, (uint32_t)(sizeof heading - 1u)) : WL_OK;
+    int n = snprintf(line, sizeof line, "/* %lu instructions, hash %08lx */\n\t0x%08lX,\n", count, hash,
+                     (count << 16) | 0x2078ul);
+    if (r == WL_OK) {
+        r = wl_platform_fs_write_at(f, at == 0 ? sizeof heading - 1u : at, line, (uint32_t)n);
+    }
+    for (unsigned long i = 0; i < count && r == WL_OK; i++) {
+        n = snprintf(line, sizeof line, "\t0x%08X, 0x%08X, 0x%08X, 0x%08X,\n", (unsigned)words[4 * i],
+                     (unsigned)words[4 * i + 1], (unsigned)words[4 * i + 2], (unsigned)words[4 * i + 3]);
+        r = wl_platform_fs_write(f, line, (uint32_t)n);
+    }
+    wl_platform_fs_close(f);
+    WL_LOG_I(TAG, "vertex program %08lx (%lu instructions) added to %s: rebuild the title to compile it",
+             hash, count, g_programs.path);
+}
+
 static void *phys_ptr(void *user, uint32_t phys, uint32_t bytes) {
     (void)user;
     if ((uint64_t)phys + bytes > wl_xb_ram_bytes()) {
@@ -125,6 +243,11 @@ WlResult wl_xb_gpu_attach_nv2a(void) {
         WlNv2aGxConfig gcfg;
         memset(&gcfg, 0, sizeof gcfg);
         gcfg.textures.budget = 8u << 20; // a title's menu alone keeps several MB of textures
+        if (wl_xb_title_vsh_natives != NULL) {
+            gcfg.natives = wl_xb_title_vsh_natives(&gcfg.native_count);
+            WL_LOG_I(TAG, "%lu vertex programs compiled ahead of time", gcfg.native_count);
+        }
+        gcfg.program_decoded = program_decoded;
         g_gx = wl_nv2a_gx_create(&gcfg);
         if (g_gx != NULL) {
             wl_nv2a_gx_backend(g_gx, &backend);

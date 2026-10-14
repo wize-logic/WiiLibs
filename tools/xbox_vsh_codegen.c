@@ -13,8 +13,12 @@
 // half is its instruction count, then four words an instruction. Programs met twice are written
 // once.
 //
-// usage: xbox_vsh_codegen microcode.inc output.c [table]
-//   (table: the name of the table, default xbox_vsh_natives, and of its count, <table>_count)
+// usage: xbox_vsh_codegen [--if-exists] [--accessor name] microcode.inc output.c [table]
+//   (table: the name of the table, default xbox_vsh_natives, and of its count, <table>_count;
+//   --if-exists: a microcode file that is not there has no programs, an empty table; --accessor:
+//   also a function of that name, const WlXboxVshNative *name(unsigned long *count), that gives
+//   the table and its count, which a runtime can declare weak: wl_add_xbox_title's
+//   wl_xb_title_vsh_natives)
 
 #include "../wl/xbox/vsh.c"
 
@@ -542,21 +546,37 @@ int main(int argc, char **argv) {
     char line[512];
     FILE *in, *out;
     int in_comment = 0;
-    const char *table = "xbox_vsh_natives";
+    const char *table = "xbox_vsh_natives", *accessor = NULL;
+    int if_exists = 0;
 
+    while (argc > 1 && argv[1][0] == '-' && argv[1][1] == '-') {
+        if (strcmp(argv[1], "--if-exists") == 0) {
+            if_exists = 1;
+        } else if (strcmp(argv[1], "--accessor") == 0 && argc > 2) {
+            accessor = argv[2];
+            argc--;
+            argv++;
+        } else {
+            break;
+        }
+        argc--;
+        argv++;
+    }
     if (argc != 3 && argc != 4) {
-        fprintf(stderr, "usage: xbox_vsh_codegen microcode.inc output.c [table]\n");
+        fprintf(stderr,
+                "usage: xbox_vsh_codegen [--if-exists] [--accessor name] microcode.inc output.c "
+                "[table]\n");
         return 2;
     }
     if (argc == 4)
         table = argv[3];
     in = fopen(argv[1], "r");
-    if (!in) {
+    if (!in && !if_exists) {
         perror(argv[1]);
         return 1;
     }
     /* the hexadecimal words, past the comment */
-    while (fgets(line, sizeof(line), in)) {
+    while (in && fgets(line, sizeof(line), in)) {
         char *cursor = line;
 
         while (*cursor) {
@@ -581,7 +601,8 @@ int main(int argc, char **argv) {
             }
         }
     }
-    fclose(in);
+    if (in)
+        fclose(in);
 
     out = fopen(argv[2], "w");
     if (!out) {
@@ -683,7 +704,16 @@ int main(int argc, char **argv) {
         fprintf(out, "\t{ 0x%08lxUL, %lu, program_%08lx, program_%08lx_colors, %s },\n",
                 hashes[index], counts[index], hashes[index], hashes[index], positions);
     }
+    /* (C has no empty array: a table of none holds one entry no program matches) */
+    if (!program_count)
+        fprintf(out, "\t{ 0UL, 0, NULL, NULL, NULL },\n");
     fprintf(out, "};\n\nconst unsigned long %s_count = %lu;\n", table, program_count);
+    if (accessor)
+        fprintf(out,
+                "\nconst WlXboxVshNative *%s(unsigned long *count);\n\n"
+                "const WlXboxVshNative *%s(unsigned long *count)\n{\n\t*count = %s_count;\n"
+                "\treturn %s;\n}\n",
+                accessor, accessor, table, table);
     fclose(out);
     printf("xbox_vsh_codegen: %lu programs from %lu words\n", program_count, word_count);
     return 0;

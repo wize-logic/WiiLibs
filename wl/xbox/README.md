@@ -90,11 +90,19 @@ outputs a draw reads; one for its colours alone; and, for a program whose positi
 by a0 and is converted to the screen (a skinned model's), one for four positions at once. It writes
 a table of `WlXboxVshNative`, which the program hands to `wl_xbox_vsh_compile`; a program found in
 it by its words' hash (`wl_xbox_vsh_hash`) runs as its function. The table's name is the tool's
-third argument (`xbox_vsh_natives` by default).
+third argument (`xbox_vsh_natives` by default). `--accessor name` also writes a function that gives
+the table and its count; `--if-exists` takes a missing file as no programs (an empty table).
 
 ```sh
-xbox_vsh_codegen microcode.inc programs.c [table]
+xbox_vsh_codegen [--if-exists] [--accessor name] microcode.inc programs.c [table]
 ```
+
+A recompiled title gets this without writing anything: the runtime appends each program it draws
+with that is not compiled in to `<hard disk folder>/vsh_programs.inc` (wl/xboxrt), and
+`wl_add_xbox_title` compiles that list at build time when the title config names it
+(`"vertex_programs": "hdd/vsh_programs.inc"`). Play the title once on the host, build again (for
+the Wii too), and its programs run as functions. The list and the C are made from the game's
+code: they stay in the title's folders, never in WiiLibs.
 
 ## Tests
 
@@ -102,7 +110,8 @@ xbox_vsh_codegen microcode.inc programs.c [table]
 evaluated directly (none differs; a digest of every program, the same on ppc-be), recipes, fog,
 bumped lookups; the cache against fresh translations, byte for byte; synthetic vertex programs
 (`vsh_programs.py` assembles `vsh_programs.inc`) interpreted exactly, analysed, and compiled by
-the tool at build time (under qemu on ppc-be) against the interpreter, bit for bit.
+the tool at build time (under qemu on ppc-be) against the interpreter, bit for bit; the batch
+interpreter against the plain one on random programs and live sets.
 
 The OpenCE-Wii port (Halo) checks the translation further with the game's own programs.
 

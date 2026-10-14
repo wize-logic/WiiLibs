@@ -33,6 +33,10 @@ typedef struct WlNv2aPipeline {
     uint32_t program_generation;
     float point_size;
     uint32_t compiled, found;
+    // called for each program decoded (again when one evicted comes back), with whether it was among
+    // the natives: a title's programs listed for compiling ahead of time (NULL: none)
+    void (*decoded)(void *user, const uint32_t *words, unsigned long count, bool native);
+    void *decoded_user;
 } WlNv2aPipeline;
 
 void wl_nv2a_pipeline_init(WlNv2aPipeline *p, const WlXboxVshNative *natives, unsigned long native_count);

@@ -47,6 +47,9 @@ A title's own knowledge is data, passed with --config (JSON; relative paths are 
                                              it expects, made before lifting (a pushed constant
                                              lives in the C) and applied by the runtime to the
                                              image it loads (tu/recomp_tu_patches.c)
+      "vertex_programs": "hdd/vsh_programs.inc",   the title's NV2A vertex programs as the runtime
+                                             lists them, compiled to C at build time (not this
+                                             tool's: wl_add_xbox_title's, tools/xbox_vsh_codegen.c)
       "split": 250,                          a fixed chunk size instead of the computed one
       "disasm_args": [], "func_id_args": [], "abi_args": [], "recomp_args": []   passed through
     }
@@ -470,7 +473,7 @@ def load_config(path):
         raise Failure(f"{path}: the title config must be a JSON object")
     known = {"name", "seed_functions", "extra_sections", "text_only", "manual_functions",
              "coalesce_functions", "trace_functions", "split", "disasm_args", "func_id_args",
-             "abi_args", "recomp_args", "icall_sites", "patches", "comment"}
+             "abi_args", "recomp_args", "icall_sites", "patches", "comment", "vertex_programs"}
     unknown = sorted(set(cfg) - known)
     if unknown:
         raise Failure(f"{path}: unknown keys {unknown} (known: {sorted(known)})")

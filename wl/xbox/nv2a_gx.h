@@ -41,6 +41,10 @@ typedef struct WlNv2aGxConfig {
     // vertex programs compiled ahead of time (tools/xbox_vsh_codegen.c), or NULL
     const WlXboxVshNative *natives;
     unsigned long native_count;
+    // called for each vertex program decoded (its instructions, four words each, and whether it was
+    // among the natives), to list a title's programs for compiling ahead of time (NULL: none)
+    void (*program_decoded)(void *user, const uint32_t *words, unsigned long count, bool native);
+    void *program_user;
     // a title's pixel programs made by hand (NULL: none), copied
     const WlXboxPshRecipe *recipe;
     // the converted textures' budget and memory (zero: 4 MiB from aligned_alloc; flush NULL: the

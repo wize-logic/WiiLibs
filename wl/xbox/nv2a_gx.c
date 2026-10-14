@@ -182,6 +182,8 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     }
     wl_nv2a_texcache_init(&gx->textures, &textures);
     wl_nv2a_pipeline_init(&gx->pipeline, gx->cfg.natives, gx->cfg.native_count);
+    gx->pipeline.decoded = gx->cfg.program_decoded;
+    gx->pipeline.decoded_user = gx->cfg.program_user;
     wl_xbox_psh_cache_init(&gx->psh, gx->cfg.recipe != NULL ? &gx->recipe : NULL);
     wl_gx_set_efb_alpha(!gx->cfg.no_efb_alpha);
     wl_gx_target_set_back_buffer_size(gx->cfg.width, gx->cfg.height);
