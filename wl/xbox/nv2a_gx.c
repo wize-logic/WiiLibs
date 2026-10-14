@@ -165,6 +165,13 @@ struct WlNv2aGx {
     unsigned xf_live;
     bool xf_eligible, xf_full;
     WlXboxVshDependencies xf_dependencies;
+    // the state the last applied draw left in GX (state_valid; device_state ends it), what has
+    // changed since (the tracker's WL_NV2A_DIRTY_* of every draw since, applied or not), whether
+    // its raster state and pixel program were exact, and whether its textures must be bound again
+    // anyway (one found changed within a frame, checked at every use, or one not bound)
+    bool state_valid;
+    uint32_t dirty;
+    bool states_exact, tev_exact, textures_volatile;
 };
 
 // ---- creation -----------------------------------------------------------------------------------
@@ -262,6 +269,7 @@ const WlXboxPshProgram *wl_nv2a_gx_last_program(const WlNv2aGx *gx, bool *used) 
 // what wl/platform's quads and the frame's start leave: everything set again before the next draw
 static void device_state(WlNv2aGx *gx) {
     wl_gx_direct_begin();
+    gx->state_valid = false;
     gx->projection_loaded = false;
     gx->xf_position = false;
     gx->xf_texgens = 0;
@@ -636,7 +644,7 @@ static const WlNv2aTexEntry *target_texture(WlNv2aGx *gx, unsigned stage, const 
 }
 
 static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
-    unsigned stage;
+    unsigned stage, wanted = 0;
 
     for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
         WlNv2aTexture t;
@@ -648,6 +656,7 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
         if (wl_nv2a_stage_program(k, stage) == WL_NV2A_STAGE_NONE || !wl_nv2a_texture(k, stage, &t)) {
             continue;
         }
+        wanted |= 1u << stage;
         e = target_texture(gx, stage, &t);
         if (e == NULL && !gx->keep_frames && is_display(gx, t.phys)) {
             // (a picture the title showed, as a texture: kept from the next frame on)
@@ -703,6 +712,12 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
             }
         }
         gx->entries[stage] = e;
+    }
+    gx->textures_volatile = false;
+    for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
+        if ((wanted & (1u << stage)) && (gx->entries[stage] == NULL || gx->entries[stage]->dynamic)) {
+            gx->textures_volatile = true;
+        }
     }
     if (gx->texture_memory_changed) {
         wl_gx_direct_texture_invalidate();
@@ -1542,9 +1557,9 @@ static void display_textures_note(WlNv2aGx *gx, const WlNv2aKelvin *k) {
 
 // A draw that writes nothing GX keeps (no colour channel, no depth write: an occlusion query's
 // quad), counting pixels: only the count is made, the program run for the positions and their
-// landings as backend_draw makes them; no state, texture, program or primitive goes to GX (every
-// draw sets its own). The projection is fitted as for a drawn draw (its fits are kept for later
-// draws). The pixels counted, the same as when it was drawn.
+// landings as backend_draw makes them; no state, texture, program or primitive goes to GX (GX keeps
+// the last drawn draw's, and what changed is kept for the next). The projection is fitted as for a
+// drawn draw (its fits are kept for later draws). The pixels counted, the same as when it was drawn.
 static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw,
                                 const WlNv2aSurface *surface) {
     DrawPlan plan;
@@ -1593,7 +1608,10 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     float corners[3][2], area = 0.0f;
     uint32_t v, seen = 0, first = 0, attributes;
     unsigned stage;
+    bool rebind;
 
+    // (what changed since the last draw, kept until a draw applies it)
+    gx->dirty |= k->dirty;
     if (wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_TEST_ENABLE)) {
         // GX has no stencil. A pass that writes only the stencil (no colour, no depth) draws
         // nothing GX can keep, and is skipped; any other is drawn as if its test passed, as
@@ -1625,9 +1643,32 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
             return 0;
         }
     }
-    exact = states_apply(gx, k, &surface);
-    textures_bind(gx, k);
-    exact = tev_setup(gx, k) && exact;
+    // the state GX keeps from the last draw that applied it, applied again where it changed: the
+    // raster state (its methods, the surface's depth buffer), the textures (theirs, the combiners'
+    // stage programs; one changing within frames always), the pixel program (the combiners, the
+    // textures bound, the fog)
+    if (!gx->state_valid || (gx->dirty & (WL_NV2A_DIRTY_RASTER | WL_NV2A_DIRTY_SURFACE))) {
+        gx->states_exact = states_apply(gx, k, &surface);
+    } else {
+        gx->stats.raster_kept++;
+    }
+    rebind = !gx->state_valid || gx->textures_volatile || (gx->dirty & (WL_NV2A_DIRTY_TEXTURES | WL_NV2A_DIRTY_COMBINERS));
+    if (rebind) {
+        textures_bind(gx, k);
+    } else {
+        gx->stats.textures_kept++;
+    }
+    if (rebind || !gx->state_valid || (gx->dirty & WL_NV2A_DIRTY_RASTER)) {
+        gx->tev_exact = tev_setup(gx, k);
+    } else {
+        gx->stats.combiners_kept++;
+        if (!gx->last_used) {
+            gx->stats.programs_unusable++;
+        }
+    }
+    gx->state_valid = true;
+    gx->dirty = 0;
+    exact = gx->states_exact && gx->tev_exact;
     if (!exact) {
         gx->stats.approximations++;
     }
@@ -1822,6 +1863,7 @@ static void backend_frame_done(void *user, const WlNv2aKelvin *k) {
     WlNv2aGx *gx = user;
 
     (void)k;
+    gx->state_valid = false;
     if (gx->frame_open && gx->back_drawn) {
         wl_nv2a_gx_present(gx);
     }
@@ -1831,6 +1873,8 @@ static void backend_flip(void *user, const WlNv2aKelvin *k, uint32_t phys) {
     WlNv2aGx *gx = user;
 
     (void)k;
+    // (a surface shown: textures at its address are looked at again)
+    gx->state_valid = false;
     if (!is_display(gx, phys)) {
         gx->displays[gx->display_next] = phys;
         gx->display_next = (gx->display_next + 1u) % 4u;
