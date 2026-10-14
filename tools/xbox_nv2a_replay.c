@@ -23,9 +23,13 @@
 //   --programs  each vertex program drawn with, once, as tools/xbox_vsh_codegen.c's input (C text:
 //               a header word with the instruction count in its high half, four words an
 //               instruction), for compiling a title's programs ahead of time
+//   --bench N   the capture replayed N times through the GX backend alone (no software GX, no
+//               recorder): the processor's part of the frames, timed (the best run and the mean,
+//               a frame), for measuring the vertex path and the translation
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "wl/codec/gx_tex.h"
 #include "wl/gxsoft/gxsoft.h"
@@ -47,6 +51,23 @@ typedef struct Tee {
 } Tee;
 
 static FILE *g_programs;
+static unsigned g_bench;
+
+// a title's vertex programs compiled ahead of time, when a build of this tool links them (the C
+// wl_add_xbox_title generates, vsh_natives.c; weak: WiiLibs' own build has none): the GX backend
+// runs them, the recorder's digest stays the interpreter's
+extern const WlXboxVshNative *wl_xb_title_vsh_natives(unsigned long *count) __attribute__((weak));
+
+static const WlNv2aGxConfig *gx_config(void) {
+    static WlNv2aGxConfig cfg;
+
+    memset(&cfg, 0, sizeof cfg);
+    if (wl_xb_title_vsh_natives != NULL) {
+        cfg.natives = wl_xb_title_vsh_natives(&cfg.native_count);
+        fprintf(stderr, "%lu vertex programs compiled ahead of time\n", cfg.native_count);
+    }
+    return &cfg;
+}
 static unsigned long g_program_hashes[1024];
 static unsigned g_program_count;
 static unsigned g_verbosity;
@@ -374,9 +395,51 @@ static void on_created(void *user, WlNv2a *dev) {
     }
 }
 
+// --bench: the replay through the GX backend alone, `runs` times (its textures kept from one run to
+// the next, as a title's are from one frame to the next)
+static double seconds_now(void) {
+    struct timespec t;
+
+    timespec_get(&t, TIME_UTC);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1.0e-9;
+}
+
+static int bench(const uint8_t *data, size_t size, unsigned runs) {
+    WlNv2aBackend backend;
+    WlNv2aReplayHooks hooks;
+    WlNv2aReplayInfo info;
+    double best = 0.0, total = 0.0;
+    unsigned run, frames = 0;
+
+    if (wl_gx_init() != WL_OK || (g_gx = wl_nv2a_gx_create(gx_config())) == NULL) {
+        fprintf(stderr, "no memory for the GX backend\n");
+        return 1;
+    }
+    wl_nv2a_gx_backend(g_gx, &backend);
+    memset(&hooks, 0, sizeof hooks);
+    hooks.created = on_created;
+    for (run = 0; run < runs; run++) {
+        double start = seconds_now(), took;
+
+        if (wl_nv2a_replay(data, size, &backend, &hooks, &info) != WL_OK) {
+            fprintf(stderr, "the replay failed\n");
+            return 1;
+        }
+        took = seconds_now() - start;
+        best = run == 0 || took < best ? took : best;
+        total += took;
+        frames = info.stats.frames != 0 ? info.stats.frames : 1u;
+    }
+    printf("bench: %u runs of %u frames (%u draws, %u vertices): best %.3f ms a frame, mean %.3f ms a frame\n",
+           runs, frames, (unsigned)info.stats.draws, (unsigned)info.stats.vertices, best * 1000.0 / frames,
+           total * 1000.0 / runs / frames);
+    wl_nv2a_gx_destroy(g_gx);
+    return 0;
+}
+
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
-                    "[--psh-dump N] [--programs FILE]\n");
+                    "[--psh-dump N] [--programs FILE] [--bench N]\n");
     return 2;
 }
 
@@ -412,6 +475,8 @@ int main(int argc, char **argv) {
             gx = true;
         } else if (strcmp(argv[i], "--psh-dump") == 0 && i + 1 < argc && g_psh_dump_count < EFB_AFTER_MAX) {
             g_psh_dump[g_psh_dump_count++] = (uint32_t)strtoul(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
+            g_bench = (unsigned)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--programs") == 0 && i + 1 < argc) {
             g_programs = fopen(argv[++i], "w");
             if (g_programs == NULL) {
@@ -439,6 +504,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     fclose(f);
+    if (g_bench != 0) {
+        return bench(data, (size_t)size, g_bench);
+    }
 
     memset(&tee, 0, sizeof tee);
     wl_nv2a_recorder_init(&g_recorder);
@@ -451,7 +519,7 @@ int main(int argc, char **argv) {
         memset(&scfg, 0, sizeof scfg);
         scfg.frame = on_gx_frame;
         scfg.draw = on_gx_draw;
-        if (wl_gx_init() != WL_OK || wl_gxsoft_attach(&scfg) != WL_OK || (g_gx = wl_nv2a_gx_create(NULL)) == NULL) {
+        if (wl_gx_init() != WL_OK || wl_gxsoft_attach(&scfg) != WL_OK || (g_gx = wl_nv2a_gx_create(gx_config())) == NULL) {
             fprintf(stderr, "no memory for the GX backend\n");
             return 1;
         }

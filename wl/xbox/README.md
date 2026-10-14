@@ -247,6 +247,7 @@ the host's software GX (wl/gxsoft), the display copy of its EFB.
 ```sh
 xbox_nv2a_replay nv2a.capture -v --png-gx frames/ --programs programs.inc
 xbox_vsh_codegen programs.inc programs.c     # the title's programs as C, for WlNv2aGxConfig.natives
+xbox_nv2a_replay nv2a.capture --bench 10     # the processor's part alone, timed (ms a frame)
 ```
 
 With `-v` and `--png-gx`, each draw also says what its GX primitives covered and wrote (triangles
@@ -261,6 +262,10 @@ texture maps, the TEV program, the first vertices) and `--gx-textures DIR` write
 `--programs` writes each vertex program the capture drew with, once, as `tools/xbox_vsh_codegen.c`'s
 input: a title project compiles them ahead of time and hands the table to the GX backend, so its
 programs run as functions rather than through the interpreter.
+
+`--bench N` replays the capture N times through the GX backend alone (no software GX, no recorder;
+the textures kept from one run to the next) and prints the best and the mean time a frame: the
+vertex programs, the fetch, the translation, what the Wii's processor does for a frame.
 
 ## The NV2A's tests
 
