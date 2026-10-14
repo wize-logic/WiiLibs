@@ -1159,6 +1159,41 @@ void wl_xb_thread_stall_check(void) {
     wl_platform_mutex_unlock(g_m);
 }
 
+extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
+
+// Each live guest thread's stack scanned for return addresses (words inside the image's code), the
+// innermost first: where the threads are when the title stops showing frames. The holder's stack
+// pointer is the live one. Only pages with a frame are read (a fault here, on the service thread,
+// must not happen).
+void wl_xb_thread_log_guest_stacks(void) {
+    wl_platform_mutex_lock(g_m);
+    WlXbThread *owner = g_owner;
+    for (WlXbThread *t = g_all; t != NULL; t = t->next_all) {
+        if (t->terminated || t->is_service) {
+            continue;
+        }
+        uint32_t esp = t == owner ? g_esp : t->cpu.g_esp;
+        char line[200];
+        size_t used = 0;
+        unsigned found = 0;
+        line[0] = '\0';
+        for (uint32_t i = 0; i < 256u && found < 14u && used + 12u < sizeof line; i++) {
+            uint32_t va = esp + i * 4u;
+            if (!wl_xb_mem_resident(va)) {
+                break;
+            }
+            uint32_t w = wl_xb_rd32(va);
+            if (w >= g_xbox_code_lo && w < g_xbox_code_hi) {
+                used += (size_t)snprintf(line + used, sizeof line - used, " %x", (unsigned)w);
+                found++;
+            }
+        }
+        WL_LOG_W(TAG, "freeze: %u %s%s esp %08x:%s", (unsigned)t->id, t->name, t == owner ? " (holds the lock)" : "",
+                 (unsigned)esp, found != 0 ? line : " no code addresses");
+    }
+    wl_platform_mutex_unlock(g_m);
+}
+
 void wl_xb_thread_log_stacks(void) {
     char line[200];
     size_t used = 0;

@@ -8,6 +8,8 @@
 #include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
 
+#include "wl/platform/profile.h"
+#include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/thread.h"
@@ -371,6 +373,46 @@ static void census_service(void *user, WlMemCensusReport *out) {
     }
 }
 
+// The freeze watch: a title that shows no new frame for 30 s while it runs logs where its threads
+// are and, on the Wii, profiles itself for 10 s into the log (tools/wl_profile.py reads it). Nothing
+// runs until then, so it cannot move the timing of what it watches. Once per freeze.
+static void freeze_check(void) {
+    static uint32_t last_flips, quiet;
+    static bool reported;
+    static WlProfileRing ring;
+    static uint32_t *storage;
+    if (storage != NULL && wl_profile_running() && ++quiet > 4u) {
+        wl_profile_stop();
+        WlProfileDumpInfo info = {500u, 0u, 0u, "a frozen title"};
+        wl_profile_dump_log(&ring, &info);
+        free(storage);
+        storage = NULL;
+        return;
+    }
+    uint32_t flips = wl_xb_gpu_flips();
+    if (flips != last_flips || flips == 0) {
+        last_flips = flips;
+        quiet = 0;
+        reported = false;
+        return;
+    }
+    if (reported || ++quiet < 3u) {
+        return;
+    }
+    reported = true;
+    WL_LOG_W(TAG, "freeze: no new frame for %u s (flip %u)", (unsigned)(quiet * 10u), (unsigned)flips);
+    wl_xb_thread_log_guest_stacks();
+    enum { WORDS = 16u * 5000u }; // 10 s at 500 Hz, 12 callers
+    storage = malloc(WORDS * sizeof(uint32_t));
+    if (storage != NULL && wl_profile_ring_init(&ring, storage, WORDS, 12u, WL_PROFILE_STOP_WHEN_FULL) == WL_OK &&
+        wl_profile_start(&ring, 500u) == WL_OK) {
+        WL_LOG_W(TAG, "freeze: profiling 10 s");
+    } else {
+        free(storage);
+        storage = NULL;
+    }
+}
+
 // Every 10 s: the guest's memory (pages committed, frames behind them) and the host's free memory,
 // the numbers a title's memory knobs (WlXbTitleConfig) are set from.
 static void status_report(void) {
@@ -396,6 +438,7 @@ static void status_report(void) {
     static uint32_t reports;
     (void)wl_xb_thread_reap();
     wl_xb_thread_stall_check();
+    freeze_check();
     wl_mem_census_log(TAG, reports++ % 6u != 0u);
     if (reports % 6u == 1u) {
         wl_xb_thread_log_stacks();

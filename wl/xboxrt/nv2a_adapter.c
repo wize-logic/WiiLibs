@@ -50,6 +50,15 @@ void wl_xb_gpu_capture(const char *path, uint32_t frames, uint32_t after_vblanks
     g_cap.armed = g_cap.path[0] != '\0';
 }
 
+uint32_t wl_xb_gpu_flips(void) {
+    if (g_gpu == NULL) {
+        return 0;
+    }
+    WlNv2aStats st;
+    wl_nv2a_stats(g_gpu, &st);
+    return st.flips;
+}
+
 bool wl_xb_gpu_capture_busy(void) {
     return g_cap.armed || g_cap.file != NULL;
 }

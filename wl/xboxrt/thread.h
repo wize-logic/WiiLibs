@@ -253,6 +253,8 @@ void wl_xb_thread_stats(WlXbThreadStats *out);
 // The service thread's status, every 10 s: after 20 s with no scheduling at all, the lock's holder
 // and every thread's state are logged (once a minute while the stall lasts).
 void wl_xb_thread_stall_check(void);
+// Each guest thread's stack scanned for return addresses into the image, for a frozen title.
+void wl_xb_thread_log_guest_stacks(void);
 
 // The host memory the threads hold (registered with the census, mem_census.h, as "threads"): their
 // records and host stacks; `deepest` is the most any host stack has been used, of `deepest_of`.

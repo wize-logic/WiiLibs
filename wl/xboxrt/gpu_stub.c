@@ -182,6 +182,10 @@ bool wl_xb_gpu_capture_busy(void) {
     return false;
 }
 
+uint32_t wl_xb_gpu_flips(void) {
+    return 0;
+}
+
 void wl_xb_gpu_set_program_list(const char *path) {
     (void)path;
 }
