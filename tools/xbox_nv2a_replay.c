@@ -7,7 +7,7 @@
 // the host's software GX (wl/gxsoft) as a PNG.
 //
 // usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N]
-//                          [--psh-dump N] [--programs FILE]
+//                          [--psh-dump N] [--programs FILE] [--stream]
 //   -v          a line for each clear, draw, frame and flip (with --png-gx, what each GX primitive
 //               covered and wrote); -vv also each draw's raster state
 //   --png-gx    DIR/frame_NNNN.png for each frame GX shows (the display copy of the EFB)
@@ -31,6 +31,10 @@
 //   --bench N   the capture replayed N times through the GX backend alone (no software GX, no
 //               recorder): the processor's part of the frames, timed (the best run and the mean,
 //               a frame), for measuring the vertex path and the translation
+//   --stream    the replay through wl_nv2a_replay_stream, as the runtime's capture bench makes it
+//               (wl/xboxrt/bench.h): the capture read a piece at a time (of an odd size, so records
+//               straddle the pieces), into a guest memory given as the caller's, written a 4 KB
+//               piece at a time where it differs; the output is the same as without
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +62,7 @@ typedef struct Tee {
 
 static FILE *g_programs;
 static unsigned g_bench;
+static bool g_stream;
 
 // a title's vertex programs compiled ahead of time, when a build of this tool links them (the C
 // wl_add_xbox_title generates, vsh_natives.c; weak: WiiLibs' own build has none): the GX backend
@@ -438,6 +443,59 @@ static void on_created(void *user, WlNv2a *dev) {
     }
 }
 
+// --stream: the capture's bytes a piece at a time, and a guest memory of the tool's own given as
+// the caller's
+static struct {
+    const uint8_t *data;
+    size_t size, at;
+    uint8_t *ram;
+    uint32_t ram_bytes;
+} g_src;
+
+static WlResult stream_read(void *user, void *dst, uint32_t bytes, uint32_t *got) {
+    size_t n = g_src.size - g_src.at;
+
+    (void)user;
+    n = n < bytes ? n : bytes;
+    n = n < 65521u ? n : 65521u;
+    memcpy(dst, g_src.data + g_src.at, n);
+    g_src.at += n;
+    *got = (uint32_t)n;
+    return WL_OK;
+}
+
+static void *stream_phys(void *user, uint32_t phys, uint32_t bytes) {
+    (void)user;
+    if (phys >= g_src.ram_bytes || bytes > g_src.ram_bytes - phys) {
+        return NULL;
+    }
+    return g_src.ram + phys;
+}
+
+static WlResult replay(const uint8_t *data, size_t size, const WlNv2aBackend *backend, const WlNv2aReplayHooks *hooks,
+                       WlNv2aReplayInfo *info) {
+    WlNv2aReplaySource source = {NULL, stream_read};
+    WlNv2aReplayMemory memory = {NULL, stream_phys, 0};
+    WlResult result;
+
+    if (!g_stream) {
+        return wl_nv2a_replay(data, size, backend, hooks, info);
+    }
+    g_src.data = data;
+    g_src.size = size;
+    g_src.at = 0;
+    g_src.ram_bytes = size >= 16 ? wl_rd_le32(data + 12) : 0u; // (the header's RAM size)
+    g_src.ram = calloc(1, g_src.ram_bytes != 0 ? g_src.ram_bytes : 1u);
+    if (g_src.ram == NULL) {
+        return WL_ERR_NOMEM;
+    }
+    memory.ram_bytes = g_src.ram_bytes;
+    result = wl_nv2a_replay_stream(&source, &memory, backend, hooks, info);
+    free(g_src.ram);
+    g_src.ram = NULL;
+    return result;
+}
+
 // --bench: the replay through the GX backend alone, `runs` times (its textures kept from one run to
 // the next, as a title's are from one frame to the next)
 static double seconds_now(void) {
@@ -464,7 +522,7 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
     for (run = 0; run < runs; run++) {
         double start = seconds_now(), took;
 
-        if (wl_nv2a_replay(data, size, &backend, &hooks, &info) != WL_OK) {
+        if (replay(data, size, &backend, &hooks, &info) != WL_OK) {
             fprintf(stderr, "the replay failed\n");
             return 1;
         }
@@ -482,7 +540,7 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
 
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
-                    "[--psh-dump N] [--programs FILE] [--textures-mb N] [--watch] [--bench N]\n");
+                    "[--psh-dump N] [--programs FILE] [--textures-mb N] [--watch] [--bench N] [--stream]\n");
     return 2;
 }
 
@@ -535,6 +593,8 @@ int main(int argc, char **argv) {
             g_gcfg.textures.arena = arena;
         } else if (strcmp(argv[i], "--watch") == 0) {
             watch = true;
+        } else if (strcmp(argv[i], "--stream") == 0) {
+            g_stream = true;
         } else if (argv[i][0] == '-' || path != NULL) {
             return usage();
         } else {
@@ -597,7 +657,7 @@ int main(int argc, char **argv) {
         g_page_epoch = calloc(g_page_count != 0 ? g_page_count : 1u, sizeof *g_page_epoch);
         hooks.memory = on_memory;
     }
-    result = wl_nv2a_replay(data, (size_t)size, &backend, &hooks, &info);
+    result = replay(data, (size_t)size, &backend, &hooks, &info);
     if (result != WL_OK) {
         fprintf(stderr, "%s: %s\n", path, wl_result_name(result));
         return 1;

@@ -370,6 +370,10 @@ void wl_nv2a_capture_note_flip(WlNv2a *dev) {
 
 // ---- replay -----------------------------------------------------------------------------------
 
+// a source's pieces are read this many bytes at a time (more for a record that needs more at once,
+// the snapshot); a memory record goes into a caller's memory a guest page at a time
+enum { STREAM_CHUNK = 256u * 1024u, PIECE = 4096u };
+
 typedef struct ReplayMemory {
     uint8_t *bytes;
     uint32_t size;
@@ -384,38 +388,147 @@ static void *replay_phys(void *user, uint32_t phys, uint32_t bytes) {
     return memory->bytes + phys;
 }
 
-WlResult wl_nv2a_replay(const uint8_t *data, size_t bytes, const WlNv2aBackend *backend,
-                        const WlNv2aReplayHooks *hooks, WlNv2aReplayInfo *info) {
+// the capture's bytes: all of them in memory, or a source's through a buffer
+typedef struct Reader {
+    const uint8_t *data;
+    size_t size, at;
+    const WlNv2aReplaySource *source;
+    uint8_t *buffer;
+    uint32_t capacity, start, end;
+    WlResult error; // the source's, or WL_ERR_NOMEM for the buffer
+} Reader;
+
+// The next `n` bytes, contiguous (valid until the next call), or NULL when the capture ends first
+// or the source fails (r->error).
+static const uint8_t *take(Reader *r, uint32_t n) {
+    const uint8_t *p;
+
+    if (r->source == NULL) {
+        if (r->size - r->at < n) {
+            r->at = r->size;
+            return NULL;
+        }
+        p = r->data + r->at;
+        r->at += n;
+        return p;
+    }
+    if (r->end - r->start < n) {
+        if (r->start != 0) {
+            memmove(r->buffer, r->buffer + r->start, r->end - r->start);
+            r->end -= r->start;
+            r->start = 0;
+        }
+        if (n > r->capacity) {
+            uint32_t capacity = n > STREAM_CHUNK ? n : STREAM_CHUNK;
+            uint8_t *grown = realloc(r->buffer, capacity);
+
+            if (grown == NULL) {
+                r->error = WL_ERR_NOMEM;
+                return NULL;
+            }
+            r->buffer = grown;
+            r->capacity = capacity;
+        }
+        while (r->end < n) {
+            uint32_t got = 0;
+            WlResult result = r->source->read(r->source->user, r->buffer + r->end, r->capacity - r->end, &got);
+
+            if (result != WL_OK) {
+                r->error = result;
+                return NULL;
+            }
+            if (got == 0) {
+                break;
+            }
+            r->end += got;
+        }
+        if (r->end < n) {
+            r->start = r->end;
+            return NULL;
+        }
+    }
+    p = r->buffer + r->start;
+    r->start += n;
+    return p;
+}
+
+// A memory record's piece into a caller's memory, 4 KB of guest memory at a time, each written only
+// when it differs; the span of what differed widened (offsets in the record; `last` one past).
+static WlResult put_theirs(const WlNv2aReplayMemory *theirs, uint32_t phys, const uint8_t *src, uint32_t n,
+                           uint32_t offset, bool span, uint32_t *first, uint32_t *last, WlNv2aReplayInfo *info) {
+    while (n != 0) {
+        uint32_t piece = PIECE - (phys & (PIECE - 1u));
+        uint8_t *dst;
+
+        piece = piece < n ? piece : n;
+        dst = theirs->phys_ptr(theirs->user, phys, piece);
+        if (dst == NULL) {
+            return WL_ERR_RANGE;
+        }
+        if (memcmp(dst, src, piece) != 0) {
+            if (span) {
+                uint32_t f = 0, l = piece;
+
+                while (dst[f] == src[f]) {
+                    f++;
+                }
+                while (dst[l - 1u] == src[l - 1u]) {
+                    l--;
+                }
+                if (*last == 0) {
+                    *first = offset + f;
+                }
+                *last = offset + l;
+            }
+            memcpy(dst, src, piece);
+            info->changed_bytes += piece;
+        }
+        phys += piece;
+        src += piece;
+        offset += piece;
+        n -= piece;
+    }
+    return WL_OK;
+}
+
+static WlResult replay(Reader *r, const WlNv2aReplayMemory *theirs, const WlNv2aBackend *backend,
+                       const WlNv2aReplayHooks *hooks, WlNv2aReplayInfo *info) {
     ReplayMemory memory;
     WlNv2aConfig cfg;
     WlNv2a *dev = NULL;
-    WlNv2aReplayInfo local;
-    size_t at;
+    const uint8_t *p;
     WlResult result = WL_OK;
     bool ended = false;
+    uint64_t (*clock)(void *) = hooks != NULL ? hooks->clock : NULL;
 
-    if (info == NULL) {
-        info = &local;
+    p = take(r, 16);
+    if (p == NULL || memcmp(p, capture_magic, 8) != 0) {
+        return r->error != WL_OK ? r->error : WL_ERR_FORMAT;
     }
-    memset(info, 0, sizeof *info);
-    if (data == NULL || bytes < 16 || memcmp(data, capture_magic, 8) != 0) {
-        return WL_ERR_FORMAT;
-    }
-    if (wl_rd_le32(data + 8) != CAPTURE_VERSION) {
+    if (wl_rd_le32(p + 8) != CAPTURE_VERSION) {
         return WL_ERR_VERSION;
     }
-    memory.size = wl_rd_le32(data + 12);
+    memory.size = wl_rd_le32(p + 12);
     info->ram_bytes = memory.size;
     if (memory.size == 0 || (memory.size & (memory.size - 1u)) != 0) {
         return WL_ERR_FORMAT;
     }
-    memory.bytes = calloc(1, memory.size);
-    if (memory.bytes == NULL) {
-        return WL_ERR_NOMEM;
-    }
     memset(&cfg, 0, sizeof cfg);
-    cfg.phys_ptr = replay_phys;
-    cfg.user = &memory;
+    if (theirs != NULL) {
+        if (memory.size > theirs->ram_bytes) {
+            return WL_ERR_RANGE;
+        }
+        memory.bytes = NULL;
+        cfg.phys_ptr = theirs->phys_ptr;
+        cfg.user = theirs->user;
+    } else {
+        memory.bytes = calloc(1, memory.size);
+        if (memory.bytes == NULL) {
+            return WL_ERR_NOMEM;
+        }
+        cfg.phys_ptr = replay_phys;
+        cfg.user = &memory;
+    }
     cfg.backend = backend;
     cfg.ram_bytes = memory.size;
     dev = wl_nv2a_create(&cfg);
@@ -426,48 +539,44 @@ WlResult wl_nv2a_replay(const uint8_t *data, size_t bytes, const WlNv2aBackend *
     if (hooks != NULL && hooks->created != NULL) {
         hooks->created(hooks->user, dev);
     }
-    at = 16;
-    while (at < bytes && !ended && result == WL_OK) {
-        char tag = (char)data[at++];
+    while (!ended && result == WL_OK && (p = take(r, 1)) != NULL) {
+        char tag = (char)p[0];
 
         switch (tag) {
         case 'S': {
             Walker w;
             uint32_t size;
 
-            if (at + 4 > bytes) {
+            if ((p = take(r, 4)) == NULL) {
                 result = WL_ERR_FORMAT;
                 break;
             }
-            size = wl_rd_le32(data + at);
-            at += 4;
-            if (size > bytes - at) {
+            size = wl_rd_le32(p);
+            if ((p = take(r, size)) == NULL) {
                 result = WL_ERR_FORMAT;
                 break;
             }
             memset(&w, 0, sizeof w);
             w.reading = true;
-            w.data = (uint8_t *)(uintptr_t)(data + at);
+            w.data = (uint8_t *)(uintptr_t)p;
             w.size = size;
             walk_state(dev, &w);
             if (w.failed) {
                 result = WL_ERR_FORMAT;
             }
-            at += size;
             break;
         }
         case 'W': {
             uint32_t offset, value;
             unsigned size;
 
-            if (at + 9 > bytes) {
+            if ((p = take(r, 9)) == NULL) {
                 result = WL_ERR_FORMAT;
                 break;
             }
-            offset = wl_rd_le32(data + at);
-            value = wl_rd_le32(data + at + 4);
-            size = data[at + 8];
-            at += 9;
+            offset = wl_rd_le32(p);
+            value = wl_rd_le32(p + 4);
+            size = p[8];
             if (hooks != NULL && hooks->mmio != NULL) {
                 hooks->mmio(hooks->user, offset, value, size);
             }
@@ -480,36 +589,64 @@ WlResult wl_nv2a_replay(const uint8_t *data, size_t bytes, const WlNv2aBackend *
             info->vblanks++;
             break;
         case 'M': {
-            uint32_t phys, size;
+            uint32_t phys, size, done = 0, first = 0, last = 0;
+            bool span = hooks != NULL && hooks->memory != NULL;
 
-            if (at + 8 > bytes) {
+            if ((p = take(r, 8)) == NULL) {
                 result = WL_ERR_FORMAT;
                 break;
             }
-            phys = wl_rd_le32(data + at);
-            size = wl_rd_le32(data + at + 4);
-            at += 8;
-            if (size > bytes - at || phys >= memory.size || size > memory.size - phys) {
+            phys = wl_rd_le32(p);
+            size = wl_rd_le32(p + 4);
+            if (phys >= memory.size || size > memory.size - phys) {
                 result = WL_ERR_FORMAT;
                 break;
             }
-            if (hooks != NULL && hooks->memory != NULL) {
-                uint32_t first = 0, last = size;
+            // (all of it at once from memory; a source's a buffer at a time)
+            while (done < size && result == WL_OK) {
+                uint32_t n = r->source == NULL || size - done < STREAM_CHUNK ? size - done : STREAM_CHUNK;
+                uint64_t t0 = 0;
 
-                while (first < size && memory.bytes[phys + first] == data[at + first]) {
-                    first++;
+                if ((p = take(r, n)) == NULL) {
+                    result = WL_ERR_FORMAT;
+                    break;
                 }
-                while (last > first && memory.bytes[phys + last - 1u] == data[at + last - 1u]) {
-                    last--;
+                if (clock != NULL) {
+                    t0 = clock(hooks->user);
                 }
-                memcpy(memory.bytes + phys, data + at, size);
-                if (last > first) {
-                    hooks->memory(hooks->user, phys + first, last - first);
+                if (theirs != NULL) {
+                    result = put_theirs(theirs, phys + done, p, n, done, span, &first, &last, info);
+                } else if (span) {
+                    uint8_t *dst = memory.bytes + phys + done;
+                    uint32_t f = 0, l = n;
+
+                    while (f < n && dst[f] == p[f]) {
+                        f++;
+                    }
+                    while (l > f && dst[l - 1u] == p[l - 1u]) {
+                        l--;
+                    }
+                    if (l > f) {
+                        if (last == 0) {
+                            first = done + f;
+                        }
+                        last = done + l;
+                    }
+                    memcpy(dst, p, n);
+                } else {
+                    memcpy(memory.bytes + phys + done, p, n);
                 }
-            } else {
-                memcpy(memory.bytes + phys, data + at, size);
+                if (clock != NULL) {
+                    info->memory_time += clock(hooks->user) - t0;
+                }
+                done += n;
             }
-            at += size;
+            if (result != WL_OK) {
+                break;
+            }
+            if (span && last > first) {
+                hooks->memory(hooks->user, phys + first, last - first);
+            }
             info->blocks++;
             info->block_bytes += size;
             break;
@@ -528,8 +665,50 @@ WlResult wl_nv2a_replay(const uint8_t *data, size_t bytes, const WlNv2aBackend *
             break;
         }
     }
+    if (result == WL_OK && r->error != WL_OK) {
+        result = r->error;
+    }
     wl_nv2a_stats(dev, &info->stats);
     wl_nv2a_destroy(dev);
     free(memory.bytes);
+    return result;
+}
+
+WlResult wl_nv2a_replay(const uint8_t *data, size_t bytes, const WlNv2aBackend *backend,
+                        const WlNv2aReplayHooks *hooks, WlNv2aReplayInfo *info) {
+    WlNv2aReplayInfo local;
+    Reader r;
+
+    if (info == NULL) {
+        info = &local;
+    }
+    memset(info, 0, sizeof *info);
+    if (data == NULL) {
+        return WL_ERR_FORMAT;
+    }
+    memset(&r, 0, sizeof r);
+    r.data = data;
+    r.size = bytes;
+    return replay(&r, NULL, backend, hooks, info);
+}
+
+WlResult wl_nv2a_replay_stream(const WlNv2aReplaySource *source, const WlNv2aReplayMemory *memory,
+                               const WlNv2aBackend *backend, const WlNv2aReplayHooks *hooks,
+                               WlNv2aReplayInfo *info) {
+    WlNv2aReplayInfo local;
+    Reader r;
+    WlResult result;
+
+    if (info == NULL) {
+        info = &local;
+    }
+    memset(info, 0, sizeof *info);
+    if (source == NULL || source->read == NULL || (memory != NULL && memory->phys_ptr == NULL)) {
+        return WL_ERR_ARG;
+    }
+    memset(&r, 0, sizeof r);
+    r.source = source;
+    result = replay(&r, memory, backend, hooks, info);
+    free(r.buffer);
     return result;
 }
