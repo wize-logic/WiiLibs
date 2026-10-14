@@ -30,7 +30,9 @@ static inline double wl_rsqrt_estimate(double x) {
     __asm__("frsqrte %0,%1" : "=f"(estimate) : "f"(x));
     return estimate;
 #else
-    return 1.0 / __builtin_sqrt(x);
+    // (through sqrtl: a title's build wraps sqrt to wl_sqrt_exact, which asks for this estimate, and
+    // without -ffast-math gcc may call sqrt here, which would never end)
+    return 1.0 / (double)__builtin_sqrtl((long double)x);
 #endif
 }
 
