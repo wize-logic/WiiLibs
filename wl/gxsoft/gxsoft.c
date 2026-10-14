@@ -499,7 +499,7 @@ static void plan_make(Plan *plan, WlGxDirectPrim prim, uint32_t count) {
     plan->sy1 = plan->sy1 > (int)EFB_H ? (int)EFB_H : plan->sy1;
     plan->channels = st->layout.colors > 2u ? 2u : st->layout.colors;
     for (n = 0; n < 8; n++) {
-        if (st->layout.texcoords & (1u << n)) {
+        if ((st->layout.texcoords | st->layout.texcoords_generated) & (1u << n)) {
             plan->texgens = n + 1u;
         }
     }
@@ -546,6 +546,15 @@ static void vertex_transform(const Plan *plan, const WlGxDirectVertex *v, float 
     float x = v->position[0], y = v->position[1], z = v->position[2];
     unsigned c, n;
 
+    // (the transform unit's position matrix, when set)
+    if (plan->st->position_matrix_set) {
+        const float (*m)[4] = plan->st->position_matrix;
+
+        x = m[0][0] * v->position[0] + m[0][1] * v->position[1] + m[0][2] * v->position[2] + m[0][3];
+        y = m[1][0] * v->position[0] + m[1][1] * v->position[1] + m[1][2] * v->position[2] + m[1][3];
+        z = m[2][0] * v->position[0] + m[2][1] * v->position[1] + m[2][2] * v->position[2] + m[2][3];
+    }
+
     if (plan->orthographic) {
         a[A_CLIP + 0] = p[0] * x + p[1];
         a[A_CLIP + 1] = p[2] * y + p[3];
@@ -566,6 +575,19 @@ static void vertex_transform(const Plan *plan, const WlGxDirectVertex *v, float 
 
         if (n >= plan->texgens) {
             t[0] = t[1] = 0.0f;
+        } else if (plan->st->texgen[n].set) {
+            // (a generator's matrix: from the vertex's coordinate n, (s, t, 1, 1), or its position as
+            // sent, (x, y, z, 1))
+            const float (*m)[4] = plan->st->texgen[n].m;
+            float in[4];
+
+            if (plan->st->texgen[n].source == WL_GX_DIRECT_TG_POSITION) {
+                in[0] = v->position[0], in[1] = v->position[1], in[2] = v->position[2], in[3] = 1.0f;
+            } else {
+                in[0] = v->texcoord[n][0], in[1] = v->texcoord[n][1], in[2] = 1.0f, in[3] = 1.0f;
+            }
+            t[0] = m[0][0] * in[0] + m[0][1] * in[1] + m[0][2] * in[2] + m[0][3] * in[3];
+            t[1] = m[1][0] * in[0] + m[1][1] * in[1] + m[1][2] * in[2] + m[1][3] * in[3];
         } else if (plan->st->layout.texcoords & (1u << n)) {
             t[0] = v->texcoord[n][0];
             t[1] = (plan->st->layout.texcoord_s & (1u << n)) ? 0.0f : v->texcoord[n][1];

@@ -199,7 +199,16 @@ even, so its winding holds).
   each uses the transform's fit, the same numbers, and a pass over the same geometry with an EQUAL
   or LEQUAL test passes as on the NV2A whatever was drawn between (`wl_nv2a_gx_last_projection`
   says which; the far plane moved so nothing is clipped there); indexed draws reuse the vertices
-  run. The combiners through psh's cache (with a title's `WlXboxPshRecipe`), the fog psh's ramp, a
+  run. A program whose position is, for the draw's constants, an affine function of v0 (an F3
+  array) leaves the position to GX's transform unit: the vertex sent as fetched, the matrix (the
+  viewport and samples folded in, so the eye vector is the processor's, for the same projection)
+  from the program run for eight probe vertices once a draw; the probes give a linear transform's
+  columns exactly, so two programs over the same geometry get the same matrix and their passes the
+  same depths. When every other output the draw reads is affine too (a colour passed from an input
+  or constant, a texture coordinate from one input of two components or from the position, no fog,
+  no sphere map, a projected stage's q 1), the program is not run at all: the coordinates come from
+  the transform unit's generators. Not to the bit (`no_xf` in `WlNv2aGxConfig` keeps every vertex on
+  the processor; the runtime's `noxf` file). The combiners through psh's cache (with a title's `WlXboxPshRecipe`), the fog psh's ramp, a
   program beyond GX texture 0 times colour. Blending, depth, alpha test and colour masks on GX
   (constant colours, MIN/MAX and src - dst approximated and counted); culling by the NV2A's rule on
   the screen winding (`wl_nv2a_cull`: SET_FRONT_FACE's CW is clockwise as the screen shows it, so
@@ -288,6 +297,10 @@ vertex programs, the fetch, the translation, what the Wii's processor does for a
 run's parts: the model's own (pusher, puller, state tracker), the backend's draws, its clears and
 frames, the memory records put in. The same on the console: wl/xboxrt's capture bench
 (`replay:<file> <runs>` in a title's `play.cfg`).
+
+`--cpu-transform` keeps every vertex on the processor (the transform unit not used), for comparing:
+`tools/png_compare.py A B --threshold N --diff D` counts each frame's pixels that differ, and beyond
+a threshold, between two folders of frames.
 
 `--stream` replays through `wl_nv2a_replay_stream`, the capture read in odd-sized pieces into a guest
 memory given as the caller's; the output is the same (the test `xbox_nv2a_replay_stream`).

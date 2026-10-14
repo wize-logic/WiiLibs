@@ -28,6 +28,8 @@
 //   --watch     the converted textures checked through a write watch, as the runtime's MMU gives
 //               it on the Wii: a page counts as stored to when one of the capture's memory blocks
 //               lands in it (the blocks are what the title wrote, as the capture read it)
+//   --cpu-transform  every vertex through the program on the processor (GX's transform unit not
+//               used for the draws whose outputs are affine), to the bit as before it
 //   --bench N   the capture replayed N times through the GX backend alone (no software GX, no
 //               recorder): the processor's part of the frames, timed (the best run and the mean,
 //               a frame), and the best run's parts: the model's (pusher, puller, 3D state), the
@@ -591,6 +593,13 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
     printf("bench: %u runs of %u frames (%u draws, %u vertices): best %.3f ms a frame, mean %.3f ms a frame\n",
            runs, frames, (unsigned)info.stats.draws, (unsigned)info.stats.vertices, best * 1000.0 / frames,
            total * 1000.0 / runs / frames);
+    {
+        WlNv2aGxStats gs;
+
+        wl_nv2a_gx_stats(g_gx, &gs);
+        printf("bench: %u draws (%u vertices) through GX's transform unit in all runs, %u more for their position "
+               "alone\n", (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws);
+    }
     printf("bench: the best run a frame: pusher %.3f ms, draws %.3f, clears and frames %.3f, memory records %.3f\n",
            (best - best_draws - best_others - best_memory) * 1000.0 / frames, best_draws * 1000.0 / frames,
            best_others * 1000.0 / frames, best_memory * 1000.0 / frames);
@@ -600,7 +609,8 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
 
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
-                    "[--psh-dump N] [--programs FILE] [--textures-mb N] [--watch] [--bench N] [--stream]\n");
+                    "[--psh-dump N] [--programs FILE] [--textures-mb N] [--watch] [--bench N] [--stream] "
+                    "[--cpu-transform]\n");
     return 2;
 }
 
@@ -653,6 +663,8 @@ int main(int argc, char **argv) {
             g_gcfg.textures.arena = arena;
         } else if (strcmp(argv[i], "--watch") == 0) {
             watch = true;
+        } else if (strcmp(argv[i], "--cpu-transform") == 0) {
+            g_gcfg.no_xf = true;
         } else if (strcmp(argv[i], "--stream") == 0) {
             g_stream = true;
         } else if (argv[i][0] == '-' || path != NULL) {
@@ -762,6 +774,8 @@ int main(int argc, char **argv) {
                (unsigned)gs.target_draws,
                (unsigned)gs.target_skipped, (unsigned)gs.stencil_skipped, (unsigned)gs.programs_unusable,
                (unsigned)gs.approximations, (unsigned)gs.clears, (unsigned)gs.quad_clears, (unsigned)gs.frames);
+        printf("            %u draws (%u vertices) through GX's transform unit, %u more for their position alone\n",
+               (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws);
         printf("software GX: %u primitives, %u triangles (%u culled, %u clipped), %u pixels, %u written, %u copies, "
                "%u restores, %u clears, %u frames, %u textures decoded\n",
                (unsigned)ss.draws, (unsigned)ss.triangles, (unsigned)ss.culled, (unsigned)ss.clipped,

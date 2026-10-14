@@ -255,6 +255,12 @@ WlNv2aGx *wl_xb_gpu_nv2a_gx(void) {
     return g_gx;
 }
 
+static bool g_no_xf;
+
+void wl_xb_gpu_set_transform_unit(bool on) {
+    g_no_xf = !on;
+}
+
 WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
     // the draws go to GX (over libogc on the Wii, the host's recorder elsewhere)
     if (!wl_gx_ready() && wl_gx_init() != WL_OK) {
@@ -281,6 +287,10 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
             WL_LOG_I(TAG, "%lu vertex programs compiled ahead of time", gcfg.native_count);
         }
         gcfg.program_decoded = program_decoded;
+        gcfg.no_xf = g_no_xf;
+        if (g_no_xf) {
+            WL_LOG_I(TAG, "GX's transform unit not used: every vertex through the program on the processor");
+        }
         g_gx = wl_nv2a_gx_create(&gcfg);
         WL_LOG_I(TAG, "textures: %u KB %s; checked through the write watch where the guest is paged",
                  (unsigned)(bytes >> 10), texture_arena != NULL ? "in an arena of their own" : "of the heap");

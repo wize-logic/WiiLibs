@@ -62,7 +62,16 @@ typedef struct WlGxDirectLayout {
     uint8_t colors;     // 0, 1 or 2: COLOR0A0, COLOR1A1 (the vertex's colours, unlit)
     uint8_t texcoords;  // bit n: texture coordinate n is sent (GX_VA_TEXn -> GX_TEXCOORDn, identity)
     uint8_t texcoord_s; // of them, those of one component (s); the others two (s, t)
+    // bit n: texture coordinate n is not sent but made by the transform unit from the position
+    // (wl_gx_direct_texgen with WL_GX_DIRECT_TG_POSITION)
+    uint8_t texcoords_generated;
 } WlGxDirectLayout;
+
+// what a texture coordinate is generated from (wl_gx_direct_texgen)
+typedef enum {
+    WL_GX_DIRECT_TG_TEXCOORD = 0, // the vertex's own coordinate n, as (s, t, 1, 1)
+    WL_GX_DIRECT_TG_POSITION      // its position as sent (before the position matrix), (x, y, z, 1)
+} WlGxDirectTexSource;
 
 // Starts direct drawing: wl_gx's shadow and this layer's are marked unknown, the position matrix 0
 // is the identity, no indirect stages, and the next draw is flushed first.
@@ -84,6 +93,13 @@ void wl_gx_direct_flush_after(void);
 // Whether the flush is sent (on by default).
 void wl_gx_direct_set_xf_flush(bool on);
 
+// The transform unit's position matrix for the draws that follow (row-major 3x4: (x', y', z') =
+// m (x, y, z, 1), before the projection), NULL the identity (as wl_gx_direct_begin leaves it).
+void wl_gx_direct_position_matrix(const float m[3][4]);
+// Texture coordinate n (0..7) made by the transform unit: (s, t) = m (the source's four numbers), m
+// row-major 2x4; NULL: the identity from the vertex's coordinate n (as the layout makes it). Set it
+// after the layout, which puts every coordinate back to the identity when it changes.
+void wl_gx_direct_texgen(unsigned n, WlGxDirectTexSource source, const float m[2][4]);
 // The projection, a 4x4 row-major matrix (libogc's Mtx44), orthographic or perspective.
 void wl_gx_direct_projection(const float m[4][4], bool orthographic);
 // The viewport (depth 0..1) and scissor, in EFB pixels.

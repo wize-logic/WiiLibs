@@ -184,4 +184,8 @@ bool wl_xb_gpu_capture_busy(void) {
 void wl_xb_gpu_set_program_list(const char *path) {
     (void)path;
 }
+
+void wl_xb_gpu_set_transform_unit(bool on) {
+    (void)on;
+}
 #endif

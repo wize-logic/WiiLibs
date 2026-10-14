@@ -29,11 +29,13 @@ picture as it would on the console, and the draw is flagged (`WlGxSoftDraw.issue
 the validator refuses, a colour channel or texture coordinate a stage reads that the layout does not
 send, an empty texture map, a TLUT not loaded).
 
-- **Transform.** The position through the identity and the projection as GX keeps it: six numbers
-  of the matrix (`GX_LoadProjectionMtx`), orthographic (w 1) or perspective (w = -z); clipped where
-  z' leaves [-w, 0] (GX's near and far planes) or w reaches 0; the viewport with depth 1 + z'/w.
+- **Transform.** The position through the position matrix (the identity unless
+  `wl_gx_direct_position_matrix` set one) and the projection as GX keeps it: six numbers of the
+  matrix (`GX_LoadProjectionMtx`), orthographic (w 1) or perspective (w = -z); clipped where z'
+  leaves [-w, 0] (GX's near and far planes) or w reaches 0; the viewport with depth 1 + z'/w.
   Texture coordinates through identity generators (one the layout does not send from the position,
-  as the Wii backend makes it); colours unlit from the vertex.
+  as the Wii backend makes it), or a 2x4 matrix's (`wl_gx_direct_texgen`) from the vertex's
+  coordinate (s, t, 1, 1) or its position as sent; colours unlit from the vertex.
 - **Rasterizing.** Triangles, strips, fans, quads; lines and points a pixel wide. Culling by the
   winding on the screen: clockwise (y down) is GX's front face, so `GX_CULL_FRONT` discards it, as
   Dolphin measures it. Pixels sampled at 7/12 of a pixel (Dolphin's centre), the top-left rule,

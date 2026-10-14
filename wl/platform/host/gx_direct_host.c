@@ -34,8 +34,14 @@ void wl_host_gx_direct_hook(void (*hook)(void *user, WlGxDirectPrim prim, const 
 }
 
 void wl_gx_direct_begin(void) {
+    unsigned n;
+
     wl_gx_invalidate_shadow();
     s.begins++;
+    s.position_matrix_set = false;
+    for (n = 0; n < 8; n++) {
+        s.texgen[n].set = false;
+    }
     g_flush_due = true;
     g_layout_known = false;
 }
@@ -49,10 +55,15 @@ void wl_gx_direct_set_xf_flush(bool on) {
 }
 
 void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
+    unsigned n;
+
     if (g_layout_known && memcmp(&s.layout, layout, sizeof s.layout) == 0) {
         return;
     }
     s.layout = *layout;
+    for (n = 0; n < 8; n++) {
+        s.texgen[n].set = false;
+    }
     g_layout_known = true;
     s.stats.layouts++;
 }
@@ -155,6 +166,24 @@ void wl_gx_direct_draw(WlGxDirectPrim prim, const WlGxDirectVertex *vertices, ui
         wl_gx_direct_vertex(&vertices[i]);
     }
     wl_gx_direct_primitive_end();
+}
+
+void wl_gx_direct_position_matrix(const float m[3][4]) {
+    s.position_matrix_set = m != NULL;
+    if (m != NULL) {
+        memcpy(s.position_matrix, m, sizeof s.position_matrix);
+    }
+}
+
+void wl_gx_direct_texgen(unsigned n, WlGxDirectTexSource source, const float m[2][4]) {
+    if (n >= 8) {
+        return;
+    }
+    s.texgen[n].set = m != NULL;
+    s.texgen[n].source = (uint8_t)source;
+    if (m != NULL) {
+        memcpy(s.texgen[n].m, m, sizeof s.texgen[n].m);
+    }
 }
 
 void wl_gx_direct_projection(const float m[4][4], bool orthographic) {
