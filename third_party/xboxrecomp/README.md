@@ -20,7 +20,7 @@ never to these files. `tools/xboxrecomp_sync.py status` checks both.
 | `tools/abi_analysis/` | calling conventions, frames | `tools/xbox_recomp.py` |
 | `tools/recomp/` (with `data/`) | the lifter: x86 to C, chunks, dispatch table | `tools/xbox_recomp.py`, the conformance net |
 | `tools/conformance/` (not `msvc-wine/`) | the conformance cases (x86 snippets with inputs) and harness; `mkxbe.py` writes a synthetic XBE | `tests/xbox_recomp/` |
-| `tools/kernel_audit/` | kernel import coverage, per-XDK ordinal remap | reference for the kernel (`wl/xboxkrnl`, planned) |
+| `tools/kernel_audit/` | kernel import coverage, per-XDK ordinal remap | reference for the kernel (`wl/xboxkrnl`'s export table and argument sizes derive from it) |
 | `tools/xiso/` | XDVDFS disc image reader (`python3 -m tools.xiso`) | extracting a title's files |
 | `tools/debug_symbols/` | function names from a debug build's assert strings | naming |
 | `tools/seed_from_log/` | runtime-discovered entry points fed back as seeds | bring-up |
