@@ -34,6 +34,7 @@ void wl_nv2a_texcache_init(WlNv2aTexCache *cache, const WlNv2aTexCacheConfig *cf
     }
     if (cache->cfg.arena != NULL && cache->cfg.arena_bytes >= 4096u) {
         wl_heap_init(&cache->heap, cache->cfg.arena, cache->cfg.arena_bytes, "textures");
+        cache->heap.best_fit = true; // (a small image does not cut into the gap a large one needs)
         if (cache->cfg.budget == 0 || cache->cfg.budget > cache->heap.size) {
             cache->cfg.budget = cache->heap.size;
         }
@@ -155,6 +156,22 @@ void wl_nv2a_texcache_frame_done(WlNv2aTexCache *cache) {
 
 void wl_nv2a_texcache_stats(const WlNv2aTexCache *cache, WlNv2aTexCacheStats *out) {
     *out = cache->stats;
+}
+
+void wl_nv2a_texcache_memory(const WlNv2aTexCache *cache, WlNv2aTexCacheMemory *out) {
+    unsigned i;
+
+    memset(out, 0, sizeof *out);
+    out->images = cache->stats.bytes;
+    out->scratch = cache->scratch_bytes;
+    if (cache->cfg.arena != NULL) {
+        out->arena = cache->heap.size;
+        out->arena_used = cache->heap.used;
+        out->arena_largest = wl_heap_largest_free(&cache->heap);
+        for (i = 0; i < cache->pending_count; i++) {
+            out->pending += wl_heap_usable_size(&cache->heap, cache->pending[i]);
+        }
+    }
 }
 
 // ---- the check ----------------------------------------------------------------------------------
@@ -317,8 +334,14 @@ static WlNv2aTexEntry *victim(WlNv2aTexCache *cache) {
 }
 
 // room for `bytes` more: the least recently drawn go (in an arena only those not drawn in this
-// frame: an image drawn in it is only given back at its end, so evicting it makes no room now)
+// frame: an image drawn in it is only given back at its end, so evicting it makes no room now). An
+// arena whose budget is its size needs none of this: its heap says when there is no room, and
+// image_for then empties the window that makes it (evicting by age here would throw away images
+// wherever they lie first).
 static void make_room(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTexEntry *keep) {
+    if (cache->cfg.arena != NULL && cache->cfg.budget >= cache->heap.size) {
+        return;
+    }
     while (cache->stats.bytes + bytes > cache->cfg.budget) {
         WlNv2aTexEntry *e = oldest(cache, keep, cache->cfg.arena != NULL);
 
@@ -328,12 +351,159 @@ static void make_room(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTexEntry 
     }
 }
 
-// An image of `bytes`: when the memory has no room, the least recently drawn of the entries not
-// drawn in this frame give theirs back until it has (an image drawn in this frame is only given
-// back at its end). NULL when even that does not make room.
+// ---- room in the arena --------------------------------------------------------------------------
+//
+// The arena's free memory is in pieces between the images kept, and a large image may find no piece
+// its size while the pieces add up to far more. Evicting the least recently drawn until it fits
+// throws away textures wherever they lie, most of them nowhere near a gap they would widen, and
+// often all of them without making the room. Instead the arena's blocks are looked at in address
+// order: a run of blocks that may go (the images not drawn in this frame) with the free pieces
+// around them is a window, and the window wide enough for the image whose newest image was drawn
+// longest ago (then: with the fewest bytes) is emptied. Blocks that may not go (an image drawn in
+// this frame, one evicted in it and waiting for its end, the one being made) bound the windows.
+
+typedef struct {
+    uint32_t start, end; // the block, header included, as offsets in the arena
+    uint32_t used_frame;
+    uint16_t entry;      // + 1; 0: a block that may not go
+} ArenaBlock;
+
+typedef struct {
+    WlNv2aTexCache *cache;
+    const WlNv2aTexEntry *keep;
+    ArenaBlock *blocks;
+    unsigned count, cap;
+    const uint16_t *by_image; // entries with an image in the arena, by the image's address
+    unsigned images, next;
+} ArenaWalk;
+
+static bool arena_block(void *user, const WlHeapLive *live) {
+    ArenaWalk *w = user;
+    WlNv2aTexCache *cache = w->cache;
+    const uint8_t *base = cache->heap.base;
+    ArenaBlock *b;
+
+    if (w->count == w->cap) {
+        return false;
+    }
+    b = &w->blocks[w->count++];
+    b->start = (uint32_t)((const uint8_t *)live->ptr - base) - WL_HEAP_GRANULE;
+    b->end = (uint32_t)((const uint8_t *)live->ptr - base) + (uint32_t)wl_heap_usable_size(&cache->heap, live->ptr);
+    b->entry = 0;
+    b->used_frame = 0;
+    // (both in address order: the entries' images are met as the walk passes them)
+    while (w->next < w->images && (const uint8_t *)cache->entries[w->by_image[w->next]].image < (const uint8_t *)live->ptr) {
+        w->next++;
+    }
+    if (w->next < w->images && cache->entries[w->by_image[w->next]].image == live->ptr) {
+        const WlNv2aTexEntry *e = &cache->entries[w->by_image[w->next]];
+
+        if (e != w->keep && e->used_frame != cache->frame) {
+            b->entry = (uint16_t)(w->by_image[w->next] + 1u);
+            b->used_frame = e->used_frame;
+        }
+    }
+    return true;
+}
+
+static void sort_images(WlNv2aTexCache *cache, uint16_t *list, unsigned n) {
+    unsigned i, j;
+
+    // (insertion sort: a few hundred entries, met when an image finds no room)
+    for (i = 1; i < n; i++) {
+        uint16_t v = list[i];
+        const uint8_t *image = cache->entries[v].image;
+
+        for (j = i; j > 0 && (const uint8_t *)cache->entries[list[j - 1]].image > image; j--) {
+            list[j] = list[j - 1];
+        }
+        list[j] = v;
+    }
+}
+
+// Empties the best window for an image of `bytes`; false when no window is wide enough.
+static bool arena_make_room(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTexEntry *keep) {
+    ArenaBlock blocks[WL_NV2A_TEXCACHE_ENTRIES + 16];
+    uint16_t by_image[WL_NV2A_TEXCACHE_ENTRIES];
+    ArenaWalk w;
+    size_t need = ((bytes + WL_HEAP_GRANULE - 1u) & ~(size_t)(WL_HEAP_GRANULE - 1u)) + WL_HEAP_GRANULE;
+    unsigned i, j, best_i = 0, best_j = 0, images = 0;
+    bool found = false;
+    uint32_t best_frame = 0;
+    size_t best_bytes = 0;
+
+    if (need > cache->heap.size) {
+        return false;
+    }
+    for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
+        if (cache->entries[i].image != NULL && wl_heap_owns(&cache->heap, cache->entries[i].image)) {
+            by_image[images++] = (uint16_t)i;
+        }
+    }
+    sort_images(cache, by_image, images);
+    memset(&w, 0, sizeof w);
+    w.cache = cache;
+    w.keep = keep;
+    w.blocks = blocks;
+    w.cap = sizeof blocks / sizeof blocks[0];
+    w.by_image = by_image;
+    w.images = images;
+    wl_heap_walk_live(&cache->heap, arena_block, &w);
+    if (w.count == w.cap) {
+        return false; // (more blocks than an arena of images holds: not ours to judge)
+    }
+    // windows [i, j] of blocks that may go: from the end of the block before i to the start of the
+    // one after j
+    for (i = 0; i < w.count; i++) {
+        uint32_t newest = 0;
+        size_t evicted = 0;
+        size_t from = i > 0 ? blocks[i - 1].end : 0;
+
+        if (blocks[i].entry == 0) {
+            continue;
+        }
+        for (j = i; j < w.count && blocks[j].entry != 0; j++) {
+            size_t to = j + 1 < w.count ? blocks[j + 1].start : cache->heap.size;
+
+            newest = blocks[j].used_frame > newest ? blocks[j].used_frame : newest;
+            evicted += blocks[j].end - blocks[j].start;
+            if (found && newest > best_frame) {
+                break; // (only worse from here)
+            }
+            if (to - from >= need) {
+                if (!found || newest < best_frame || (newest == best_frame && evicted < best_bytes)) {
+                    found = true;
+                    best_i = i;
+                    best_j = j;
+                    best_frame = newest;
+                    best_bytes = evicted;
+                }
+                break;
+            }
+        }
+    }
+    if (!found) {
+        return false;
+    }
+    for (i = best_i; i <= best_j; i++) {
+        evict(cache, &cache->entries[blocks[i].entry - 1u]);
+    }
+    return true;
+}
+
+// An image of `bytes`: when the memory has no room, entries not drawn in this frame give theirs back
+// until it has (an image drawn in this frame is only given back at its end): in an arena those of
+// the window arena_make_room finds, elsewhere the least recently drawn. NULL when even that does not
+// make room.
 static void *image_for(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTexEntry *keep) {
     void *image = image_alloc(cache, bytes);
 
+    if (image == NULL && cache->cfg.arena != NULL) {
+        if (arena_make_room(cache, bytes, keep)) {
+            image = image_alloc(cache, bytes);
+        }
+        return image;
+    }
     while (image == NULL) {
         WlNv2aTexEntry *e = oldest(cache, keep, true);
 
@@ -390,15 +560,45 @@ static bool scratch_for(WlNv2aTexCache *cache, size_t bytes) {
     return true;
 }
 
+// The decoders' scratch for one conversion: the cache's own, grown as needed up to
+// WL_NV2A_TEXCACHE_SCRATCH_KEPT and kept; a larger one (a big texture GX has no codec for, a cube
+// map made a sphere: megabytes) is had for the conversion alone, from the arena like an image (the
+// textures not drawn in this frame making room) or else the heap, and given back right after, so
+// that the heap does not keep the largest scratch ever wanted.
+static void *scratch_take(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTexEntry *keep) {
+    void *p;
+
+    if (bytes <= WL_NV2A_TEXCACHE_SCRATCH_KEPT) {
+        return scratch_for(cache, bytes) ? cache->scratch : NULL;
+    }
+    p = cache->cfg.arena != NULL ? image_for(cache, bytes, keep) : NULL;
+    return p != NULL ? p : malloc(bytes);
+}
+
+static void scratch_give(WlNv2aTexCache *cache, void *p) {
+    if (p == NULL || p == cache->scratch) {
+        return;
+    }
+    if (cache->cfg.arena != NULL && wl_heap_owns(&cache->heap, p)) {
+        image_free(cache, p);
+    } else {
+        free(p);
+    }
+}
+
 // the entry's image made from the texels (its layout already set)
 static bool convert(WlNv2aTexCache *cache, WlNv2aTexEntry *e, const WlNv2aTexture *t, const uint8_t *src,
                     const uint8_t *palette) {
-    size_t scratch = wl_nv2a_texture_scratch_bytes(t, &e->layout);
+    size_t scratch_bytes = wl_nv2a_texture_scratch_bytes(t, &e->layout);
+    void *scratch = NULL;
+    bool done;
 
-    if (scratch != 0 && !scratch_for(cache, scratch)) {
+    if (scratch_bytes != 0 && (scratch = scratch_take(cache, scratch_bytes, e)) == NULL) {
         return false;
     }
-    if (!wl_nv2a_texture_convert(t, &e->layout, src, palette, e->image, scratch != 0 ? cache->scratch : NULL)) {
+    done = wl_nv2a_texture_convert(t, &e->layout, src, palette, e->image, scratch);
+    scratch_give(cache, scratch);
+    if (!done) {
         return false;
     }
     if (cache->cfg.flush != NULL) {

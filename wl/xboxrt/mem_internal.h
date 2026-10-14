@@ -25,6 +25,9 @@ void wl_xb_backend_release_phys(uint32_t phys, uint32_t pages);
 void wl_xb_backend_move_phys(uint32_t from, uint32_t to, uint32_t va);
 // Frames (host memory behind physical pages), faults resolved, page table entries reused.
 void wl_xb_backend_stats(uint32_t *frames, uint32_t *faults, uint32_t *pte_evictions);
+// The host memory the backend holds on the heap: its tables, and the frames behind the guest's pages
+// when they come from the heap (the Wii's pools; the host maps its RAM object instead: 0).
+void wl_xb_backend_host_bytes(size_t *tables, size_t *frames);
 // The calling host thread as the fault backend names it (the host: its pthread_t; the Wii: 0).
 uintptr_t wl_xb_backend_thread_handle(void);
 // Logs where the host thread `handle` is running: on the host a signal makes it log its PC and the
@@ -65,6 +68,8 @@ static inline void wl_xb_pg_wrote(uint32_t p) {
     g_xb_pg_wgen[p] = ++g_xb_pg_epoch;
 }
 
+// The paging core's tables on the heap, in bytes (0 while it is off).
+size_t wl_xb_pg_host_bytes(void);
 // Starts the core over `frames` frames (at most 65535) and opens the swap file the configuration
 // names. Once, from the backend's init.
 WlResult wl_xb_pg_init(const WlXbMemConfig *cfg, uint32_t frames);

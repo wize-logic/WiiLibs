@@ -138,6 +138,17 @@ uint32_t wl_nv2a_ramin_read32(const WlNv2a *dev, uint32_t offset) {
     return page != NULL ? wl_rd_le32(page + offset % WL_NV2A_RAMIN_PAGE) : 0;
 }
 
+size_t wl_nv2a_host_bytes(const WlNv2a *dev) {
+    size_t bytes = sizeof *dev + WL_NV2A_BATCH_INDICES * sizeof *dev->batch_indices + WL_NV2A_BATCH_INLINE_BYTES +
+                   WL_NV2A_BATCH_IMMEDIATE * sizeof *dev->batch_immediate;
+    unsigned i;
+
+    for (i = 0; i < WL_NV2A_PRAMIN_SIZE / WL_NV2A_RAMIN_PAGE; i++) {
+        bytes += dev->ramin[i] != NULL ? WL_NV2A_RAMIN_PAGE : 0u;
+    }
+    return bytes;
+}
+
 uint8_t *wl_nv2a_ramin_page(WlNv2a *dev, uint32_t offset) {
     uint8_t **page = &dev->ramin[(offset & (WL_NV2A_PRAMIN_SIZE - 1u)) / WL_NV2A_RAMIN_PAGE];
 

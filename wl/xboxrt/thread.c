@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/platform/mem_census.h"
 #include "wl/xboxrt/crash.h"
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
@@ -52,6 +53,8 @@ static volatile uint64_t g_vt_ns = DET_START_NS;
 static uint64_t g_det_next_us;          // the holder looks at the clock's events from then on
 static uint32_t g_det_backedge_ns, g_det_call_ns, g_det_device_ns;
 static WlXbThread *volatile g_idle;     // the idle thread (the service thread)
+
+static void census_threads(void *user, WlMemCensusReport *out);
 
 void wl_xb_thread_config_default(WlXbThreadConfig *cfg) {
     cfg->quantum_ms = 10;
@@ -576,6 +579,7 @@ WlResult wl_xb_threads_init(const WlXbThreadConfig *cfg, WlXbThread **out) {
                  "device access)", (unsigned)g_det_backedge_ns, (unsigned)g_det_call_ns, (unsigned)g_det_device_ns);
     }
     g_ready_init = true;
+    (void)wl_mem_census_add("threads", census_threads, NULL);
     WlXbThread *t = new_thread(WL_XB_PRIORITY_NORMAL);
     if (t == NULL) {
         return WL_ERR_NOMEM;
@@ -742,6 +746,8 @@ static void *thread_main(void *arg) {
     }
     wl_platform_mutex_unlock(g_m);
     wl_xb_unlock(t);
+    // (the last its host stack is used for: the stack may go back a while later, wl_xb_thread_reap)
+    __atomic_store_n(&t->host_done_ms, (uint32_t)wl_platform_time_ms() | 1u, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -776,6 +782,8 @@ WlResult wl_xb_thread_create(uint32_t routine, uint32_t ctx1, uint32_t ctx2, uin
     if (t->host_stack == NULL) {
         return WL_ERR_NOMEM;
     }
+    wl_platform_stack_fill(t->host_stack, host);
+    t->host_stack_size = host;
     wl_platform_mutex_lock(g_m);
     g_live++;
     g_stats.threads_created++;
@@ -824,6 +832,7 @@ static void *host_thread_main(void *arg) {
     t->running_guest = false;
     t->terminated = true;
     wl_xb_unlock(t);
+    __atomic_store_n(&t->host_done_ms, (uint32_t)wl_platform_time_ms() | 1u, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -850,6 +859,8 @@ WlResult wl_xb_thread_create_host(const char *name, WlXbHostThreadFn fn, void *u
         free(start);
         return WL_ERR_NOMEM;
     }
+    wl_platform_stack_fill(t->host_stack, host);
+    t->host_stack_size = host;
     start->t = t;
     start->fn = fn;
     start->user = user;
@@ -1067,4 +1078,84 @@ int wl_xb_process_wait(void) {
 
 void wl_xb_thread_stats(WlXbThreadStats *out) {
     *out = g_stats;
+}
+
+void wl_xb_thread_host_memory(size_t *bytes, uint32_t *stacks, size_t *deepest, size_t *deepest_of) {
+    size_t total = 0, deep = 0, deep_of = 0;
+    uint32_t n = 0;
+    wl_platform_mutex_lock(g_m);
+    for (WlXbThread *t = g_all; t != NULL; t = t->next_all) {
+        total += sizeof *t + t->host_stack_size;
+        if (t->host_stack != NULL) {
+            size_t used = wl_platform_stack_used(t->host_stack, t->host_stack_size);
+            n++;
+            if (used * 1024u / t->host_stack_size > (deep_of != 0 ? deep * 1024u / deep_of : 0)) {
+                deep = used;
+                deep_of = t->host_stack_size;
+            }
+        }
+    }
+    wl_platform_mutex_unlock(g_m);
+    *bytes = total;
+    *stacks = n;
+    *deepest = deep;
+    *deepest_of = deep_of;
+}
+
+uint32_t wl_xb_thread_reap(void) {
+    // (a grace of seconds after the thread's last statement: what is left of it, its function's
+    // return and the platform thread's end, has long run by then)
+    const uint32_t grace_ms = 2000u;
+    uint32_t now = (uint32_t)wl_platform_time_ms();
+    uint32_t freed = 0;
+    size_t bytes = 0;
+    if (!g_ready_init) {
+        return 0;
+    }
+    wl_platform_mutex_lock(g_m);
+    for (WlXbThread *t = g_all; t != NULL; t = t->next_all) {
+        uint32_t done = __atomic_load_n(&t->host_done_ms, __ATOMIC_ACQUIRE);
+        if (t->host_stack != NULL && t->terminated && done != 0 && now - done >= grace_ms) {
+            free(t->host_stack);
+            bytes += t->host_stack_size;
+            t->host_stack = NULL;
+            t->host_stack_size = 0;
+            freed++;
+        }
+    }
+    wl_platform_mutex_unlock(g_m);
+    if (freed != 0) {
+        WL_LOG_I(TAG, "%u ended threads' host stacks given back (%u KB)", (unsigned)freed, (unsigned)(bytes >> 10));
+    }
+    return freed;
+}
+
+void wl_xb_thread_log_stacks(void) {
+    char line[200];
+    size_t used = 0;
+    line[0] = '\0';
+    wl_platform_mutex_lock(g_m);
+    for (WlXbThread *t = g_all; t != NULL && used + 40u < sizeof line; t = t->next_all) {
+        if (t->host_stack != NULL) {
+            used += (size_t)snprintf(line + used, sizeof line - used, "%s%s %u/%u%s", used != 0 ? ", " : "", t->name,
+                                     (unsigned)(wl_platform_stack_used(t->host_stack, t->host_stack_size) >> 10),
+                                     (unsigned)(t->host_stack_size >> 10), t->terminated ? " (ended)" : "");
+        }
+    }
+    wl_platform_mutex_unlock(g_m);
+    WL_LOG_I(TAG, "host stacks, deepest/size KB: %s", line);
+}
+
+static void census_threads(void *user, WlMemCensusReport *out) {
+    (void)user;
+    uint32_t stacks;
+    size_t deepest, of;
+    wl_xb_thread_host_memory(&out->bytes, &stacks, &deepest, &of);
+    if (of != 0) {
+        snprintf(out->note, sizeof out->note, "%u stacks, deepest %u of %u", (unsigned)stacks, (unsigned)(deepest >> 10),
+                 (unsigned)(of >> 10));
+    } else {
+        // (the host's threads run on stacks of their own: these are not used there)
+        snprintf(out->note, sizeof out->note, "%u stacks, not used here", (unsigned)stacks);
+    }
 }

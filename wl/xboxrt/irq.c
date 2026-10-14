@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Interrupt lines, the service thread, KeTickCount and the vertical blank (irq.h).
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <malloc.h>
-
+#include "wl/platform/mem.h"
+#include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
 
 #include "wl/xboxrt/irq.h"
@@ -27,6 +28,8 @@ static struct {
 static uint32_t g_tick_count;
 static WlXbServiceConfig g_cfg;
 #define MAX_VBLANK_HOOKS 8u
+#define SVC_STACK (256u << 10)  // the service thread's host stack
+#define RELAY_STACK (16u << 10) // the retrace relay's (the Wii)
 static struct {
     WlXbVblankFn fn;
     void *user;
@@ -336,6 +339,38 @@ void wl_xb_det_service_run(void) {
     poll(true);
 }
 
+// wl_mem's tagged heaps (outside malloc's: carved from MEM1's and MEM2's tops at start), used of
+// budget in KB, on one line: a budget much larger than its use is memory malloc could have had.
+static void mem_tags_log(void) {
+    if (!wl_mem_ready()) {
+        return;
+    }
+    WlMemRow rows[WL_MEM_MAX_ROWS];
+    uint32_t n = wl_mem_rows(rows, WL_MEM_MAX_ROWS);
+    char line[200];
+    size_t used = 0;
+    line[0] = '\0';
+    for (uint32_t i = 0; i < n && used + 32u < sizeof line; i++) {
+        if (rows[i].budget != 0) {
+            used += (size_t)snprintf(line + used, sizeof line - used, "%s%s %u/%u", used != 0 ? ", " : "", rows[i].name,
+                                     (unsigned)((rows[i].peak + 1023u) >> 10), (unsigned)(rows[i].budget >> 10));
+        }
+    }
+    WL_LOG_I(TAG, "census: wl_mem heaps beside malloc's, peak/budget KB: %s", line);
+}
+
+static void census_service(void *user, WlMemCensusReport *out) {
+    (void)user;
+    out->bytes = sizeof *g_svc + SVC_STACK + (g_relay_stack != NULL ? RELAY_STACK : 0u);
+    size_t deepest = wl_platform_stack_used(g_svc_stack, SVC_STACK);
+    if (deepest != 0) {
+        snprintf(out->note, sizeof out->note, "deepest %u of %u KB", (unsigned)(deepest >> 10),
+                 (unsigned)(SVC_STACK >> 10));
+    } else {
+        snprintf(out->note, sizeof out->note, "stack not used here"); // (the host's threads have their own)
+    }
+}
+
 // Every 10 s: the guest's memory (pages committed, frames behind them) and the host's free memory,
 // the numbers a title's memory knobs (WlXbTitleConfig) are set from.
 static void status_report(void) {
@@ -352,16 +387,19 @@ static void status_report(void) {
                      (unsigned)wl_xb_tick_ms());
         }
     }
-#if defined(__GLIBC__)
-    struct mallinfo2 mi = mallinfo2();
-#else
-    struct mallinfo mi = mallinfo();
-#endif
     WL_LOG_I(TAG, "status: guest %u of %u pages used (user %u, contiguous %u), %u frames (%u KB), "
-             "%u faults resolved, %u PTE evictions; host malloc %u KB free of %u KB",
+             "%u faults resolved, %u PTE evictions",
              (unsigned)m.used_pages, (unsigned)m.ram_pages, (unsigned)m.user_pages, (unsigned)m.contig_pages,
-             (unsigned)m.frames, (unsigned)(m.frames * 4u), (unsigned)m.faults_resolved, (unsigned)m.pte_evictions,
-             (unsigned)(mi.fordblks / 1024), (unsigned)(mi.arena / 1024));
+             (unsigned)m.frames, (unsigned)(m.frames * 4u), (unsigned)m.faults_resolved, (unsigned)m.pte_evictions);
+    // the host's heap (mem_census.h): every report its free memory (inside newlib's arena and above
+    // its top), once a minute who holds it, the threads' host stacks and wl_mem's own heaps
+    static uint32_t reports;
+    (void)wl_xb_thread_reap();
+    wl_mem_census_log(TAG, reports++ % 6u != 0u);
+    if (reports % 6u == 1u) {
+        wl_xb_thread_log_stacks();
+        mem_tags_log();
+    }
     if (m.frames_total != 0) {
         // demand paging: what the frames' shortage costs
         WL_LOG_I(TAG, "status: paging %u of %u frames free, %u pinned; %u evictions (%u clean, %u in the fault), "
@@ -533,11 +571,13 @@ WlResult wl_xb_service_start(const WlXbServiceConfig *cfg) {
     if (wl_xb_deterministic()) {
         wl_xb_det_set_idle(g_svc);
     }
-    const size_t host_stack = 256u << 10;
+    const size_t host_stack = SVC_STACK;
     g_svc_stack = aligned_alloc(64, host_stack);
     if (g_svc_stack == NULL) {
         return WL_ERR_NOMEM;
     }
+    wl_platform_stack_fill(g_svc_stack, host_stack);
+    (void)wl_mem_census_add("service", census_service, NULL);
     WlResult r = wl_platform_thread_create(&g_svc_host, service_main, NULL, g_svc_stack, host_stack, WL_THREAD_PRIO_NET);
     if (r != WL_OK) {
         g_running = false;
@@ -547,9 +587,12 @@ WlResult wl_xb_service_start(const WlXbServiceConfig *cfg) {
 #if defined(__wii__)
     if (g_cfg.vblank && !wl_xb_deterministic()) {
         if (wl_platform_sem_create(&g_retrace_sem, 0, 16) == WL_OK) {
-            g_relay_stack = aligned_alloc(64, 16u << 10);
+            g_relay_stack = aligned_alloc(64, RELAY_STACK);
+            if (g_relay_stack != NULL) {
+                wl_platform_stack_fill(g_relay_stack, RELAY_STACK);
+            }
             if (g_relay_stack != NULL &&
-                wl_platform_thread_create(&g_relay_host, relay_main, NULL, g_relay_stack, 16u << 10, WL_THREAD_PRIO_AUDIO) ==
+                wl_platform_thread_create(&g_relay_host, relay_main, NULL, g_relay_stack, RELAY_STACK, WL_THREAD_PRIO_AUDIO) ==
                     WL_OK) {
                 wl_platform_video_set_retrace_hook(on_retrace, NULL);
             }

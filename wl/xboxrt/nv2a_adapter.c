@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/mem.h"
@@ -280,6 +281,49 @@ void wl_xb_gpu_set_vertex_cache(void *arena, uint32_t bytes) {
     g_vcache_bytes = bytes;
 }
 
+// What the GPU holds of the host's heap (mem_census.h): the device and the backend's records, the
+// render targets' images, the texture decoders' scratch, and the textures' arena (the boot's, of the
+// heap too) or, without one, the images kept on the heap.
+static void census_gpu(void *user, WlMemCensusReport *out) {
+    (void)user;
+    size_t record = 0, targets = 0;
+    unsigned count = 0;
+    if (g_gx != NULL) {
+        wl_nv2a_gx_host_bytes(g_gx, &record, &targets, &count);
+    }
+    out->bytes = record + (g_gpu != NULL ? wl_nv2a_host_bytes(g_gpu) : 0u);
+}
+
+static void census_targets(void *user, WlMemCensusReport *out) {
+    (void)user;
+    size_t record, targets;
+    unsigned count;
+    wl_nv2a_gx_host_bytes(g_gx, &record, &targets, &count);
+    out->bytes = targets;
+    snprintf(out->note, sizeof out->note, "%u", count);
+}
+
+static void census_textures(void *user, WlMemCensusReport *out) {
+    (void)user;
+    WlNv2aTexCacheMemory m;
+    wl_nv2a_texcache_memory(wl_nv2a_gx_textures(g_gx), &m);
+    if (m.arena != 0) {
+        out->bytes = m.arena;
+        snprintf(out->note, sizeof out->note, "arena: %u used, largest free %u", (unsigned)(m.arena_used >> 10),
+                 (unsigned)(m.arena_largest >> 10));
+    } else {
+        out->bytes = m.images;
+        snprintf(out->note, sizeof out->note, "of the heap");
+    }
+}
+
+static void census_scratch(void *user, WlMemCensusReport *out) {
+    (void)user;
+    WlNv2aTexCacheMemory m;
+    wl_nv2a_texcache_memory(wl_nv2a_gx_textures(g_gx), &m);
+    out->bytes = m.scratch;
+}
+
 WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
     // the draws go to GX (over libogc on the Wii, the host's recorder elsewhere)
     if (!wl_gx_ready() && wl_gx_init() != WL_OK) {
@@ -348,7 +392,11 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
     }
     if (g_gx != NULL) {
         wl_nv2a_gx_attach(g_gx, g_gpu);
+        (void)wl_mem_census_add("targets", census_targets, NULL);
+        (void)wl_mem_census_add("textures", census_textures, NULL);
+        (void)wl_mem_census_add("tex scratch", census_scratch, NULL);
     }
+    (void)wl_mem_census_add("gpu", census_gpu, NULL);
 #if !defined(__wii__)
     const char *cap = getenv("WL_XB_CAPTURE"); // path[,frames[,after vblanks]]
     if (cap != NULL && cap[0] != '\0') {

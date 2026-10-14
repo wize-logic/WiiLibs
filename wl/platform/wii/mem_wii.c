@@ -18,7 +18,13 @@
 #include <ogc/mutex.h>
 #include <ogc/system.h>
 
+#include <malloc.h>
+#include <reent.h>
+#include <stddef.h>
+#include <string.h>
+
 #include "wl/platform/mem.h"
+#include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
 
 #define MEM1_SYSTEM_LEAVE (4u * 1024u * 1024u)
@@ -145,4 +151,47 @@ void wl_gpu_buffer_invalidate(void *ptr, size_t size) {
     WL_ASSERT(((uintptr_t)ptr & (WL_ARENA_ALIGN_GPU - 1)) == 0 &&
               (size & (WL_ARENA_ALIGN_GPU - 1)) == 0);
     DCInvalidateRange(ptr, (u32)size);
+}
+
+// ---- the heap's figures (mem_census.h) --------------------------------------------------------
+//
+// newlib's mallinfo, and the arena libogc's sbrk has not handed out yet: it grows from MEM1's
+// arena lo and, once MEM1 cannot hold a request, from MEM2's (for good, until it shrinks back to
+// MEM2's start), and newlib trims the top back to it whenever more than 128 KB lies free there.
+
+void *_sbrk_r(struct _reent *reent, ptrdiff_t incr);
+void __malloc_lock(struct _reent *reent);
+void __malloc_unlock(struct _reent *reent);
+
+void wl_platform_heap_info(WlPlatformHeapInfo *out) {
+    memset(out, 0, sizeof *out);
+    __malloc_lock(_REENT);
+    struct mallinfo mi = mallinfo();
+    uintptr_t top = (uintptr_t)_sbrk_r(_REENT, 0); // (where the next sbrk would start)
+    __malloc_unlock(_REENT);
+    uintptr_t mem2_lo = (uintptr_t)SYS_GetArena2Lo(), mem2_hi = (uintptr_t)SYS_GetArena2Hi();
+    if (top == (uintptr_t)-1) {
+        top = 0;
+    }
+    out->known = true;
+    out->arena = (size_t)mi.arena;
+    out->in_use = (size_t)mi.uordblks;
+    out->free_inside = (size_t)mi.fordblks;
+    if (top >= 0x90000000u) {
+        out->top = mem2_hi > top ? mem2_hi - top : 0;
+    } else {
+        uintptr_t mem1_hi = (uintptr_t)SYS_GetArena1Hi();
+        out->top = mem1_hi > top ? mem1_hi - top : 0;
+        out->elsewhere = mem2_hi > mem2_lo ? mem2_hi - mem2_lo : 0;
+    }
+    out->free_total = out->free_inside + out->top + out->elsewhere;
+}
+
+WlResult wl_platform_heap_cap(size_t bytes) {
+    (void)bytes;
+    return WL_ERR_UNSUPPORTED;
+}
+
+void wl_platform_heap_exempt(bool on) {
+    (void)on;
 }

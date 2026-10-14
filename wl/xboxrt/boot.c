@@ -11,6 +11,7 @@
 
 #include "wl/base/endian.h"
 #include "wl/platform/mem.h"
+#include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/hwcount.h"
 #include "wl/platform/profile_arm.h"
@@ -220,6 +221,28 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
     }
     *arena = texture_arena;
     *arena_bytes = texture_bytes;
+#if !defined(__wii__)
+    {
+        // the Wii's heap on the host: what is allocated from here on (the guest memory's tables, the
+        // threads' stacks, the GPU's and everyone's buffers: on the Wii all of it comes out of
+        // keep_free_bytes, the frames and the textures' arena being had already) capped, so that a
+        // run shows what would fail first. The host's own stand-ins (the software GX of the
+        // screenshots, the GX recorders) are not counted (mem_census.h). WL_XB_HEAP_MB=14 is the Wii's.
+        const char *mb = getenv("WL_XB_HEAP_MB");
+        const char *kb = getenv("WL_XB_HEAP_KB");
+        size_t cap = 0;
+        if (kb != NULL && kb[0] != '\0') {
+            cap = (size_t)strtoul(kb, NULL, 10) << 10;
+        } else if (mb != NULL && mb[0] != '\0') {
+            cap = (size_t)strtoul(mb, NULL, 10) << 20;
+        }
+        if (cap != 0) {
+            WlResult capped = wl_platform_heap_cap(cap);
+            WL_LOG_I(TAG, "host heap: %u KB from here on, as the Wii's (%s)", (unsigned)(cap >> 10),
+                     capped == WL_OK ? "capped" : wl_result_name(capped));
+        }
+    }
+#endif
     WlResult r = wl_xb_mem_init(&mc);
     if (r == WL_OK) {
         r = wl_xb_fault_install();
@@ -351,13 +374,22 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
 #if defined(__wii__)
     WlResult mem_result = WL_OK; // logged once the log is open (it is not yet)
     if (!wl_mem_ready()) {
-        // wl_mem takes only what its heaps need (MEM1's budgets and arenas, a small MEM2 asset
-        // heap): the rest stays malloc's, for the guest's frames and the host-side buffers. Its
-        // default would claim both regions whole and leave no room for the frame pools.
+        // wl_mem takes only what its heaps need (MEM1's budgets and arenas): the rest stays
+        // malloc's, for the guest's frames and the host-side buffers. Its default would claim both
+        // regions whole and leave no room for the frame pools. The runtime's only users of wl_mem's
+        // heaps are the GX FIFO, three thread stacks (the IO thread's 32 KB, the shutdown watch's
+        // 16 KB, the audio thread's 24 KB) and the audio's DMA blocks (five of 4 KB at most): the
+        // budgets are those with room to spare (the built-in ones, 4 MB of MEM1 and 4 MB of MEM2,
+        // held 6.8 MB that nothing used, out of malloc's reach; the census logs each heap's peak).
         static WlMemTagDef tags[WL_TAG_BUILTIN_COUNT];
         memcpy(tags, wl_mem_builtin_tags(), sizeof tags);
-        tags[WL_TAG_ASSET].budget = 2u << 20;
+        tags[WL_TAG_STACK].budget = 256u << 10;
+        tags[WL_TAG_HOT].budget = 64u << 10;
+        tags[WL_TAG_AUDIO].budget = 128u << 10;
+        tags[WL_TAG_NET].budget = 0;
+        tags[WL_TAG_ASSET].budget = 0;
         tags[WL_TAG_AUDIO_BANK].budget = 0;
+        tags[WL_TAG_IO].budget = 0;
         WlMemConfig mcfg;
         wl_mem_config_default(&mcfg);
         mcfg.tags = tags;

@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/mem_internal.h"
 
@@ -67,6 +68,23 @@ static void mark(uint32_t first, uint32_t pages, uint8_t kind) {
     }
 }
 
+// The host memory the guest's memory holds (mem_census.h): the page tables of the core, the paging
+// and the backend; and the frames when they come from the heap (the Wii's pools).
+static void census_tables(void *user, WlMemCensusReport *out) {
+    (void)user;
+    size_t tables, frames;
+    wl_xb_backend_host_bytes(&tables, &frames);
+    out->bytes = (size_t)g_xb_ram_pages * (sizeof *g_kind + sizeof *g_run + sizeof *g_owner) +
+                 (size_t)USER_PAGES * (sizeof *g_va_prot + sizeof *g_xb_va2phys) + MAX_REGIONS * sizeof *g_regions +
+                 wl_xb_pg_host_bytes() + tables;
+}
+
+static void census_frames(void *user, WlMemCensusReport *out) {
+    (void)user;
+    size_t tables;
+    wl_xb_backend_host_bytes(&tables, &out->bytes);
+}
+
 WlResult wl_xb_mem_init(const WlXbMemConfig *cfg) {
     if (g_ready) {
         return WL_ERR_STATE;
@@ -105,6 +123,8 @@ WlResult wl_xb_mem_init(const WlXbMemConfig *cfg) {
     g_xbox_mem_offset = (ptrdiff_t)base;
 #endif
     g_ready = true;
+    (void)wl_mem_census_add("guest tables", census_tables, NULL);
+    (void)wl_mem_census_add("frames", census_frames, NULL);
     WL_LOG_I(TAG, "guest RAM %u MB (%u pages), host base %p, reserved low 0x%x, GPU instance 0x%x", cfg->ram_bytes >> 20,
              (unsigned)pages, (void *)base, (unsigned)cfg->reserved_low_bytes, (unsigned)cfg->gpu_instance_bytes);
     return WL_OK;
