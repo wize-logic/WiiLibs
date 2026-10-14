@@ -165,7 +165,8 @@ bool wl_xb_wait(WlXbThread *self, uint32_t timeout_ms);
 // next waits). May be called from the service thread.
 void wl_xb_wake(WlXbThread *t);
 // A yield point: if a thread of equal or higher priority is ready and the caller's quantum is
-// over (or one of higher priority is ready at all), the caller goes to the back of the queue.
+// over (or one of higher priority is ready at all), the caller goes to the back of the queue
+// (never at DISPATCH_LEVEL or above: see wl_xb_safe_point).
 // Also runs pending interrupt work (irq.h).
 void wl_xb_yield_point(void);
 // Gives the lock up to every ready thread of equal or higher priority (NtYieldExecution).
@@ -177,7 +178,9 @@ void wl_xb_yield(void);
 // loop hook. It does nothing unless the calling host thread holds the guest lock outside a kernel
 // call and outside the interrupt work, so it may be called from any fault. A title that polls a
 // device register until an interrupt changes memory (D3D's fence wait) gets its ISR and DPCs this
-// way, and a thread waiting for the lock (the service thread first) gets it at the next access.
+// way, and a thread waiting for the lock (the service thread first) gets it at the next access,
+// unless the holder's IRQL (its KPCR's) is DISPATCH_LEVEL or above: then it keeps the lock, as it
+// keeps the console's processor, and its own safe points run the interrupts its IRQL lets in.
 // Lock not necessarily held.
 void wl_xb_safe_point(void);
 // Non-zero when a safe point has something to do (interrupt work raised, a thread waiting for the
@@ -248,6 +251,8 @@ typedef struct {
     uint32_t starved_handoffs; // the lock given to a thread that waited past starve_ms
     uint32_t safe_yields;   // of those, the ones that gave the lock to a waiting thread
     uint32_t service_starved; // the service thread waited a second or more for the lock (logged)
+    // safe points that kept the lock from a waiting thread: the holder was at DISPATCH_LEVEL or above
+    uint32_t raised_holds;
 } WlXbThreadStats;
 void wl_xb_thread_stats(WlXbThreadStats *out);
 // The service thread's status, every 10 s: after 20 s with no scheduling at all, the lock's holder

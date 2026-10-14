@@ -443,6 +443,11 @@ static void status_report(void) {
     if (reports % 6u == 1u) {
         wl_xb_thread_log_stacks();
         mem_tags_log();
+        WlXbThreadStats ts;
+        wl_xb_thread_stats(&ts);
+        // a holder at DISPATCH_LEVEL keeps the lock (thread.h, wl_xb_safe_point): how often it did
+        WL_LOG_I(TAG, "scheduling: %u handoffs, %u yields at safe points, %u kept at a raised IRQL, %u waits",
+                 (unsigned)ts.handoffs, (unsigned)ts.safe_yields, (unsigned)ts.raised_holds, (unsigned)ts.waits);
     }
     if (m.frames_total != 0) {
         // demand paging: what the frames' shortage costs

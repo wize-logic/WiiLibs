@@ -37,7 +37,9 @@ settings).
 - **IRQL, DPCs, timers, interrupts** (`ke_irq.c`): the IRQL lives in each thread's KPCR. Timers
   have deadlines on the runtime's service. `HalGetInterruptVector` gives vector `0x30 + line` at
   IRQL `26 - line`. `KeConnectInterrupt` makes the line's ISR run at its IRQL when the line is
-  asserted. DPCs drain at DISPATCH_LEVEL. The work runs at the runtime's safe points (`wl/xboxrt/irq.h`).
+  asserted. DPCs drain at DISPATCH_LEVEL. The work runs at the runtime's safe points (`wl/xboxrt/irq.h`);
+  a thread at DISPATCH_LEVEL or above keeps the processor (no thread switch, no DPC) until it
+  lowers its IRQL, as on the console.
 - **Threads** (`ps.c`): `PsCreateSystemThreadEx` makes real guest threads (optionally the first
   runs on the caller, xboxrecomp's inline model), with priorities from `KeSetBasePriorityThread`
   (base 16 plus the increment), suspend before start and resume, `PsTerminateSystemThread`.

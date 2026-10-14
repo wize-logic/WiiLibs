@@ -21,6 +21,7 @@
 #define TAG "xbthread"
 
 #define KPCR_IRQL 0x24u
+#define DISPATCH_LEVEL 2u
 #define KTHREAD_OFFSET 0x400u // in the thread's kernel page, after the KPCR
 #define KTHREAD_BYTES 0x200u
 
@@ -340,6 +341,17 @@ static void requeue(WlXbThread *self) {
 static bool yield_if_due(WlXbThread *self) {
     WlXbThread *head = g_ready;
     if (self == NULL || head == NULL || wl_xb_in_service()) {
+        return false;
+    }
+    if (self->kpcr != 0 && wl_xb_rd8(self->kpcr + KPCR_IRQL) >= DISPATCH_LEVEL) {
+        // At DISPATCH_LEVEL or above the holder keeps the processor, as on the console's one CPU:
+        // no other thread runs, and the DPCs wait until it lowers its IRQL (KfLowerIrql runs them
+        // then). Its own safe points still run the interrupts its IRQL lets in (their poll comes
+        // first). Code at a raised IRQL counts on this as its lock: DirectSound edits its voice
+        // lists so, and its DPC, run on the service thread in the middle of an edit, leaves a
+        // stopped voice in the APU's list for good (the idle-voice trap at every frame, and a
+        // wait for the voice that never ends).
+        g_stats.raised_holds++;
         return false;
     }
     uint64_t now = wl_xb_time_us();
@@ -1188,8 +1200,14 @@ void wl_xb_thread_log_guest_stacks(void) {
                 found++;
             }
         }
-        WL_LOG_W(TAG, "freeze: %u %s%s esp %08x:%s", (unsigned)t->id, t->name, t == owner ? " (holds the lock)" : "",
-                 (unsigned)esp, found != 0 ? line : " no code addresses");
+        // its IRQL (a holder at DISPATCH_LEVEL keeps the lock: thread.h, wl_xb_safe_point)
+        unsigned irql = t->kpcr != 0 && wl_xb_mem_resident(t->kpcr + KPCR_IRQL) ? wl_xb_rd8(t->kpcr + KPCR_IRQL) : 0u;
+        char at[16] = "";
+        if (irql != 0) {
+            snprintf(at, sizeof at, " irql %u", irql);
+        }
+        WL_LOG_W(TAG, "freeze: %u %s%s%s esp %08x:%s", (unsigned)t->id, t->name, t == owner ? " (holds the lock)" : "",
+                 at, (unsigned)esp, found != 0 ? line : " no code addresses");
     }
     wl_platform_mutex_unlock(g_m);
 }

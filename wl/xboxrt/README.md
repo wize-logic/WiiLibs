@@ -142,9 +142,12 @@ resumes after the instruction:
 
 **Every device access is a safe point** (`wl_xb_safe_point`, `thread.h`): once the device has
 answered, pending interrupt work runs and a thread waiting for the guest lock gets it. A title that
-polls a register until an interrupt moves a word in memory (D3D's fence wait) depends on it. An
-access that is not to a device, or that the decoder refuses (`lmw`, `dcbz`, `lwarx`, FP), is a
-crash report.
+polls a register until an interrupt moves a word in memory (D3D's fence wait) depends on it. A
+holder at DISPATCH_LEVEL or above (its KPCR's IRQL) keeps the lock, as it keeps the console's one
+processor: the interrupts its IRQL lets in run at its safe points, but no other thread runs and no
+DPC until it lowers the IRQL. DirectSound edits its voice lists so, with no other lock. An access
+that is not to a device, or that the decoder refuses (`lmw`, `dcbz`, `lwarx`, FP), is a crash
+report.
 
 ## The register file (`regs.h`, `recomp_symbols.inc`)
 
@@ -200,7 +203,8 @@ Interrupt lines (edge-asserted, or level sources a device answers), the kernel's
 timers, ISRs and DPCs, `KeTickCount` kept moving in guest memory, and the vertical blank (the
 retrace interrupt on the Wii, a 59.94 Hz timer elsewhere). The work runs with the lock held at the
 holder's next yield point, or on the service thread (above every guest priority) when no thread
-runs or the holder hands it the lock at a safe point. It always runs on the service thread's guest
+runs or the holder hands it the lock at a safe point (never from DISPATCH_LEVEL or above, where
+the DPCs would run in the middle of the holder's work). It always runs on the service thread's guest
 stack: a device access can come in the middle of a translated function whose `esp` the compiler
 has not stored back yet, so the interrupted stack is left alone. A guest thread that spins without
 a kernel call, an `rdtsc` or a device access holds interrupts off (see `g_xb_attention` above); the
