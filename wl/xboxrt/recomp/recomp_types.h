@@ -1216,6 +1216,19 @@ extern volatile uint64_t g_icall_guard_misses;
 #define RECOMP_ICALL_GUARD_MISS() ((void)0)
 #endif
 
+/* WiiLibs: an indirect call or jump resolves its target with one call, wl/xboxrt's wl_xb_lookup
+ * (thunk.h): the title's manual functions, the generated table and the kernel thunks in that order,
+ * as the three calls upstream makes here, behind a direct-mapped cache of the answers (the generated
+ * table is a binary search: 3.8% of Halo's time on the Wii went to it). One call instead of three
+ * also makes each of a title's indirect call sites about 30 bytes smaller. (recomp_dispatch.c
+ * defines RECOMP_DISPATCH_H and its own recomp_func_t after this header: it makes no calls.) */
+#ifndef RECOMP_DISPATCH_H
+recomp_func_t wl_xb_lookup(uint32_t xbox_va);
+#endif
+#ifndef RECOMP_RESOLVE
+#define RECOMP_RESOLVE(va) wl_xb_lookup(va)
+#endif
+
 /**
  * RECOMP_ICALL - Indirect call through the dispatch table.
  *
@@ -1241,9 +1254,7 @@ extern volatile uint64_t g_icall_guard_misses;
         recomp_icall_not_code_log(_va); \
         g_esp += 4; eax = 0; break; \
     } \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = RECOMP_RESOLVE(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
@@ -1265,9 +1276,7 @@ extern volatile uint64_t g_icall_guard_misses;
         recomp_icall_not_code_log(_va); \
         g_esp = (saved_esp); eax = 0; break; \
     } \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = RECOMP_RESOLVE(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
@@ -1283,9 +1292,7 @@ extern volatile uint64_t g_icall_guard_misses;
         recomp_icall_not_code_log(_va); \
         g_esp += 4; eax = 0; break; \
     } \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = RECOMP_RESOLVE(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
@@ -1308,9 +1315,7 @@ extern volatile uint64_t g_icall_guard_misses;
         g_esp = (saved_esp); eax = 0; break; \
     } \
     RECOMP_ICALL_OBSERVE_SITE((site), _va); \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = RECOMP_RESOLVE(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
@@ -1327,9 +1332,7 @@ extern volatile uint64_t g_icall_guard_misses;
         g_esp += 4; eax = 0; break; \
     } \
     RECOMP_ICALL_OBSERVE_SITE((site), _va); \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = RECOMP_RESOLVE(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
@@ -1345,9 +1348,7 @@ extern volatile uint64_t g_icall_guard_misses;
  */
 #define RECOMP_ITAIL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = RECOMP_RESOLVE(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \

@@ -38,8 +38,43 @@ void recomp_trace_esp(const char *name, const char *tag);
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0, uint32_t edi0, uint32_t esp0);
 void recomp_call_profile_hit(uint32_t va);
 
+// ---- Indirect call targets ---------------------------------------------------------------------
+
+// Every indirect call and jump of generated code resolves its target through wl_xb_lookup
+// (RECOMP_RESOLVE in recomp_types.h). The generated table's recomp_lookup is a binary search over
+// every translated function (13 probes for Halo's 7,600, with a mispredicted branch at most of
+// them: 3.8% of a10's time on the Wii, most of it the CRT's qsort calling its comparator), so the
+// answers are kept in a direct-mapped cache in front of it: a hit is an index, a load, a compare.
+// 4096 entries (32 KB of bss): the targets one frame of a game reaches are a few hundred.
+//
+// Only what the manual and generated tables give is kept. Both are fixed for a run (a title that
+// changes what its own recomp_lookup_manual answers calls wl_xb_lookup_flush), so an entry never
+// goes stale. A kernel thunk is not kept: its lookup tells the dispatcher which slot is coming
+// (g_pending_slot), so it has to run every time. Guest code runs under the guest lock, one thread
+// at a time, which is what makes the two-word entries safe to fill without anything more.
+#define ICACHE_BITS 12u
+#define ICACHE_SIZE (1u << ICACHE_BITS)
+
+typedef struct {
+    uint32_t va;
+    recomp_func_t fn; // NULL: empty (an entry is never filled with a miss)
+} ICacheEntry;
+
+static ICacheEntry g_icache[ICACHE_SIZE];
+
+// Function starts are mostly 16-aligned and the code spans a few MB: the bits above the alignment
+// with the bits a cache size higher folded in, so code 64 KB apart does not collide every time.
+static inline uint32_t icache_index(uint32_t va) {
+    return ((va >> 2) ^ (va >> (2u + ICACHE_BITS))) & (ICACHE_SIZE - 1u);
+}
+
+void wl_xb_lookup_flush(void) {
+    memset(g_icache, 0, sizeof g_icache);
+}
+
 void wl_xb_set_manual_lookup(WlXbManualLookup fn) {
     g_manual = fn;
+    wl_xb_lookup_flush(); // the manual table comes first: what it now answers wins
 }
 
 __attribute__((weak)) recomp_func_t recomp_lookup_manual(uint32_t xbox_va) {
@@ -52,15 +87,28 @@ __attribute__((weak)) recomp_func_t recomp_lookup_manual(uint32_t xbox_va) {
 // pull it in.
 extern recomp_func_t recomp_lookup(uint32_t xbox_va) __attribute__((weak));
 
-recomp_func_t wl_xb_lookup(uint32_t va) {
+// The miss: manual, generated, kernel, as the generated code used to ask them itself. A title's code
+// lies in its XBE's sections, never in the thunks' synthetic range, so a thunk skips the search.
+__attribute__((noinline)) static recomp_func_t lookup_miss(uint32_t va, ICacheEntry *e) {
     recomp_func_t fn = recomp_lookup_manual(va);
-    if (fn == NULL && recomp_lookup != NULL) {
+    if (fn == NULL && va < WL_XB_THUNK_BASE && recomp_lookup != NULL) {
         fn = recomp_lookup(va);
     }
-    if (fn == NULL) {
-        fn = recomp_lookup_kernel(va);
+    if (fn != NULL) {
+        e->va = va;
+        e->fn = fn;
+        return fn;
     }
-    return fn;
+    return recomp_lookup_kernel(va);
+}
+
+recomp_func_t wl_xb_lookup(uint32_t va) {
+    ICacheEntry *e = &g_icache[icache_index(va)];
+    recomp_func_t fn = e->fn;
+    if (__builtin_expect(e->va == va && fn != NULL, 1)) {
+        return fn;
+    }
+    return lookup_miss(va, e);
 }
 
 void wl_xb_set_code_bounds(uint32_t lo, uint32_t hi) {

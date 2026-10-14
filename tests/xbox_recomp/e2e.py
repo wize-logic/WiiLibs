@@ -76,6 +76,7 @@ void recomp_icall_fail_log(uint32_t va) { printf("icall fail %08x\n", (unsigned)
 void recomp_icall_not_code_log(uint32_t va) { printf("icall not code %08x\n", (unsigned)va); }
 recomp_func_t recomp_lookup_manual(uint32_t va) { (void)va; return 0; }
 recomp_func_t recomp_lookup_kernel(uint32_t va) { (void)va; return 0; }
+recomp_func_t wl_xb_lookup(uint32_t va) { recomp_func_t f = recomp_lookup_manual(va); if (!f) f = recomp_lookup(va); return f ? f : recomp_lookup_kernel(va); } /* RECOMP_RESOLVE */
 uint64_t xbox_ReadTimeStampCounter(void) { return 0; }
 void recomp_trace_enter(const char *n, uint32_t v) { (void)n; (void)v; }
 void recomp_trace_exit(const char *n, uint32_t v) { (void)n; (void)v; }

@@ -29,7 +29,7 @@ static void *const k_runtime_fns[] = {
     (void *)recomp_icall_not_code_log, (void *)recomp_debug_service, (void *)xbox_ReadTimeStampCounter,
     (void *)recomp_setjmp_slot,   (void *)recomp_guest_longjmp,  (void *)recomp_unimpl,
     (void *)recomp_trace_enter,   (void *)recomp_trace_exit,     (void *)recomp_trace_esp,
-    (void *)wl_xb_safe_point,
+    (void *)wl_xb_safe_point,     (void *)wl_xb_lookup,
 };
 
 TEST unions_are_little_endian(void) {
@@ -115,11 +115,57 @@ TEST runtime_functions_exist(void) {
     PASS();
 }
 
+// The indirect-call lookup's cache (thunk.c) against a manual table that counts its calls: every
+// answer right whatever collides in the cache, a repeated target answered without asking again, and
+// a new manual table seen at once.
+static uint32_t g_manual_calls;
+static void fn_even(void) {}
+static void fn_odd(void) {}
+static recomp_func_t manual_by_parity(uint32_t va) {
+    g_manual_calls++;
+    if (va < 0x00010000u || va >= 0x00410000u) {
+        return NULL;
+    }
+    return ((va >> 4) & 1u) != 0 ? fn_odd : fn_even;
+}
+static recomp_func_t manual_none(uint32_t va) {
+    (void)va;
+    g_manual_calls++;
+    return NULL;
+}
+
+TEST lookup_cache(void) {
+    wl_xb_set_manual_lookup(manual_by_parity);
+    // 0x40000 starts 16 bytes apart (every cache slot taken many times over), twice, interleaved
+    // with one target looked up again and again
+    for (int pass = 0; pass < 2; pass++) {
+        for (uint32_t va = 0x00010000u; va < 0x00410000u; va += 16u) {
+            ASSERT(wl_xb_lookup(va) == (((va >> 4) & 1u) != 0 ? fn_odd : fn_even));
+            ASSERT(wl_xb_lookup(0x00012340u) == fn_even);
+        }
+    }
+    g_manual_calls = 0;
+    ASSERT(wl_xb_lookup(0x00012340u) == fn_even);
+    ASSERT(wl_xb_lookup(0x00012350u) == fn_odd);
+    ASSERT(wl_xb_lookup(0x00012340u) == fn_even);
+    ASSERT(g_manual_calls <= 1u); // 0x12340 was cached
+    g_manual_calls = 0;
+    ASSERT(wl_xb_lookup(0x00500000u) == NULL); // nothing there: asked every time, never kept
+    ASSERT(wl_xb_lookup(0x00500000u) == NULL);
+    ASSERT_EQ_FMT(2u, g_manual_calls, "%u");
+    ASSERT(wl_xb_lookup(0) == NULL);
+    wl_xb_set_manual_lookup(manual_none); // forgets what the old table answered
+    ASSERT(wl_xb_lookup(0x00012340u) == NULL);
+    wl_xb_set_manual_lookup(NULL);
+    PASS();
+}
+
 SUITE(abi_suite) {
     RUN_TEST(unions_are_little_endian);
     RUN_TEST(registers_save_and_load);
     RUN_TEST(memory_macros_agree);
     RUN_TEST(runtime_functions_exist);
+    RUN_TEST(lookup_cache);
 }
 
 GREATEST_MAIN_DEFS();

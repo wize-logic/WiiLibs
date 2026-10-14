@@ -23,6 +23,8 @@ a little-endian one:
 - `RECOMP_FP_PC` (x87 precision control at 24 bits) rounds inline when the result is a normal float
   and calls the exact slow path, out of line, otherwise;
 - the indirect-call trace ring and counter exist only with `WL_RECOMP_ICALL_TRACE`;
+- an indirect call or jump resolves its target with one call, `RECOMP_RESOLVE` (`wl_xb_lookup`),
+  not three: the runtime caches the answers in front of the generated binary search;
 - `MMX_CVT_F2I` rounds independently of the host's rounding mode;
 - GCC only: `#error` when the compiler lacks `scalar_storage_order` (clang ignores it).
 
@@ -71,7 +73,8 @@ Functions:
 
 | Symbol | What |
 |---|---|
-| `recomp_func_t recomp_lookup_manual(uint32_t va)` | the title's hand-written functions by guest address, tried first on every indirect call; `NULL` when none (a title overrides it: make the runtime's default weak, or a hook) |
+| `recomp_func_t wl_xb_lookup(uint32_t va)` | every indirect call and jump (`RECOMP_RESOLVE`): the three below in order (manual, generated, kernel), `NULL` when none answers; wl/xboxrt's keeps the manual and generated answers in a direct-mapped cache |
+| `recomp_func_t recomp_lookup_manual(uint32_t va)` | the title's hand-written functions by guest address, asked first by `wl_xb_lookup`; `NULL` when none (a title overrides it: make the runtime's default weak, or a hook); the same answer for an address all run long (a cache keeps it) |
 | `recomp_func_t recomp_lookup_kernel(uint32_t va)` | kernel thunks (synthetic addresses 0xFE0000xx and up) |
 | `void recomp_icall_fail_log(uint32_t va)` | an indirect call to code with no translation |
 | `void recomp_icall_not_code_log(uint32_t va)` | an indirect call to an address that is not code (rate-limit it) |

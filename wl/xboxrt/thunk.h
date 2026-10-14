@@ -40,12 +40,19 @@ int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
 // <setjmp.h>'s jmp_buf comes from the generated code's header)
 
 // The title's manual overrides: what the default recomp_lookup_manual asks (NULL: none). A title
-// may instead define recomp_lookup_manual itself (the default is weak).
+// may instead define recomp_lookup_manual itself (the default is weak); either must give the same
+// answer for an address for as long as it is used, or call wl_xb_lookup_flush when that changes.
 typedef recomp_func_t (*WlXbManualLookup)(uint32_t xbox_va);
 void wl_xb_set_manual_lookup(WlXbManualLookup fn);
 
 // The way an indirect call resolves `va`: manual, generated, kernel. NULL when nothing is there.
+// Generated code calls it for every indirect call and jump (RECOMP_RESOLVE in recomp_types.h); the
+// manual and generated answers are cached (direct-mapped, 4096 entries), the kernel's never are.
+// Guest code only: called with the guest lock held.
 recomp_func_t wl_xb_lookup(uint32_t va);
+// Forgets the cached answers: for a title whose own recomp_lookup_manual changes what it answers
+// (wl_xb_set_manual_lookup does it itself).
+void wl_xb_lookup_flush(void);
 
 // ---- Kernel thunk slots --------------------------------------------------------------------------
 

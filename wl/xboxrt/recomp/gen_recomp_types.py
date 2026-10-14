@@ -32,6 +32,8 @@ WiiLibs' copy (wl/xboxrt/recomp/recomp_types.h) is that template, with WiiLibs' 
      a load of g_xb_attention and a branch, and wl_xb_safe_point() when another guest thread or
      interrupt work is waiting (a loop that only polls memory would otherwise hold the guest lock
      forever)
+ 13. the indirect-call macros resolve their target with one call, RECOMP_RESOLVE (wl/xboxrt's
+     wl_xb_lookup: manual, generated, kernel behind a direct-mapped cache), not three
 
 On a little-endian host the storage-order attribute does nothing and the byte swaps are
 identities, so the same header serves host tests.
@@ -360,6 +362,29 @@ void wl_xb_safe_point(void);
 """
 
 
+RESOLVE_SEQ = """    recomp_func_t _fn = recomp_lookup_manual(_va); \\
+    if (!_fn) _fn = recomp_lookup(_va); \\
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \\
+"""
+RESOLVE_NEW = """    recomp_func_t _fn = RECOMP_RESOLVE(_va); \\
+"""
+RESOLVE_DEF_ANCHOR = "/**\n * RECOMP_ICALL - Indirect call through the dispatch table.\n"
+RESOLVE_DEF = """/* WiiLibs: an indirect call or jump resolves its target with one call, wl/xboxrt's wl_xb_lookup
+ * (thunk.h): the title's manual functions, the generated table and the kernel thunks in that order,
+ * as the three calls upstream makes here, behind a direct-mapped cache of the answers (the generated
+ * table is a binary search: 3.8% of Halo's time on the Wii went to it). One call instead of three
+ * also makes each of a title's indirect call sites about 30 bytes smaller. (recomp_dispatch.c
+ * defines RECOMP_DISPATCH_H and its own recomp_func_t after this header: it makes no calls.) */
+#ifndef RECOMP_DISPATCH_H
+recomp_func_t wl_xb_lookup(uint32_t xbox_va);
+#endif
+#ifndef RECOMP_RESOLVE
+#define RECOMP_RESOLVE(va) wl_xb_lookup(va)
+#endif
+
+""" + RESOLVE_DEF_ANCHOR
+
+
 PORT_OLD = """#ifndef RECOMP_PORT_IN
 #define RECOMP_PORT_IN(port, size) ((void)(port), (void)(size), 0u)
 #endif
@@ -392,6 +417,11 @@ def transform(src: str, commit: str, release: str, patches: list[str]) -> str:
         raise AnchorError(f"edit 'icall trace': expected the trace sequence in at least 5 macros, found {n}")
     src = src.replace(TRACE_SEQ, TRACE_NEW)
     src = replace_once(src, TRACE_DEF_ANCHOR, TRACE_DEF, "icall trace macro")
+    n = src.count(RESOLVE_SEQ)
+    if n < 6:
+        raise AnchorError(f"edit 'icall resolve': expected the lookup sequence in at least 6 macros, found {n}")
+    src = src.replace(RESOLVE_SEQ, RESOLVE_NEW)
+    src = replace_once(src, RESOLVE_DEF_ANCHOR, RESOLVE_DEF, "RECOMP_RESOLVE")
     src = replace_between(src, CVT_START, CVT_END, CVT_NEW, "MMX_CVT_F2I")
     for old, new in UNION_EDITS:
         src = replace_once(src, old, new, old)
