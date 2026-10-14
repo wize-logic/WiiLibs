@@ -7,7 +7,7 @@
 // the host's software GX (wl/gxsoft) as a PNG.
 //
 // usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N]
-//                          [--psh-dump N] [--programs FILE] [--stream]
+//                          [--gx-textures DIR] [--psh-dump N] [--programs FILE] [--stream]
 //   -v          a line for each clear, draw, frame and flip (with --png-gx, what each GX primitive
 //               covered and wrote); -vv also each draw's raster state
 //   --png-gx    DIR/frame_NNNN.png for each frame GX shows (the display copy of the EFB)
@@ -636,7 +636,7 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
 
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
-                    "[--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] "
+                    "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] "
                     "[--stream] [--cpu-transform]\n");
     return 2;
 }

@@ -46,7 +46,7 @@ typedef struct {
     const char *play;            // the play harness's setting (play.h: "script:<file>", "bot:<seed>",
                                  // "look:<seed>"); NULL: none, or on the Wii the first line of
                                  // <title_dir>/play.cfg when there is one
-    const char *play_out;        // where its screenshots go (NULL: beside the script)
+    const char *play_out;        // where its screenshots go (NULL: <title folder>/play)
     bool deterministic;          // the deterministic mode (thread.h): a virtual clock, so that two runs
                                  // with the same input run alike (the host: WL_XB_DETERMINISTIC=1)
     void (*kernel_config)(WlXkConfig *cfg, void *user); // edits the kernel's settings before init

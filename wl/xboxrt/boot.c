@@ -34,12 +34,11 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     memset(cfg, 0, sizeof *cfg);
     cfg->xbe_name = "default.xbe";
     cfg->ram_mb = 64;
-    // the host side: caches, buffers, render targets (12 MB: what the 20 MB kept before held beside
-    // 8 MB of textures), and the GX textures converted from the guest's in an arena of their own
-    // (14 MB: a10's opening draws ~11.6 MB of them in each frame; an arena too small for a frame's
-    // textures converts them again in every frame)
+    // the host side: caches, buffers, render targets (14 MB), and the GX textures converted from the
+    // guest's in an arena of their own (13 MB: a10 draws at most ~11.6 MB of them in a frame; an
+    // arena too small for a frame's textures converts them again in every frame)
     cfg->keep_free_bytes = 14u << 20;
-    cfg->texture_bytes = 13u << 20; // a10 draws at most 11.6 MB of them in a frame
+    cfg->texture_bytes = 13u << 20;
     cfg->htab_bytes = 256u << 10;
 }
 
@@ -330,8 +329,9 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
         vcache_kb = 0;
     }
 #if !defined(__wii__)
-    if (getenv("WL_XB_VCACHE_KB") != NULL) {
-        vcache_kb = (uint32_t)strtoul(getenv("WL_XB_VCACHE_KB"), NULL, 10);
+    const char *kb = getenv("WL_XB_VCACHE_KB");
+    if (kb != NULL && kb[0] != '\0') { // (set and empty: the default)
+        vcache_kb = (uint32_t)strtoul(kb, NULL, 10);
     }
 #endif
     wl_xb_gpu_set_vertex_cache(NULL, vcache_kb << 10);
