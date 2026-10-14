@@ -254,6 +254,19 @@ TEST an_idle_voice_traps_the_front_end_until_the_guest_answers(void) {
     ASSERT_FALSE(wl_xbox_apu_running(apu));
     // trapped: frames are silence and no new trap comes
     ASSERT_EQ(8u, wl_xbox_apu_run(apu, 8, out));
+    WlXboxApuStats st;
+    wl_xbox_apu_stats(apu, &st);
+    ASSERT_EQ(30u, st.trap_voice);
+    ASSERT_EQ(1u, st.trap_repeats);
+    // a handler that lets the front end run with the voice still in its list: the next frame
+    // traps on it again (counted: the runtime logs a voice the guest keeps leaving there)
+    w32(apu, 0x1100, 0x00);
+    w32(apu, 0x1000, 0xFFFFFFFFu);
+    ASSERT_EQ(1u, wl_xbox_apu_run(apu, 8, out));
+    wl_xbox_apu_stats(apu, &st);
+    ASSERT_EQ(30u, st.trap_voice);
+    ASSERT_EQ(2u, st.trap_repeats);
+    ASSERT_EQ(2u, st.traps);
     // DirectSound takes it out of the list (here: empties the 2D list) and lets the front end run
     w32(apu, 0x2054, 0xFFFF);
     w32(apu, 0x1100, 0x80);
@@ -261,9 +274,8 @@ TEST an_idle_voice_traps_the_front_end_until_the_guest_answers(void) {
     w32(apu, 0x1000, 0xFFFFFFFFu);
     ASSERT(wl_xbox_apu_running(apu));
     ASSERT_EQ(8u, wl_xbox_apu_run(apu, 8, out));
-    WlXboxApuStats st;
     wl_xbox_apu_stats(apu, &st);
-    ASSERT_EQ(1u, st.traps);
+    ASSERT_EQ(2u, st.traps);
     wl_xbox_apu_destroy(apu);
     PASS();
 }

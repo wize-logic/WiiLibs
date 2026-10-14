@@ -39,7 +39,7 @@
 static const uint16_t k_ordinals[] = {
     127, 126, 268, 53, 51, 8, 189, 225, 186, 233, 234, 235, 187, 192, 221, 255, 258, 291, 277, 294, 108, 145, 159, 158,
     113, 107, 149, 119, 109, 98, 44, 190, 202, 219, 236, 211, 226, 207, 210, 218, 184, 199, 217, 166, 171, 173, 168, 305,
-    304, 289, 279, 362, 335, 336, 337, 340, 338, 339, 24, 99, 232, 238, 112, 132, 128, 156, 322, 224,
+    304, 289, 279, 362, 335, 336, 337, 340, 338, 339, 24, 99, 232, 238, 112, 132, 128, 156, 322, 224, 129, 161,
 };
 enum {
     S_PERF_FREQ, S_PERF_COUNTER, S_COMPARE_MEMORY, S_INTERLOCKED_INC, S_INTERLOCKED_CMPXCHG, S_DBGPRINT,
@@ -52,7 +52,7 @@ enum {
     S_MM_GPU_INSTANCE, S_RTL_TIME_TO_FIELDS, S_RTL_FIELDS_TO_TIME, S_RTL_INIT_ANSI, S_RTL_EQUAL_STRING,
     S_RTL_SPRINTF, S_SHA_INIT, S_SHA_UPDATE, S_SHA_FINAL, S_HMAC, S_RC4_KEY, S_RC4_CRYPT, S_EX_QUERY_NV,
     S_KE_DELAY, S_NT_USER_APC, S_NT_YIELD, S_KE_INIT_SEMAPHORE, S_KE_RELEASE_SEMAPHORE, S_KE_SYSTEM_TIME,
-    S_KE_TICK_COUNT, S_HW_INFO, S_NT_RESUME,
+    S_KE_TICK_COUNT, S_HW_INFO, S_NT_RESUME, S_KE_RAISE_TO_DPC, S_KF_LOWER_IRQL,
 };
 
 static uint8_t *g_image; // the XBE's bytes
@@ -623,6 +623,107 @@ TEST device_ticks_run_at_safe_points(void) {
     PASS();
 }
 
+// ---- A raised IRQL keeps the processor -------------------------------------------------------------
+// DirectSound edits its voice lists at DISPATCH_LEVEL (KeRaiseIrqlToDpcLevel) with no other lock,
+// and polls the APU's registers meanwhile. On the console nothing but interrupts runs then: the
+// device accesses run the ISR, but its DPC and a thread that would preempt the holder wait until
+// the IRQL comes down. (Given the lock at a device access, the service thread ran the DPC at its
+// own IRQL, and a ready thread ran too: Halo's DirectSound then lost a stopped voice for good.)
+
+#define RAISED_DEV_VA 0xFEF01000u
+#define RAISED_LINE 10u
+
+static volatile uint32_t g_raised_reads;
+static volatile bool g_raised_irq;
+static uint32_t g_raised_dpc, g_raised_isr_runs;
+
+static uint32_t raised_dev_read(void *user, uint32_t off, unsigned size) {
+    (void)user;
+    (void)off;
+    (void)size;
+    if (++g_raised_reads == 50u) {
+        g_raised_irq = true; // the device raises its line in the middle of the raised section
+    }
+    return g_raised_reads;
+}
+
+static void raised_dev_write(void *user, uint32_t off, uint32_t v, unsigned size) {
+    (void)user;
+    (void)off;
+    (void)v;
+    (void)size;
+    g_raised_irq = false; // acknowledged
+}
+
+static bool raised_level(void *user) {
+    (void)user;
+    return g_raised_irq;
+}
+
+static void raised_isr(void) {
+    // BOOLEAN ServiceRoutine(PKINTERRUPT, PVOID): acknowledge at the device, queue the DPC
+    g_raised_isr_runs++;
+    wl_xb_wr32(RAISED_DEV_VA, 1);
+    uint32_t esp = g_esp;
+    KN(S_KE_INSERT_DPC, g_raised_dpc, 0, 0);
+    g_esp = esp;
+    g_eax = 1;
+    guest_ret(8);
+}
+
+TEST a_raised_irql_keeps_the_processor(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    WlXbDevice dev = {"raised", RAISED_DEV_VA, 0x1000u, raised_dev_read, raised_dev_write, NULL};
+    ASSERT_EQ(WL_OK, wl_xb_mmio_register(&dev));
+    wl_xb_irq_set_level(RAISED_LINE, raised_level, NULL);
+    uint32_t irql = gmem(4), ki = gmem(0x80);
+    g_raised_dpc = gmem(0x20);
+    KN(S_KE_INIT_DPC, g_raised_dpc, guest_fn(5, dpc_routine), 0xD15Cu);
+    uint32_t vector = KN(S_HAL_VECTOR, RAISED_LINE, irql);
+    ASSERT(wl_xb_rd8(irql) > 2u); // a device's IRQL: above DISPATCH_LEVEL
+    KN(S_KE_INIT_INTERRUPT, ki, guest_fn(6, raised_isr), 0, vector, wl_xb_rd8(irql), 0 /* level */, 0);
+    ASSERT_EQ_FMT(1u, KN(S_KE_CONNECT_INTERRUPT, ki), "%u");
+    g_dpc_runs = 0;
+    g_raised_isr_runs = 0;
+    g_raised_reads = 0;
+    g_hi_flag = gmem(4);
+    g_hi_tp = gmem(8);
+    wl_xb_wr64(g_hi_tp, (uint64_t)(int64_t)-100000); // 10 ms
+    WlXbThreadStats ts0, ts1;
+    wl_xb_thread_stats(&ts0);
+
+    ASSERT_EQ_FMT(0u, K0(S_KE_RAISE_TO_DPC), "%u"); // the old IRQL
+    // a thread made now is ready at once (with the holder's priority; it raises its own, sleeps
+    // and marks the flag): not while the holder stays at DISPATCH_LEVEL
+    uint32_t hp = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(4, hi_routine)), "%08x");
+    uint64_t t0 = now_ms();
+    while (now_ms() - t0 < 60u) { // the quantum (10 ms) over many times, the thread's sleep too
+        (void)wl_xb_rd32(RAISED_DEV_VA + 4u);
+    }
+    ASSERT_EQ_FMT(1u, g_raised_isr_runs, "%u"); // the interrupt came in at a device access
+    ASSERT(!g_raised_irq);
+    ASSERT_EQ_FMT(0u, g_dpc_runs, "%u"); // its DPC waits for the IRQL
+    ASSERT_EQ_FMT(0u, wl_xb_rd32(g_hi_flag), "%u"); // no other thread ran
+    wl_xb_thread_stats(&ts1);
+    ASSERT(ts1.raised_holds > ts0.raised_holds);
+
+    // KfLowerIrql runs the DPC at once; the other thread gets the lock at a later safe point
+    g_ecx = 0;
+    K0(S_KF_LOWER_IRQL);
+    ASSERT_EQ_FMT(1u, g_dpc_runs, "%u");
+    ASSERT_EQ_FMT(0xD15Cu, g_dpc_arg, "%08x");
+    t0 = now_ms();
+    while (wl_xb_rd32(g_hi_flag) == 0 && now_ms() - t0 < 3000u) {
+        (void)wl_xb_rd32(RAISED_DEV_VA + 4u);
+    }
+    ASSERT_EQ_FMT(1u, wl_xb_rd32(g_hi_flag), "%u");
+    KN(S_NT_CLOSE, wl_xb_rd32(hp));
+    PASS();
+}
+
 // ---- Files ----------------------------------------------------------------------------------------
 
 static uint32_t g_apc_runs, g_apc_ctx, g_apc_info;
@@ -892,6 +993,7 @@ SUITE(kernel_suite) {
     RUN_TEST(timers_dpcs_interrupts);
     RUN_TEST(device_polls_are_safe_points);
     RUN_TEST(device_ticks_run_at_safe_points);
+    RUN_TEST(a_raised_irql_keeps_the_processor);
     RUN_TEST(files_dvd_and_overlapped);
     RUN_TEST(files_sparse_cache_drive);
     RUN_TEST(virtual_and_contiguous_memory);
