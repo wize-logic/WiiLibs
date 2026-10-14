@@ -29,7 +29,9 @@ enum {
     WL_NV2A_TEXCACHE_PENDING = 256,
     WL_NV2A_TEXCACHE_FULL_HASH = 256 * 1024,
     // textures that found no memory, not tried again in the same frame
-    WL_NV2A_TEXCACHE_REFUSED = 16
+    WL_NV2A_TEXCACHE_REFUSED = 16,
+    // the decoders' scratch kept between conversions at most (a larger one is had for one)
+    WL_NV2A_TEXCACHE_SCRATCH_KEPT = 256 * 1024
 };
 
 typedef struct WlNv2aTexCacheConfig {
@@ -116,3 +118,14 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
 // and the next frame checks each texture again.
 void wl_nv2a_texcache_frame_done(WlNv2aTexCache *cache);
 void wl_nv2a_texcache_stats(const WlNv2aTexCache *cache, WlNv2aTexCacheStats *out);
+
+// The memory the cache holds, for a census of the host's heap.
+typedef struct WlNv2aTexCacheMemory {
+    size_t images;        // the images kept (stats.bytes)
+    size_t pending;       // images evicted in this frame, given back at its end
+    size_t scratch;       // the decoders' scratch (of the heap)
+    size_t arena;         // the arena's bytes (0: the images are the heap's)
+    size_t arena_used;    // of those, in blocks (headers included)
+    size_t arena_largest; // its largest free block (the largest image that fits without evicting)
+} WlNv2aTexCacheMemory;
+void wl_nv2a_texcache_memory(const WlNv2aTexCache *cache, WlNv2aTexCacheMemory *out);

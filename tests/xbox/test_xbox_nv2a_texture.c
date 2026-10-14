@@ -522,6 +522,74 @@ TEST cache_watched_and_in_an_arena(void) {
     PASS();
 }
 
+// An arena in pieces: a large image empties the window of images beside a gap whose newest was drawn
+// longest ago, not every image by age until one happens to fit.
+TEST cache_arena_window(void) {
+    static WlNv2aTexCache cache;
+    static uint8_t arena[8 * (1024 + 32) + 32];
+    static const unsigned order[] = {2, 4, 6, 3, 5, 7}; // their last frames, oldest first
+    TGuest g;
+    WlNv2aTexCacheConfig cfg;
+    WlNv2aTexture t, wide, other[8];
+    WlNv2aTexCacheStats s;
+    bool made;
+    unsigned i;
+    uint32_t evicted;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    // 16x16 A8R8G8B8 images (1 KiB), and a 32x16 one (2 KiB: two of them side by side)
+    set_texture(&g, 0, 0x100000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 4, 4, 1, false));
+    set_texture(&g, 1, 0x200000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 5, 4, 1, false));
+    t_kick(&g);
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 0, &t));
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 1, &wide));
+    memset(&cfg, 0, sizeof cfg);
+    cfg.arena = arena;
+    cfg.arena_bytes = sizeof arena;
+    wl_nv2a_texcache_init(&cache, &cfg);
+    for (i = 0; i < 8; i++) {
+        other[i] = t;
+        other[i].phys = 0x100000 + 0x1000 * i;
+        other[i].format_word ^= i << 28; // (another key)
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made) != NULL); // (in address order)
+    }
+    for (i = 0; i < 6; i++) {
+        wl_nv2a_texcache_frame_done(&cache);
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[order[i]], false, &made) != NULL);
+        ASSERT_FALSE(made);
+    }
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[0], false, &made) != NULL);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[1], false, &made) != NULL);
+    wl_nv2a_texcache_stats(&cache, &s);
+    evicted = s.evicted;
+    // 0 and 1 are drawn in this frame; by age 2, 4, 6 would go before 3 makes 2 and 3 a window
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &wide, false, &made) != NULL);
+    ASSERT(made);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(2u, s.evicted - evicted);
+    ASSERT_EQ(0u, s.no_memory);
+    for (i = 4; i < 8; i++) {
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made) != NULL);
+        ASSERT_FALSE(made); // (kept)
+    }
+    // with nothing left that may go, a second wide one finds no window and evicts nothing
+    {
+        WlNv2aTexture wide2 = wide;
+        wide2.phys = 0x300000;
+        evicted = s.evicted;
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &wide2, false, &made) == NULL);
+        wl_nv2a_texcache_stats(&cache, &s);
+        ASSERT_EQ(evicted, s.evicted);
+        ASSERT_EQ(1u, s.no_memory);
+    }
+    ASSERT(wl_heap_check(&cache.heap));
+    wl_nv2a_texcache_clear(&cache);
+    ASSERT_EQ(0u, cache.heap.live);
+    t_destroy(&g);
+    PASS();
+}
+
 SUITE(texture_suite) {
     RUN_TEST(stage_registers_decoded);
     RUN_TEST(conversions_sample_as_the_nv2a_would);
@@ -530,6 +598,7 @@ SUITE(texture_suite) {
     RUN_TEST(cube_maps_become_sphere_maps);
     RUN_TEST(cache_keeps_finds_changes_and_evicts);
     RUN_TEST(cache_watched_and_in_an_arena);
+    RUN_TEST(cache_arena_window);
 }
 
 GREATEST_MAIN_DEFS();

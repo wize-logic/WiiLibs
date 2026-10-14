@@ -23,6 +23,9 @@ typedef struct WlHeap {
     uint32_t frees;
     uint32_t live;  // allocs - frees
     uint32_t fails; // allocation requests that returned NULL
+    // false (wl_heap_init's): the first free block that fits; true: the smallest that fits (slower
+    // with a long free list, but it keeps the large free blocks whole for large requests)
+    bool best_fit;
 } WlHeap;
 
 // `memory` may be unaligned: the heap trims it to 32-byte alignment. Needs >= 128 bytes.

@@ -74,6 +74,7 @@ void wl_heap_init(WlHeap *heap, void *memory, size_t size, const char *name) {
     heap->name = name;
     heap->used = heap->peak = 0;
     heap->allocs = heap->frees = heap->live = heap->fails = 0;
+    heap->best_fit = false;
     WlHeapBlock *b = (WlHeapBlock *)(void *)heap->base;
     b->size = (uint32_t)size;
     b->prev_size = 0;
@@ -101,6 +102,16 @@ void *wl_heap_alloc(WlHeap *heap, size_t size, size_t align, const char *site, u
     WlHeapBlock *b = heap->free_head;
     while (b != NULL && b->size < need) {
         b = links(b)->next;
+    }
+    if (b != NULL && heap->best_fit && b->size != need) {
+        for (WlHeapBlock *c = links(b)->next; c != NULL; c = links(c)->next) {
+            if (c->size >= need && c->size < b->size) {
+                b = c;
+                if (c->size == need) {
+                    break;
+                }
+            }
+        }
     }
     if (b == NULL) {
         heap->fails++;
