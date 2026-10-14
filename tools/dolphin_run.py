@@ -185,7 +185,7 @@ def gdb_backtrace(process) -> str:
 
 def dolphin_ini(sd_image: str, sd_folder: str, dump_frames: bool, gdb_port: int = 0, video: str = "",
                 panics: bool = False, single_core: bool = False, mmu: bool = False,
-                unthrottled: bool = False) -> str:
+                unthrottled: bool = False, dump_audio: bool = False) -> str:
     lines = ["[Interface]", "ConfirmStop = False", f"UsePanicHandlers = {panics}", "ShowLogWindow = False",
              "[Analytics]", "PermissionAsked = True", "Enabled = False",
              # (the console's own clock: a person's global Dolphin.ini may overclock the CPU, which
@@ -209,6 +209,9 @@ def dolphin_ini(sd_image: str, sd_folder: str, dump_frames: bool, gdb_port: int 
         lines.append(f"WiiSDCardSyncFolder = {sd_folder}")
     if dump_frames:
         lines += ["[Movie]", "DumpFrames = True", "DumpFramesSilent = True"]
+    if dump_audio:
+        # (the audio the console sent out, as WAV files in User/Dump/Audio)
+        lines += ["[DSP]", "DumpAudio = True", "DumpAudioSilent = True"]
     return "\n".join(lines) + "\n"
 
 
@@ -413,6 +416,8 @@ def main() -> int:
                         help="the GPU emulated on the CPU's thread (slower; no CPU/GPU races)")
     parser.add_argument("--mmu", action="store_true",
                         help="Dolphin's full MMU emulation (page tables, and a DSI on a miss)")
+    parser.add_argument("--dump-audio", type=Path, metavar="DIR",
+                        help="copy the audio the console sent out (Dolphin's WAV dumps) into this folder")
     parser.add_argument("--unthrottled", action="store_true",
                         help="no speed limit: a long run finishes sooner, the program sees no difference")
     parser.add_argument("--panics", action="store_true",
@@ -457,7 +462,7 @@ def main() -> int:
                                                               bool(args.dump_frames),
                                                               GDB_PORT if args.backtrace else 0, args.video,
                                                               args.panics, args.single_core, args.mmu,
-                                                              args.unthrottled))
+                                                              args.unthrottled, bool(args.dump_audio)))
     (user / "Config" / "GFX.ini").write_text(gfx_ini(bool(args.dump_frames), args.wii_aspect == "16:9"))
     log = user / "Logs" / "dolphin.log"
     if log.exists():
@@ -532,6 +537,12 @@ def main() -> int:
         for frame in frames:
             shutil.copyfile(frame, args.dump_frames / frame.name)
         print(f"frames: {len(frames)} in {args.dump_frames}")
+    if args.dump_audio:
+        waves = sorted((user / "Dump" / "Audio").glob("*.wav"))
+        args.dump_audio.mkdir(parents=True, exist_ok=True)
+        for wave in waves:
+            shutil.copyfile(wave, args.dump_audio / wave.name)
+        print(f"audio: {len(waves)} files in {args.dump_audio}")
 
     lines = osreport_lines(log)
     for line in lines:
