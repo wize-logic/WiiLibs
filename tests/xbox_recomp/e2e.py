@@ -17,7 +17,9 @@ image sits), then:
     WiiLibs' runtime header for big-endian PowerPC Linux (run under qemu-ppc) and for the host,
     with a small runtime that loads the image into guest memory and calls the lifted run(seed).
 
-Outputs (the return value and the program's out[] words) must match for every seed.
+Outputs (the return value and the program's out[] words) must match for every seed. Each program is
+lifted twice: with the x87 state in memory at every operation, and with --x87-locals (the lifter's
+x87_locals.py: the stack, control word and compare result in C locals inside a function).
 
     e2e.py --build DIR [--target ppc-be|host|both] [-k NAME]
 
@@ -49,6 +51,9 @@ PROGRAMS = {
     "prog_sse": dict(flags=["-mmmx", "-msse", "-mfpmath=sse"], nout=92),
     # assembly: jumps and calls into other functions' bodies, false function starts (*_false)
     "prog_interior": dict(src="prog_interior.S", flags=[], nout=10),
+    # assembly: x87 depth through branches, calls made with values live on the stack, joins at
+    # different depths, rounding modes, compares, precision control 24
+    "prog_x87_paths": dict(src="prog_x87_paths.S", flags=[], nout=62),
 }
 SEEDS = [1, 12345, 0xDEADBEEF, 7, 0x80000000, 0x0F0F0F0F]
 # Programs (and why) that may not match on a target. Keep empty unless understood.
@@ -135,7 +140,7 @@ def build_image(name, spec, work: Path):
     return syms, funcs
 
 
-def lift(name, work: Path, funcs, pipe: Path):
+def lift(name, work: Path, funcs, pipe: Path, x87_locals=False):
     """Lift every function with the patched pipeline's FunctionTranslator; write gen/."""
     from tools.recomp import config
     from tools.recomp.translator import FunctionTranslator
@@ -154,10 +159,11 @@ def lift(name, work: Path, funcs, pipe: Path):
         if sym.endswith("_false"):
             db[a]["detection_method"] = "imm_ref_target"
     ft = FunctionTranslator(image, db)
+    ft.x87_locals = x87_locals
     # as tools.recomp does last: a called address inside a body gets a function of its own
     ft.discover_interior_entries()
     db = {a: info for a, info in ft.func_db.items() if a not in ft.owned_function_starts}
-    gen = work / f"{name}_gen"
+    gen = work / (f"{name}_x87l_gen" if x87_locals else f"{name}_gen")
     gen.mkdir(exist_ok=True)
     chunks, protos = [], []
     for a in sorted(db):
@@ -180,7 +186,7 @@ def lift(name, work: Path, funcs, pipe: Path):
         "    unsigned i;\n"
         "    for (i = 0; i < sizeof T / sizeof T[0]; i++) if (T[i].va == va) return T[i].fn;\n"
         "    return 0;\n}\n")
-    return gen, unimpl
+    return gen, unimpl, dict(ft.x87_stats)
 
 
 def main(argv=None) -> int:
@@ -215,44 +221,48 @@ def main(argv=None) -> int:
             if args.k and args.k not in name:
                 continue
             syms, funcs = build_image(name, spec, work)
-            gen, unimpl = lift(name, work, funcs, pipe)
             entry, out = syms["run"], syms["out"]
-            code_hi = max(a + s for a, s, _ in funcs)
-            rt = (RUNTIME.replace("@BASE@", f"0x{BASE:X}").replace("@ENTRY@", f"sub_{entry:08X}")
-                  .replace("@OUT@", f"0x{out:08X}").replace("@NOUT@", str(spec["nout"]))
-                  .replace("@CODE_LO@", f"0x{BASE:08X}").replace("@CODE_HI@", f"0x{code_hi:08X}"))
-            (gen / "rt.c").write_text(rt)
             natives = {s: run([str(work / "loader"), f"{name}.bin", hex(entry), hex(out), str(spec["nout"]), hex(s)],
                               cwd=work) for s in SEEDS}
-            flags = ["-std=gnu11", args.opt, "-ffp-contract=off", "-fno-strict-aliasing", "-w",
-                     f"-I{args.header}", f"-I{gen}"]
-            srcs = [str(gen / f) for f in ("recomp_0000.c", "recomp_dispatch.c", "rt.c")]
-            for t in targets:
-                exe = work / f"{name}_{t}"
-                if t == "ppc-be":
-                    run(["powerpc-linux-gnu-gcc", "-static", "-mcpu=750"] + flags + srcs + ["-o", str(exe), "-lm"])
-                    emu = ["qemu-ppc"]
-                else:
-                    run(["gcc"] + flags + srcs + ["-o", str(exe), "-lm"])
-                    emu = []
-                bad = []
-                for s in SEEDS:
-                    got = run(emu + [str(exe), f"{name}.bin", hex(s)], cwd=work)
-                    want = natives[s]
-                    if got != want:
-                        diff = [f"{w.strip()} vs {g.strip()}" for w, g in zip(want.splitlines(), got.splitlines())
-                                if w != g]
-                        bad.append(f"seed {s:#x}: {len(diff)} word(s) differ: " + "; ".join(diff[:4]))
-                words = len(SEEDS) * (spec["nout"] + 1)
-                if bad and name not in EXPECTED:
-                    rc = 1
-                    print(f"[{t}] {name}: FAIL ({len(funcs)} functions)")
-                    for b in bad:
-                        print(f"[{t}]   {b}")
-                else:
-                    print(f"[{t}] {name}: {'OK' if not bad else 'expected: ' + EXPECTED[name]} -- {len(funcs)} "
-                          f"functions lifted, {words} words match the x86 CPU over {len(SEEDS)} seeds"
-                          + (f"; unimplemented: {unimpl}" if unimpl else ""))
+            for x87_locals in (False, True):
+                gen, unimpl, x87 = lift(name, work, funcs, pipe, x87_locals)
+                if x87_locals and not x87:
+                    continue  # no x87 code: the same C as the memory model
+                label = f"{name} (x87 locals: {x87})" if x87_locals else name
+                code_hi = max(a + s for a, s, _ in funcs)
+                rt = (RUNTIME.replace("@BASE@", f"0x{BASE:X}").replace("@ENTRY@", f"sub_{entry:08X}")
+                      .replace("@OUT@", f"0x{out:08X}").replace("@NOUT@", str(spec["nout"]))
+                      .replace("@CODE_LO@", f"0x{BASE:08X}").replace("@CODE_HI@", f"0x{code_hi:08X}"))
+                (gen / "rt.c").write_text(rt)
+                flags = ["-std=gnu11", args.opt, "-ffp-contract=off", "-fno-strict-aliasing", "-w",
+                         f"-I{args.header}", f"-I{gen}"]
+                srcs = [str(gen / f) for f in ("recomp_0000.c", "recomp_dispatch.c", "rt.c")]
+                for t in targets:
+                    exe = work / (f"{name}_x87l_{t}" if x87_locals else f"{name}_{t}")
+                    if t == "ppc-be":
+                        run(["powerpc-linux-gnu-gcc", "-static", "-mcpu=750"] + flags + srcs + ["-o", str(exe), "-lm"])
+                        emu = ["qemu-ppc"]
+                    else:
+                        run(["gcc"] + flags + srcs + ["-o", str(exe), "-lm"])
+                        emu = []
+                    bad = []
+                    for s in SEEDS:
+                        got = run(emu + [str(exe), f"{name}.bin", hex(s)], cwd=work)
+                        want = natives[s]
+                        if got != want:
+                            diff = [f"{w.strip()} vs {g.strip()}" for w, g in zip(want.splitlines(), got.splitlines())
+                                    if w != g]
+                            bad.append(f"seed {s:#x}: {len(diff)} word(s) differ: " + "; ".join(diff[:4]))
+                    words = len(SEEDS) * (spec["nout"] + 1)
+                    if bad and name not in EXPECTED:
+                        rc = 1
+                        print(f"[{t}] {label}: FAIL ({len(funcs)} functions)")
+                        for b in bad:
+                            print(f"[{t}]   {b}")
+                    else:
+                        print(f"[{t}] {label}: {'OK' if not bad else 'expected: ' + EXPECTED[name]} -- {len(funcs)} "
+                              f"functions lifted, {words} words match the x86 CPU over {len(SEEDS)} seeds"
+                              + (f"; unimplemented: {unimpl}" if unimpl else ""))
         return rc
     except RuntimeError as e:
         print(f"harness error:\n{e}")
