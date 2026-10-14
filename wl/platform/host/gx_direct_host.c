@@ -68,6 +68,8 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
     s.stats.layouts++;
 }
 
+void wl_platform_heap_exempt(bool on) __attribute__((weak));
+
 static WlGxDirectVertex *g_vertices;
 static uint32_t g_capacity, g_expected, g_received;
 static bool g_in_primitive;
@@ -78,7 +80,14 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
         return;
     }
     if (count > g_capacity) {
+        // (the recorder is the host's alone: kept out of the host heap's count, mem_census.h)
+        if (wl_platform_heap_exempt != NULL) {
+            wl_platform_heap_exempt(true);
+        }
         WlGxDirectVertex *grown = realloc(g_vertices, count * sizeof *grown);
+        if (wl_platform_heap_exempt != NULL) {
+            wl_platform_heap_exempt(false);
+        }
         if (grown == NULL) {
             return;
         }

@@ -5,7 +5,7 @@
 #   host   - dependency-free stubs over POSIX and pthreads, so application code runs in host tests
 #   ppc-be - the host stubs too (big-endian Linux under qemu, for tests)
 add_library(wl_platform STATIC
-    mem_heap.c mem.c heap_overflow.c heap_sites.c ring.c io.c fs.c gx_common.c gx_target.c gx_vertex.c stack.c tev.c backtrace.c net.c
+    mem_heap.c mem.c mem_census.c heap_overflow.c heap_sites.c ring.c io.c fs.c gx_common.c gx_target.c gx_vertex.c stack.c tev.c backtrace.c net.c
     posix.c present.c video_mode.c profile.c profile_arm.c hwcount.c hwcount_app.c stop.c input_shape.c input_reports.c input_gesture.c shutdown.c gx_fifo.c audio_gain.c overlay.c file_replace.c dircache.c
     home_menu.c home_menu_draw.c strap_screen.c strap_screen_draw.c home_shell.c)
 wl_target_defaults(wl_platform)
@@ -21,8 +21,12 @@ if(WL_PLATFORM STREQUAL "wii")
 else()
     find_package(Threads REQUIRED)
     target_sources(wl_platform PRIVATE
-        host/audio_host.c host/backtrace_host.c host/fs_host.c host/gx_host.c host/gx_direct_host.c host/gx_target_host.c host/hwcount_host.c host/input_host.c host/mem_host.c host/net_host.c host/profile_host.c host/stop_host.c
+        host/audio_host.c host/backtrace_host.c host/fs_host.c host/gx_host.c host/gx_direct_host.c host/gx_target_host.c host/heap_host.c host/hwcount_host.c host/input_host.c host/mem_host.c host/net_host.c host/profile_host.c host/stop_host.c
         host/random_host.c host/system_host.c host/tev_host.c host/thread_host.c)
     target_link_libraries(wl_platform PUBLIC Threads::Threads)
+    # host/heap_host.c replaces malloc for the census's cap, which a static link cannot do
+    if(CMAKE_EXE_LINKER_FLAGS MATCHES "-static" OR CMAKE_EXE_LINKER_FLAGS_INIT MATCHES "-static")
+        set_source_files_properties(host/heap_host.c PROPERTIES COMPILE_DEFINITIONS WL_HEAP_HOST_STATIC=1)
+    endif()
 endif()
 add_library(WiiLibs::platform ALIAS wl_platform)

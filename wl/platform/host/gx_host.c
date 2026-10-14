@@ -18,11 +18,98 @@ const WlHostGxState *wl_host_gx_state(void) {
     return &s;
 }
 
+// The renderer is the host's own stand-in for the console's GPU: what it allocates is kept out of
+// the host heap's count and cap (mem_census.h's wl_platform_heap_exempt; weak, so that a program
+// without the census does not get its malloc), which imitate the Wii's heap. So the renderer set
+// is called through these, each exempting the call.
+static WlHostGxRenderer g_inner;
+
+void wl_platform_heap_exempt(bool on) __attribute__((weak));
+
+static void exempt(bool on) {
+    if (wl_platform_heap_exempt != NULL) {
+        wl_platform_heap_exempt(on);
+    }
+}
+
+static void r_frame_begin(void *user, uint32_t clear_rgba) {
+    exempt(true);
+    g_inner.frame_begin(user, clear_rgba);
+    exempt(false);
+}
+
+static void r_frame_end(void *user, uint32_t width, uint32_t height) {
+    exempt(true);
+    g_inner.frame_end(user, width, height);
+    exempt(false);
+}
+
+static void r_draw(void *user, WlGxDirectPrim prim, const WlGxDirectVertex *vertices, uint32_t count) {
+    exempt(true);
+    g_inner.draw(user, prim, vertices, count);
+    exempt(false);
+}
+
+static void r_copy(void *user, int x, int y, uint32_t w, uint32_t h, void *dst, unsigned format, bool clear) {
+    exempt(true);
+    g_inner.copy(user, x, y, w, h, dst, format, clear);
+    exempt(false);
+}
+
+static void r_restore(void *user, const void *colour, const void *depth, uint32_t w, uint32_t h) {
+    exempt(true);
+    g_inner.restore(user, colour, depth, w, h);
+    exempt(false);
+}
+
+static void r_clear(void *user, bool colour, bool depth, uint32_t rgba, float z, int x, int y, int w, int h) {
+    exempt(true);
+    g_inner.clear(user, colour, depth, rgba, z, x, y, w, h);
+    exempt(false);
+}
+
+static void r_squeeze(void *user, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w) {
+    exempt(true);
+    g_inner.squeeze(user, back_w, back_h, x, w);
+    exempt(false);
+}
+
+static uint32_t r_peek(void *user, int x, int y) {
+    exempt(true);
+    uint32_t v = g_inner.peek(user, x, y);
+    exempt(false);
+    return v;
+}
+
+static void r_efb_alpha(void *user, bool on) {
+    exempt(true);
+    g_inner.efb_alpha(user, on);
+    exempt(false);
+}
+
+static void r_texture_invalidate(void *user) {
+    exempt(true);
+    g_inner.texture_invalidate(user);
+    exempt(false);
+}
+
 void wl_host_gx_set_renderer(const WlHostGxRenderer *renderer) {
+    memset(&g_renderer, 0, sizeof g_renderer);
     if (renderer != NULL) {
-        g_renderer = *renderer;
-    } else {
-        memset(&g_renderer, 0, sizeof g_renderer);
+        g_inner = *renderer;
+        g_renderer.user = renderer->user;
+#define WRAP(m) g_renderer.m = renderer->m != NULL ? r_##m : NULL
+        WRAP(frame_begin);
+        WRAP(frame_end);
+        WRAP(draw);
+        WRAP(copy);
+        WRAP(restore);
+        WRAP(clear);
+        WRAP(squeeze);
+        WRAP(peek);
+        WRAP(efb_alpha);
+        WRAP(texture_invalidate);
+#undef WRAP
     }
     g_renderer_set = renderer != NULL;
 }

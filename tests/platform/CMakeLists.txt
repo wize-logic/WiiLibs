@@ -61,6 +61,7 @@ wl_add_test(test_platform_heap_wrap SOURCES test_platform_heap_wrap.c
             ${PROJECT_SOURCE_DIR}/wl/platform/wii/heap_wrap_wii.c LIBS wl_platform LABELS unit be)
 # Who holds the heap: the accounting by call site that the wrap layer feeds.
 wl_add_test(test_platform_heap_sites SOURCES test_platform_heap_sites.c LIBS wl_platform LABELS unit be)
+wl_add_test(test_platform_mem_census SOURCES test_platform_mem_census.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_profile SOURCES test_platform_profile.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_stop SOURCES test_platform_stop.c LIBS wl_platform LABELS unit be)
 # Leaving the program: shutdown hooks, the system buttons' thread, the GX FIFO's size from its budget.
