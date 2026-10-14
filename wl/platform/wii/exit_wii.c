@@ -49,8 +49,9 @@ uint32_t wl_platform_system_events(void) {
 // The Homebrew Channel (and the loaders that copy it) leave a reload stub at 0x80001800 with
 // "STUBHAXX" after its first word; libogc's exit jumps there. Without one (Dolphin booting the DOL
 // itself) there is nothing to go back to and the jump lands at 0, so leaving powers off instead.
+// Dolphin writes the signature with no code before it (the first word 0): that is no stub either.
 static bool loader_stub(void) {
-    return memcmp((const void *)0x80001804, "STUBHAXX", 8) == 0;
+    return memcmp((const void *)0x80001804, "STUBHAXX", 8) == 0 && *(const volatile uint32_t *)0x80001800 != 0u;
 }
 
 WL_NORETURN void wl_platform_exit(WlExitTarget target) {
