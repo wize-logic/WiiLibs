@@ -99,6 +99,7 @@ typedef struct WlNv2aTexCache {
     unsigned refused_next;
     uint32_t refused_logged;
     uint32_t frame, serial;
+    bool capturing; // a capture ran at the last lookup
     WlNv2aTexCacheStats stats;
     // the decoders' scratch (grown as needed)
     void *scratch;

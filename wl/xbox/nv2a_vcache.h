@@ -88,7 +88,8 @@ typedef struct WlNv2aVCache {
     unsigned pending_count;
     WlHeap heap; // over the arena, when there is one
     uint32_t frame;
-    bool made; // an array made since wl_nv2a_vcache_made last said so
+    bool made;      // an array made since wl_nv2a_vcache_made last said so
+    bool capturing; // a capture ran at the last lookup
     WlNv2aVCacheStats stats;
 } WlNv2aVCache;
 

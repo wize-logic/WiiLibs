@@ -5,12 +5,14 @@
 // decoders of the rest), mip levels, a cube map's sphere map, and the cache: kept, found changed,
 // evicted within its budget; checked through a write watch (no texels read while its pages see no
 // store), its images in an arena of its own (room made by evicting, a texture without room not
-// tried again in the frame).
+// tried again in the frame); a capture begun inside a frame reads the textures checked before it
+// again.
 #include <math.h>
 #include <string.h>
 
 #include "greatest.h"
 #include "nv2a_test_util.h"
+#include "wl/xbox/nv2a_capture.h"
 #include "wl/xbox/nv2a_texcache.h"
 #include "wl/xbox/nv2a_texture.h"
 
@@ -590,6 +592,48 @@ TEST cache_arena_window(void) {
     PASS();
 }
 
+static WlResult sink_count(void *user, const void *data, uint32_t bytes) {
+    (void)data;
+    *(uint32_t *)user += bytes;
+    return WL_OK;
+}
+
+// A capture begun inside a frame: the textures checked before it are read again at their next use
+// (the capture must hold every texture its draws read), once.
+TEST cache_reads_again_when_a_capture_begins(void) {
+    static WlNv2aTexCache cache;
+    TGuest g;
+    WlNv2aTexture t;
+    WlNv2aTexCacheStats s;
+    WlNv2aCaptureSink sink;
+    uint32_t written = 0, before;
+    bool made;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    set_texture(&g, 0, 0x100000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 4, 4, 1, false));
+    t_kick(&g);
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 0, &t));
+    wl_nv2a_texcache_init(&cache, NULL);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(1u, s.checks);
+    sink.user = &written;
+    sink.write = sink_count;
+    ASSERT_EQ(WL_OK, wl_nv2a_capture_begin(g.dev, &sink));
+    before = written;
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT_FALSE(made);
+    ASSERT(written >= before + 16u * 16u * 4u); // (its texels in the capture)
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(2u, s.checks);
+    wl_nv2a_capture_end(g.dev);
+    wl_nv2a_texcache_clear(&cache);
+    t_destroy(&g);
+    PASS();
+}
+
 SUITE(texture_suite) {
     RUN_TEST(stage_registers_decoded);
     RUN_TEST(conversions_sample_as_the_nv2a_would);
@@ -599,6 +643,7 @@ SUITE(texture_suite) {
     RUN_TEST(cache_keeps_finds_changes_and_evicts);
     RUN_TEST(cache_watched_and_in_an_arena);
     RUN_TEST(cache_arena_window);
+    RUN_TEST(cache_reads_again_when_a_capture_begins);
 }
 
 GREATEST_MAIN_DEFS();

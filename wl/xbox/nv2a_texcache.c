@@ -256,6 +256,22 @@ static bool watching(const WlNv2aTexCache *cache, const WlNv2a *dev) {
     return cache->cfg.watch != NULL && !wl_nv2a_capture_active(dev);
 }
 
+// A capture begun: the textures checked before it (in the frame it began in: the cache's frames end
+// at the backend's present, not at the flip the capture starts at) are checked again at their next
+// use, so the capture reads the texels of every texture its draws read.
+static void capture_note(WlNv2aTexCache *cache, const WlNv2a *dev) {
+    bool running = wl_nv2a_capture_running(dev);
+
+    if (running && !cache->capturing) {
+        unsigned i;
+
+        for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
+            cache->entries[i].checked_frame = 0; // (frames count from 1)
+        }
+    }
+    cache->capturing = running;
+}
+
 // The watch armed over the texture's texels and palette (before they are read): its stamp, 0 when
 // there is none.
 static uint32_t watch_arm(WlNv2aTexCache *cache, const WlNv2aTexture *t) {
@@ -622,6 +638,7 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     }
     cache->stats.lookups++;
     mipmaps = mipmaps && t->levels > 1; // (one level: the same image either way)
+    capture_note(cache, dev);
     e = find(cache, t, mipmaps);
     if (e != NULL && e->checked_frame == cache->frame && !e->dynamic) {
         e->used_frame = cache->frame;

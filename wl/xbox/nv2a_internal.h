@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "wl/xbox/nv2a.h"
+#include "wl/xbox/nv2a_capture.h"
 #include "wl/xbox/nv2a_kelvin.h"
 
 #define WL_NV2A_TAG "nv2a"
@@ -120,4 +121,3 @@ void wl_nv2a_capture_note_mmio(WlNv2a *dev, uint32_t offset, uint32_t value, uns
 void wl_nv2a_capture_note_vblank(WlNv2a *dev);
 void wl_nv2a_capture_note_memory(WlNv2a *dev, uint32_t phys, const void *data, uint32_t bytes);
 void wl_nv2a_capture_note_flip(WlNv2a *dev);
-bool wl_nv2a_capture_running(const WlNv2a *dev);

@@ -231,7 +231,9 @@ even, so its winding holds).
   frame), and checked once a frame (every use once found
   rewritten): through a write watch where the caller has one (the runtime's MMU: a texture whose
   pages saw no store is as it was, its texels not read; one whose pages did is hashed, or made
-  again if large), else by a hash of the guest's texels (XXH32's rounds: 32-bit multiplies).
+  again if large), else by a hash of the guest's texels (XXH32's rounds: 32-bit multiplies). A
+  capture begun inside a frame has the textures and vertex arrays checked before it read again at
+  their next use.
 - **The pipeline** (`nv2a_pipeline.h`) is what the GX backend does on the processor: programs
   compiled and kept, vertices run (or the fixed function's composite matrix), the NV2A's fog modes,
   what psh is told of the textures, each stage's GX coordinates, the GX mappings of the raster state.
