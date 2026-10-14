@@ -652,11 +652,15 @@ int main(int argc, char **argv) {
         fprintf(out, "}\n\n");
         /* (the program, for the outputs a draw reads: each instruction
         that reaches none of them skipped) */
+        /* (for count vertices at once, so the function's entry and exit, its
+        registers saved and restored, are paid once for them) */
         fprintf(out,
-                "static void program_%08lx(const float (*c)[4], const float (*v)[4], "
-                "WlXboxVshOutput *o,\n"
-                "\tunsigned live)\n"
-                "{\n\tfloat r[12][4] = { { 0.0f } };\n\tfloat p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"
+                "static void program_%08lx_batch(const float (*c)[4], const float "
+                "(*vs)[WL_XBOX_VSH_INPUT_COUNT][4],\n"
+                "\tWlXboxVshOutput *os, unsigned count, unsigned live)\n"
+                "{\n\tunsigned n;\n\n\tfor (n = 0; n < count; n++)\n\t{\n"
+                "\tconst float (*v)[4] = vs[n];\n\tWlXboxVshOutput *o = &os[n];\n"
+                "\tfloat r[12][4] = { { 0.0f } };\n\tfloat p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"
                 "\tfloat A[4], B[4], C[4], M[4], I[4];\n\tint a0 = 0;\n\n"
                 "\t(void)c;\n\t(void)v;\n\t(void)a0;\n\t(void)A;\n\t(void)B;\n\t(void)C;\n\t(void)"
                 "r;\n\t(void)live;\n",
@@ -680,7 +684,12 @@ int main(int argc, char **argv) {
             if (open)
                 fprintf(out, "\t}\n");
         }
-        fprintf(out, "\tmemcpy(o->position, p, sizeof(o->position));\n}\n\n");
+        fprintf(out, "\tmemcpy(o->position, p, sizeof(o->position));\n\t}\n}\n\n");
+        fprintf(out,
+                "static void program_%08lx(const float (*c)[4], const float (*v)[4], "
+                "WlXboxVshOutput *o,\n\tunsigned live)\n{\n"
+                "\tprogram_%08lx_batch(c, (const float (*)[WL_XBOX_VSH_INPUT_COUNT][4])v, o, 1, live);\n}\n\n",
+                hash, hash);
         /* (its position for four values of v0: for the skinned programs, those
         whose position reads constants by a0 and is converted to the screen,
         whose every node a device may make a matrix of; the others' matrices
@@ -701,12 +710,12 @@ int main(int argc, char **argv) {
 
         if (positioned[index])
             snprintf(positions, sizeof(positions), "program_%08lx_positions", hashes[index]);
-        fprintf(out, "\t{ 0x%08lxUL, %lu, program_%08lx, program_%08lx_colors, %s },\n",
-                hashes[index], counts[index], hashes[index], hashes[index], positions);
+        fprintf(out, "\t{ 0x%08lxUL, %lu, program_%08lx, program_%08lx_colors, %s, program_%08lx_batch },\n",
+                hashes[index], counts[index], hashes[index], hashes[index], positions, hashes[index]);
     }
     /* (C has no empty array: a table of none holds one entry no program matches) */
     if (!program_count)
-        fprintf(out, "\t{ 0UL, 0, NULL, NULL, NULL },\n");
+        fprintf(out, "\t{ 0UL, 0, NULL, NULL, NULL, NULL },\n");
     fprintf(out, "};\n\nconst unsigned long %s_count = %lu;\n", table, program_count);
     if (accessor)
         fprintf(out,

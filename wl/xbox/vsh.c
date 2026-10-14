@@ -377,6 +377,7 @@ void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction
     program->native = NULL;
     program->native_colors = NULL;
     program->native_positions = NULL;
+    program->native_batch = NULL;
     program->hash = wl_xbox_vsh_hash(instructions, instruction_count);
     {
         unsigned long hash = program->hash;
@@ -386,6 +387,7 @@ void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction
                 program->native = natives[index].run;
                 program->native_colors = natives[index].colors;
                 program->native_positions = natives[index].positions;
+                program->native_batch = natives[index].batch;
                 break;
             }
         }
@@ -1261,6 +1263,13 @@ void wl_xbox_vsh_run_batch(const WlXboxVshProgram *program, const float (*consta
     vsh_scratch scratch;
     unsigned done, n;
 
+    if (program->native && program->native_batch) {
+        if (live & WL_XBOX_VSH_LIVE_POINT_SIZE)
+            for (done = 0; done < count; done++)
+                outputs[done].point_size = point_size;
+        program->native_batch(constants, inputs, outputs, count, live);
+        return;
+    }
     if (program->native) {
         for (done = 0; done < count; done++)
             wl_xbox_vsh_run_live(program, constants, inputs[done], point_size, &outputs[done], live);

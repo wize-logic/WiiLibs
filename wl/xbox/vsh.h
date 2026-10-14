@@ -56,6 +56,11 @@ typedef void (*WlXboxVshPositionsProc)(const float (*constants)[4], const float 
                                        const float (*points)[4], float (*clips)[4],
                                        float (*positions)[4]);
 
+/* ... and the program for count vertices (inputs[n] into outputs[n]), the
+point size not set */
+typedef void (*WlXboxVshBatchProc)(const float (*constants)[4], const float (*inputs)[16][4],
+                                   WlXboxVshOutput *outputs, unsigned count, unsigned live);
+
 /* the outputs a draw reads (wl_xbox_vsh_run_live): the others are left as they
 were, or hold what the instructions computed on the way */
 enum {
@@ -82,6 +87,8 @@ typedef struct WlXboxVshNative {
     WlXboxVshColorsProc colors;
     /* its position for four values of v0 (NULL: none) */
     WlXboxVshPositionsProc positions;
+    /* (for count vertices at once; NULL: run a vertex at a time) */
+    WlXboxVshBatchProc batch;
 } WlXboxVshNative;
 
 /* an instruction as the interpreter runs it, its fields resolved once by
@@ -140,6 +147,8 @@ typedef struct WlXboxVshProgram {
     WlXboxVshColorsProc native_colors;
     /* (its position for four values of v0; NULL on the interpreter) */
     WlXboxVshPositionsProc native_positions;
+    /* (for many vertices at once; NULL on the interpreter) */
+    WlXboxVshBatchProc native_batch;
     /* the temporaries read before they are written (bit n: r[n]), which
     the interpreter clears for each vertex */
     unsigned short exposed;
