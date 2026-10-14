@@ -153,7 +153,13 @@ bool wl_xb_in_service(void) {
 }
 
 uint32_t wl_xb_tick_ms(void) {
-    return (uint32_t)((wl_xb_time_us() - g_tick_start_us) / 1000u);
+    uint64_t us = wl_xb_time_us() - g_tick_start_us;
+    // a 32-bit division for the first 71 minutes: on the Wii this runs at every poll (update_tick),
+    // and libgcc's 64-bit __udivdi3 took 0.4% of a10's time there
+    if ((us >> 32) == 0) {
+        return (uint32_t)us / 1000u;
+    }
+    return (uint32_t)(us / 1000u);
 }
 
 static void update_tick(void) {
