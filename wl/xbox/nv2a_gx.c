@@ -18,6 +18,7 @@
 #include "wl/platform/gx_target.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/tev.h"
+#include "wl/xbox/nv2a_color.h"
 #include "wl/xbox/nv2a_pipeline.h"
 #include "wl/xbox/nv2a_texture.h"
 #include "wl/xbox/psh_cache.h"
@@ -766,29 +767,6 @@ static bool tev_setup(WlNv2aGx *gx, const WlNv2aKelvin *k) {
 
 // ---- vertices ------------------------------------------------------------------------------------
 
-// test >= 0 ? a : b (a NaN test gives b): one fsel on PowerPC, no branch
-static inline float select_ge0(float test, float a, float b) {
-#if defined(__PPC__) || defined(__powerpc__)
-    float r;
-
-    __asm__("fsel %0,%1,%2,%3" : "=f"(r) : "f"(test), "f"(a), "f"(b));
-    return r;
-#else
-    return test >= 0.0f ? a : b;
-#endif
-}
-
-// a colour's component as a byte: 0 at or below 0 (and for a NaN), 255 at or above 1, else
-// (int)(value * 255 + 0.5). Without branches: y = value * 255 + 0.5 is below 1 exactly where the
-// byte is 0, and at or above 255 where it is 255 (every float gives the same byte as the tests on
-// value would, checked over all of them)
-static inline uint32_t color_byte(float value) {
-    float y = value * 255.0f + 0.5f;
-    float z = select_ge0(y - 1.0f, y, 0.0f);
-
-    return (uint32_t)(int)select_ge0(z - 255.0f, 255.0f, z);
-}
-
 static float as_depth(float z, float depth_max) {
     float depth = depth_max > 0.0f ? z / depth_max : z;
 
@@ -1106,10 +1084,6 @@ static inline void put_float(uint32_t *word, float f) {
     memcpy(word, &f, sizeof f);
 }
 
-static inline uint32_t color_word(const float c[4]) {
-    return color_byte(c[0]) << 24 | color_byte(c[1]) << 16 | color_byte(c[2]) << 8 | color_byte(c[3]);
-}
-
 // a vertex as GX takes it (OpenCE-Wii's vertex_store) from what the program left, in the draw's
 // layout, and where it lands in EFB pixels
 static void vertex_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPlan *plan, const WlXboxVshOutput *o,
@@ -1146,10 +1120,10 @@ static void vertex_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPla
     put_float(&out->w[1], position[1]);
     put_float(&out->w[2], position[2]);
     if (plan->colors >= 1) {
-        out->w[i++] = (plan->channels & 1u) ? color_word(o->d0) : 0u;
+        out->w[i++] = (plan->channels & 1u) ? wl_nv2a_color_word(o->d0) : 0u;
     }
     if (plan->colors >= 2) {
-        out->w[i++] = (plan->channels & 2u) ? color_word(o->d1) : 0u;
+        out->w[i++] = (plan->channels & 2u) ? wl_nv2a_color_word(o->d1) : 0u;
     }
     for (stage = 0; stage < plan->stage_count; stage++) {
         unsigned n = plan->stage_list[stage];
@@ -1173,7 +1147,7 @@ static void vertex_pack_xf(const DrawPlan *plan, const float (*inputs)[4], Packe
     put_float(&out->w[1], inputs[0][1]);
     put_float(&out->w[2], inputs[0][2]);
     for (c = 0; c < plan->colors; c++) {
-        out->w[i++] = xf->color_source[c] < 0 ? xf->color_word[c] : color_word(inputs[xf->color_source[c]]);
+        out->w[i++] = xf->color_source[c] < 0 ? xf->color_word[c] : wl_nv2a_color_word(inputs[xf->color_source[c]]);
     }
     for (stage = 0; stage < plan->stage_count; stage++) {
         unsigned source = xf->stage_source[plan->stage_list[stage]];
@@ -1401,7 +1375,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         }
         if (source == 0) {
             xf->color_source[c] = -1;
-            xf->color_word[c] = color_word(c == 0 ? o[0].d0 : o[0].d1);
+            xf->color_word[c] = wl_nv2a_color_word(c == 0 ? o[0].d0 : o[0].d1);
             continue;
         }
         for (n = 0; n < XF_PROBES; n++) {

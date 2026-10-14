@@ -136,6 +136,8 @@ typedef struct WlNv2aAttrib {
     // guest memory: the attribute's current value); INLINE: unused
     const uint8_t *data;
     uint32_t stride;
+    // ARRAYS: the guest-physical address of that attribute (data's)
+    uint32_t phys;
     uint8_t type, size; // WL_NV2A_VTX_*, components (0: disabled)
     // INLINE: the attribute's byte offset in a vertex
     uint16_t inline_offset;
