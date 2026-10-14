@@ -49,6 +49,10 @@ void wl_xb_gpu_capture(const char *path, uint32_t frames, uint32_t after_vblanks
     g_cap.armed = g_cap.path[0] != '\0';
 }
 
+bool wl_xb_gpu_capture_busy(void) {
+    return g_cap.armed || g_cap.file != NULL;
+}
+
 // The vertex programs the title draws with, listed for compiling ahead of time
 // (wl_xb_gpu_set_program_list): those the file holds, by their hash, and the file
 static struct {

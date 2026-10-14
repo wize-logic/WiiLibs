@@ -1258,6 +1258,10 @@ static void script_frame(void) {
             P.bots[(int)s->sticks[0]] = (int)s->sticks[1];
             break;
         case K_QUIT:
+            // a screenshot just before is written first (the card goes once the title has left)
+            if (wl_xb_gpu_capture_busy() && P.clock - P.started_clock < 10.0) {
+                return;
+            }
             wl_xb_play_log("script finished: quit");
             P.finished = true;
             wl_platform_log_flush();

@@ -108,6 +108,8 @@ struct WlNv2aGx *wl_xb_gpu_nv2a_gx(void);
 // tools/xbox_nv2a_replay. On the host the WL_XB_CAPTURE environment variable sets it too:
 // "path[,frames[,after vblanks]]". Nothing when wl/xbox's NV2A model is not built in.
 void wl_xb_gpu_capture(const char *path, uint32_t frames, uint32_t after_vblanks);
+// A capture is armed or still being written (the play harness's quit waits for it).
+bool wl_xb_gpu_capture_busy(void);
 // The vertex programs the GPU decodes that the title does not have compiled ahead of time are
 // appended to the file `path` (the boot code's: <hard disk folder>/vsh_programs.inc), as
 // tools/xbox_vsh_codegen.c takes them, each once: the title's build compiles the list into C
