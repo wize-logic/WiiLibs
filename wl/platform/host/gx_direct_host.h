@@ -11,6 +11,15 @@ enum { WL_HOST_GX_MAP_NONE = 0, WL_HOST_GX_MAP_TEXTURE, WL_HOST_GX_MAP_RAMP };
 
 typedef struct WlHostGxDirect {
     WlGxDirectLayout layout;
+    // the transform unit's matrices (wl_gx_direct_position_matrix, wl_gx_direct_texgen): set or
+    // the identity
+    bool position_matrix_set;
+    float position_matrix[3][4];
+    struct {
+        bool set;
+        uint8_t source; // WlGxDirectTexSource
+        float m[2][4];
+    } texgen[8];
     float projection[4][4];
     bool orthographic;
     float viewport[4];

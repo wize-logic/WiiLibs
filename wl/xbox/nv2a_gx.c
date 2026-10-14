@@ -507,7 +507,7 @@ static bool states_apply(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aSurfac
 // cull_measure: GX's names for its windings are not the screen's).
 static void cull_measure(WlNv2aGx *gx, uint32_t clear_rgba) {
     static const float corners[3][2] = {{0.0f, 0.0f}, {16.0f, 0.0f}, {0.0f, 16.0f}};
-    WlGxDirectLayout layout = {1, 0, 0};
+    WlGxDirectLayout layout = {1, 0, 0, 0};
     WlTevProgram tev;
     float m[4][4];
     unsigned pass, v;

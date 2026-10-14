@@ -23,6 +23,13 @@ _Static_assert((int)WL_GX_CULL_BACK == GX_CULL_BACK && (int)WL_GX_CULL_FRONT == 
 static struct {
     WlGxDirectLayout layout;
     bool layout_known;
+    // the transform unit's matrices as loaded: the position matrix's (identity or not) and each
+    // coordinate's generator, so that what is asked again is not sent again
+    bool position_identity;
+    Mtx position;
+    uint8_t texgen_set; // bit n: coordinate n has a matrix of its own
+    uint8_t texgen_source[8];
+    float texgen[8][2][4];
     bool in_primitive;
     WlGxDirectStats stats;
 } d;
@@ -34,6 +41,8 @@ void wl_gx_direct_begin(void) {
     wl_gx_invalidate_shadow();
     wl_gx_tlut_invalidate();
     d.layout_known = false;
+    d.position_identity = true;
+    d.texgen_set = 0;
     wl_gx_direct_flush_after();
     guMtxIdentity(identity);
     GX_LoadPosMtxImm(identity, GX_PNMTX0);
@@ -55,6 +64,7 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
     }
     d.layout = *layout;
     d.layout_known = true;
+    d.texgen_set = 0;
     d.stats.layouts++;
     GX_ClearVtxDesc();
     GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
@@ -68,7 +78,7 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
         GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
     }
     for (n = 0; n < 8; n++) {
-        if (layout->texcoords & (1u << n)) {
+        if ((layout->texcoords | layout->texcoords_generated) & (1u << n)) {
             texgens = n + 1;
         }
     }
@@ -173,6 +183,59 @@ void wl_gx_direct_draw(WlGxDirectPrim prim, const WlGxDirectVertex *vertices, ui
         emit(&vertices[i]);
     }
     wl_gx_direct_primitive_end();
+}
+
+void wl_gx_direct_position_matrix(const float m[3][4]) {
+    Mtx matrix;
+
+    if (m == NULL) {
+        if (d.position_identity) {
+            return;
+        }
+        guMtxIdentity(matrix);
+        d.position_identity = true;
+    } else {
+        if (!d.position_identity && memcmp(d.position, m, sizeof d.position) == 0) {
+            return;
+        }
+        memcpy(matrix, m, sizeof matrix);
+        memcpy(d.position, m, sizeof d.position);
+        d.position_identity = false;
+    }
+    GX_LoadPosMtxImm(matrix, GX_PNMTX0);
+    wl_gx_wii_note_commands();
+}
+
+void wl_gx_direct_texgen(unsigned n, WlGxDirectTexSource source, const float m[2][4]) {
+    Mtx matrix;
+
+    if (n >= 8) {
+        return;
+    }
+    if (m == NULL) {
+        if (!(d.texgen_set & (1u << n))) {
+            return;
+        }
+        d.texgen_set &= (uint8_t)~(1u << n);
+        GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4,
+                          (d.layout.texcoords & (1u << n)) ? (u32)(GX_TG_TEX0 + n) : (u32)GX_TG_POS, GX_IDENTITY);
+        wl_gx_wii_note_commands();
+        return;
+    }
+    if ((d.texgen_set & (1u << n)) && d.texgen_source[n] == (uint8_t)source &&
+        memcmp(d.texgen[n], m, sizeof d.texgen[n]) == 0) {
+        return;
+    }
+    d.texgen_set |= (uint8_t)(1u << n);
+    d.texgen_source[n] = (uint8_t)source;
+    memcpy(d.texgen[n], m, sizeof d.texgen[n]);
+    memset(matrix, 0, sizeof matrix);
+    memcpy(matrix, m, sizeof d.texgen[n]);
+    GX_LoadTexMtxImm(matrix, (u32)(GX_TEXMTX0 + 3u * n), GX_MTX2x4);
+    GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4,
+                      source == WL_GX_DIRECT_TG_POSITION ? (u32)GX_TG_POS : (u32)(GX_TG_TEX0 + n),
+                      (u32)(GX_TEXMTX0 + 3u * n));
+    wl_gx_wii_note_commands();
 }
 
 void wl_gx_direct_projection(const float m[4][4], bool orthographic) {
