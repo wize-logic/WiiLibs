@@ -540,8 +540,17 @@ void wl_xb_port_out(uint32_t port, uint32_t value, unsigned size);
 #ifndef WL_XB_EA
 #if (defined(__PPC__) || defined(__powerpc__)) && !defined(WL_XB_EA_NO_ASM)
 /* PowerPC: GCC spells the C form rlwinm, rlwinm, or; rlwinm then rlwimi is one fewer, on every
- * guest access. A constant address still folds to a constant. */
-static inline uint32_t wl_xb_ea_ppc(uint32_t guest) {
+ * guest access. A constant address still folds to a constant. Always inline: at -Os GCC keeps an
+ * out-of-line copy in each translation unit and calls it for every access (with the call's own
+ * return and the moves around it, 9-10% of Halo's time on the Wii). Inline, an access takes one
+ * instruction more room than the call (Halo's lifted code: about 8% more, 1 MB); WL_XB_EA_CALL
+ * gives GCC the choice again, for a title short of memory. */
+#ifdef WL_XB_EA_CALL
+#define WL_XB_EA_INLINE static inline
+#else
+#define WL_XB_EA_INLINE static inline __attribute__((always_inline))
+#endif
+WL_XB_EA_INLINE uint32_t wl_xb_ea_ppc(uint32_t guest) {
     uint32_t ea;
     if (__builtin_constant_p(guest))
         return (guest & 0x0FFFFFFFu) | ((guest >> 3) & 0x10000000u);
