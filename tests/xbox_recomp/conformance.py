@@ -19,6 +19,11 @@ instructions with a list of inputs. Here:
   4. the same replay is built for the host (x86-64), where the header's byte-order attribute is a
      no-op.
 
+Every case that touches the x87 runs a second time as <case>_x87l: its lines made a function and
+passed through the lifter's --x87-locals pass (x87_locals.py: the stack, control word and compare
+result in C locals, memory written back where control leaves), against the same recording. Both
+forms must match the CPU.
+
 Every case must pass, or be in EXPECTED with the reason. A case in EXPECTED that passes fails the
 run too, so the list cannot go stale.
 
@@ -35,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -163,7 +169,7 @@ void recomp_debug_service(uint32_t s, uint32_t a) { (void)s; (void)a; }
 #define GUEST_STACK @STACK@u
 #define GUEST_SIZE @SIZE@u
 
-struct kase { const char *name; int kind; int nvec; double tol; void (*fn)(void); };
+struct kase { const char *name; int kind; int nvec; double tol; void (*fn)(void); long first; };
 
 static void regs_reset(void) {
     memset(&g_xmm0, 0, sizeof(RecompXmm) ); memset(&g_xmm1, 0, sizeof(RecompXmm));
@@ -226,6 +232,8 @@ int main(int argc, char **argv) {
         const struct kase *k = &K[c];
         int bad = 0;
         char why[1024] = "";
+        /* a case's records start at its first; an _x87l variant replays its case's */
+        if (fseek(f, k->first * (long)@RECSIZE@, SEEK_SET) != 0) { printf("cannot seek the golden file\n"); return 2; }
         for (v = 0; v < (unsigned)k->nvec; v++) {
             struct rec r;
             uint32_t want_eax, l_eax;
@@ -282,21 +290,39 @@ int main(int argc, char **argv) {
 """
 
 
+LOCALS = "    uint32_t ebp = 0; int _cf = 0; int _flags = 0;\n" \
+    "    uint32_t _fa = 0, _fb = 0; int32_t _fas = 0, _fbs = 0; double _fca = 0.0, _fcb = 0.0;\n" \
+    "    (void)ebp; (void)_cf; (void)_flags; (void)_fa; (void)_fb; (void)_fas; (void)_fbs; (void)_fca; (void)_fcb;"
+
+
+def x87_locals_variant(p):
+    """The case as a function the way translate_function emits one (the x87 macros defined inside
+    it), through the --x87-locals pass: (C text, None) or (C text unchanged, why it declined)."""
+    from tools.recomp.translator import FP_STACK_MACROS, FP_STACK_UNDEFS
+    from tools.recomp.x87_locals import localise_x87
+    lines = ([f"static void lif_{p['name']}_x87l(void)", "{"] + LOCALS.split("\n") + FP_STACK_MACROS
+             + [f"    {l}" for l in p["lines"]] + FP_STACK_UNDEFS + ["}"])
+    out, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS)
+    return "\n".join(out), why
+
+
 def replay_source(prepared):
     out = [PRELUDE.replace("@SCRATCH@", "0x%08X" % GUEST_SCRATCH).replace("@STACK@", "0x%08X" % GUEST_STACK)
            .replace("@SIZE@", "0x%08X" % GUEST_SIZE), FP_MACROS]
     for p in prepared:
+        if p.get("text"):
+            continue
         body = "\n".join(f"    {l}" for l in p["lines"]) or "    /* nothing */"
         out.append(f"""static void lif_{p['name']}(void) {{
-    uint32_t ebp = 0; int _cf = 0; int _flags = 0;
-    uint32_t _fa = 0, _fb = 0; int32_t _fas = 0, _fbs = 0; double _fca = 0.0, _fcb = 0.0;
-    (void)ebp; (void)_cf; (void)_flags; (void)_fa; (void)_fb; (void)_fas; (void)_fbs; (void)_fca; (void)_fcb;
+{LOCALS}
 {body}
 }}""")
+    # the _x87l variants last: each defines the x87 macros itself and undefines them at its end
+    out += [p["text"] for p in prepared if p.get("text")]
     kinds = {"gpr": 0, "fpu": 1, "sse": 2}
     out.append("static const struct kase K[] = {")
     for p in prepared:
-        out.append(f'    {{"{p["name"]}", {kinds[p["kind"]]}, {p["nvec"]}, {p["tol"]!r}, lif_{p["name"]}}},')
+        out.append(f'    {{"{p["name"]}", {kinds[p["kind"]]}, {p["nvec"]}, {p["tol"]!r}, lif_{p["name"]}, {p["first"]}L}},')
     out.append("};")
     return "\n".join(out) + "\n" + REPLAY.replace("@RECSIZE@", str(REC.size))
 
@@ -354,7 +380,7 @@ def main(argv=None) -> int:
         run(["gcc", "-m32", "-masm=intel", "-msse", "-msse2", "-fno-pic", "-O0", "-c", "native.c", "-o", "native.o"],
             cwd=work)
         dump = run(["objdump", "-d", "-M", "intel", "native.o"], cwd=work)
-        prepared, unimpl = [], {}
+        prepared, unimpl, first = [], {}, 0
         for c in cases:
             code = _bytes_from_objdump(dump, c["name"])
             lines, _mn = _lift(code)
@@ -362,13 +388,24 @@ def main(argv=None) -> int:
                 if "RECOMP_UNIMPL" in l or "TODO" in l:
                     unimpl.setdefault(c["name"], []).append(l.strip())
             prepared.append(dict(name=c["name"], kind=c["kind"], lines=lines, nvec=len(c["inputs"]),
-                                 tol=float(c.get("tol", 0.0))))
+                                 tol=float(c.get("tol", 0.0)), first=first))
+            first += len(c["inputs"])
+        # the x87 cases again, through --x87-locals
+        variants, declined = {}, {}
+        for p in list(prepared):
+            if not any(re.search(r"\bfp_|\bg_fp_|RECOMP_FP_PC", l) for l in p["lines"]):
+                continue
+            text, why = x87_locals_variant(p)
+            if why:
+                declined[p["name"]] = why
+            variants[p["name"] + "_x87l"] = p["name"]
+            prepared.append(dict(p, name=p["name"] + "_x87l", text=text))
         (work / "gold.c").write_text(gold_source(cases))
         run(["gcc", "-m32", "-msse2", "-fno-pic", "-no-pie", "-O0", "gold.c", "native.o", "-o", "gold_x86", "-lm"],
             cwd=work)
         run([str(work / "gold_x86"), "golden.bin"], cwd=work)
         nrec = (work / "golden.bin").stat().st_size // REC.size
-        assert nrec == sum(p["nvec"] for p in prepared), (nrec, sum(p["nvec"] for p in prepared))
+        assert nrec == first, (nrec, first)
         (work / "replay.c").write_text(replay_source(prepared))
 
         if args.header == "upstream":
@@ -395,6 +432,7 @@ def main(argv=None) -> int:
     for t, out in results.items():
         expected = dict(EXPECTED)
         expected.update(EXPECTED_ON.get(t, {}))
+        expected.update({v: expected[b] for v, b in variants.items() if b in expected})
         fails, passes, total = {}, set(), "?"
         for line in out.splitlines():
             parts = line.split(" ", 3)
@@ -423,6 +461,8 @@ def main(argv=None) -> int:
             print(out)
         if not ok:
             rc = 1
+    print(f"x87 locals: {len(variants)} case(s) also run through --x87-locals"
+          + (f"; it kept the memory model in {len(declined)}: {declined}" if declined else ""))
     if unimpl:
         print(f"note: {len(unimpl)} case(s) lifted with unimplemented instructions: {sorted(unimpl)}")
     return rc
