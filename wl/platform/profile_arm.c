@@ -429,10 +429,12 @@ WlResult wl_profile_arm_launch(WlProfileArm *arm, const WlProfileArmConfig *conf
     uint32_t stack_size;
     WlResult result;
 
+    if (arm != NULL) {
+        memset(arm, 0, sizeof *arm); // (a launch that fails leaves nothing to join)
+    }
     if (arm == NULL || config == NULL || config->hooks.ready == NULL) {
         return WL_ERR_ARG;
     }
-    memset(arm, 0, sizeof *arm);
     arm->config = *config;
     stack_size = config->stack_size != 0 ? config->stack_size : WL_PROFILE_ARM_DEFAULT_STACK_SIZE;
     stack_size = (stack_size + 31u) & ~31u;

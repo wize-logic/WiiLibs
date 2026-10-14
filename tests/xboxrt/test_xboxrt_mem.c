@@ -195,7 +195,7 @@ TEST reservations_and_queries(void) {
 // ---- Device faults through the host's decoder ---------------------------------------------------
 
 typedef struct {
-    uint32_t regs[64];
+    volatile uint32_t regs[64]; // (written by the fault handler: the compiler must not keep a value)
     uint32_t reads, writes;
     uint32_t last_off, last_size;
 } FakeDev;
@@ -217,7 +217,7 @@ static void fake_write(void *user, uint32_t off, uint32_t v, unsigned size) {
     d->writes++;
     d->last_off = off;
     d->last_size = size;
-    uint32_t *w = &d->regs[(off >> 2) & 63u];
+    volatile uint32_t *w = &d->regs[(off >> 2) & 63u];
     uint32_t shift = (off & 3u) * 8u;
     uint32_t mask = size == 4 ? 0xFFFFFFFFu : ((size == 2 ? 0xFFFFu : 0xFFu) << shift);
     *w = (*w & ~mask) | ((v << (size == 4 ? 0 : shift)) & mask);
@@ -228,7 +228,7 @@ static void fake_write(void *user, uint32_t off, uint32_t v, unsigned size) {
 TEST device_faults(void) {
     up();
     wl_xb_mmio_reset();
-    memset(&g_dev, 0, sizeof g_dev);
+    memset((void *)&g_dev, 0, sizeof g_dev);
     WlXbDevice dev = {"fake", DEV_VA, 0x1000u, fake_read, fake_write, &g_dev};
     ASSERT_EQ(WL_OK, wl_xb_mmio_register(&dev));
     g_dev.regs[1] = 0x89ABCDEFu;

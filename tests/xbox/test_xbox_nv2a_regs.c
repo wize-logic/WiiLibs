@@ -199,11 +199,13 @@ TEST texture_formats_match_the_other_table(void) {
         char name[128];
         const Entry *other;
 
+        int n;
         if (strncmp(mine[i].name, "LU_", 3) == 0 || strncmp(mine[i].name, "LC_", 3) == 0) {
-            snprintf(name, sizeof name, "%.2s_IMAGE_%s", mine[i].name, mine[i].name + 3);
+            n = snprintf(name, sizeof name, "%.2s_IMAGE_%s", mine[i].name, mine[i].name + 3);
         } else {
-            snprintf(name, sizeof name, "%s", mine[i].name);
+            n = snprintf(name, sizeof name, "%s", mine[i].name);
         }
+        ASSERT(n > 0 && (size_t)n < sizeof name);
         other = find(theirs, t, name);
         if (other == NULL) {
             continue;

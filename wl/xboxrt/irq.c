@@ -109,7 +109,8 @@ WlResult wl_xb_service_add_tick(WlXbTickFn fn, void *user, uint32_t period_us) {
 
 // The service thread: marks the ticks whose time came; returns the earliest next one (or `wake`).
 static uint64_t ticks_due(uint64_t now, uint64_t wake) {
-    const uint32_t n = __atomic_load_n(&g_tick_count, __ATOMIC_ACQUIRE);
+    uint32_t n = __atomic_load_n(&g_tick_count, __ATOMIC_ACQUIRE);
+    n = n < WL_XB_MAX_TICKS ? n : WL_XB_MAX_TICKS; // (never more; it tells the compiler so)
     for (uint32_t i = 0; i < n; i++) {
         if (now >= g_tick[i].next_us) {
             g_tick[i].next_us += g_tick[i].period_us;
@@ -129,7 +130,8 @@ static uint64_t ticks_due(uint64_t now, uint64_t wake) {
 
 // The work: the ticks marked due, lock held.
 static void run_ticks(void) {
-    const uint32_t n = __atomic_load_n(&g_tick_count, __ATOMIC_ACQUIRE);
+    uint32_t n = __atomic_load_n(&g_tick_count, __ATOMIC_ACQUIRE);
+    n = n < WL_XB_MAX_TICKS ? n : WL_XB_MAX_TICKS; // (never more; it tells the compiler so)
     for (uint32_t i = 0; i < n; i++) {
         if (__atomic_exchange_n(&g_tick[i].due, 0u, __ATOMIC_ACQ_REL) != 0) {
             g_tick[i].fn(g_tick[i].user);

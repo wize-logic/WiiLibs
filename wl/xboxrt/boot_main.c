@@ -23,10 +23,12 @@
 // A host path as a platform path: the card's root is the file system's root.
 static void platform_path(const char *host, char *out, size_t cap) {
     char abs[PATH_MAX];
-    if (realpath(host, abs) == NULL) {
-        snprintf(abs, sizeof abs, "%s", host);
+    if (realpath(host, abs) == NULL && snprintf(abs, sizeof abs, "%s", host) >= (int)sizeof abs) {
+        fprintf(stderr, "path too long: %s\n", host);
     }
-    snprintf(out, cap, "sd:/%s", abs[0] == '/' ? abs + 1 : abs);
+    if (snprintf(out, cap, "sd:/%s", abs[0] == '/' ? abs + 1 : abs) >= (int)cap) {
+        fprintf(stderr, "path too long: %s\n", abs);
+    }
 }
 #endif
 

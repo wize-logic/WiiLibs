@@ -237,13 +237,15 @@ bool xk_object_name(uint32_t oa, char *out, uint32_t cap, uint32_t *status) {
     }
     uint32_t root = wl_xb_rd32(oa);
     XkFile *rf = root != 0 && root != 0xFFFFFFFDu ? file_of(root) : NULL;
+    int n;
     if (rf != NULL) {
         size_t len = strlen(rf->name);
-        snprintf(out, cap, "%s%s%s", rf->name, (len > 0 && rf->name[len - 1] == '\\') ? "" : "\\", name);
+        n = snprintf(out, cap, "%s%s%s", rf->name, (len > 0 && rf->name[len - 1] == '\\') ? "" : "\\", name);
     } else {
-        snprintf(out, cap, "%s", name);
+        n = snprintf(out, cap, "%s", name);
     }
-    return true;
+    return n >= 0 && (uint32_t)n < cap; // a name cut short names another file: invalid
+
 }
 
 static uint32_t open_file(uint32_t handle_out, uint32_t access, uint32_t oa, uint32_t iosb, uint32_t disposition,
