@@ -122,6 +122,13 @@ void wl_xb_gpu_set_program_list(const char *path);
 // The boot code turns it off for a file "noxf" in the title's folder (and WL_XB_NO_XF on the host).
 // Call it before wl_xb_gpu_attach_nv2a.
 void wl_xb_gpu_set_transform_unit(bool on);
+// The GX backend's vertex arrays kept for GX to read by index (wl/xbox/nv2a_vcache.h: a level's
+// static geometry converted once, its draws through the transform unit sending indices alone), in
+// `arena` (`bytes`, 32-byte aligned; NULL: the heap, within `bytes`), checked through the write
+// watch. 0 bytes: none (the default). The boot code sets it for a file "vcache" in the title's folder
+// (its text the KB, 1024 when empty; WL_XB_VCACHE_KB on the host). Call it before
+// wl_xb_gpu_attach_nv2a.
+void wl_xb_gpu_set_vertex_cache(void *arena, uint32_t bytes);
 
 #ifdef __cplusplus
 }

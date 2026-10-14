@@ -261,6 +261,14 @@ void wl_xb_gpu_set_transform_unit(bool on) {
     g_no_xf = !on;
 }
 
+static void *g_vcache_arena;
+static uint32_t g_vcache_bytes;
+
+void wl_xb_gpu_set_vertex_cache(void *arena, uint32_t bytes) {
+    g_vcache_arena = arena;
+    g_vcache_bytes = bytes;
+}
+
 WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
     // the draws go to GX (over libogc on the Wii, the host's recorder elsewhere)
     if (!wl_gx_ready() && wl_gx_init() != WL_OK) {
@@ -282,6 +290,18 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
         }
         gcfg.textures.watch = tex_watch;
         gcfg.textures.written = tex_written;
+        if (g_vcache_bytes != 0) {
+            if (g_vcache_arena != NULL) {
+                gcfg.vertices.arena = g_vcache_arena;
+                gcfg.vertices.arena_bytes = g_vcache_bytes;
+            } else {
+                gcfg.vertices.budget = g_vcache_bytes;
+            }
+            gcfg.vertices.watch = tex_watch;
+            gcfg.vertices.written = tex_written;
+            WL_LOG_I(TAG, "vertex arrays: %u KB %s for GX to read by index", (unsigned)(g_vcache_bytes >> 10),
+                     g_vcache_arena != NULL ? "in an arena of their own" : "of the heap");
+        }
         if (wl_xb_title_vsh_natives != NULL) {
             gcfg.natives = wl_xb_title_vsh_natives(&gcfg.native_count);
             WL_LOG_I(TAG, "%lu vertex programs compiled ahead of time", gcfg.native_count);

@@ -262,10 +262,14 @@ static const char *play_setting(const WlXbTitleConfig *cfg) {
 }
 
 // The GPU's options from the title's folder: a file "noxf" (or WL_XB_NO_XF on the host) keeps GX's
-// transform unit out of the vertices, for an A/B on the console.
+// transform unit out of the vertices, for an A/B on the console; a file "vcache" (its text the KB,
+// 1024 when empty; WL_XB_VCACHE_KB on the host) keeps the static geometry's vertex arrays for GX to
+// read by index, from the heap.
 static void gpu_options(const WlXbTitleConfig *cfg) {
     char flag[WL_FS_PATH_MAX];
     bool no_xf;
+    uint32_t vcache_kb = 0;
+    WlPlatformFile *vf = NULL;
 
     snprintf(flag, sizeof flag, "%s/noxf", cfg->title_dir);
     no_xf = wl_platform_fs_exists(flag);
@@ -273,6 +277,23 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
     no_xf = no_xf || getenv("WL_XB_NO_XF") != NULL;
 #endif
     wl_xb_gpu_set_transform_unit(!no_xf);
+    snprintf(flag, sizeof flag, "%s/vcache", cfg->title_dir);
+    if (wl_platform_fs_open(flag, WL_FILE_READ, &vf) == WL_OK) {
+        char text[16];
+        uint32_t got = 0;
+
+        wl_platform_fs_read_some_at(vf, 0, text, sizeof text - 1u, &got);
+        wl_platform_fs_close(vf);
+        text[got] = '\0';
+        vcache_kb = (uint32_t)strtoul(text, NULL, 10);
+        vcache_kb = vcache_kb != 0 ? vcache_kb : 1024u;
+    }
+#if !defined(__wii__)
+    if (getenv("WL_XB_VCACHE_KB") != NULL) {
+        vcache_kb = (uint32_t)strtoul(getenv("WL_XB_VCACHE_KB"), NULL, 10);
+    }
+#endif
+    wl_xb_gpu_set_vertex_cache(NULL, vcache_kb << 10);
 }
 
 // The capture bench (bench.h) in place of the title: guest memory and the GPU as the title has
