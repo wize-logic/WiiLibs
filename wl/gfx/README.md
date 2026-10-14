@@ -67,6 +67,10 @@ instructions.
   `__wrap_sqrtf`; a program that does not wrap `sqrtf` does not carry it). In CMake:
   `wl_gfx_wrap_sqrtf(<executable>)` (`cmake/WiiLibs.cmake`). Nothing wraps `sqrtf` unless the
   program asks. The code calls no `sqrtf` and no `__real_sqrtf`, so the wrap cannot recurse.
+- `wl_sqrt_exact(x)` is the same for `sqrt` (double): the correctly rounded root, bit for bit newlib's,
+  from `frsqrte`'s estimate, four Newton steps and the last bit decided in 128-bit integers
+  (`gfx_sqrt_wrap.c` defines `__wrap_sqrt`; CMake: `wl_gfx_wrap_sqrt(<executable>)`). A recompiled
+  Xbox title gets both wraps from `wl_add_xbox_title`.
 - Tests (`tests/gfx/test_gfx_sqrt.c`, `test_gfx_sqrt_wrap.c`): against the platform's `sqrtf`,
   bit for bit, for every 199th positive float and every one of the smallest on the host (every
   1993rd and 5th under qemu; `WL_TEST_EXHAUSTIVE=1` compares every float), two binades densely,

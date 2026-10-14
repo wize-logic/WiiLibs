@@ -131,7 +131,7 @@ Stubs and approximations among them:
 - `ETHREAD.UniqueThread` is at KTHREAD + 0x134. The `XC_MAX_OS` user section's layout comes from
   public headers as remembered and is not checked against a console.
 - `KeQueryPerformanceFrequency` is 3 375 000 Hz, `KeTimeIncrement` 1 ms in 100 ns units.
-- DirectSound finds the AC'97 codec not ready (wl/xboxrt's MCPX devices) and fails to start.
+- DirectSound finds a ready AC'97 codec and a running APU when wl/xboxrt attaches `wl/xboxapu`'s models (the default); with the idle devices (`noaudio`, `WL_XB_AUDIO=0`) the codec is not ready and DirectSound fails to start.
 
 ## Tests
 
@@ -142,7 +142,7 @@ timeouts and mutants; timers with DPCs; an interrupt line with its ISR and DPC; 
 switch delivered to a loop that only polls a device register (D3D's fence wait); overlapped reads
 with their APC; the read-only DVD, a sparse cache drive, listings and delete-on-close; virtual and
 contiguous memory and the GPU instance; Rtl strings, time and printf; SHA-1, HMAC (RFC 2202) and
-RC4; the EEPROM settings. It runs on the host and on ppc-be. `tests/xboxrt/e2e/` runs a lifted title on
+RC4; the EEPROM settings. It runs on the host and on ppc-be, and again in the runtime's deterministic mode (`test_xboxkrnl_det`). `tests/xboxrt/e2e/` runs a lifted title on
 the kernel.
 
 Provenance: `exports.inc`, `rtl.c`, `kdata.c`, `hal.c`, `ex.c`, `path.c` and `nt_file.c` derive in
