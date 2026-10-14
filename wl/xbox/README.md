@@ -213,7 +213,8 @@ even, so its winding holds).
   (constant colours, MIN/MAX and src - dst approximated and counted); culling by the NV2A's rule on
   the screen winding (`wl_nv2a_cull`: SET_FRONT_FACE's CW is clockwise as the screen shows it, so
   Direct3D's D3DCULL_CCW keeps a quad wound clockwise on the screen; GX's sense measured once at
-  start); stencil draws skipped and counted. The
+  start); a draw with the stencil test is drawn as if the test passed (counted as `stencil_ignored`),
+  one that writes only the stencil is skipped (`stencil_skipped`). The
   EFB is the back buffer; another surface (a multisampled one among them) takes it through
   `wl/platform/gx_target.h`, and a texture at its address then samples its image; once a title
   samples a surface it showed (a displayed picture as a texture), each finished back buffer is
@@ -225,8 +226,9 @@ even, so its winding holds).
   the rest decoded to RGBA8: A4R4G4B4 keeps its four bits of alpha so a glyph cache's text stays
   smooth; DXT3/5's alpha a separate I4; P8 as C8 with a TLUT; a cube map made into psh's sphere
   map), kept by (address, format, size, palette) within a budget (4 MiB by default) or in an arena
-  of their own (a heap over it: a texture makes room by evicting the least recently drawn; one
-  without room is not tried again in that frame), and checked once a frame (every use once found
+  of their own (a heap over it, best fit: a texture makes room by emptying the oldest window of
+  the arena wide enough for it, not every image by age; one without room is not tried again in that
+  frame), and checked once a frame (every use once found
   rewritten): through a write watch where the caller has one (the runtime's MMU: a texture whose
   pages saw no store is as it was, its texels not read; one whose pages did is hashed, or made
   again if large), else by a hash of the guest's texels (XXH32's rounds: 32-bit multiplies).
@@ -237,6 +239,16 @@ even, so its winding holds).
   (`wl_nv2a_gx_blend_of`, `wl_nv2a_cull_of`, Direct3D's cull modes `wl_nv2a_cull_d3d`, GX's cull mode
   of the measured winding `wl_nv2a_gx_cull`) in `nv2a_raster.c`, which needs nothing else of wl_xbox:
   an Xbox Direct3D device's render states are the NV2A's values, and OpenCE-Wii's takes them so.
+- **Vertex arrays** (`nv2a_vcache.h`): a draw through the transform unit whose position, colours
+  and texture coordinates come from static arrays (a level's geometry, drawn in several passes every
+  frame) is sent as 16-bit indices alone: each array is converted once into big-endian arrays that
+  GX reads by index (`wl_gx_direct_array`), kept by (address of element 0, stride, format, what it
+  is converted as) and the range of elements, at most 65536. Like the textures' cache it is checked
+  once a frame (the write watch, else a hash of the source), evicts the least recently drawn within
+  its budget or arena (`WlNv2aGxConfig.vertices`; budget 0 is off) and gives memory back only once
+  the GPU has finished the frame that may read it; an array found changed is converted again, one
+  found changed twice (a skinned mesh) is not kept and its draws are sent as before. The runtime
+  keeps 1 MB by default (`vcache`/`novcache`, `wl/xboxrt/README.md`).
 - **The recorder** (`nv2a_record.h`) digests and describes every clear, draw, frame and flip.
 
 On the host, the GX backend's calls reach wl/platform's host backend, which records them; with
@@ -264,7 +276,7 @@ wl_nv2a_capture_frames(dev, &sink, 2);     // close the file once wl_nv2a_captur
 `wl_nv2a_replay_stream` reads the capture from a source a piece at a time and may take the caller's
 guest memory (its `phys_ptr`), into which the memory records go a 4 KB piece at a time where they
 differ: the runtime's capture bench (wl/xboxrt's `bench.h`) replays over the title's paged memory so.
-The host tool prints what was drawn and, with `--png-gx`, each frame GX shows: the GX backend over
+The host tool prints what was drawn (`-v` describes each clear, draw, frame and flip, `-vv` adds the 3D state of each draw) and, with `--png-gx`, each frame GX shows: the GX backend over
 the host's software GX (wl/gxsoft), the display copy of its EFB.
 
 ```sh
@@ -282,7 +294,9 @@ approximated. To look closer: `--efb-after N DIR` writes the EFB after the repla
 texture maps, the TEV program, the first vertices) and `--gx-textures DIR` writes those maps,
 `--psh-dump N` prints draw N's combiner words and psh's program.
 
-`--textures-mb N` keeps the converted textures in an arena of N MiB as the runtime does, and
+`--textures-mb N` keeps the converted textures in an arena of N MiB as the runtime does,
+`--vertex-cache-kb N` keeps the vertex arrays for GX to read by index in N KiB (none by default; the
+summary gives a `vertex arrays:` line), and
 `--watch` checks them through a write watch made from the capture's memory blocks (a page counts as
 stored to when a block changes bytes in it), as the Wii's MMU checks them: with both, a replay
 times the texture cache as the console runs it. The summary line `textures:` gives its counts.
@@ -312,7 +326,7 @@ across kicks, a ring's wrap), Direct3D's handshake, RAMHT and DMA objects, semap
 reports, the vblank and flips, a trap, a capture replayed (`test_xbox_nv2a.c`); every vertex format,
 each kind of draw, long batches, the windows, the combiner words, the surface (`_kelvin`); texture
 registers, conversions sampled against the texel decoders, levels, DXT and P8, sphere maps, the
-cache (`_texture`); the GX backend over the host's recorder: vertices as GX gets them, the TEV
+cache (`_texture`); the vertex arrays' cache (`_vcache`: each kind converted to the bit, found again, rewritten once and twice, evicted); the GX backend over the host's recorder: vertices as GX gets them, the TEV
 program, textures, the perspective path, culling, stencil, clears, render targets (`_gx`); the GX
 backend drawn by the host's software GX from push buffer to pixel: the console suite whole, with
 its Dolphin expectations, Direct3D's culling of screen-space quads, a program whose final product
@@ -323,7 +337,7 @@ through the GX backend on the Wii's GX and reads the EFB back.
 
 ## Not handled yet
 
-Stencil (GX has none: those draws are skipped); the fixed-function transform beyond the composite
+Stencil (GX has none: a draw with the test is drawn as if it passed, a stencil-only pass is skipped); the fixed-function transform beyond the composite
 matrix (no lighting, no texgen); point sprites, line widths; the NV2A's dependent texture modes
 (bump-env, dot products) beyond what psh does; the 2D classes (M2MF, image blit: logged); surfaces
 in guest memory (a render target's pixels are on the host: a title reading them back with the CPU
