@@ -514,6 +514,12 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     wl_xb_unlock(boot);
     int code = wl_xb_process_wait();
     WL_LOG_I(TAG, "the title left with %d", code);
+    // the guest stopped before the platform winds down: its other threads (and the service
+    // thread's interrupts and vertical blanks) would go on running the title's code while the
+    // card is unmounted and the audio and video are stopped. The service thread first (it may be
+    // waiting for the lock), then the lock is the boot thread's for good: no guest code runs again.
+    wl_xb_service_stop();
+    wl_xb_lock(boot);
 #if defined(__wii__)
     wl_platform_log_flush();
 #endif
