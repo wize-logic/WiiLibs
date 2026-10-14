@@ -162,6 +162,11 @@ void wl_apu_voice_off(WlXboxApu *apu, uint32_t v) {
 // The voice processor found a voice in a list that is not active: with FETFORCE1's idle-voice bit
 // the front end traps on it, and the guest's interrupt handler takes the voice out of its list
 // (DirectSound reads FEDECMETH/FEDECPARAM). One trap at a time: the others come in later frames.
+// An idle voice met in a list traps the front end, one trap at a time, for the first such voice in
+// list order, as the voice processor walks its lists. Deliberately so, not rotated among idle
+// voices: a voice the driver never takes out of its list (state it got wrong) then traps every
+// frame, which the repeat counter below makes visible ("idle voice N trapped M times in a row" in
+// the status), instead of being hidden behind the others.
 void wl_apu_idle_voice(WlXboxApu *apu, uint32_t v) {
     if ((wl_apu_reg(apu, WL_APU_FETFORCE1) & WL_APU_FETFORCE1_IDLE_VOICE) == 0 ||
         apu->trap_pending ||
