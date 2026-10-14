@@ -14,7 +14,9 @@ a little-endian one:
 - `XBOX_PTR(a)` is `WL_XB_EA(a)` plus `g_xbox_mem_offset`, or plus nothing with `WL_XB_EA_BASE_ZERO`
   (the Wii). `WL_XB_EA(a) = (a & 0x0FFFFFFF) | ((a >> 3) & 0x10000000)`: user space keeps its
   address, the contiguous window 0x8xxxxxxx and its alias 0xFxxxxxxx land at 0x1xxxxxxx (an
-  `rlwinm` and an `rlwimi` on PowerPC);
+  `rlwinm` and an `rlwimi` on PowerPC, always inline: about 8% more lifted code than GCC's -Os call of
+  an out-of-line copy, which took 9-10% of Halo's time on the Wii; `WL_XB_EA_CALL` brings the call
+  back for a title short of memory);
 - `RecompXmm` and `RecompMmx` have little-endian storage, so their lane views overlay as on x86;
 - `lock xadd`/`lock cmpxchg` (`RECOMP_ATOMIC_ADD32/CAS32`) byte-swap around a compare-and-swap loop;
 - `RECOMP_TLS` is empty: the registers are plain globals;

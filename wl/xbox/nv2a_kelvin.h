@@ -167,6 +167,30 @@ void wl_nv2a_draw_fetch(const WlNv2aDraw *draw, const WlNv2aKelvin *k, uint32_t 
 // they were (an immediate vertex's are all copied)
 void wl_nv2a_draw_fetch_some(const WlNv2aDraw *draw, const WlNv2aKelvin *k, uint32_t vertex, uint32_t attributes,
                              float inputs[WL_NV2A_ATTRIBS][4]);
+// A draw's fetch decided once for its vertices: the attributes in `attributes` (bit n: v[n]) that
+// come from the vertices, each with its address, stride and format, and those that are current
+// values (the same for every vertex: wl_nv2a_fetch_constants writes them). wl_nv2a_fetch_vertex then
+// gives what wl_nv2a_draw_fetch_some gives, to the bit, for the streamed ones (an immediate vertex's
+// registers all copied).
+typedef struct WlNv2aFetchPlan {
+    uint8_t source; // WL_NV2A_SOURCE_*
+    uint8_t count;  // streamed attributes
+    struct {
+        const uint8_t *data; // vertex 0's (ARRAYS: index index_base's; INLINE: the first vertex's)
+        uint32_t stride;
+        uint8_t attribute, format; // v[n]; WL_NV2A_FETCH_*
+        uint8_t type, size;
+    } streamed[WL_NV2A_ATTRIBS];
+    uint32_t constants; // the current values' attributes
+    const uint32_t *indices;
+    uint32_t index_base;
+} WlNv2aFetchPlan;
+void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetchPlan *plan);
+// the current values' attributes into each of `count` input register sets
+void wl_nv2a_fetch_constants(const WlNv2aFetchPlan *plan, const WlNv2aKelvin *k, float (*inputs)[WL_NV2A_ATTRIBS][4],
+                             unsigned count);
+void wl_nv2a_fetch_vertex(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, uint32_t vertex,
+                          float inputs[WL_NV2A_ATTRIBS][4]);
 // one attribute's value from its data (an array element or inline), as the NV2A widens it: the
 // components the format leaves out are 0, w 1
 void wl_nv2a_attrib_decode(uint8_t type, uint8_t size, const uint8_t *data, float out[4]);

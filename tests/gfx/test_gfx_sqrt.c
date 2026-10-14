@@ -13,6 +13,7 @@
 #include "greatest.h"
 
 float __wrap_sqrtf(float x);
+double __wrap_sqrt(double x);
 
 // The test links with --wrap=wl_sqrtf_integer, to count the calls the refinement leaves to it (it never should).
 float __real_wl_sqrtf_integer(float value);
@@ -173,6 +174,109 @@ TEST wrap_is_the_exact_root(void) {
     PASS();
 }
 
+// ---- double -------------------------------------------------------------------------------------------
+
+static double (*volatile platform_sqrt)(double) = sqrt;
+
+static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
+static uint64_t rnd64(void) {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 7;
+    g_rng ^= g_rng << 17;
+    return g_rng;
+}
+
+#if defined(__powerpc__)
+#define DOUBLES 200000u
+#else
+#define DOUBLES 4000000u
+#endif
+
+// random positive finite doubles of every exponent, subnormals among them, and doubles in [1, 4)
+TEST double_exact_matches_sqrt(void) {
+    unsigned long differ = 0;
+    for (uint32_t i = 0; i < DOUBLES; i++) {
+        uint64_t bits = rnd64() & 0x7FFFFFFFFFFFFFFFull;
+        if ((bits >> 52) == 0x7FF) {
+            bits &= 0x7FEFFFFFFFFFFFFFull;
+        }
+        if (i % 4 == 0) {
+            bits = (bits & 0x000FFFFFFFFFFFFFull) | ((uint64_t)(1023 + (i / 4) % 2) << 52);
+        }
+        if (i % 16 == 1) {
+            bits &= 0x000FFFFFFFFFFFFFull; // a subnormal
+        }
+        if (bits == 0) {
+            continue;
+        }
+        double x = wl_bits_double(bits);
+        if (wl_double_bits(wl_sqrt_exact(x)) != wl_double_bits(platform_sqrt(x))) {
+            differ++;
+        }
+    }
+    ASSERT_EQ_FMT(0ul, differ, "%lu");
+    PASS();
+}
+
+TEST double_refine_is_exact_from_a_coarse_estimate(void) {
+    unsigned long differ = 0;
+    for (int which = 0; which < 3; which++) {
+        for (uint32_t i = 0; i < DOUBLES / 4; i++) {
+            uint64_t bits = (rnd64() & 0x000FFFFFFFFFFFFFull) | ((uint64_t)(1023 + i % 2) << 52);
+            double x = wl_bits_double(bits);
+            if (wl_double_bits(wl_sqrt_refine(x, coarse_estimate(x, which))) != wl_double_bits(platform_sqrt(x))) {
+                differ++;
+            }
+        }
+    }
+    ASSERT_EQ_FMT(0ul, differ, "%lu");
+    PASS();
+}
+
+// squares of whole numbers of up to 26 bits and the doubles beside them, and the squares of the
+// midpoints' neighbours: where a wrong rounding shows soonest
+TEST double_squares_and_their_neighbours(void) {
+    unsigned long differ = 0;
+    for (uint32_t i = 0; i < DOUBLES / 8; i++) {
+        uint64_t k = (rnd64() >> 38) | 1u;
+        double square = (double)k * (double)k;
+        for (int step = -2; step <= 2; step++) {
+            double x = wl_bits_double(wl_double_bits(square) + (uint64_t)(int64_t)step);
+            if (wl_double_bits(wl_sqrt_exact(x)) != wl_double_bits(platform_sqrt(x))) {
+                differ++;
+            }
+        }
+        // a double's square, rounded: its root is the double or a neighbour
+        double r = wl_bits_double((rnd64() & 0x000FFFFFFFFFFFFFull) | ((uint64_t)1023 << 52)), x = r * r;
+        if (wl_double_bits(wl_sqrt_exact(x)) != wl_double_bits(platform_sqrt(x))) {
+            differ++;
+        }
+    }
+    ASSERT_EQ_FMT(0ul, differ, "%lu");
+    PASS();
+}
+
+TEST double_special_values_are_ieees(void) {
+    double inf = wl_bits_double(0x7FF0000000000000ull), nan = wl_bits_double(0x7FF8000000000000ull);
+    ASSERT_EQ(0x0000000000000000ull, wl_double_bits(wl_sqrt_exact(0.0)));
+    ASSERT_EQ(0x8000000000000000ull, wl_double_bits(wl_sqrt_exact(-0.0)));
+    ASSERT_EQ(0x7FF0000000000000ull, wl_double_bits(wl_sqrt_exact(inf)));
+    ASSERT(isnan(wl_sqrt_exact(-1.0)));
+    ASSERT(isnan(wl_sqrt_exact(-4.9e-324)));
+    ASSERT(isnan(wl_sqrt_exact(-inf)));
+    ASSERT(isnan(wl_sqrt_exact(nan)));
+    ASSERT_EQ(wl_double_bits(platform_sqrt(4.9e-324)), wl_double_bits(wl_sqrt_exact(4.9e-324)));
+    ASSERT_EQ(wl_double_bits(platform_sqrt(2.2250738585072014e-308)),
+              wl_double_bits(wl_sqrt_exact(2.2250738585072014e-308)));
+    ASSERT_EQ(wl_double_bits(platform_sqrt(1.7976931348623157e308)),
+              wl_double_bits(wl_sqrt_exact(1.7976931348623157e308)));
+    ASSERT_EQ(wl_double_bits(platform_sqrt(3.9999999999999996)), wl_double_bits(wl_sqrt_exact(3.9999999999999996)));
+    ASSERT_EQ(0x3FF0000000000000ull, wl_double_bits(wl_sqrt_exact(1.0)));
+    ASSERT_EQ(0x4000000000000000ull, wl_double_bits(wl_sqrt_exact(4.0)));
+    ASSERT_EQ(wl_double_bits(platform_sqrt(2.0)), wl_double_bits(__wrap_sqrt(2.0)));
+    PASS();
+}
+
 SUITE(gfx_sqrt_suite) {
     RUN_TEST(exact_matches_sqrtf_over_all_floats);
     RUN_TEST(exact_matches_sqrtf_densely_where_games_live);
@@ -181,6 +285,10 @@ SUITE(gfx_sqrt_suite) {
     RUN_TEST(integer_root_matches_sqrtf);
     RUN_TEST(special_values_are_ieees);
     RUN_TEST(wrap_is_the_exact_root);
+    RUN_TEST(double_exact_matches_sqrt);
+    RUN_TEST(double_refine_is_exact_from_a_coarse_estimate);
+    RUN_TEST(double_squares_and_their_neighbours);
+    RUN_TEST(double_special_values_are_ieees);
 }
 
 GREATEST_MAIN_DEFS();
