@@ -33,6 +33,10 @@ typedef struct WlNv2aPipeline {
     uint32_t program_generation;
     float point_size;
     uint32_t compiled, found;
+    // called for each program decoded (again when one evicted comes back), with whether it was among
+    // the natives: a title's programs listed for compiling ahead of time (NULL: none)
+    void (*decoded)(void *user, const uint32_t *words, unsigned long count, bool native);
+    void *decoded_user;
 } WlNv2aPipeline;
 
 void wl_nv2a_pipeline_init(WlNv2aPipeline *p, const WlXboxVshNative *natives, unsigned long native_count);
@@ -45,6 +49,12 @@ bool wl_nv2a_pipeline_begin(WlNv2aPipeline *p, const WlNv2aKelvin *k);
 // 1. `out->clip_captured` says whether out->clip is the clip-space position.
 void wl_nv2a_pipeline_vertex(WlNv2aPipeline *p, const WlNv2aKelvin *k, const float inputs[WL_NV2A_ATTRIBS][4],
                              unsigned live, WlXboxVshOutput *out);
+// The same for `count` vertices (inputs[n] into out[n]), the program's interpreted together
+// (wl_xbox_vsh_run_batch, with `work` its scratch): the same results, to the bit.
+void wl_nv2a_pipeline_vertices(WlNv2aPipeline *p, const WlNv2aKelvin *k, const float (*inputs)[WL_NV2A_ATTRIBS][4],
+                               unsigned count, unsigned live, WlXboxVshOutput *out, WlXboxVshWork *work);
+// The input registers the outputs in `live` read (bit n: v[n]): the others need not be fetched.
+uint32_t wl_nv2a_pipeline_inputs(const WlNv2aPipeline *p, unsigned live);
 
 // The fog factor (1 no fog, 0 all fog) of a fog coordinate (the program's oFog) by SET_FOG_MODE
 // and SET_FOG_PARAMS (bias, multiplier): linear bias - 1 + multiplier c, exp bias - 1.5 +

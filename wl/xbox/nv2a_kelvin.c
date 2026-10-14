@@ -119,6 +119,11 @@ void wl_nv2a_attrib_decode(uint8_t type, uint8_t size, const uint8_t *data, floa
 
 void wl_nv2a_draw_fetch(const WlNv2aDraw *draw, const WlNv2aKelvin *k, uint32_t vertex,
                         float inputs[WL_NV2A_ATTRIBS][4]) {
+    wl_nv2a_draw_fetch_some(draw, k, vertex, (1u << WL_NV2A_ATTRIBS) - 1u, inputs);
+}
+
+void wl_nv2a_draw_fetch_some(const WlNv2aDraw *draw, const WlNv2aKelvin *k, uint32_t vertex, uint32_t attributes,
+                             float inputs[WL_NV2A_ATTRIBS][4]) {
     unsigned a;
 
     if (draw->source == WL_NV2A_SOURCE_IMMEDIATE) {
@@ -128,6 +133,9 @@ void wl_nv2a_draw_fetch(const WlNv2aDraw *draw, const WlNv2aKelvin *k, uint32_t 
     for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
         const WlNv2aAttrib *attrib = &draw->attribs[a];
 
+        if (!(attributes & (1u << a))) {
+            continue;
+        }
         if (!(draw->streamed & (1u << a))) {
             memcpy(inputs[a], k->current[a], sizeof inputs[a]);
         } else if (draw->source == WL_NV2A_SOURCE_ARRAYS) {

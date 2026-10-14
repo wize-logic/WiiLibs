@@ -55,6 +55,9 @@ bool wl_nv2a_pipeline_begin(WlNv2aPipeline *p, const WlNv2aKelvin *k) {
     p->program = &p->programs[slot].program;
     p->program_generation = k->program_generation;
     p->compiled++;
+    if (p->decoded != NULL) {
+        p->decoded(p->decoded_user, words, count, p->program->native != NULL);
+    }
     return true;
 }
 
@@ -122,6 +125,27 @@ void wl_nv2a_pipeline_vertex(WlNv2aPipeline *p, const WlNv2aKelvin *k, const flo
         return;
     }
     wl_xbox_vsh_run_live(p->program, (const float (*)[4])k->constants, inputs, p->point_size, out, live);
+}
+
+void wl_nv2a_pipeline_vertices(WlNv2aPipeline *p, const WlNv2aKelvin *k, const float (*inputs)[WL_NV2A_ATTRIBS][4],
+                               unsigned count, unsigned live, WlXboxVshOutput *out, WlXboxVshWork *work) {
+    unsigned n;
+
+    if (p->program == NULL) {
+        for (n = 0; n < count; n++) {
+            fixed_function(k, inputs[n], &out[n]);
+        }
+        return;
+    }
+    wl_xbox_vsh_run_batch(p->program, (const float (*)[4])k->constants, inputs, count, p->point_size, out, live, work);
+}
+
+uint32_t wl_nv2a_pipeline_inputs(const WlNv2aPipeline *p, unsigned live) {
+    if (p->program == NULL) {
+        // (the fixed function's: the position, the colours, the fog coordinate, the texture coordinates)
+        return 1u << 0 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 9 | 1u << 10 | 1u << 11 | 1u << 12;
+    }
+    return (uint32_t)wl_xbox_vsh_inputs_read(p->program, live);
 }
 
 float wl_nv2a_fog_factor(const WlNv2aKelvin *k, float coordinate) {

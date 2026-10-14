@@ -13,8 +13,12 @@
 // half is its instruction count, then four words an instruction. Programs met twice are written
 // once.
 //
-// usage: xbox_vsh_codegen microcode.inc output.c [table]
-//   (table: the name of the table, default xbox_vsh_natives, and of its count, <table>_count)
+// usage: xbox_vsh_codegen [--if-exists] [--accessor name] microcode.inc output.c [table]
+//   (table: the name of the table, default xbox_vsh_natives, and of its count, <table>_count;
+//   --if-exists: a microcode file that is not there has no programs, an empty table; --accessor:
+//   also a function of that name, const WlXboxVshNative *name(unsigned long *count), that gives
+//   the table and its count, which a runtime can declare weak: wl_add_xbox_title's
+//   wl_xb_title_vsh_natives)
 
 #include "../wl/xbox/vsh.c"
 
@@ -280,109 +284,8 @@ static void instruction_code(FILE *out, const WlXboxVshInstruction *instruction,
     (void)component_letters;
 }
 
-/* the outputs each instruction's results reach (WL_XBOX_VSH_LIVE_...), found
-backwards from the end a register's component at a time: a draw that reads
-none of them skips the instruction, and what it runs is the same, so the
-outputs it reads are too */
-static unsigned temporary_index(unsigned temporary) {
-    return temporary == 12 ? 12 : temporary < 12 ? temporary : 0;
-}
-
-static void live_needs(const WlXboxVshProgram *program, unsigned *needs) {
-    unsigned need[13][4], need_a0 = 0;
-    long index;
-    int component, which;
-
-    memset(need, 0, sizeof(need));
-    /* (the position is p as the program ends) */
-    for (component = 0; component < 4; component++)
-        need[12][component] = WL_XBOX_VSH_LIVE_POSITION;
-    for (index = (long)program->count - 1; index >= 0; index--) {
-        const WlXboxVshInstruction *instruction = &program->instructions[index];
-        unsigned reaches = 0, kills[13] = {0};
-
-        /* what its writes reach */
-        if (instruction->mac == _mac_arl)
-            reaches |= need_a0;
-        else if (instruction->mac != _mac_nop && instruction->mac_mask)
-            kills[temporary_index(instruction->temporary)] |= instruction->mac_mask;
-        if (instruction->ilu != _ilu_nop && instruction->ilu_mask)
-            kills[temporary_index(instruction->mac != _mac_nop ? 1 : instruction->temporary)] |=
-                instruction->ilu_mask;
-        if (instruction->output_mask && instruction->output_is_register &&
-            (instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0) {
-            switch (instruction->output_address) {
-            case _output_position:
-                kills[12] |= instruction->output_mask;
-                break;
-            case _output_d0:
-                reaches |= WL_XBOX_VSH_LIVE_D0;
-                break;
-            case _output_d1:
-                reaches |= WL_XBOX_VSH_LIVE_D1;
-                break;
-            case _output_b0:
-            case _output_b1:
-                reaches |= WL_XBOX_VSH_LIVE_BACK;
-                break;
-            case _output_fog:
-                if (instruction->output_mask & 8)
-                    reaches |= WL_XBOX_VSH_LIVE_FOG;
-                break;
-            case _output_point_size:
-                if (instruction->output_mask & 8)
-                    reaches |= WL_XBOX_VSH_LIVE_POINT_SIZE;
-                break;
-            default:
-                if (instruction->output_address >= _output_t0 &&
-                    instruction->output_address < _output_t0 + 4)
-                    reaches |= WL_XBOX_VSH_LIVE_T0 << (instruction->output_address - _output_t0);
-                break;
-            }
-        }
-        for (which = 0; which < 13; which++)
-            for (component = 0; component < 4; component++)
-                if (kills[which] & (8u >> component)) {
-                    reaches |= need[which][component];
-                    need[which][component] = 0;
-                }
-        if (instruction->mac == _mac_arl)
-            need_a0 = 0;
-        /* (the clip-space position: p before this instruction's writes) */
-        if (instruction->captures_clip) {
-            reaches |= WL_XBOX_VSH_LIVE_POSITION;
-            for (component = 0; component < 4; component++)
-                need[12][component] |= WL_XBOX_VSH_LIVE_POSITION;
-        }
-        /* what it reads: its operands, whole */
-        if (reaches) {
-            int reads[3] = {0, 0, 0};
-
-            if (instruction->mac != _mac_nop) {
-                reads[0] = 1;
-                if (instruction->mac != _mac_mov && instruction->mac != _mac_arl &&
-                    instruction->mac != _mac_add)
-                    reads[1] = 1;
-            }
-            if (instruction->ilu != _ilu_nop || instruction->mac == _mac_add ||
-                instruction->mac == _mac_mad)
-                reads[2] = 1;
-            for (which = 0; which < 3; which++) {
-                const WlXboxVshOperand *operand = &instruction->operands[which];
-
-                if (!reads[which])
-                    continue;
-                if (operand->mux == _mux_temporary)
-                    for (component = 0; component < 4; component++)
-                        need[temporary_index(operand->index)][operand->swizzle[component] & 3] |=
-                            reaches;
-                else if (operand->mux == _mux_constant && instruction->relative)
-                    need_a0 |= reaches;
-            }
-        }
-        needs[index] = reaches;
-    }
-}
+/* (the outputs each instruction's results reach: wl_xbox_vsh_live_needs,
+which the interpreter also skips by) */
 
 /* the outputs' components no instruction writes, as wl_xbox_vsh_run leaves
 them (but the point size, which wl_xbox_vsh_run_live sets) */
@@ -508,7 +411,7 @@ static void constant_free_comment(FILE *out, const WlXboxVshProgram *program) {
 }
 
 /* writing a program's positions function: the instructions that reach the
-position (live_needs), for four values of v0 at once. An instruction that
+position (wl_xbox_vsh_live_needs), for four values of v0 at once. An instruction that
 reads nothing of v0 (through its operands, the registers written from it,
 or a0 made from it) is the same in every lane: written once, from lane 0's
 registers, and what it writes copied to the others; one that does is
@@ -643,21 +546,37 @@ int main(int argc, char **argv) {
     char line[512];
     FILE *in, *out;
     int in_comment = 0;
-    const char *table = "xbox_vsh_natives";
+    const char *table = "xbox_vsh_natives", *accessor = NULL;
+    int if_exists = 0;
 
+    while (argc > 1 && argv[1][0] == '-' && argv[1][1] == '-') {
+        if (strcmp(argv[1], "--if-exists") == 0) {
+            if_exists = 1;
+        } else if (strcmp(argv[1], "--accessor") == 0 && argc > 2) {
+            accessor = argv[2];
+            argc--;
+            argv++;
+        } else {
+            break;
+        }
+        argc--;
+        argv++;
+    }
     if (argc != 3 && argc != 4) {
-        fprintf(stderr, "usage: xbox_vsh_codegen microcode.inc output.c [table]\n");
+        fprintf(stderr,
+                "usage: xbox_vsh_codegen [--if-exists] [--accessor name] microcode.inc output.c "
+                "[table]\n");
         return 2;
     }
     if (argc == 4)
         table = argv[3];
     in = fopen(argv[1], "r");
-    if (!in) {
+    if (!in && !if_exists) {
         perror(argv[1]);
         return 1;
     }
     /* the hexadecimal words, past the comment */
-    while (fgets(line, sizeof(line), in)) {
+    while (in && fgets(line, sizeof(line), in)) {
         char *cursor = line;
 
         while (*cursor) {
@@ -682,7 +601,8 @@ int main(int argc, char **argv) {
             }
         }
     }
-    fclose(in);
+    if (in)
+        fclose(in);
 
     out = fopen(argv[2], "w");
     if (!out) {
@@ -742,7 +662,7 @@ int main(int argc, char **argv) {
                 "r;\n\t(void)live;\n",
                 hash);
         live_defaults(out, &program);
-        live_needs(&program, needs);
+        wl_xbox_vsh_live_needs(&program, needs);
         {
             unsigned open = 0;
 
@@ -784,7 +704,16 @@ int main(int argc, char **argv) {
         fprintf(out, "\t{ 0x%08lxUL, %lu, program_%08lx, program_%08lx_colors, %s },\n",
                 hashes[index], counts[index], hashes[index], hashes[index], positions);
     }
+    /* (C has no empty array: a table of none holds one entry no program matches) */
+    if (!program_count)
+        fprintf(out, "\t{ 0UL, 0, NULL, NULL, NULL },\n");
     fprintf(out, "};\n\nconst unsigned long %s_count = %lu;\n", table, program_count);
+    if (accessor)
+        fprintf(out,
+                "\nconst WlXboxVshNative *%s(unsigned long *count);\n\n"
+                "const WlXboxVshNative *%s(unsigned long *count)\n{\n\t*count = %s_count;\n"
+                "\treturn %s;\n}\n",
+                accessor, accessor, table, table);
     fclose(out);
     printf("xbox_vsh_codegen: %lu programs from %lu words\n", program_count, word_count);
     return 0;

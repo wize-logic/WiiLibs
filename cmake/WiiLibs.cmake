@@ -234,6 +234,15 @@ endfunction()
 # seeds, extra options). CHUNKS (default 32) is how many translation units the code is spread over.
 # NO_EXECUTABLE makes only <target>_code. The driver's Python needs capstone; set
 # WL_XBOX_RECOMP_PYTHON to choose the interpreter.
+# The title config's "vertex_programs" names the list of the title's NV2A vertex programs (relative
+# to the config; the runtime appends each program it draws with that is not compiled in to
+# <hard disk folder>/vsh_programs.inc, so a config gives "hdd/vsh_programs.inc"): at build time
+# tools/xbox_vsh_codegen.c (built for the build machine with WL_HOST_C_COMPILER, default cc) makes
+# it C, ${CMAKE_CURRENT_BINARY_DIR}/<target>_recomp/vsh/vsh_natives.c (derived from the title: never
+# commit it or the list), compiled into the executable (-O2, no fused multiply-adds: the same bits
+# as the interpreter), whose wl_xb_title_vsh_natives the runtime finds them by. A list that is not
+# there yet is an empty table. The executable also gets sqrtf as wl_sqrtf_exact
+# (wl_gfx_wrap_sqrtf: the same bits, faster on the Wii).
 # (a cache entry: a project that adds WiiLibs with add_subdirectory calls the functions below from its
 # own scope, where a plain variable of this directory is not seen)
 set(WL_CMAKE_DIR ${CMAKE_CURRENT_LIST_DIR} CACHE INTERNAL "WiiLibs' cmake directory")
@@ -364,6 +373,49 @@ function(wl_add_xbox_title target)
             "RUNTIME was given; the link needs the runtime ABI from SOURCES")
     endif()
     target_link_libraries(${target} PRIVATE m)
+    wl_gfx_wrap_sqrtf(${target})
+    # the title's vertex programs compiled ahead of time
+    set(vsh_list "")
+    if(A_TITLE_CONFIG)
+        string(JSON vsh_list ERROR_VARIABLE no_vsh_list GET "${config_text}" vertex_programs)
+        if(no_vsh_list)
+            set(vsh_list "")
+        elseif(NOT IS_ABSOLUTE "${vsh_list}")
+            set(vsh_list "${config_dir}/${vsh_list}")
+        endif()
+    endif()
+    if(vsh_list)
+        if(NOT WL_HOST_C_COMPILER)
+            find_program(WL_HOST_C_COMPILER NAMES cc gcc clang)
+        endif()
+        if(NOT WL_HOST_C_COMPILER)
+            message(FATAL_ERROR "wl_add_xbox_title(${target}): no C compiler for the build machine "
+                "(tools/xbox_vsh_codegen.c); set WL_HOST_C_COMPILER")
+        endif()
+        set(vsh_dir ${out}/vsh)
+        set(vsh_tool ${vsh_dir}/xbox_vsh_codegen${CMAKE_HOST_EXECUTABLE_SUFFIX})
+        set(vsh_c ${vsh_dir}/vsh_natives.c)
+        add_custom_command(OUTPUT ${vsh_tool}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${vsh_dir}
+            COMMAND ${WL_HOST_C_COMPILER} -O1 -std=c11 -ffp-contract=off -I${wl_root}
+                ${wl_root}/tools/xbox_vsh_codegen.c ${wl_root}/wl/gfx/gfx_sqrt.c -lm -o ${vsh_tool}
+            DEPENDS ${wl_root}/tools/xbox_vsh_codegen.c ${wl_root}/wl/xbox/vsh.c ${wl_root}/wl/xbox/vsh.h
+                ${wl_root}/wl/xbox/vsh_native.h ${wl_root}/wl/gfx/gfx_sqrt.c ${wl_root}/wl/gfx/gfx_sqrt.h
+            COMMENT "Building the vertex program compiler for the build machine"
+            VERBATIM)
+        # (run at every build, the list being the runtime's; the C is replaced only when it changes)
+        add_custom_target(${target}_vsh
+            COMMAND ${vsh_tool} --if-exists --accessor wl_xb_title_vsh_natives ${vsh_list} ${vsh_c}.new
+                wl_xb_vsh_natives
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${vsh_c}.new ${vsh_c}
+            BYPRODUCTS ${vsh_c}
+            DEPENDS ${vsh_tool}
+            COMMENT "Compiling the vertex programs of ${vsh_list}"
+            VERBATIM)
+        target_sources(${target} PRIVATE ${vsh_c})
+        set_source_files_properties(${vsh_c} PROPERTIES GENERATED TRUE COMPILE_OPTIONS "-O2;-ffp-contract=off")
+        add_dependencies(${target} ${target}_vsh)
+    endif()
     if(WL_PLATFORM STREQUAL "wii")
         ogc_create_dol(${target})
     endif()

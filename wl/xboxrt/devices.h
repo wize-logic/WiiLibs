@@ -104,6 +104,13 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes);
 // tools/xbox_nv2a_replay. On the host the WL_XB_CAPTURE environment variable sets it too:
 // "path[,frames[,after vblanks]]". Nothing when wl/xbox's NV2A model is not built in.
 void wl_xb_gpu_capture(const char *path, uint32_t frames, uint32_t after_vblanks);
+// The vertex programs the GPU decodes that the title does not have compiled ahead of time are
+// appended to the file `path` (the boot code's: <hard disk folder>/vsh_programs.inc), as
+// tools/xbox_vsh_codegen.c takes them, each once: the title's build compiles the list into C
+// (wl_add_xbox_title, the title config's "vertex_programs"), which the runtime then runs in place
+// of the interpreter. NULL or "": no list. Call it before wl_xb_gpu_attach_nv2a. Nothing when
+// wl/xbox's NV2A model is not built in.
+void wl_xb_gpu_set_program_list(const char *path);
 
 #ifdef __cplusplus
 }

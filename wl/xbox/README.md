@@ -66,6 +66,19 @@ leaving the screen-space position, the clip-space position before the conversion
 (`clip_captured`), the colours, texture coordinates, fog and point size. `wl_xbox_vsh_run_live`
 computes only the outputs a draw reads (`WL_XBOX_VSH_LIVE_*`), the same bits.
 
+The interpreter does no decoding as it runs: compile resolves each instruction once into a step
+(`WlXboxVshStep`: each operand's register file, index, swizzle and sign, the registers and masks
+each unit writes, the output written) and finds, backwards from the end, the outputs each one's
+results reach (`wl_xbox_vsh_live_needs`, which the compiled functions skip by too). A run skips the
+steps that reach no output the draw reads. `wl_xbox_vsh_run_batch` runs many vertices, 16 at a
+time (`WL_XBOX_VSH_BATCH`, the registers in the caller's `WlXboxVshWork`), an instruction at a time
+for all of them: a constant operand is made once for the batch, a temporary or input read in place
+(swizzled or negated ones gathered first), each result written with its mask for every vertex.
+Each vertex gets the same operations in the same order as a run of the program for it alone, so the
+bits are the same (`test_xbox_vsh_batch.c` holds the plain interpreter and checks the batch against
+it on random programs). `wl_xbox_vsh_inputs_read` says which input registers the steps a draw runs
+read: the GX backend fetches only those.
+
 The analysis (`wl_xbox_vsh_analyze`, `_uniform`, `_constants`) walks a program with sets of input
 registers in place of numbers: each output component's inputs, whether it is an affine function of
 them (then GX's matrices can compute it), whether it reads a constant (one that does not is the
@@ -77,11 +90,19 @@ outputs a draw reads; one for its colours alone; and, for a program whose positi
 by a0 and is converted to the screen (a skinned model's), one for four positions at once. It writes
 a table of `WlXboxVshNative`, which the program hands to `wl_xbox_vsh_compile`; a program found in
 it by its words' hash (`wl_xbox_vsh_hash`) runs as its function. The table's name is the tool's
-third argument (`xbox_vsh_natives` by default).
+third argument (`xbox_vsh_natives` by default). `--accessor name` also writes a function that gives
+the table and its count; `--if-exists` takes a missing file as no programs (an empty table).
 
 ```sh
-xbox_vsh_codegen microcode.inc programs.c [table]
+xbox_vsh_codegen [--if-exists] [--accessor name] microcode.inc programs.c [table]
 ```
+
+A recompiled title gets this without writing anything: the runtime appends each program it draws
+with that is not compiled in to `<hard disk folder>/vsh_programs.inc` (wl/xboxrt), and
+`wl_add_xbox_title` compiles that list at build time when the title config names it
+(`"vertex_programs": "hdd/vsh_programs.inc"`). Play the title once on the host, build again (for
+the Wii too), and its programs run as functions. The list and the C are made from the game's
+code: they stay in the title's folders, never in WiiLibs.
 
 ## Tests
 
@@ -89,7 +110,8 @@ xbox_vsh_codegen microcode.inc programs.c [table]
 evaluated directly (none differs; a digest of every program, the same on ppc-be), recipes, fog,
 bumped lookups; the cache against fresh translations, byte for byte; synthetic vertex programs
 (`vsh_programs.py` assembles `vsh_programs.inc`) interpreted exactly, analysed, and compiled by
-the tool at build time (under qemu on ppc-be) against the interpreter, bit for bit.
+the tool at build time (under qemu on ppc-be) against the interpreter, bit for bit; the batch
+interpreter against the plain one on random programs and live sets.
 
 The OpenCE-Wii port (Halo) checks the translation further with the game's own programs.
 
@@ -229,6 +251,7 @@ the host's software GX (wl/gxsoft), the display copy of its EFB.
 ```sh
 xbox_nv2a_replay nv2a.capture -v --png-gx frames/ --programs programs.inc
 xbox_vsh_codegen programs.inc programs.c     # the title's programs as C, for WlNv2aGxConfig.natives
+xbox_nv2a_replay nv2a.capture --bench 10     # the processor's part alone, timed (ms a frame)
 ```
 
 With `-v` and `--png-gx`, each draw also says what its GX primitives covered and wrote (triangles
@@ -248,6 +271,10 @@ times the texture cache as the console runs it. The summary line `textures:` giv
 `--programs` writes each vertex program the capture drew with, once, as `tools/xbox_vsh_codegen.c`'s
 input: a title project compiles them ahead of time and hands the table to the GX backend, so its
 programs run as functions rather than through the interpreter.
+
+`--bench N` replays the capture N times through the GX backend alone (no software GX, no recorder;
+the textures kept from one run to the next) and prints the best and the mean time a frame: the
+vertex programs, the fetch, the translation, what the Wii's processor does for a frame.
 
 ## The NV2A's tests
 

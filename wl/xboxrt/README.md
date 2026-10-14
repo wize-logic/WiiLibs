@@ -367,7 +367,11 @@ own. It returns the process's exit code. `wl_xboxrt_main` is a `main`: on the ho
 `WL_XB_PLAY_OUT` start the play harness), on the Wii `sd:/xbox/<WL_XB_TITLE_NAME>`; it calls
 `wl_xb_title_setup(&cfg)` first, a weak hook a title's own source may define. The seed file
 (`<hdd folder>/recomp_seeds.json`) gets every indirect-call target that had no translated function,
-appended to what the file holds.
+appended to what the file holds. In the same way `<hdd folder>/vsh_programs.inc` gets every NV2A
+vertex program the title draws with that is not compiled in (`wl_xb_gpu_set_program_list`): a title
+config's `"vertex_programs": "hdd/vsh_programs.inc"` has `wl_add_xbox_title` compile the list to C
+(tools/xbox_vsh_codegen.c), and the GPU runs those programs as functions (the generated
+`wl_xb_title_vsh_natives`, weak here).
 
 ## Crash reports (`crash.h`)
 

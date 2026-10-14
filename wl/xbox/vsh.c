@@ -4,12 +4,19 @@
 // (scalar) units read their operands A, B and C, then write their results (the ILU's to r1 when
 // both run), r12 is the position output read back, a0 indexes the constants relatively.
 //
+// The interpreter runs the steps compile resolved from the fields (WlXboxVshStep: each operand's
+// register, swizzle and sign, each write's register and mask, the outputs an instruction reaches),
+// an instruction at a time for a batch of vertices, so that what an instruction is is decided once
+// for all of them, and skips the instructions that reach no output the draw reads. Each vertex sees
+// the same operations in the same order as a run of the program for it alone.
+//
 // Programs known ahead of time can also be compiled to C (tools/xbox_vsh_codegen.c, which decodes
 // them with this file): a program found among them (wl_xbox_vsh_hash) runs as its function.
 
 #include "wl/xbox/vsh_native.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <string.h>
 
 enum {
@@ -96,6 +103,245 @@ static void operand_fields(const uint32_t *instruction, int which, WlXboxVshOper
     }
 }
 
+static unsigned temporary_index(unsigned temporary) {
+    return temporary == 12 ? 12 : temporary < 12 ? temporary : 0;
+}
+
+/* the outputs each instruction's results reach (WL_XBOX_VSH_LIVE_...), found
+backwards from the end a register's component at a time: a draw that reads
+none of them skips the instruction, and what it runs is the same, so the
+outputs it reads are too */
+void wl_xbox_vsh_live_needs(const WlXboxVshProgram *program, unsigned *needs) {
+    unsigned need[13][4], need_a0 = 0;
+    long index;
+    int component, which;
+
+    memset(need, 0, sizeof(need));
+    /* (the position is p as the program ends) */
+    for (component = 0; component < 4; component++)
+        need[12][component] = WL_XBOX_VSH_LIVE_POSITION;
+    for (index = (long)program->count - 1; index >= 0; index--) {
+        const WlXboxVshInstruction *instruction = &program->instructions[index];
+        unsigned reaches = 0, kills[13] = {0};
+
+        /* what its writes reach */
+        if (instruction->mac == _mac_arl)
+            reaches |= need_a0;
+        else if (instruction->mac != _mac_nop && instruction->mac_mask)
+            kills[temporary_index(instruction->temporary)] |= instruction->mac_mask;
+        if (instruction->ilu != _ilu_nop && instruction->ilu_mask)
+            kills[temporary_index(instruction->mac != _mac_nop ? 1 : instruction->temporary)] |=
+                instruction->ilu_mask;
+        if (instruction->output_mask && instruction->output_is_register &&
+            (instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0) {
+            switch (instruction->output_address) {
+            case _output_position:
+                kills[12] |= instruction->output_mask;
+                break;
+            case _output_d0:
+                reaches |= WL_XBOX_VSH_LIVE_D0;
+                break;
+            case _output_d1:
+                reaches |= WL_XBOX_VSH_LIVE_D1;
+                break;
+            case _output_b0:
+            case _output_b1:
+                reaches |= WL_XBOX_VSH_LIVE_BACK;
+                break;
+            case _output_fog:
+                if (instruction->output_mask & 8)
+                    reaches |= WL_XBOX_VSH_LIVE_FOG;
+                break;
+            case _output_point_size:
+                if (instruction->output_mask & 8)
+                    reaches |= WL_XBOX_VSH_LIVE_POINT_SIZE;
+                break;
+            default:
+                if (instruction->output_address >= _output_t0 &&
+                    instruction->output_address < _output_t0 + 4)
+                    reaches |= WL_XBOX_VSH_LIVE_T0 << (instruction->output_address - _output_t0);
+                break;
+            }
+        }
+        for (which = 0; which < 13; which++)
+            for (component = 0; component < 4; component++)
+                if (kills[which] & (8u >> component)) {
+                    reaches |= need[which][component];
+                    need[which][component] = 0;
+                }
+        if (instruction->mac == _mac_arl)
+            need_a0 = 0;
+        /* (the clip-space position: p before this instruction's writes) */
+        if (instruction->captures_clip) {
+            reaches |= WL_XBOX_VSH_LIVE_POSITION;
+            for (component = 0; component < 4; component++)
+                need[12][component] |= WL_XBOX_VSH_LIVE_POSITION;
+        }
+        /* what it reads: its operands, whole */
+        if (reaches) {
+            int reads[3] = {0, 0, 0};
+
+            if (instruction->mac != _mac_nop) {
+                reads[0] = 1;
+                if (instruction->mac != _mac_mov && instruction->mac != _mac_arl &&
+                    instruction->mac != _mac_add)
+                    reads[1] = 1;
+            }
+            if (instruction->ilu != _ilu_nop || instruction->mac == _mac_add ||
+                instruction->mac == _mac_mad)
+                reads[2] = 1;
+            for (which = 0; which < 3; which++) {
+                const WlXboxVshOperand *operand = &instruction->operands[which];
+
+                if (!reads[which])
+                    continue;
+                if (operand->mux == _mux_temporary)
+                    for (component = 0; component < 4; component++)
+                        need[temporary_index(operand->index)][operand->swizzle[component] & 3] |=
+                            reaches;
+                else if (operand->mux == _mux_constant && instruction->relative)
+                    need_a0 |= reaches;
+            }
+        }
+        needs[index] = reaches;
+    }
+}
+
+/* the operands the interpreter reads: A for every MAC operation, B for those
+of two vectors, C for ADD, MAD and every ILU operation */
+static int step_reads(const WlXboxVshInstruction *instruction, int which) {
+    switch (which) {
+    case 0:
+        return instruction->mac >= _mac_mov && instruction->mac <= _mac_arl;
+    case 1:
+        return instruction->mac == _mac_mul ||
+               (instruction->mac >= _mac_mad && instruction->mac <= _mac_sge);
+    default:
+        return instruction->mac == _mac_add || instruction->mac == _mac_mad ||
+               instruction->ilu != _ilu_nop;
+    }
+}
+
+/* the interpreter's steps from the instructions' fields */
+static void steps_make(WlXboxVshProgram *program) {
+    unsigned needs[WL_XBOX_VSH_MAX_INSTRUCTIONS], written[13] = {0};
+    unsigned long index;
+    int which, component;
+
+    program->exposed = 0;
+    program->captures_clip = 0;
+    wl_xbox_vsh_live_needs(program, needs);
+    for (index = 0; index < program->count; index++) {
+        const WlXboxVshInstruction *instruction = &program->instructions[index];
+        WlXboxVshStep *step = &program->steps[index];
+
+        memset(step, 0, sizeof(*step));
+        step->mac = instruction->mac;
+        step->ilu = instruction->ilu;
+        step->reaches = (unsigned short)needs[index];
+        if (instruction->captures_clip) {
+            step->flags |= WL_XBOX_VSH_STEP_CAPTURES_CLIP;
+            program->captures_clip = 1;
+        }
+        for (which = 0; which < 3; which++) {
+            const WlXboxVshOperand *operand = &instruction->operands[which];
+            WlXboxVshStepOperand *to = &step->operands[which];
+
+            if (!step_reads(instruction, which))
+                continue;
+            switch (operand->mux) {
+            case _mux_temporary:
+                to->file = WL_XBOX_VSH_FILE_TEMPORARY;
+                to->index = (unsigned char)temporary_index(operand->index);
+                break;
+            case _mux_input:
+                to->file = WL_XBOX_VSH_FILE_INPUT;
+                to->index = (unsigned char)(instruction->input & 15);
+                break;
+            case _mux_constant:
+                if (instruction->relative) {
+                    to->file = WL_XBOX_VSH_FILE_RELATIVE;
+                    to->index = instruction->constant;
+                } else {
+                    to->file = WL_XBOX_VSH_FILE_CONSTANT;
+                    to->index = (unsigned char)(instruction->constant < WL_XBOX_VSH_CONSTANT_COUNT
+                                                    ? instruction->constant
+                                                    : WL_XBOX_VSH_CONSTANT_COUNT - 1);
+                }
+                break;
+            default:
+                to->file = WL_XBOX_VSH_FILE_ZERO;
+                break;
+            }
+            to->swizzle = (unsigned char)((operand->swizzle[0] & 3) | (operand->swizzle[1] & 3) << 2 |
+                                          (operand->swizzle[2] & 3) << 4 |
+                                          (operand->swizzle[3] & 3) << 6);
+            /* (a temporary read before any instruction writes it: 0) */
+            if (to->file == WL_XBOX_VSH_FILE_TEMPORARY && to->index < 12)
+                for (component = 0; component < 4; component++)
+                    if (!(written[to->index] & (8u >> (operand->swizzle[component] & 3))))
+                        program->exposed |= (unsigned short)(1u << to->index);
+            if (operand->negate)
+                to->file |= WL_XBOX_VSH_NEGATE;
+        }
+        if (instruction->mac == _mac_arl) {
+            step->flags |= WL_XBOX_VSH_STEP_ARL;
+        } else if (instruction->mac != _mac_nop && instruction->mac_mask) {
+            step->mac_register = (unsigned char)temporary_index(instruction->temporary);
+            step->mac_mask = instruction->mac_mask;
+            written[step->mac_register] |= step->mac_mask;
+        }
+        if (instruction->ilu != _ilu_nop && instruction->ilu_mask) {
+            step->ilu_register = (unsigned char)temporary_index(
+                instruction->mac != _mac_nop ? 1 : instruction->temporary);
+            step->ilu_mask = instruction->ilu_mask;
+            written[step->ilu_register] |= step->ilu_mask;
+        }
+        if (instruction->output_mask && instruction->output_is_register &&
+            (instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0) {
+            unsigned char output = WL_XBOX_VSH_TO_NONE, mask = instruction->output_mask;
+
+            switch (instruction->output_address) {
+            case _output_position:
+                output = WL_XBOX_VSH_TO_POSITION;
+                break;
+            case _output_d0:
+                output = WL_XBOX_VSH_TO_D0;
+                break;
+            case _output_d1:
+                output = WL_XBOX_VSH_TO_D1;
+                break;
+            case _output_b0:
+                output = WL_XBOX_VSH_TO_B0;
+                break;
+            case _output_b1:
+                output = WL_XBOX_VSH_TO_B1;
+                break;
+            case _output_fog:
+                output = WL_XBOX_VSH_TO_FOG;
+                mask &= 8;
+                break;
+            case _output_point_size:
+                output = WL_XBOX_VSH_TO_POINT_SIZE;
+                mask &= 8;
+                break;
+            default:
+                if (instruction->output_address >= _output_t0 &&
+                    instruction->output_address < _output_t0 + 4)
+                    output = (unsigned char)(WL_XBOX_VSH_TO_T0 + instruction->output_address -
+                                             _output_t0);
+                break;
+            }
+            if (output != WL_XBOX_VSH_TO_NONE && mask) {
+                step->output = output;
+                step->output_mask = mask;
+                if (instruction->output_from_ilu)
+                    step->flags |= WL_XBOX_VSH_STEP_FROM_ILU;
+            }
+        }
+    }
+}
+
 void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction_count,
                          const WlXboxVshNative *natives, unsigned long native_count,
                          WlXboxVshProgram *program) {
@@ -127,6 +373,7 @@ void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction
         if (field(word, 3, 0, 1))
             break;
     }
+    steps_make(program);
     program->native = NULL;
     program->native_colors = NULL;
     program->native_positions = NULL;
@@ -143,59 +390,6 @@ void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction
             }
         }
     }
-}
-
-struct registers {
-    float r[12][4];
-    float position[4];
-    const float (*inputs)[4];
-    const float (*constants)[4];
-    int a0;
-};
-
-static void read_operand(const struct registers *registers, const WlXboxVshInstruction *instruction,
-                         const WlXboxVshOperand *operand, float out[4]) {
-    static const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    const float *source = zero;
-    int component;
-
-    switch (operand->mux) {
-    case _mux_temporary:
-        /* r12 reads back the position output */
-        source = operand->index == 12 ? registers->position
-                                      : registers->r[operand->index < 12 ? operand->index : 0];
-        break;
-    case _mux_input:
-        source = registers->inputs[instruction->input];
-        break;
-    case _mux_constant: {
-        int constant = instruction->constant + (instruction->relative ? registers->a0 : 0);
-
-        if (constant < 0)
-            constant = 0;
-        if (constant >= WL_XBOX_VSH_CONSTANT_COUNT)
-            constant = WL_XBOX_VSH_CONSTANT_COUNT - 1;
-        source = registers->constants[constant];
-        break;
-    }
-    default:
-        break;
-    }
-    for (component = 0; component < 4; component++)
-        out[component] = operand->negate ? -source[operand->swizzle[component]]
-                                         : source[operand->swizzle[component]];
-}
-
-static void write_masked(float destination[4], const float value[4], unsigned mask) {
-    /* (bit 3 is x) */
-    if (mask & 8)
-        destination[0] = value[0];
-    if (mask & 4)
-        destination[1] = value[1];
-    if (mask & 2)
-        destination[2] = value[2];
-    if (mask & 1)
-        destination[3] = value[3];
 }
 
 /* ---------- what the outputs depend on
@@ -530,9 +724,511 @@ static void output_clear(WlXboxVshOutput *output, float point_size) {
     output->point_size = point_size;
 }
 
-static void wl_xbox_vsh_interpret(const WlXboxVshProgram *program, const float (*constants)[4],
-                                  const float (*inputs)[4], float point_size,
-                                  WlXboxVshOutput *output);
+
+/* ---------- the interpreter
+
+Each instruction runs for a batch of vertices (the registers of vertex n are
+r[n], a0[n]) before the next: what it reads and writes is decided once for
+all of them. For each vertex the operations are those of a run for it alone,
+in the same order (its operands read before its results are written), so
+the results are the same to the bit.
+
+An operand is read through a view: vertex n's four components, swizzled and
+signed, at base + n stride bytes. A constant's (or 0's) is made once for the
+batch (stride 0); a temporary or an input read as it is, in place; any other
+(swizzled, negated, or a constant by a0) is gathered first into the scratch. */
+
+typedef struct vsh_view {
+    const unsigned char *base;
+    size_t stride;
+} vsh_view;
+
+#define VSH_AT(view, n) ((const float *)(const void *)((view).base + (size_t)(n) * (view).stride))
+
+/* (the identity swizzle: x y z w) */
+enum { VSH_XYZW = 0 | 1 << 2 | 2 << 4 | 3 << 6 };
+
+static void view_make(vsh_view *view, const WlXboxVshStepOperand *operand, float (*r)[13][4],
+                      const float (*inputs)[WL_XBOX_VSH_INPUT_COUNT][4],
+                      const float (*constants)[4], const int *a0, unsigned count,
+                      float uniform[4], float (*gathered)[4]) {
+    unsigned x = operand->swizzle & 3u, y = (operand->swizzle >> 2) & 3u,
+             z = (operand->swizzle >> 4) & 3u, w = (operand->swizzle >> 6) & 3u, n;
+    int negate = (operand->file & WL_XBOX_VSH_NEGATE) != 0;
+    const unsigned char *base;
+    size_t stride;
+
+    switch (operand->file & ~WL_XBOX_VSH_NEGATE) {
+    case WL_XBOX_VSH_FILE_TEMPORARY:
+        base = (const unsigned char *)r[0][operand->index];
+        stride = sizeof(r[0]);
+        break;
+    case WL_XBOX_VSH_FILE_INPUT:
+        base = (const unsigned char *)inputs[0][operand->index];
+        stride = sizeof(inputs[0]);
+        break;
+    case WL_XBOX_VSH_FILE_RELATIVE:
+        for (n = 0; n < count; n++) {
+            const float *p = constants[wl_xbox_vsh_clamp(operand->index + a0[n])];
+
+            if (negate) {
+                gathered[n][0] = -p[x];
+                gathered[n][1] = -p[y];
+                gathered[n][2] = -p[z];
+                gathered[n][3] = -p[w];
+            } else {
+                gathered[n][0] = p[x];
+                gathered[n][1] = p[y];
+                gathered[n][2] = p[z];
+                gathered[n][3] = p[w];
+            }
+        }
+        view->base = (const unsigned char *)gathered;
+        view->stride = sizeof(gathered[0]);
+        return;
+    default: {
+        /* a constant, or 0: the same for every vertex */
+        const float *p = (operand->file & ~WL_XBOX_VSH_NEGATE) == WL_XBOX_VSH_FILE_CONSTANT
+                             ? constants[operand->index]
+                             : wl_xbox_vsh_zero;
+
+        if (negate) {
+            uniform[0] = -p[x];
+            uniform[1] = -p[y];
+            uniform[2] = -p[z];
+            uniform[3] = -p[w];
+        } else {
+            uniform[0] = p[x];
+            uniform[1] = p[y];
+            uniform[2] = p[z];
+            uniform[3] = p[w];
+        }
+        view->base = (const unsigned char *)uniform;
+        view->stride = 0;
+        return;
+    }
+    }
+    if (operand->swizzle == VSH_XYZW && !negate) {
+        view->base = base;
+        view->stride = stride;
+        return;
+    }
+    for (n = 0; n < count; n++) {
+        const float *p = (const float *)(const void *)(base + n * stride);
+
+        if (negate) {
+            gathered[n][0] = -p[x];
+            gathered[n][1] = -p[y];
+            gathered[n][2] = -p[z];
+            gathered[n][3] = -p[w];
+        } else {
+            gathered[n][0] = p[x];
+            gathered[n][1] = p[y];
+            gathered[n][2] = p[z];
+            gathered[n][3] = p[w];
+        }
+    }
+    view->base = (const unsigned char *)gathered;
+    view->stride = sizeof(gathered[0]);
+}
+
+/* the x component alone (the ILU's scalar operations), each vertex's at
+base + n stride bytes, negated or not; a constant by a0 is gathered */
+static void scalar_view(vsh_view *view, int *negate, const WlXboxVshStepOperand *operand,
+                        float (*r)[13][4], const float (*inputs)[WL_XBOX_VSH_INPUT_COUNT][4],
+                        const float (*constants)[4], const int *a0, unsigned count,
+                        float uniform[4], float (*gathered)[4]) {
+    unsigned x = operand->swizzle & 3u, n;
+
+    *negate = (operand->file & WL_XBOX_VSH_NEGATE) != 0;
+    switch (operand->file & ~WL_XBOX_VSH_NEGATE) {
+    case WL_XBOX_VSH_FILE_TEMPORARY:
+        view->base = (const unsigned char *)&r[0][operand->index][x];
+        view->stride = sizeof(r[0]);
+        return;
+    case WL_XBOX_VSH_FILE_INPUT:
+        view->base = (const unsigned char *)&inputs[0][operand->index][x];
+        view->stride = sizeof(inputs[0]);
+        return;
+    case WL_XBOX_VSH_FILE_RELATIVE:
+        for (n = 0; n < count; n++)
+            gathered[n][0] = constants[wl_xbox_vsh_clamp(operand->index + a0[n])][x];
+        view->base = (const unsigned char *)gathered;
+        view->stride = sizeof(gathered[0]);
+        return;
+    case WL_XBOX_VSH_FILE_CONSTANT:
+        uniform[0] = constants[operand->index][x];
+        break;
+    default:
+        uniform[0] = 0.0f;
+        break;
+    }
+    view->base = (const unsigned char *)uniform;
+    view->stride = 0;
+}
+
+/* a result's masked components (bit 3 x) into each vertex's register or
+output, stride bytes apart */
+static void write_batch(unsigned char *destination, size_t stride, const float (*value)[4],
+                        unsigned count, unsigned mask) {
+    unsigned n;
+
+    if (mask == 15) {
+        for (n = 0; n < count; n++, destination += stride) {
+            float *d = (float *)(void *)destination;
+            float x = value[n][0], y = value[n][1], z = value[n][2], w = value[n][3];
+
+            d[0] = x;
+            d[1] = y;
+            d[2] = z;
+            d[3] = w;
+        }
+        return;
+    }
+    for (n = 0; n < count; n++, destination += stride) {
+        float *d = (float *)(void *)destination;
+
+        if (mask & 8)
+            d[0] = value[n][0];
+        if (mask & 4)
+            d[1] = value[n][1];
+        if (mask & 2)
+            d[2] = value[n][2];
+        if (mask & 1)
+            d[3] = value[n][3];
+    }
+}
+
+/* the registers of a batch (WlXboxVshWork's, or one vertex's on the stack) */
+typedef struct vsh_scratch {
+    float (*r)[13][4];
+    float (*mac)[4], (*ilu)[4];
+    float (*operands[3])[4];
+    int *a0;
+} vsh_scratch;
+
+static void interpret(const WlXboxVshProgram *program, const float (*constants)[4],
+                      const float (*inputs)[WL_XBOX_VSH_INPUT_COUNT][4], unsigned count,
+                      float point_size, WlXboxVshOutput *outputs, unsigned live,
+                      const vsh_scratch *scratch) {
+    float (*r)[13][4] = scratch->r, (*mac)[4] = scratch->mac, (*ilu)[4] = scratch->ilu;
+    int *a0 = scratch->a0;
+    unsigned long index;
+    unsigned n, t;
+
+    /* the registers, and the outputs' parts no instruction may write */
+    for (n = 0; n < count; n++) {
+        WlXboxVshOutput *o = &outputs[n];
+
+        a0[n] = 0;
+        r[n][12][0] = r[n][12][1] = r[n][12][2] = 0.0f;
+        r[n][12][3] = 1.0f;
+        for (t = 0; t < 12; t++)
+            if (program->exposed & (1u << t))
+                r[n][t][0] = r[n][t][1] = r[n][t][2] = r[n][t][3] = 0.0f;
+        if (live & WL_XBOX_VSH_LIVE_POSITION) {
+            o->clip[0] = o->clip[1] = o->clip[2] = o->clip[3] = 0.0f;
+            o->clip_captured = 0;
+        }
+        if (live & WL_XBOX_VSH_LIVE_D0) {
+            o->d0[0] = o->d0[1] = o->d0[2] = 0.0f;
+            o->d0[3] = 1.0f;
+        }
+        if (live & WL_XBOX_VSH_LIVE_D1) {
+            o->d1[0] = o->d1[1] = o->d1[2] = 0.0f;
+            o->d1[3] = 1.0f;
+        }
+        if (live & WL_XBOX_VSH_LIVE_BACK) {
+            o->b0[0] = o->b0[1] = o->b0[2] = 0.0f;
+            o->b1[0] = o->b1[1] = o->b1[2] = 0.0f;
+            o->b0[3] = o->b1[3] = 1.0f;
+        }
+        for (t = 0; t < 4; t++)
+            if (live & (WL_XBOX_VSH_LIVE_T0 << t)) {
+                o->t[t][0] = o->t[t][1] = o->t[t][2] = 0.0f;
+                o->t[t][3] = 1.0f;
+            }
+        if (live & WL_XBOX_VSH_LIVE_FOG)
+            o->fog = 1.0f;
+        if (live & WL_XBOX_VSH_LIVE_POINT_SIZE)
+            o->point_size = point_size;
+    }
+
+    for (index = 0; index < program->count; index++) {
+        const WlXboxVshStep *step = &program->steps[index];
+        float uniform[3][4];
+        vsh_view a, b, c;
+        int scalar = step->ilu == _ilu_rcp || step->ilu == _ilu_rcc || step->ilu == _ilu_rsq;
+
+        if (!(step->reaches & live))
+            continue;
+        if (step->mac >= _mac_mov && step->mac <= _mac_arl)
+            view_make(&a, &step->operands[0], r, inputs, constants, a0, count, uniform[0],
+                      scratch->operands[0]);
+        if (step->mac == _mac_mul || (step->mac >= _mac_mad && step->mac <= _mac_sge))
+            view_make(&b, &step->operands[1], r, inputs, constants, a0, count, uniform[1],
+                      scratch->operands[1]);
+        if (step->mac == _mac_add || step->mac == _mac_mad ||
+            (step->ilu != _ilu_nop && !scalar))
+            view_make(&c, &step->operands[2], r, inputs, constants, a0, count, uniform[2],
+                      scratch->operands[2]);
+
+        /* the MAC's result for each vertex */
+        switch (step->mac) {
+        case _mac_nop:
+            break;
+        case _mac_mov:
+        case _mac_arl:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n);
+                float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+
+                mac[n][0] = x0;
+                mac[n][1] = x1;
+                mac[n][2] = x2;
+                mac[n][3] = x3;
+            }
+            break;
+        case _mac_mul:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n), *y = VSH_AT(b, n);
+                float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+                float y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
+
+                mac[n][0] = x0 * y0;
+                mac[n][1] = x1 * y1;
+                mac[n][2] = x2 * y2;
+                mac[n][3] = x3 * y3;
+            }
+            break;
+        case _mac_add:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n), *z = VSH_AT(c, n);
+                float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+                float z0 = z[0], z1 = z[1], z2 = z[2], z3 = z[3];
+
+                mac[n][0] = x0 + z0;
+                mac[n][1] = x1 + z1;
+                mac[n][2] = x2 + z2;
+                mac[n][3] = x3 + z3;
+            }
+            break;
+        case _mac_mad:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n), *y = VSH_AT(b, n), *z = VSH_AT(c, n);
+                float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+                float y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
+                float z0 = z[0], z1 = z[1], z2 = z[2], z3 = z[3];
+
+                mac[n][0] = x0 * y0 + z0;
+                mac[n][1] = x1 * y1 + z1;
+                mac[n][2] = x2 * y2 + z2;
+                mac[n][3] = x3 * y3 + z3;
+            }
+            break;
+        case _mac_dp3:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n), *y = VSH_AT(b, n);
+                float d = x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+
+                mac[n][0] = mac[n][1] = mac[n][2] = mac[n][3] = d;
+            }
+            break;
+        case _mac_dph:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n), *y = VSH_AT(b, n);
+                float d = x[0] * y[0] + x[1] * y[1] + x[2] * y[2] + y[3];
+
+                mac[n][0] = mac[n][1] = mac[n][2] = mac[n][3] = d;
+            }
+            break;
+        case _mac_dp4:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n), *y = VSH_AT(b, n);
+                float d = x[0] * y[0] + x[1] * y[1] + x[2] * y[2] + x[3] * y[3];
+
+                mac[n][0] = mac[n][1] = mac[n][2] = mac[n][3] = d;
+            }
+            break;
+        case _mac_dst:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n), *y = VSH_AT(b, n);
+                float m1 = x[1] * y[1], m2 = x[2], m3 = y[3];
+
+                mac[n][0] = 1.0f;
+                mac[n][1] = m1;
+                mac[n][2] = m2;
+                mac[n][3] = m3;
+            }
+            break;
+        case _mac_min:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n), *y = VSH_AT(b, n);
+                float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+                float y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
+
+                mac[n][0] = x0 < y0 ? x0 : y0;
+                mac[n][1] = x1 < y1 ? x1 : y1;
+                mac[n][2] = x2 < y2 ? x2 : y2;
+                mac[n][3] = x3 < y3 ? x3 : y3;
+            }
+            break;
+        case _mac_max:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n), *y = VSH_AT(b, n);
+                float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+                float y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
+
+                mac[n][0] = x0 > y0 ? x0 : y0;
+                mac[n][1] = x1 > y1 ? x1 : y1;
+                mac[n][2] = x2 > y2 ? x2 : y2;
+                mac[n][3] = x3 > y3 ? x3 : y3;
+            }
+            break;
+        case _mac_slt:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n), *y = VSH_AT(b, n);
+                float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+                float y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
+
+                mac[n][0] = x0 < y0 ? 1.0f : 0.0f;
+                mac[n][1] = x1 < y1 ? 1.0f : 0.0f;
+                mac[n][2] = x2 < y2 ? 1.0f : 0.0f;
+                mac[n][3] = x3 < y3 ? 1.0f : 0.0f;
+            }
+            break;
+        case _mac_sge:
+            for (n = 0; n < count; n++) {
+                const float *x = VSH_AT(a, n), *y = VSH_AT(b, n);
+                float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+                float y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
+
+                mac[n][0] = x0 >= y0 ? 1.0f : 0.0f;
+                mac[n][1] = x1 >= y1 ? 1.0f : 0.0f;
+                mac[n][2] = x2 >= y2 ? 1.0f : 0.0f;
+                mac[n][3] = x3 >= y3 ? 1.0f : 0.0f;
+            }
+            break;
+        default:
+            /* (an operation the MAC does not have: 0) */
+            for (n = 0; n < count; n++)
+                mac[n][0] = mac[n][1] = mac[n][2] = mac[n][3] = 0.0f;
+            break;
+        }
+
+        /* the ILU's */
+        if (scalar) {
+            vsh_view s;
+            int negate;
+
+            scalar_view(&s, &negate, &step->operands[2], r, inputs, constants, a0, count, uniform[2],
+                        scratch->operands[2]);
+            for (n = 0; n < count; n++) {
+                float x = *VSH_AT(s, n), i;
+
+                if (negate)
+                    x = -x;
+                i = step->ilu == _ilu_rcp   ? 1.0f / x
+                    : step->ilu == _ilu_rcc ? wl_xbox_vsh_reciprocal_clamped(x)
+                                            : 1.0f / wl_xbox_vsh_sqrtf(fabsf(x));
+                ilu[n][0] = ilu[n][1] = ilu[n][2] = ilu[n][3] = i;
+            }
+        } else if (step->ilu == _ilu_mov) {
+            for (n = 0; n < count; n++) {
+                const float *z = VSH_AT(c, n);
+                float z0 = z[0], z1 = z[1], z2 = z[2], z3 = z[3];
+
+                ilu[n][0] = z0;
+                ilu[n][1] = z1;
+                ilu[n][2] = z2;
+                ilu[n][3] = z3;
+            }
+        } else if (step->ilu != _ilu_nop) {
+            for (n = 0; n < count; n++) {
+                float z[4];
+
+                memcpy(z, VSH_AT(c, n), sizeof(z));
+                wl_xbox_vsh_ilu(step->ilu, z, ilu[n]);
+            }
+        }
+
+        /* the screen-space conversion: the position before it */
+        if (step->flags & WL_XBOX_VSH_STEP_CAPTURES_CLIP)
+            for (n = 0; n < count; n++) {
+                memcpy(outputs[n].clip, r[n][12], sizeof(outputs[n].clip));
+                outputs[n].clip_captured = 1;
+            }
+
+        /* results written once both units have read their inputs */
+        if (step->flags & WL_XBOX_VSH_STEP_ARL) {
+            for (n = 0; n < count; n++)
+                a0[n] = wl_xbox_vsh_floor_index(mac[n][0] + 0.001f);
+        } else if (step->mac_mask) {
+            write_batch((unsigned char *)r[0][step->mac_register], sizeof(r[0]),
+                        (const float (*)[4])mac, count, step->mac_mask);
+        }
+        if (step->ilu_mask)
+            write_batch((unsigned char *)r[0][step->ilu_register], sizeof(r[0]),
+                        (const float (*)[4])ilu, count, step->ilu_mask);
+        if (step->output != WL_XBOX_VSH_TO_NONE) {
+            const float (*value)[4] =
+                (const float (*)[4])(step->flags & WL_XBOX_VSH_STEP_FROM_ILU ? ilu : mac);
+            unsigned char *destination = (unsigned char *)outputs;
+            size_t stride = sizeof(outputs[0]);
+
+            switch (step->output) {
+            case WL_XBOX_VSH_TO_POSITION:
+                destination = (unsigned char *)r[0][12];
+                stride = sizeof(r[0]);
+                break;
+            case WL_XBOX_VSH_TO_D0:
+                destination += offsetof(WlXboxVshOutput, d0);
+                break;
+            case WL_XBOX_VSH_TO_D1:
+                destination += offsetof(WlXboxVshOutput, d1);
+                break;
+            case WL_XBOX_VSH_TO_B0:
+                destination += offsetof(WlXboxVshOutput, b0);
+                break;
+            case WL_XBOX_VSH_TO_B1:
+                destination += offsetof(WlXboxVshOutput, b1);
+                break;
+            case WL_XBOX_VSH_TO_FOG:
+                destination += offsetof(WlXboxVshOutput, fog);
+                break;
+            case WL_XBOX_VSH_TO_POINT_SIZE:
+                destination += offsetof(WlXboxVshOutput, point_size);
+                break;
+            default:
+                destination += offsetof(WlXboxVshOutput, t) +
+                               sizeof(float[4]) * (size_t)(step->output - WL_XBOX_VSH_TO_T0);
+                break;
+            }
+            write_batch(destination, stride, value, count, step->output_mask);
+        }
+    }
+    for (n = 0; n < count; n++)
+        memcpy(outputs[n].position, r[n][12], sizeof(outputs[n].position));
+}
+
+/* one vertex, its registers on the stack */
+static void interpret_one(const WlXboxVshProgram *program, const float (*constants)[4],
+                          const float (*inputs)[4], float point_size, WlXboxVshOutput *output,
+                          unsigned live) {
+    float r[1][13][4], mac[1][4], ilu[1][4], operands[3][1][4];
+    int a0[1];
+    vsh_scratch scratch;
+
+    scratch.r = r;
+    scratch.mac = mac;
+    scratch.ilu = ilu;
+    scratch.operands[0] = operands[0];
+    scratch.operands[1] = operands[1];
+    scratch.operands[2] = operands[2];
+    scratch.a0 = a0;
+    interpret(program, constants, (const float (*)[WL_XBOX_VSH_INPUT_COUNT][4])inputs, 1,
+              point_size, output, live, &scratch);
+}
 
 void wl_xbox_vsh_run(const WlXboxVshProgram *program, const float (*constants)[4],
                      const float (*inputs)[4], float point_size, WlXboxVshOutput *output) {
@@ -541,7 +1237,7 @@ void wl_xbox_vsh_run(const WlXboxVshProgram *program, const float (*constants)[4
         program->native(constants, inputs, output, WL_XBOX_VSH_LIVE_ALL);
         return;
     }
-    wl_xbox_vsh_interpret(program, constants, inputs, point_size, output);
+    interpret_one(program, constants, inputs, point_size, output, WL_XBOX_VSH_LIVE_ALL);
 }
 
 void wl_xbox_vsh_run_live(const WlXboxVshProgram *program, const float (*constants)[4],
@@ -555,7 +1251,48 @@ void wl_xbox_vsh_run_live(const WlXboxVshProgram *program, const float (*constan
         program->native(constants, inputs, output, live);
         return;
     }
-    wl_xbox_vsh_run(program, constants, inputs, point_size, output);
+    interpret_one(program, constants, inputs, point_size, output, live);
+}
+
+void wl_xbox_vsh_run_batch(const WlXboxVshProgram *program, const float (*constants)[4],
+                           const float (*inputs)[WL_XBOX_VSH_INPUT_COUNT][4], unsigned count,
+                           float point_size, WlXboxVshOutput *outputs, unsigned live,
+                           WlXboxVshWork *work) {
+    vsh_scratch scratch;
+    unsigned done, n;
+
+    if (program->native) {
+        for (done = 0; done < count; done++)
+            wl_xbox_vsh_run_live(program, constants, inputs[done], point_size, &outputs[done], live);
+        return;
+    }
+    scratch.r = work->r;
+    scratch.mac = work->mac;
+    scratch.ilu = work->ilu;
+    scratch.operands[0] = work->operands[0];
+    scratch.operands[1] = work->operands[1];
+    scratch.operands[2] = work->operands[2];
+    scratch.a0 = work->a0;
+    for (done = 0; done < count; done += n) {
+        n = count - done < WL_XBOX_VSH_BATCH ? count - done : WL_XBOX_VSH_BATCH;
+        interpret(program, constants, inputs + done, n, point_size, outputs + done, live, &scratch);
+    }
+}
+
+unsigned long wl_xbox_vsh_inputs_read(const WlXboxVshProgram *program, unsigned live) {
+    unsigned long reads = 0, index;
+    int which;
+
+    for (index = 0; index < program->count; index++) {
+        const WlXboxVshStep *step = &program->steps[index];
+
+        if (!(step->reaches & live))
+            continue;
+        for (which = 0; which < 3; which++)
+            if ((step->operands[which].file & ~WL_XBOX_VSH_NEGATE) == WL_XBOX_VSH_FILE_INPUT)
+                reads |= 1UL << step->operands[which].index;
+    }
+    return reads;
 }
 
 int wl_xbox_vsh_run_positions(const WlXboxVshProgram *program, const float (*constants)[4],
@@ -565,160 +1302,4 @@ int wl_xbox_vsh_run_positions(const WlXboxVshProgram *program, const float (*con
         return 0;
     program->native_positions(constants, inputs, points, clips, positions);
     return 1;
-}
-
-static void wl_xbox_vsh_interpret(const WlXboxVshProgram *program, const float (*constants)[4],
-                                  const float (*inputs)[4], float point_size,
-                                  WlXboxVshOutput *output) {
-    struct registers registers;
-    unsigned long index;
-    int component;
-
-    memset(&registers, 0, sizeof(registers));
-    registers.position[3] = 1.0f;
-    registers.inputs = inputs;
-    registers.constants = constants;
-    output_clear(output, point_size);
-
-    for (index = 0; index < program->count; index++) {
-        const WlXboxVshInstruction *instruction = &program->instructions[index];
-        float a[4], b[4], c[4], mac[4] = {0}, ilu[4] = {0};
-
-        read_operand(&registers, instruction, &instruction->operands[0], a);
-        read_operand(&registers, instruction, &instruction->operands[1], b);
-        read_operand(&registers, instruction, &instruction->operands[2], c);
-        switch (instruction->mac) {
-        case _mac_mov:
-        case _mac_arl:
-            memcpy(mac, a, sizeof(mac));
-            break;
-        case _mac_mul:
-            for (component = 0; component < 4; component++)
-                mac[component] = a[component] * b[component];
-            break;
-        case _mac_add:
-            for (component = 0; component < 4; component++)
-                mac[component] = a[component] + c[component];
-            break;
-        case _mac_mad:
-            for (component = 0; component < 4; component++)
-                mac[component] = a[component] * b[component] + c[component];
-            break;
-        case _mac_dp3:
-            mac[0] = mac[1] = mac[2] = mac[3] = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-            break;
-        case _mac_dph:
-            mac[0] = mac[1] = mac[2] = mac[3] = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + b[3];
-            break;
-        case _mac_dp4:
-            mac[0] = mac[1] = mac[2] = mac[3] =
-                a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
-            break;
-        case _mac_dst:
-            mac[0] = 1.0f;
-            mac[1] = a[1] * b[1];
-            mac[2] = a[2];
-            mac[3] = b[3];
-            break;
-        case _mac_min:
-            for (component = 0; component < 4; component++)
-                mac[component] = a[component] < b[component] ? a[component] : b[component];
-            break;
-        case _mac_max:
-            for (component = 0; component < 4; component++)
-                mac[component] = a[component] > b[component] ? a[component] : b[component];
-            break;
-        case _mac_slt:
-            for (component = 0; component < 4; component++)
-                mac[component] = a[component] < b[component] ? 1.0f : 0.0f;
-            break;
-        case _mac_sge:
-            for (component = 0; component < 4; component++)
-                mac[component] = a[component] >= b[component] ? 1.0f : 0.0f;
-            break;
-        default:
-            break;
-        }
-        switch (instruction->ilu) {
-        case _ilu_mov:
-            memcpy(ilu, c, sizeof(ilu));
-            break;
-        case _ilu_rcp:
-            ilu[0] = ilu[1] = ilu[2] = ilu[3] = 1.0f / c[0];
-            break;
-        case _ilu_rcc:
-            ilu[0] = ilu[1] = ilu[2] = ilu[3] = wl_xbox_vsh_reciprocal_clamped(c[0]);
-            break;
-        case _ilu_rsq:
-            ilu[0] = ilu[1] = ilu[2] = ilu[3] = 1.0f / sqrtf(fabsf(c[0]));
-            break;
-        case _ilu_exp:
-        case _ilu_log:
-        case _ilu_lit:
-            wl_xbox_vsh_ilu(instruction->ilu, c, ilu);
-            break;
-        default:
-            break;
-        }
-        /* the screen-space conversion: the position before it */
-        if (instruction->captures_clip) {
-            memcpy(output->clip, registers.position, sizeof(output->clip));
-            output->clip_captured = 1;
-        }
-
-        /* results written once both units have read their inputs */
-        if (instruction->mac == _mac_arl) {
-            registers.a0 = (int)floorf(mac[0] + 0.001f);
-        } else if (instruction->mac != _mac_nop && instruction->mac_mask) {
-            write_masked(
-                instruction->temporary == 12
-                    ? registers.position
-                    : registers.r[instruction->temporary < 12 ? instruction->temporary : 0],
-                mac, instruction->mac_mask);
-        }
-        if (instruction->ilu != _ilu_nop && instruction->ilu_mask) {
-            unsigned temporary = instruction->mac != _mac_nop ? 1 : instruction->temporary;
-
-            write_masked(temporary == 12 ? registers.position
-                                         : registers.r[temporary < 12 ? temporary : 0],
-                         ilu, instruction->ilu_mask);
-        }
-        if (instruction->output_mask && instruction->output_is_register &&
-            (instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0) {
-            const float *source = instruction->output_from_ilu ? ilu : mac;
-
-            switch (instruction->output_address) {
-            case _output_position:
-                write_masked(registers.position, source, instruction->output_mask);
-                break;
-            case _output_d0:
-                write_masked(output->d0, source, instruction->output_mask);
-                break;
-            case _output_d1:
-                write_masked(output->d1, source, instruction->output_mask);
-                break;
-            case _output_b0:
-                write_masked(output->b0, source, instruction->output_mask);
-                break;
-            case _output_b1:
-                write_masked(output->b1, source, instruction->output_mask);
-                break;
-            case _output_fog:
-                if (instruction->output_mask & 8)
-                    output->fog = source[0];
-                break;
-            case _output_point_size:
-                if (instruction->output_mask & 8)
-                    output->point_size = source[0];
-                break;
-            default:
-                if (instruction->output_address >= _output_t0 &&
-                    instruction->output_address < _output_t0 + 4)
-                    write_masked(output->t[instruction->output_address - _output_t0], source,
-                                 instruction->output_mask);
-                break;
-            }
-        }
-    }
-    memcpy(output->position, registers.position, sizeof(output->position));
 }
