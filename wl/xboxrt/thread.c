@@ -1130,6 +1130,35 @@ uint32_t wl_xb_thread_reap(void) {
     return freed;
 }
 
+// A stall: the scheduler made no progress (no hand-off, safe point, wait or wake) since the last
+// look. Called from the service thread's status (every 10 s); after two quiet looks it logs who
+// holds the guest lock and every thread's state, once a minute while it lasts, so a hang names its
+// threads.
+void wl_xb_thread_stall_check(void) {
+    static uint32_t last, quiet;
+    uint32_t now = g_stats.handoffs + g_stats.safe_points + g_stats.waits + g_stats.wakes + g_stats.timeouts;
+    if (now != last) {
+        last = now;
+        quiet = 0;
+        return;
+    }
+    if (++quiet < 2u || (quiet - 2u) % 6u != 0u) {
+        return;
+    }
+    wl_platform_mutex_lock(g_m);
+    WlXbThread *owner = g_owner;
+    WL_LOG_W(TAG, "stall: no scheduling for %u s; the lock is %s's (%u), the ready queue's head %s", (unsigned)(quiet * 10u),
+             owner != NULL ? owner->name : "nobody's", owner != NULL ? (unsigned)owner->id : 0u,
+             g_ready != NULL ? g_ready->name : "(empty)");
+    for (WlXbThread *t = g_all; t != NULL; t = t->next_all) {
+        WL_LOG_W(TAG, "stall: %u %s prio %d%s%s%s%s susp %u kdepth %u esp %08x eax %08x", (unsigned)t->id, t->name,
+                 t->priority, t->ready ? " ready" : "", t->woken ? " woken" : "", t->terminated ? " ended" : "",
+                 t->running_guest ? " running" : "", (unsigned)t->suspend_count, (unsigned)t->kernel_depth,
+                 (unsigned)t->cpu.g_esp, (unsigned)t->cpu.g_eax);
+    }
+    wl_platform_mutex_unlock(g_m);
+}
+
 void wl_xb_thread_log_stacks(void) {
     char line[200];
     size_t used = 0;
