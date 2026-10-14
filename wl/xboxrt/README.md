@@ -48,8 +48,9 @@ pages (128 for a debug kit); a user page and its window alias are one page of me
 
 ## Demand paging (`paging.c`)
 
-The Wii has ~21 MB of frames for 64 MB of guest RAM (MEM2 and what MEM1 spares beside a 12 MB
-DOL, the host side's `keep_free_bytes` and the GPU's texture arena), and a title touches more than
+The Wii has about 20 MB of frames for 64 MB of guest RAM (MEM2 and what MEM1 spares beside a 14 MB
+DOL, less the host side's `keep_free_bytes` and the GPU's texture arena; the boot logs the pools,
+`guest frames: N KB at ...`), and a title touches more than
 that (Halo's menu ~34 MB, a level its 22 MB tag cache, 22 MB texture cache and 4 MB sound cache on
 top). When no frame is free one is taken back from a page and the page goes to a swap file, to be
 read back on its next touch.
@@ -175,13 +176,13 @@ compiles the list against the generated code's header so a type that differs doe
 | `recomp_unimpl`, `recomp_trace_*`, `recomp_abi_violation_log`, `recomp_call_profile_hit` | weak defaults here | the lifter's optional diagnostics |
 | `wl_xb_port_in`/`wl_xb_port_out` | here | x86 port I/O: reads give 0 (the video encoder's field flag at `0x80C0`: progressive), writes are dropped |
 
-The hook the generator should emit at loop back edges: `g_xb_attention` is non-zero while a safe
-point has work, and `if (g_xb_attention) wl_xb_safe_point();` before a backward jump costs a load
-and a branch. A loop that polls plain guest memory has no device access or kernel call to stop at,
-and D3D has several that wait for what an interrupt does: on Halo, the flip throttle at
-`0x00185694` and the wait at `0x00189325` hold the guest lock forever without it, and with the hook
-before each of the title's 6298 backward jumps (tried by hand on a local build) it runs on into its
-frame loop.
+The hook at loop back edges: `g_xb_attention` is non-zero while a safe point has work, and the
+generated code does `if (g_xb_attention) wl_xb_safe_point();` (`RECOMP_BACKEDGE()`, patch 0008)
+before every backward jump, for a load and a branch. A loop that polls plain guest memory has no
+device access or kernel call to stop at, and D3D has several that wait for what an interrupt does:
+on Halo, the flip throttle at `0x00185694` and the wait at `0x00189325` held the guest lock forever
+without it (the title has 6298 backward jumps). In the deterministic mode the flag stays set, so
+every backward jump is a safe point that moves the virtual clock.
 
 ## Threads and the guest lock (`thread.h`)
 
@@ -252,7 +253,8 @@ same log lines and the same screenshots). Off, nothing changes: `wl_xb_time_us` 
 ## The GPU and the MCPX (`devices.h`)
 
 `wl_xb_devices_register_mcpx` registers the MCPX's devices: the APU (idle, its sample counter
-moving at 48 kHz), AC'97 (idle, codec not ready, so `DirectSoundCreate` fails cleanly), the USB host
+moving at 48 kHz), AC'97 (idle, codec not ready, so `DirectSoundCreate` fails cleanly: what a title
+gets with `noaudio`; the audio models below replace both), the USB host
 controllers with the gamepads (below), the NIC and the flash (idle).
 
 **Audio** (`audio.c`, built when `wl/xboxapu` is): `wl_xb_audio_attach` puts wl/xboxapu's APU and
@@ -273,7 +275,8 @@ nothing in a title's code is replaced, nothing is title-specific.
   writes running checksums of the APU's 32 mixbins and of the output, a line each second of audio
   (two runs in the deterministic mode, `WL_XB_DETERMINISTIC=1`, compare line by line: a change to
   the APU model that should not change the sound shows it does not); `WL_XB_AUDIO=0` keeps the
-  idle devices (DirectSoundCreate fails, the title runs silent).
+  idle devices (DirectSoundCreate fails, the title runs silent; on the Wii a file `noaudio` in the
+  title folder does the same).
 - Every 10 s an `xbaudio` status line: frames run (and silent), voices a frame, what a frame costs
   in nanoseconds, notifiers, traps, GP commands, starved stream frames, clipped samples, output
   underruns, AC'97 buffers.
@@ -428,7 +431,7 @@ the address of its variable, and an ordinal with no body a slot whose first call
 rest stays malloc's), the SD card, the log and the crash screen; the XBE's header; guest memory (the
 Wii's frame pools: the two largest blocks malloc gives, less `keep_free_bytes` and `texture_bytes`;
 the host's frame limit, if any; the swap file `<hard disk folder>/pagefile.sys`); the converted
-textures' arena (`texture_bytes`, 14 MB; `WL_XB_TEXTURE_MB` on the host); threads; the
+textures' arena (`texture_bytes`, 13 MB, the vertex arrays' cache in its end; `WL_XB_TEXTURE_MB` on the host); threads; the
 image; the kernel (`wl/xboxkrnl`); the thunks; the MCPX devices and the GPU (wl/xbox's model when
 it is built in, else the stub); the service thread; then the entry point on a guest thread of its
 own. It returns the process's exit code. A play setting `replay:...` runs the capture bench instead,
@@ -442,6 +445,67 @@ vertex program the title draws with that is not compiled in (`wl_xb_gpu_set_prog
 config's `"vertex_programs": "hdd/vsh_programs.inc"` has `wl_add_xbox_title` compile the list to C
 (tools/xbox_vsh_codegen.c), and the GPU runs those programs as functions (the generated
 `wl_xb_title_vsh_natives`, weak here).
+
+## Running a title
+
+The host: `prog <title folder> [hard disk folder]`; the title folder holds `default.xbe` and is the
+guest's D:, the hard disk folder (default `<title folder>/hdd`) its C:, E: and the cache drives. The
+Wii: `sd:/xbox/<WL_XB_TITLE_NAME>` (a compile definition of `wl_xboxrt_main`, `title` by default),
+the log in `<title folder>/logs`. A title project's own `main` fills a `WlXbTitleConfig`
+(`boot.h`); the defaults are `ram_mb` 64, `keep_free_bytes` 14 MB (the host side's memory on the
+Wii besides the textures' arena), `texture_bytes` 13 MB, `htab_bytes` 256 KB and a swap file of the
+guest RAM's size.
+
+**Files in the title folder** (read at start; on the host too, except `play.cfg`):
+
+| File | Effect |
+|---|---|
+| `play.cfg` | the Wii only: its first line is the play setting (`script:`, `bot:`, `look:` or `replay:`, see above) unless the title's config already has one |
+| `profile.txt` | arms the sampling profiler (`wl/platform/README.md`, "Arming it from a file"): `after` counts seconds since the entry point started, a profile follows every `seconds` for `repeat` runs, the dumps are `profile<N>.txt` in the title folder (and in the log with `log 1`); symbolize with `tools/wl_profile.py <elf> <dump or log>` |
+| `hwcount.txt` | arms the hardware counters (`wl/platform/README.md`, "Hardware counters") |
+| `noxf` | GX's transform unit is kept out of the vertices (every vertex through the program on the processor), for an A/B; `WL_XB_NO_XF` on the host |
+| `vcache` | the vertex arrays' cache size in KB, its text (1024 when empty); the default is 1 MB, kept in the end of the textures' arena |
+| `novcache` | turns the vertex arrays' cache off (beats `vcache`) |
+| `noaudio` | the idle APU and AC'97 (DirectSound fails, the title runs silent), for an A/B; `WL_XB_AUDIO=0` on the host |
+| `play/` | where screenshots and captures go (`WL_XB_PLAY_OUT` on the host); scripts and `replay:` captures are looked for relative to the title folder |
+| `hdd/pagefile.sys` | the paging's swap file |
+| `hdd/recomp_seeds.json`, `hdd/vsh_programs.inc` | what the run found for the next build (below) |
+
+**Environment variables** (host only; the Wii has files instead):
+
+| Variable | Effect |
+|---|---|
+| `WL_XB_TRACE` | any value: log every kernel call |
+| `WL_XB_PLAY` | the play setting: `script:<host path>`, `bot:<seed>`, `look:<seed>` or `replay:<capture> [runs]` |
+| `WL_XB_PLAY_OUT` | the folder for screenshots and captures (default `<title folder>/play`) |
+| `WL_XB_DETERMINISTIC` | anything but empty or `0`: the deterministic mode |
+| `WL_XB_DET_NS` | `<backward jump>,<kernel call>,<device access>` nanoseconds of virtual time (default 40,400,400) |
+| `WL_XB_FRAME_MB`, `WL_XB_FRAME_KB` | a frame limit for guest memory, paged as the Wii pages (KB wins) |
+| `WL_XB_TEXTURE_MB` | the textures' arena (the Wii's is `texture_bytes`) |
+| `WL_XB_HEAP_MB`, `WL_XB_HEAP_KB` | caps the host's heap from the guest memory's creation on, as the Wii's is (`14` imitates it; the software GX and recorders are not counted) |
+| `WL_XB_NO_XF`, `WL_XB_VCACHE_KB` | as the files `noxf` and `vcache` (`0` turns the cache off) |
+| `WL_XB_CAPTURE` | `path[,frames[,after]]`: a GPU capture of `frames` frames (2) starting `after` vertical blanks in (600) |
+| `WL_XB_AUDIO`, `_WAV`, `_TRACE`, `_HASH` | see "The GPU and the MCPX" |
+
+The imitation of the Wii's memory on the host is `WL_XB_FRAME_MB=24 WL_XB_HEAP_MB=14`.
+
+**What the log says.** Tag `xbirq`, every 10 s: `status:` lines for the guest clock against the
+host's, the guest's pages and frames, the heap's free memory and, with demand paging, the frames
+and swap I/O; once a minute the heap's census (who holds it), the threads' host stacks, wl_mem's
+heaps (peak/budget) and the scheduler's counts. Tag `xbgpu`, every 600 vertical blanks: draws (and
+those into targets, with the stencil, beyond GX or approximated), the depth fits, the textures' cache
+(KB kept, converted, evicted, checks and write-watch answers) and the vertex arrays' (draws sent as
+indices, KB kept, converted, evicted). Tag `xbaudio`, every 10 s. Two reports name a hang by what
+its threads were doing, costing nothing until they fire (a watcher that polled could move a race):
+the **stall report** (`stall:`, no scheduling for 20 s: who holds the guest lock, the ready queue's
+head and every thread's state, once a minute while it lasts) and the **freeze watch** (`freeze:`,
+no new frame for 30 s: each guest thread's return addresses found on its stack and its IRQL, and
+on the Wii a 10 s profile of the frozen title into the log, for `tools/wl_profile.py`; once per
+freeze).
+
+The title's build learns from a run: every indirect-call target with no translated function is
+added to the seed file, and every NV2A vertex program drawn that is not compiled in to the program
+list (`wl/xbox/README.md`).
 
 ## Crash reports (`crash.h`)
 
