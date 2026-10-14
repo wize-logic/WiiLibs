@@ -22,6 +22,7 @@ static const char capture_magic[8] = {'W', 'L', 'N', 'V', '2', 'A', 'C', 'P'};
 struct WlNv2aCapture {
     WlNv2aCaptureSink sink;
     uint32_t frames_left; // 0: until wl_nv2a_capture_end
+    uint32_t kicks_mark;  // the model's kicks at the last flip counted (a flip with none since does not count)
     bool armed, running;
     WlResult error;
     struct {
@@ -360,9 +361,16 @@ void wl_nv2a_capture_note_flip(WlNv2a *dev) {
 
     if (c->armed) {
         capture_start(dev);
+        c->kicks_mark = dev->stats.kicks;
         return;
     }
     emit_tag(dev, 'F');
+    // a frame is a flip after a push buffer ran: a slow console sees the title flip again with nothing
+    // sent between (a frame the display repeats), and such a capture would hold no frame at all
+    if (dev->stats.kicks == c->kicks_mark) {
+        return;
+    }
+    c->kicks_mark = dev->stats.kicks;
     if (c->frames_left != 0 && --c->frames_left == 0) {
         wl_nv2a_capture_end(dev);
     }
