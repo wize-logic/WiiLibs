@@ -227,6 +227,19 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
     if (r == WL_OK) {
         WlXbThreadConfig tc;
         wl_xb_thread_config_default(&tc);
+        tc.deterministic = cfg->deterministic;
+#if !defined(__wii__)
+        // the deterministic mode's costs: WL_XB_DET_NS=<backward jump>,<kernel call>,<device access>
+        const char *det_ns = getenv("WL_XB_DET_NS");
+        if (det_ns != NULL && det_ns[0] != '\0') {
+            unsigned be = 0, call = 0, dev = 0;
+            if (sscanf(det_ns, "%u,%u,%u", &be, &call, &dev) >= 1) {
+                tc.det_backedge_ns = be;
+                tc.det_call_ns = call != 0 ? call : tc.det_call_ns;
+                tc.det_device_ns = dev != 0 ? dev : tc.det_device_ns;
+            }
+        }
+#endif
         r = wl_xb_threads_init(&tc, boot);
     }
     if (r == WL_OK) {

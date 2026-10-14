@@ -57,6 +57,12 @@ int main(int argc, char **argv) {
     if (getenv("WL_XB_TRACE") != NULL) {
         cfg.trace_kernel_calls = true;
     }
+    {
+        const char *det = getenv("WL_XB_DETERMINISTIC");
+        if (det != NULL && det[0] != '\0' && strcmp(det, "0") != 0) {
+            cfg.deterministic = true; // thread.h's deterministic mode
+        }
+    }
 #endif
     wl_xb_title_setup(&cfg);
 #if !defined(__wii__)

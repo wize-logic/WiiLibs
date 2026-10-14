@@ -556,7 +556,7 @@ static uint32_t frame_number(const Hc *hc) {
     if (hc->start_us == 0) {
         return 0;
     }
-    return (uint32_t)((wl_platform_time_us() - hc->start_us) / 1000u) & 0xFFFFu;
+    return (uint32_t)((wl_xb_time_us() - hc->start_us) / 1000u) & 0xFFFFu;
 }
 
 static void hc_reset(Hc *hc) {
@@ -581,7 +581,7 @@ static uint32_t hc_read(void *user, uint32_t off, unsigned size) {
         v = frame_number(hc);
         break;
     case HC_FM_REMAINING: {
-        uint32_t us = (uint32_t)(wl_platform_time_us() % 1000u);
+        uint32_t us = (uint32_t)(wl_xb_time_us() % 1000u);
         v = (0x2EDFu - us * 12u) & 0x3FFFu;
         break;
     }
@@ -628,7 +628,7 @@ static void hc_write(void *user, uint32_t off, uint32_t value, unsigned size) {
         bool was = operational(hc);
         *r = value;
         if (!was && operational(hc)) {
-            hc->start_us = wl_platform_time_us();
+            hc->start_us = wl_xb_time_us();
             if (!hc->running_logged) {
                 hc->running_logged = true;
                 WL_LOG_I(TAG, "OHCI%d operational (HcControl %08x, HCCA %08x)", hc->index, (unsigned)value,

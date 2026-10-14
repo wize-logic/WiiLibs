@@ -10,12 +10,18 @@
 
 #define FILETIME_1970 116444736000000000ull // 100 ns intervals from 1601 to 1970
 
+// The deterministic mode's calendar starts on 2004-11-15 00:00 UTC (a fixed date, not the host's).
+#define DET_EPOCH_UNIX_US 1100476800000000ull
+
 uint64_t xk_system_time(void) {
+    if (wl_xb_deterministic()) {
+        return (DET_EPOCH_UNIX_US + wl_xb_time_us()) * 10u + FILETIME_1970;
+    }
     return wl_platform_wall_time_us() * 10u + FILETIME_1970 + (uint64_t)((int64_t)g_xk_cfg.timezone_bias * 600000000);
 }
 
 uint32_t xk_timeout_ms(const int64_t *timeout, uint64_t *deadline_us) {
-    uint64_t now = wl_platform_time_us();
+    uint64_t now = wl_xb_time_us();
     if (timeout == NULL) {
         *deadline_us = 0;
         return WL_WAIT_FOREVER;
@@ -143,7 +149,7 @@ uint32_t xk_wait(uint32_t count, const uint32_t *objects, bool wait_all, bool al
         }
         uint32_t left = ms;
         if (ms != WL_WAIT_FOREVER) {
-            uint64_t now = wl_platform_time_us();
+            uint64_t now = wl_xb_time_us();
             if (now >= deadline) {
                 g_xk_stats.wait_timeouts++;
                 return STATUS_TIMEOUT;

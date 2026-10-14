@@ -6,6 +6,7 @@
 #include "wl/platform/input_shape.h"
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/input.h"
+#include "wl/xboxrt/thread.h"
 
 #define TAG "xbinput"
 
@@ -144,7 +145,7 @@ void wl_xb_input_frame(void) {
     if (g_host_controllers) {
         wl_platform_input_poll(&raw);
     }
-    uint64_t now = wl_platform_time_us();
+    uint64_t now = wl_xb_time_us();
     for (uint32_t i = 0; i < WL_XB_INPUT_PORTS; i++) {
         Port *p = &g_ports[i];
         WlXboxPad pad, more;

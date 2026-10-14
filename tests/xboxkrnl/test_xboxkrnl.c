@@ -198,6 +198,21 @@ static void make_file(const char *rel, const char *text) {
     }
 }
 
+// The tests' clock: the guest's (the host's, or the deterministic mode's virtual one), and a pause
+// on it (the virtual clock moves on by it at once, then a safe point looks at what came due).
+static uint64_t now_ms(void) {
+    return wl_xb_time_us() / 1000u;
+}
+
+static void pause_ms(uint32_t ms) {
+    if (wl_xb_deterministic()) {
+        wl_xb_time_spend_us(ms * 1000u);
+        wl_xb_yield_point();
+    } else {
+        wl_platform_thread_sleep_ms(ms);
+    }
+}
+
 static void boot(void) {
     if (g_ready) {
         return;
@@ -221,7 +236,12 @@ static void boot(void) {
         return;
     }
     WlXbThread *t = NULL;
-    if (wl_xb_threads_init(NULL, &t) != WL_OK || wl_xb_thread_setup_guest(t, 0x20000u, 0, 0, 0) != WL_OK) {
+    WlXbThreadConfig tc;
+    wl_xb_thread_config_default(&tc);
+#if defined(WL_XK_TEST_DETERMINISTIC)
+    tc.deterministic = true; // the same tests on the virtual clock (thread.h)
+#endif
+    if (wl_xb_threads_init(&tc, &t) != WL_OK || wl_xb_thread_setup_guest(t, 0x20000u, 0, 0, 0) != WL_OK) {
         return;
     }
     build_xbe();
@@ -288,7 +308,7 @@ TEST thunk_abi(void) {
     // KeTickCount moves in guest memory
     uint32_t tick_va = wl_xb_rd32(THUNK_VA + 4u * S_KE_TICK_COUNT);
     uint32_t t0 = wl_xb_rd32(tick_va);
-    wl_platform_thread_sleep_ms(20);
+    pause_ms(20);
     ASSERT(wl_xb_rd32(tick_va) > t0);
     // XboxHardwareInfo: the NV2A revision
     ASSERT_EQ(0xA1, wl_xb_rd8(wl_xb_rd32(THUNK_VA + 4u * S_HW_INFO) + 4u));
@@ -367,9 +387,9 @@ TEST events_timeouts_mutants(void) {
     ASSERT_EQ_FMT(0u, KN(S_NT_CREATE_EVENT, hp, 0, 1, 0), "%08x"); // synchronization, not signalled
     uint32_t ev = wl_xb_rd32(hp);
     wl_xb_wr64(tp, (uint64_t)(int64_t)-200000); // 20 ms
-    uint64_t t0 = wl_platform_time_ms();
+    uint64_t t0 = now_ms();
     ASSERT_EQ_FMT(0x102u, KN(S_NT_WAIT1, ev, 0, tp), "%08x"); // STATUS_TIMEOUT
-    ASSERT(wl_platform_time_ms() - t0 >= 15u);
+    ASSERT(now_ms() - t0 >= 15u);
     KN(S_NT_SET_EVENT, ev, 0);
     ASSERT_EQ_FMT(0u, KN(S_NT_WAIT1, ev, 0, tp), "%08x");
     ASSERT_EQ_FMT(0x102u, KN(S_NT_WAIT1, ev, 0, tp), "%08x"); // auto-reset by the satisfied wait
@@ -394,9 +414,9 @@ TEST events_timeouts_mutants(void) {
     ASSERT_EQ_FMT(0xC0000008u, KN(S_NT_CLOSE, m), "%08x"); // a closed handle
     // a delay sleeps about as long as asked
     wl_xb_wr64(tp, (uint64_t)(int64_t)-300000);
-    t0 = wl_platform_time_ms();
+    t0 = now_ms();
     ASSERT_EQ_FMT(0u, KN(S_KE_DELAY, 0, 0, tp), "%08x");
-    ASSERT(wl_platform_time_ms() - t0 >= 25u);
+    ASSERT(now_ms() - t0 >= 25u);
     PASS();
 }
 
@@ -535,8 +555,8 @@ TEST device_polls_are_safe_points(void) {
     g_spin_isr_runs = 0;
     g_spin_reads = 0;
     g_spin_raise_at = 100;
-    uint64_t t0 = wl_platform_time_ms();
-    while (wl_xb_rd32(g_spin_flag) == 0 && wl_platform_time_ms() - t0 < 3000u) {
+    uint64_t t0 = now_ms();
+    while (wl_xb_rd32(g_spin_flag) == 0 && now_ms() - t0 < 3000u) {
         (void)wl_xb_rd32(SPIN_DEV_VA + 0x44u);
     }
     ASSERT_EQ_FMT(1u, wl_xb_rd32(g_spin_flag), "%u");
@@ -553,8 +573,8 @@ TEST device_polls_are_safe_points(void) {
     WlXbThreadStats ts0, ts1;
     wl_xb_thread_stats(&ts0);
     ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(4, hi_routine)), "%08x");
-    t0 = wl_platform_time_ms();
-    while (wl_xb_rd32(g_hi_flag) == 0 && wl_platform_time_ms() - t0 < 3000u) {
+    t0 = now_ms();
+    while (wl_xb_rd32(g_hi_flag) == 0 && now_ms() - t0 < 3000u) {
         (void)wl_xb_rd32(SPIN_DEV_VA + 0x44u);
     }
     ASSERT_EQ_FMT(1u, wl_xb_rd32(g_hi_flag), "%u");
@@ -587,15 +607,15 @@ TEST device_ticks_run_at_safe_points(void) {
     g_tick_word = gmem(4);
     wl_xb_wr32(g_tick_word, 7);
     ASSERT_EQ(WL_OK, wl_xb_service_add_tick(tick_fn, NULL, 2000));
-    uint64_t t0 = wl_platform_time_ms();
-    while (wl_xb_rd32(g_tick_word) != 0 && wl_platform_time_ms() - t0 < 3000u) {
+    uint64_t t0 = now_ms();
+    while (wl_xb_rd32(g_tick_word) != 0 && now_ms() - t0 < 3000u) {
         (void)wl_xb_rd32(SPIN_DEV_VA + 0x44u);
     }
     ASSERT_EQ_FMT(0u, wl_xb_rd32(g_tick_word), "%u");
     g_tick_word = 0; // the tick stays: it must not write into the next tests' scratch memory
     const uint32_t before = g_tick_runs;
-    t0 = wl_platform_time_ms();
-    while (wl_platform_time_ms() - t0 < 60u) {
+    t0 = now_ms();
+    while (now_ms() - t0 < 60u) {
         (void)wl_xb_rd32(SPIN_DEV_VA + 0x44u);
     }
     ASSERT(g_tick_runs - before >= 5u); // about 30 at 2 ms

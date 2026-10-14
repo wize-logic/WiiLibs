@@ -218,6 +218,32 @@ handler of the same round, so an interrupt the device raised is delivered at onc
 runs at the holder's next safe point: a thread spinning on guest memory with the generated code's
 back-edge hook gives the device its frames (DirectSound waiting for its GP command word does).
 
+## The deterministic mode (`thread.h`)
+
+`WlXbThreadConfig.deterministic` (`WlXbTitleConfig.deterministic`; on the host
+`WL_XB_DETERMINISTIC=1`) makes two runs of a title with the same input run the same guest code in
+the same order and see the same times, so a failure seen once is seen again and a run can be
+bisected. The guest's clock (`wl_xb_time_us`: `KeTickCount`, `rdtsc`, `KeQueryPerformanceCounter`,
+the interrupt and system times, timers and wait timeouts, the vertical blank, the devices' counters,
+the audio processor's frames, the play harness's presses) is then virtual:
+
+- it moves on by a fixed cost at each safe point of the lock's holder: 40 ns a backward jump (the
+  back-edge hook: `g_xb_attention` stays set, so every backward jump is one), 400 ns a kernel call
+  or `rdtsc`, 400 ns a device access (`WL_XB_DET_NS=<jump>,<call>,<device>` on the host);
+- when every guest thread waits, it jumps to what is due next (a vertical blank, a timer, a wait's
+  timeout, a device's tick);
+- the service thread does no work of its own: the vertical blank, ticks and timers come due at the
+  holder's safe points, and the service thread is the idle thread, handed the lock only when no guest
+  thread is ready;
+- a wake, a new thread and a resume put the thread in the ready queue at once, at a point of the
+  guest's, instead of when its host thread gets to run; quanta and the starvation boost count the
+  virtual clock;
+- the system time starts on a fixed date and files report a fixed time.
+
+The title runs as fast as the host lets it (a menu that waits for vertical blanks flies past). On
+the host, Halo's a10 runs about 10% slower a frame than without it (two runs of a script give the
+same log lines and the same screenshots). Off, nothing changes: `wl_xb_time_us` is the host's clock.
+
 ## The GPU and the MCPX (`devices.h`)
 
 `wl_xb_devices_register_mcpx` registers the MCPX's devices: the APU (idle, its sample counter
@@ -343,8 +369,9 @@ or `script stopped at line N (...): why` with what was shown).
 - **Screenshots**: on the host wl/gxsoft draws the next two frames (the first may begin mid-frame)
   and the second becomes `<out>/<name>.png`; on the Wii a one-frame GPU capture (`<name>.cap`, for
   `tools/xbox_nv2a_replay CAP --png-gx DIR`). `capture <frames>` takes a longer capture on both.
-- **Not deterministic**: the guest's clocks are the host's, so how many game ticks a frame runs
-  depends on the host's speed; only the input is tied to the game's ticks.
+- **Deterministic only in the deterministic mode** (above): otherwise the guest's clocks are the
+  host's, so how many game ticks a frame runs depends on the host's speed; only the input is tied
+  to the game's ticks.
 
 ## The capture bench (`bench.h`)
 

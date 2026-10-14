@@ -23,6 +23,7 @@
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/mmio.h"
+#include "wl/xboxrt/thread.h"
 
 #define TAG "xbaudio"
 #define FRAME_SAMPLES (WL_XBOX_APU_FRAME * 2u) // stereo int16 a frame
@@ -194,8 +195,8 @@ static void wav_write(const int16_t *pcm, uint32_t frames) {
 static void tick(void *user) {
     (void)user;
     uint32_t want;
-    const uint64_t now = wl_platform_time_us();
-    if (g_output) {
+    const uint64_t now = wl_xb_time_us();
+    if (g_output && !wl_xb_deterministic()) { // the deterministic mode: by the (virtual) clock
         const uint32_t queued = wl_ring_count(&g_ring);
         want = queued < g_cfg.latency_frames ? g_cfg.latency_frames - queued : 0;
     } else {
@@ -313,7 +314,7 @@ WlResult wl_xb_audio_attach(const WlXbAudioConfig *cfg) {
     }
     wl_xb_irq_set_level(WL_XB_IRQ_APU, apu_irq, NULL);
     wl_xb_irq_set_level(WL_XB_IRQ_AC97, ac97_irq, NULL);
-    g_start_us = wl_platform_time_us();
+    g_start_us = wl_xb_time_us();
     g_cost.next_status_us = g_start_us + 10000000u;
     if (g_cfg.output && wl_platform_audio_start(WL_XBOX_APU_RATE, 256, fill, NULL) == WL_OK &&
         wl_platform_audio_threaded()) {

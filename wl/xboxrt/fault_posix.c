@@ -146,7 +146,7 @@ static void on_fault(int sig, siginfo_t *si, void *ctx) {
     }
     if (va >= WL_XB_MMIO_BASE && wl_xb_mmio_find(va) != NULL) {
         if (emulate((ucontext_t *)ctx, va, &what, &pc)) {
-            wl_xb_safe_point();
+            wl_xb_device_safe_point();
             return;
         }
         WlXbCrash c = {"device access the decoder cannot emulate", what, va, ea, pc, false};

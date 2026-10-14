@@ -10,6 +10,7 @@
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/regfile.h"
+#include "wl/xboxrt/thread.h"
 
 #define PMC_BOOT_0 0x000000u
 #define PMC_INTR_0 0x000100u
@@ -78,7 +79,7 @@ static uint32_t stub_read(void *user, uint32_t off, unsigned size) {
         break;
     case PTIMER_TIME_0:
     case PTIMER_TIME_1: {
-        uint64_t ns = (wl_platform_time_us() - g->start_us) * 1000u;
+        uint64_t ns = (wl_xb_time_us() - g->start_us) * 1000u;
         v = reg == PTIMER_TIME_0 ? (uint32_t)(ns << 5) & 0xFFFFFFE0u : (uint32_t)(ns >> 27) & 0x1FFFFFFFu;
         break;
     }
@@ -157,7 +158,7 @@ WlXbGpuStub *wl_xb_gpu_stub_create(void) {
         free(g);
         return NULL;
     }
-    g->start_us = wl_platform_time_us();
+    g->start_us = wl_xb_time_us();
     return g;
 }
 

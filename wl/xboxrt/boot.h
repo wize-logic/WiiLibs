@@ -47,6 +47,8 @@ typedef struct {
                                  // "look:<seed>"); NULL: none, or on the Wii the first line of
                                  // <title_dir>/play.cfg when there is one
     const char *play_out;        // where its screenshots go (NULL: beside the script)
+    bool deterministic;          // the deterministic mode (thread.h): a virtual clock, so that two runs
+                                 // with the same input run alike (the host: WL_XB_DETERMINISTIC=1)
     void (*kernel_config)(WlXkConfig *cfg, void *user); // edits the kernel's settings before init
     void (*before_entry)(void *user); // after the image is loaded and the kernel is up
     void *user;

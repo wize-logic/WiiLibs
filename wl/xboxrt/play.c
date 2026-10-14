@@ -838,7 +838,7 @@ static void buttons_released(WlXboxPad *pad, const Step *s) {
 // release has lasted long enough (a press is done)
 static bool press_phase(WlXboxPad *pad, const Step *s) {
     uint32_t reports = wl_xb_input_reports(s->player);
-    uint64_t now = wl_platform_time_us();
+    uint64_t now = wl_xb_time_us();
     int64_t frame = -1;
     bool has_frame = number_of("frame", &frame);
     bool long_enough = reports - P.phase_reports >= PRESS_REPORTS && now - P.phase_us >= PRESS_MS * 1000u &&
@@ -998,7 +998,7 @@ static void script_frame(void) {
             P.scratch = 0;
             P.pressed = true;
             P.phase_reports = wl_xb_input_reports(s->player);
-            P.phase_us = wl_platform_time_us();
+            P.phase_us = wl_xb_time_us();
             P.phase_frame = -1;
             number_of("frame", &P.phase_frame);
             P.presses = 0;
