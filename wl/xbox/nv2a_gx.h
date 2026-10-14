@@ -75,6 +75,8 @@ typedef struct WlNv2aGxStats {
     uint32_t xf_draws;            // draws whose vertices GX's transform unit transformed
     uint32_t xf_vertices;         // ...and their vertices
     uint32_t xf_position_draws;   // draws whose positions alone it transformed (the rest the program's)
+    uint32_t unwritten_counted;   // draws that write nothing (no colour, no depth) counting pixels: counted, not drawn
+    uint32_t unwritten_skipped;   // ...and not counting: skipped
 } WlNv2aGxStats;
 
 // A backend over GX, which must be up (wl_gx_init). NULL when there is no memory. The device it
