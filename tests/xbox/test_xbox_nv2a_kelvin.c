@@ -493,6 +493,23 @@ TEST fetch_plan_matches_the_fetch_of_each_vertex(void) {
         }
         wl_nv2a_fetch_plan(&draw, attributes, &plan);
         wl_nv2a_fetch_constants(&plan, &k, got, SLOTS);
+        // (some vertices fetched together: the first SLOTS, in an order of their own)
+        {
+            uint32_t some[SLOTS], m = draw.count < SLOTS ? draw.count : SLOTS;
+
+            for (v = 0; v < m; v++) {
+                some[v] = (v * 7u) % m;
+            }
+            wl_nv2a_fetch_vertices(&plan, &draw, some, m, got);
+            for (v = 0; v < m; v++) {
+                wl_nv2a_draw_fetch_some(&draw, &k, some[v], attributes, want[v]);
+                for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
+                    if (attributes & (1u << a)) {
+                        ASSERT_MEM_EQm("an attribute, fetched together", want[v][a], got[v][a], sizeof want[v][a]);
+                    }
+                }
+            }
+        }
         for (v = 0; v < draw.count; v++) {
             unsigned slot = v % SLOTS;
 

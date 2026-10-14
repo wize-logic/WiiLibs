@@ -191,6 +191,11 @@ void wl_nv2a_fetch_constants(const WlNv2aFetchPlan *plan, const WlNv2aKelvin *k,
                              unsigned count);
 void wl_nv2a_fetch_vertex(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, uint32_t vertex,
                           float inputs[WL_NV2A_ATTRIBS][4]);
+// the same for `count` vertices (vertices[n] into inputs[n]), an attribute at a time for up to
+// WL_NV2A_FETCH_BATCH of them
+enum { WL_NV2A_FETCH_BATCH = 32 };
+void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, const uint32_t *vertices,
+                            uint32_t count, float (*inputs)[WL_NV2A_ATTRIBS][4]);
 // one attribute's value from its data (an array element or inline), as the NV2A widens it: the
 // components the format leaves out are 0, w 1
 void wl_nv2a_attrib_decode(uint8_t type, uint8_t size, const uint8_t *data, float out[4]);

@@ -180,8 +180,12 @@ attributes in order, each at a multiple of its component's size), or immediate v
 (SET_VERTEX3F/4F/4S, SET_VERTEX_DATA2F/2S/4UB/4S/4F: a write of attribute 0's last component completes
 a vertex). `wl_nv2a_draw_fetch` gives a vertex as the program's sixteen input registers, every
 array format decoded (D3DCOLOR's B, G, R, A to r, g, b, a; normalized and plain shorts; floats and
-FLOAT2H; bytes; the 11:11:10 normal), a disabled attribute its current value. A long batch is handed
-over in parts of whole primitives (a strip's parts even, so its winding holds).
+FLOAT2H; bytes; the 11:11:10 normal), a disabled attribute its current value. A backend decides a
+draw's fetch once (`wl_nv2a_fetch_plan`: the attributes a program reads, each with its address,
+stride and decoder) and fetches a batch of vertices an attribute at a time (`wl_nv2a_fetch_vertices`;
+bytes and the packed normal's fields through tables of the same values), to the bit what
+`wl_nv2a_draw_fetch` gives. A long batch is handed over in parts of whole primitives (a strip's parts
+even, so its winding holds).
 
 ## Backends
 

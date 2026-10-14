@@ -1124,9 +1124,7 @@ static void vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
         gx->batch.run_vertices[runs] = made;
         runs++;
     }
-    for (r = 0; r < runs; r++) {
-        wl_nv2a_fetch_vertex(&gx->fetch, draw, gx->batch.run_vertex[r], gx->batch.inputs[r]);
-    }
+    wl_nv2a_fetch_vertices(&gx->fetch, draw, gx->batch.run_vertex, runs, gx->batch.inputs);
     wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, runs,
                               plan->live, gx->batch.outputs, &gx->batch.work);
     for (r = 0; r < runs; r++) {
