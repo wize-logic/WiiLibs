@@ -32,6 +32,7 @@
 
 #include "wl/xbox/nv2a.h"
 #include "wl/xbox/nv2a_texcache.h"
+#include "wl/xbox/nv2a_vcache.h"
 #include "wl/xbox/psh.h"
 #include "wl/xbox/vsh.h"
 
@@ -50,6 +51,10 @@ typedef struct WlNv2aGxConfig {
     // the converted textures' budget and memory (zero: 4 MiB from aligned_alloc; flush NULL: the
     // images committed for the GPU, wl_gpu_buffer_commit)
     WlNv2aTexCacheConfig textures;
+    // the vertex arrays kept for GX to read by index (nv2a_vcache.h: budget 0, none; flush NULL: the
+    // arrays committed for the GPU): a draw through the transform unit whose attributes are all
+    // kept sends its indices alone
+    WlNv2aVCacheConfig vertices;
     // the back buffer's size in EFB pixels (0: 640 x 480)
     uint32_t width, height;
     // keep the EFB without a destination alpha (RGB8_Z24; default: RGBA6_Z24, 6 bits a channel, as
@@ -77,6 +82,8 @@ typedef struct WlNv2aGxStats {
     uint32_t xf_position_draws;   // draws whose positions alone it transformed (the rest the program's)
     uint32_t unwritten_counted;   // draws that write nothing (no colour, no depth) counting pixels: counted, not drawn
     uint32_t unwritten_skipped;   // ...and not counting: skipped
+    uint32_t indexed_draws;       // draws through the transform unit that sent their indices alone
+    uint32_t indexed_vertices;    // ...and their vertices
     uint32_t raster_kept;         // draws that left GX's raster state as the draw before (unchanged)
     uint32_t textures_kept;       // ...its textures
     uint32_t combiners_kept;      // ...its pixel program
@@ -93,6 +100,7 @@ void wl_nv2a_gx_backend(WlNv2aGx *gx, WlNv2aBackend *out);
 void wl_nv2a_gx_present(WlNv2aGx *gx);
 void wl_nv2a_gx_stats(const WlNv2aGx *gx, WlNv2aGxStats *out);
 const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx);
+const WlNv2aVCache *wl_nv2a_gx_vertex_cache(const WlNv2aGx *gx);
 // The pixel program the last draw was made with (psh's: its reason when it is beyond GX, what it
 // approximated), and whether it was used (false: texture 0 times the colour instead); NULL before
 // the first draw. Valid until the next draw. For logs and tools.
