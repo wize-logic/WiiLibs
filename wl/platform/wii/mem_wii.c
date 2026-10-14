@@ -179,6 +179,10 @@ void wl_platform_heap_info(WlPlatformHeapInfo *out) {
     out->free_inside = (size_t)mi.fordblks;
     if (top >= 0x90000000u) {
         out->top = mem2_hi > top ? mem2_hi - top : 0;
+        // newlib counts the hole between MEM1's arena and MEM2 (where sbrk went on) as a block in
+        // use: taken back out, MEM1's top as the hole's start, so the figure is close, not exact
+        uintptr_t hole = 0x90000000u - (uintptr_t)SYS_GetArena1Hi();
+        out->in_use = out->in_use > hole ? out->in_use - hole : out->in_use;
     } else {
         uintptr_t mem1_hi = (uintptr_t)SYS_GetArena1Hi();
         out->top = mem1_hi > top ? mem1_hi - top : 0;
