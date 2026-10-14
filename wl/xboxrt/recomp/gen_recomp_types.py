@@ -18,8 +18,10 @@ WiiLibs' copy (wl/xboxrt/recomp/recomp_types.h) is that template, with WiiLibs' 
      effective address is the address); MEM8..MEMD read and write little-endian through
      scalar_storage_order("little-endian") structs, volatile and may_alias
   5. MEMF_SET/MEMD_SET store a float's integer bits (one byte-reversed store, not a float
-     store, reload and swap)
-  6. RecompXmm and RecompMmx get little-endian storage, so their lane views agree as on x86
+     store, reload and swap), always inline
+  6. RecompXmm and RecompMmx get little-endian storage, so their lane views agree as on x86; the
+     packed float arithmetic (RECOMP_XMM_LANEWISE) works on host-order copies of the lanes, inline,
+     and XMM_SHUFFLE moves lanes as bytes
   7. RECOMP_FP_PC: a fast path (round to float when the result is a normal float) before the
      exact slow path, which stays out of line
   8. the indirect-call trace ring and counter are compiled only with WL_RECOMP_ICALL_TRACE
@@ -245,13 +247,21 @@ typedef struct RECOMP_GUEST_LE { volatile double   v; } recomp_le_f64;
 
 /** Float/double stores, through the value's integer bits: a byte-reversed float store would be
  * a float store, an integer reload and a three-instruction swap; this is the float store, the
- * reload and one stwbrx (two for a double). */
-static inline void recomp_memf_set(uint32_t addr, float v) {
+ * reload and one stwbrx (two for a double). Always inline, like WL_XB_EA: at -Os GCC calls an
+ * out-of-line copy in each translation unit, with a stack frame of its own for the reload (1.9% of
+ * Halo's time on the Wii, at 12,700 stores); inline it is two or three instructions more at each.
+ * WL_XB_EA_CALL leaves GCC the choice, here too. */
+#if defined(WL_XB_EA_CALL)
+#define RECOMP_MEM_SET_INLINE static inline
+#else
+#define RECOMP_MEM_SET_INLINE static inline __attribute__((always_inline))
+#endif
+RECOMP_MEM_SET_INLINE void recomp_memf_set(uint32_t addr, float v) {
     union { float f; uint32_t u; } c;
     c.f = v;
     MEM32(addr) = c.u;
 }
-static inline void recomp_memd_set(uint32_t addr, double v) {
+RECOMP_MEM_SET_INLINE void recomp_memd_set(uint32_t addr, double v) {
     union { double d; uint64_t u; } c;
     c.d = v;
     MEM32(addr) = (uint32_t)c.u;
@@ -322,6 +332,54 @@ UNION_EDITS = [
      " * unpacks and MMX_MEM's raw copy of guest bytes agree with the hardware. */\n"
      "typedef union __attribute__((scalar_storage_order(\"little-endian\"))) RecompMmx {"),
 ]
+
+
+LANEWISE_OLD = """#define RECOMP_XMM_LANEWISE(name, expr)                                   \\
+    static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \\
+        RecompXmm r; int i;                                               \\
+        for (i = 0; i < 4; ++i) { (void)a; (void)b; r.f[i] = (expr); }    \\
+        return r;                                                         \\
+    }
+"""
+LANEWISE_NEW = """/* WiiLibs: RecompXmm's lanes are little-endian, and on a big-endian host a float read from
+ * reversed storage is an lwbrx, a store and a reload, and one written back a store, a reload and a
+ * three-instruction swap, lane after lane, each reload waiting on the store before it (XMM_MUL and
+ * XMM_ADD out of line took 1.3% of Halo's time on the Wii). Here the operands' lanes go to host-order
+ * copies first, the arithmetic runs on those, and the results go back with one stwbrx each; inline,
+ * as the operands are the register globals and a call made a copy of each. `a` and `b` are the
+ * host-order copies, so `expr` is upstream's. */
+#define RECOMP_XMM_LANEWISE(name, expr)                                   \\
+    static inline __attribute__((always_inline)) RecompXmm name(RecompXmm a_, RecompXmm b_) { \\
+        union { float f[4]; uint32_t u[4]; } a, b, h;                     \\
+        RecompXmm r; int i;                                               \\
+        _Pragma("GCC unroll 4")                                           \\
+        for (i = 0; i < 4; ++i) { a.u[i] = a_.u[i]; b.u[i] = b_.u[i]; }   \\
+        _Pragma("GCC unroll 4")                                           \\
+        for (i = 0; i < 4; ++i) { (void)a; (void)b; h.f[i] = (expr); }    \\
+        _Pragma("GCC unroll 4")                                           \\
+        for (i = 0; i < 4; ++i) r.u[i] = h.u[i];                          \\
+        return r;                                                         \\
+    }
+"""
+
+SHUFFLE_OLD = """static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
+    RecompXmm r;
+    r.u[0] = a.u[(imm >> 0) & 3u]; r.u[1] = a.u[(imm >> 2) & 3u];
+    r.u[2] = b.u[(imm >> 4) & 3u]; r.u[3] = b.u[(imm >> 6) & 3u];
+    return r;
+}
+"""
+SHUFFLE_NEW = """static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
+    /* WiiLibs: lanes moved as bytes (both sides are little-endian), not read with lwbrx and
+     * written back with stwbrx */
+    RecompXmm r;
+    memcpy((char *)&r + 0,  (const char *)&a + 4u * ((imm >> 0) & 3u), 4);
+    memcpy((char *)&r + 4,  (const char *)&a + 4u * ((imm >> 2) & 3u), 4);
+    memcpy((char *)&r + 8,  (const char *)&b + 4u * ((imm >> 4) & 3u), 4);
+    memcpy((char *)&r + 12, (const char *)&b + 4u * ((imm >> 6) & 3u), 4);
+    return r;
+}
+"""
 
 
 MMX_START = "#ifndef RECOMP_MMX_DEFINED\n"
@@ -425,6 +483,8 @@ def transform(src: str, commit: str, release: str, patches: list[str]) -> str:
     src = replace_between(src, CVT_START, CVT_END, CVT_NEW, "MMX_CVT_F2I")
     for old, new in UNION_EDITS:
         src = replace_once(src, old, new, old)
+    src = replace_once(src, LANEWISE_OLD, LANEWISE_NEW, "RECOMP_XMM_LANEWISE")
+    src = replace_once(src, SHUFFLE_OLD, SHUFFLE_NEW, "XMM_SHUFFLE")
     src = hoist_mmx(src)
     src = replace_once(src, BACKEDGE_OLD, BACKEDGE_NEW, "RECOMP_BACKEDGE safe point")
     src = replace_once(src, PORT_OLD, PORT_NEW, "RECOMP_PORT_IN/OUT")

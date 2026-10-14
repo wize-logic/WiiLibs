@@ -604,13 +604,21 @@ typedef struct RECOMP_GUEST_LE { volatile double   v; } recomp_le_f64;
 
 /** Float/double stores, through the value's integer bits: a byte-reversed float store would be
  * a float store, an integer reload and a three-instruction swap; this is the float store, the
- * reload and one stwbrx (two for a double). */
-static inline void recomp_memf_set(uint32_t addr, float v) {
+ * reload and one stwbrx (two for a double). Always inline, like WL_XB_EA: at -Os GCC calls an
+ * out-of-line copy in each translation unit, with a stack frame of its own for the reload (1.9% of
+ * Halo's time on the Wii, at 12,700 stores); inline it is two or three instructions more at each.
+ * WL_XB_EA_CALL leaves GCC the choice, here too. */
+#if defined(WL_XB_EA_CALL)
+#define RECOMP_MEM_SET_INLINE static inline
+#else
+#define RECOMP_MEM_SET_INLINE static inline __attribute__((always_inline))
+#endif
+RECOMP_MEM_SET_INLINE void recomp_memf_set(uint32_t addr, float v) {
     union { float f; uint32_t u; } c;
     c.f = v;
     MEM32(addr) = c.u;
 }
-static inline void recomp_memd_set(uint32_t addr, double v) {
+RECOMP_MEM_SET_INLINE void recomp_memd_set(uint32_t addr, double v) {
     union { double d; uint64_t u; } c;
     c.d = v;
     MEM32(addr) = (uint32_t)c.u;
@@ -782,10 +790,23 @@ static inline RecompXmm XMM_MOVE_HIGH_TO_LOW(RecompXmm a, RecompXmm b) {
 
 /* -- packed arithmetic -- */
 
+/* WiiLibs: RecompXmm's lanes are little-endian, and on a big-endian host a float read from
+ * reversed storage is an lwbrx, a store and a reload, and one written back a store, a reload and a
+ * three-instruction swap, lane after lane, each reload waiting on the store before it (XMM_MUL and
+ * XMM_ADD out of line took 1.3% of Halo's time on the Wii). Here the operands' lanes go to host-order
+ * copies first, the arithmetic runs on those, and the results go back with one stwbrx each; inline,
+ * as the operands are the register globals and a call made a copy of each. `a` and `b` are the
+ * host-order copies, so `expr` is upstream's. */
 #define RECOMP_XMM_LANEWISE(name, expr)                                   \
-    static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \
+    static inline __attribute__((always_inline)) RecompXmm name(RecompXmm a_, RecompXmm b_) { \
+        union { float f[4]; uint32_t u[4]; } a, b, h;                     \
         RecompXmm r; int i;                                               \
-        for (i = 0; i < 4; ++i) { (void)a; (void)b; r.f[i] = (expr); }    \
+        _Pragma("GCC unroll 4")                                           \
+        for (i = 0; i < 4; ++i) { a.u[i] = a_.u[i]; b.u[i] = b_.u[i]; }   \
+        _Pragma("GCC unroll 4")                                           \
+        for (i = 0; i < 4; ++i) { (void)a; (void)b; h.f[i] = (expr); }    \
+        _Pragma("GCC unroll 4")                                           \
+        for (i = 0; i < 4; ++i) r.u[i] = h.u[i];                          \
         return r;                                                         \
     }
 
@@ -853,9 +874,13 @@ static inline uint32_t XMM_MOVEMASK(RecompXmm a) {
 
 /** shufps: lanes 0-1 selected out of `a`, lanes 2-3 out of `b`. */
 static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
+    /* WiiLibs: lanes moved as bytes (both sides are little-endian), not read with lwbrx and
+     * written back with stwbrx */
     RecompXmm r;
-    r.u[0] = a.u[(imm >> 0) & 3u]; r.u[1] = a.u[(imm >> 2) & 3u];
-    r.u[2] = b.u[(imm >> 4) & 3u]; r.u[3] = b.u[(imm >> 6) & 3u];
+    memcpy((char *)&r + 0,  (const char *)&a + 4u * ((imm >> 0) & 3u), 4);
+    memcpy((char *)&r + 4,  (const char *)&a + 4u * ((imm >> 2) & 3u), 4);
+    memcpy((char *)&r + 8,  (const char *)&b + 4u * ((imm >> 4) & 3u), 4);
+    memcpy((char *)&r + 12, (const char *)&b + 4u * ((imm >> 6) & 3u), 4);
     return r;
 }
 
