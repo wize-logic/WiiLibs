@@ -76,6 +76,13 @@ function(wl_gfx_wrap_sqrtf target)
     target_link_options(${target} PRIVATE "LINKER:--wrap=sqrtf" "LINKER:-u,__wrap_sqrtf")
 endfunction()
 
+# wl_gfx_wrap_sqrt(<executable>): the same for sqrt, double: every call is wl_sqrt_exact (wl/gfx/gfx_sqrt.h),
+# the bits newlib's sqrt gives, without its bit-a-step loop.
+function(wl_gfx_wrap_sqrt target)
+    target_link_libraries(${target} PRIVATE wl_gfx)
+    target_link_options(${target} PRIVATE "LINKER:--wrap=sqrt" "LINKER:-u,__wrap_sqrt")
+endfunction()
+
 # wl_add_hbc_package(<target> NAME <name> [DOL <file>] [OUTPUT <zip>] [APP_DIR <dir>] [CODER <c>]
 #                    [VERSION <v>] [SHORT_DESCRIPTION <s>] [LONG_DESCRIPTION <l> |
 #                    LONG_DESCRIPTION_FILE <file>] [ICON <128x48.png> | ICON_TEXT <line> [<line>]]
@@ -241,8 +248,8 @@ endfunction()
 # it C, ${CMAKE_CURRENT_BINARY_DIR}/<target>_recomp/vsh/vsh_natives.c (derived from the title: never
 # commit it or the list), compiled into the executable (-O2, no fused multiply-adds: the same bits
 # as the interpreter), whose wl_xb_title_vsh_natives the runtime finds them by. A list that is not
-# there yet is an empty table. The executable also gets sqrtf as wl_sqrtf_exact
-# (wl_gfx_wrap_sqrtf: the same bits, faster on the Wii).
+# there yet is an empty table. The executable also gets sqrtf and sqrt as wl_sqrtf_exact and
+# wl_sqrt_exact (wl_gfx_wrap_sqrtf, wl_gfx_wrap_sqrt: the same bits, faster on the Wii).
 # (a cache entry: a project that adds WiiLibs with add_subdirectory calls the functions below from its
 # own scope, where a plain variable of this directory is not seen)
 set(WL_CMAKE_DIR ${CMAKE_CURRENT_LIST_DIR} CACHE INTERNAL "WiiLibs' cmake directory")
@@ -374,6 +381,7 @@ function(wl_add_xbox_title target)
     endif()
     target_link_libraries(${target} PRIVATE m)
     wl_gfx_wrap_sqrtf(${target})
+    wl_gfx_wrap_sqrt(${target})
     # the title's vertex programs compiled ahead of time
     set(vsh_list "")
     if(A_TITLE_CONFIG)

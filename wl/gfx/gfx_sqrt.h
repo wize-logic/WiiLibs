@@ -99,6 +99,98 @@ static inline float wl_sqrtf_exact(float x) {
     return wl_sqrtf_refine(x, wl_rsqrt_estimate((double)x));
 }
 
+// ---- the same for double ------------------------------------------------------------------------------
+// sqrt correctly rounded, the bits newlib's (a bit a step, several hundred instructions on Broadway), glibc's
+// and x86's sqrtsd give. A double's neighbours' midpoints have squares of 108 bits, so the rounding is decided
+// in integers: the candidate's significand K (53 bits, the root in [1, 2)) against the value's M (the value in
+// [1, 4) times 2^52): the root is above the midpoint K + 1/2 when M * 2^54 > (2K + 1)^2, below K - 1/2 when
+// M * 2^54 < (2K - 1)^2, never equal. Newton's steps from frsqrte's estimate leave the candidate a few
+// neighbours off at most, and the decision moves it until it is the nearest, so the result does not depend on
+// the estimate.
+
+static inline uint64_t wl_double_bits(double x) {
+    uint64_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+    return bits;
+}
+
+static inline double wl_bits_double(uint64_t bits) {
+    double x;
+    memcpy(&x, &bits, sizeof(x));
+    return x;
+}
+
+// (high, low), a 128-bit number, against the square of s < 2^55: 1 above it, -1 below, 0 equal.
+static inline int wl_u128_vs_square(uint64_t high, uint64_t low, uint64_t s) {
+    uint32_t s_high = (uint32_t)(s >> 32), s_low = (uint32_t)s;
+    uint64_t lo = (uint64_t)s_low * s_low, mid = (uint64_t)s_high * s_low, hi = (uint64_t)s_high * s_high;
+    uint64_t square_low = lo + (mid << 33);
+    uint64_t square_high = hi + (mid >> 31) + (square_low < lo ? 1u : 0u);
+    if (high != square_high) {
+        return high > square_high ? 1 : -1;
+    }
+    return low > square_low ? 1 : low < square_low ? -1 : 0;
+}
+
+// The correctly rounded root of `value` in [1, 4), from `estimate`, an estimate of 1 / sqrt(value) within a few
+// percent: four steps of Newton's method, then the candidate moved to the nearest double by the integers.
+static inline double wl_sqrt_refine(double value, double estimate) {
+    double y = estimate;
+    y = y * (1.5 - 0.5 * value * y * y);
+    y = y * (1.5 - 0.5 * value * y * y);
+    y = y * (1.5 - 0.5 * value * y * y);
+    y = y * (1.5 - 0.5 * value * y * y);
+    double root = value * y;
+    if (!(root >= 1.0)) {
+        root = 1.0;
+    }
+    if (!(root < 2.0)) {
+        root = 1.9999999999999998; // (the largest double below 2)
+    }
+    uint64_t bits = wl_double_bits(value), one = (uint64_t)1 << 52, mantissa = one - 1;
+    uint64_t m = (bits & mantissa) | one;
+    if ((bits >> 52) != 1023) {
+        m <<= 1; // (the value in [2, 4))
+    }
+    uint64_t high = m >> 10, low = m << 54, k = (wl_double_bits(root) & mantissa) | one;
+    for (;;) {
+        if (wl_u128_vs_square(high, low, 2 * k + 1) > 0) {
+            k++;
+        } else if (k > one && wl_u128_vs_square(high, low, 2 * k - 1) < 0) {
+            k--;
+        } else {
+            break;
+        }
+    }
+    return wl_bits_double(((uint64_t)1023 << 52) | (k & mantissa));
+}
+
+// sqrt, correctly rounded as newlib gives it: a zero (also -0) and +infinity are themselves; a negative is the
+// NaN newlib's (x - x) / (x - x) makes, a NaN or -infinity newlib's x * x + x. The value is scaled into
+// [1, 4) by an even power of two (a subnormal first by 2^54), its root scaled back by half of it.
+static inline double wl_sqrt_exact(double x) {
+    if (!(x > 0.0 && x <= 1.7976931348623157e308)) {
+        if (x == 0.0 || x > 0.0) {
+            return x; // zero or +infinity
+        }
+        if (x != x || x < -1.7976931348623157e308) {
+            return x * x + x; // NaN or -infinity
+        }
+        return (x - x) / (x - x);
+    }
+    int scale = 0;
+    if (x < 2.2250738585072014e-308) {
+        x *= 18014398509481984.0; // 2^54
+        scale = -27;
+    }
+    uint64_t bits = wl_double_bits(x);
+    int exponent = (int)(bits >> 52) - 1023;
+    int half = exponent >= 0 ? exponent / 2 : -((1 - exponent) / 2); // (the floor of exponent / 2)
+    double value = wl_bits_double((bits & (((uint64_t)1 << 52) - 1)) | ((uint64_t)(1023 + exponent - 2 * half) << 52));
+    double root = wl_sqrt_refine(value, wl_rsqrt_estimate(value));
+    return root * wl_bits_double((uint64_t)(1023 + half + scale) << 52);
+}
+
 // A program that links with -Wl,--wrap=sqrtf sends every call of sqrtf, the libraries' too, to __wrap_sqrtf,
 // which is wl_sqrtf_exact (gfx_sqrt_wrap.c, in libwl_gfx.a: the linker takes it from there). CMake:
 // wl_gfx_wrap_sqrtf(<target>) (cmake/WiiLibs.cmake) adds the flag. It needs no __real_sqrtf.
