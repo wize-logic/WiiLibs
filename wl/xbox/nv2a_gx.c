@@ -740,8 +740,27 @@ static bool tev_setup(WlNv2aGx *gx, const WlNv2aKelvin *k) {
 
 // ---- vertices ------------------------------------------------------------------------------------
 
-static uint8_t color_byte(float value) {
-    return (uint8_t)(value <= 0.0f ? 0 : value >= 1.0f ? 255 : (int)(value * 255.0f + 0.5f));
+// test >= 0 ? a : b (a NaN test gives b): one fsel on PowerPC, no branch
+static inline float select_ge0(float test, float a, float b) {
+#if defined(__PPC__) || defined(__powerpc__)
+    float r;
+
+    __asm__("fsel %0,%1,%2,%3" : "=f"(r) : "f"(test), "f"(a), "f"(b));
+    return r;
+#else
+    return test >= 0.0f ? a : b;
+#endif
+}
+
+// a colour's component as a byte: 0 at or below 0 (and for a NaN), 255 at or above 1, else
+// (int)(value * 255 + 0.5). Without branches: y = value * 255 + 0.5 is below 1 exactly where the
+// byte is 0, and at or above 255 where it is 255 (every float gives the same byte as the tests on
+// value would, checked over all of them)
+static inline uint32_t color_byte(float value) {
+    float y = value * 255.0f + 0.5f;
+    float z = select_ge0(y - 1.0f, y, 0.0f);
+
+    return (uint32_t)(int)select_ge0(z - 255.0f, 255.0f, z);
 }
 
 static float as_depth(float z, float depth_max) {
@@ -994,6 +1013,8 @@ typedef struct DrawPlan {
     // coordinates sent (bit n: stage n; the fog's), and a vertex's words
     unsigned colors, channels, texcoords, words;
     StagePlan stages[WL_NV2A_TEXTURES];
+    // the stages whose coordinates are sent, in order
+    unsigned stage_count, stage_list[WL_NV2A_TEXTURES];
 } DrawPlan;
 
 static void stage_plan(StagePlan *s, const WlNv2aTexEntry *entry, unsigned stage_program) {
@@ -1025,16 +1046,13 @@ static inline void stage_texcoord(const StagePlan *s, const float t[4], float st
     }
 }
 
-static inline uint32_t float_word(float f) {
-    uint32_t w;
-
-    memcpy(&w, &f, sizeof w);
-    return w;
+// a float into a word's place, its bits (a float store, not a trip through an integer register)
+static inline void put_float(uint32_t *word, float f) {
+    memcpy(word, &f, sizeof f);
 }
 
 static inline uint32_t color_word(const float c[4]) {
-    return (uint32_t)color_byte(c[0]) << 24 | (uint32_t)color_byte(c[1]) << 16 | (uint32_t)color_byte(c[2]) << 8 |
-           color_byte(c[3]);
+    return color_byte(c[0]) << 24 | color_byte(c[1]) << 16 | color_byte(c[2]) << 8 | color_byte(c[3]);
 }
 
 // a vertex as GX takes it (OpenCE-Wii's vertex_store) from what the program left, in the draw's
@@ -1064,26 +1082,25 @@ static void vertex_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPla
         out->x = position[0];
         out->y = position[1];
     }
-    out->w[0] = float_word(position[0]);
-    out->w[1] = float_word(position[1]);
-    out->w[2] = float_word(position[2]);
+    put_float(&out->w[0], position[0]);
+    put_float(&out->w[1], position[1]);
+    put_float(&out->w[2], position[2]);
     if (plan->colors >= 1) {
         out->w[i++] = (plan->channels & 1u) ? color_word(o->d0) : 0u;
     }
     if (plan->colors >= 2) {
         out->w[i++] = (plan->channels & 2u) ? color_word(o->d1) : 0u;
     }
-    for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
-        if (plan->texcoords & (1u << stage)) {
-            float st[2];
+    for (stage = 0; stage < plan->stage_count; stage++) {
+        unsigned n = plan->stage_list[stage];
+        float st[2];
 
-            stage_texcoord(&plan->stages[stage], o->t[stage], st);
-            out->w[i++] = float_word(st[0]);
-            out->w[i++] = float_word(st[1]);
-        }
+        stage_texcoord(&plan->stages[n], o->t[n], st);
+        put_float(&out->w[i++], st[0]);
+        put_float(&out->w[i++], st[1]);
     }
     if (plan->texcoords & (1u << WL_XBOX_PSH_FOG_TEXCOORD)) {
-        out->w[i] = float_word(wl_gx_ramp_coordinate(wl_nv2a_fog_factor(k, o->fog)));
+        put_float(&out->w[i], wl_gx_ramp_coordinate(wl_nv2a_fog_factor(k, o->fog)));
     }
 }
 
@@ -1124,9 +1141,7 @@ static void vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
         gx->batch.run_vertices[runs] = made;
         runs++;
     }
-    for (r = 0; r < runs; r++) {
-        wl_nv2a_fetch_vertex(&gx->fetch, draw, gx->batch.run_vertex[r], gx->batch.inputs[r]);
-    }
+    wl_nv2a_fetch_vertices(&gx->fetch, draw, gx->batch.run_vertex, runs, gx->batch.inputs);
     wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, runs,
                               plan->live, gx->batch.outputs, &gx->batch.work);
     for (r = 0; r < runs; r++) {
@@ -1204,6 +1219,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     wl_gx_direct_layout(&layout);
 
     plan.live = WL_XBOX_VSH_LIVE_POSITION;
+    plan.stage_count = 0;
     plan.colors = layout.colors;
     plan.channels = gx->channels;
     plan.texcoords = layout.texcoords;
@@ -1217,6 +1233,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
         if (gx->texcoords & (1u << stage)) {
             stage_plan(&plan.stages[stage], gx->entries[stage], wl_nv2a_stage_program(k, stage));
+            plan.stage_list[plan.stage_count++] = stage;
             plan.live |= (unsigned)WL_XBOX_VSH_LIVE_T0 << stage;
             plan.words += 2u;
         }

@@ -86,7 +86,8 @@ same whatever the draw's constants, so a static vertex buffer's can be kept), th
 
 `tools/xbox_vsh_codegen.c`, a host tool, compiles a file of programs (the game's microcode, as C
 text) to C: a function for each that does what the interpreter does, its operands fixed, for the
-outputs a draw reads; one for its colours alone; and, for a program whose position reads constants
+outputs a draw reads (with its loop over a batch of vertices, so a call's entry and exit are paid once
+for them); one for its colours alone; and, for a program whose position reads constants
 by a0 and is converted to the screen (a skinned model's), one for four positions at once. It writes
 a table of `WlXboxVshNative`, which the program hands to `wl_xbox_vsh_compile`; a program found in
 it by its words' hash (`wl_xbox_vsh_hash`) runs as its function. The table's name is the tool's
@@ -145,7 +146,9 @@ time (the guest lock); backend callbacks run inside the MMIO write that kicked t
   GET to PUT before it returns, then GET = PUT: method headers increasing and non-increasing, old
   and new jumps, one level of call and return (envytools' "PFIFO DMA pusher"); a header's words may
   span kicks. Direct3D's start-up handshake works as on the hardware: GET starts at 0, a jump at
-  physical 0 takes it to the push buffer, and GET is then PUT.
+  physical 0 takes it to the push buffer, and GET is then PUT. The rest of a header's run to the 3D
+  object goes to the state tracker at once (`wl_nv2a_kelvin_methods`: a run of ARRAY_ELEMENT16/32
+  indices straight into the batch), each word what the puller would make of it.
 - **The puller** binds objects to subchannels by handle (RAMHT, searched whole), handles its own
   methods (the reference counter, NV1A semaphores: an acquire whose value is not there is counted
   and passed, as a synchronous GPU has nothing to wait for), looks up the handles of methods
@@ -178,8 +181,12 @@ attributes in order, each at a multiple of its component's size), or immediate v
 (SET_VERTEX3F/4F/4S, SET_VERTEX_DATA2F/2S/4UB/4S/4F: a write of attribute 0's last component completes
 a vertex). `wl_nv2a_draw_fetch` gives a vertex as the program's sixteen input registers, every
 array format decoded (D3DCOLOR's B, G, R, A to r, g, b, a; normalized and plain shorts; floats and
-FLOAT2H; bytes; the 11:11:10 normal), a disabled attribute its current value. A long batch is handed
-over in parts of whole primitives (a strip's parts even, so its winding holds).
+FLOAT2H; bytes; the 11:11:10 normal), a disabled attribute its current value. A backend decides a
+draw's fetch once (`wl_nv2a_fetch_plan`: the attributes a program reads, each with its address,
+stride and decoder) and fetches a batch of vertices an attribute at a time (`wl_nv2a_fetch_vertices`;
+bytes and the packed normal's fields through tables of the same values), to the bit what
+`wl_nv2a_draw_fetch` gives. A long batch is handed over in parts of whole primitives (a strip's parts
+even, so its winding holds).
 
 ## Backends
 
@@ -277,8 +284,10 @@ programs run as functions rather than through the interpreter.
 
 `--bench N` replays the capture N times through the GX backend alone (no software GX, no recorder;
 the textures kept from one run to the next) and prints the best and the mean time a frame: the
-vertex programs, the fetch, the translation, what the Wii's processor does for a frame. The same on
-the console: wl/xboxrt's capture bench (`replay:<file> <runs>` in a title's `play.cfg`).
+vertex programs, the fetch, the translation, what the Wii's processor does for a frame; and the best
+run's parts: the model's own (pusher, puller, state tracker), the backend's draws, its clears and
+frames, the memory records put in. The same on the console: wl/xboxrt's capture bench
+(`replay:<file> <runs>` in a title's `play.cfg`).
 
 `--stream` replays through `wl_nv2a_replay_stream`, the capture read in odd-sized pieces into a guest
 memory given as the caller's; the output is the same (the test `xbox_nv2a_replay_stream`).

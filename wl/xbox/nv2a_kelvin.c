@@ -165,8 +165,45 @@ enum {
     FETCH_GENERIC // wl_nv2a_attrib_decode's
 };
 
+// the conversions the formats need, as tables of what wl_nv2a_attrib_decode computes (the same
+// operations, so the same bits): a byte normalized, the packed normal's 11- and 10-bit fields
+// normalized. (The 750 has no integer-to-float instruction: each conversion is a store, a load and
+// a subtraction of a magic double.)
+static float g_byte_float[256], g_cmp11_float[2048], g_cmp10_float[1024];
+static bool g_fetch_tables;
+
+static void fetch_tables_make(void) {
+    unsigned i;
+
+    for (i = 0; i < 256; i++) {
+        uint8_t byte = (uint8_t)i;
+
+        g_byte_float[i] = byte * (1.0f / 255.0f);
+    }
+    for (i = 0; i < 2048; i++) {
+        g_cmp11_float[i] = normalized(sign_extend(i, 11), 1023.0f);
+    }
+    for (i = 0; i < 1024; i++) {
+        g_cmp10_float[i] = normalized(sign_extend(i, 10), 511.0f);
+    }
+    g_fetch_tables = true;
+}
+
+// (float)value for |value| < 2^22, exactly: the float 1.5 * 2^23 + value, by its bits, less 1.5 * 2^23
+static inline float small_int_float(int value) {
+    uint32_t bits = 0x4B400000u + (uint32_t)value;
+    float f;
+
+    memcpy(&f, &bits, sizeof f);
+    return f - 12582912.0f;
+}
+
 void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetchPlan *plan) {
     unsigned a;
+
+    if (!g_fetch_tables) {
+        fetch_tables_make();
+    }
 
     plan->source = draw->source;
     plan->count = 0;
@@ -227,89 +264,152 @@ void wl_nv2a_fetch_constants(const WlNv2aFetchPlan *plan, const WlNv2aKelvin *k,
     }
 }
 
-void wl_nv2a_fetch_vertex(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, uint32_t vertex,
-                          float inputs[WL_NV2A_ATTRIBS][4]) {
-    uint32_t element;
+// (a little-endian word into a float's place, its bits as they are: no trip through a float
+// register, which on PowerPC is a store and a load)
+static inline void store_word(float *out, const uint8_t *data) {
+    uint32_t w = wl_rd_le32(data);
+
+    memcpy(out, &w, sizeof w);
+}
+
+void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, const uint32_t *vertices,
+                            uint32_t count, float (*inputs)[WL_NV2A_ATTRIBS][4]) {
+    uint32_t elements[WL_NV2A_FETCH_BATCH];
+    uint32_t n, done, run;
     unsigned i;
 
     if (plan->source == WL_NV2A_SOURCE_IMMEDIATE) {
-        memcpy(inputs, draw->immediate[vertex], sizeof(float) * WL_NV2A_ATTRIBS * 4);
+        for (n = 0; n < count; n++) {
+            memcpy(inputs[n], draw->immediate[vertices[n]], sizeof(float) * WL_NV2A_ATTRIBS * 4);
+        }
         return;
     }
-    // (the element: an array's index from the least, an inline vertex's number)
-    element = plan->source != WL_NV2A_SOURCE_ARRAYS ? vertex
-              : plan->indices != NULL                ? plan->indices[vertex] - plan->index_base
-                                                     : vertex;
-    for (i = 0; i < plan->count; i++) {
-        const uint8_t *data = plan->streamed[i].data + (size_t)element * plan->streamed[i].stride;
-        float *out = inputs[plan->streamed[i].attribute];
+    for (done = 0; done < count; done += run) {
+        float (*in)[WL_NV2A_ATTRIBS][4] = inputs + done;
 
-        // (as wl_nv2a_attrib_decode widens them: the components left out 0, w 1)
-        switch (plan->streamed[i].format) {
-        case FETCH_F4:
-            out[3] = word_float(wl_rd_le32(data + 12));
-            out[2] = word_float(wl_rd_le32(data + 8));
-            out[1] = word_float(wl_rd_le32(data + 4));
-            out[0] = word_float(wl_rd_le32(data));
-            break;
-        case FETCH_F3:
-            out[0] = word_float(wl_rd_le32(data));
-            out[1] = word_float(wl_rd_le32(data + 4));
-            out[2] = word_float(wl_rd_le32(data + 8));
-            out[3] = 1.0f;
-            break;
-        case FETCH_F2:
-            out[0] = word_float(wl_rd_le32(data));
-            out[1] = word_float(wl_rd_le32(data + 4));
-            out[2] = 0.0f;
-            out[3] = 1.0f;
-            break;
-        case FETCH_F1:
-            out[0] = word_float(wl_rd_le32(data));
-            out[1] = out[2] = 0.0f;
-            out[3] = 1.0f;
-            break;
-        case FETCH_D3DCOLOR:
-            // a D3DCOLOR: bytes B, G, R, A
-            out[0] = data[2] * (1.0f / 255.0f);
-            out[1] = data[1] * (1.0f / 255.0f);
-            out[2] = data[0] * (1.0f / 255.0f);
-            out[3] = data[3] * (1.0f / 255.0f);
-            break;
-        case FETCH_CMP: {
-            uint32_t word = wl_rd_le32(data);
+        run = count - done < WL_NV2A_FETCH_BATCH ? count - done : WL_NV2A_FETCH_BATCH;
+        // (each vertex's element: an array's index from the least, an inline vertex's number)
+        for (n = 0; n < run; n++) {
+            uint32_t v = vertices[done + n];
 
-            out[0] = normalized(sign_extend(word & 0x7FFu, 11), 1023.0f);
-            out[1] = normalized(sign_extend((word >> 11) & 0x7FFu, 11), 1023.0f);
-            out[2] = normalized(sign_extend(word >> 22, 10), 511.0f);
-            out[3] = 1.0f;
-            break;
+            elements[n] = plan->source == WL_NV2A_SOURCE_ARRAYS && plan->indices != NULL
+                              ? plan->indices[v] - plan->index_base
+                              : v;
         }
-        case FETCH_S1: {
-            unsigned c, size = plan->streamed[i].size;
+        // an attribute at a time for all of them (its format decided once)
+        for (i = 0; i < plan->count; i++) {
+            const uint8_t *base = plan->streamed[i].data;
+            uint32_t stride = plan->streamed[i].stride;
+            unsigned attribute = plan->streamed[i].attribute, size = plan->streamed[i].size, c;
 
-            out[1] = out[2] = 0.0f;
-            out[3] = 1.0f;
-            for (c = 0; c < size; c++) {
-                out[c] = normalized((int16_t)wl_rd_le16(data + 2 * c), 32767.0f);
+            // (as wl_nv2a_attrib_decode widens them: the components left out 0, w 1)
+            switch (plan->streamed[i].format) {
+            case FETCH_F4:
+                for (n = 0; n < run; n++) {
+                    const uint8_t *data = base + (size_t)elements[n] * stride;
+                    float *out = in[n][attribute];
+
+                    store_word(&out[0], data);
+                    store_word(&out[1], data + 4);
+                    store_word(&out[2], data + 8);
+                    store_word(&out[3], data + 12);
+                }
+                break;
+            case FETCH_F3:
+                for (n = 0; n < run; n++) {
+                    const uint8_t *data = base + (size_t)elements[n] * stride;
+                    float *out = in[n][attribute];
+
+                    store_word(&out[0], data);
+                    store_word(&out[1], data + 4);
+                    store_word(&out[2], data + 8);
+                    out[3] = 1.0f;
+                }
+                break;
+            case FETCH_F2:
+                for (n = 0; n < run; n++) {
+                    const uint8_t *data = base + (size_t)elements[n] * stride;
+                    float *out = in[n][attribute];
+
+                    store_word(&out[0], data);
+                    store_word(&out[1], data + 4);
+                    out[2] = 0.0f;
+                    out[3] = 1.0f;
+                }
+                break;
+            case FETCH_F1:
+                for (n = 0; n < run; n++) {
+                    float *out = in[n][attribute];
+
+                    store_word(&out[0], base + (size_t)elements[n] * stride);
+                    out[1] = out[2] = 0.0f;
+                    out[3] = 1.0f;
+                }
+                break;
+            case FETCH_D3DCOLOR:
+                // a D3DCOLOR: bytes B, G, R, A
+                for (n = 0; n < run; n++) {
+                    const uint8_t *data = base + (size_t)elements[n] * stride;
+                    float *out = in[n][attribute];
+
+                    out[0] = g_byte_float[data[2]];
+                    out[1] = g_byte_float[data[1]];
+                    out[2] = g_byte_float[data[0]];
+                    out[3] = g_byte_float[data[3]];
+                }
+                break;
+            case FETCH_CMP:
+                for (n = 0; n < run; n++) {
+                    uint32_t word = wl_rd_le32(base + (size_t)elements[n] * stride);
+                    float *out = in[n][attribute];
+
+                    out[0] = g_cmp11_float[word & 0x7FFu];
+                    out[1] = g_cmp11_float[(word >> 11) & 0x7FFu];
+                    out[2] = g_cmp10_float[word >> 22];
+                    out[3] = 1.0f;
+                }
+                break;
+            case FETCH_S1:
+                for (n = 0; n < run; n++) {
+                    const uint8_t *data = base + (size_t)elements[n] * stride;
+                    float *out = in[n][attribute];
+
+                    out[1] = out[2] = 0.0f;
+                    out[3] = 1.0f;
+                    for (c = 0; c < size; c++) {
+                        // (normalized's own operations, the integer made a float by its bits)
+                        float result = small_int_float((int16_t)wl_rd_le16(data + 2 * c)) * (1.0f / 32767.0f);
+
+                        out[c] = result < -1.0f ? -1.0f : result;
+                    }
+                }
+                break;
+            case FETCH_UB:
+                for (n = 0; n < run; n++) {
+                    const uint8_t *data = base + (size_t)elements[n] * stride;
+                    float *out = in[n][attribute];
+
+                    out[1] = out[2] = 0.0f;
+                    out[3] = 1.0f;
+                    for (c = 0; c < size; c++) {
+                        out[c] = g_byte_float[data[c]];
+                    }
+                }
+                break;
+            default:
+                for (n = 0; n < run; n++) {
+                    wl_nv2a_attrib_decode(plan->streamed[i].type, (uint8_t)size,
+                                          base + (size_t)elements[n] * stride, in[n][attribute]);
+                }
+                break;
             }
-            break;
-        }
-        case FETCH_UB: {
-            unsigned c, size = plan->streamed[i].size;
-
-            out[1] = out[2] = 0.0f;
-            out[3] = 1.0f;
-            for (c = 0; c < size; c++) {
-                out[c] = data[c] * (1.0f / 255.0f);
-            }
-            break;
-        }
-        default:
-            wl_nv2a_attrib_decode(plan->streamed[i].type, plan->streamed[i].size, data, out);
-            break;
         }
     }
+}
+
+void wl_nv2a_fetch_vertex(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, uint32_t vertex,
+                          float inputs[WL_NV2A_ATTRIBS][4]) {
+    wl_nv2a_fetch_vertices(plan, draw, &vertex, 1, (float (*)[WL_NV2A_ATTRIBS][4])inputs);
 }
 
 void wl_nv2a_prim_info(uint32_t primitive, WlNv2aPrimInfo *out) {
@@ -475,6 +575,11 @@ void wl_nv2a_kelvin_init(WlNv2a *dev) {
     k->dirty = WL_NV2A_DIRTY_ALL;
 }
 
+// what each method is, decided once (the dispatch's tests per method, from a table): known, an
+// immediate vertex method, and its dirty group
+enum { METHOD_KNOWN = 0x8000u, METHOD_IMMEDIATE = 0x4000u, METHOD_DIRTY = 0x3FFFu };
+static uint16_t g_method_info[WL_NV2A_K_METHODS / 4];
+
 static uint32_t dirty_group(uint32_t method) {
     if (method >= 0x200 && method <= 0x214) {
         return WL_NV2A_DIRTY_SURFACE;
@@ -506,6 +611,17 @@ static bool known_method(uint32_t m) {
            (m >= 0x1710 && m <= 0x17D0) || (m >= 0x17E0 && m <= 0x1818) || m == 0x181C || m == 0x1820 ||
            m == 0x1824 || (m >= 0x1880 && m <= 0x1AFC) || (m >= 0x1B00 && m <= 0x1BFC) ||
            (m >= 0x1D6C && m <= 0x1D9C) || (m >= 0x1E20 && m <= 0x1EA4);
+}
+
+static bool immediate_range(uint32_t method);
+
+static void method_info_make(void) {
+    uint32_t m;
+
+    for (m = 0; m < WL_NV2A_K_METHODS; m += 4) {
+        g_method_info[m >> 2] = (uint16_t)((known_method(m) ? METHOD_KNOWN : 0u) |
+                                           (immediate_range(m) ? METHOD_IMMEDIATE : 0u) | dirty_group(m));
+    }
 }
 
 static void note_unhandled(WlNv2a *dev, uint32_t method, uint32_t param) {
@@ -1114,9 +1230,15 @@ static bool immediate_range(uint32_t method) {
 
 void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     WlNv2aKelvin *k = &dev->kelvin;
+    uint32_t info;
 
     method &= WL_NV2A_K_METHODS - 4u;
-    if (!known_method(method)) {
+    info = g_method_info[method >> 2];
+    if (info == 0) {
+        method_info_make();
+        info = g_method_info[method >> 2];
+    }
+    if (!(info & METHOD_KNOWN)) {
         note_unhandled(dev, method, param);
     }
 
@@ -1151,7 +1273,7 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     }
 
     k->raw[method >> 2] = param;
-    if (immediate_range(method)) {
+    if (info & METHOD_IMMEDIATE) {
         immediate_method(dev, method, param);
         return;
     }
@@ -1261,8 +1383,35 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
             k->constants_generation++;
             k->dirty |= WL_NV2A_DIRTY_VIEWPORT | WL_NV2A_DIRTY_CONSTANTS;
         } else {
-            k->dirty |= dirty_group(method);
+            k->dirty |= info & METHOD_DIRTY;
         }
         break;
+    }
+}
+
+void wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const uint8_t *words, uint32_t count) {
+    WlNv2aKelvin *k = &dev->kelvin;
+    uint32_t n;
+
+    method &= WL_NV2A_K_METHODS - 4u;
+    // (a run of indices into one begin/end: each word what wl_nv2a_kelvin_method makes of it, without
+    // its dispatch)
+    if (!increasing && (method == WL_NV2A_K_ARRAY_ELEMENT16 || method == WL_NV2A_K_ARRAY_ELEMENT32) &&
+        k->primitive != 0 && batch_open(dev, WL_NV2A_SOURCE_ARRAYS)) {
+        for (n = 0; n < count; n++) {
+            uint32_t param = wl_rd_le32(words + 4u * n);
+
+            k->raw[method >> 2] = param;
+            if (method == WL_NV2A_K_ARRAY_ELEMENT16) {
+                batch_index(dev, param & 0xFFFFu);
+                batch_index(dev, param >> 16);
+            } else {
+                batch_index(dev, param);
+            }
+        }
+        return;
+    }
+    for (n = 0; n < count; n++) {
+        wl_nv2a_kelvin_method(dev, increasing ? method + 4u * n : method, wl_rd_le32(words + 4u * n));
     }
 }

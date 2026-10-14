@@ -113,8 +113,8 @@ TEST compile_finds_a_function_by_hash_and_count(void) {
     unsigned long count;
     const uint32_t *words = program_words(0, &count);
     WlXboxVshNative natives[2] = {
-        {wl_xbox_vsh_hash(words, count), count + 1, native_run, native_colors, NULL},
-        {wl_xbox_vsh_hash(words, count), count, native_run, native_colors, NULL},
+        {wl_xbox_vsh_hash(words, count), count + 1, native_run, native_colors, NULL, NULL},
+        {wl_xbox_vsh_hash(words, count), count, native_run, native_colors, NULL, NULL},
     };
     wl_xbox_vsh_compile(words, count, natives, 1, &g_program); // (the count differs)
     ASSERT(g_program.native == NULL);

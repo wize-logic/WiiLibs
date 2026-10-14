@@ -106,6 +106,9 @@ uint64_t wl_nv2a_time(WlNv2a *dev);
 
 // the state tracker (nv2a_kelvin.c)
 void wl_nv2a_kelvin_init(WlNv2a *dev);
+// `count` words of one method header's run (increasing: method, method + 4, ...; else every word to
+// `method`), little-endian at `words`: what as many wl_nv2a_kelvin_method calls make of them
+void wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const uint8_t *words, uint32_t count);
 void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param);
 // a trap the title's ISR must see (NO_OPERATION with a parameter): true when the pusher stops
 bool wl_nv2a_trap(WlNv2a *dev, uint32_t method, uint32_t param);

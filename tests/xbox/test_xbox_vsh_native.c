@@ -140,6 +140,24 @@ TEST functions_match_the_interpreter(void) {
             wl_xbox_vsh_run_live(&g_native, (const float (*)[4])g_constants,
                                  (const float (*)[4])g_inputs, 2.5f, &got, live);
             ASSERTm("run_live", live_same(&want, &got, live));
+            // (the same, for three vertices at once)
+            {
+                static float inputs[3][WL_XBOX_VSH_INPUT_COUNT][4];
+                static WlXboxVshOutput outs[3];
+                static WlXboxVshWork work;
+
+                for (int m = 0; m < 3; m++) {
+                    memcpy(inputs[m], g_inputs, sizeof inputs[m]);
+                    memset(&outs[m], 0x7F, sizeof outs[m]);
+                }
+                ASSERT(g_native.native_batch != NULL);
+                wl_xbox_vsh_run_batch(&g_native, (const float (*)[4])g_constants,
+                                      (const float (*)[WL_XBOX_VSH_INPUT_COUNT][4])inputs, 3, 2.5f, outs, live,
+                                      &work);
+                for (int m = 0; m < 3; m++) {
+                    ASSERTm("run_batch", live_same(&want, &outs[m], live));
+                }
+            }
             memset(&got, 0, sizeof got);
             wl_xbox_vsh_run_colors(&g_native, (const float (*)[4])g_constants,
                                    (const float (*)[4])g_inputs, &got);
