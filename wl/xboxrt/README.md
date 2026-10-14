@@ -364,8 +364,11 @@ or `script stopped at line N (...): why` with what was shown).
   counted in the title's ticks in a game), and a per-frame hook.
 - **Timing**: a press holds and releases for at least 100 ms, 4 reports to the title and 2 of its
   `frame`s each; the script's clock counts vertical blanks (59.94 a second, a stall of loading
-  counted as a quarter second); in a game, holds and the bot count the title's ticks, so a slower
-  host moves as far and the bot's input at a given tick is the same on every run.
+  counted as a quarter second); in a game, holds and the bot count the game's time played (the
+  title's ticks, which a revert to a checkpoint puts back but the time played does not), so a slower
+  host moves as far, the bot's input at a given tick is the same on every run, and a bot that dies
+  and is put back does not play the same death again and again. A bot step whose game time stands
+  still ends after four times its length (and a minute) on the script's clock.
 - **Screenshots**: on the host wl/gxsoft draws the next two frames (the first may begin mid-frame)
   and the second becomes `<out>/<name>.png`; on the Wii a one-frame GPU capture (`<name>.cap`, for
   `tools/xbox_nv2a_replay CAP --png-gx DIR`). `capture <frames>` takes a longer capture on both.

@@ -35,6 +35,8 @@
 #define VBLANK_HZ 59.94
 #define MAX_REG 32
 #define PLAY_PRIORITY 31
+#define TICK_JUMP 60 // a tick moving on more than this in a frame was a checkpoint loaded, not play
+#define STILL_FACTOR 4.0 // a bot step whose game time stands still ends after this many times its length
 
 enum {
     K_WAIT,
@@ -122,6 +124,11 @@ static struct {
     double started_clock;
     uint32_t started_frame, started_vblank;
     int64_t started_tick, started_checkpoints, scratch;
+    // the game's time played: the title's tick, but never back (a revert to a checkpoint puts the
+    // tick back; this goes on), so a step's time and the bot's clock move on through deaths
+    int64_t played, started_played, last_game_tick;
+    uint32_t reverts;
+    char map[64];
     bool pressed;
     uint32_t phase_reports;
     uint64_t phase_us;
@@ -765,6 +772,26 @@ static void observe(void) {
     if (P.observed && checkpoints > P.checkpoints) {
         wl_xb_play_log("checkpoint %lld saved (tick %lld)", (long long)checkpoints, (long long)tick);
     }
+    // the time played (P.played): the game's tick when a game or a map begins, or a checkpoint
+    // ahead is loaded; it goes on, not back, when the game reverts to a checkpoint behind (a death)
+    char map[sizeof P.map];
+    if (!wl_xb_play_text("map", map, sizeof map)) {
+        map[0] = '\0';
+    }
+    if (tick >= 0) {
+        if (P.last_game_tick < 0 || strcmp(map, P.map) != 0 || tick - P.last_game_tick > TICK_JUMP) {
+            P.played = tick;
+        } else if (tick > P.last_game_tick) {
+            P.played += tick - P.last_game_tick;
+        } else if (tick < P.last_game_tick) {
+            P.reverts++;
+            wl_xb_play_log("the game went back from tick %lld to %lld (a revert, %u so far): the time played goes on "
+                           "from %lld", (long long)P.last_game_tick, (long long)tick, (unsigned)P.reverts,
+                           (long long)P.played);
+        }
+    }
+    P.last_game_tick = tick;
+    snprintf(P.map, sizeof P.map, "%s", map);
     P.tick = tick;
     P.checkpoints = checkpoints;
     P.observed = true;
@@ -869,21 +896,27 @@ static int16_t stick_value(double v) {
     return (int16_t)(v * 32767.0);
 }
 
-// the step's elapsed time in its unit: seconds (the script's clock; in a game the title's ticks
-// when the step began in one), frames, ticks
+// the step's elapsed time in its unit: seconds (the script's clock; in a game the game's time
+// played when the step began in one), frames, ticks (played)
 static double elapsed(const Step *s) {
-    int64_t tick = P.tick;
+    bool in_game = P.started_tick >= 0 && P.tick >= 0 && P.played >= P.started_played;
     switch (s->unit) {
     case DUR_FRAMES:
         return (double)(P.frames - P.started_frame);
     case DUR_TICKS:
-        return P.started_tick >= 0 && tick >= P.started_tick ? (double)(tick - P.started_tick) : 0.0;
+        return in_game ? (double)(P.played - P.started_played) : 0.0;
     default:
-        if (P.started_tick >= 0 && tick >= P.started_tick) {
-            return (double)(tick - P.started_tick) / tick_rate();
+        if (in_game) {
+            return (double)(P.played - P.started_played) / tick_rate();
         }
         return P.clock - P.started_clock;
     }
+}
+
+// the bot's clock in milliseconds: the game's time played (the same input at the same tick, and
+// after a revert other input than the play that ended in it), else the script's clock
+static uint64_t bot_ms(void) {
+    return P.tick >= 0 ? (uint64_t)((double)P.played * 1000.0 / tick_rate()) + 1u : (uint64_t)(P.clock * 1000.0);
 }
 
 static bool memory_holds(const Step *s, uint32_t *value) {
@@ -994,6 +1027,7 @@ static void script_frame(void) {
             P.started_frame = P.frames;
             P.started_vblank = wl_xb_vblank_count();
             P.started_tick = P.tick;
+            P.started_played = P.played;
             P.started_checkpoints = P.checkpoints;
             P.scratch = 0;
             P.pressed = true;
@@ -1139,6 +1173,13 @@ static void script_frame(void) {
                 }
                 break;
             }
+            if ((s->kind == K_LOOK || (s->kind == K_BOT && s->arg[0] == '\0')) && s->unit == DUR_SECONDS &&
+                P.clock - P.started_clock >= s->number * STILL_FACTOR + 60.0) {
+                // the game's time stood still (a pause, a cutscene that waits): the script's clock ends it
+                wl_xb_play_log("%s: %.0f s of the game's time in %.0f s: ended by the script's clock", s->text, t,
+                               P.clock - P.started_clock);
+                break;
+            }
             if (s->kind == K_HOLD) {
                 buttons_held(pad, s);
             } else if (s->kind == K_STICK) {
@@ -1149,10 +1190,7 @@ static void script_frame(void) {
                 pad->analog[WL_XBOX_PAD_LT] = (uint8_t)(fmin(fmax(s->sticks[0], 0.0), 1.0) * 255.0);
                 pad->analog[WL_XBOX_PAD_RT] = (uint8_t)(fmin(fmax(s->sticks[1], 0.0), 1.0) * 255.0);
             } else {
-                // in a game the title's ticks are the bot's clock: the same input at the same tick
-                uint64_t ms = P.tick >= 0 ? (uint64_t)((double)P.tick * 1000.0 / tick_rate()) + 1u
-                                          : (uint64_t)(P.clock * 1000.0);
-                wl_xb_play_bot(pad, ms, 1, s->kind == K_LOOK);
+                wl_xb_play_bot(pad, bot_ms(), 1, s->kind == K_LOOK);
             }
             return;
         case K_DOWN:
@@ -1198,7 +1236,7 @@ static void script_frame(void) {
                 return;
             }
             P.tstep.frames = P.frames - P.started_frame;
-            P.tstep.ticks = P.started_tick >= 0 && P.tick >= P.started_tick ? P.tick - P.started_tick : -1;
+            P.tstep.ticks = P.started_tick >= 0 && P.tick >= 0 ? P.played - P.started_played : -1;
             P.tstep.seconds = t;
             WlXboxPad tp;
             memset(&tp, 0, sizeof tp);
@@ -1340,14 +1378,11 @@ static void play_frame(void) {
         for (uint32_t p = 0; p < WL_XB_PLAY_PORTS; p++) {
             wl_xbox_pad_merge(&P.out[p], &P.latched[p]);
             if (P.bots[p] != 0) {
-                uint64_t ms = P.tick >= 0 ? (uint64_t)((double)P.tick * 1000.0 / tick_rate()) + 1u
-                                          : (uint64_t)(P.clock * 1000.0);
-                wl_xb_play_bot(&P.out[p], ms, P.bots[p] - 1, false);
+                wl_xb_play_bot(&P.out[p], bot_ms(), P.bots[p] - 1, false);
             }
         }
     } else if (P.mode == MODE_BOT || P.mode == MODE_LOOK) {
-        uint64_t ms = P.tick >= 0 ? (uint64_t)((double)P.tick * 1000.0 / tick_rate()) + 1u : (uint64_t)(P.clock * 1000.0);
-        wl_xb_play_bot(&P.out[0], ms, P.seed, P.mode == MODE_LOOK);
+        wl_xb_play_bot(&P.out[0], bot_ms(), P.seed, P.mode == MODE_LOOK);
     }
     if (g_frame_hook != NULL) {
         WlXbPlayFrame fr = {P.frames, vb, P.out};
@@ -1427,6 +1462,7 @@ WlResult wl_xb_play_start(const char *setting, const char *base_dir, const char 
         snprintf(P.out_dir, sizeof P.out_dir, "%s", P.base_dir);
     }
     P.tick = -1;
+    P.last_game_tick = -1;
     if (P.mode == MODE_SCRIPT) {
         WlResult r = load_script();
         if (r != WL_OK) {
