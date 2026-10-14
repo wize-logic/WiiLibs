@@ -271,6 +271,19 @@ void wl_xb_mem_unpin(uint32_t va, uint32_t bytes);
 // Whether the page of `va` has a frame now (diagnostics and tests; false for anything else).
 bool wl_xb_mem_resident(uint32_t va);
 
+// ---- Write watch ---------------------------------------------------------------------------------
+// Whether guest memory was written since a moment, from the MMU's changed bits rather than its
+// bytes: for a cache of things made from guest memory (the GPU's converted textures), which then
+// need not read or hash memory that did not change. Page granular (a store anywhere in a page
+// counts), and a page freed or moved counts as written. Only where the guest is paged (the Wii's
+// MMU with C bits; the host and ppc-be with a frame limit): elsewhere there is no stamp, and the
+// caller compares the bytes.
+// Arms the watch over guest-physical [phys, phys + bytes): a stamp (nonzero) for
+// wl_xb_phys_written, or 0 when the stores to part of it cannot be seen. Touches no guest memory.
+uint32_t wl_xb_phys_watch(uint32_t phys, uint32_t bytes);
+// Whether part of [phys, phys + bytes) may have been written since `stamp` was had (true for 0).
+bool wl_xb_phys_written(uint32_t phys, uint32_t bytes, uint32_t stamp);
+
 // ---- Diagnostics -------------------------------------------------------------------------------
 
 typedef struct {

@@ -83,6 +83,9 @@ TEST lazy_backing(void) {
 #if defined(__linux__) && !defined(__powerpc__)
     ASSERT(after.frames >= before.frames + 200u); // 256 pages touched (qemu-user does not report)
 #endif
+    // no paging, no write watch: the caller compares the bytes
+    ASSERT_EQ(0u, wl_xb_phys_watch(phys, WL_XB_PAGE));
+    ASSERT(wl_xb_phys_written(phys, WL_XB_PAGE, 1u));
     ASSERT_EQ(WL_OK, wl_xb_phys_free(phys));
     ASSERT_EQ(0, wl_xb_rd8(WL_XB_WINDOW | phys)); // freed pages read as zero
     PASS();

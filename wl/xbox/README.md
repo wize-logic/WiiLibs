@@ -186,8 +186,12 @@ over in parts of whole primitives (a strip's parts even, so its winding holds).
   DXT, cube, P8; levels and faces) and converted into GX's formats (wl/codec's exact conversions,
   the rest decoded to RGBA8: A4R4G4B4 keeps its four bits of alpha so a glyph cache's text stays
   smooth; DXT3/5's alpha a separate I4; P8 as C8 with a TLUT; a cube map made into psh's sphere
-  map), kept by (address, format, size, palette) within a budget (4 MiB by default) and checked by a
-  hash of the guest's texels once a frame (every use once found rewritten).
+  map), kept by (address, format, size, palette) within a budget (4 MiB by default) or in an arena
+  of their own (a heap over it: a texture makes room by evicting the least recently drawn; one
+  without room is not tried again in that frame), and checked once a frame (every use once found
+  rewritten): through a write watch where the caller has one (the runtime's MMU: a texture whose
+  pages saw no store is as it was, its texels not read; one whose pages did is hashed, or made
+  again if large), else by a hash of the guest's texels (XXH32's rounds: 32-bit multiplies).
 - **The pipeline** (`nv2a_pipeline.h`) is what the GX backend does on the processor: programs
   compiled and kept, vertices run (or the fixed function's composite matrix), the NV2A's fog modes,
   what psh is told of the textures, each stage's GX coordinates, the GX mappings of the raster state.
@@ -235,6 +239,11 @@ approximated. To look closer: `--efb-after N DIR` writes the EFB after the repla
 `--gx-dump N` prints what GX is handed for its primitive N (projection, viewport, raster state,
 texture maps, the TEV program, the first vertices) and `--gx-textures DIR` writes those maps,
 `--psh-dump N` prints draw N's combiner words and psh's program.
+
+`--textures-mb N` keeps the converted textures in an arena of N MiB as the runtime does, and
+`--watch` checks them through a write watch made from the capture's memory blocks (a page counts as
+stored to when a block changes bytes in it), as the Wii's MMU checks them: with both, a replay
+times the texture cache as the console runs it. The summary line `textures:` gives its counts.
 
 `--programs` writes each vertex program the capture drew with, once, as `tools/xbox_vsh_codegen.c`'s
 input: a title project compiles them ahead of time and hands the table to the GX backend, so its

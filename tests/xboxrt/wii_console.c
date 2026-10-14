@@ -6,7 +6,9 @@
 // emulated through the DSI trampoline and the PowerPC decoder, with live FP state across a thousand
 // of them, and demand paging: 12 MB of pages over 8 MB of frames, zero pages giving their frames
 // back in the DSI's exception context and, when a card is there for the swap file, changed pages
-// written out in batches and read back through the trampoline. Prints "XBRT ok <name>" per check,
+// written out in batches and read back through the trampoline; and the write watch over the MMU's
+// C bits: a store seen (also to a page whose TLB entry had C already: the watch clears it in the
+// table and the TLB), reads and a swap-out and read back not. Prints "XBRT ok <name>" per check,
 // " XBRT FAIL <name>" on a failure, "XBRT skip <name>" for a check that cannot run, and
 // "XBRT DONE pass=<n> fail=<n>" at the end.
 #include <malloc.h>
@@ -209,6 +211,56 @@ int main(void) {
                  (unsigned)pg2.evictions, (unsigned)pg2.clean_evictions, (unsigned)pg2.fast_evictions, (unsigned)pg2.swap_ins,
                  (unsigned)pg2.swap_outs, (unsigned)pg2.swap_writes, (unsigned)(pg2.swap_us / 1000u));
     }
+
+    // the write watch: four pages stored to first (their PTEs and TLB entries have C), then watched
+    uint32_t wphys = 0;
+    check("watch_alloc", wl_xb_phys_alloc(4u * WL_XB_PAGE, 0, 0xFFFFFFFFu, 0, &wphys) == WL_OK);
+    const uint32_t w = WL_XB_WINDOW | wphys;
+    for (uint32_t i = 0; i < 4u; i++) {
+        wl_xb_wr32(w + i * WL_XB_PAGE, 0xD0000000u | i);
+    }
+    uint32_t stamp = wl_xb_phys_watch(wphys, 4u * WL_XB_PAGE);
+    bool reads = stamp != 0;
+    for (uint32_t i = 0; i < 4u; i++) {
+        reads &= wl_xb_rd32(w + i * WL_XB_PAGE) == (0xD0000000u | i);
+    }
+    check("watch_armed", stamp != 0);
+    check("watch_reads_unseen", reads && !wl_xb_phys_written(wphys, 4u * WL_XB_PAGE, stamp));
+    wl_xb_wr32(w + 2u * WL_XB_PAGE + 8u, 1u);
+    check("watch_store_seen", wl_xb_phys_written(wphys + 2u * WL_XB_PAGE, WL_XB_PAGE, stamp) &&
+                                  !wl_xb_phys_written(wphys, 2u * WL_XB_PAGE, stamp) &&
+                                  !wl_xb_phys_written(wphys + 3u * WL_XB_PAGE, WL_XB_PAGE, stamp));
+    // armed again over a page just stored to, and stored to once more (the TLB entry had C)
+    stamp = wl_xb_phys_watch(wphys, 4u * WL_XB_PAGE);
+    bool quiet = !wl_xb_phys_written(wphys, 4u * WL_XB_PAGE, stamp);
+    wl_xb_wr32(w + 2u * WL_XB_PAGE + 12u, 2u);
+    check("watch_store_again", quiet && wl_xb_phys_written(wphys + 2u * WL_XB_PAGE, WL_XB_PAGE, stamp));
+    // a user page stored to through its user EA, watched by its physical page
+    uint32_t uphys = 0;
+    wl_xb_wr32(big + 0x10u, 3u);
+    bool user_ok = wl_xb_va_to_phys(big, &uphys);
+    stamp = wl_xb_phys_watch(uphys, WL_XB_PAGE);
+    user_ok &= !wl_xb_phys_written(uphys, WL_XB_PAGE, stamp);
+    wl_xb_wr32(big + 0x14u, 4u);
+    check("watch_user_ea", user_ok && wl_xb_phys_written(uphys, WL_XB_PAGE, stamp));
+    if (pg1.swap_slots != 0) {
+        // out to the swap file and read back, the pages unchanged: no store; a store before the
+        // swap-out, seen after it
+        stamp = wl_xb_phys_watch(wphys, 4u * WL_XB_PAGE);
+        wl_xb_wr32(w + WL_XB_PAGE + 8u, 5u);
+        for (uint32_t i = 0; i < many; i++) {
+            wl_xb_wr32(big + i * WL_XB_PAGE + 0x80u, i);
+        }
+        bool out = !wl_xb_mem_resident(w) && !wl_xb_mem_resident(w + WL_XB_PAGE);
+        bool back = wl_xb_rd32(w) == 0xD0000000u && wl_xb_rd32(w + WL_XB_PAGE + 8u) == 5u;
+        WL_LOG_I(TAG, "XBRT watch_swap: the watched pages %s", out ? "went to the swap file" : "stayed resident");
+        check("watch_swap", back && !wl_xb_phys_written(wphys, WL_XB_PAGE, stamp) &&
+                                wl_xb_phys_written(wphys + WL_XB_PAGE, WL_XB_PAGE, stamp));
+    } else {
+        WL_LOG_I(TAG, "XBRT skip watch_swap (no card for the swap file)");
+    }
+    stamp = wl_xb_phys_watch(wphys, 4u * WL_XB_PAGE);
+    check("watch_free", wl_xb_phys_free(wphys) == WL_OK && wl_xb_phys_written(wphys, WL_XB_PAGE, stamp));
     check("paging_release", wl_xb_va_release(big, NULL) == WL_OK);
     WL_LOG_I(TAG, "XBRT DONE pass=%d fail=%d", g_pass, g_fail);
     for (;;) {

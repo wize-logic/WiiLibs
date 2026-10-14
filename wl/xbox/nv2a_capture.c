@@ -493,7 +493,22 @@ WlResult wl_nv2a_replay(const uint8_t *data, size_t bytes, const WlNv2aBackend *
                 result = WL_ERR_FORMAT;
                 break;
             }
-            memcpy(memory.bytes + phys, data + at, size);
+            if (hooks != NULL && hooks->memory != NULL) {
+                uint32_t first = 0, last = size;
+
+                while (first < size && memory.bytes[phys + first] == data[at + first]) {
+                    first++;
+                }
+                while (last > first && memory.bytes[phys + last - 1u] == data[at + last - 1u]) {
+                    last--;
+                }
+                memcpy(memory.bytes + phys, data + at, size);
+                if (last > first) {
+                    hooks->memory(hooks->user, phys + first, last - first);
+                }
+            } else {
+                memcpy(memory.bytes + phys, data + at, size);
+            }
             at += size;
             info->blocks++;
             info->block_bytes += size;

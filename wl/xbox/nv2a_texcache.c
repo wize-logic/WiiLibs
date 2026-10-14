@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "wl/base/hash.h"
+#include "wl/xbox/nv2a_capture.h"
 
 #define TAG "nv2a"
 
@@ -28,14 +28,43 @@ void wl_nv2a_texcache_init(WlNv2aTexCache *cache, const WlNv2aTexCacheConfig *cf
     if (cfg != NULL) {
         cache->cfg = *cfg;
     }
-    if (cache->cfg.budget == 0) {
-        cache->cfg.budget = 4u * 1024u * 1024u;
-    }
     if (cache->cfg.alloc == NULL || cache->cfg.release == NULL) {
         cache->cfg.alloc = default_alloc;
         cache->cfg.release = default_release;
     }
+    if (cache->cfg.arena != NULL && cache->cfg.arena_bytes >= 4096u) {
+        wl_heap_init(&cache->heap, cache->cfg.arena, cache->cfg.arena_bytes, "textures");
+        if (cache->cfg.budget == 0 || cache->cfg.budget > cache->heap.size) {
+            cache->cfg.budget = cache->heap.size;
+        }
+    } else {
+        cache->cfg.arena = NULL;
+    }
+    if (cache->cfg.budget == 0) {
+        cache->cfg.budget = 4u * 1024u * 1024u;
+    }
+    if (cache->cfg.watch == NULL || cache->cfg.written == NULL) {
+        cache->cfg.watch = NULL;
+        cache->cfg.written = NULL;
+    }
     cache->frame = 1;
+}
+
+// ---- images -------------------------------------------------------------------------------------
+
+static void *image_alloc(WlNv2aTexCache *cache, size_t bytes) {
+    if (cache->cfg.arena != NULL) {
+        return wl_heap_alloc(&cache->heap, bytes, 32, TAG, 0, 0);
+    }
+    return cache->cfg.alloc(cache->cfg.user, bytes);
+}
+
+static void image_free(WlNv2aTexCache *cache, void *image) {
+    if (cache->cfg.arena != NULL) {
+        wl_heap_free(&cache->heap, image);
+    } else {
+        cache->cfg.release(cache->cfg.user, image);
+    }
 }
 
 static unsigned bucket_of(uint32_t phys, uint32_t format_word) {
@@ -65,7 +94,7 @@ static void link_entry(WlNv2aTexCache *cache, WlNv2aTexEntry *e) {
 // an image the GPU may still read this frame: given back at its end
 static bool release_image(WlNv2aTexCache *cache, void *image, bool used_now) {
     if (!used_now) {
-        cache->cfg.release(cache->cfg.user, image);
+        image_free(cache, image);
         return true;
     }
     if (cache->pending_count == WL_NV2A_TEXCACHE_PENDING) {
@@ -94,7 +123,7 @@ void wl_nv2a_texcache_clear(WlNv2aTexCache *cache) {
     wl_nv2a_texcache_frame_done(cache);
     for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
         if (cache->entries[i].image != NULL) {
-            cache->cfg.release(cache->cfg.user, cache->entries[i].image);
+            image_free(cache, cache->entries[i].image);
         }
         memset(&cache->entries[i], 0, sizeof cache->entries[i]);
     }
@@ -106,8 +135,20 @@ void wl_nv2a_texcache_clear(WlNv2aTexCache *cache) {
 }
 
 void wl_nv2a_texcache_frame_done(WlNv2aTexCache *cache) {
+    size_t drawn = 0;
+    unsigned i;
+
     while (cache->pending_count != 0) {
-        cache->cfg.release(cache->cfg.user, cache->pending[--cache->pending_count]);
+        image_free(cache, cache->pending[--cache->pending_count]);
+    }
+    for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
+        if (cache->entries[i].image != NULL && cache->entries[i].used_frame == cache->frame) {
+            drawn += cache->entries[i].layout.total_bytes;
+        }
+    }
+    cache->stats.frame_bytes = drawn;
+    if (drawn > cache->stats.peak_frame_bytes) {
+        cache->stats.peak_frame_bytes = drawn;
     }
     cache->frame++;
 }
@@ -116,26 +157,113 @@ void wl_nv2a_texcache_stats(const WlNv2aTexCache *cache, WlNv2aTexCacheStats *ou
     *out = cache->stats;
 }
 
+// ---- the check ----------------------------------------------------------------------------------
+
+static inline uint32_t rotl32(uint32_t v, unsigned n) {
+    return (v << n) | (v >> (32u - n));
+}
+
+static inline uint32_t load32(const uint8_t *p) {
+    uint32_t v;
+
+    memcpy(&v, p, 4);
+    return v;
+}
+
+// XXH32's rounds (four lanes of 32-bit multiplies: cheap on a 32-bit processor, where FNV-1a's
+// 64-bit multiply per byte is not), continued from `h`. In the host's byte order: a hash is only
+// compared with one made the same way.
+#define P1 2654435761u
+#define P2 2246822519u
+#define P3 3266489917u
+#define P4 668265263u
+#define P5 374761393u
+static uint64_t hash_update(uint64_t h, const uint8_t *p, size_t bytes) {
+    uint32_t seed = (uint32_t)h ^ (uint32_t)(h >> 32);
+    uint32_t v1 = seed + P1 + P2, v2 = seed + P2, v3 = seed, v4 = seed - P1, acc;
+    const uint8_t *end = p + bytes;
+
+    while ((size_t)(end - p) >= 16u) {
+        v1 = rotl32(v1 + load32(p) * P2, 13) * P1;
+        v2 = rotl32(v2 + load32(p + 4) * P2, 13) * P1;
+        v3 = rotl32(v3 + load32(p + 8) * P2, 13) * P1;
+        v4 = rotl32(v4 + load32(p + 12) * P2, 13) * P1;
+        p += 16;
+    }
+    acc = rotl32(v1, 1) + rotl32(v2, 7) + rotl32(v3, 12) + rotl32(v4, 18) + (uint32_t)bytes;
+    while ((size_t)(end - p) >= 4u) {
+        acc = rotl32(acc + load32(p) * P3, 17) * P4;
+        p += 4;
+    }
+    while (p < end) {
+        acc = rotl32(acc + *p++ * P5, 11) * P1;
+    }
+    acc ^= acc >> 15;
+    acc *= P2;
+    acc ^= acc >> 13;
+    acc *= P3;
+    acc ^= acc >> 16;
+    return (h << 32 | h >> 32) ^ acc;
+}
+
+#define HASH_INIT 0x9E3779B97F4A7C15ull
+
 static uint64_t hash_texels(WlNv2aTexCache *cache, const uint8_t *src, size_t bytes) {
-    uint64_t hash = WL_FNV1A64_INIT;
+    uint64_t hash = HASH_INIT;
 
     cache->stats.hashed++;
     if (bytes <= WL_NV2A_TEXCACHE_FULL_HASH) {
         cache->stats.hashed_bytes += bytes;
-        return wl_fnv1a64_update(hash, src, bytes);
+        return hash_update(hash, src, bytes);
     }
     // the first and last 4 KiB and 64 pieces of 256 bytes between
     {
         size_t step = (bytes - 8192u) / 64u, i;
 
-        hash = wl_fnv1a64_update(hash, src, 4096);
+        hash = hash_update(hash, src, 4096);
         for (i = 0; i < 64; i++) {
-            hash = wl_fnv1a64_update(hash, src + 4096u + i * step, 256);
+            hash = hash_update(hash, src + 4096u + i * step, 256);
         }
-        hash = wl_fnv1a64_update(hash, src + bytes - 4096u, 4096);
+        hash = hash_update(hash, src + bytes - 4096u, 4096);
         cache->stats.hashed_bytes += 8192u + 64u * 256u;
     }
     return hash;
+}
+
+// whether the texture's checks may use the write watch now (a capture must see the texels read)
+static bool watching(const WlNv2aTexCache *cache, const WlNv2a *dev) {
+    return cache->cfg.watch != NULL && !wl_nv2a_capture_active(dev);
+}
+
+// The watch armed over the texture's texels and palette (before they are read): its stamp, 0 when
+// there is none.
+static uint32_t watch_arm(WlNv2aTexCache *cache, const WlNv2aTexture *t) {
+    uint32_t stamp, palette_stamp;
+
+    if (cache->cfg.watch == NULL) {
+        return 0;
+    }
+    stamp = cache->cfg.watch(cache->cfg.user, t->phys, t->total_bytes);
+    if (stamp != 0 && t->palette_entries != 0) {
+        palette_stamp = cache->cfg.watch(cache->cfg.user, t->palette_phys, 4u * t->palette_entries);
+        // (the earlier stamp: whatever was stored to the texels while the palette's was armed counts)
+        stamp = palette_stamp != 0 ? stamp : 0u;
+    }
+    return stamp;
+}
+
+static bool watch_written(WlNv2aTexCache *cache, const WlNv2aTexEntry *e, const WlNv2aTexture *t) {
+    return cache->cfg.written(cache->cfg.user, t->phys, t->total_bytes, e->stamp) ||
+           (t->palette_entries != 0 &&
+            cache->cfg.written(cache->cfg.user, t->palette_phys, 4u * t->palette_entries, e->stamp));
+}
+
+// ---- entries ------------------------------------------------------------------------------------
+
+// The image rectangle only sizes a linear texture: a swizzled one's register may hold anything (the
+// last linear texture's), and is no part of what it is.
+static uint32_t rect_of(const WlNv2aTexture *t) {
+    return t->linear ? t->rect_word : 0u;
 }
 
 static WlNv2aTexEntry *find(WlNv2aTexCache *cache, const WlNv2aTexture *t, bool mipmaps) {
@@ -144,7 +272,7 @@ static WlNv2aTexEntry *find(WlNv2aTexCache *cache, const WlNv2aTexture *t, bool 
     while (link != 0) {
         WlNv2aTexEntry *e = &cache->entries[link - 1];
 
-        if (e->phys == t->phys && e->format_word == t->format_word && e->rect_word == t->rect_word &&
+        if (e->phys == t->phys && e->format_word == t->format_word && e->rect_word == rect_of(t) &&
             e->palette_phys == t->palette_phys && e->mipmaps == (uint8_t)mipmaps) {
             return e;
         }
@@ -153,40 +281,93 @@ static WlNv2aTexEntry *find(WlNv2aTexCache *cache, const WlNv2aTexture *t, bool 
     return NULL;
 }
 
-// a slot for a new entry: a free one, else the least recently drawn (evicted)
-static WlNv2aTexEntry *victim(WlNv2aTexCache *cache) {
-    WlNv2aTexEntry *oldest = NULL;
+// the least recently drawn entry with an image, other than `keep`; with `idle`, only one not drawn
+// in this frame (whose image goes back at once)
+static WlNv2aTexEntry *oldest(WlNv2aTexCache *cache, const WlNv2aTexEntry *keep, bool idle) {
+    WlNv2aTexEntry *found = NULL;
     unsigned i;
 
     for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
         WlNv2aTexEntry *e = &cache->entries[i];
 
-        if (e->image == NULL) {
-            return e;
-        }
-        if (oldest == NULL || e->used_frame < oldest->used_frame) {
-            oldest = e;
+        if (e->image != NULL && e != keep && (!idle || e->used_frame != cache->frame) &&
+            (found == NULL || e->used_frame < found->used_frame)) {
+            found = e;
         }
     }
-    return oldest != NULL && evict(cache, oldest) ? oldest : NULL;
+    return found;
 }
 
-// room for `bytes` more: the least recently drawn go
+// a slot for a new entry: a free one, else the least recently drawn (evicted)
+static WlNv2aTexEntry *victim(WlNv2aTexCache *cache) {
+    WlNv2aTexEntry *e;
+    unsigned i;
+
+    for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
+        if (cache->entries[i].image == NULL) {
+            return &cache->entries[i];
+        }
+    }
+    e = oldest(cache, NULL, false);
+    return e != NULL && evict(cache, e) ? e : NULL;
+}
+
+// room for `bytes` more: the least recently drawn go (in an arena only those not drawn in this
+// frame: an image drawn in it is only given back at its end, so evicting it makes no room now)
 static void make_room(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTexEntry *keep) {
     while (cache->stats.bytes + bytes > cache->cfg.budget) {
-        WlNv2aTexEntry *oldest = NULL;
-        unsigned i;
+        WlNv2aTexEntry *e = oldest(cache, keep, cache->cfg.arena != NULL);
 
-        for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
-            WlNv2aTexEntry *e = &cache->entries[i];
-
-            if (e->image != NULL && e != keep && (oldest == NULL || e->used_frame < oldest->used_frame)) {
-                oldest = e;
-            }
-        }
-        if (oldest == NULL || !evict(cache, oldest)) {
+        if (e == NULL || !evict(cache, e)) {
             return;
         }
+    }
+}
+
+// An image of `bytes`: when the memory has no room, the least recently drawn of the entries not
+// drawn in this frame give theirs back until it has (an image drawn in this frame is only given
+// back at its end). NULL when even that does not make room.
+static void *image_for(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTexEntry *keep) {
+    void *image = image_alloc(cache, bytes);
+
+    while (image == NULL) {
+        WlNv2aTexEntry *e = oldest(cache, keep, true);
+
+        if (e == NULL) {
+            return NULL;
+        }
+        evict(cache, e);
+        image = image_alloc(cache, bytes);
+    }
+    return image;
+}
+
+// a texture that found no memory in this frame: not tried again before the next one
+static bool refused_now(const WlNv2aTexCache *cache, const WlNv2aTexture *t) {
+    unsigned i;
+
+    for (i = 0; i < WL_NV2A_TEXCACHE_REFUSED; i++) {
+        if (cache->refused[i].frame == cache->frame && cache->refused[i].phys == t->phys &&
+            cache->refused[i].format_word == t->format_word && cache->refused[i].rect_word == rect_of(t)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void refuse(WlNv2aTexCache *cache, const WlNv2aTexture *t, size_t bytes) {
+    unsigned i = cache->refused_next++ % WL_NV2A_TEXCACHE_REFUSED;
+
+    cache->refused[i].phys = t->phys;
+    cache->refused[i].format_word = t->format_word;
+    cache->refused[i].rect_word = rect_of(t);
+    cache->refused[i].frame = cache->frame;
+    cache->stats.no_memory++;
+    // (logged now and then: a texture refused once is refused in every frame it is drawn)
+    if (cache->refused_logged == 0 || cache->frame - cache->refused_logged >= 600u) {
+        cache->refused_logged = cache->frame;
+        WL_LOG_W(TAG, "no memory for a texture of %u bytes (%u kept; %u refused so far)", (unsigned)bytes,
+                 (unsigned)cache->stats.bytes, (unsigned)cache->stats.no_memory);
     }
 }
 
@@ -227,18 +408,34 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
                                            bool mipmaps, bool *made) {
     WlNv2aTexEntry *e;
     const uint8_t *src, *palette = NULL;
-    uint64_t hash, palette_hash = 0;
+    uint64_t hash = 0, palette_hash = 0;
+    uint32_t stamp;
     WlNv2aGxLayout layout;
+    bool large;
 
     if (made != NULL) {
         *made = false;
     }
     cache->stats.lookups++;
+    mipmaps = mipmaps && t->levels > 1; // (one level: the same image either way)
     e = find(cache, t, mipmaps);
     if (e != NULL && e->checked_frame == cache->frame && !e->dynamic) {
         e->used_frame = cache->frame;
         cache->stats.hits++;
         return e;
+    }
+    cache->stats.checks++;
+    if (e != NULL && e->stamp != 0 && watching(cache, dev) && !watch_written(cache, e, t)) {
+        // no store to its pages since it was checked: as it was
+        e->checked_frame = cache->frame;
+        e->used_frame = cache->frame;
+        cache->stats.hits++;
+        cache->stats.watched++;
+        return e;
+    }
+    if (e == NULL && refused_now(cache, t)) {
+        cache->stats.failed++;
+        return NULL;
     }
     src = wl_nv2a_phys(dev, t->phys, t->total_bytes);
     if (src == NULL) {
@@ -248,27 +445,39 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     if (t->palette_entries != 0) {
         palette = wl_nv2a_phys(dev, t->palette_phys, 4u * t->palette_entries);
         if (palette != NULL) {
-            palette_hash = wl_fnv1a64(palette, 4u * t->palette_entries);
+            palette_hash = hash_update(HASH_INIT, palette, 4u * t->palette_entries);
         }
     }
-    hash = hash_texels(cache, src, t->total_bytes);
     if (e != NULL) {
+        bool drawn_now = e->used_frame == cache->frame;
+
+        // (the watch armed before the texels are read: a store from here on is seen at the next
+        // check; a large texture under the watch is not hashed, its samples would not see every
+        // store, so a store to its pages has it made again)
+        stamp = watching(cache, dev) ? watch_arm(cache, t) : 0u;
+        large = stamp != 0 && t->total_bytes > WL_NV2A_TEXCACHE_FULL_HASH;
+
         e->checked_frame = cache->frame;
         e->used_frame = cache->frame;
-        if (e->hash == hash && e->palette_hash == palette_hash) {
-            cache->stats.hits++;
-            return e;
+        e->stamp = stamp;
+        if (!large) {
+            hash = hash_texels(cache, src, t->total_bytes);
+            if (e->hash == hash && e->palette_hash == palette_hash) {
+                cache->stats.hits++;
+                return e;
+            }
         }
         // rewritten since: made again, in place when the GPU cannot be reading it yet
         e->hash = hash;
         e->palette_hash = palette_hash;
         e->dynamic = 1;
-        {
-            void *image = cache->cfg.alloc(cache->cfg.user, e->layout.total_bytes);
+        if (drawn_now) {
+            // (the GPU may read the old image in this frame: a new one, the old given back at its end)
+            void *image = image_for(cache, e->layout.total_bytes, e);
 
             if (image == NULL || !release_image(cache, e->image, true)) {
                 if (image != NULL) {
-                    cache->cfg.release(cache->cfg.user, image);
+                    image_free(cache, image);
                 }
                 // (no room to keep the old image for the GPU: converted where it is)
                 image = NULL;
@@ -298,16 +507,20 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
         cache->stats.failed++;
         return NULL;
     }
-    e->image = cache->cfg.alloc(cache->cfg.user, layout.total_bytes);
+    e->image = image_for(cache, layout.total_bytes, NULL);
     if (e->image == NULL) {
-        WL_LOG_W(TAG, "no memory for a texture of %u bytes (%u kept)", (unsigned)layout.total_bytes,
-                 (unsigned)cache->stats.bytes);
+        refuse(cache, t, layout.total_bytes);
         cache->stats.failed++;
         return NULL;
     }
+    stamp = watching(cache, dev) ? watch_arm(cache, t) : 0u;
+    large = stamp != 0 && t->total_bytes > WL_NV2A_TEXCACHE_FULL_HASH;
+    if (!large) {
+        hash = hash_texels(cache, src, t->total_bytes);
+    }
     e->phys = t->phys;
     e->format_word = t->format_word;
-    e->rect_word = t->rect_word;
+    e->rect_word = rect_of(t);
     e->palette_phys = t->palette_phys;
     e->source_bytes = t->total_bytes;
     e->hash = hash;
@@ -320,9 +533,10 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     e->width = (uint16_t)t->width;
     e->height = (uint16_t)t->height;
     e->used_frame = e->checked_frame = cache->frame;
+    e->stamp = stamp;
     e->dynamic = 0;
     if (!convert(cache, e, t, src, palette)) {
-        cache->cfg.release(cache->cfg.user, e->image);
+        image_free(cache, e->image);
         memset(e, 0, sizeof *e);
         cache->stats.failed++;
         return NULL;

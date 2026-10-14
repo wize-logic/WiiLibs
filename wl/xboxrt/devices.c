@@ -265,7 +265,9 @@ WlResult wl_xb_gpu_attach(const WlXbGpuOps *ops, void *gpu) {
 }
 
 #if !defined(WL_XBRT_HAVE_NV2A)
-WlResult wl_xb_gpu_attach_nv2a(void) {
+WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
+    (void)texture_arena;
+    (void)texture_bytes;
     return WL_ERR_UNSUPPORTED;
 }
 #endif

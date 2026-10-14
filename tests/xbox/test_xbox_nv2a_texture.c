@@ -3,7 +3,9 @@
 // DXT, cube and P8 textures: sizes, levels, faces, palettes), textures converted into GX's formats
 // and decoded back to what the NV2A would sample (the codec's exact conversions and the texel
 // decoders of the rest), mip levels, a cube map's sphere map, and the cache: kept, found changed,
-// evicted within its budget.
+// evicted within its budget; checked through a write watch (no texels read while its pages see no
+// store), its images in an arena of its own (room made by evicting, a texture without room not
+// tried again in the frame).
 #include <math.h>
 #include <string.h>
 
@@ -373,6 +375,153 @@ TEST cache_keeps_finds_changes_and_evicts(void) {
     PASS();
 }
 
+// A write watch over the test's guest RAM, as the runtime's MMU gives it: a store is told by hand
+// (w_store), page granular.
+static struct {
+    uint32_t epoch;
+    uint32_t page_epoch[T_RAM / 4096u];
+    unsigned arms, looks;
+} g_w;
+
+static uint32_t w_watch(void *user, uint32_t phys, uint32_t bytes) {
+    (void)user;
+    (void)phys;
+    (void)bytes;
+    g_w.arms++;
+    return g_w.epoch;
+}
+
+static bool w_written(void *user, uint32_t phys, uint32_t bytes, uint32_t stamp) {
+    uint32_t p;
+    (void)user;
+    g_w.looks++;
+    for (p = phys / 4096u; p <= (phys + bytes - 1u) / 4096u; p++) {
+        if (g_w.page_epoch[p] > stamp) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void w_store(TGuest *g, uint32_t phys, uint8_t value) {
+    g->ram[phys] = value;
+    g_w.page_epoch[phys / 4096u] = ++g_w.epoch;
+}
+
+TEST cache_watched_and_in_an_arena(void) {
+    static WlNv2aTexCache cache;
+    static uint8_t arena[4096 + 32];
+    TGuest g;
+    WlNv2aTexCacheConfig cfg;
+    WlNv2aTexture t, big, other[4];
+    WlNv2aTexCacheStats s;
+    const WlNv2aTexEntry *e;
+    bool made;
+    unsigned i;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    memset(&g_w, 0, sizeof g_w);
+    g_w.epoch = 1;
+    for (i = 0; i < 16 * 16 * 4; i++) {
+        g.ram[0x100000 + i] = (uint8_t)i;
+    }
+    // a 16x16 A8R8G8B8 (1 KiB), and a 512x256 one (512 KiB: above the whole hash)
+    set_texture(&g, 0, 0x100000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 4, 4, 1, false));
+    set_texture(&g, 1, 0x200000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 9, 8, 1, false));
+    t_kick(&g);
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 0, &t));
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 1, &big));
+    memset(&cfg, 0, sizeof cfg);
+    cfg.watch = w_watch;
+    cfg.written = w_written;
+    wl_nv2a_texcache_init(&cache, &cfg);
+
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT(made);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(1u, s.hashed);
+    // no store since: the next frames' checks read nothing
+    for (i = 0; i < 3; i++) {
+        wl_nv2a_texcache_frame_done(&cache);
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+        ASSERT_FALSE(made);
+    }
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(1u, s.hashed);
+    ASSERT_EQ(3u, s.watched);
+    // a store that changes a texel: hashed and made again
+    w_store(&g, 0x100010, 0xEE);
+    wl_nv2a_texcache_frame_done(&cache);
+    e = wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made);
+    ASSERT(e != NULL);
+    ASSERT(made);
+    // a store of the same byte (or beside the texture, in its page): hashed, kept
+    w_store(&g, 0x100010, 0xEE);
+    w_store(&g, 0x100800, 0x11);
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) == e);
+    ASSERT_FALSE(made);
+    // ...and from then on the watch again
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) == e);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(3u, s.hashed);
+    ASSERT_EQ(4u, s.watched);
+    ASSERT_EQ(1u, s.reconverted);
+    // the large one is never hashed under the watch: a store to its pages has it made again
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made) != NULL);
+    ASSERT(made);
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made) != NULL);
+    ASSERT_FALSE(made);
+    w_store(&g, 0x200000 + 300000, 0x22); // (one the samples would not see)
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made) != NULL);
+    ASSERT(made);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(3u, s.hashed);
+    ASSERT_EQ(2u, s.reconverted);
+    wl_nv2a_texcache_clear(&cache);
+
+    // an arena with room for three 1 KiB images (each with its heap's 32-byte header)
+    memset(&cfg, 0, sizeof cfg);
+    cfg.arena = arena;
+    cfg.arena_bytes = sizeof arena;
+    wl_nv2a_texcache_init(&cache, &cfg);
+    for (i = 0; i < 4; i++) {
+        other[i] = t;
+        other[i].phys = 0x100000 + 0x1000 * i;
+        other[i].format_word ^= i << 28; // (another key)
+    }
+    // one a frame: the fourth evicts the first, nothing fails
+    for (i = 0; i < 4; i++) {
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made) != NULL);
+        wl_nv2a_texcache_frame_done(&cache);
+    }
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(0u, s.failed);
+    ASSERT(s.evicted >= 1);
+    // all four in one frame: the last one drawn has no room (the others are the GPU's until the
+    // frame ends), and is not tried again in the frame
+    for (i = 0; i < 4; i++) {
+        e = wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made);
+        ASSERT(i < 3 ? e != NULL : e == NULL);
+    }
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[3], false, &made) == NULL);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(1u, s.no_memory);
+    ASSERT_EQ(2u, s.failed);
+    // the next frame it has room again (the least recently drawn goes)
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[3], false, &made) != NULL);
+    ASSERT(made);
+    ASSERT(wl_heap_check(&cache.heap));
+    wl_nv2a_texcache_clear(&cache);
+    ASSERT_EQ(0u, cache.heap.live);
+    t_destroy(&g);
+    PASS();
+}
+
 SUITE(texture_suite) {
     RUN_TEST(stage_registers_decoded);
     RUN_TEST(conversions_sample_as_the_nv2a_would);
@@ -380,6 +529,7 @@ SUITE(texture_suite) {
     RUN_TEST(dxt_and_palettes);
     RUN_TEST(cube_maps_become_sphere_maps);
     RUN_TEST(cache_keeps_finds_changes_and_evicts);
+    RUN_TEST(cache_watched_and_in_an_arena);
 }
 
 GREATEST_MAIN_DEFS();

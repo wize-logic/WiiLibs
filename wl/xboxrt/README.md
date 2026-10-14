@@ -47,10 +47,11 @@ pages (128 for a debug kit); a user page and its window alias are one page of me
 
 ## Demand paging (`paging.c`)
 
-The Wii has ~33 MB of frames for 64 MB of guest RAM (MEM2 and what MEM1 spares beside a 12 MB
-DOL and the host side's `keep_free_bytes`), and a title touches more than that (Halo's menu ~34 MB,
-a level its 22 MB tag cache, 22 MB texture cache and 4 MB sound cache on top). When no frame is free
-one is taken back from a page and the page goes to a swap file, to be read back on its next touch.
+The Wii has ~21 MB of frames for 64 MB of guest RAM (MEM2 and what MEM1 spares beside a 12 MB
+DOL, the host side's `keep_free_bytes` and the GPU's texture arena), and a title touches more than
+that (Halo's menu ~34 MB, a level its 22 MB tag cache, 22 MB texture cache and 4 MB sound cache on
+top). When no frame is free one is taken back from a page and the page goes to a swap file, to be
+read back on its next touch.
 The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV` and `mprotect`.
 
 - **States.** A physical page is *zero* (no frame, no swap slot: never touched, freed, or given up
@@ -105,6 +106,16 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
   reads guest memory (file I/O goes through bounce buffers, GX gets textures and vertices from
   host-side copies, the audio output from a host ring). Pin anything a future backend lets a DMA
   or an unlocked thread read.
+- **The write watch** (`wl_xb_phys_watch`, `wl_xb_phys_written`): whether a range of guest memory
+  was stored to since a stamp, from the same C bits, so that a cache of something made from guest
+  memory (the GPU's converted textures) need not read or hash it again. Each page has a write epoch,
+  set from a global count when a store to it is seen (a C bit harvested anywhere, the host's write
+  fault) or its bytes change otherwise (freed, moved); arming harvests and clears the pages' C bits
+  (with the `tlbie`: the TLB keeps C too) and takes the count; a look harvests and clears them
+  again and compares. A watched page's PTE never carries C ahead of a store, and the host opens a
+  watched page for writing only on a write. A swap-out and read back keep the page's bytes and its
+  epoch. Not where the MMU does not record C, and never for a pinned page on the host (open for
+  writing for good): there the caller compares the bytes.
 - **Statistics.** `WlXbMemStats` (evictions, the clean ones and those made in the fault, swap-ins,
   swap-outs and their write calls, bytes, time in swap I/O, slots), a second `[xbirq] status:` line
   every 10 s when paging, and a `thrashing:` warning when more than 128 pages a second (512 KB/s)
@@ -346,8 +357,9 @@ the address of its variable, and an ordinal with no body a slot whose first call
 
 `wl_xb_boot_run(&cfg)` brings it all up and runs the title: on the Wii `wl_mem` (heaps only: the
 rest stays malloc's), the SD card, the log and the crash screen; the XBE's header; guest memory (the
-Wii's frame pools: the two largest blocks malloc gives, less `keep_free_bytes`; the host's frame
-limit, if any; the swap file `<hard disk folder>/pagefile.sys`); threads; the
+Wii's frame pools: the two largest blocks malloc gives, less `keep_free_bytes` and `texture_bytes`;
+the host's frame limit, if any; the swap file `<hard disk folder>/pagefile.sys`); the converted
+textures' arena (`texture_bytes`, 14 MB; `WL_XB_TEXTURE_MB` on the host); threads; the
 image; the kernel (`wl/xboxkrnl`); the thunks; the MCPX devices and the GPU (wl/xbox's model when
 it is built in, else the stub); the service thread; then the entry point on a guest thread of its
 own. It returns the process's exit code. `wl_xboxrt_main` is a `main`: on the host

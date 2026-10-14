@@ -5,7 +5,8 @@
 // clean pages read back cost no write when they go again, both EAs of a page see one page
 // whatever happened to its frame, pinned pages keep theirs, relocations and frees carry the
 // paging state, accesses across two pages and copies between two buffers larger than the pool
-// work, devices still fault. Built twice: with a swap file, and without one
+// work, devices still fault, and the write watch sees the stores to a range (and only those: not
+// reads, not a swap-out and read back) through either EA. Built twice: with a swap file, and without one
 // (WL_XBRT_PAGING_NO_SWAP), where only zero and clean pages give frames back and a changed page
 // that needs a frame is a guest crash.
 #define _GNU_SOURCE
@@ -126,6 +127,81 @@ TEST zero_pages_go_for_nothing(void) {
     ASSERT(b.fast_evictions - a.fast_evictions >= FRAMES); // the exception-safe path's (the Wii's DSI)
     ASSERT_EQ(a.swap_outs, b.swap_outs);
     ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
+    PASS();
+}
+
+TEST stores_are_watched(void) {
+    up();
+    uint32_t phys = 0;
+    ASSERT_EQ(WL_OK, wl_xb_phys_alloc(4u * PAGE, 0, 0xFFFFFFFFu, 0, &phys));
+    const uint32_t w = WL_XB_WINDOW | phys;
+    fill(w, 4, 9);
+    uint32_t stamp = wl_xb_phys_watch(phys, 4u * PAGE);
+    ASSERT(stamp != 0);
+    ASSERT_FALSE(wl_xb_phys_written(phys, 4u * PAGE, stamp));
+    ASSERT(check(w, 4, 9)); // reads are not stores
+    ASSERT_FALSE(wl_xb_phys_written(phys, 4u * PAGE, stamp));
+    wl_xb_wr32(w + 2u * PAGE + 8u, 1u);
+    ASSERT(wl_xb_phys_written(phys, 4u * PAGE, stamp));
+    ASSERT_FALSE(wl_xb_phys_written(phys, 2u * PAGE, stamp)); // page granular
+    ASSERT(wl_xb_phys_written(phys + 2u * PAGE + 100u, 4u, stamp));
+    ASSERT(wl_xb_phys_written(phys, 4u * PAGE, 0)); // no stamp: written
+    // armed again: nothing until the next store, which a page written before still shows
+    stamp = wl_xb_phys_watch(phys, 4u * PAGE);
+    ASSERT_FALSE(wl_xb_phys_written(phys, 4u * PAGE, stamp));
+    wl_xb_wr32(w + 2u * PAGE + 12u, 2u);
+    ASSERT(wl_xb_phys_written(phys + 2u * PAGE, PAGE, stamp));
+    // and once looked at, a store after the look is still seen
+    stamp = wl_xb_phys_watch(phys, 4u * PAGE);
+    ASSERT_FALSE(wl_xb_phys_written(phys, 4u * PAGE, stamp));
+    wl_xb_wr32(w + 3u * PAGE + 8u, 3u);
+    ASSERT(wl_xb_phys_written(phys, 4u * PAGE, stamp));
+    wl_xb_wr32(w + 3u * PAGE + 12u, 4u);
+    ASSERT(wl_xb_phys_written(phys + 3u * PAGE, 4u, stamp));
+    // a user page, stored to through its user EA, watched through its physical address
+    uint32_t va = alloc(1), uphys = 0;
+    ASSERT(va != 0);
+    ASSERT(wl_xb_va_to_phys(va, &uphys));
+    wl_xb_wr32(va, 5u);
+    stamp = wl_xb_phys_watch(uphys, PAGE);
+    ASSERT_EQ(5u, wl_xb_rd32(WL_XB_WINDOW | uphys));
+    ASSERT_FALSE(wl_xb_phys_written(uphys, PAGE, stamp));
+    wl_xb_wr32(va + 4u, 6u);
+    ASSERT(wl_xb_phys_written(uphys, PAGE, stamp));
+#if !defined(WL_XBRT_PAGING_NO_SWAP)
+    {
+        // out to the swap file and read back: no store
+        stamp = wl_xb_phys_watch(phys, 4u * PAGE);
+        const uint32_t n = 3u * FRAMES;
+        uint32_t junk = alloc(n);
+        ASSERT(junk != 0);
+        fill(junk, n, 10);
+        ASSERT_FALSE(wl_xb_mem_resident(w));
+        ASSERT(check(w, 4, 9));
+        ASSERT_FALSE(wl_xb_phys_written(phys, 4u * PAGE, stamp));
+        // a store, then out to the swap file before the look: seen
+        wl_xb_wr32(w + PAGE + 8u, 7u);
+        fill(junk, n, 11);
+        ASSERT_FALSE(wl_xb_mem_resident(w + PAGE));
+        ASSERT(wl_xb_phys_written(phys + PAGE, PAGE, stamp));
+        ASSERT_FALSE(wl_xb_phys_written(phys, PAGE, stamp));
+        ASSERT_EQ(7u, wl_xb_rd32(w + PAGE + 8u));
+        ASSERT_EQ(WL_OK, wl_xb_va_release(junk, NULL));
+    }
+#endif
+    // a pinned page: the host keeps it open for writing, so it cannot be watched
+    ASSERT_EQ(WL_OK, wl_xb_mem_pin(va, 4u));
+    ASSERT_EQ(0u, wl_xb_phys_watch(uphys, PAGE));
+    wl_xb_mem_unpin(va, 4u);
+    ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
+    // freed: its bytes are zero now, which counts as written
+    stamp = wl_xb_phys_watch(phys, 4u * PAGE);
+    ASSERT(stamp != 0);
+    ASSERT_EQ(WL_OK, wl_xb_phys_free(phys));
+    ASSERT(wl_xb_phys_written(phys, PAGE, stamp));
+    // outside the RAM: no watch
+    ASSERT_EQ(0u, wl_xb_phys_watch(16u << 20, PAGE));
+    ASSERT(wl_xb_phys_written(16u << 20, PAGE, 1u));
     PASS();
 }
 
@@ -352,6 +428,7 @@ TEST changed_pages_need_a_swap_file(void) {
 SUITE(paging) {
     RUN_TEST(paging_is_on);
     RUN_TEST(zero_pages_go_for_nothing);
+    RUN_TEST(stores_are_watched);
 #if !defined(WL_XBRT_PAGING_NO_SWAP)
     RUN_TEST(changed_pages_swap_out_and_back);
     RUN_TEST(clean_pages_read_back_go_for_nothing);

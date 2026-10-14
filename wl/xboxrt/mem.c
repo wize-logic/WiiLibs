@@ -707,6 +707,29 @@ bool wl_xb_mem_resident(uint32_t va) {
     return g_xb_pg_frames == 0 || g_xb_pg_frame[p1 - 1u] != 0; // without paging the OS backs every page
 }
 
+// ---- Write watch -------------------------------------------------------------------------------
+
+// The pages of guest-physical [phys, phys + bytes): false when the range is empty or not RAM.
+static bool phys_pages(uint32_t phys, uint32_t bytes, uint32_t *first, uint32_t *pages) {
+    uint64_t end = (uint64_t)phys + bytes;
+    if (!g_ready || bytes == 0 || end > (uint64_t)g_xb_ram_pages << WL_XB_PAGE_SHIFT) {
+        return false;
+    }
+    *first = phys >> WL_XB_PAGE_SHIFT;
+    *pages = (uint32_t)((end - 1u) >> WL_XB_PAGE_SHIFT) - *first + 1u;
+    return true;
+}
+
+uint32_t wl_xb_phys_watch(uint32_t phys, uint32_t bytes) {
+    uint32_t first, pages;
+    return phys_pages(phys, bytes, &first, &pages) ? wl_xb_pg_watch(first, pages) : 0u;
+}
+
+bool wl_xb_phys_written(uint32_t phys, uint32_t bytes, uint32_t stamp) {
+    uint32_t first, pages;
+    return !phys_pages(phys, bytes, &first, &pages) || wl_xb_pg_written(first, pages, stamp);
+}
+
 void wl_xb_mem_watch(uint32_t swap_ins_per_s) {
     static uint64_t last_us, last_log_us;
     static uint32_t last_ins, last_outs, last_evictions;

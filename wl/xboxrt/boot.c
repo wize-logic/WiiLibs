@@ -32,7 +32,12 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     memset(cfg, 0, sizeof *cfg);
     cfg->xbe_name = "default.xbe";
     cfg->ram_mb = 64;
-    cfg->keep_free_bytes = 20u << 20; // the host side: GX textures converted from the guest's, caches
+    // the host side: caches, buffers, render targets (12 MB: what the 20 MB kept before held beside
+    // 8 MB of textures), and the GX textures converted from the guest's in an arena of their own
+    // (14 MB: a10's opening draws ~11.6 MB of them in each frame; an arena too small for a frame's
+    // textures converts them again in every frame)
+    cfg->keep_free_bytes = 12u << 20;
+    cfg->texture_bytes = 14u << 20;
     cfg->htab_bytes = 256u << 10;
 }
 
@@ -239,14 +244,15 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
             bytes[0] = pool[0] != NULL ? want : 0;
         } else {
             // the two largest blocks the heap gives (MEM2's and what is left of MEM1's), held while
-            // probing, then `keep_free_bytes` given back from the smaller one first
+            // probing, then `keep_free_bytes` and the textures' arena given back from the smaller
+            // one first
             for (unsigned i = 0; i < 2u; i++) {
                 for (uint32_t t = 64u << 20; t >= (1u << 20) && pool[i] == NULL; t -= 1u << 20) {
                     pool[i] = memalign(WL_XB_PAGE, t);
                     bytes[i] = pool[i] != NULL ? t : 0;
                 }
             }
-            uint32_t give = cfg->keep_free_bytes;
+            uint32_t give = cfg->keep_free_bytes + cfg->texture_bytes;
             for (int i = 1; i >= 0 && give != 0; i--) {
                 if (pool[i] == NULL) {
                     continue;
@@ -272,6 +278,29 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
         }
     }
 #endif
+    // the GPU's converted textures: an arena of their own, had now, while the heap's free memory is
+    // still in one piece (the Wii: what the frame pools gave back for it)
+    uint32_t texture_bytes = cfg->texture_bytes;
+#if !defined(__wii__)
+    {
+        const char *mb = getenv("WL_XB_TEXTURE_MB"); // the Wii's arena on the host
+        if (mb != NULL && mb[0] != '\0') {
+            texture_bytes = (uint32_t)strtoul(mb, NULL, 10) << 20;
+        }
+    }
+#endif
+    texture_bytes &= ~31u;
+    void *texture_arena = NULL;
+    if (!cfg->gpu_stub && texture_bytes != 0) {
+#if defined(__wii__)
+        texture_arena = memalign(32, texture_bytes);
+#else
+        texture_arena = aligned_alloc(32, texture_bytes);
+#endif
+        if (texture_arena == NULL) {
+            WL_LOG_W(TAG, "no %u KB for the textures' arena: they share the heap", (unsigned)(texture_bytes >> 10));
+        }
+    }
     r = wl_xb_mem_init(&mc);
     if (r == WL_OK) {
         r = wl_xb_fault_install();
@@ -345,7 +374,7 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     if (r != WL_OK && r != WL_ERR_UNSUPPORTED) {
         WL_LOG_W(TAG, "audio: %s (the title runs silent)", wl_result_name(r));
     }
-    bool real_gpu = !cfg->gpu_stub && wl_xb_gpu_attach_nv2a() == WL_OK;
+    bool real_gpu = !cfg->gpu_stub && wl_xb_gpu_attach_nv2a(texture_arena, texture_bytes) == WL_OK;
     if (!real_gpu) {
         WlXbGpuStub *stub = wl_xb_gpu_stub_create();
         if (stub != NULL) {

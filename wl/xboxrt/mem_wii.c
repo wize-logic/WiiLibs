@@ -164,11 +164,19 @@ static inline uint8_t bits_flags(uint32_t w1) {
     return (uint8_t)(((w1 & PTE_R) != 0 && g_hw_ref ? WL_XB_PG_REF : 0u) | ((w1 & PTE_C) != 0 ? WL_XB_PG_DIRTY : 0u));
 }
 
+// A valid PTE's R and C bits into page `p`'s flags; a C bit is a store seen (the write watch).
+static inline void take_bits(uint32_t p, uint32_t w1) {
+    g_xb_pg_flags[p] |= bits_flags(w1);
+    if ((w1 & PTE_C) != 0) {
+        wl_xb_pg_wrote(p);
+    }
+}
+
 // A valid PTE's R and C bits into its page's flags.
 static void harvest_bits(uint32_t ea, uint32_t w1) {
     uint32_t p1 = phys_of(ea);
     if (p1 != 0) {
-        g_xb_pg_flags[p1 - 1u] |= bits_flags(w1);
+        take_bits(p1 - 1u, w1);
     }
 }
 
@@ -213,13 +221,15 @@ static void pte_insert(uint32_t ea, uint32_t frame, uint32_t p, uint32_t rc) {
 }
 
 // The PTE for a touch of page `p` at `ea`: R set (it is being used now), C when the page is known
-// changed (no table search for its first store) or the hardware does not record C (the page then
-// counts as changed from now on).
+// changed (no table search for its first store) and no write watch covers it, or the hardware does
+// not record C (the page then counts as changed from now on).
 static void pte_map(uint32_t ea, uint32_t frame, uint32_t p) {
     if (!g_hw_changed) {
         g_xb_pg_flags[p] |= WL_XB_PG_DIRTY;
     }
-    pte_insert(ea & ~(WL_XB_PAGE - 1u), frame, p, PTE_R | ((g_xb_pg_flags[p] & WL_XB_PG_DIRTY) != 0 ? PTE_C : 0u));
+    uint8_t fl = g_xb_pg_flags[p];
+    bool c = (fl & WL_XB_PG_DIRTY) != 0 && ((fl & WL_XB_PG_WATCH) == 0 || !g_hw_changed);
+    pte_insert(ea & ~(WL_XB_PAGE - 1u), frame, p, PTE_R | (c ? PTE_C : 0u));
     g_xb_pg_flags[p] |= WL_XB_PG_REF;
 }
 
@@ -240,7 +250,7 @@ void wl_xb_mmu_harvest(uint32_t p, bool clear_ref) {
             continue;
         }
         uint32_t w1 = w0p[1];
-        g_xb_pg_flags[p] |= bits_flags(w1);
+        take_bits(p, w1);
         if (drop) {
             // no R from the hardware: "used" is a fault since the last pass, so the PTE goes
             pte_drop(w0p, pte_ea(*w0p, pteg_index(w0p)));
@@ -252,6 +262,28 @@ void wl_xb_mmu_harvest(uint32_t p, bool clear_ref) {
             tlbie(pte_ea(*w0p, pteg_index(w0p)));
         }
     }
+}
+
+bool wl_xb_mmu_watch(uint32_t p) {
+    if (!g_hw_changed) {
+        return false;
+    }
+    for (uint32_t a = 0; a < 2u; a++) {
+        volatile uint32_t *w0p = pte_of(p, a);
+        if (w0p == NULL) {
+            continue;
+        }
+        uint32_t w1 = w0p[1];
+        if ((w1 & PTE_C) != 0) {
+            // C taken and cleared in the table, and the TLB entry dropped: the TLB keeps C too, and
+            // a store only searches the table to set it when the TLB entry has it clear
+            take_bits(p, w1);
+            w0p[1] = w1 & ~PTE_C;
+            __asm__ volatile("sync" ::: "memory");
+            tlbie(pte_ea(*w0p, pteg_index(w0p)));
+        }
+    }
+    return true;
 }
 
 void wl_xb_mmu_unmap(uint32_t p) {
