@@ -97,6 +97,36 @@ void wl_gx_direct_vertex(const WlGxDirectVertex *vertex) {
     }
 }
 
+void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
+    WlGxDirectVertex v;
+    uint32_t i = 3, n;
+
+    // (the words back into a vertex, by the layout, as the FIFO would read them)
+    memset(&v, 0, sizeof v);
+    if (count < 3) {
+        return;
+    }
+    memcpy(v.position, words, sizeof v.position);
+    for (n = 0; n < s.layout.colors && n < 2 && i < count; n++, i++) {
+        v.color[n][0] = (uint8_t)(words[i] >> 24);
+        v.color[n][1] = (uint8_t)(words[i] >> 16);
+        v.color[n][2] = (uint8_t)(words[i] >> 8);
+        v.color[n][3] = (uint8_t)words[i];
+    }
+    for (n = 0; n < 8; n++) {
+        if (!(s.layout.texcoords & (1u << n))) {
+            continue;
+        }
+        if (i < count) {
+            memcpy(&v.texcoord[n][0], &words[i++], sizeof(float));
+        }
+        if (!(s.layout.texcoord_s & (1u << n)) && i < count) {
+            memcpy(&v.texcoord[n][1], &words[i++], sizeof(float));
+        }
+    }
+    wl_gx_direct_vertex(&v);
+}
+
 void wl_gx_direct_primitive_end(void) {
     if (!g_in_primitive) {
         return;

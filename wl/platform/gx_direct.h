@@ -74,6 +74,10 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout);
 void wl_gx_direct_draw(WlGxDirectPrim prim, const WlGxDirectVertex *vertices, uint32_t count);
 void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count);
 void wl_gx_direct_vertex(const WlGxDirectVertex *vertex);
+// The same vertex as the FIFO takes it in the layout set: `count` words, the position's three floats,
+// each colour as 0xRRGGBBAA, each texture coordinate's one or two floats (a float as its bits), in
+// that order. On the Wii the words go into the FIFO as they are, without the layout's tests.
+void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count);
 void wl_gx_direct_primitive_end(void);
 // A raster state change (an EFB copy, a token, a draw-done): the next draw is flushed first.
 void wl_gx_direct_flush_after(void);

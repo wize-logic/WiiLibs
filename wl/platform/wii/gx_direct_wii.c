@@ -144,6 +144,16 @@ void wl_gx_direct_vertex(const WlGxDirectVertex *vertex) {
     }
 }
 
+void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
+    uint32_t i;
+
+    if (d.in_primitive) {
+        for (i = 0; i < count; i++) {
+            wgPipe->U32 = words[i];
+        }
+    }
+}
+
 void wl_gx_direct_primitive_end(void) {
     if (d.in_primitive) {
         GX_End();
