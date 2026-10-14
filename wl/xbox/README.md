@@ -145,7 +145,9 @@ time (the guest lock); backend callbacks run inside the MMIO write that kicked t
   GET to PUT before it returns, then GET = PUT: method headers increasing and non-increasing, old
   and new jumps, one level of call and return (envytools' "PFIFO DMA pusher"); a header's words may
   span kicks. Direct3D's start-up handshake works as on the hardware: GET starts at 0, a jump at
-  physical 0 takes it to the push buffer, and GET is then PUT.
+  physical 0 takes it to the push buffer, and GET is then PUT. The rest of a header's run to the 3D
+  object goes to the state tracker at once (`wl_nv2a_kelvin_methods`: a run of ARRAY_ELEMENT16/32
+  indices straight into the batch), each word what the puller would make of it.
 - **The puller** binds objects to subchannels by handle (RAMHT, searched whole), handles its own
   methods (the reference counter, NV1A semaphores: an acquire whose value is not there is counted
   and passed, as a synchronous GPU has nothing to wait for), looks up the handles of methods

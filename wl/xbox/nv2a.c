@@ -311,6 +311,17 @@ static void pusher_error(WlNv2a *dev, unsigned chid, uint32_t at, uint32_t word,
     }
 }
 
+// whether a run of words to this method may go to the 3D object at once: the 3D class's own methods
+// (not the puller's, an object handle the puller looks up, or the trap's NO_OPERATION), a run that
+// stays among them
+static bool bulk_method(const WlNv2aChannel *ch, unsigned subchannel, uint32_t method) {
+    return ch->subchannel_class[subchannel] == WL_NV2A_CLASS_KELVIN && method >= 0x100u &&
+           method != WL_NV2A_K_NO_OPERATION &&
+           !(method >= WL_NV2A_PULLER_HANDLE_FIRST && method <= WL_NV2A_PULLER_HANDLE_LAST) &&
+           (ch->non_increasing || method + 4u * ch->count <= WL_NV2A_PULLER_HANDLE_FIRST ||
+            method > WL_NV2A_PULLER_HANDLE_LAST);
+}
+
 static void run_channel(WlNv2a *dev, unsigned chid) {
     WlNv2aChannel *ch = &dev->channels[chid];
     uint32_t words = 0;
@@ -353,8 +364,32 @@ static void run_channel(WlNv2a *dev, unsigned chid) {
                 break;
             }
             if (ch->count != 0) {
-                uint32_t method = ch->method;
+                uint32_t method = ch->method, run;
 
+                // (the rest of a header's run to the 3D object at once, as far as this span, PUT and
+                // the word limit allow: each word what the puller makes of it, without the pusher's and
+                // the puller's tests for each)
+                run = (span - i) / 4u;
+                if (ch->put >= at && (ch->put - at) / 4u < run) {
+                    run = (ch->put - at) / 4u;
+                }
+                run = run < ch->count ? run : ch->count;
+                if (run > WL_NV2A_KICK_WORD_LIMIT - (words - 1u)) {
+                    run = WL_NV2A_KICK_WORD_LIMIT - (words - 1u);
+                }
+                if (run >= 2 && bulk_method(ch, ch->subchannel, method)) {
+                    ch->get = at + 4u * run;
+                    dev->stats.words += run - 1u;
+                    dev->stats.methods += run;
+                    words += run - 1u;
+                    ch->count -= run;
+                    if (!ch->non_increasing) {
+                        ch->method += 4u * run;
+                    }
+                    wl_nv2a_kelvin_methods(dev, method, !ch->non_increasing, p + i, run);
+                    i += 4u * (run - 1u);
+                    continue;
+                }
                 if (!ch->non_increasing) {
                     ch->method += 4;
                 }

@@ -475,6 +475,11 @@ void wl_nv2a_kelvin_init(WlNv2a *dev) {
     k->dirty = WL_NV2A_DIRTY_ALL;
 }
 
+// what each method is, decided once (the dispatch's tests per method, from a table): known, an
+// immediate vertex method, and its dirty group
+enum { METHOD_KNOWN = 0x8000u, METHOD_IMMEDIATE = 0x4000u, METHOD_DIRTY = 0x3FFFu };
+static uint16_t g_method_info[WL_NV2A_K_METHODS / 4];
+
 static uint32_t dirty_group(uint32_t method) {
     if (method >= 0x200 && method <= 0x214) {
         return WL_NV2A_DIRTY_SURFACE;
@@ -506,6 +511,17 @@ static bool known_method(uint32_t m) {
            (m >= 0x1710 && m <= 0x17D0) || (m >= 0x17E0 && m <= 0x1818) || m == 0x181C || m == 0x1820 ||
            m == 0x1824 || (m >= 0x1880 && m <= 0x1AFC) || (m >= 0x1B00 && m <= 0x1BFC) ||
            (m >= 0x1D6C && m <= 0x1D9C) || (m >= 0x1E20 && m <= 0x1EA4);
+}
+
+static bool immediate_range(uint32_t method);
+
+static void method_info_make(void) {
+    uint32_t m;
+
+    for (m = 0; m < WL_NV2A_K_METHODS; m += 4) {
+        g_method_info[m >> 2] = (uint16_t)((known_method(m) ? METHOD_KNOWN : 0u) |
+                                           (immediate_range(m) ? METHOD_IMMEDIATE : 0u) | dirty_group(m));
+    }
 }
 
 static void note_unhandled(WlNv2a *dev, uint32_t method, uint32_t param) {
@@ -1114,9 +1130,15 @@ static bool immediate_range(uint32_t method) {
 
 void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     WlNv2aKelvin *k = &dev->kelvin;
+    uint32_t info;
 
     method &= WL_NV2A_K_METHODS - 4u;
-    if (!known_method(method)) {
+    info = g_method_info[method >> 2];
+    if (info == 0) {
+        method_info_make();
+        info = g_method_info[method >> 2];
+    }
+    if (!(info & METHOD_KNOWN)) {
         note_unhandled(dev, method, param);
     }
 
@@ -1151,7 +1173,7 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     }
 
     k->raw[method >> 2] = param;
-    if (immediate_range(method)) {
+    if (info & METHOD_IMMEDIATE) {
         immediate_method(dev, method, param);
         return;
     }
@@ -1261,8 +1283,35 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
             k->constants_generation++;
             k->dirty |= WL_NV2A_DIRTY_VIEWPORT | WL_NV2A_DIRTY_CONSTANTS;
         } else {
-            k->dirty |= dirty_group(method);
+            k->dirty |= info & METHOD_DIRTY;
         }
         break;
+    }
+}
+
+void wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const uint8_t *words, uint32_t count) {
+    WlNv2aKelvin *k = &dev->kelvin;
+    uint32_t n;
+
+    method &= WL_NV2A_K_METHODS - 4u;
+    // (a run of indices into one begin/end: each word what wl_nv2a_kelvin_method makes of it, without
+    // its dispatch)
+    if (!increasing && (method == WL_NV2A_K_ARRAY_ELEMENT16 || method == WL_NV2A_K_ARRAY_ELEMENT32) &&
+        k->primitive != 0 && batch_open(dev, WL_NV2A_SOURCE_ARRAYS)) {
+        for (n = 0; n < count; n++) {
+            uint32_t param = wl_rd_le32(words + 4u * n);
+
+            k->raw[method >> 2] = param;
+            if (method == WL_NV2A_K_ARRAY_ELEMENT16) {
+                batch_index(dev, param & 0xFFFFu);
+                batch_index(dev, param >> 16);
+            } else {
+                batch_index(dev, param);
+            }
+        }
+        return;
+    }
+    for (n = 0; n < count; n++) {
+        wl_nv2a_kelvin_method(dev, increasing ? method + 4u * n : method, wl_rd_le32(words + 4u * n));
     }
 }
