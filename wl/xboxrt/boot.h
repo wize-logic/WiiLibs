@@ -35,8 +35,8 @@ typedef struct {
                                  // back every page; else a frame limit paged as the Wii pages
                                  // (WL_XB_FRAME_MB or WL_XB_FRAME_KB in the environment win)
     uint32_t keep_free_bytes;    // the Wii: the host side's memory besides the textures' arena,
-                                 // 12 MB by default (demand paging covers the guest)
-    uint32_t texture_bytes;      // the GPU's converted textures: an arena of their own (14 MB by
+                                 // 14 MB by default (demand paging covers the guest)
+    uint32_t texture_bytes;      // the GPU's converted textures: an arena of their own (13 MB by
                                  // default; the Wii takes it from the frames, beside
                                  // keep_free_bytes; the host: WL_XB_TEXTURE_MB wins)
     uint32_t htab_bytes;         // the Wii's page table: 256 KB by default

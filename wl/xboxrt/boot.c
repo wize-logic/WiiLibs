@@ -36,8 +36,8 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     // 8 MB of textures), and the GX textures converted from the guest's in an arena of their own
     // (14 MB: a10's opening draws ~11.6 MB of them in each frame; an arena too small for a frame's
     // textures converts them again in every frame)
-    cfg->keep_free_bytes = 12u << 20;
-    cfg->texture_bytes = 14u << 20;
+    cfg->keep_free_bytes = 14u << 20;
+    cfg->texture_bytes = 13u << 20; // a10 draws at most 11.6 MB of them in a frame
     cfg->htab_bytes = 256u << 10;
 }
 
