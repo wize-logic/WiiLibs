@@ -5,6 +5,7 @@ __pycache__/
 # Local tooling and editor state
 .claude/
 CLAUDE.md
+AGENTS.md
 .vscode/
 .idea/
 *.swp
