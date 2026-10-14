@@ -84,6 +84,9 @@ typedef struct {
     uint32_t bad_memory;     // guest-physical reads outside RAM (each skipped)
     uint32_t clipped;        // output samples clipped
     uint32_t list_loops;     // voice lists cut after 256 voices
+    // the voice the last idle-voice trap named, and the traps in a row that named it (the guest's
+    // handler answered without taking it out of its list)
+    uint32_t trap_voice, trap_repeats;
 } WlXboxApuStats;
 void wl_xbox_apu_stats(const WlXboxApu *apu, WlXboxApuStats *out);
 

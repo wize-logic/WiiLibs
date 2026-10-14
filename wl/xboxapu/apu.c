@@ -176,6 +176,8 @@ void wl_apu_idle_voice(WlXboxApu *apu, uint32_t v) {
     raise(apu, WL_APU_IRQ_FE_TRAP);
     apu->trap_pending = true;
     apu->stats.traps++;
+    apu->stats.trap_repeats = apu->stats.trap_voice == v ? apu->stats.trap_repeats + 1u : 1u;
+    apu->stats.trap_voice = v;
 }
 
 // ---- Front end methods -------------------------------------------------------------------------

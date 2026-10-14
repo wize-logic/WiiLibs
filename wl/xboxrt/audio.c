@@ -257,6 +257,22 @@ void wl_xb_audio_log_status(void) {
              (unsigned)s.notifies, (unsigned)s.traps, (unsigned)s.gp_commands,
              (unsigned)s.stream_starved, (unsigned)s.clipped, (unsigned)s.bad_memory,
              (unsigned)g_underruns, (unsigned)a.buffers_done[0], (unsigned)a.buffers_done[1]);
+    if (s.trap_repeats >= 16u) {
+        // an idle voice the guest's handler leaves in its list: what its record says
+        const uint32_t vpv = wl_xbox_apu_read(g_apu, 0x202Cu, 4);
+        const uint8_t *rec = vpv != 0 ? phys_ptr(NULL, vpv + s.trap_voice * 0x80u, 0x80u) : NULL;
+        if (rec != NULL) {
+            WL_LOG_W(TAG,
+                     "idle voice %u trapped %u times in a row: fmt %08x state %08x link %08x cbo "
+                     "%08x ebo %08x; lists %04x %04x %04x",
+                     (unsigned)s.trap_voice, (unsigned)s.trap_repeats, (unsigned)wl_rd_le32(rec + 4),
+                     (unsigned)wl_rd_le32(rec + 0x54), (unsigned)wl_rd_le32(rec + 0x7C),
+                     (unsigned)wl_rd_le32(rec + 0x58), (unsigned)wl_rd_le32(rec + 0x5C),
+                     (unsigned)wl_xbox_apu_read(g_apu, 0x2054u, 4),
+                     (unsigned)wl_xbox_apu_read(g_apu, 0x2060u, 4),
+                     (unsigned)wl_xbox_apu_read(g_apu, 0x206Cu, 4));
+        }
+    }
 }
 
 // ---- Setup -------------------------------------------------------------------------------------
