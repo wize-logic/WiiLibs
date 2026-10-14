@@ -30,7 +30,8 @@
 //               lands in it (the blocks are what the title wrote, as the capture read it)
 //   --bench N   the capture replayed N times through the GX backend alone (no software GX, no
 //               recorder): the processor's part of the frames, timed (the best run and the mean,
-//               a frame), for measuring the vertex path and the translation
+//               a frame), and the best run's parts: the model's (pusher, puller, 3D state), the
+//               backend's draws, its clears and frames, the memory records put in
 //   --stream    the replay through wl_nv2a_replay_stream, as the runtime's capture bench makes it
 //               (wl/xboxrt/bench.h): the capture read a piece at a time (of an odd size, so records
 //               straddle the pieces), into a guest memory given as the caller's, written a 4 KB
@@ -505,35 +506,94 @@ static double seconds_now(void) {
     return (double)t.tv_sec + (double)t.tv_nsec * 1.0e-9;
 }
 
+// (the bench's clock in microseconds, and the backend's calls timed: what is left is the model's)
+static uint64_t micros_now(void *user) {
+    (void)user;
+    return (uint64_t)(seconds_now() * 1.0e6);
+}
+
+static struct {
+    WlNv2aBackend inner;
+    double draws, others;
+} g_timed;
+
+static uint32_t timed_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
+    double t0 = seconds_now();
+    uint32_t pixels = g_timed.inner.draw(g_timed.inner.user, k, draw);
+
+    (void)user;
+    g_timed.draws += seconds_now() - t0;
+    return pixels;
+}
+
+static void timed_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
+    double t0 = seconds_now();
+
+    (void)user;
+    g_timed.inner.clear(g_timed.inner.user, k, flags);
+    g_timed.others += seconds_now() - t0;
+}
+
+static void timed_frame(void *user, const WlNv2aKelvin *k) {
+    double t0 = seconds_now();
+
+    (void)user;
+    g_timed.inner.frame_done(g_timed.inner.user, k);
+    g_timed.others += seconds_now() - t0;
+}
+
+static void timed_flip(void *user, const WlNv2aKelvin *k, uint32_t phys) {
+    double t0 = seconds_now();
+
+    (void)user;
+    g_timed.inner.flip(g_timed.inner.user, k, phys);
+    g_timed.others += seconds_now() - t0;
+}
+
 static int bench(const uint8_t *data, size_t size, unsigned runs) {
     WlNv2aBackend backend;
     WlNv2aReplayHooks hooks;
     WlNv2aReplayInfo info;
-    double best = 0.0, total = 0.0;
+    double best = 0.0, total = 0.0, best_draws = 0.0, best_others = 0.0, best_memory = 0.0;
     unsigned run, frames = 0;
 
     if (wl_gx_init() != WL_OK || (g_gx = wl_nv2a_gx_create(gx_config())) == NULL) {
         fprintf(stderr, "no memory for the GX backend\n");
         return 1;
     }
-    wl_nv2a_gx_backend(g_gx, &backend);
+    wl_nv2a_gx_backend(g_gx, &g_timed.inner);
+    memset(&backend, 0, sizeof backend);
+    backend.draw = timed_draw;
+    backend.clear = timed_clear;
+    backend.frame_done = timed_frame;
+    backend.flip = timed_flip;
     memset(&hooks, 0, sizeof hooks);
     hooks.created = on_created;
+    hooks.clock = micros_now;
     for (run = 0; run < runs; run++) {
         double start = seconds_now(), took;
 
+        g_timed.draws = g_timed.others = 0.0;
         if (replay(data, size, &backend, &hooks, &info) != WL_OK) {
             fprintf(stderr, "the replay failed\n");
             return 1;
         }
         took = seconds_now() - start;
-        best = run == 0 || took < best ? took : best;
+        if (run == 0 || took < best) {
+            best = took;
+            best_draws = g_timed.draws;
+            best_others = g_timed.others;
+            best_memory = (double)info.memory_time * 1.0e-6;
+        }
         total += took;
         frames = info.stats.frames != 0 ? info.stats.frames : 1u;
     }
     printf("bench: %u runs of %u frames (%u draws, %u vertices): best %.3f ms a frame, mean %.3f ms a frame\n",
            runs, frames, (unsigned)info.stats.draws, (unsigned)info.stats.vertices, best * 1000.0 / frames,
            total * 1000.0 / runs / frames);
+    printf("bench: the best run a frame: pusher %.3f ms, draws %.3f, clears and frames %.3f, memory records %.3f\n",
+           (best - best_draws - best_others - best_memory) * 1000.0 / frames, best_draws * 1000.0 / frames,
+           best_others * 1000.0 / frames, best_memory * 1000.0 / frames);
     wl_nv2a_gx_destroy(g_gx);
     return 0;
 }

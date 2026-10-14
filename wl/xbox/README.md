@@ -284,8 +284,10 @@ programs run as functions rather than through the interpreter.
 
 `--bench N` replays the capture N times through the GX backend alone (no software GX, no recorder;
 the textures kept from one run to the next) and prints the best and the mean time a frame: the
-vertex programs, the fetch, the translation, what the Wii's processor does for a frame. The same on
-the console: wl/xboxrt's capture bench (`replay:<file> <runs>` in a title's `play.cfg`).
+vertex programs, the fetch, the translation, what the Wii's processor does for a frame; and the best
+run's parts: the model's own (pusher, puller, state tracker), the backend's draws, its clears and
+frames, the memory records put in. The same on the console: wl/xboxrt's capture bench
+(`replay:<file> <runs>` in a title's `play.cfg`).
 
 `--stream` replays through `wl_nv2a_replay_stream`, the capture read in odd-sized pieces into a guest
 memory given as the caller's; the output is the same (the test `xbox_nv2a_replay_stream`).
