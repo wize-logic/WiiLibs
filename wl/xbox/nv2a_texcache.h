@@ -104,6 +104,9 @@ typedef struct WlNv2aTexCache {
 } WlNv2aTexCache;
 
 // An empty cache (the caller's: it is large) with its configuration (NULL: the defaults).
+// the hash the texels are checked by (XXH32's rounds, in the host's byte order), continued from
+// `hash`: the vertex cache's too
+uint64_t wl_nv2a_texcache_hash(uint64_t hash, const uint8_t *bytes, size_t count);
 void wl_nv2a_texcache_init(WlNv2aTexCache *cache, const WlNv2aTexCacheConfig *cfg);
 // Gives every image back (the GPU must be done with them).
 void wl_nv2a_texcache_clear(WlNv2aTexCache *cache);

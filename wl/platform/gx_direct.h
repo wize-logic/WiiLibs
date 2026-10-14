@@ -12,6 +12,11 @@
 // first wl_gx_direct_draw after wl_gx_direct_begin or wl_gx_direct_flush_after is preceded by a strip
 // of eight vertices of zeros in its own format, which are one point and draw nothing.
 //
+// Indexed attributes. An attribute the layout marks indexed is not sent with each vertex but read by
+// GX from an array (wl_gx_direct_array) at a 16-bit index the vertex sends in its place
+// (wl_gx_direct_vertex_index): geometry converted once and kept (wl/xbox's vertex cache) costs the
+// processor two bytes an attribute a vertex.
+//
 // The Wii backend is wii/gx_direct_wii.c; the host's (host/gx_direct_host.c) records what was asked
 // (host/gx_direct_host.h).
 #pragma once
@@ -65,7 +70,14 @@ typedef struct WlGxDirectLayout {
     // bit n: texture coordinate n is not sent but made by the transform unit from the position
     // (wl_gx_direct_texgen with WL_GX_DIRECT_TG_POSITION)
     uint8_t texcoords_generated;
+    // the attributes read from arrays at the vertex's index (bit WL_GX_DIRECT_ARRAY_*: the position,
+    // a colour, a texture coordinate the layout has), the others sent
+    uint16_t indexed;
 } WlGxDirectLayout;
+
+// an indexed attribute (WlGxDirectLayout.indexed's bit, wl_gx_direct_array's attribute): the
+// position, colour c (WL_GX_DIRECT_ARRAY_COLOR0 + c), texture coordinate n (..._TEXCOORD0 + n)
+enum { WL_GX_DIRECT_ARRAY_POSITION = 0, WL_GX_DIRECT_ARRAY_COLOR0 = 1, WL_GX_DIRECT_ARRAY_TEXCOORD0 = 3 };
 
 // what a texture coordinate is generated from (wl_gx_direct_texgen)
 typedef enum {
@@ -88,6 +100,18 @@ void wl_gx_direct_vertex(const WlGxDirectVertex *vertex);
 // that order. On the Wii the words go into the FIFO as they are, without the layout's tests.
 void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count);
 void wl_gx_direct_primitive_end(void);
+// An indexed attribute's array (WL_GX_DIRECT_ARRAY_*), for the vertices that follow: element i at
+// data + i * stride, in memory the GPU reads (32-byte aligned, written back from the cache). Its
+// elements as the FIFO would take the attribute: the position three big-endian floats, a colour
+// its bytes r, g, b, a, a texture coordinate its one or two big-endian floats. Set it after the
+// layout.
+void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride);
+// A vertex of the layout set with indexed attributes: `index` (into every array) for each of them,
+// `count` words for the others, as wl_gx_direct_vertex_words takes them (the attributes the layout
+// sends, in its order, the indexed ones left out).
+void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t count);
+// Memory an array was read from has changed: GX's vertex cache emptied.
+void wl_gx_direct_arrays_changed(void);
 // A raster state change (an EFB copy, a token, a draw-done): the next draw is flushed first.
 void wl_gx_direct_flush_after(void);
 // Whether the flush is sent (on by default).

@@ -33,14 +33,23 @@ static inline float wl_xbox_vsh_reciprocal_clamped(float x) {
 }
 
 /* ARL's index, (int)floorf(x) without floorf's call: the same for every x a
-float's whole part fits in an int, floorf's past that */
+float's whole part fits in an int, floorf's past that. Below 2^23 the whole
+number is found in floats (x moved to where a float's step is 1, rounded there,
+moved back, then 1 less if it rounded up), so the only conversion is the last
+one to an int (on PowerPC, without a second trip through memory back to a
+float); from 2^23 on every float is whole. */
 static inline int wl_xbox_vsh_floor_index(float x) {
-    int whole;
+    float whole;
 
-    if (!(x > -2147483648.0f && x < 2147483648.0f))
-        return (int)floorf(x);
-    whole = (int)x;
-    return (float)whole > x ? whole - 1 : whole;
+    if (!(x > -8388608.0f && x < 8388608.0f)) {
+        if (!(x > -2147483648.0f && x < 2147483648.0f))
+            return (int)floorf(x);
+        return (int)x;
+    }
+    whole = x >= 0.0f ? (x + 8388608.0f) - 8388608.0f : (x - 8388608.0f) + 8388608.0f;
+    if (whole > x)
+        whole -= 1.0f;
+    return (int)whole;
 }
 
 /* 1 / sqrt(x) to frsqrte's 5 bits for x > 0 (wl/gfx/gfx_sqrt.h: the

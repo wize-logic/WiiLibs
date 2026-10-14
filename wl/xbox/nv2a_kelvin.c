@@ -835,6 +835,7 @@ static uint32_t arrays_layout(WlNv2a *dev, uint32_t least, uint32_t last, WlNv2a
             }
             continue;
         }
+        attribs[a].phys = phys;
         attribs[a].type = type;
         attribs[a].size = size;
         attribs[a].stride = stride;

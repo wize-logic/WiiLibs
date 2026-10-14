@@ -188,4 +188,9 @@ void wl_xb_gpu_set_program_list(const char *path) {
 void wl_xb_gpu_set_transform_unit(bool on) {
     (void)on;
 }
+
+void wl_xb_gpu_set_vertex_cache(void *arena, uint32_t bytes) {
+    (void)arena;
+    (void)bytes;
+}
 #endif

@@ -8,7 +8,8 @@
 // capture replayed to the same pixels (written out for the replay tool's test). Draws from vertex
 // arrays through GX's transform unit against the same draws on the processor, within a tolerance,
 // and a second pass over them by a program whose colour the processor computes (the transform unit
-// still doing its position) passing LEQUAL everywhere.
+// still doing its position) passing LEQUAL everywhere; the same draw with its arrays kept for GX to
+// read by index (the vertex cache), to the bit, and again after its vertices are rewritten.
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,6 +73,7 @@ static void on_draw(void *user, const WlGxSoftDraw *d) {
 
 // (the next pixel_device's GX backend never uses the transform unit)
 static bool g_no_xf;
+static size_t g_vertex_cache;
 
 static WlNv2a *pixel_device(TGuest *g) {
     WlGxSoftConfig cfg;
@@ -89,6 +91,7 @@ static WlNv2a *pixel_device(TGuest *g) {
 
         memset(&gcfg, 0, sizeof gcfg);
         gcfg.no_xf = g_no_xf;
+        gcfg.vertices.budget = g_vertex_cache;
         g_gx = wl_nv2a_gx_create(&gcfg);
     }
     if (g_gx == NULL) {
@@ -782,6 +785,70 @@ TEST a_second_pass_by_the_processor_passes_over_the_transform_units_depths(void)
     PASS();
 }
 
+// the arrays' draw twice in a frame, the second time after the guest rewrote a vertex, each with or
+// without the vertex cache: the EFB after each
+static int xf_cached_frames(uint32_t *first, uint32_t *second, size_t cache, WlNv2aGxStats *stats,
+                            WlNv2aVCacheStats *vstats) {
+    TGuest g;
+    int x, y;
+
+    g_vertex_cache = cache;
+    if (pixel_device(&g) == NULL) {
+        g_vertex_cache = 0;
+        return 0;
+    }
+    g_vertex_cache = 0;
+    f_perspective(&g);
+    f_constant(&g, 98, 0, 0, 1000.0f / 999.9f, -100.0f / 999.9f);
+    f_clear(&g, 0xFF000000u);
+    xf_arrays(&g);
+    t_kick(&g);
+    for (y = 0; y < 480; y++) {
+        for (x = 0; x < 640; x++) {
+            first[y * 640 + x] = pixel(x, y);
+        }
+    }
+    // (the next frame: a corner moved, a colour changed; the cache checks the arrays again)
+    wl_nv2a_gx_present(g_gx);
+    f_clear(&g, 0xFF000000u);
+    t_w32(&g, XF_ARRAY + 24u * 5u, t_f(19.5f));
+    t_w32(&g, XF_ARRAY + 24u * 7u + 12u, 0xFF20C040u);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+    t_m1(&g, WL_NV2A_K_DRAW_ARRAYS, (uint32_t)(XF_VERTICES - 1) << 24);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+    t_kick(&g);
+    for (y = 0; y < 480; y++) {
+        for (x = 0; x < 640; x++) {
+            second[y * 640 + x] = pixel(x, y);
+        }
+    }
+    wl_nv2a_gx_stats(g_gx, stats);
+    wl_nv2a_vcache_stats(wl_nv2a_gx_vertex_cache(g_gx), vstats);
+    pixel_done(&g);
+    return 1;
+}
+
+TEST arrays_kept_for_gx_to_index_draw_to_the_bit(void) {
+    static uint32_t sent[2][640 * 480], kept[2][640 * 480];
+    WlNv2aGxStats sent_stats, kept_stats;
+    WlNv2aVCacheStats sent_vstats, kept_vstats;
+
+    ASSERT(xf_cached_frames(sent[0], sent[1], 0, &sent_stats, &sent_vstats));
+    ASSERT(xf_cached_frames(kept[0], kept[1], 64u * 1024u, &kept_stats, &kept_vstats));
+    ASSERT_EQ(0u, sent_stats.indexed_draws);
+    ASSERT_EQ(2u, sent_stats.xf_draws);
+    // (position, colour and coordinate all from arrays: each frame's draw sent as indices)
+    ASSERT_EQ(2u, kept_stats.indexed_draws);
+    ASSERT_EQ(2u * XF_VERTICES, kept_stats.indexed_vertices);
+    ASSERT_EQ(3u, kept_vstats.converted);
+    ASSERT_EQ(3u, kept_vstats.checks);
+    ASSERT(kept_vstats.reconverted >= 2u);
+    ASSERT_MEM_EQ(sent[0], kept[0], sizeof sent[0]);
+    ASSERT_MEM_EQ(sent[1], kept[1], sizeof sent[1]);
+    ASSERT(memcmp(sent[0], sent[1], sizeof sent[0]) != 0);
+    PASS();
+}
+
 SUITE(pixels_suite) {
     RUN_TEST(console_suite_on_the_software_gx);
     RUN_TEST(textured_quad_through_the_combiners);
@@ -797,6 +864,7 @@ SUITE(pixels_suite) {
     RUN_TEST(capture_replays_to_the_same_pixels);
     RUN_TEST(arrays_through_the_transform_unit_land_as_on_the_processor);
     RUN_TEST(a_second_pass_by_the_processor_passes_over_the_transform_units_depths);
+    RUN_TEST(arrays_kept_for_gx_to_index_draw_to_the_bit);
 }
 
 GREATEST_MAIN_DEFS();

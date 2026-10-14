@@ -208,6 +208,10 @@ static uint64_t hash_update(uint64_t h, const uint8_t *p, size_t bytes) {
 
 #define HASH_INIT 0x9E3779B97F4A7C15ull
 
+uint64_t wl_nv2a_texcache_hash(uint64_t hash, const uint8_t *bytes, size_t count) {
+    return hash_update(hash, bytes, count);
+}
+
 static uint64_t hash_texels(WlNv2aTexCache *cache, const uint8_t *src, size_t bytes) {
     uint64_t hash = HASH_INIT;
 

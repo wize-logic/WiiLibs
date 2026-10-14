@@ -18,6 +18,7 @@
 #include "wl/platform/gx_target.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/tev.h"
+#include "wl/xbox/nv2a_color.h"
 #include "wl/xbox/nv2a_pipeline.h"
 #include "wl/xbox/nv2a_texture.h"
 #include "wl/xbox/psh_cache.h"
@@ -91,6 +92,7 @@ struct WlNv2aGx {
     WlNv2a *dev;
     WlNv2aPipeline pipeline;
     WlNv2aTexCache textures;
+    WlNv2aVCache vertices;
     WlXboxPshCache psh;
     WlNv2aGxStats stats;
     // the last draw's pixel program, and whether it was used
@@ -184,6 +186,7 @@ static void commit(void *user, void *memory, size_t bytes) {
 WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     WlNv2aGx *gx = calloc(1, sizeof *gx);
     WlNv2aTexCacheConfig textures;
+    WlNv2aVCacheConfig vertices;
 
     if (gx == NULL) {
         return NULL;
@@ -203,6 +206,11 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
         textures.flush = commit;
     }
     wl_nv2a_texcache_init(&gx->textures, &textures);
+    vertices = gx->cfg.vertices;
+    if (vertices.flush == NULL) {
+        vertices.flush = commit;
+    }
+    wl_nv2a_vcache_init(&gx->vertices, &vertices);
     wl_nv2a_pipeline_init(&gx->pipeline, gx->cfg.natives, gx->cfg.native_count);
     gx->pipeline.decoded = gx->cfg.program_decoded;
     gx->pipeline.decoded_user = gx->cfg.program_user;
@@ -224,6 +232,7 @@ void wl_nv2a_gx_destroy(WlNv2aGx *gx) {
         wl_nv2a_gx_present(gx);
     }
     wl_nv2a_texcache_clear(&gx->textures);
+    wl_nv2a_vcache_clear(&gx->vertices);
     for (i = 0; i < TARGETS; i++) {
         if (gx->targets[i].memory != NULL) {
             gx->textures.cfg.release(gx->textures.cfg.user, gx->targets[i].memory);
@@ -242,6 +251,10 @@ void wl_nv2a_gx_stats(const WlNv2aGx *gx, WlNv2aGxStats *out) {
 
 const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx) {
     return &gx->textures;
+}
+
+const WlNv2aVCache *wl_nv2a_gx_vertex_cache(const WlNv2aGx *gx) {
+    return &gx->vertices;
 }
 
 bool wl_nv2a_gx_last_projection(const WlNv2aGx *gx, float *a, float *b, bool *shared) {
@@ -330,6 +343,7 @@ void wl_nv2a_gx_present(WlNv2aGx *gx) {
     gx->stats.frames++;
     // (the GPU has drawn the frame: the textures evicted during it can go)
     wl_nv2a_texcache_frame_done(&gx->textures);
+    wl_nv2a_vcache_frame_done(&gx->vertices);
     wl_gx_direct_flush_after();
 }
 
@@ -526,7 +540,7 @@ static bool states_apply(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aSurfac
 // cull_measure: GX's names for its windings are not the screen's).
 static void cull_measure(WlNv2aGx *gx, uint32_t clear_rgba) {
     static const float corners[3][2] = {{0.0f, 0.0f}, {16.0f, 0.0f}, {0.0f, 16.0f}};
-    WlGxDirectLayout layout = {1, 0, 0, 0};
+    WlGxDirectLayout layout = {1, 0, 0, 0, 0};
     WlTevProgram tev;
     float m[4][4];
     unsigned pass, v;
@@ -765,29 +779,6 @@ static bool tev_setup(WlNv2aGx *gx, const WlNv2aKelvin *k) {
 }
 
 // ---- vertices ------------------------------------------------------------------------------------
-
-// test >= 0 ? a : b (a NaN test gives b): one fsel on PowerPC, no branch
-static inline float select_ge0(float test, float a, float b) {
-#if defined(__PPC__) || defined(__powerpc__)
-    float r;
-
-    __asm__("fsel %0,%1,%2,%3" : "=f"(r) : "f"(test), "f"(a), "f"(b));
-    return r;
-#else
-    return test >= 0.0f ? a : b;
-#endif
-}
-
-// a colour's component as a byte: 0 at or below 0 (and for a NaN), 255 at or above 1, else
-// (int)(value * 255 + 0.5). Without branches: y = value * 255 + 0.5 is below 1 exactly where the
-// byte is 0, and at or above 255 where it is 255 (every float gives the same byte as the tests on
-// value would, checked over all of them)
-static inline uint32_t color_byte(float value) {
-    float y = value * 255.0f + 0.5f;
-    float z = select_ge0(y - 1.0f, y, 0.0f);
-
-    return (uint32_t)(int)select_ge0(z - 255.0f, 255.0f, z);
-}
 
 static float as_depth(float z, float depth_max) {
     float depth = depth_max > 0.0f ? z / depth_max : z;
@@ -1106,10 +1097,6 @@ static inline void put_float(uint32_t *word, float f) {
     memcpy(word, &f, sizeof f);
 }
 
-static inline uint32_t color_word(const float c[4]) {
-    return color_byte(c[0]) << 24 | color_byte(c[1]) << 16 | color_byte(c[2]) << 8 | color_byte(c[3]);
-}
-
 // a vertex as GX takes it (OpenCE-Wii's vertex_store) from what the program left, in the draw's
 // layout, and where it lands in EFB pixels
 static void vertex_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPlan *plan, const WlXboxVshOutput *o,
@@ -1146,10 +1133,10 @@ static void vertex_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPla
     put_float(&out->w[1], position[1]);
     put_float(&out->w[2], position[2]);
     if (plan->colors >= 1) {
-        out->w[i++] = (plan->channels & 1u) ? color_word(o->d0) : 0u;
+        out->w[i++] = (plan->channels & 1u) ? wl_nv2a_color_word(o->d0) : 0u;
     }
     if (plan->colors >= 2) {
-        out->w[i++] = (plan->channels & 2u) ? color_word(o->d1) : 0u;
+        out->w[i++] = (plan->channels & 2u) ? wl_nv2a_color_word(o->d1) : 0u;
     }
     for (stage = 0; stage < plan->stage_count; stage++) {
         unsigned n = plan->stage_list[stage];
@@ -1173,7 +1160,7 @@ static void vertex_pack_xf(const DrawPlan *plan, const float (*inputs)[4], Packe
     put_float(&out->w[1], inputs[0][1]);
     put_float(&out->w[2], inputs[0][2]);
     for (c = 0; c < plan->colors; c++) {
-        out->w[i++] = xf->color_source[c] < 0 ? xf->color_word[c] : color_word(inputs[xf->color_source[c]]);
+        out->w[i++] = xf->color_source[c] < 0 ? xf->color_word[c] : wl_nv2a_color_word(inputs[xf->color_source[c]]);
     }
     for (stage = 0; stage < plan->stage_count; stage++) {
         unsigned source = xf->stage_source[plan->stage_list[stage]];
@@ -1401,7 +1388,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         }
         if (source == 0) {
             xf->color_source[c] = -1;
-            xf->color_word[c] = color_word(c == 0 ? o[0].d0 : o[0].d1);
+            xf->color_word[c] = wl_nv2a_color_word(c == 0 ? o[0].d0 : o[0].d1);
             continue;
         }
         for (n = 0; n < XF_PROBES; n++) {
@@ -1466,6 +1453,54 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         xf->words = plan->words;
         xf->attributes = 1u;
     }
+    return true;
+}
+
+// The arrays of a draw through the transform unit alone, from the vertex cache: its position, each
+// colour passed from the vertices and each stage's coordinate read by GX at the draw's indices less
+// its least (their arrays from that element on), into arrays[WL_GX_DIRECT_ARRAY_*], the layout's
+// indexed attributes set (a constant colour is still sent). false (the vertices sent as before) when
+// the cache is off, the draw is not from arrays or its indices are beyond 16 bits of its least, or an
+// array cannot be kept.
+static bool xf_arrays(WlNv2aGx *gx, const WlNv2aDraw *draw, const DrawPlan *plan, const XfPlan *xf,
+                      WlGxDirectLayout *layout, const void *arrays[WL_GX_DIRECT_ARRAY_TEXCOORD0 + WL_NV2A_TEXTURES]) {
+    unsigned c, stage;
+    uint16_t indexed = 1u << WL_GX_DIRECT_ARRAY_POSITION;
+
+    if (!wl_nv2a_vcache_on(&gx->vertices) || draw->source != WL_NV2A_SOURCE_ARRAYS ||
+        draw->index_last - draw->index_base >= WL_NV2A_VCACHE_SPAN) {
+        return false;
+    }
+    for (c = 0; c < plan->colors && c < 2u; c++) {
+        if (xf->color_source[c] < 0) {
+            continue;
+        }
+        arrays[WL_GX_DIRECT_ARRAY_COLOR0 + c] =
+            wl_nv2a_vcache_get(&gx->vertices, gx->dev, &draw->attribs[xf->color_source[c]], draw->index_base,
+                               draw->index_last, WL_NV2A_VCACHE_COLOR);
+        if (arrays[WL_GX_DIRECT_ARRAY_COLOR0 + c] == NULL) {
+            return false;
+        }
+        indexed |= (uint16_t)(1u << (WL_GX_DIRECT_ARRAY_COLOR0 + c));
+    }
+    arrays[WL_GX_DIRECT_ARRAY_POSITION] = wl_nv2a_vcache_get(&gx->vertices, gx->dev, &draw->attribs[0],
+                                                             draw->index_base, draw->index_last, WL_NV2A_VCACHE_POSITION);
+    if (arrays[WL_GX_DIRECT_ARRAY_POSITION] == NULL) {
+        return false;
+    }
+    for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
+        if (!(layout->texcoords & (1u << stage))) {
+            continue;
+        }
+        arrays[WL_GX_DIRECT_ARRAY_TEXCOORD0 + stage] =
+            wl_nv2a_vcache_get(&gx->vertices, gx->dev, &draw->attribs[xf->stage_source[stage]], draw->index_base,
+                               draw->index_last, WL_NV2A_VCACHE_TEXCOORD);
+        if (arrays[WL_GX_DIRECT_ARRAY_TEXCOORD0 + stage] == NULL) {
+            return false;
+        }
+        indexed |= (uint16_t)(1u << (WL_GX_DIRECT_ARRAY_TEXCOORD0 + stage));
+    }
+    layout->indexed = indexed;
     return true;
 }
 
@@ -1604,7 +1639,8 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     WlGxDirectLayout layout;
     DrawPlan plan;
     XfPlan xf;
-    bool exact, xf_ok, count_pixels = wl_nv2a_k(k, WL_NV2A_K_SET_ZPASS_PIXEL_COUNT_ENABLE) != 0;
+    bool exact, xf_ok, indexed = false, count_pixels = wl_nv2a_k(k, WL_NV2A_K_SET_ZPASS_PIXEL_COUNT_ENABLE) != 0;
+    const void *arrays[WL_GX_DIRECT_ARRAY_TEXCOORD0 + WL_NV2A_TEXTURES] = {NULL};
     float corners[3][2], area = 0.0f;
     uint32_t v, seen = 0, first = 0, attributes;
     unsigned stage;
@@ -1746,7 +1782,19 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
                 }
             }
         }
+        indexed = xf_arrays(gx, draw, &plan, &xf, &layout, arrays);
         wl_gx_direct_layout(&layout);
+        for (stage = 0; indexed && stage < WL_GX_DIRECT_ARRAY_TEXCOORD0 + WL_NV2A_TEXTURES; stage++) {
+            if (layout.indexed & (1u << stage)) {
+                wl_gx_direct_array(stage, arrays[stage],
+                                   wl_nv2a_vcache_element_bytes(stage == WL_GX_DIRECT_ARRAY_POSITION ? WL_NV2A_VCACHE_POSITION
+                                                                : stage < WL_GX_DIRECT_ARRAY_TEXCOORD0 ? WL_NV2A_VCACHE_COLOR
+                                                                                                       : WL_NV2A_VCACHE_TEXCOORD));
+            }
+        }
+        if (indexed && wl_nv2a_vcache_made(&gx->vertices)) {
+            wl_gx_direct_arrays_changed();
+        }
         wl_gx_direct_position_matrix((const float (*)[4])xf.position);
         gx->xf_position = true;
         for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
@@ -1775,6 +1823,31 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
         gx->xf_texgens = 0;
     }
 
+    if (indexed) {
+        // (the vertices' indices alone, and the colours' words the transform unit's draw sends)
+        uint32_t words[2];
+        unsigned colors = 0, c;
+
+        for (c = 0; c < plan.colors && c < 2u; c++) {
+            if (!(layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_COLOR0 + c)))) {
+                words[colors++] = xf.color_word[c];
+            }
+        }
+        wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
+        if (draw->indices != NULL) {
+            for (v = 0; v < draw->count; v++) {
+                wl_gx_direct_vertex_index((uint16_t)(draw->indices[v] - draw->index_base), words, colors);
+            }
+        } else {
+            for (v = 0; v < draw->count; v++) {
+                wl_gx_direct_vertex_index((uint16_t)v, words, colors);
+            }
+        }
+        wl_gx_direct_primitive_end();
+        gx->stats.indexed_draws++;
+        gx->stats.indexed_vertices += draw->count;
+        return 0;
+    }
     wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
     gx->memo_stamp++;
     // (the fetch decided once for the draw: the attributes the program reads, the current values'

@@ -47,6 +47,11 @@ typedef struct WlHostGxDirect {
     uint32_t count;
     WlGxDirectVertex vertices[WL_HOST_GX_DIRECT_KEPT];
     WlGxDirectStats stats;
+    // the indexed attributes' arrays (wl_gx_direct_array: WL_GX_DIRECT_ARRAY_*), the vertices sent
+    // through indices, and how often the arrays were said to have changed
+    const void *arrays[11];
+    uint32_t array_strides[11];
+    uint32_t indexed_vertices, arrays_changed;
     // a renderer's own vertex formats: its primitives begun (wl_gx_direct_begin_format), the last's
     // GX primitive, format and count, and the bytes of the last flush sent before one
     uint32_t format_begins;

@@ -25,9 +25,12 @@
 //               instruction), for compiling a title's programs ahead of time
 //   --textures-mb N  the GX backend's converted textures in an arena of N MiB, as the runtime
 //               keeps them (without it: the backend's default budget, from the heap)
-//   --watch     the converted textures checked through a write watch, as the runtime's MMU gives
-//               it on the Wii: a page counts as stored to when one of the capture's memory blocks
-//               lands in it (the blocks are what the title wrote, as the capture read it)
+//   --vertex-cache-kb N  the GX backend's vertex arrays kept for GX to read by index
+//               (nv2a_vcache.h) in an arena of N KiB (without it: none kept)
+//   --watch     the converted textures and vertex arrays checked through a write watch, as the
+//               runtime's MMU gives it on the Wii: a page counts as stored to when one of the
+//               capture's memory blocks lands in it (the blocks are what the title wrote, as the
+//               capture read it); with --bench too
 //   --cpu-transform  every vertex through the program on the processor (GX's transform unit not
 //               used for the draws whose outputs are affine), to the bit as before it
 //   --bench N   the capture replayed N times through the GX backend alone (no software GX, no
@@ -552,6 +555,26 @@ static void timed_flip(void *user, const WlNv2aKelvin *k, uint32_t phys) {
     g_timed.others += seconds_now() - t0;
 }
 
+// the vertex cache's work and memory, when it is on
+static void vertex_cache_line(const char *prefix) {
+    WlNv2aVCacheStats vs;
+    WlNv2aGxStats gs;
+
+    if (!wl_nv2a_vcache_on(wl_nv2a_gx_vertex_cache(g_gx))) {
+        return;
+    }
+    wl_nv2a_vcache_stats(wl_nv2a_gx_vertex_cache(g_gx), &vs);
+    wl_nv2a_gx_stats(g_gx, &gs);
+    printf("%svertex arrays: %u draws (%u vertices) sent as indices; %u lookups, %u checks (%u by the write watch), "
+           "%u hashes (%llu bytes), %u converted (%llu elements), %u made again, %u refused, %u evicted, %u failed; "
+           "%u KB kept (%u KB at most), %u KB drawn in a frame at most\n",
+           prefix, (unsigned)gs.indexed_draws, (unsigned)gs.indexed_vertices, (unsigned)vs.lookups, (unsigned)vs.checks,
+           (unsigned)vs.watched, (unsigned)vs.hashed, (unsigned long long)vs.hashed_bytes, (unsigned)vs.converted,
+           (unsigned long long)vs.converted_elements, (unsigned)vs.reconverted, (unsigned)vs.refused,
+           (unsigned)vs.evicted, (unsigned)vs.failed, (unsigned)(vs.bytes >> 10), (unsigned)(vs.peak_bytes >> 10),
+           (unsigned)(vs.peak_frame_bytes >> 10));
+}
+
 static int bench(const uint8_t *data, size_t size, unsigned runs) {
     WlNv2aBackend backend;
     WlNv2aReplayHooks hooks;
@@ -572,6 +595,9 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
     memset(&hooks, 0, sizeof hooks);
     hooks.created = on_created;
     hooks.clock = micros_now;
+    if (g_page_epoch != NULL) {
+        hooks.memory = on_memory;
+    }
     for (run = 0; run < runs; run++) {
         double start = seconds_now(), took;
 
@@ -599,6 +625,7 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
         wl_nv2a_gx_stats(g_gx, &gs);
         printf("bench: %u draws (%u vertices) through GX's transform unit in all runs, %u more for their position "
                "alone\n", (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws);
+        vertex_cache_line("bench: ");
     }
     printf("bench: the best run a frame: pusher %.3f ms, draws %.3f, clears and frames %.3f, memory records %.3f\n",
            (best - best_draws - best_others - best_memory) * 1000.0 / frames, best_draws * 1000.0 / frames,
@@ -609,8 +636,8 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
 
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
-                    "[--psh-dump N] [--programs FILE] [--textures-mb N] [--watch] [--bench N] [--stream] "
-                    "[--cpu-transform]\n");
+                    "[--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] "
+                    "[--stream] [--cpu-transform]\n");
     return 2;
 }
 
@@ -661,6 +688,9 @@ int main(int argc, char **argv) {
             g_gcfg.textures.arena_bytes = (size_t)strtoul(argv[++i], NULL, 0) << 20;
             arena = g_gcfg.textures.arena_bytes != 0 ? malloc(g_gcfg.textures.arena_bytes) : NULL;
             g_gcfg.textures.arena = arena;
+        } else if (strcmp(argv[i], "--vertex-cache-kb") == 0 && i + 1 < argc) {
+            g_gcfg.vertices.arena_bytes = (size_t)strtoul(argv[++i], NULL, 0) << 10;
+            g_gcfg.vertices.arena = g_gcfg.vertices.arena_bytes != 0 ? malloc(g_gcfg.vertices.arena_bytes) : NULL;
         } else if (strcmp(argv[i], "--watch") == 0) {
             watch = true;
         } else if (strcmp(argv[i], "--cpu-transform") == 0) {
@@ -687,6 +717,14 @@ int main(int argc, char **argv) {
         return 1;
     }
     fclose(f);
+    if (watch && size >= 16) {
+        g_gcfg.textures.watch = watch_arm;
+        g_gcfg.textures.written = watch_written;
+        g_gcfg.vertices.watch = watch_arm;
+        g_gcfg.vertices.written = watch_written;
+        g_page_count = wl_rd_le32(data + 12) >> 12; // (the header's RAM size)
+        g_page_epoch = calloc(g_page_count != 0 ? g_page_count : 1u, sizeof *g_page_epoch);
+    }
     if (g_bench != 0) {
         return bench(data, (size_t)size, g_bench);
     }
@@ -702,10 +740,6 @@ int main(int argc, char **argv) {
         memset(&scfg, 0, sizeof scfg);
         scfg.frame = on_gx_frame;
         scfg.draw = on_gx_draw;
-        if (watch) {
-            g_gcfg.textures.watch = watch_arm;
-            g_gcfg.textures.written = watch_written;
-        }
         if (wl_gx_init() != WL_OK || wl_gxsoft_attach(&scfg) != WL_OK || (g_gx = wl_nv2a_gx_create(gx_config())) == NULL) {
             fprintf(stderr, "no memory for the GX backend\n");
             return 1;
@@ -724,9 +758,7 @@ int main(int argc, char **argv) {
     memset(&hooks, 0, sizeof hooks);
     hooks.created = on_created;
     hooks.flip = on_flip;
-    if (watch && size >= 16) {
-        g_page_count = wl_rd_le32(data + 12) >> 12; // (the header's RAM size)
-        g_page_epoch = calloc(g_page_count != 0 ? g_page_count : 1u, sizeof *g_page_epoch);
+    if (g_page_epoch != NULL) {
         hooks.memory = on_memory;
     }
     result = replay(data, (size_t)size, &backend, &hooks, &info);
@@ -760,6 +792,7 @@ int main(int argc, char **argv) {
             WlNv2aTexCacheStats ts;
 
             wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+            vertex_cache_line("");
             printf("textures: %u lookups, %u checks (%u by the write watch), %u hashes (%llu bytes), %u converted, "
                    "%u made again, %u evicted, %u failed (%u for memory); %u KB kept, %u KB drawn in a frame at most\n",
                    (unsigned)ts.lookups, (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed,

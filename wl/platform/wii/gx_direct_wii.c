@@ -30,6 +30,9 @@ static struct {
     uint8_t texgen_set; // bit n: coordinate n has a matrix of its own
     uint8_t texgen_source[8];
     float texgen[8][2][4];
+    // a vertex of an indexed layout as the FIFO takes it: each item an index (0) or a number of
+    // words; whether every attribute is indexed
+    uint8_t order[11], order_count;
     bool in_primitive;
     WlGxDirectStats stats;
 } d;
@@ -56,6 +59,21 @@ void wl_gx_direct_begin(void) {
     wl_gx_wii_note_commands();
 }
 
+// an attribute's input in the layout (GX_INDEX16 or GX_DIRECT), its place in an indexed vertex's
+// order noted (an index, or its words after the words before it)
+static u8 input_of(const WlGxDirectLayout *layout, unsigned attribute, uint8_t words) {
+    if (layout->indexed & (1u << attribute)) {
+        d.order[d.order_count++] = 0;
+        return GX_INDEX16;
+    }
+    if (d.order_count != 0 && d.order[d.order_count - 1] != 0) {
+        d.order[d.order_count - 1] = (uint8_t)(d.order[d.order_count - 1] + words);
+    } else {
+        d.order[d.order_count++] = words;
+    }
+    return GX_DIRECT;
+}
+
 void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
     unsigned n, texgens = 0;
 
@@ -66,15 +84,16 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
     d.layout_known = true;
     d.texgen_set = 0;
     d.stats.layouts++;
+    d.order_count = 0;
     GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_POS, input_of(layout, WL_GX_DIRECT_ARRAY_POSITION, 3));
     GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
     if (layout->colors >= 1) {
-        GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+        GX_SetVtxDesc(GX_VA_CLR0, input_of(layout, WL_GX_DIRECT_ARRAY_COLOR0, 1));
         GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
     }
     if (layout->colors >= 2) {
-        GX_SetVtxDesc(GX_VA_CLR1, GX_DIRECT);
+        GX_SetVtxDesc(GX_VA_CLR1, input_of(layout, WL_GX_DIRECT_ARRAY_COLOR0 + 1, 1));
         GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
     }
     for (n = 0; n < 8; n++) {
@@ -89,7 +108,8 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
             GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4, GX_TG_POS, GX_IDENTITY);
             continue;
         }
-        GX_SetVtxDesc((u8)(GX_VA_TEX0 + n), GX_DIRECT);
+        GX_SetVtxDesc((u8)(GX_VA_TEX0 + n),
+                      input_of(layout, WL_GX_DIRECT_ARRAY_TEXCOORD0 + n, (layout->texcoord_s & (1u << n)) ? 1 : 2));
         GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_TEX0 + n, (layout->texcoord_s & (1u << n)) ? GX_TEX_S : GX_TEX_ST, GX_F32,
                          0);
         GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4, GX_TG_TEX0 + n, GX_IDENTITY);
@@ -104,18 +124,26 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
 static inline void emit(const WlGxDirectVertex *v) {
     unsigned n;
 
-    GX_Position3f32(v->position[0], v->position[1], v->position[2]);
-    if (d.layout.colors >= 1) {
-        GX_Color4u8(v->color[0][0], v->color[0][1], v->color[0][2], v->color[0][3]);
+    // (an indexed attribute sends its index: the vertex's element 0)
+    if (d.layout.indexed & (1u << WL_GX_DIRECT_ARRAY_POSITION)) {
+        GX_Position1x16(0);
+    } else {
+        GX_Position3f32(v->position[0], v->position[1], v->position[2]);
     }
-    if (d.layout.colors >= 2) {
-        GX_Color4u8(v->color[1][0], v->color[1][1], v->color[1][2], v->color[1][3]);
+    for (n = 0; n < d.layout.colors && n < 2; n++) {
+        if (d.layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_COLOR0 + n))) {
+            GX_Color1x16(0);
+        } else {
+            GX_Color4u8(v->color[n][0], v->color[n][1], v->color[n][2], v->color[n][3]);
+        }
     }
     for (n = 0; n < 8; n++) {
         if (!(d.layout.texcoords & (1u << n))) {
             continue;
         }
-        if (d.layout.texcoord_s & (1u << n)) {
+        if (d.layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_TEXCOORD0 + n))) {
+            GX_TexCoord1x16(0);
+        } else if (d.layout.texcoord_s & (1u << n)) {
             GX_TexCoord1f32(v->texcoord[n][0]);
         } else {
             GX_TexCoord2f32(v->texcoord[n][0], v->texcoord[n][1]);
@@ -162,6 +190,40 @@ void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
             wgPipe->U32 = words[i];
         }
     }
+}
+
+void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride) {
+    u32 gx_attribute = attribute == WL_GX_DIRECT_ARRAY_POSITION ? (u32)GX_VA_POS
+                       : attribute < WL_GX_DIRECT_ARRAY_TEXCOORD0
+                           ? (u32)(GX_VA_CLR0 + attribute - WL_GX_DIRECT_ARRAY_COLOR0)
+                           : (u32)(GX_VA_TEX0 + attribute - WL_GX_DIRECT_ARRAY_TEXCOORD0);
+
+    if (attribute >= WL_GX_DIRECT_ARRAY_TEXCOORD0 + 8u) {
+        return;
+    }
+    GX_SetArray(gx_attribute, (void *)data, (u8)stride);
+    wl_gx_wii_note_commands();
+}
+
+void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t count) {
+    unsigned i, n;
+
+    if (!d.in_primitive) {
+        return;
+    }
+    for (i = 0; i < d.order_count; i++) {
+        if (d.order[i] == 0) {
+            wgPipe->U16 = index;
+            continue;
+        }
+        for (n = 0; n < d.order[i] && count != 0; n++, count--) {
+            wgPipe->U32 = *words++;
+        }
+    }
+}
+
+void wl_gx_direct_arrays_changed(void) {
+    GX_InvVtxCache();
 }
 
 void wl_gx_direct_primitive_end(void) {
