@@ -22,8 +22,8 @@ WiiLibs' copy (wl/xboxrt/recomp/recomp_types.h) is that template, with WiiLibs' 
   6. RecompXmm and RecompMmx get little-endian storage, so their lane views agree as on x86; the
      packed float arithmetic (RECOMP_XMM_LANEWISE) works on host-order copies of the lanes, inline,
      and XMM_SHUFFLE moves lanes as bytes
-  7. RECOMP_FP_PC: a fast path (round to float when the result is a normal float) before the
-     exact slow path, which stays out of line
+  7. RECOMP_FP_PC and RECOMP_FP_PC_CW (the control word as an argument): a fast path (round to
+     float when the result is a normal float) before the exact slow path, which stays out of line
   8. the indirect-call trace ring and counter are compiled only with WL_RECOMP_ICALL_TRACE
   9. MMX_CVT_F2I rounds with recomp_cvt_si32 (nearest-even, not the host's rounding mode)
  10. RecompMmx and the g_mm0..7 declarations move out of the RECOMP_GENERATED_CODE block, so the
@@ -271,7 +271,10 @@ RECOMP_MEM_SET_INLINE void recomp_memd_set(uint32_t addr, double v) {
 #define MEMD_SET(addr, v) recomp_memd_set((uint32_t)(addr), (double)(v))
 """
 
-FPPC_OLD = "#define RECOMP_FP_PC(x) ((g_fp_control_word & 0x300u) ? (double)(x) : recomp_fp_round24(x))"
+FPPC_OLD = """/* RECOMP_FP_PC_CW takes the control word as an argument: a function whose x87
+ * state the lifter keeps in locals (--x87-locals) passes its local copy. */
+#define RECOMP_FP_PC_CW(cw, x) (((cw) & 0x300u) ? (double)(x) : recomp_fp_round24(x))
+#define RECOMP_FP_PC(x) RECOMP_FP_PC_CW(g_fp_control_word, x)"""
 FPPC_NEW = """/* WiiLibs: the common case inline -- the result rounded to float is a normal float, so the
  * plain conversion is exact PC=24 rounding -- and only zero, denormal, overflowing, infinite and
  * NaN results take recomp_fp_round24, out of line. Upstream inlines the whole range test at
@@ -284,7 +287,10 @@ static inline double recomp_fp_pc24(double x) {
         return (double)f;
     return recomp_fp_round24(x);
 }
-#define RECOMP_FP_PC(x) ((g_fp_control_word & 0x300u) ? (double)(x) : recomp_fp_pc24(x))"""
+/* RECOMP_FP_PC_CW takes the control word as an argument: a function whose x87
+ * state the lifter keeps in locals (--x87-locals) passes its local copy. */
+#define RECOMP_FP_PC_CW(cw, x) (((cw) & 0x300u) ? (double)(x) : recomp_fp_pc24(x))
+#define RECOMP_FP_PC(x) RECOMP_FP_PC_CW(g_fp_control_word, x)"""
 
 ROUND24_OLD = "static inline double recomp_fp_round24(double x) {"
 ROUND24_NEW = "static __attribute__((noinline, cold, unused)) double recomp_fp_round24(double x) {"
