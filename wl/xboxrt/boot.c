@@ -264,7 +264,7 @@ static const char *play_setting(const WlXbTitleConfig *cfg) {
 // The GPU's options from the title's folder: a file "noxf" (or WL_XB_NO_XF on the host) keeps GX's
 // transform unit out of the vertices, for an A/B on the console; a file "vcache" (its text the KB,
 // 1024 when empty; WL_XB_VCACHE_KB on the host) keeps the static geometry's vertex arrays for GX to
-// read by index, from the heap.
+// read by index, in the end of the textures' arena.
 static void gpu_options(const WlXbTitleConfig *cfg) {
     char flag[WL_FS_PATH_MAX];
     bool no_xf;

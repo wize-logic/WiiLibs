@@ -219,6 +219,17 @@ static void gpu_status(void) {
              (unsigned)(ts.frame_bytes / 1024u), (unsigned)(ts.peak_frame_bytes / 1024u), (unsigned)ts.converted,
              (unsigned)ts.reconverted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.evicted,
              (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed, (unsigned)(ts.hashed_bytes >> 10));
+    if (wl_nv2a_vcache_on(wl_nv2a_gx_vertex_cache(g_gx))) {
+        WlNv2aVCacheStats vs;
+        wl_nv2a_vcache_stats(wl_nv2a_gx_vertex_cache(g_gx), &vs);
+        WL_LOG_I(TAG, "status: %u draws (%u vertices) sent as indices; vertex arrays %u KB kept (%u KB drawn in the "
+                 "last frame, %u KB at most), %u converted, %u made again, %u refused, %u failed, %u evicted; %u "
+                 "checks, %u by the write watch",
+                 (unsigned)gs.indexed_draws, (unsigned)gs.indexed_vertices, (unsigned)(vs.bytes / 1024u),
+                 (unsigned)(vs.frame_bytes / 1024u), (unsigned)(vs.peak_frame_bytes / 1024u), (unsigned)vs.converted,
+                 (unsigned)vs.reconverted, (unsigned)vs.refused, (unsigned)vs.failed, (unsigned)vs.evicted,
+                 (unsigned)vs.checks, (unsigned)vs.watched);
+    }
 }
 
 static void a_vblank(void *gpu) {
@@ -282,6 +293,14 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
         // the textures in an arena of their own (the boot's): a texture makes room by evicting
         // others, and the host's other memory is not fragmented by them
         size_t bytes = texture_bytes != 0 ? texture_bytes : 8u << 20;
+        // (the vertex arrays without an arena of their own: the end of the textures' when it
+        // leaves them 8 MB, so the heap, short during a level, is not asked)
+        uint32_t vbytes = (g_vcache_bytes + 31u) & ~31u;
+        if (vbytes != 0 && g_vcache_arena == NULL && texture_arena != NULL && bytes >= vbytes + (8u << 20)) {
+            bytes -= vbytes;
+            g_vcache_arena = (uint8_t *)texture_arena + bytes;
+            g_vcache_bytes = vbytes;
+        }
         if (texture_arena != NULL) {
             gcfg.textures.arena = texture_arena;
             gcfg.textures.arena_bytes = bytes;
