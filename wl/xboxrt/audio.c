@@ -2,7 +2,8 @@
 // The audio hardware behind the title (devices.h): wl/xboxapu's APU and AC'97 models as devices,
 // their interrupt lines, the service tick that runs the APU's frames and the AC'97's bus masters,
 // and where the sound goes: the platform's audio output at 48 kHz (the Wii's AESND voice takes
-// 48 kHz as it is), a WAV file on the host, an MMIO trace on the host.
+// 48 kHz as it is), a WAV file on the host, an MMIO trace on the host, checksums of the mixbins and
+// the output on the host.
 //
 // Pacing. The APU makes 1500 frames of 32 samples a second. With the platform output running on
 // its own thread (the Wii), the tick keeps `latency_frames` frames queued ahead of it, so the
@@ -43,8 +44,12 @@ static const int16_t *g_cur;   // the audio thread: the frame being played out .
 static uint32_t g_cur_off;     // ... and how much of it
 static volatile uint32_t g_underruns;
 #if !defined(__wii__)
-static FILE *g_wav, *g_trace;
+static FILE *g_wav, *g_trace, *g_hash;
 static uint64_t g_wav_frames;
+static struct {
+    uint64_t frames;
+    uint32_t bins, out; // FNV-1a over every frame's 32 x 32 bin words and 64 output samples
+} g_sum;
 #endif
 static struct {
     uint64_t run_us, run_frames;
@@ -86,6 +91,40 @@ static void trace(const char *dev, char rw, uint32_t off, unsigned size, uint32_
     (void)v;
 #endif
 }
+
+// ---- The checksums (host) ----------------------------------------------------------------------
+
+#if !defined(__wii__)
+static uint32_t fnv_words(uint32_t h, const uint32_t *w, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        for (uint32_t b = 0; b < 32u; b += 8u) {
+            h = (h ^ ((w[i] >> b) & 0xFFu)) * 16777619u;
+        }
+    }
+    return h;
+}
+
+static void hash_frame(void *user, const int32_t *bins, const int16_t *out) {
+    (void)user;
+    uint32_t w[WL_XBOX_APU_BINS * WL_XBOX_APU_FRAME];
+    const uint32_t nb = WL_XBOX_APU_BINS * WL_XBOX_APU_FRAME;
+    for (uint32_t i = 0; i < nb; i++) {
+        w[i] = (uint32_t)bins[i];
+    }
+    g_sum.bins = fnv_words(g_sum.bins, w, nb);
+    if (out != NULL) {
+        for (uint32_t i = 0; i < FRAME_SAMPLES; i++) {
+            w[i] = (uint16_t)out[i];
+        }
+        g_sum.out = fnv_words(g_sum.out, w, FRAME_SAMPLES);
+    }
+    if (++g_sum.frames % (WL_XBOX_APU_RATE / WL_XBOX_APU_FRAME) == 0) {
+        fprintf(g_hash, "frame %llu bins %08x out %08x\n", (unsigned long long)g_sum.frames,
+                (unsigned)g_sum.bins, (unsigned)g_sum.out); // host only
+        fflush(g_hash);
+    }
+}
+#endif
 
 // ---- The devices -------------------------------------------------------------------------------
 
@@ -285,6 +324,7 @@ void wl_xb_audio_config_default(WlXbAudioConfig *cfg) {
 #if !defined(__wii__)
     cfg->wav_path = getenv("WL_XB_AUDIO_WAV");
     cfg->trace_path = getenv("WL_XB_AUDIO_TRACE");
+    cfg->hash_path = getenv("WL_XB_AUDIO_HASH");
     const char *off = getenv("WL_XB_AUDIO");
     cfg->off = off != NULL && strcmp(off, "0") == 0;
 #endif
@@ -306,6 +346,17 @@ WlResult wl_xb_audio_attach(const WlXbAudioConfig *cfg) {
     WlXboxApuConfig ac;
     wl_xbox_apu_config_default(&ac);
     ac.phys_ptr = phys_ptr;
+#if !defined(__wii__)
+    if (g_cfg.hash_path != NULL && g_cfg.hash_path[0] != '\0') {
+        g_hash = fopen(g_cfg.hash_path, "w");
+        if (g_hash != NULL) {
+            g_sum.bins = g_sum.out = 2166136261u;
+            ac.on_frame = hash_frame;
+        } else {
+            WL_LOG_W(TAG, "cannot write %s", g_cfg.hash_path);
+        }
+    }
+#endif
     g_apu = wl_xbox_apu_create(&ac);
     WlXboxAc97Config cc = {phys_ptr, NULL, true};
     g_ac97 = wl_xbox_ac97_create(&cc);

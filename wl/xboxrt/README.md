@@ -269,7 +269,10 @@ nothing in a title's code is replaced, nothing is title-specific.
 - The host (no sound device): frames follow the wall clock. `WL_XB_AUDIO_WAV=<file>` writes
   everything played to a 48 kHz stereo WAV (a valid file each second, whenever the run ends);
   `WL_XB_AUDIO_TRACE=<file>` logs every APU and AC'97 access with its value and the translated
-  function that made it (`wl_xb_mmio_fault_pc` and `wl_xb_symbolize`); `WL_XB_AUDIO=0` keeps the
+  function that made it (`wl_xb_mmio_fault_pc` and `wl_xb_symbolize`); `WL_XB_AUDIO_HASH=<file>`
+  writes running checksums of the APU's 32 mixbins and of the output, a line each second of audio
+  (two runs in the deterministic mode, `WL_XB_DETERMINISTIC=1`, compare line by line: a change to
+  the APU model that should not change the sound shows it does not); `WL_XB_AUDIO=0` keeps the
   idle devices (DirectSoundCreate fails, the title runs silent).
 - Every 10 s an `xbaudio` status line: frames run (and silent), voices a frame, what a frame costs
   in nanoseconds, notifiers, traps, GP commands, starved stream frames, clipped samples, output

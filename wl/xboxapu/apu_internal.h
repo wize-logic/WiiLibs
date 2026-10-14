@@ -11,6 +11,9 @@
 #define WL_APU_GLOBAL_LO 0x1000u // the global registers kept: 0x1000..0x4FFF
 #define WL_APU_GLOBAL_HI 0x5000u
 #define WL_APU_DSP_SLOTS 1024u // GP/EP memory words kept (a title touches few through the window)
+#define WL_APU_SRC_MAX (WL_XBOX_APU_FRAME * 16u + 2u) // source samples a frame takes (step <= 16)
+#define WL_APU_PEND_FRAMES 32u // voice channels' frames held before they are added to their bins
+#define WL_APU_PEND_ADDS 32u   // additions a bin holds before they are made
 
 // What the hardware keeps of a voice outside its record: the decoder's and resampler's state.
 typedef struct {
@@ -54,6 +57,12 @@ typedef struct {
     int32_t pitch_seen;
     uint32_t step;    // source samples an output sample, Q16
     uint16_t gain[8]; // last frame's gains per target, Q15 (volume ramps start here)
+    // the gains (Q15) worked out last from the volume words and the amplitude envelope's value
+    // (vol_key: VOLA, VOLB, VOLC, the envelope; reused while they stay the same)
+    bool vol_valid;
+    uint8_t vol_act; // the targets whose gain is not 0 (bit t)
+    uint32_t vol_key[4];
+    uint16_t vol_gain[8];
 } WlApuVoice;
 
 struct WlXboxApu {
@@ -68,7 +77,21 @@ struct WlXboxApu {
     uint32_t sge_gen;  // counts page table and segment table writes (voices' page caches)
     WlApuVoice voice[WL_XBOX_APU_VOICES];
     int32_t mix[WL_XBOX_APU_BINS][WL_XBOX_APU_FRAME];
-    uint32_t mix_used; // bins written this frame (the others are 0)
+    uint32_t mix_used; // bins written in the last frame (the others are 0)
+    uint32_t mix_live; // apu_vp.c, in a frame: bins holding this frame's sum (the others: 0)
+    uint32_t out_left, out_right;   // bins with a weight in the stereo mix's left, right side
+    int32_t src[2][WL_APU_SRC_MAX]; // a voice's source samples for the frame (apu_vp.c)
+    // Voices' frames waiting to be added to their bins (apu_vp.c): a bin's additions go in at
+    // once, every frame added to it per sample (integer sums: the order does not matter). The
+    // frames (a voice channel's 32 samples each, x 4) and each bin's additions (frame, gain << 15).
+    int32_t pend_frame[WL_APU_PEND_FRAMES][WL_XBOX_APU_FRAME];
+    uint32_t pend_frames;
+    uint32_t pend_bins; // bins with additions waiting
+    uint8_t pend_n[WL_XBOX_APU_BINS];
+    struct WlApuPend {
+        const int32_t *frame;
+        int32_t gain;
+    } pend[WL_XBOX_APU_BINS][WL_APU_PEND_ADDS];
     WlXboxApuStats stats;
 };
 
