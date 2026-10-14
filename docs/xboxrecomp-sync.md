@@ -137,6 +137,11 @@ Wii (devkitPPC 16.1, the flags above), not linked.
 | v0.13.1 + patches 0001-0007 | `.text` only (`"text_only": true`) | 6,948 / 6,961 | 599 | 71 (21 mnemonics) | 10,963,718 (10.46 MiB) | |
 | v0.13.1 unpatched, a byte-swapping probe header (research, r2) | `.text` only | 6,948 / 6,961 | 599 | 71 | 10,775,590 (10.28 MiB) | 17,119,463 (16.33 MiB) |
 
+The newest row is the current state (the Wii executable was 15.04 MB before patch 0013 and 13.89 MB
+after, per the commit that added it). The smoke check needs the game's XBE, so a change to the lifter
+or the runtime header is measured again before the table is updated; the older rows come from the
+commits that added them.
+
 The unimplemented instructions are privileged or legacy ones (`in`, `out`, `cli`/`sti`,
 `pushfd`/`popfd`, `hlt`, `iretd`, `wbinvd`, `cpuid`, `aam`, `bound`, ...). Some are data decoded as
 code (the six `lock or eax, [eax]` in Halo's `.text` are not even valid: a lock needs a memory

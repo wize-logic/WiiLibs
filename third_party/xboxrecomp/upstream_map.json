@@ -785,7 +785,8 @@
    "kind": "concept",
    "license": "LGPL-2.1-or-later (xemu, upstream NOTICE)",
    "wl": [
-    "wl/xboxrt/devices.c (APU answered as idle hardware)"
+    "wl/xboxrt/devices.c (the APU idle when audio is off)",
+    "wl/xboxapu/ (written from public descriptions, not from this)"
    ],
    "status": "done",
    "notes": "never copy"
@@ -808,7 +809,7 @@
    "upstream": "src/usb/**",
    "kind": "concept",
    "wl": [
-    "wl/xboxrt/devices.c (USB answered as absent hardware)"
+    "wl/xboxrt/usb_ohci.c, usb_xid.c (the OHCI controllers and gamepads, derived: third_party/README.md)"
    ],
    "status": "done"
   },
