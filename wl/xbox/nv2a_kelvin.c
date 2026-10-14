@@ -576,8 +576,9 @@ void wl_nv2a_kelvin_init(WlNv2a *dev) {
 }
 
 // what each method is, decided once (the dispatch's tests per method, from a table): known, an
-// immediate vertex method, and its dirty group
-enum { METHOD_KNOWN = 0x8000u, METHOD_IMMEDIATE = 0x4000u, METHOD_DIRTY = 0x3FFFu };
+// immediate vertex method, plain (a value kept and nothing else: no window, no case of
+// wl_nv2a_kelvin_method's switch), and its dirty group
+enum { METHOD_KNOWN = 0x8000u, METHOD_IMMEDIATE = 0x4000u, METHOD_PLAIN = 0x2000u, METHOD_DIRTY = 0x1FFFu };
 static uint16_t g_method_info[WL_NV2A_K_METHODS / 4];
 
 static uint32_t dirty_group(uint32_t method) {
@@ -615,12 +616,63 @@ static bool known_method(uint32_t m) {
 
 static bool immediate_range(uint32_t method);
 
+// the methods wl_nv2a_kelvin_method does more with than keep their value (its switch's cases, the
+// windows, the viewport's words, the immediate vertex methods): kept in step with it
+static bool special_method(uint32_t m) {
+    static const uint16_t cases[] = {
+        WL_NV2A_K_NOTIFY,
+        WL_NV2A_K_SET_FLIP_READ,
+        WL_NV2A_K_SET_FLIP_WRITE,
+        WL_NV2A_K_SET_FLIP_MODULO,
+        WL_NV2A_K_FLIP_INCREMENT_WRITE,
+        WL_NV2A_K_FLIP_STALL,
+        WL_NV2A_K_SET_CONTEXT_DMA_NOTIFIES,
+        WL_NV2A_K_SET_CONTEXT_DMA_A,
+        WL_NV2A_K_SET_CONTEXT_DMA_B,
+        WL_NV2A_K_SET_CONTEXT_DMA_STATE,
+        WL_NV2A_K_SET_CONTEXT_DMA_COLOR,
+        WL_NV2A_K_SET_CONTEXT_DMA_ZETA,
+        WL_NV2A_K_SET_CONTEXT_DMA_VERTEX_A,
+        WL_NV2A_K_SET_CONTEXT_DMA_VERTEX_B,
+        WL_NV2A_K_SET_CONTEXT_DMA_SEMAPHORE,
+        WL_NV2A_K_SET_CONTEXT_DMA_REPORT,
+        WL_NV2A_K_SET_TRANSFORM_PROGRAM_LOAD,
+        WL_NV2A_K_SET_TRANSFORM_CONSTANT_LOAD,
+        WL_NV2A_K_SET_TRANSFORM_PROGRAM_START,
+        WL_NV2A_K_SET_TRANSFORM_EXECUTION_MODE,
+        WL_NV2A_K_CLEAR_REPORT_VALUE,
+        WL_NV2A_K_GET_REPORT,
+        WL_NV2A_K_SET_BEGIN_END,
+        WL_NV2A_K_ARRAY_ELEMENT16,
+        WL_NV2A_K_ARRAY_ELEMENT32,
+        WL_NV2A_K_DRAW_ARRAYS,
+        WL_NV2A_K_INLINE_ARRAY,
+        WL_NV2A_K_BACK_END_WRITE_SEMAPHORE_RELEASE,
+        WL_NV2A_K_CLEAR_SURFACE,
+    };
+    unsigned i;
+
+    if ((m >= WL_NV2A_K_SET_TRANSFORM_PROGRAM && m < WL_NV2A_K_SET_TRANSFORM_CONSTANT + 0x80) ||
+        (m >= WL_NV2A_K_SET_VIEWPORT_OFFSET && m <= WL_NV2A_K_SET_VIEWPORT_OFFSET + 12) ||
+        (m >= WL_NV2A_K_SET_VIEWPORT_SCALE && m <= WL_NV2A_K_SET_VIEWPORT_SCALE + 12) || immediate_range(m)) {
+        return true;
+    }
+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        if (m == cases[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void method_info_make(void) {
     uint32_t m;
 
     for (m = 0; m < WL_NV2A_K_METHODS; m += 4) {
-        g_method_info[m >> 2] = (uint16_t)((known_method(m) ? METHOD_KNOWN : 0u) |
-                                           (immediate_range(m) ? METHOD_IMMEDIATE : 0u) | dirty_group(m));
+        bool known = known_method(m);
+
+        g_method_info[m >> 2] = (uint16_t)((known ? METHOD_KNOWN : 0u) | (immediate_range(m) ? METHOD_IMMEDIATE : 0u) |
+                                           (known && !special_method(m) ? METHOD_PLAIN : 0u) | dirty_group(m));
     }
 }
 
@@ -1120,11 +1172,62 @@ static bool texcoord_method(WlNv2aKelvin *k, uint32_t method, uint32_t param) {
     return false;
 }
 
+// the generic attributes' methods (SET_VERTEX_DATA*, from WL_NV2A_K_SET_VERTEX_DATA2F_M on; the
+// four floats first, what a title sends most)
+static void vertex_data_method(WlNv2a *dev, uint32_t method, uint32_t param) {
+    WlNv2aKelvin *k = &dev->kelvin;
+    float f = word_float(param);
+
+    if (method >= WL_NV2A_K_SET_VERTEX_DATA4F_M) {
+        unsigned slot = (method - WL_NV2A_K_SET_VERTEX_DATA4F_M) >> 4, c = ((method - WL_NV2A_K_SET_VERTEX_DATA4F_M) >> 2) & 3u;
+
+        set_current(k, slot, c, f);
+        if (c == 3 && slot == 0) {
+            emit_immediate(dev);
+        }
+    } else if (method < WL_NV2A_K_SET_VERTEX_DATA2S) {
+        unsigned slot = (method - WL_NV2A_K_SET_VERTEX_DATA2F_M) >> 3, c = ((method - WL_NV2A_K_SET_VERTEX_DATA2F_M) >> 2) & 1u;
+
+        set_current(k, slot, c, f);
+        if (c == 1) {
+            k->current[slot][2] = 0.0f;
+            k->current[slot][3] = 1.0f;
+            if (slot == 0) {
+                emit_immediate(dev);
+            }
+        }
+    } else if (method < WL_NV2A_K_SET_VERTEX_DATA4UB) {
+        unsigned slot = (method - WL_NV2A_K_SET_VERTEX_DATA2S) >> 2;
+
+        set_current4(k, slot, (float)(int16_t)(param & 0xFFFFu), (float)(int16_t)(param >> 16), 0.0f, 1.0f);
+        if (slot == 0) {
+            emit_immediate(dev);
+        }
+    } else if (method < WL_NV2A_K_SET_VERTEX_DATA4S_M) {
+        unsigned slot = (method - WL_NV2A_K_SET_VERTEX_DATA4UB) >> 2;
+
+        bytes4(k, slot, param);
+        if (slot == 0) {
+            emit_immediate(dev);
+        }
+    } else {
+        unsigned slot = (method - WL_NV2A_K_SET_VERTEX_DATA4S_M) >> 3, c = ((method - WL_NV2A_K_SET_VERTEX_DATA4S_M) >> 2) & 1u;
+
+        set_current(k, slot, 2 * c, (float)(int16_t)(param & 0xFFFFu));
+        set_current(k, slot, 2 * c + 1, (float)(int16_t)(param >> 16));
+        if (c == 1 && slot == 0) {
+            emit_immediate(dev);
+        }
+    }
+}
+
 static void immediate_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     WlNv2aKelvin *k = &dev->kelvin;
     float f = word_float(param);
 
-    if (method >= WL_NV2A_K_SET_VERTEX3F && method <= WL_NV2A_K_SET_VERTEX3F + 8) {
+    if (method >= WL_NV2A_K_SET_VERTEX_DATA2F_M) {
+        vertex_data_method(dev, method, param);
+    } else if (method >= WL_NV2A_K_SET_VERTEX3F && method <= WL_NV2A_K_SET_VERTEX3F + 8) {
         unsigned c = (method - WL_NV2A_K_SET_VERTEX3F) >> 2;
 
         set_current(k, 0, c, f);
@@ -1178,46 +1281,6 @@ static void immediate_method(WlNv2a *dev, uint32_t method, uint32_t param) {
         set_current(k, 1, 0, f);
     } else if (method >= WL_NV2A_K_SET_WEIGHT4F && method <= WL_NV2A_K_SET_WEIGHT4F + 12) {
         set_current(k, 1, (method - WL_NV2A_K_SET_WEIGHT4F) >> 2, f);
-    } else if (method >= WL_NV2A_K_SET_VERTEX_DATA2F_M && method < WL_NV2A_K_SET_VERTEX_DATA2S) {
-        unsigned slot = (method - WL_NV2A_K_SET_VERTEX_DATA2F_M) >> 3, c = ((method - WL_NV2A_K_SET_VERTEX_DATA2F_M) >> 2) & 1u;
-
-        set_current(k, slot, c, f);
-        if (c == 1) {
-            k->current[slot][2] = 0.0f;
-            k->current[slot][3] = 1.0f;
-            if (slot == 0) {
-                emit_immediate(dev);
-            }
-        }
-    } else if (method >= WL_NV2A_K_SET_VERTEX_DATA2S && method < WL_NV2A_K_SET_VERTEX_DATA4UB) {
-        unsigned slot = (method - WL_NV2A_K_SET_VERTEX_DATA2S) >> 2;
-
-        set_current4(k, slot, (float)(int16_t)(param & 0xFFFFu), (float)(int16_t)(param >> 16), 0.0f, 1.0f);
-        if (slot == 0) {
-            emit_immediate(dev);
-        }
-    } else if (method >= WL_NV2A_K_SET_VERTEX_DATA4UB && method < WL_NV2A_K_SET_VERTEX_DATA4S_M) {
-        unsigned slot = (method - WL_NV2A_K_SET_VERTEX_DATA4UB) >> 2;
-
-        bytes4(k, slot, param);
-        if (slot == 0) {
-            emit_immediate(dev);
-        }
-    } else if (method >= WL_NV2A_K_SET_VERTEX_DATA4S_M && method < WL_NV2A_K_SET_VERTEX_DATA4F_M) {
-        unsigned slot = (method - WL_NV2A_K_SET_VERTEX_DATA4S_M) >> 3, c = ((method - WL_NV2A_K_SET_VERTEX_DATA4S_M) >> 2) & 1u;
-
-        set_current(k, slot, 2 * c, (float)(int16_t)(param & 0xFFFFu));
-        set_current(k, slot, 2 * c + 1, (float)(int16_t)(param >> 16));
-        if (c == 1 && slot == 0) {
-            emit_immediate(dev);
-        }
-    } else if (method >= WL_NV2A_K_SET_VERTEX_DATA4F_M && method < WL_NV2A_K_SET_VERTEX_DATA4F_M + 0x100) {
-        unsigned slot = (method - WL_NV2A_K_SET_VERTEX_DATA4F_M) >> 4, c = ((method - WL_NV2A_K_SET_VERTEX_DATA4F_M) >> 2) & 3u;
-
-        set_current(k, slot, c, f);
-        if (c == 3 && slot == 0) {
-            emit_immediate(dev);
-        }
     }
 }
 
@@ -1231,12 +1294,21 @@ static bool immediate_range(uint32_t method) {
 void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     WlNv2aKelvin *k = &dev->kelvin;
     uint32_t info;
+    bool changed;
 
     method &= WL_NV2A_K_METHODS - 4u;
     info = g_method_info[method >> 2];
     if (info == 0) {
         method_info_make();
         info = g_method_info[method >> 2];
+    }
+    if (info & METHOD_PLAIN) {
+        // (the state groups are dirty when a value changes, not when it is written again)
+        if (k->raw[method >> 2] != param) {
+            k->raw[method >> 2] = param;
+            k->dirty |= info & METHOD_DIRTY;
+        }
+        return;
     }
     if (!(info & METHOD_KNOWN)) {
         note_unhandled(dev, method, param);
@@ -1246,32 +1318,39 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     if (method >= WL_NV2A_K_SET_TRANSFORM_PROGRAM && method < WL_NV2A_K_SET_TRANSFORM_CONSTANT) {
         unsigned word = ((method - WL_NV2A_K_SET_TRANSFORM_PROGRAM) >> 2) & 3u;
 
-        if (k->program_load < WL_NV2A_PROGRAM_SLOTS) {
+        // (a word written again as it was changes nothing: no new generation, nothing dirty)
+        if (k->program_load < WL_NV2A_PROGRAM_SLOTS && k->program[k->program_load][word] != param) {
             k->program[k->program_load][word] = param;
+            k->program_generation++;
+            k->dirty |= WL_NV2A_DIRTY_PROGRAM;
         }
         if (word == 3) {
             k->program_load++;
         }
         k->program_word = word;
-        k->program_generation++;
-        k->dirty |= WL_NV2A_DIRTY_PROGRAM;
         return;
     }
     if (method >= WL_NV2A_K_SET_TRANSFORM_CONSTANT && method < WL_NV2A_K_SET_TRANSFORM_CONSTANT + 0x80) {
         unsigned word = ((method - WL_NV2A_K_SET_TRANSFORM_CONSTANT) >> 2) & 3u;
 
         if (k->constant_load < WL_NV2A_CONSTANTS) {
-            k->constants[k->constant_load][word] = word_float(param);
+            float value = word_float(param);
+
+            if (memcmp(&k->constants[k->constant_load][word], &value, sizeof value) != 0) {
+                k->constants[k->constant_load][word] = value;
+                k->constants_generation++;
+                k->dirty |= WL_NV2A_DIRTY_CONSTANTS;
+            }
         }
         if (word == 3) {
             k->constant_load++;
         }
         k->constant_word = word;
-        k->constants_generation++;
-        k->dirty |= WL_NV2A_DIRTY_CONSTANTS;
         return;
     }
 
+    // (the state groups are dirty when a value changes, not when it is written again)
+    changed = k->raw[method >> 2] != param;
     k->raw[method >> 2] = param;
     if (info & METHOD_IMMEDIATE) {
         immediate_method(dev, method, param);
@@ -1325,8 +1404,10 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
         break;
     case WL_NV2A_K_SET_TRANSFORM_PROGRAM_START:
     case WL_NV2A_K_SET_TRANSFORM_EXECUTION_MODE:
-        k->program_generation++;
-        k->dirty |= WL_NV2A_DIRTY_PROGRAM;
+        if (changed) {
+            k->program_generation++;
+            k->dirty |= WL_NV2A_DIRTY_PROGRAM;
+        }
         break;
     case WL_NV2A_K_CLEAR_REPORT_VALUE:
         if (param == WL_NV2A_REPORT_ZPASS_PIXEL_COUNT) {
@@ -1372,17 +1453,21 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
         }
         break;
     default:
-        if (method >= WL_NV2A_K_SET_VIEWPORT_OFFSET && method <= WL_NV2A_K_SET_VIEWPORT_OFFSET + 12) {
-            k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET][(method - WL_NV2A_K_SET_VIEWPORT_OFFSET) >> 2] =
-                word_float(param);
-            k->constants_generation++;
-            k->dirty |= WL_NV2A_DIRTY_VIEWPORT | WL_NV2A_DIRTY_CONSTANTS;
-        } else if (method >= WL_NV2A_K_SET_VIEWPORT_SCALE && method <= WL_NV2A_K_SET_VIEWPORT_SCALE + 12) {
-            k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE][(method - WL_NV2A_K_SET_VIEWPORT_SCALE) >> 2] =
-                word_float(param);
-            k->constants_generation++;
-            k->dirty |= WL_NV2A_DIRTY_VIEWPORT | WL_NV2A_DIRTY_CONSTANTS;
-        } else {
+        if (method >= WL_NV2A_K_SET_VIEWPORT_OFFSET && method <= WL_NV2A_K_SET_VIEWPORT_SCALE + 12 &&
+            (method <= WL_NV2A_K_SET_VIEWPORT_OFFSET + 12 || method >= WL_NV2A_K_SET_VIEWPORT_SCALE)) {
+            // (the viewport's words are constants: changed if the constant is, the window may have
+            // written it since)
+            float *slot = method >= WL_NV2A_K_SET_VIEWPORT_SCALE
+                              ? &k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE][(method - WL_NV2A_K_SET_VIEWPORT_SCALE) >> 2]
+                              : &k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET][(method - WL_NV2A_K_SET_VIEWPORT_OFFSET) >> 2];
+            float value = word_float(param);
+
+            if (memcmp(slot, &value, sizeof value) != 0) {
+                *slot = value;
+                k->constants_generation++;
+                k->dirty |= WL_NV2A_DIRTY_VIEWPORT | WL_NV2A_DIRTY_CONSTANTS;
+            }
+        } else if (changed) {
             k->dirty |= info & METHOD_DIRTY;
         }
         break;
@@ -1412,6 +1497,22 @@ void wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const
         return;
     }
     for (n = 0; n < count; n++) {
-        wl_nv2a_kelvin_method(dev, increasing ? method + 4u * n : method, wl_rd_le32(words + 4u * n));
+        uint32_t m = (increasing ? method + 4u * n : method) & (WL_NV2A_K_METHODS - 4u);
+        uint32_t param = wl_rd_le32(words + 4u * n), info = g_method_info[m >> 2];
+
+        // (a plain method's value kept here, and an immediate one's taken, as wl_nv2a_kelvin_method does)
+        if (info & METHOD_PLAIN) {
+            if (k->raw[m >> 2] != param) {
+                k->raw[m >> 2] = param;
+                k->dirty |= info & METHOD_DIRTY;
+            }
+            continue;
+        }
+        if (info & METHOD_IMMEDIATE) {
+            k->raw[m >> 2] = param;
+            immediate_method(dev, m, param);
+            continue;
+        }
+        wl_nv2a_kelvin_method(dev, m, param);
     }
 }

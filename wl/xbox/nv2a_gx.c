@@ -165,6 +165,13 @@ struct WlNv2aGx {
     unsigned xf_live;
     bool xf_eligible, xf_full;
     WlXboxVshDependencies xf_dependencies;
+    // the state the last applied draw left in GX (state_valid; device_state ends it), what has
+    // changed since (the tracker's WL_NV2A_DIRTY_* of every draw since, applied or not), whether
+    // its raster state and pixel program were exact, and whether its textures must be bound again
+    // anyway (one found changed within a frame, checked at every use, or one not bound)
+    bool state_valid;
+    uint32_t dirty;
+    bool states_exact, tev_exact, textures_volatile;
 };
 
 // ---- creation -----------------------------------------------------------------------------------
@@ -262,6 +269,7 @@ const WlXboxPshProgram *wl_nv2a_gx_last_program(const WlNv2aGx *gx, bool *used) 
 // what wl/platform's quads and the frame's start leave: everything set again before the next draw
 static void device_state(WlNv2aGx *gx) {
     wl_gx_direct_begin();
+    gx->state_valid = false;
     gx->projection_loaded = false;
     gx->xf_position = false;
     gx->xf_texgens = 0;
@@ -636,7 +644,7 @@ static const WlNv2aTexEntry *target_texture(WlNv2aGx *gx, unsigned stage, const 
 }
 
 static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
-    unsigned stage;
+    unsigned stage, wanted = 0;
 
     for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
         WlNv2aTexture t;
@@ -648,6 +656,7 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
         if (wl_nv2a_stage_program(k, stage) == WL_NV2A_STAGE_NONE || !wl_nv2a_texture(k, stage, &t)) {
             continue;
         }
+        wanted |= 1u << stage;
         e = target_texture(gx, stage, &t);
         if (e == NULL && !gx->keep_frames && is_display(gx, t.phys)) {
             // (a picture the title showed, as a texture: kept from the next frame on)
@@ -703,6 +712,12 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
             }
         }
         gx->entries[stage] = e;
+    }
+    gx->textures_volatile = false;
+    for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
+        if ((wanted & (1u << stage)) && (gx->entries[stage] == NULL || gx->entries[stage]->dynamic)) {
+            gx->textures_volatile = true;
+        }
     }
     if (gx->texture_memory_changed) {
         wl_gx_direct_texture_invalidate();
@@ -1480,6 +1495,109 @@ static float area2(const float a[2], const float b[2], const float c[2]) {
     return (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
 }
 
+// a vertex's landing (vertex_pack's x, y) into the draw's triangles' areas: what a pixel count without
+// a depth test would say
+static void landing_area(uint32_t primitive, const PackedVertex *vertex, uint32_t *seen_count, float corners[3][2],
+                         float *area) {
+    float here[2] = {vertex->x, vertex->y};
+    uint32_t seen = *seen_count;
+
+    switch (primitive) {
+    case WL_NV2A_PRIM_TRIANGLES:
+        memcpy(corners[seen % 3u], here, sizeof here);
+        if (seen % 3u == 2u) {
+            *area += fabsf(area2(corners[0], corners[1], corners[2]));
+        }
+        break;
+    case WL_NV2A_PRIM_TRIANGLE_STRIP:
+    case WL_NV2A_PRIM_QUAD_STRIP:
+        memcpy(corners[seen % 3u], here, sizeof here);
+        if (seen >= 2u) {
+            *area += fabsf(area2(corners[0], corners[1], corners[2]));
+        }
+        break;
+    case WL_NV2A_PRIM_TRIANGLE_FAN:
+    case WL_NV2A_PRIM_POLYGON:
+    case WL_NV2A_PRIM_QUADS:
+        if (primitive == WL_NV2A_PRIM_QUADS && seen % 4u == 0u) {
+            memcpy(corners[0], here, sizeof here);
+        } else if (seen == 0u) {
+            memcpy(corners[0], here, sizeof here);
+        } else {
+            if ((primitive == WL_NV2A_PRIM_QUADS ? seen % 4u : seen) >= 2u) {
+                *area += fabsf(area2(corners[0], corners[1], here));
+            }
+            memcpy(corners[1], here, sizeof here);
+        }
+        break;
+    default:
+        break;
+    }
+    *seen_count = seen + 1u;
+}
+
+// what textures_bind notes of a draw's textures for later frames, for a draw that binds none: a
+// picture the title showed, read as a texture (each frame then kept as one)
+static void display_textures_note(WlNv2aGx *gx, const WlNv2aKelvin *k) {
+    unsigned stage;
+
+    for (stage = 0; stage < WL_NV2A_TEXTURES && !gx->keep_frames; stage++) {
+        WlNv2aTexture t;
+
+        if (wl_nv2a_stage_program(k, stage) == WL_NV2A_STAGE_NONE || !wl_nv2a_texture(k, stage, &t)) {
+            continue;
+        }
+        if (target_texture(gx, stage, &t) == NULL && is_display(gx, t.phys)) {
+            gx->keep_frames = true;
+            WL_LOG_I(TAG, "a displayed surface (%08x) is read as a texture: each frame is kept as one",
+                     (unsigned)t.phys);
+        }
+    }
+}
+
+// A draw that writes nothing GX keeps (no colour channel, no depth write: an occlusion query's
+// quad), counting pixels: only the count is made, the program run for the positions and their
+// landings as backend_draw makes them; no state, texture, program or primitive goes to GX (GX keeps
+// the last drawn draw's, and what changed is kept for the next). The projection is fitted as for a
+// drawn draw (its fits are kept for later draws). The pixels counted, the same as when it was drawn.
+static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw,
+                                const WlNv2aSurface *surface) {
+    DrawPlan plan;
+    float corners[3][2], area = 0.0f;
+    uint32_t v, seen = 0, first = 0;
+
+    memset(&plan, 0, sizeof plan);
+    plan.live = WL_XBOX_VSH_LIVE_POSITION;
+    plan.sx = (float)surface->samples_x;
+    plan.sy = (float)surface->samples_y;
+    plan.to_sx = power_of_two(surface->samples_x) ? 1.0f / plan.sx : 0.0f;
+    plan.to_sy = power_of_two(surface->samples_y) ? 1.0f / plan.sy : 0.0f;
+    plan.landing = true;
+    plan.depth_max = surface->depth_max > 0.0f ? surface->depth_max : 16777215.0f;
+    plan.scale = k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE];
+    plan.offset = k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET];
+    gx->projection = projection_fit(gx, k, draw, plan.depth_max);
+    gx->memo_stamp++;
+    wl_nv2a_fetch_plan(draw, wl_nv2a_pipeline_inputs(&gx->pipeline, plan.live), &gx->fetch);
+    wl_nv2a_fetch_constants(&gx->fetch, k, gx->batch.inputs, WL_XBOX_VSH_BATCH);
+    for (v = 0; v < draw->count; v++) {
+        unsigned n = (v - first) % WL_XBOX_VSH_BATCH;
+
+        if (n == 0) {
+            first = v;
+            vertices_make(gx, k, draw, v, draw->count - v < WL_XBOX_VSH_BATCH ? draw->count - v : WL_XBOX_VSH_BATCH,
+                          &plan);
+        }
+        landing_area(draw->primitive, gx->batch.vertices[n], &seen, corners, &area);
+    }
+    gx->stats.unwritten_counted++;
+    {
+        float most = (float)gx->view_w * (float)gx->view_h, pixels = area * 0.5f;
+
+        return (uint32_t)(pixels > most ? most : pixels);
+    }
+}
+
 static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
     WlNv2aGx *gx = user;
     WlNv2aSurface surface;
@@ -1490,7 +1608,10 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     float corners[3][2], area = 0.0f;
     uint32_t v, seen = 0, first = 0, attributes;
     unsigned stage;
+    bool rebind;
 
+    // (what changed since the last draw, kept until a draw applies it)
+    gx->dirty |= k->dirty;
     if (wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_TEST_ENABLE)) {
         // GX has no stencil. A pass that writes only the stencil (no colour, no depth) draws
         // nothing GX can keep, and is skipped; any other is drawn as if its test passed, as
@@ -1511,9 +1632,43 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     }
     gx->stats.draws++;
     gx->stats.vertices += draw->count;
-    exact = states_apply(gx, k, &surface);
-    textures_bind(gx, k);
-    exact = tev_setup(gx, k) && exact;
+    if ((wl_nv2a_k(k, WL_NV2A_K_SET_COLOR_MASK) & 0x01010101u) == 0 && wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_MASK) == 0) {
+        // (nothing written: its pixel count alone, or nothing)
+        display_textures_note(gx, k);
+        if (count_pixels && gx->pipeline.program != NULL) {
+            return unwritten_count(gx, k, draw, &surface);
+        }
+        if (!count_pixels) {
+            gx->stats.unwritten_skipped++;
+            return 0;
+        }
+    }
+    // the state GX keeps from the last draw that applied it, applied again where it changed: the
+    // raster state (its methods, the surface's depth buffer), the textures (theirs, the combiners'
+    // stage programs; one changing within frames always), the pixel program (the combiners, the
+    // textures bound, the fog)
+    if (!gx->state_valid || (gx->dirty & (WL_NV2A_DIRTY_RASTER | WL_NV2A_DIRTY_SURFACE))) {
+        gx->states_exact = states_apply(gx, k, &surface);
+    } else {
+        gx->stats.raster_kept++;
+    }
+    rebind = !gx->state_valid || gx->textures_volatile || (gx->dirty & (WL_NV2A_DIRTY_TEXTURES | WL_NV2A_DIRTY_COMBINERS));
+    if (rebind) {
+        textures_bind(gx, k);
+    } else {
+        gx->stats.textures_kept++;
+    }
+    if (rebind || !gx->state_valid || (gx->dirty & WL_NV2A_DIRTY_RASTER)) {
+        gx->tev_exact = tev_setup(gx, k);
+    } else {
+        gx->stats.combiners_kept++;
+        if (!gx->last_used) {
+            gx->stats.programs_unusable++;
+        }
+    }
+    gx->state_valid = true;
+    gx->dirty = 0;
+    exact = gx->states_exact && gx->tev_exact;
     if (!exact) {
         gx->stats.approximations++;
     }
@@ -1641,41 +1796,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
         vertex = gx->batch.vertices[n];
         wl_gx_direct_vertex_words(vertex->w, plan.words);
         if (count_pixels) {
-            // (the triangles' areas: what a pixel count without a depth test would say)
-            float here[2] = {vertex->x, vertex->y};
-
-            switch (draw->primitive) {
-            case WL_NV2A_PRIM_TRIANGLES:
-                memcpy(corners[seen % 3u], here, sizeof here);
-                if (seen % 3u == 2u) {
-                    area += fabsf(area2(corners[0], corners[1], corners[2]));
-                }
-                break;
-            case WL_NV2A_PRIM_TRIANGLE_STRIP:
-            case WL_NV2A_PRIM_QUAD_STRIP:
-                memcpy(corners[seen % 3u], here, sizeof here);
-                if (seen >= 2u) {
-                    area += fabsf(area2(corners[0], corners[1], corners[2]));
-                }
-                break;
-            case WL_NV2A_PRIM_TRIANGLE_FAN:
-            case WL_NV2A_PRIM_POLYGON:
-            case WL_NV2A_PRIM_QUADS:
-                if (draw->primitive == WL_NV2A_PRIM_QUADS && seen % 4u == 0u) {
-                    memcpy(corners[0], here, sizeof here);
-                } else if (seen == 0u) {
-                    memcpy(corners[0], here, sizeof here);
-                } else {
-                    if ((draw->primitive == WL_NV2A_PRIM_QUADS ? seen % 4u : seen) >= 2u) {
-                        area += fabsf(area2(corners[0], corners[1], here));
-                    }
-                    memcpy(corners[1], here, sizeof here);
-                }
-                break;
-            default:
-                break;
-            }
-            seen++;
+            landing_area(draw->primitive, vertex, &seen, corners, &area);
         }
     }
     wl_gx_direct_primitive_end();
@@ -1742,6 +1863,7 @@ static void backend_frame_done(void *user, const WlNv2aKelvin *k) {
     WlNv2aGx *gx = user;
 
     (void)k;
+    gx->state_valid = false;
     if (gx->frame_open && gx->back_drawn) {
         wl_nv2a_gx_present(gx);
     }
@@ -1751,6 +1873,8 @@ static void backend_flip(void *user, const WlNv2aKelvin *k, uint32_t phys) {
     WlNv2aGx *gx = user;
 
     (void)k;
+    // (a surface shown: textures at its address are looked at again)
+    gx->state_valid = false;
     if (!is_display(gx, phys)) {
         gx->displays[gx->display_next] = phys;
         gx->display_next = (gx->display_next + 1u) % 4u;
