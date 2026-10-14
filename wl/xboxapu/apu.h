@@ -51,7 +51,7 @@ typedef struct {
 
 void wl_xbox_apu_config_default(WlXboxApuConfig *cfg);
 
-// NULL when out of memory (about 30 KB: the voices' decoder state).
+// NULL when out of memory (about 160 KB: the voices' decoder state, the frame's mix).
 WlXboxApu *wl_xbox_apu_create(const WlXboxApuConfig *cfg);
 void wl_xbox_apu_destroy(WlXboxApu *apu);
 

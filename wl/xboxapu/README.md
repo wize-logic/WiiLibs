@@ -36,7 +36,7 @@ What the model does:
   xboxdevwiki gives, sustain, an exponential release to -60 dB; counts of 16 frames a unit),
   fetches samples (8-bit unsigned, 16-, 24- and 32-bit PCM through the 4 KB buffer pages, or a
   stream's segments; Xbox ADPCM, 36 bytes a channel and 64 samples a block, decoded with
-  `wl/audio`'s IMA step), resamples them by its pitch (2^(p/4096) source samples a sample, linear
+  `wl/audio`'s IMA step, its difference kept in 16 bits), resamples them by its pitch (2^(p/4096) source samples a sample, linear
   interpolation; the pitch envelope adds its share), and adds them to its eight target bins at
   their volumes (12 bits of 1/64 dB; ramped over the frame). Stereo voices send even targets the
   left and odd ones the right; a 3D-list voice's first four targets go to the HRTF submix bins; a
@@ -84,12 +84,15 @@ mix is the sound.
 
 ## Cost
 
-Measured with a benchmark of the model (a mix of stereo ADPCM at 44.1 kHz, mono ADPCM at 22 kHz and
-PCM16 voices): on the host (x86-64, -O2) about 0.3 us a voice a frame; on 32-bit PowerPC (-O2
--mcpu=750, the Wii's code; instructions counted under qemu) about 1200 instructions a frame plus
-3500 a voice. Halo's main menu plays three voices (its music, a stereo ADPCM stream at 44.1 kHz,
-and two silent loops DirectSound keeps running, which cost little: a silent frame is not mixed):
-11 800 instructions a frame, 18 million a second, a few percent of the Wii's 729 MHz.
+`tests/xboxapu/bench_xboxapu.c` plays a scene shaped like what Halo plays in a level: 26 voices a
+frame, most of them mono ADPCM streams near 22 kHz sent to three bins, stereo ADPCM loops at
+44.1 kHz, 16-bit PCM voices with five or six targets, a few silent, some moving, and one of each
+rarer case. On 32-bit PowerPC (-O2 -mcpu=750, the Wii's code; instructions counted under qemu with
+`tools/qemu_icount.py`) it costs about 50 000 instructions a frame, 1900 a voice (90 000 before
+the voice processor was made for the Wii: ADPCM a block at a time through one table, gains worked
+out only when they change, the bins' additions made together up to eight voices a pass, a
+multiply-high for each), 75 million a second at 1500 frames; on the host (x86-64, -O2) about
+4 us a frame. Its checksum over 3000 frames (a ctest) pins the bins and the output bit for bit.
 
 ## Tests
 

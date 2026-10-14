@@ -102,6 +102,8 @@ WlXboxApu *wl_xbox_apu_create(const WlXboxApuConfig *cfg) {
     for (uint32_t b = 0; b < WL_XBOX_APU_BINS; b++) { // at most 1.0: the mix stays in 32 bits
         apu->cfg.mix_left[b] = apu->cfg.mix_left[b] > 32768u ? 32768u : apu->cfg.mix_left[b];
         apu->cfg.mix_right[b] = apu->cfg.mix_right[b] > 32768u ? 32768u : apu->cfg.mix_right[b];
+        apu->out_left |= (uint32_t)(apu->cfg.mix_left[b] != 0) << b;
+        apu->out_right |= (uint32_t)(apu->cfg.mix_right[b] != 0) << b;
     }
     wl_apu_vp_init();
     reset(apu);
@@ -524,36 +526,60 @@ static void gp_command(WlXboxApu *apu) {
 
 // ---- Frames ------------------------------------------------------------------------------------
 
-static int16_t clip16(WlXboxApu *apu, int32_t v) {
-    if (v > 32767 || v < -32768) {
-        apu->stats.clipped++;
-        return v > 0 ? 32767 : -32768;
+// A bin's sample for the stereo mix: a bin beyond twice full scale clips anyway; keeping it to 17
+// bits keeps the products in 32 (the Wii's processor has no 64-bit multiply).
+static inline int32_t bin17(int32_t v) {
+    return v > 65535 ? 65535 : v < -65535 ? -65535 : v;
+}
+
+// One side's sum: acc[i] += (bin[i] x g) >> 15 for the bins in `bins` (bit b: bin b) with their
+// weights.
+static void mix_side(const WlXboxApu *apu, uint32_t bins, const uint16_t *weight, int32_t *acc) {
+    for (uint32_t b = 0; bins != 0; b++, bins >>= 1) {
+        if ((bins & 1u) == 0) {
+            continue;
+        }
+        const int32_t *bin = apu->mix[b], g = weight[b];
+        if (g == 32768) { // (s x 2^15) >> 15 is s
+            for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i += 4u) {
+                acc[i] += bin17(bin[i]);
+                acc[i + 1u] += bin17(bin[i + 1u]);
+                acc[i + 2u] += bin17(bin[i + 2u]);
+                acc[i + 3u] += bin17(bin[i + 3u]);
+            }
+            continue;
+        }
+        for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i += 4u) {
+            acc[i] += (bin17(bin[i]) * g) >> 15;
+            acc[i + 1u] += (bin17(bin[i + 1u]) * g) >> 15;
+            acc[i + 2u] += (bin17(bin[i + 2u]) * g) >> 15;
+            acc[i + 3u] += (bin17(bin[i + 3u]) * g) >> 15;
+        }
     }
-    return (int16_t)v;
+}
+
+// Each output side (16 bits, clipped and counted) of its sum.
+static void out_side(WlXboxApu *apu, const int32_t *acc, int16_t *out) {
+    for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
+        int32_t v = acc[i];
+        if ((uint32_t)(v + 32768) > 65535u) {
+            apu->stats.clipped++;
+            v = v > 0 ? 32767 : -32768;
+        }
+        out[2u * i] = (int16_t)v;
+    }
 }
 
 static void mix_out(WlXboxApu *apu, int16_t *out) {
+    // the bins mixed this frame with a weight on a side (the others add nothing to it)
     int32_t l[WL_XBOX_APU_FRAME], r[WL_XBOX_APU_FRAME];
-    memset(l, 0, sizeof l);
-    memset(r, 0, sizeof r);
-    for (uint32_t b = 0; b < WL_XBOX_APU_BINS; b++) {
-        const int32_t gl = apu->cfg.mix_left[b], gr = apu->cfg.mix_right[b];
-        if ((gl == 0 && gr == 0) || !(apu->mix_used & (1u << b))) {
-            continue; // not mixed, or silent this frame
-        }
-        const int32_t *bin = apu->mix[b];
-        for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
-            // a bin beyond twice full scale clips anyway: keeping it to 17 bits keeps the products
-            // in 32 (the Wii's processor has no 64-bit multiply)
-            const int32_t s = bin[i] > 65535 ? 65535 : bin[i] < -65535 ? -65535 : bin[i];
-            l[i] += (s * gl) >> 15;
-            r[i] += (s * gr) >> 15;
-        }
-    }
     for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
-        out[2u * i] = clip16(apu, l[i]);
-        out[2u * i + 1u] = clip16(apu, r[i]);
+        l[i] = r[i] = 0;
     }
+    mix_side(apu, apu->out_left & apu->mix_used, apu->cfg.mix_left, l);
+    mix_side(apu, apu->out_right & apu->mix_used, apu->cfg.mix_right, r);
+    out_side(apu, l, out);
+    out_side(apu, r, out + 1);
 }
 
 uint32_t wl_xbox_apu_run(WlXboxApu *apu, uint32_t frames, int16_t *out) {
