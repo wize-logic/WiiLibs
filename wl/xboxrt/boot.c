@@ -298,13 +298,14 @@ static const char *play_setting(const WlXbTitleConfig *cfg) {
 }
 
 // The GPU's options from the title's folder: a file "noxf" (or WL_XB_NO_XF on the host) keeps GX's
-// transform unit out of the vertices, for an A/B on the console; a file "vcache" (its text the KB,
-// 1024 when empty; WL_XB_VCACHE_KB on the host) keeps the static geometry's vertex arrays for GX to
-// read by index, in the end of the textures' arena.
+// transform unit out of the vertices, for an A/B on the console. The static geometry's vertex
+// arrays are kept for GX to read by index, 1 MB of them in the end of the textures' arena (a10 kept
+// at most 843 KB on the Wii); a file "vcache" sets the KB (its text, 1024 when empty), a file
+// "novcache" turns them off (WL_XB_VCACHE_KB on the host, 0 for off).
 static void gpu_options(const WlXbTitleConfig *cfg) {
     char flag[WL_FS_PATH_MAX];
     bool no_xf;
-    uint32_t vcache_kb = 0;
+    uint32_t vcache_kb = 1024u;
     WlPlatformFile *vf = NULL;
 
     snprintf(flag, sizeof flag, "%s/noxf", cfg->title_dir);
@@ -323,6 +324,10 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
         text[got] = '\0';
         vcache_kb = (uint32_t)strtoul(text, NULL, 10);
         vcache_kb = vcache_kb != 0 ? vcache_kb : 1024u;
+    }
+    snprintf(flag, sizeof flag, "%s/novcache", cfg->title_dir);
+    if (wl_platform_fs_exists(flag)) {
+        vcache_kb = 0;
     }
 #if !defined(__wii__)
     if (getenv("WL_XB_VCACHE_KB") != NULL) {
