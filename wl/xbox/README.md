@@ -227,11 +227,15 @@ even, so its winding holds).
   smooth; DXT3/5's alpha a separate I4; P8 as C8 with a TLUT; a cube map made into psh's sphere
   map), kept by (address, format, size, palette) within a budget (4 MiB by default) or in an arena
   of their own (a heap over it, best fit: a texture makes room by emptying the oldest window of
-  the arena wide enough for it, not every image by age; one without room is not tried again in that
-  frame), and checked once a frame (every use once found
+  the arena wide enough for it, not every image by age; one without room even so is kept smaller,
+  from its next mip level or a halved sphere map, up to three levels down, and made whole again
+  once textures not drawn for 60 frames give way; one with no smaller image is not tried again in
+  that frame), and checked once a frame (every use once found
   rewritten): through a write watch where the caller has one (the runtime's MMU: a texture whose
   pages saw no store is as it was, its texels not read; one whose pages did is hashed, or made
-  again if large), else by a hash of the guest's texels (XXH32's rounds: 32-bit multiplies).
+  again if large), else by a hash of the guest's texels (XXH32's rounds: 32-bit multiplies). A
+  capture begun inside a frame has the textures and vertex arrays checked before it read again at
+  their next use.
 - **The pipeline** (`nv2a_pipeline.h`) is what the GX backend does on the processor: programs
   compiled and kept, vertices run (or the fixed function's composite matrix), the NV2A's fog modes,
   what psh is told of the textures, each stage's GX coordinates, the GX mappings of the raster state.

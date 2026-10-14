@@ -223,11 +223,12 @@ static void gpu_status(void) {
              (unsigned)gs.stencil_skipped, (unsigned)gs.stencil_ignored, (unsigned)gs.programs_unusable,
              (unsigned)gs.approximations);
     WL_LOG_I(TAG, "status: depth fits %u made, %u shared; textures %u KB kept (%u KB drawn in the last frame, "
-             "%u KB at most), %u converted, %u made again, %u failed (%u for memory), %u evicted; %u checks, %u by "
-             "the write watch, %u hashes (%u KB)",
+             "%u KB at most), %u converted, %u made again, %u failed (%u for memory), %u kept smaller (%u made whole "
+             "again), %u evicted; %u checks, %u by the write watch, %u hashes (%u KB)",
              (unsigned)gs.fits_made, (unsigned)gs.fits_shared, (unsigned)(ts.bytes / 1024u),
              (unsigned)(ts.frame_bytes / 1024u), (unsigned)(ts.peak_frame_bytes / 1024u), (unsigned)ts.converted,
-             (unsigned)ts.reconverted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.evicted,
+             (unsigned)ts.reconverted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.reduced,
+             (unsigned)ts.restored, (unsigned)ts.evicted,
              (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed, (unsigned)(ts.hashed_bytes >> 10));
     if (wl_nv2a_vcache_on(wl_nv2a_gx_vertex_cache(g_gx))) {
         WlNv2aVCacheStats vs;

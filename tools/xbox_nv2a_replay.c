@@ -794,10 +794,12 @@ int main(int argc, char **argv) {
             wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
             vertex_cache_line("");
             printf("textures: %u lookups, %u checks (%u by the write watch), %u hashes (%llu bytes), %u converted, "
-                   "%u made again, %u evicted, %u failed (%u for memory); %u KB kept, %u KB drawn in a frame at most\n",
+                   "%u made again, %u evicted, %u failed (%u for memory), %u kept smaller (%u made whole again); %u KB kept, "
+                   "%u KB drawn in a frame at most\n",
                    (unsigned)ts.lookups, (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed,
                    (unsigned long long)ts.hashed_bytes, (unsigned)ts.converted, (unsigned)ts.reconverted,
-                   (unsigned)ts.evicted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)(ts.bytes >> 10),
+                   (unsigned)ts.evicted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.reduced,
+                   (unsigned)ts.restored, (unsigned)(ts.bytes >> 10),
                    (unsigned)(ts.peak_frame_bytes >> 10));
         }
         wl_gxsoft_stats(&ss);

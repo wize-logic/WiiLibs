@@ -335,6 +335,21 @@ static bool unchanged(WlNv2aVCache *cache, WlNv2a *dev, WlNv2aVCacheEntry *e, co
     return hash == e->hash;
 }
 
+// A capture begun: the arrays checked before it are checked again at their next use, so the capture
+// reads every array its draws read (as the texture cache does).
+static void capture_note(WlNv2aVCache *cache, const WlNv2a *dev) {
+    bool running = wl_nv2a_capture_running(dev);
+
+    if (running && !cache->capturing) {
+        unsigned i;
+
+        for (i = 0; i < WL_NV2A_VCACHE_ENTRIES; i++) {
+            cache->entries[i].checked_frame = 0; // (frames count from 1)
+        }
+    }
+    cache->capturing = running;
+}
+
 // a new entry for [first, first + count) of the array, converted
 static WlNv2aVCacheEntry *make(WlNv2aVCache *cache, WlNv2a *dev, const WlNv2aVCacheEntry *key, uint32_t first,
                                uint32_t count, const WlNv2aVCacheEntry *spare) {
@@ -378,6 +393,7 @@ const void *wl_nv2a_vcache_get(WlNv2aVCache *cache, WlNv2a *dev, const WlNv2aAtt
         return NULL;
     }
     cache->stats.lookups++;
+    capture_note(cache, dev);
     if ((kind == WL_NV2A_VCACHE_POSITION && (attrib->type != WL_NV2A_VTX_F || attrib->size != 3)) ||
         (kind == WL_NV2A_VCACHE_TEXCOORD && (attrib->size == 0 || attrib->size > 2)) ||
         wl_nv2a_attrib_bytes(attrib->type, attrib->size) == 0 || last - first >= WL_NV2A_VCACHE_SPAN) {

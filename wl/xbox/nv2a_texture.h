@@ -76,6 +76,11 @@ typedef struct WlNv2aGxLayout {
 // What the texture becomes on GX: false when it cannot (a format not known, a size GX cannot
 // show). `mipmaps`: keep the levels (the sampler uses them).
 bool wl_nv2a_texture_layout(const WlNv2aTexture *t, bool mipmaps, WlNv2aGxLayout *out);
+// The same texture smaller, for want of memory: `skip` more of its largest levels left out (the
+// guest's own smaller levels, first_level on; none under 8 texels a side; not a linear texture), a
+// cube map's sphere halved `skip` times (down to 8 x 8). Coordinates are unchanged (normalized).
+// false when the texture has no image that small.
+bool wl_nv2a_texture_layout_reduced(const WlNv2aTexture *t, bool mipmaps, uint32_t skip, WlNv2aGxLayout *out);
 // Converts the texture (its guest bytes `src`, total_bytes of them; `palette` a P8's entries, or
 // NULL) into `dst` (layout->total_bytes, 32-byte aligned). `scratch` takes
 // wl_nv2a_texture_scratch_bytes of the texture for the decoding. false on bad input.

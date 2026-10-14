@@ -38,6 +38,8 @@ WlResult wl_nv2a_capture_begin(WlNv2a *dev, const WlNv2aCaptureSink *sink);
 void wl_nv2a_capture_end(WlNv2a *dev);
 // armed (waiting for its first flip) or running
 bool wl_nv2a_capture_active(const WlNv2a *dev);
+// running (past its first flip: recording)
+bool wl_nv2a_capture_running(const WlNv2a *dev);
 
 // ---- replay -----------------------------------------------------------------------------------
 typedef struct WlNv2aReplayHooks {

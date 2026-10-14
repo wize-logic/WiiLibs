@@ -287,9 +287,10 @@ int wl_xb_bench_run(const char *setting, const char *base_dir) {
         wl_nv2a_gx_stats(gx, &gs);
         wl_nv2a_texcache_stats(wl_nv2a_gx_textures(gx), &ts);
         wl_xb_mem_stats(&ms);
-        WL_LOG_I(TAG, "textures: %u converted, %u made again, %u evicted, %u failed (%u for memory); %u checks, %u by "
-                 "the write watch, %u hashes (%u KB); %u KB kept", (unsigned)ts.converted, (unsigned)ts.reconverted,
-                 (unsigned)ts.evicted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.checks,
+        WL_LOG_I(TAG, "textures: %u converted, %u made again, %u evicted, %u failed (%u for memory), %u kept smaller "
+                 "(%u made whole again); %u checks, %u by the write watch, %u hashes (%u KB); %u KB kept",
+                 (unsigned)ts.converted, (unsigned)ts.reconverted, (unsigned)ts.evicted, (unsigned)ts.failed,
+                 (unsigned)ts.no_memory, (unsigned)ts.reduced, (unsigned)ts.restored, (unsigned)ts.checks,
                  (unsigned)ts.watched, (unsigned)ts.hashed, (unsigned)(ts.hashed_bytes >> 10),
                  (unsigned)(ts.bytes >> 10));
         WL_LOG_I(TAG, "guest memory: %u frames (%u free), %u evictions, %u swap-ins, %u swap-outs, %u ms in the swap "

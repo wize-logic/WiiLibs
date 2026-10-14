@@ -256,6 +256,22 @@ static bool watching(const WlNv2aTexCache *cache, const WlNv2a *dev) {
     return cache->cfg.watch != NULL && !wl_nv2a_capture_active(dev);
 }
 
+// A capture begun: the textures checked before it (in the frame it began in: the cache's frames end
+// at the backend's present, not at the flip the capture starts at) are checked again at their next
+// use, so the capture reads the texels of every texture its draws read.
+static void capture_note(WlNv2aTexCache *cache, const WlNv2a *dev) {
+    bool running = wl_nv2a_capture_running(dev);
+
+    if (running && !cache->capturing) {
+        unsigned i;
+
+        for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
+            cache->entries[i].checked_frame = 0; // (frames count from 1)
+        }
+    }
+    cache->capturing = running;
+}
+
 // The watch armed over the texture's texels and palette (before they are read): its stamp, 0 when
 // there is none.
 static uint32_t watch_arm(WlNv2aTexCache *cache, const WlNv2aTexture *t) {
@@ -608,6 +624,90 @@ static bool convert(WlNv2aTexCache *cache, WlNv2aTexEntry *e, const WlNv2aTextur
     return true;
 }
 
+// Room for a texture kept smaller to be made whole: free memory, else the images of textures not
+// drawn for WL_NV2A_TEXCACHE_RESTORE_FRAMES frames given back (the least recently drawn first),
+// never one the frames draw now. NULL when even that does not make room.
+static void *image_stale(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTexEntry *keep) {
+    void *image = image_alloc(cache, bytes);
+
+    while (image == NULL) {
+        WlNv2aTexEntry *e = oldest(cache, keep, true);
+
+        if (e == NULL || cache->frame - e->used_frame < WL_NV2A_TEXCACHE_RESTORE_FRAMES || !evict(cache, e)) {
+            return NULL;
+        }
+        image = image_alloc(cache, bytes);
+    }
+    return image;
+}
+
+// A texture kept smaller for want of memory, as it was: made whole again when there is room for it
+// (image_stale; with its smaller image given back first when only that makes the room, the smaller
+// one made again where it fails), tried at its first use in a frame (the GPU has finished with the
+// smaller image) once in WL_NV2A_TEXCACHE_RESTORE_FRAMES. `src` and `palette` its guest bytes when
+// they were read (NULL: read now). *made true when its image was made anew; false when the entry
+// is gone (no memory even for the smaller image again, or bad texels).
+static bool restore(WlNv2aTexCache *cache, WlNv2a *dev, WlNv2aTexEntry *e, const WlNv2aTexture *t, bool drawn_now,
+                    const uint8_t *src, const uint8_t *palette, bool *made) {
+    WlNv2aGxLayout whole, small = e->layout;
+    void *image;
+
+    if (e->reduced == 0 || drawn_now || cache->frame - e->restore_frame < WL_NV2A_TEXCACHE_RESTORE_FRAMES) {
+        return true;
+    }
+    e->restore_frame = cache->frame;
+    if (!wl_nv2a_texture_layout(t, e->mipmaps != 0, &whole)) {
+        return true;
+    }
+    if (src == NULL) {
+        src = wl_nv2a_phys(dev, t->phys, t->total_bytes);
+        palette = t->palette_entries != 0 ? wl_nv2a_phys(dev, t->palette_phys, 4u * t->palette_entries) : NULL;
+        if (src == NULL) {
+            return true;
+        }
+    }
+    image = image_stale(cache, whole.total_bytes, e);
+    if (made != NULL) {
+        *made = true; // (from here on its image is made anew, or it is gone)
+    }
+    if (image != NULL) {
+        image_free(cache, e->image);
+    } else {
+        // (the smaller image beside the room: given back, and made again if the whole one still
+        // finds none)
+        image_free(cache, e->image);
+        image = image_alloc(cache, whole.total_bytes);
+        if (image == NULL) {
+            image = image_alloc(cache, small.total_bytes);
+            e->image = image;
+            if (image == NULL || !convert(cache, e, t, src, palette)) {
+                if (image != NULL) {
+                    image_free(cache, image);
+                }
+                e->image = NULL;
+                cache->stats.bytes -= small.total_bytes;
+                unlink_entry(cache, e);
+                memset(e, 0, sizeof *e);
+                return false;
+            }
+            return true;
+        }
+    }
+    e->image = image;
+    e->layout = whole;
+    cache->stats.bytes += whole.total_bytes - small.total_bytes;
+    if (!convert(cache, e, t, src, palette)) {
+        image_free(cache, image);
+        cache->stats.bytes -= whole.total_bytes;
+        unlink_entry(cache, e);
+        memset(e, 0, sizeof *e);
+        return false;
+    }
+    e->reduced = 0;
+    cache->stats.restored++;
+    return true;
+}
+
 const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, const WlNv2aTexture *t,
                                            bool mipmaps, bool *made) {
     WlNv2aTexEntry *e;
@@ -616,12 +716,14 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     uint32_t stamp;
     WlNv2aGxLayout layout;
     bool large;
+    uint32_t reduced;
 
     if (made != NULL) {
         *made = false;
     }
     cache->stats.lookups++;
     mipmaps = mipmaps && t->levels > 1; // (one level: the same image either way)
+    capture_note(cache, dev);
     e = find(cache, t, mipmaps);
     if (e != NULL && e->checked_frame == cache->frame && !e->dynamic) {
         e->used_frame = cache->frame;
@@ -631,6 +733,10 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     cache->stats.checks++;
     if (e != NULL && e->stamp != 0 && watching(cache, dev) && !watch_written(cache, e, t)) {
         // no store to its pages since it was checked: as it was
+        if (!restore(cache, dev, e, t, e->used_frame == cache->frame, NULL, NULL, made)) {
+            cache->stats.failed++;
+            return NULL;
+        }
         e->checked_frame = cache->frame;
         e->used_frame = cache->frame;
         cache->stats.hits++;
@@ -667,6 +773,10 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
         if (!large) {
             hash = hash_texels(cache, src, t->total_bytes);
             if (e->hash == hash && e->palette_hash == palette_hash) {
+                if (!restore(cache, dev, e, t, drawn_now, src, palette, made)) {
+                    cache->stats.failed++;
+                    return NULL;
+                }
                 cache->stats.hits++;
                 return e;
             }
@@ -712,6 +822,22 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
         return NULL;
     }
     e->image = image_for(cache, layout.total_bytes, NULL);
+    e->reduced = 0;
+    for (reduced = 1; e->image == NULL && reduced <= WL_NV2A_TEXCACHE_REDUCE_MAX; reduced++) {
+        // (no room even with the images not drawn in this frame given back: kept smaller)
+        WlNv2aGxLayout smaller;
+
+        if (!wl_nv2a_texture_layout_reduced(t, mipmaps, reduced, &smaller)) {
+            break;
+        }
+        e->image = image_for(cache, smaller.total_bytes, NULL);
+        if (e->image != NULL) {
+            layout = smaller;
+            e->reduced = (uint8_t)reduced;
+            e->restore_frame = cache->frame;
+            cache->stats.reduced++;
+        }
+    }
     if (e->image == NULL) {
         refuse(cache, t, layout.total_bytes);
         cache->stats.failed++;
