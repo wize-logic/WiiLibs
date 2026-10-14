@@ -34,7 +34,10 @@ typedef struct WlNv2aDma {
     uint32_t valid; // the object was found in instance memory (else base 0, no limit)
 } WlNv2aDma;
 
-// what changed since the last draw (WlNv2aKelvin.dirty: the backend clears what it consumed)
+// what changed since the last draw (WlNv2aKelvin.dirty, cleared after each draw: a backend keeps its
+// own if it needs more): a group is dirty when one of its values changes, not when a method writes
+// the value it had (a title's Direct3D sends whole state blocks again), and the program and
+// constants' generations move the same way
 enum {
     WL_NV2A_DIRTY_SURFACE = 1u << 0,
     WL_NV2A_DIRTY_RASTER = 1u << 1, // blend, depth, alpha test, cull, masks, stencil, fog

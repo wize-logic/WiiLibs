@@ -1231,6 +1231,7 @@ static bool immediate_range(uint32_t method) {
 void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     WlNv2aKelvin *k = &dev->kelvin;
     uint32_t info;
+    bool changed;
 
     method &= WL_NV2A_K_METHODS - 4u;
     info = g_method_info[method >> 2];
@@ -1246,32 +1247,39 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     if (method >= WL_NV2A_K_SET_TRANSFORM_PROGRAM && method < WL_NV2A_K_SET_TRANSFORM_CONSTANT) {
         unsigned word = ((method - WL_NV2A_K_SET_TRANSFORM_PROGRAM) >> 2) & 3u;
 
-        if (k->program_load < WL_NV2A_PROGRAM_SLOTS) {
+        // (a word written again as it was changes nothing: no new generation, nothing dirty)
+        if (k->program_load < WL_NV2A_PROGRAM_SLOTS && k->program[k->program_load][word] != param) {
             k->program[k->program_load][word] = param;
+            k->program_generation++;
+            k->dirty |= WL_NV2A_DIRTY_PROGRAM;
         }
         if (word == 3) {
             k->program_load++;
         }
         k->program_word = word;
-        k->program_generation++;
-        k->dirty |= WL_NV2A_DIRTY_PROGRAM;
         return;
     }
     if (method >= WL_NV2A_K_SET_TRANSFORM_CONSTANT && method < WL_NV2A_K_SET_TRANSFORM_CONSTANT + 0x80) {
         unsigned word = ((method - WL_NV2A_K_SET_TRANSFORM_CONSTANT) >> 2) & 3u;
 
         if (k->constant_load < WL_NV2A_CONSTANTS) {
-            k->constants[k->constant_load][word] = word_float(param);
+            float value = word_float(param);
+
+            if (memcmp(&k->constants[k->constant_load][word], &value, sizeof value) != 0) {
+                k->constants[k->constant_load][word] = value;
+                k->constants_generation++;
+                k->dirty |= WL_NV2A_DIRTY_CONSTANTS;
+            }
         }
         if (word == 3) {
             k->constant_load++;
         }
         k->constant_word = word;
-        k->constants_generation++;
-        k->dirty |= WL_NV2A_DIRTY_CONSTANTS;
         return;
     }
 
+    // (the state groups are dirty when a value changes, not when it is written again)
+    changed = k->raw[method >> 2] != param;
     k->raw[method >> 2] = param;
     if (info & METHOD_IMMEDIATE) {
         immediate_method(dev, method, param);
@@ -1325,8 +1333,10 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
         break;
     case WL_NV2A_K_SET_TRANSFORM_PROGRAM_START:
     case WL_NV2A_K_SET_TRANSFORM_EXECUTION_MODE:
-        k->program_generation++;
-        k->dirty |= WL_NV2A_DIRTY_PROGRAM;
+        if (changed) {
+            k->program_generation++;
+            k->dirty |= WL_NV2A_DIRTY_PROGRAM;
+        }
         break;
     case WL_NV2A_K_CLEAR_REPORT_VALUE:
         if (param == WL_NV2A_REPORT_ZPASS_PIXEL_COUNT) {
@@ -1372,17 +1382,21 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
         }
         break;
     default:
-        if (method >= WL_NV2A_K_SET_VIEWPORT_OFFSET && method <= WL_NV2A_K_SET_VIEWPORT_OFFSET + 12) {
-            k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET][(method - WL_NV2A_K_SET_VIEWPORT_OFFSET) >> 2] =
-                word_float(param);
-            k->constants_generation++;
-            k->dirty |= WL_NV2A_DIRTY_VIEWPORT | WL_NV2A_DIRTY_CONSTANTS;
-        } else if (method >= WL_NV2A_K_SET_VIEWPORT_SCALE && method <= WL_NV2A_K_SET_VIEWPORT_SCALE + 12) {
-            k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE][(method - WL_NV2A_K_SET_VIEWPORT_SCALE) >> 2] =
-                word_float(param);
-            k->constants_generation++;
-            k->dirty |= WL_NV2A_DIRTY_VIEWPORT | WL_NV2A_DIRTY_CONSTANTS;
-        } else {
+        if (method >= WL_NV2A_K_SET_VIEWPORT_OFFSET && method <= WL_NV2A_K_SET_VIEWPORT_SCALE + 12 &&
+            (method <= WL_NV2A_K_SET_VIEWPORT_OFFSET + 12 || method >= WL_NV2A_K_SET_VIEWPORT_SCALE)) {
+            // (the viewport's words are constants: changed if the constant is, the window may have
+            // written it since)
+            float *slot = method >= WL_NV2A_K_SET_VIEWPORT_SCALE
+                              ? &k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE][(method - WL_NV2A_K_SET_VIEWPORT_SCALE) >> 2]
+                              : &k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET][(method - WL_NV2A_K_SET_VIEWPORT_OFFSET) >> 2];
+            float value = word_float(param);
+
+            if (memcmp(slot, &value, sizeof value) != 0) {
+                *slot = value;
+                k->constants_generation++;
+                k->dirty |= WL_NV2A_DIRTY_VIEWPORT | WL_NV2A_DIRTY_CONSTANTS;
+            }
+        } else if (changed) {
             k->dirty |= info & METHOD_DIRTY;
         }
         break;

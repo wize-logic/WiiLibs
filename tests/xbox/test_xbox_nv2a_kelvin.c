@@ -4,8 +4,9 @@
 // DRAW_ARRAYS, ARRAY_ELEMENT16 and ARRAY_ELEMENT32, from inline arrays and from immediate vertices
 // (each kind of SET_VERTEX_DATA*), disabled attributes reading their current value; long batches
 // handed over in whole primitives; the vertex program and constant windows; the viewport in
-// c[58]/c[59]; the combiners as psh's 57 words; the surface decoded. A draw's fetch plan against the
-// fetch of each vertex alone, on random formats, data and attribute sets, bit for bit.
+// c[58]/c[59]; the state groups dirty on a change of value; the combiners as psh's 57 words; the
+// surface decoded. A draw's fetch plan against the fetch of each vertex alone, on random formats,
+// data and attribute sets, bit for bit.
 #include <math.h>
 #include <string.h>
 
@@ -363,6 +364,87 @@ TEST program_and_constant_windows(void) {
     PASS();
 }
 
+// the state groups dirty, and the program and constants' generations moved, when a value changes,
+// not when a method writes the value it had; the viewport's words compared with the constants
+// they write (which the window may have written since)
+TEST dirty_on_a_change_of_value(void) {
+    TGuest g;
+    WlNv2aKelvin *k;
+    uint32_t program_generation, constants_generation;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    k = (WlNv2aKelvin *)wl_nv2a_kelvin(g.dev);
+    t_m1(&g, WL_NV2A_K_SET_BLEND_ENABLE, 1);
+    t_m1(&g, WL_NV2A_K_SET_TRANSFORM_PROGRAM_LOAD, 0);
+    t_method(&g, WL_NV2A_K_SET_TRANSFORM_PROGRAM, 4);
+    t_word(&g, 1);
+    t_word(&g, 2);
+    t_word(&g, 3);
+    t_word(&g, 4);
+    t_m1(&g, WL_NV2A_K_SET_TRANSFORM_CONSTANT_LOAD, 96);
+    t_method(&g, WL_NV2A_K_SET_TRANSFORM_CONSTANT, 4);
+    t_word(&g, t_f(1.0f));
+    t_word(&g, t_f(2.0f));
+    t_word(&g, t_f(3.0f));
+    t_word(&g, t_f(4.0f));
+    t_m1(&g, WL_NV2A_K_SET_VIEWPORT_OFFSET, t_f(320.0f));
+    t_kick(&g);
+    ASSERT(k->dirty & WL_NV2A_DIRTY_RASTER);
+    // all of it again, as it was: nothing
+    k->dirty = 0;
+    program_generation = k->program_generation;
+    constants_generation = k->constants_generation;
+    t_m1(&g, WL_NV2A_K_SET_BLEND_ENABLE, 1);
+    t_m1(&g, WL_NV2A_K_SET_TRANSFORM_PROGRAM_LOAD, 0);
+    t_method(&g, WL_NV2A_K_SET_TRANSFORM_PROGRAM, 4);
+    t_word(&g, 1);
+    t_word(&g, 2);
+    t_word(&g, 3);
+    t_word(&g, 4);
+    t_m1(&g, WL_NV2A_K_SET_TRANSFORM_CONSTANT_LOAD, 96);
+    t_method(&g, WL_NV2A_K_SET_TRANSFORM_CONSTANT, 4);
+    t_word(&g, t_f(1.0f));
+    t_word(&g, t_f(2.0f));
+    t_word(&g, t_f(3.0f));
+    t_word(&g, t_f(4.0f));
+    t_m1(&g, WL_NV2A_K_SET_VIEWPORT_OFFSET, t_f(320.0f));
+    t_kick(&g);
+    ASSERT_EQ(0u, k->dirty);
+    ASSERT_EQ(program_generation, k->program_generation);
+    ASSERT_EQ(constants_generation, k->constants_generation);
+    ASSERT_EQ(1u, k->program_load);
+    ASSERT_EQ(97u, k->constant_load);
+    // one value each changed
+    t_m1(&g, WL_NV2A_K_SET_BLEND_ENABLE, 0);
+    t_kick(&g);
+    ASSERT_EQ((uint32_t)WL_NV2A_DIRTY_RASTER, k->dirty);
+    k->dirty = 0;
+    t_m1(&g, WL_NV2A_K_SET_TRANSFORM_PROGRAM_LOAD, 0);
+    t_method(&g, WL_NV2A_K_SET_TRANSFORM_PROGRAM, 2);
+    t_word(&g, 1);
+    t_word(&g, 5);
+    t_kick(&g);
+    ASSERT_EQ((uint32_t)WL_NV2A_DIRTY_PROGRAM, k->dirty);
+    ASSERT(k->program_generation != program_generation);
+    k->dirty = 0;
+    t_m1(&g, WL_NV2A_K_SET_TRANSFORM_CONSTANT_LOAD, 96);
+    t_m1(&g, WL_NV2A_K_SET_TRANSFORM_CONSTANT, t_f(-1.0f));
+    t_kick(&g);
+    ASSERT_EQ((uint32_t)WL_NV2A_DIRTY_CONSTANTS, k->dirty);
+    ASSERT(k->constants_generation != constants_generation);
+    ASSERT(near(k->constants[96][0], -1.0f));
+    // the viewport's offset overwritten through the window, then set again as it was: set
+    k->dirty = 0;
+    t_m1(&g, WL_NV2A_K_SET_TRANSFORM_CONSTANT_LOAD, WL_NV2A_CONSTANT_VIEWPORT_OFFSET);
+    t_m1(&g, WL_NV2A_K_SET_TRANSFORM_CONSTANT, t_f(7.0f));
+    t_m1(&g, WL_NV2A_K_SET_VIEWPORT_OFFSET, t_f(320.0f));
+    t_kick(&g);
+    ASSERT(k->dirty & WL_NV2A_DIRTY_VIEWPORT);
+    ASSERT(near(k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET][0], 320.0f));
+    t_destroy(&g);
+    PASS();
+}
+
 TEST combiners_as_the_pixel_shader_words(void) {
     TGuest g;
     const WlNv2aKelvin *k;
@@ -533,6 +615,7 @@ SUITE(kelvin_suite) {
     RUN_TEST(long_batches_go_in_whole_primitives);
     RUN_TEST(line_loops_close);
     RUN_TEST(program_and_constant_windows);
+    RUN_TEST(dirty_on_a_change_of_value);
     RUN_TEST(combiners_as_the_pixel_shader_words);
     RUN_TEST(surface_decoded);
     RUN_TEST(fetch_plan_matches_the_fetch_of_each_vertex);
