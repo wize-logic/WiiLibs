@@ -62,6 +62,7 @@ static volatile uint32_t *g_htab;
 static uint32_t g_pteg_mask;
 static Pool g_pools[WL_XB_MAX_FRAME_POOLS];
 static uint16_t *g_hint[2]; // [ram pages] the PTE group (+ 1) of the page's user / window PTE
+static size_t g_hint_bytes, g_htab_bytes, g_pool_bytes; // what they hold of the heap (the census)
 static uint32_t g_faults, g_pte_evictions, g_evict_rr;
 // Whether the MMU records R and C in the table (the 750CL does; an emulator might not): measured
 // once at init (mmu_selftest). Without R, "used" is a fault: clearing it drops the page's PTEs.
@@ -558,6 +559,9 @@ WlResult wl_xb_backend_init(const WlXbMemConfig *cfg, uintptr_t *base_out) {
     memset(t, 0, htab);
     DCFlushRange(t, htab);
     g_htab = t;
+    g_hint_bytes = 2u * pages * sizeof *g_hint[0];
+    g_htab_bytes = htab;
+    g_pool_bytes = total;
     g_pteg_mask = (htab >> 6) - 1u; // PTEGs of 64 bytes
     uint32_t sdr1 = ((uint32_t)(uintptr_t)t - 0x80000000u) | ((htab >> 16) - 1u);
 
@@ -622,4 +626,9 @@ void wl_xb_backend_probe(uintptr_t handle) {
 
 WlResult wl_xb_fault_install(void) {
     return WL_OK; // the DSI handler is part of wl_xb_backend_init
+}
+
+void wl_xb_backend_host_bytes(size_t *tables, size_t *frames) {
+    *tables = g_hint_bytes + g_htab_bytes;
+    *frames = g_pool_bytes;
 }

@@ -26,6 +26,9 @@
 
 enum {
     TARGETS = 8,
+    // a render target neither drawn into nor read for this many frames gives its image back (the
+    // host's heap: a 640x480 one is 1.2 MB, and one a cutscene made would be kept for good)
+    TARGET_IDLE_FRAMES = 1800,
     // indexed draws' vertices kept by index (a direct-mapped table: a strip's or list's neighbours
     // come back soon)
     MEMO = 1024,
@@ -232,6 +235,20 @@ void wl_nv2a_gx_destroy(WlNv2aGx *gx) {
     free(gx);
 }
 
+void wl_nv2a_gx_host_bytes(const WlNv2aGx *gx, size_t *record, size_t *targets, unsigned *target_count) {
+    unsigned i;
+
+    *record = sizeof *gx;
+    *targets = 0;
+    *target_count = 0;
+    for (i = 0; i < TARGETS; i++) {
+        if (gx->targets[i].memory != NULL) {
+            *targets += gx->targets[i].bytes;
+            ++*target_count;
+        }
+    }
+}
+
 void wl_nv2a_gx_attach(WlNv2aGx *gx, WlNv2a *dev) {
     gx->dev = dev;
 }
@@ -316,6 +333,21 @@ static void use_back_buffer(WlNv2aGx *gx) {
 
 static void frame_keep(WlNv2aGx *gx);
 
+// the render targets not used for TARGET_IDLE_FRAMES give their images back (the GPU has finished
+// with them: they were last drawn or read frames ago)
+static void targets_idle(WlNv2aGx *gx) {
+    unsigned i;
+
+    for (i = 0; i < TARGETS; i++) {
+        RenderTarget *r = &gx->targets[i];
+
+        if (r->memory != NULL && r != gx->owner && gx->frame - r->used_frame > TARGET_IDLE_FRAMES) {
+            gx->textures.cfg.release(gx->textures.cfg.user, r->memory);
+            memset(r, 0, sizeof *r);
+        }
+    }
+}
+
 void wl_nv2a_gx_present(WlNv2aGx *gx) {
     if (!gx->frame_open) {
         return;
@@ -328,6 +360,7 @@ void wl_nv2a_gx_present(WlNv2aGx *gx) {
     gx->back_drawn = false;
     gx->frame++;
     gx->stats.frames++;
+    targets_idle(gx);
     // (the GPU has drawn the frame: the textures evicted during it can go)
     wl_nv2a_texcache_frame_done(&gx->textures);
     wl_gx_direct_flush_after();
@@ -623,6 +656,7 @@ static const WlNv2aTexEntry *target_texture(WlNv2aGx *gx, unsigned stage, const 
         if (r->memory != NULL && r->resolved && r->phys == t->phys && r != gx->owner) {
             WlNv2aTexEntry *e = &gx->target_entries[stage];
 
+            r->used_frame = gx->frame; // (read: in use, targets_idle)
             memset(e, 0, sizeof *e);
             e->phys = r->phys;
             e->image = r->memory;

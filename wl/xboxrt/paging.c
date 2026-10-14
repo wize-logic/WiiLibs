@@ -516,6 +516,16 @@ static void swap_open(const WlXbMemConfig *cfg) {
     WL_LOG_I(TAG, "swap file %s: %u pages", cfg->swap_path, (unsigned)g_slots);
 }
 
+size_t wl_xb_pg_host_bytes(void) {
+    if (g_xb_pg_frames == 0) {
+        return 0;
+    }
+    size_t pages = g_xb_ram_pages;
+    return pages * (sizeof *g_xb_pg_flags + sizeof *g_xb_pg_frame + sizeof *g_xb_pg_slot + sizeof *g_xb_pg_wgen) +
+           (g_xb_pg_frames + 1u) * sizeof *g_owner + g_xb_pg_frames * sizeof *g_free +
+           (g_slot_used != NULL ? (g_slots + 31u) / 32u * sizeof *g_slot_used : 0u) + (g_io != NULL ? BATCH * PAGE : 0u);
+}
+
 WlResult wl_xb_pg_init(const WlXbMemConfig *cfg, uint32_t frames) {
     if (g_xb_pg_frames != 0 || frames == 0 || frames > 0xFFFFu) {
         return WL_ERR_ARG;

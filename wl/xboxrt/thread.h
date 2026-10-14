@@ -52,6 +52,8 @@ struct WlXbThread {
     WlPlatformThread host;
     WlPlatformCond cond;       // the thread sleeps here
     void *host_stack;
+    size_t host_stack_size;    // its bytes (painted when made, so its depth can be measured)
+    uint32_t host_done_ms;     // when its host thread ran its last statement (ms, odd; 0: not yet)
     bool ready;                // in the ready queue
     uint64_t ready_since_us;   // when it was queued
     bool woken;                // a wake arrived while it slept (wl_xb_wake)
@@ -209,6 +211,17 @@ typedef struct {
     uint32_t service_starved; // the service thread waited a second or more for the lock (logged)
 } WlXbThreadStats;
 void wl_xb_thread_stats(WlXbThreadStats *out);
+
+// The host memory the threads hold (registered with the census, mem_census.h, as "threads"): their
+// records and host stacks; `deepest` is the most any host stack has been used, of `deepest_of`.
+void wl_xb_thread_host_memory(size_t *bytes, uint32_t *stacks, size_t *deepest, size_t *deepest_of);
+// Gives back the host stacks of the threads that ended (a title's entry thread often does, with
+// its stack of 1 MB) a little while after their host threads are done; returns how many. The
+// service thread calls it now and then.
+uint32_t wl_xb_thread_reap(void);
+// One INFO line: each thread's host stack, its size and the deepest it has been (KB), for sizing
+// WlXbThreadConfig.host_stack_bytes.
+void wl_xb_thread_log_stacks(void);
 
 #ifdef __cplusplus
 }

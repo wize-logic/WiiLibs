@@ -93,6 +93,9 @@ void wl_nv2a_gx_backend(WlNv2aGx *gx, WlNv2aBackend *out);
 void wl_nv2a_gx_present(WlNv2aGx *gx);
 void wl_nv2a_gx_stats(const WlNv2aGx *gx, WlNv2aGxStats *out);
 const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx);
+// The host memory the backend holds besides its textures' (wl_nv2a_texcache_memory): its record
+// (the caches of pixel programs, fits and vertices are in it) and its render targets' images.
+void wl_nv2a_gx_host_bytes(const WlNv2aGx *gx, size_t *record, size_t *targets, unsigned *target_count);
 // The pixel program the last draw was made with (psh's: its reason when it is beyond GX, what it
 // approximated), and whether it was used (false: texture 0 times the colour instead); NULL before
 // the first draw. Valid until the next draw. For logs and tools.

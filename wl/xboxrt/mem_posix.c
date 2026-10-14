@@ -329,3 +329,9 @@ void wl_xb_backend_stats(uint32_t *frames, uint32_t *faults, uint32_t *pte_evict
     *faults = g_faults;
     *pte_evictions = 0;
 }
+
+void wl_xb_backend_host_bytes(size_t *tables, size_t *frames) {
+    size_t pages = g_ram >> WL_XB_PAGE_SHIFT;
+    *tables = g_user_va != NULL ? pages * (2u + sizeof *g_user_va) : 0u;
+    *frames = 0; // (the RAM object is mapped, not had from the heap)
+}

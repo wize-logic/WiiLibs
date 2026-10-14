@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/input.h"
@@ -955,7 +956,11 @@ static void screenshot(const char *name) {
     static WlGxSoftConfig cfg;
     cfg.frame = shot_frame;
     P.shot_frames = 2;
-    if (wl_gxsoft_attach(&cfg) != WL_OK) {
+    // (the software GX is the host's alone: kept out of the host heap's count, mem_census.h)
+    wl_platform_heap_exempt(true);
+    WlResult attached = wl_gxsoft_attach(&cfg);
+    wl_platform_heap_exempt(false);
+    if (attached != WL_OK) {
         wl_xb_play_log("screenshot: the software GX did not start");
         P.shot_frames = 0;
     }
@@ -971,7 +976,9 @@ static void screenshot(const char *name) {
 static void screenshot_poll(void) {
 #if defined(WL_XBRT_HAVE_GXSOFT)
     if (P.shot_frames <= 0 && wl_gxsoft_attached()) {
+        wl_platform_heap_exempt(true);
         wl_gxsoft_detach();
+        wl_platform_heap_exempt(false);
     }
 #endif
 }
@@ -1297,6 +1304,12 @@ static WlResult load_script(void) {
     if (P.count < 0) {
         wl_xb_play_log("%s:%d: not a step", P.script_path, bad);
         return WL_ERR_FORMAT;
+    }
+    // (parsed into room for the most a script may have, 1024 steps of about 430 bytes: kept at its
+    // own count, for the Wii's heap)
+    Step *fit = realloc(P.steps, (size_t)(P.count > 0 ? P.count : 1) * sizeof *P.steps);
+    if (fit != NULL) {
+        P.steps = fit;
     }
     wl_xb_play_log("script %s, %d steps", P.script_path, P.count);
     if (P.count == 0) {

@@ -107,3 +107,6 @@ typedef struct WlNv2aStats {
     uint32_t memory_misses;   // guest memory the model wanted that phys_ptr did not give
 } WlNv2aStats;
 void wl_nv2a_stats(const WlNv2a *dev, WlNv2aStats *out);
+// The host memory the device holds (its record, the batch buffers, the instance memory's pages made
+// so far), for a census of the host's heap. A backend's (nv2a_gx.h) is its own.
+size_t wl_nv2a_host_bytes(const WlNv2a *dev);
