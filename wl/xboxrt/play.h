@@ -107,7 +107,8 @@ typedef struct {
     double timeout_s;
     uint32_t port;         // the controller it drives (0..3)
     uint32_t frames;       // frames since it began
-    int64_t ticks;         // the title's ticks since it began (-1: not in a game)
+    int64_t ticks;         // the game's time played since it began, in ticks (a revert to a
+                           // checkpoint does not put it back; -1: not in a game)
     double seconds;        // the step's time (ticks / tick rate in a game, else frames)
     WlXboxPad *pad;        // this frame's controller (zeroed before each call): the step fills it
     void *state;           // the step's own

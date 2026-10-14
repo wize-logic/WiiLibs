@@ -55,6 +55,9 @@ struct WlXbThread {
     bool ready;                // in the ready queue
     uint64_t ready_since_us;   // when it was queued
     bool woken;                // a wake arrived while it slept (wl_xb_wake)
+    bool det_created;          // its host thread exists (wl_xb_thread_create): a resume queues it
+    bool det_waiting;          // the deterministic mode: in wl_xb_wait, not queued
+    uint64_t det_deadline_us;  // its timeout in the virtual clock (0: none)
     bool running_guest;        // between its routine's start and its end
     uint32_t kernel_depth;     // > 0 while in a kernel call (thunk.c): device accesses are no safe points
     uint32_t host_tid;         // wl_platform_thread_self_id of its host thread (set when it takes the lock)
@@ -82,6 +85,11 @@ typedef struct {
                                   // are C frames; each gets twice its guest stack, 192 KB at
                                   // least): 1 MB
     uint32_t default_stack_bytes; // a guest stack when the title asks for 0: 64 KB
+    bool deterministic;           // the deterministic mode (below): off
+    // what one safe point costs in the deterministic mode's clock (0: the defaults below)
+    uint32_t det_backedge_ns;     // a backward jump: 40 ns
+    uint32_t det_call_ns;         // a kernel call or an rdtsc: 400 ns
+    uint32_t det_device_ns;       // a device register access: 400 ns
 } WlXbThreadConfig;
 void wl_xb_thread_config_default(WlXbThreadConfig *cfg);
 
@@ -174,6 +182,37 @@ void wl_xb_safe_point(void);
 // lock). Generated code may test it at loop back edges, where a spin on plain guest memory has no
 // other safe point: if (g_xb_attention) wl_xb_safe_point();
 extern volatile uint32_t g_xb_attention;
+// The safe point of a device access once the device has answered (fault_posix.c, mem_wii.c): what
+// wl_xb_safe_point does, at a device access's cost in the deterministic mode's clock.
+void wl_xb_device_safe_point(void);
+
+// ---- The deterministic mode ------------------------------------------------------------------
+//
+// Off by default; WlXbThreadConfig.deterministic (WlXbTitleConfig.deterministic, the host's
+// WL_XB_DETERMINISTIC=1) turns it on. Two runs of the same title with the same input then run the
+// same guest instructions in the same order and see the same times: a failure seen once is seen
+// again, and a run can be bisected.
+//
+// The guest's clock (wl_xb_time_us: KeTickCount, rdtsc, KeQueryPerformanceCounter, the interrupt
+// and system times, timers, wait timeouts, the vertical blank, the devices' counters and the audio
+// processor's frames) is virtual: it moves on by a fixed cost at each safe point of the thread
+// that holds the guest lock (a backward jump, a kernel call or rdtsc, a device access), and when
+// every guest thread waits it jumps to the next thing due (a vertical blank, a timer, a wait's
+// timeout, a device's tick). The host's wall clock never enters. The service thread does no work
+// of its own: the vertical blank, ticks and timers come due at the holder's safe points, and the
+// service thread is the idle thread, handed the lock only when no guest thread is ready. A wake,
+// a new thread and a resume put the thread in the ready queue at once (instead of when its host
+// thread gets to run), so the queue, and every decision made from it, depends only on the guest.
+// The title runs as fast as the host lets it, not at the console's speed.
+bool wl_xb_deterministic(void);
+// The guest's monotonic clock in microseconds: the host's (wl_platform_time_us) normally, the
+// virtual one in the deterministic mode. Lock not necessarily held.
+uint64_t wl_xb_time_us(void);
+// The same in nanoseconds (rdtsc's resolution).
+uint64_t wl_xb_time_ns(void);
+// A busy wait of `us` (KeStallExecutionProcessor): the virtual clock moves on by it; nothing
+// outside the deterministic mode. Lock held.
+void wl_xb_time_spend_us(uint32_t us);
 
 // ---- Calling guest code ------------------------------------------------------------------------
 

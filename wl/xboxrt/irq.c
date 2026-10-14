@@ -52,8 +52,11 @@ static void *g_svc_stack, *g_relay_stack;
 static WlPlatformSemaphore g_retrace_sem;
 static volatile uint32_t g_tick_va;
 static uint64_t g_tick_start_us;
+static uint64_t g_wall_start_us;
 static WlXbServiceStats g_stats;
 static uint32_t g_work_esp; // the top of the service thread's guest stack: where the work runs
+static uint64_t g_det_vblank_us; // the deterministic mode: the next vertical blank (virtual clock)
+static uint64_t g_vblank_period_us;
 
 void wl_xb_service_config_default(WlXbServiceConfig *cfg) {
     cfg->vblank_hz_milli = 59940;
@@ -102,7 +105,7 @@ WlResult wl_xb_service_add_tick(WlXbTickFn fn, void *user, uint32_t period_us) {
     g_tick[g_tick_count].fn = fn;
     g_tick[g_tick_count].user = user;
     g_tick[g_tick_count].period_us = period_us;
-    g_tick[g_tick_count].next_us = wl_platform_time_us() + period_us;
+    g_tick[g_tick_count].next_us = wl_xb_time_us() + period_us;
     __atomic_store_n(&g_tick_count, g_tick_count + 1u, __ATOMIC_RELEASE);
     return WL_OK;
 }
@@ -120,6 +123,7 @@ static uint64_t ticks_due(uint64_t now, uint64_t wake) {
             __atomic_store_n(&g_tick[i].due, 1u, __ATOMIC_RELEASE);
             __atomic_fetch_or(&g_pending, WL_XB_SVC_DEVICE, __ATOMIC_SEQ_CST);
             g_xb_attention = 1;
+            g_xb_det_work = 1;
         }
         if (g_tick[i].next_us < wake) {
             wake = g_tick[i].next_us;
@@ -144,7 +148,7 @@ bool wl_xb_in_service(void) {
 }
 
 uint32_t wl_xb_tick_ms(void) {
-    return (uint32_t)((wl_platform_time_us() - g_tick_start_us) / 1000u);
+    return (uint32_t)((wl_xb_time_us() - g_tick_start_us) / 1000u);
 }
 
 static void update_tick(void) {
@@ -156,7 +160,7 @@ static void update_tick(void) {
 
 void wl_xb_service_set_tick_va(uint32_t va) {
     if (g_tick_start_us == 0) {
-        g_tick_start_us = wl_platform_time_us();
+        g_tick_start_us = wl_xb_time_us();
     }
     // the service thread writes it without the guest lock (update_tick): its page must never wait
     // for the swap file
@@ -177,6 +181,7 @@ static void wake_service(void) {
 
 void wl_xb_service_raise(uint32_t reasons) {
     g_xb_attention = 1;
+    g_xb_det_work = 1;
     if (g_started) {
         wl_platform_mutex_lock(g_sm);
         g_pending |= reasons;
@@ -191,6 +196,7 @@ void wl_xb_irq_assert(uint32_t line) {
     if (line < WL_XB_IRQ_LINES) {
         __atomic_fetch_or(&g_lines, 1u << line, __ATOMIC_SEQ_CST);
         g_xb_attention = 1;
+        g_xb_det_work = 1;
         wl_xb_service_raise(WL_XB_SVC_IRQ);
     }
 }
@@ -220,6 +226,7 @@ uint32_t wl_xb_irq_lines(void) {
 
 void wl_xb_service_set_deadline(uint64_t when_us) {
     g_deadline = when_us;
+    wl_xb_det_note_deadline(when_us);
     wake_service();
 }
 
@@ -237,7 +244,7 @@ static void run_service(void) {
     for (uint32_t round = 0; round < MAX_ROUNDS; round++) {
         uint32_t reasons = __atomic_exchange_n(&g_pending, 0u, __ATOMIC_SEQ_CST);
         uint64_t deadline = g_deadline;
-        if (deadline != 0 && wl_platform_time_us() >= deadline) {
+        if (deadline != 0 && wl_xb_time_us() >= deadline) {
             g_deadline = 0;
             reasons |= WL_XB_SVC_TIMER;
         }
@@ -279,7 +286,7 @@ static void poll(bool levels) {
     }
     update_tick();
     uint64_t deadline = g_deadline;
-    bool due = g_pending != 0 || g_lines != 0 || (deadline != 0 && wl_platform_time_us() >= deadline);
+    bool due = g_pending != 0 || g_lines != 0 || (deadline != 0 && wl_xb_time_us() >= deadline);
     if (!due && levels) {
         for (uint32_t i = 0; i < WL_XB_IRQ_LINES && !due; i++) {
             due = g_level[i].fn != NULL && g_level[i].fn(g_level[i].user);
@@ -301,6 +308,34 @@ void wl_xb_service_poll_levels(void) {
     poll(true);
 }
 
+uint64_t wl_xb_det_service_due(uint64_t now) {
+    if (!g_started) {
+        return UINT64_MAX;
+    }
+    uint64_t next = UINT64_MAX;
+    if (g_cfg.vblank) {
+        if (now >= g_det_vblank_us) {
+            g_det_vblank_us += g_vblank_period_us;
+            if (g_det_vblank_us <= now) {
+                g_det_vblank_us = now + g_vblank_period_us; // fell behind: no burst of vblanks
+            }
+            __atomic_fetch_or(&g_pending, WL_XB_SVC_VBLANK, __ATOMIC_SEQ_CST);
+            g_xb_det_work = 1;
+        }
+        next = g_det_vblank_us;
+    }
+    next = ticks_due(now, next);
+    uint64_t deadline = g_deadline;
+    if (deadline != 0 && deadline < next) {
+        next = deadline;
+    }
+    return next;
+}
+
+void wl_xb_det_service_run(void) {
+    poll(true);
+}
+
 // Every 10 s: the guest's memory (pages committed, frames behind them) and the host's free memory,
 // the numbers a title's memory knobs (WlXbTitleConfig) are set from.
 static void status_report(void) {
@@ -308,8 +343,14 @@ static void status_report(void) {
     wl_xb_mem_stats(&m);
     if (g_tick_va != 0) {
         // what the guest's clock reads against the host's (a title times its frames by it)
-        WL_LOG_I(TAG, "status: KeTickCount %u ms, host clock %u ms", (unsigned)wl_xb_rd32(g_tick_va),
-                 (unsigned)wl_xb_tick_ms());
+        if (wl_xb_deterministic()) {
+            WL_LOG_I(TAG, "status: KeTickCount %u ms, virtual clock %u ms, host clock %u ms",
+                     (unsigned)wl_xb_rd32(g_tick_va), (unsigned)wl_xb_tick_ms(),
+                     (unsigned)((wl_platform_time_us() - g_wall_start_us) / 1000u));
+        } else {
+            WL_LOG_I(TAG, "status: KeTickCount %u ms, host clock %u ms", (unsigned)wl_xb_rd32(g_tick_va),
+                     (unsigned)wl_xb_tick_ms());
+        }
     }
 #if defined(__GLIBC__)
     struct mallinfo2 mi = mallinfo2();
@@ -333,8 +374,39 @@ static void status_report(void) {
     }
 }
 
+// The deterministic mode's service thread: the idle thread. It is handed the lock when no guest
+// thread is ready, moves the virtual clock on to what is due next and runs it; the vertical blank,
+// the ticks and the timers otherwise come due at the holder's safe points (thread.c).
+static void det_service_main(void) {
+    uint64_t next_status = wl_platform_time_us() + 10000000u;
+    bool warned = false;
+    while (g_running) {
+        if (wl_xb_det_idle_take(g_svc, 1000)) {
+            g_stats.service_thread_runs++;
+            int r = 0;
+            while (r == 0 && g_running) {
+                r = wl_xb_det_idle_step();
+            }
+            if (r < 0 && !warned) {
+                warned = true;
+                WL_LOG_W(TAG, "deterministic mode: every thread waits for good and nothing is due");
+            }
+            wl_xb_unlock(g_svc);
+        }
+        uint64_t now = wl_platform_time_us();
+        if (now >= next_status) {
+            next_status = now + 10000000u;
+            status_report();
+        }
+    }
+}
+
 static void *service_main(void *arg) {
     (void)arg;
+    if (wl_xb_deterministic()) {
+        det_service_main();
+        return NULL;
+    }
     uint64_t vblank_period = g_cfg.vblank_hz_milli > 0 ? 1000000000ull / g_cfg.vblank_hz_milli : 16683u;
     uint64_t next_vblank = wl_platform_time_us() + vblank_period;
     uint64_t next_status = wl_platform_time_us() + 10000000u;
@@ -429,8 +501,11 @@ WlResult wl_xb_service_start(const WlXbServiceConfig *cfg) {
         g_cfg.tick_ms = 1;
     }
     if (g_tick_start_us == 0) {
-        g_tick_start_us = wl_platform_time_us();
+        g_tick_start_us = wl_xb_time_us();
     }
+    g_wall_start_us = wl_platform_time_us();
+    g_vblank_period_us = g_cfg.vblank_hz_milli > 0 ? 1000000000ull / g_cfg.vblank_hz_milli : 16683u;
+    g_det_vblank_us = wl_xb_time_us() + g_vblank_period_us;
     if (wl_platform_mutex_create(&g_sm) != WL_OK || wl_platform_cond_create(&g_sc) != WL_OK) {
         return WL_ERR_NOMEM;
     }
@@ -455,6 +530,9 @@ WlResult wl_xb_service_start(const WlXbServiceConfig *cfg) {
     }
     g_running = true;
     g_started = true;
+    if (wl_xb_deterministic()) {
+        wl_xb_det_set_idle(g_svc);
+    }
     const size_t host_stack = 256u << 10;
     g_svc_stack = aligned_alloc(64, host_stack);
     if (g_svc_stack == NULL) {
@@ -467,7 +545,7 @@ WlResult wl_xb_service_start(const WlXbServiceConfig *cfg) {
         return r;
     }
 #if defined(__wii__)
-    if (g_cfg.vblank) {
+    if (g_cfg.vblank && !wl_xb_deterministic()) {
         if (wl_platform_sem_create(&g_retrace_sem, 0, 16) == WL_OK) {
             g_relay_stack = aligned_alloc(64, 16u << 10);
             if (g_relay_stack != NULL &&
@@ -492,6 +570,9 @@ void wl_xb_service_stop(void) {
         return;
     }
     g_running = false;
+    if (wl_xb_deterministic()) {
+        wl_xb_det_set_idle(NULL);
+    }
     wake_service();
     wl_platform_thread_join(g_svc_host, NULL);
 #if defined(__wii__)

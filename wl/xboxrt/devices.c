@@ -9,6 +9,7 @@
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/regfile.h"
+#include "wl/xboxrt/thread.h"
 #include "wl/xboxrt/usb.h"
 
 #define TAG "xbdev"
@@ -145,7 +146,7 @@ static WlResult add_device(const char *name, uint32_t base, uint32_t size, DevRe
     d->name = name;
     d->read = rd;
     d->write = wr;
-    d->start_us = wl_platform_time_us();
+    d->start_us = wl_xb_time_us();
     WlXbDevice dev = {name, base, size, dev_read, dev_write, d};
     return wl_xb_mmio_register(&dev);
 }
@@ -154,7 +155,7 @@ static WlResult add_device(const char *name, uint32_t base, uint32_t size, DevRe
 static bool apu_read(Dev *d, uint32_t off, unsigned size, uint32_t *out) {
     (void)size;
     if ((off & ~3u) == 0x20010u) {
-        *out = (uint32_t)((wl_platform_time_us() - d->start_us) * 48u / 1000u);
+        *out = (uint32_t)((wl_xb_time_us() - d->start_us) * 48u / 1000u);
         return true;
     }
     return false;

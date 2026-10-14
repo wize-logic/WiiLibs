@@ -324,6 +324,10 @@ uint64_t xbox_ReadTimeStampCounter(void) {
     if (wl_xb_current() != NULL) {
         wl_xb_yield_point();
     }
+    if (wl_xb_deterministic()) {
+        uint64_t ns = wl_xb_time_ns();
+        return (ns / 1000000u) * XBOX_TSC_KHZ + (ns % 1000000u) * XBOX_TSC_KHZ / 1000000u;
+    }
     uint64_t us = wl_platform_time_us();
     return us * (XBOX_TSC_KHZ / 1000u) + (us * (XBOX_TSC_KHZ % 1000u)) / 1000u;
 }

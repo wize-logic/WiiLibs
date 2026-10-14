@@ -566,6 +566,9 @@ void k_NtFlushBuffersFile(void) {
 // ---- Information -------------------------------------------------------------------------------------
 
 static uint64_t filetime_of(uint64_t unix_us) {
+    if (wl_xb_deterministic()) {
+        return 127449504000000000ull; // a fixed time (2004-11-15): the host's file times differ per copy
+    }
     return unix_us != 0 ? unix_us * 10u + 116444736000000000ull : 116444736000000000ull;
 }
 

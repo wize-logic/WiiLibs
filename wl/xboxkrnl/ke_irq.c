@@ -158,7 +158,7 @@ bool xk_timer_cancel(uint32_t timer) {
 }
 
 static void fire_timers(void) {
-    uint64_t now = wl_platform_time_us();
+    uint64_t now = wl_xb_time_us();
     for (uint32_t i = 0; i < MAX_TIMERS; i++) {
         Timer *t = &g_timers[i];
         if (!t->active || t->due_us > now) {

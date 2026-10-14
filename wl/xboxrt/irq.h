@@ -99,6 +99,32 @@ typedef struct {
 } WlXbServiceStats;
 void wl_xb_service_stats(WlXbServiceStats *out);
 
+// ---- Between irq.c and thread.c: the deterministic mode (thread.h) ----------------------------
+
+struct WlXbThread;
+
+// Set (beside g_xb_attention) when interrupt work is raised: the deterministic safe point's fast
+// path looks at it, as g_xb_attention stays set in that mode.
+extern volatile uint32_t g_xb_det_work;
+// The vertical blank and the devices' ticks whose virtual time `now_us` has come are marked due;
+// returns the earliest virtual time something of the service's is due next (the kernel's timer
+// deadline included; UINT64_MAX: nothing). Lock held.
+uint64_t wl_xb_det_service_due(uint64_t now_us);
+// The service's work due now (wl_xb_service_poll_levels with the lock held by the idle thread).
+void wl_xb_det_service_run(void);
+// thread.c: a new deadline of the service's (lowers the next virtual time the holder looks at).
+void wl_xb_det_note_deadline(uint64_t when_us);
+// thread.c: the idle thread (the service thread) gets the lock whenever no guest thread is ready;
+// NULL takes it back (wl_xb_service_stop). Lock not held.
+void wl_xb_det_set_idle(struct WlXbThread *t);
+// thread.c: the idle thread waits up to `timeout_ms` for the lock; true when it has it (registers
+// loaded, as wl_xb_lock leaves them). Lock not held.
+bool wl_xb_det_idle_take(struct WlXbThread *self, uint32_t timeout_ms);
+// thread.c, by the idle thread holding the lock: timed-out waits are queued and the service work
+// due now runs; then 1 when a guest thread is ready, else the clock jumps to the next thing due (a
+// service deadline, a wait's timeout) and 0, or -1 when nothing at all is due.
+int wl_xb_det_idle_step(void);
+
 #ifdef __cplusplus
 }
 #endif

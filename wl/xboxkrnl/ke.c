@@ -128,7 +128,7 @@ void k_KeDelayExecutionThread(void) {
             RET(STATUS_USER_APC);
             return;
         }
-        uint64_t now = wl_platform_time_us();
+        uint64_t now = wl_xb_time_us();
         if (now >= deadline) {
             break;
         }
@@ -142,7 +142,7 @@ void k_KeDelayExecutionThread(void) {
 
 // LARGE_INTEGER KeQueryPerformanceCounter(VOID) / KeQueryPerformanceFrequency(VOID)
 void k_KeQueryPerformanceCounter(void) {
-    uint64_t us = wl_platform_time_us();
+    uint64_t us = wl_xb_time_us();
     uint64_t ticks = (us / 1000000u) * PERF_HZ + (us % 1000000u) * PERF_HZ / 1000000u;
     g_eax = (uint32_t)ticks;
     g_edx = (uint32_t)(ticks >> 32);
@@ -155,7 +155,7 @@ void k_KeQueryPerformanceFrequency(void) {
 
 // ULONGLONG KeQueryInterruptTime(VOID): 100 ns since boot
 void k_KeQueryInterruptTime(void) {
-    uint64_t t = wl_platform_time_us() * 10u;
+    uint64_t t = wl_xb_time_us() * 10u;
     g_eax = (uint32_t)t;
     g_edx = (uint32_t)(t >> 32);
 }
@@ -171,12 +171,16 @@ void k_KeQuerySystemTime(void) {
 // VOID KeStallExecutionProcessor(ULONG MicroSeconds): a busy wait, as on the console (short ones)
 void k_KeStallExecutionProcessor(void) {
     uint32_t us = ARG(0);
+    if (wl_xb_deterministic()) {
+        wl_xb_time_spend_us(us); // the virtual clock moves on by it, at once
+        return;
+    }
     if (us >= 2000u) {
         wl_platform_thread_sleep_ms(us / 1000u); // long stalls give the host its CPU
         return;
     }
-    uint64_t end = wl_platform_time_us() + us;
-    while (wl_platform_time_us() < end) {
+    uint64_t end = wl_xb_time_us() + us;
+    while (wl_xb_time_us() < end) {
     }
 }
 

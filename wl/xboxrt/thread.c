@@ -42,12 +42,44 @@ static uint32_t g_live; // guest threads started and not ended
 static uint32_t g_tls_data, g_tls_bytes, g_tls_zero;
 static WlXbThreadStats g_stats;
 volatile uint32_t g_xb_attention;
+volatile uint32_t g_xb_det_work;
+
+// The deterministic mode (thread.h). The virtual clock starts at 1 s, so that no deadline made
+// from it is 0 (none); it is written only by the lock's holder.
+#define DET_START_NS 1000000000ull
+static bool g_det;
+static volatile uint64_t g_vt_ns = DET_START_NS;
+static uint64_t g_det_next_us;          // the holder looks at the clock's events from then on
+static uint32_t g_det_backedge_ns, g_det_call_ns, g_det_device_ns;
+static WlXbThread *volatile g_idle;     // the idle thread (the service thread)
 
 void wl_xb_thread_config_default(WlXbThreadConfig *cfg) {
     cfg->quantum_ms = 10;
     cfg->starve_ms = 30;
     cfg->host_stack_bytes = 1u << 20;
     cfg->default_stack_bytes = 64u << 10;
+    cfg->deterministic = false;
+    cfg->det_backedge_ns = 40;
+    cfg->det_call_ns = 400;
+    cfg->det_device_ns = 400;
+}
+
+bool wl_xb_deterministic(void) {
+    return g_det;
+}
+
+uint64_t wl_xb_time_us(void) {
+    return g_det ? g_vt_ns / 1000u : wl_platform_time_us();
+}
+
+uint64_t wl_xb_time_ns(void) {
+    return g_det ? g_vt_ns : wl_platform_time_us() * 1000u;
+}
+
+void wl_xb_time_spend_us(uint32_t us) {
+    if (g_det) {
+        g_vt_ns += (uint64_t)us * 1000u;
+    }
 }
 
 bool wl_xb_threads_ready(void) {
@@ -76,7 +108,7 @@ static void enqueue(WlXbThread *t) {
     t->next_ready = *pp;
     *pp = t;
     t->ready = true;
-    t->ready_since_us = wl_platform_time_us();
+    t->ready_since_us = wl_xb_time_us();
     g_xb_attention = 1; // the holder gives the lock up at its next safe point when this one outranks it
 }
 
@@ -90,9 +122,26 @@ static WlXbThread *dequeue(void) {
     return t;
 }
 
-// Gives the baton away (g_m held): to the head of the queue, or to no one.
+// Takes `t` out of the ready queue (g_m held).
+static void unqueue(WlXbThread *t) {
+    WlXbThread *volatile *pp = &g_ready;
+    while (*pp != NULL && *pp != t) {
+        pp = &(*pp)->next_ready;
+    }
+    if (*pp == t) {
+        *pp = t->next_ready;
+        t->next_ready = NULL;
+        t->ready = false;
+    }
+}
+
+// Gives the baton away (g_m held; the caller is the holder): to the head of the queue, or to no
+// one. In the deterministic mode no one is the idle thread, which moves the clock on.
 static void hand_off(void) {
     WlXbThread *next = dequeue();
+    if (next == NULL && g_det && g_idle != NULL && g_owner != g_idle) {
+        next = g_idle;
+    }
     g_owner = next;
     if (next != NULL) {
         g_stats.handoffs++;
@@ -129,7 +178,24 @@ static void take(WlXbThread *self) {
             }
         }
     }
-    g_quantum_start = wl_platform_time_us();
+    g_quantum_start = wl_xb_time_us();
+}
+
+// The deterministic mode: `self` was handed the baton (it waited for it on its own): it becomes
+// the holder (g_m not held).
+static void det_enter(WlXbThread *self) {
+    self->host_tid = wl_platform_thread_self_id();
+    self->host_handle = wl_xb_backend_thread_handle();
+    g_quantum_start = wl_xb_time_us();
+    g_cur = self;
+    wl_xb_cpu_load(&self->cpu);
+}
+
+// The deterministic mode: waits for the baton (g_m held).
+static void det_await(WlXbThread *self) {
+    while (g_owner != self) {
+        wl_platform_cond_wait(self->cond, g_m);
+    }
 }
 
 void wl_xb_lock(WlXbThread *self) {
@@ -152,7 +218,58 @@ void wl_xb_unlock(WlXbThread *self) {
     wl_platform_mutex_unlock(g_m);
 }
 
+// The deterministic mode's wait: the thread leaves the queue until a wake or its timeout in the
+// virtual clock puts it back (wl_xb_wake, det_expire).
+static bool det_wait(WlXbThread *self, uint32_t timeout_ms) {
+    wl_xb_cpu_save(&self->cpu);
+    g_cur = NULL;
+    wl_platform_mutex_lock(g_m);
+    g_stats.waits++;
+    if (self->woken || timeout_ms == 0) {
+        enqueue(self); // a wake came first, or no time to wait: only a yield
+    } else {
+        self->det_waiting = true;
+        self->det_deadline_us = timeout_ms == WL_WAIT_FOREVER ? 0 : wl_xb_time_us() + (uint64_t)timeout_ms * 1000u;
+        if (self->det_deadline_us != 0 && self->det_deadline_us < g_det_next_us) {
+            g_det_next_us = self->det_deadline_us;
+        }
+    }
+    hand_off();
+    det_await(self);
+    bool woke = self->woken;
+    self->woken = false;
+    if (!woke) {
+        g_stats.timeouts++;
+    }
+    wl_platform_mutex_unlock(g_m);
+    det_enter(self);
+    return woke;
+}
+
+// The deterministic mode: the waits whose timeout has come go back in the queue; returns the
+// earliest timeout still to come (UINT64_MAX: none). g_m not held.
+static uint64_t det_expire(uint64_t now) {
+    uint64_t next = UINT64_MAX;
+    wl_platform_mutex_lock(g_m);
+    for (WlXbThread *t = g_all; t != NULL; t = t->next_all) {
+        if (!t->det_waiting || t->det_deadline_us == 0) {
+            continue;
+        }
+        if (t->det_deadline_us <= now) {
+            t->det_waiting = false;
+            enqueue(t);
+        } else if (t->det_deadline_us < next) {
+            next = t->det_deadline_us;
+        }
+    }
+    wl_platform_mutex_unlock(g_m);
+    return next;
+}
+
 bool wl_xb_wait(WlXbThread *self, uint32_t timeout_ms) {
+    if (g_det) {
+        return det_wait(self, timeout_ms);
+    }
     wl_xb_cpu_save(&self->cpu);
     g_cur = NULL;
     wl_platform_mutex_lock(g_m);
@@ -189,7 +306,12 @@ void wl_xb_wake(WlXbThread *t) {
     wl_platform_mutex_lock(g_m);
     t->woken = true;
     g_stats.wakes++;
-    if (!t->ready && g_owner != t) {
+    if (g_det) {
+        if (t->det_waiting) {
+            t->det_waiting = false; // queued now, not when its host thread gets to run
+            enqueue(t);
+        }
+    } else if (!t->ready && g_owner != t) {
         wl_platform_cond_signal(t->cond);
     }
     wl_platform_mutex_unlock(g_m);
@@ -204,7 +326,7 @@ static void requeue(WlXbThread *self) {
     while (g_owner != self) {
         wl_platform_cond_wait(self->cond, g_m);
     }
-    g_quantum_start = wl_platform_time_us();
+    g_quantum_start = wl_xb_time_us();
     wl_platform_mutex_unlock(g_m);
     g_cur = self;
     wl_xb_cpu_load(&self->cpu);
@@ -217,7 +339,7 @@ static bool yield_if_due(WlXbThread *self) {
     if (self == NULL || head == NULL || wl_xb_in_service()) {
         return false;
     }
-    uint64_t now = wl_platform_time_us();
+    uint64_t now = wl_xb_time_us();
     bool boosted = self == g_boosted && now - g_quantum_start < (uint64_t)g_cfg.quantum_ms * 1000u;
     if (boosted && !head->is_service) {
         return false; // a starved thread keeps the lock for one quantum, as NT's boost gives it
@@ -259,7 +381,7 @@ static bool yield_if_due(WlXbThread *self) {
         while (g_owner != self) {
             wl_platform_cond_wait(self->cond, g_m);
         }
-        g_quantum_start = wl_platform_time_us();
+        g_quantum_start = wl_xb_time_us();
         wl_platform_mutex_unlock(g_m);
         g_cur = self;
         wl_xb_cpu_load(&self->cpu);
@@ -268,12 +390,122 @@ static bool yield_if_due(WlXbThread *self) {
     return false;
 }
 
+// The deterministic mode: the clock's events whose time has come (the service's, the waits'
+// timeouts, KeTickCount's next millisecond) are marked due; the next one is remembered.
+static void det_events(uint64_t now) {
+    uint64_t next = wl_xb_det_service_due(now);
+    uint64_t ms = (now / 1000u + 1u) * 1000u;
+    if (ms < next) {
+        next = ms;
+    }
+    uint64_t w = det_expire(now);
+    if (w < next) {
+        next = w;
+    }
+    g_det_next_us = next;
+}
+
+// The deterministic mode's safe point: the clock moves on by `ns`; the work (interrupts, a yield)
+// is looked at when something is due, a thread is ready, or (`levels`) a device was accessed.
+static void det_point(uint32_t ns, bool levels) {
+    WlXbThread *self = g_cur;
+    if (self == NULL || self->host_tid != wl_platform_thread_self_id()) {
+        return; // not the holder
+    }
+    g_vt_ns += ns;
+    if (self->kernel_depth != 0 || self->is_service || wl_xb_in_service()) {
+        return;
+    }
+    uint64_t now = g_vt_ns / 1000u;
+    if (!levels && now < g_det_next_us && g_xb_det_work == 0 && g_ready == NULL) {
+        return;
+    }
+    g_xb_det_work = 0;
+    g_stats.safe_points++;
+    if (now >= g_det_next_us) {
+        det_events(now);
+    }
+    wl_xb_service_poll_levels();
+    if (yield_if_due(self)) {
+        g_stats.safe_yields++;
+    }
+}
+
 void wl_xb_yield_point(void) {
+    if (g_det) {
+        det_point(g_det_call_ns, false);
+        return;
+    }
     wl_xb_service_poll();
     yield_if_due(g_cur);
 }
 
+void wl_xb_device_safe_point(void) {
+    if (g_det) {
+        det_point(g_det_device_ns, true);
+        return;
+    }
+    wl_xb_safe_point();
+}
+
+void wl_xb_det_note_deadline(uint64_t when_us) {
+    if (g_det && when_us != 0 && when_us < g_det_next_us) {
+        g_det_next_us = when_us;
+    }
+}
+
+void wl_xb_det_set_idle(WlXbThread *t) {
+    wl_platform_mutex_lock(g_m);
+    WlXbThread *old = g_idle;
+    g_idle = t;
+    if (old != NULL && t == NULL) {
+        wl_platform_cond_signal(old->cond);
+    }
+    wl_platform_mutex_unlock(g_m);
+}
+
+bool wl_xb_det_idle_take(WlXbThread *self, uint32_t timeout_ms) {
+    wl_platform_mutex_lock(g_m);
+    if (g_owner != self && g_idle == self) {
+        wl_platform_cond_wait_timeout(self->cond, g_m, timeout_ms);
+    }
+    bool took = g_owner == self;
+    wl_platform_mutex_unlock(g_m);
+    if (took) {
+        det_enter(self);
+    }
+    return took;
+}
+
+int wl_xb_det_idle_step(void) {
+    uint64_t now = g_vt_ns / 1000u;
+    uint64_t next = wl_xb_det_service_due(now);
+    uint64_t w = det_expire(now);
+    if (w < next) {
+        next = w;
+    }
+    wl_xb_det_service_run();
+    g_det_next_us = 0; // the next holder looks at the events at its first safe point
+    if (g_ready != NULL) {
+        return 1;
+    }
+    if (next == UINT64_MAX) {
+        return -1;
+    }
+    // every thread waits: the clock jumps to what is due next (on at least a microsecond, so a
+    // deadline the work did not take away cannot hold it in place)
+    if (next <= now) {
+        next = now + 1u;
+    }
+    g_vt_ns = next * 1000u;
+    return 0;
+}
+
 void wl_xb_safe_point(void) {
+    if (g_det) {
+        det_point(g_det_backedge_ns, false);
+        return;
+    }
     WlXbThread *self = g_cur;
     if (self == NULL || self->kernel_depth != 0 || self->is_service || wl_xb_in_service() ||
         self->host_tid != wl_platform_thread_self_id()) {
@@ -333,6 +565,15 @@ WlResult wl_xb_threads_init(const WlXbThreadConfig *cfg, WlXbThread **out) {
     }
     if (wl_platform_mutex_create(&g_m) != WL_OK || wl_platform_cond_create(&g_proc_cond) != WL_OK) {
         return WL_ERR_NOMEM;
+    }
+    g_det = g_cfg.deterministic;
+    if (g_det) {
+        g_det_backedge_ns = g_cfg.det_backedge_ns != 0 ? g_cfg.det_backedge_ns : 40u;
+        g_det_call_ns = g_cfg.det_call_ns != 0 ? g_cfg.det_call_ns : 400u;
+        g_det_device_ns = g_cfg.det_device_ns != 0 ? g_cfg.det_device_ns : 400u;
+        g_xb_attention = 1; // every backward jump is a safe point: the clock counts them
+        WL_LOG_I(TAG, "deterministic mode: a virtual clock (%u ns a backward jump, %u ns a kernel call, %u ns a "
+                 "device access)", (unsigned)g_det_backedge_ns, (unsigned)g_det_call_ns, (unsigned)g_det_device_ns);
     }
     g_ready_init = true;
     WlXbThread *t = new_thread(WL_XB_PRIORITY_NORMAL);
@@ -452,15 +693,34 @@ static void thread_finished(WlXbThread *t) {
 }
 
 // The host side of a guest thread: wait to be resumed, take the lock, run the routine.
+// The deterministic mode: a new or resumed thread goes in the ready queue now, at a point of the
+// guest's (its host thread only waits for the baton).
+static void det_start(WlXbThread *t) {
+    wl_platform_mutex_lock(g_m);
+    t->woken = false;
+    if (!t->ready && g_owner != t && !t->running_guest && !t->terminated) {
+        enqueue(t);
+    }
+    wl_platform_mutex_unlock(g_m);
+}
+
 static void *thread_main(void *arg) {
     WlXbThread *t = arg;
-    wl_platform_mutex_lock(g_m);
-    while (t->suspend_count > 0) {
-        wl_platform_cond_wait(t->cond, g_m);
+    if (g_det) {
+        // queued by its creation or its resume (det_start): it waits for the baton
+        wl_platform_mutex_lock(g_m);
+        det_await(t);
+        wl_platform_mutex_unlock(g_m);
+        det_enter(t);
+    } else {
+        wl_platform_mutex_lock(g_m);
+        while (t->suspend_count > 0) {
+            wl_platform_cond_wait(t->cond, g_m);
+        }
+        t->woken = false;
+        wl_platform_mutex_unlock(g_m);
+        wl_xb_lock(t);
     }
-    t->woken = false;
-    wl_platform_mutex_unlock(g_m);
-    wl_xb_lock(t);
     if (setjmp(t->exit_jmp) == 0) {
         t->running_guest = true;
         uint32_t args[2] = {t->start_ctx1, t->start_ctx2};
@@ -529,6 +789,10 @@ WlResult wl_xb_thread_create(uint32_t routine, uint32_t ctx1, uint32_t ctx2, uin
         return r;
     }
     wl_platform_thread_detach(t->host);
+    t->det_created = true;
+    if (g_det && t->suspend_count == 0) {
+        det_start(t);
+    }
     if (out != NULL) {
         *out = t;
     }
@@ -545,7 +809,14 @@ static void *host_thread_main(void *arg) {
     HostStart start = *(HostStart *)arg;
     free(arg);
     WlXbThread *t = start.t;
-    wl_xb_lock(t);
+    if (g_det) {
+        wl_platform_mutex_lock(g_m);
+        det_await(t);
+        wl_platform_mutex_unlock(g_m);
+        det_enter(t);
+    } else {
+        wl_xb_lock(t);
+    }
     if (setjmp(t->exit_jmp) == 0) {
         t->running_guest = true;
         start.fn(t, start.user);
@@ -588,6 +859,9 @@ WlResult wl_xb_thread_create_host(const char *name, WlXbHostThreadFn fn, void *u
         return r;
     }
     wl_platform_thread_detach(t->host);
+    if (g_det) {
+        det_start(t);
+    }
     if (out != NULL) {
         *out = t;
     }
@@ -604,6 +878,9 @@ uint32_t wl_xb_thread_resume(WlXbThread *t) {
         }
     }
     wl_platform_mutex_unlock(g_m);
+    if (g_det && before == 1u && t->det_created) {
+        det_start(t);
+    }
     return before;
 }
 
@@ -614,6 +891,9 @@ uint32_t wl_xb_thread_suspend(WlXbThread *t) {
     uint32_t before = t->suspend_count;
     if (!t->running_guest && !t->terminated) {
         t->suspend_count++;
+        if (g_det && t->ready) {
+            unqueue(t); // not started yet: out of the queue until its resume
+        }
     } else {
         WL_LOG_W(TAG, "suspend of running thread %u ignored", (unsigned)t->id);
     }
@@ -663,6 +943,16 @@ void wl_xb_thread_set_priority(WlXbThread *t, int priority) {
         priority = 31;
     }
     t->priority = priority;
+    if (g_det) {
+        wl_platform_mutex_lock(g_m);
+        if (t->ready) {
+            unqueue(t); // queued again at its new priority (a thread made and then given its priority)
+            uint64_t since = t->ready_since_us;
+            enqueue(t);
+            t->ready_since_us = since;
+        }
+        wl_platform_mutex_unlock(g_m);
+    }
     if (t->kthread != 0) {
         wl_xb_wr8(t->kthread + 0x32, (uint8_t)(priority & 31));
     }

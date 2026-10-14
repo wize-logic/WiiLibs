@@ -438,7 +438,7 @@ void wl_xb_dsi_slow(void *frame) {
             uint32_t acc = wl_xb_ppc_ea(&a, f->gpr);
             if (wl_xb_ppc_emulate(&a, f->gpr, acc, va)) {
                 f->pc += 4u;
-                wl_xb_safe_point(); // normal context (the trampoline): interrupt work, a waiting thread
+                wl_xb_device_safe_point(); // normal context (the trampoline): interrupt work, a waiting thread
                 return;
             }
             what = "no device at the address";
