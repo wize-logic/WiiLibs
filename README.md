@@ -16,10 +16,10 @@ Each module is `wl/<name>/` with its own README, a CMake target `wl_<name>` (ali
 | `base` | Result codes, asserts, logging, bump arena, endian readers, fixed point, FNV-1a/CRC-32, PRNG, UTF-8 | all |
 | `codec` | The GX texture codec (every texel format, TLUTs, CMPR with the hardware's 5/8 : 3/8 blend), Xbox texture conversion (Morton swizzle, DXT to CMPR/RGBA8, Xbox formats to GX) and the DSP-ADPCM decoder, shared by `gfx`, `gxtex`, `audio` and `brstm` | all |
 | `host` | POSIX helpers for tools: files, JSON reader, SHA-1, threads, processes | host |
-| `platform` | Platform layer (GX with render targets, video, input, audio out, files (and a crash-safe replace with its sweep, a directory listing cache), sockets, threads, tagged memory, a malloc that spills from MEM1 into MEM2, ring buffers, backtraces, a sampling profiler that a control file arms, hardware counters (the performance monitor and GX's) with a verdict on what bounds a frame, a bring-up text console and stop screen, a frame overlay with its drawing helpers, a HOME menu with the Wii's notices and a wrist strap reminder) with a libogc backend and a dependency-free host backend | all |
+| `platform` | Platform layer (GX with render targets, video, input, audio out, files (and a crash-safe replace with its sweep, a directory listing cache), sockets, threads, tagged memory, a malloc that spills from MEM1 into MEM2, ring buffers, backtraces, a census of who holds the heap (and a cap that imitates the Wii's on the host), a sampling profiler that a control file arms, hardware counters (the performance monitor and GX's) with a verdict on what bounds a frame, a bring-up text console and stop screen, a frame overlay with its drawing helpers, a HOME menu with the Wii's notices and a wrist strap reminder) with a libogc backend and a dependency-free host backend | all |
 | `gxsoft` | A software GX for host builds and tests: what a program asks of `platform`'s GX layer (the direct layer, TEV programs stage by stage, textures decoded with `codec`, blending, depth, culling, clipping, render targets' EFB copies, the display copy) drawn on the processor as the console's GX draws it, checked against Dolphin | host, ppc-be |
 | `audio` | ADPCM decode (DSP-ADPCM via `codec`), 32-voice mixer, streamed music, DS SSEQ/SBNK/SWAR synthesiser, music track engine (`wl_audio_core` is the portable part) | all |
-| `gfx` | Matrix/vector maths, Broadway paired-single fast paths (C fallback elsewhere), a correctly rounded `sqrtf` from `frsqrte` (opt-in `--wrap=sqrtf`), GX texture decode/encode (wrappers over `codec`) | all |
+| `gfx` | Matrix/vector maths, Broadway paired-single fast paths (C fallback elsewhere), a correctly rounded `sqrtf` and `sqrt` from `frsqrte` (opt-in `--wrap=sqrtf`, `--wrap=sqrt`), GX texture decode/encode (wrappers over `codec`) | all |
 | `gxtex` | Offline GX texture encoding, BRRES TEX0 reading, NDS 2D graphics (NCGR/NCLR/NCER/NANR) to GX | all |
 | `nds` | NDS ROM header, FNT/FAT, overlays, NARC, LZ10/LZ11/BLZ | all |
 | `ctr` | 3DS NCSD, NCCH, ExeFS, RomFS, GARC (decrypted images) | all (file source: host) |
@@ -28,9 +28,9 @@ Each module is `wl/<name>/` with its own README, a CMake target `wl_<name>` (ali
 | `gs` | Genius Sonority FSYS archives, TOC, LZSS | all |
 | `brstm` | NW4R audio: BRSTM, BRSAR, RWSD, DSP-ADPCM (via `codec`) | all (path open: host) |
 | `sdat` | NDS SDAT sound archives (SSEQ/SBNK/SWAR/STRM) | all (index: host) |
-| `xbox` | The Xbox's NV2A on GX: pixel shaders' register combiners translated to TEV programs (with a cache that rewrites constants in place, and a hook for a game's hand-made programs), vertex programs decoded, analysed (inputs, affinity, constants read) and run on the processor, and compiled ahead of time to C by `tools/xbox_vsh_codegen.c`; the NV2A as a device for a title whose own Direct3D runs unchanged (MMIO registers, push buffers executed, semaphores, interrupts, the 3D state, vertex fetch of every format, textures converted and kept, captures and their replay), with a backend on GX (`wl_xbox_gx`) and a recorder | all (the tools: host) |
+| `xbox` | The Xbox's NV2A on GX: pixel shaders' register combiners translated to TEV programs (with a cache that rewrites constants in place, and a hook for a game's hand-made programs), vertex programs decoded, analysed (inputs, affinity, constants read) and run on the processor, and compiled ahead of time to C by `tools/xbox_vsh_codegen.c`; the NV2A as a device for a title whose own Direct3D runs unchanged (MMIO registers, push buffers executed, semaphores, interrupts, the 3D state, vertex fetch of every format, textures converted and kept in an arena and checked through a write watch, captures and their replay), with a backend on GX (`wl_xbox_gx`: draws whose outputs are affine go to GX's transform unit, static vertex arrays are kept for GX to read by index) and a recorder | all (the tools: host) |
 | `xboxapu` | The Xbox's audio hardware as device models a recompiled title's own DirectSound drives: the MCPX APU (registers, front end methods, the voice processor playing PCM and Xbox ADPCM buffer and stream voices with pitch, envelopes and 32 mixbins at 48 kHz, notifiers, interrupts, a stereo mix in place of the GP/EP DSP programs) and the AC'97 controller | all |
-| `xboxrt` | The runtime a recompiled Xbox title runs on: guest memory at the Xbox's addresses (the Wii's MMU with a hashed page table filled on first touch, demand paging to a swap file when the frames run out; a reservation elsewhere, paged the same way under a frame limit), devices behind faults with PowerPC and x86-64 instruction decoders, the generated code's register file, guest threads under one guest lock, interrupts and the vertical blank, the kernel thunk dispatcher, the XBE loader, crash reports, the audio devices (`xboxapu`'s models, the platform's output at 48 kHz, a WAV on the host), the USB host controllers with the Xbox's gamepads (the Wii's controllers mapped onto them), a play harness that drives them from a script, and the boot code (`wl_xboxrt_boot`, `wl_xboxrt_main`) | all (the MMU backend: Wii; faults: host, ppc-be) |
+| `xboxrt` | The runtime a recompiled Xbox title runs on: guest memory at the Xbox's addresses (the Wii's MMU with a hashed page table filled on first touch, demand paging to a swap file when the frames run out; a reservation elsewhere, paged the same way under a frame limit), devices behind faults with PowerPC and x86-64 instruction decoders, the generated code's register file, guest threads under one guest lock, interrupts and the vertical blank, the kernel thunk dispatcher, the XBE loader, crash reports, the audio devices (`xboxapu`'s models, the platform's output at 48 kHz, a WAV on the host), the USB host controllers with the Xbox's gamepads (the Wii's controllers mapped onto them), a play harness that drives them from a script, a deterministic mode (a virtual clock), a capture bench, diagnostics (a stall report, a freeze watch, a heap census) and the boot code (`wl_xboxrt_boot`, `wl_xboxrt_main`) | all (the MMU backend: Wii; faults: host, ppc-be) |
 | `xboxkrnl` | The Xbox kernel's exports for recompiled titles over `xboxrt` and `platform`: dispatcher objects and waits, critical sections, threads, IRQL/DPCs/timers/interrupts, memory, files through a mount table (the title's folder, the hard disk's partitions, sparse cache drives), settings, AV and HAL queries, Rtl, SHA-1/HMAC/RC4; every import of Halo's XBE covered | all |
 
 `wl/xboxrt/recomp/` holds the runtime header recompiled Xbox code includes (`recomp_types.h`,
@@ -76,13 +76,14 @@ cmake --build build/wii && ctest --test-dir build/wii -L dolphin --output-on-fai
 | Tool | What it does |
 |---|---|
 | `tools/wii_package.py` | Zips a `.dol` for the Homebrew Channel: `apps/<app>/boot.dol`, a `meta.xml` (name, coder, version, descriptions; escaped), a 128x48 `icon.png` (given, or drawn from the name) and any `--extra` files; reproducible (`SOURCE_DATE_EPOCH`). From CMake: `wl_add_hbc_package(<dol target> NAME ... [ICON_TEXT|ICON] [EXTRA ...])` (`cmake/WiiLibs.cmake`) adds `<target>_hbc`. Tests: `tests/tools/` (host) |
-| `tools/dolphin_run.py` | Runs a `.dol` in Dolphin: see above; `--sd-out DIR` copies the files the program wrote to the card (new or changed since `--sd`: a log, a save) out of the runner's copy of it. Tests: `tests/tools/test_dolphin_run.py` |
+| `tools/dolphin_run.py` | Runs a `.dol` in Dolphin: see above. `--sd DIR` syncs a folder in as the card and `--sd-out DIR` copies the files the program wrote (new or changed since `--sd`: a log, a save) out of the runner's copy of it; `--until TEXT` / `--fail REGEX` end the run on an OSREPORT line; `--mmu` turns on Dolphin's full MMU emulation (needed by `wl_xboxrt_console.dol` and every recompiled title); `--unthrottled` removes the speed limit (a long run finishes sooner, the program sees no difference); `--screenshot PNG`, `--dump-frames DIR` and `--dump-audio DIR` save what the console showed and played; `--single-core`, `--panics`, `--video`, `--wii-aspect`, `--wii-progressive`, `--wii-eurgb60`, `--name` (a work folder, so runs can go side by side); `--backtrace ELF` and `--break SYMBOL` use the GDB stub. Tests: `tests/tools/test_dolphin_run.py` |
 | `tools/link_stubs.py` | Links a program that is not complete yet: on undefined symbols it writes a C file defining each as a function that stops the program naming it (`--stop-function`, default `wl_platform_missing_symbol` of `wl/platform/stop.h`, which shows the name on the Wii's screen and waits for HOME), compiles it, links again and lists the names in `--report`; `--data NAME[:BYTES]` defines a data symbol as zero bytes instead. Tests: `tests/tools/test_link_stubs.py` (host) |
 | `tools/wl_profile.py` | Symbolizes the sampling profiler's dumps (`wl/platform/profile.h`) against the program's ELF: the top functions by their own samples and by inclusive, callers and callees of a function, a call tree, the hottest instructions, a time line, folded stacks for flame graphs. Tests: `tests/tools/test_wl_profile.py` |
 | `tools/qemu_icount.py` | Counts the instructions a program built for big-endian PowerPC Linux (the `ppc-be` toolchain, `-mcpu=750`) runs under qemu-ppc: in all, by function, by translation block, and the difference from a smaller run of the same program (a cost per item: per vertex, per output frame). Speed counted without a Wii: exact and repeatable, though not cycles. Tests: `tests/tools/test_qemu_icount.py` |
 | `tools/fma_check.py` | Lists the fused multiply-adds (`fmadd`, `fmsub`, `fnmadd`, `fnmsub` and their single forms, the Gekko's paired singles `ps_madd`..`ps_madds1`, AltiVec's and VSX's) in PowerPC objects, archives and ELF files, by object and function, with the instructions (`-v`); exit 1 if there are any, 2 if the check could not be made (a file objdump cannot read as PowerPC is never a pass). For a program whose results must match another machine's bit for bit: compilers fuse unasked, and Clang has let some through `-ffp-contract=off`. Shell-pattern filters on objects and archive members (`--include`, `--exclude`) and on functions (`--include-function`, `--exclude-function`), `@file` response files (ninja's), `--stamp` for build systems. Runs objdump with `-M gekko`, without which the paired singles are misread. From CMake: `wl_add_fma_check(<target> [LINKED] [OBJDUMP ...] [EXCLUDE ...] [EXCLUDE_FUNCTION ...])` (`cmake/WiiLibs.cmake`) fails the target's build if its objects (or, with `LINKED`, its ELF) have one; pairs with `wl_target_defaults(<target> DETERMINISTIC)`. Tests: `tests/tools/` (host; real objects where a PowerPC Linux compiler is installed) |
+| `tools/png_compare.py` | Compares two folders of PNG frames (`xbox_nv2a_replay --png-gx`'s): for each frame of the same name the pixels that differ at all, those beyond `--threshold N` (default 8, a channel's difference) in any channel, the largest difference and the bounds of the differing pixels; `--diff DIR` writes an image of each frame's differences. Exit 1 when a frame has a pixel beyond the threshold. 8-bit RGB or RGBA PNGs only |
 | `tools/xbox_tex_reference.py` | Reference implementation of the Xbox texture conversions |
-| `tools/xbox_nv2a_replay.c` | Replays a capture of the NV2A model (`wl/xbox/nv2a_capture.h`: a title's push buffers and the guest memory they read) on the host: each clear, draw, frame and flip described, the model's counts, and with `--png-gx` each frame the GX backend would show, drawn by the host's software GX (`wl/gxsoft`; `wl/xbox/README.md`). Built with the host build (`xbox_nv2a_replay`). Tests: `tests/xbox/` |
+| `tools/xbox_nv2a_replay.c` | Replays a capture of the NV2A model (`wl/xbox/nv2a_capture.h`: a title's push buffers and the guest memory they read) on the host: each clear, draw, frame and flip described, the model's counts, and with `--png-gx` each frame the GX backend would show, drawn by the host's software GX (`wl/gxsoft`); `--bench N` times the GPU path alone, `--textures-mb`, `--vertex-cache-kb` and `--watch` size its caches as the runtime does, `--cpu-transform` keeps GX's transform unit out, `--programs FILE` lists the vertex programs drawn (flags and what they print: `wl/xbox/README.md`). Built with the host build (`xbox_nv2a_replay`). Tests: `tests/xbox/` |
 | `tools/xbox_vsh_codegen.c` | Compiles a file of Xbox (NV2A) vertex programs to C functions that give, bit for bit, what `wl/xbox/vsh.h`'s interpreter gives, and a table of them for `wl_xbox_vsh_compile` (`wl/xbox/README.md`). Built with the host build (`xbox_vsh_codegen`). Tests: `tests/xbox/test_xbox_vsh_native.c` |
 | `tools/xbox_recomp.py` | Runs xboxrecomp's pipeline (vendored in `third_party/xboxrecomp`, WiiLibs' patches applied in the build tree) on an XBE: parse, disassemble every executable section, identify, calling conventions, lift to C in chunks, each stage cached by its inputs' hashes; wraps the chunks in a fixed set of translation units for a build system. A title's knowledge comes in a JSON config (`--config`: hand-written functions, seeds, extra options). From CMake: `wl_add_xbox_title` (below). Tests: `tests/tools/test_xbox_recomp.py`, `tests/xbox_recomp/` (host) |
 | `tools/xbox_recomp_smoke.py` | Smoke check on a real title: runs the driver on an XBE into a build directory and compiles every chunk for the Wii with devkitPPC, reporting functions, unresolved call targets, unimplemented instructions and the summed `.text`. Nothing it generates leaves the build directory |
@@ -100,29 +101,37 @@ for the Wii (or the host, or `ppc-be` for tests). In a CMake project that adds W
 
 ```cmake
 wl_add_xbox_title(mygame XBE ${GAME_DIR}/default.xbe
-    TITLE_CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/title.json   # optional: hand-written functions, seeds
-    OPT -Os                                               # default; -O2 is about 40% bigger
+    TITLE_CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/title.json   # optional: hand-written functions, seeds, XBE patches
+    OPT -Os                                               # default; -O2 was about 40% bigger (measured with patches 0001-0007)
     SOURCES src/overrides.c)                              # the title project's own code
 ```
 
 At build time `tools/xbox_recomp.py` runs the pipeline on the XBE into the build tree (the generated
 code is derived from the game: it stays there and is never committed), the chunks are compiled with
 the flags they need against `wl/xboxrt/recomp/recomp_types.h`, and the executable links WiiLibs' Xbox
-runtime (`WiiLibs::xboxrt`, being written; `RUNTIME` names another). On the Wii it gets its `.dol`.
+runtime (`WiiLibs::xboxrt`, with `WiiLibs::xboxkrnl`, `xbox` and `xboxapu` behind it; `RUNTIME` names another). On the Wii it gets its `.dol`. The title config's keys are listed in `tools/xbox_recomp.py`'s documentation; `"vertex_programs"` has the build compile the title's NV2A vertex programs to C (`wl/xbox/README.md`), and `"x87_locals": false` turns off patch 0013.
 The header makes the generated code right on a big-endian CPU: guest memory keeps the x86's
 little-endian bytes and every access byte-reverses (`lwbrx`/`stwbrx`); guest addresses go through
 `WL_XB_EA` (user space as is, the 0x8xxxxxxx/0xFxxxxxxx windows at 0x1xxxxxxx). Its README lists the
 symbols a runtime defines.
 
 What makes it trustworthy: `ctest -R xbox_recomp_conformance` lifts every one of xboxrecomp's
-conformance cases (x86 snippets with inputs; 207 cases, 6,322 vectors) and runs them big-endian
+conformance cases (x86 snippets with inputs; 243 cases, 6,815 vectors, the x87 ones also through `--x87-locals`) and runs them big-endian
 under qemu-ppc against a recording of this machine's x86 CPU; `xbox_recomp_e2e` does the same with
 whole programs; `xboxrecomp_pytest` runs upstream's own test suite on the patched pipeline.
 WiiLibs' fixes to upstream (shift counts, float-to-int conversions, float stores, reserved names,
-80-bit x87 operands, parity conditions, a runtime-header option) are patch files in
+80-bit x87 operands, parity conditions, a runtime-header option, a safe point at backward jumps, port
+I/O, jumps and calls into code no function starts at, and the x87 state kept in locals) are patch files (0001-0013) in
 `third_party/xboxrecomp/patches/`, written to be sent upstream. Upstream updates are taken with
 `tools/xboxrecomp_sync.py` ([docs/xboxrecomp-sync.md](docs/xboxrecomp-sync.md)). Retail Halo
-(7,493 functions) lifts and compiles for the Wii to 10.8 MiB of code at `-Os`.
+(7,493 functions) lifts and compiles for the Wii to about 11.8 MiB of code at `-Os` with patches
+0001-0013 (12,367,796 bytes of `.text` summed over the objects; the Wii executable is about 14 MB:
+[docs/xboxrecomp-sync.md](docs/xboxrecomp-sync.md)'s reference numbers, which need the game's XBE
+and were not re-measured for this document).
+
+Running the result, on the host or on the Wii: the title's folder, the files in it that switch
+things (`play.cfg`, `profile.txt`, `hwcount.txt`, `noxf`, `vcache`, `novcache`, `noaudio`) and the
+environment variables (`WL_XB_*`) are listed in [wl/xboxrt/README.md](wl/xboxrt/README.md), "Running a title".
 
 ## Conventions
 
@@ -141,9 +150,15 @@ WiiLibs' fixes to upstream (shift counts, float-to-int conversions, float stores
   output. Input is only initialised, not driven. Nothing has run on hardware yet.
 - No tests against real game files (the Xbox smoke check, `tools/xbox_recomp_smoke.py`, is run by
   hand on a title the developer owns).
-- Recompiled Xbox code: the runtime (`wl/xboxrt`), the kernel and NV2A on GX are being written; a
-  title links only against a stand-in so far. Each `tail_jump_alias` entry is lifted as a full copy
-  of the body it enters (Halo: 2.0 MB of x86 lifted from 1.6 MB of unique code).
+- Recompiled Xbox code: retail Halo boots on the Wii in Dolphin (with `--mmu`), draws on GX, plays
+  sound through the APU model, takes the controllers through the USB model and plays whole levels
+  (the play harness, a deterministic mode for comparing runs, the capture bench, demand paging,
+  a stall report and a freeze watch are the tools for long runs). Not done: the Xbox's 30 frames a
+  second is not reached; materials GX cannot do exactly get stand-ins (cube maps, per-pixel dot
+  products, the stencil: `wl/xbox/README.md`, "Not handled yet"); the audio has no effects
+  (`wl/xboxapu/README.md`); nothing of it has run on hardware. Each `tail_jump_alias` entry is
+  lifted as a full copy of the body it enters (Halo: 2.0 MB of x86 lifted from 1.6 MB of unique
+  code).
 
 ## Licence
 
