@@ -100,4 +100,6 @@ guest memory: 16-bit PCM through scattered pages reaching its bins exactly, volu
 `wl_xbox_adpcm_decode_block` (64 samples a block, blocks across pages), a stream's two segment
 lists, its starvation and refill, the amplitude envelope's stages, a multipass voice, the GP's
 command word and the fence, a 3D voice's submix bins, and the AC'97 bus master's descriptors,
-status and interrupt.
+status and interrupt. `bench_xboxapu_checksum` (host and ppc-be): the benchmark's scene for 3000
+frames, its checksum of every frame's bins and output against the one the voice processor made
+before it was reworked for speed.
