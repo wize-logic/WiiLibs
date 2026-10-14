@@ -138,6 +138,89 @@ void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
     wl_gx_direct_vertex(&v);
 }
 
+void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride) {
+    if (attribute < 11u) {
+        s.arrays[attribute] = data;
+        s.array_strides[attribute] = stride;
+    }
+}
+
+static float be_float(const uint8_t *p) {
+    uint32_t bits = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+    float f;
+
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+// an indexed attribute's element, or NULL when its array was not set
+static const uint8_t *element(unsigned attribute, uint16_t index) {
+    const uint8_t *array = s.arrays[attribute];
+
+    return array != NULL ? array + (size_t)index * s.array_strides[attribute] : NULL;
+}
+
+void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t count) {
+    WlGxDirectVertex v;
+    const uint8_t *e;
+    uint32_t i = 0, n;
+
+    // (the vertex as GX would read it: an indexed attribute from its array, the others' words)
+    memset(&v, 0, sizeof v);
+    if (s.layout.indexed & (1u << WL_GX_DIRECT_ARRAY_POSITION)) {
+        if ((e = element(WL_GX_DIRECT_ARRAY_POSITION, index)) != NULL) {
+            v.position[0] = be_float(e);
+            v.position[1] = be_float(e + 4);
+            v.position[2] = be_float(e + 8);
+        }
+    } else {
+        for (n = 0; n < 3 && i < count; n++) {
+            memcpy(&v.position[n], &words[i++], sizeof(float));
+        }
+    }
+    for (n = 0; n < s.layout.colors && n < 2; n++) {
+        if (s.layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_COLOR0 + n))) {
+            if ((e = element(WL_GX_DIRECT_ARRAY_COLOR0 + n, index)) != NULL) {
+                memcpy(v.color[n], e, 4);
+            }
+        } else if (i < count) {
+            v.color[n][0] = (uint8_t)(words[i] >> 24);
+            v.color[n][1] = (uint8_t)(words[i] >> 16);
+            v.color[n][2] = (uint8_t)(words[i] >> 8);
+            v.color[n][3] = (uint8_t)words[i];
+            i++;
+        }
+    }
+    for (n = 0; n < 8; n++) {
+        bool one = (s.layout.texcoord_s & (1u << n)) != 0;
+
+        if (!(s.layout.texcoords & (1u << n))) {
+            continue;
+        }
+        if (s.layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_TEXCOORD0 + n))) {
+            if ((e = element(WL_GX_DIRECT_ARRAY_TEXCOORD0 + n, index)) != NULL) {
+                v.texcoord[n][0] = be_float(e);
+                v.texcoord[n][1] = one ? 0.0f : be_float(e + 4);
+            }
+            continue;
+        }
+        if (i < count) {
+            memcpy(&v.texcoord[n][0], &words[i++], sizeof(float));
+        }
+        if (!one && i < count) {
+            memcpy(&v.texcoord[n][1], &words[i++], sizeof(float));
+        }
+    }
+    if (g_in_primitive) {
+        s.indexed_vertices++;
+    }
+    wl_gx_direct_vertex(&v);
+}
+
+void wl_gx_direct_arrays_changed(void) {
+    s.arrays_changed++;
+}
+
 void wl_gx_direct_primitive_end(void) {
     if (!g_in_primitive) {
         return;
