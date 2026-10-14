@@ -35,6 +35,11 @@ recomp_func_t recomp_lookup_kernel(uint32_t va) {
     (void)va;
     return NULL;
 }
+recomp_func_t wl_xb_lookup(uint32_t va) { /* RECOMP_RESOLVE: manual, generated, kernel (no cache here) */
+    recomp_func_t fn = recomp_lookup_manual(va);
+    if (fn == NULL) fn = recomp_lookup(va);
+    return fn != NULL ? fn : recomp_lookup_kernel(va);
+}
 void recomp_icall_fail_log(uint32_t va) { fprintf(stderr, "stub runtime: no function at %08x\n", (unsigned)va); }
 void recomp_icall_not_code_log(uint32_t va) { fprintf(stderr, "stub runtime: %08x is not code\n", (unsigned)va); }
 void recomp_debug_service(uint32_t service, uint32_t arg_va) {

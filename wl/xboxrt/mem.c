@@ -34,6 +34,13 @@ static uint32_t g_region_count;
 static uint32_t g_top_hint; // no free page above this one
 static uint32_t g_used, g_user_pages, g_contig_pages, g_relocations;
 static uint32_t g_low_pages; // the reserved low pages (the retail kernel's), lent as a last resort
+// User pages page_ok found committed lately, direct-mapped by page number (the page + 1; 0: empty).
+// A title project's own code checks every guest read with wl_xb_range_ok (Halo's play harness
+// reads object fields this way: 1.3% of a10's time on the Wii), and the 128 KB table's entry is a
+// cache miss more often than not; these 64 bytes stay in the cache. Only a decommit makes a
+// committed page fail, and it empties them.
+#define OK_PAGES 16u
+static uint32_t g_ok_pages[OK_PAGES];
 
 void wl_xb_mem_config_default(WlXbMemConfig *cfg) {
     memset(cfg, 0, sizeof *cfg);
@@ -444,6 +451,7 @@ WlResult wl_xb_va_commit(uint32_t va, uint32_t bytes, uint32_t protect) {
 }
 
 static void decommit_pages(uint32_t vp0, uint32_t vp1) {
+    memset(g_ok_pages, 0, sizeof g_ok_pages); // (page_ok's memo of committed pages)
     for (uint32_t vp = vp0; vp < vp1; vp++) {
         if (g_xb_va2phys[vp] == 0) {
             continue;
@@ -591,7 +599,16 @@ bool wl_xb_va_to_phys(uint32_t va, uint32_t *phys) {
 
 static bool page_ok(uint32_t va) {
     if (va < WL_XB_USER_LIMIT) {
-        return g_xb_va2phys != NULL && g_xb_va2phys[va >> WL_XB_PAGE_SHIFT] != 0;
+        uint32_t vp = va >> WL_XB_PAGE_SHIFT;
+        uint32_t *memo = &g_ok_pages[vp & (OK_PAGES - 1u)];
+        if (*memo == vp + 1u) {
+            return true;
+        }
+        if (g_xb_va2phys == NULL || g_xb_va2phys[vp] == 0) {
+            return false;
+        }
+        *memo = vp + 1u;
+        return true;
     }
     uint32_t top = va >> 28;
     if ((top == 0x8u || top == 0xFu) && va < WL_XB_MMIO_BASE) {

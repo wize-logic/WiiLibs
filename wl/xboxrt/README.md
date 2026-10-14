@@ -164,6 +164,7 @@ compiles the list against the generated code's header so a type that differs doe
 
 | Function | Provided by | What |
 |---|---|---|
+| `wl_xb_lookup(va)` | here | what every indirect call and jump asks (`RECOMP_RESOLVE`): the three below in order, the manual and generated answers kept in a direct-mapped cache of 4096 entries (the generated table is a binary search); kernel thunks are never kept, as their lookup names the slot the dispatcher runs |
 | `recomp_lookup(va)` | the generated `recomp_dispatch.c` | VA to translated function. Referenced weakly here: generated code must be linked as objects (sources of the executable, or an `OBJECT` library), since nothing would pull it out of a static archive |
 | `recomp_lookup_manual(va)` | weak default here | the title's hand-written functions: the default asks the hook set with `wl_xb_set_manual_lookup` (`WlXbTitleConfig.manual_lookup`) |
 | `recomp_lookup_kernel(va)` | here | the kernel thunk slots `0xFE000000 + slot * 4`: the dispatcher pops the return address, makes the call a yield point, runs the export and pops its stdcall bytes |

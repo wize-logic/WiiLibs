@@ -164,6 +164,7 @@ static recomp_func_t g_guest_fns[MAX_GUEST_FNS];
 
 static uint32_t guest_fn(uint32_t index, recomp_func_t fn) {
     g_guest_fns[index] = fn;
+    wl_xb_lookup_flush(); // the manual table changed: the lookup's cache may hold the old function
     return TEXT_VA + 0x100u + index * 16u;
 }
 

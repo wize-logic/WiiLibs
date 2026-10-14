@@ -154,6 +154,7 @@ void recomp_icall_not_code_log(uint32_t va) { (void)va; }
 recomp_func_t recomp_lookup(uint32_t va) { (void)va; return 0; }
 recomp_func_t recomp_lookup_manual(uint32_t va) { (void)va; return 0; }
 recomp_func_t recomp_lookup_kernel(uint32_t va) { (void)va; return 0; }
+recomp_func_t wl_xb_lookup(uint32_t va) { recomp_func_t f = recomp_lookup_manual(va); if (!f) f = recomp_lookup(va); return f ? f : recomp_lookup_kernel(va); } /* RECOMP_RESOLVE */
 void recomp_unimpl(const char *t, uint32_t va) { printf("UNIMPL %s at %08x\n", t, (unsigned)va); }
 uint64_t xbox_ReadTimeStampCounter(void) { return 0; }
 void recomp_debug_service(uint32_t s, uint32_t a) { (void)s; (void)a; }
