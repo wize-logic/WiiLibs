@@ -444,8 +444,7 @@ void wl_xb_port_out(uint32_t port, uint32_t value, unsigned size) {
 // EFLAGS bits a guest can set and read back that no generated code keeps: AC (18) and ID (21). A
 // processor that has CPUID lets ID be toggled, which is how code (Bink's MMX check) asks before it
 // runs CPUID.
-#define EFLAGS_KEPT 0x00240000u
-static uint32_t g_eflags_kept;
+#define EFLAGS_KEPT 0x00240000u // (in g_eflags_kept: per guest thread, as DF is)
 
 // What the Xbox's processor (a Pentium III, family 6 model 8, at 733 MHz) answers to CPUID.
 static void cpuid(void) {
@@ -473,11 +472,11 @@ static void cpuid(void) {
 }
 
 // The generated code calls this for an instruction the lifter does not translate, with the
-// registers stored to their globals before the call and loaded back after it. Three are done here
+// registers stored to their globals before the call and loaded back after it. These are done here
 // rather than skipped, as code that asks the processor what it is uses them together: pushfd and
-// popfd (EFLAGS through the stack: DF and the bits above are kept, the arithmetic flags, which
-// live in the generated code's locals, read as clear) and cpuid. Every other one stays a no-op,
-// logged at its first run.
+// popfd, their 16-bit pushf and popf (EFLAGS through the stack: DF and the bits above are kept,
+// per guest thread; the arithmetic flags, which live in the generated code's locals, read as
+// clear) and cpuid. Every other one stays a no-op, logged at its first run.
 __attribute__((weak)) void recomp_unimpl(const char *text, uint32_t va) {
     if (text != NULL && (strcmp(text, "pushfd") == 0 || strcmp(text, "pushf") == 0)) {
         uint32_t fl = 0x00000202u | (g_df ? 0x400u : 0u) | g_eflags_kept; // IF and the reserved bit 1
@@ -495,6 +494,12 @@ __attribute__((weak)) void recomp_unimpl(const char *text, uint32_t va) {
         g_esp += 4u;
         g_df = (fl & 0x400u) != 0;
         g_eflags_kept = fl & EFLAGS_KEPT;
+        return;
+    }
+    if (text != NULL && strcmp(text, "popf") == 0) { // 16 bits: FLAGS alone, AC and ID stay
+        uint32_t fl = wl_xb_rd16(g_esp);
+        g_esp += 2u;
+        g_df = (fl & 0x400u) != 0;
         return;
     }
     if (text != NULL && strcmp(text, "cpuid") == 0) {

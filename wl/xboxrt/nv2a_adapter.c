@@ -220,24 +220,20 @@ static void gpu_status(void) {
     if (g_gx == NULL) {
         return;
     }
-    WlNv2aStats ns;
-    wl_nv2a_stats(g_gpu, &ns);
-    // the pusher and the display: whether the title's push buffers still come in and flip
-    WL_LOG_I(TAG, "status: pusher %u kicks, %u words, %u methods, %u errors, %u unmet acquires; %u flips, %u frames, "
-             "%u vblanks, %u notifies, %u semaphores", (unsigned)ns.kicks, (unsigned)ns.words, (unsigned)ns.methods,
-             (unsigned)ns.pusher_errors, (unsigned)ns.acquires_unmet, (unsigned)ns.flips, (unsigned)ns.frames,
-             (unsigned)ns.vblanks, (unsigned)ns.notifies, (unsigned)ns.semaphores);
+    if (g_gpu != NULL) {
+        WlNv2aStats ns;
+        wl_nv2a_stats(g_gpu, &ns);
+        // the pusher and the display: whether the title's push buffers still come in and flip (an
+        // unmet acquire: the channel waited on a semaphore)
+        WL_LOG_I(TAG, "status: pusher %u kicks, %u words, %u methods, %u errors, %u unmet acquires; %u flips, %u "
+                 "frames, %u vblanks, %u notifies, %u semaphores", (unsigned)ns.kicks, (unsigned)ns.words,
+                 (unsigned)ns.methods, (unsigned)ns.pusher_errors, (unsigned)ns.acquires_unmet, (unsigned)ns.flips,
+                 (unsigned)ns.frames, (unsigned)ns.vblanks, (unsigned)ns.notifies, (unsigned)ns.semaphores);
+    }
     WlNv2aGxStats gs;
     wl_nv2a_gx_stats(g_gx, &gs);
     WlNv2aTexCacheStats ts;
     wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
-    if (g_gpu != NULL) {
-        WlNv2aStats ds;
-        wl_nv2a_stats(g_gpu, &ds);
-        WL_LOG_I(TAG, "status: %u semaphore acquires not met at once (the channel waited), %u pusher errors, %u "
-                 "notifies, %u kicks", (unsigned)ds.acquires_unmet, (unsigned)ds.pusher_errors, (unsigned)ds.notifies,
-                 (unsigned)ds.kicks);
-    }
     WL_LOG_I(TAG, "status: %u frames, %u draws (%u perspective, %u into targets, %u target-less, %u stencil "
              "only (skipped), %u stencil ignored, %u programs beyond GX, %u approximated)", (unsigned)gs.frames, (unsigned)gs.draws,
              (unsigned)gs.perspective_draws, (unsigned)gs.target_draws, (unsigned)gs.target_skipped,
