@@ -636,10 +636,14 @@ void wl_nv2a_suspend_current(WlNv2a *dev, unsigned why) {
     }
 }
 
-// a channel stopped at a trap or a NOTIFY goes on once the ISR has cleared its interrupt
+// a channel stopped at a trap or a NOTIFY goes on once the ISR has cleared its interrupt, while
+// PGRAPH's FIFO access is on (the ISR turns it off while it works)
 static void resume_trapped(WlNv2a *dev) {
     unsigned chid;
 
+    if (!(dev->pgraph_fifo & 1u)) {
+        return;
+    }
     for (chid = 0; chid < WL_NV2A_CHANNELS; chid++) {
         WlNv2aChannel *ch = &dev->channels[chid];
         uint8_t was = ch->suspended;
@@ -875,6 +879,8 @@ static void write32(WlNv2a *dev, uint32_t offset, uint32_t value) {
         break;
     case WL_NV2A_PGRAPH_FIFO:
         dev->pgraph_fifo = value;
+        // (access on again: a channel the ISR has acknowledged goes on)
+        resume_trapped(dev);
         break;
     case WL_NV2A_PCRTC_INTR_0:
         dev->pcrtc_intr &= ~value;

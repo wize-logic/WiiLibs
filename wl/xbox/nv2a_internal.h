@@ -35,8 +35,8 @@ typedef struct WlNv2aChannel {
     uint32_t method, count;
     uint8_t subchannel, non_increasing;
     // stopped (WL_NV2A_SUSPEND_* bits): after a trapped method or a NOTIFY that wakes the title, until
-    // its ISR acknowledges the interrupt; at a semaphore acquire not met, tried again at the next
-    // doorbell and vertical blank
+    // its ISR acknowledges the interrupt (and PGRAPH's FIFO access is on); at a semaphore acquire not
+    // met, tried again at the next doorbell and vertical blank
     uint8_t suspended;
     uint32_t subchannel_class[WL_NV2A_SUBCHANNELS];
     uint32_t subchannel_instance[WL_NV2A_SUBCHANNELS];

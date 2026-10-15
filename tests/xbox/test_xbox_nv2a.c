@@ -434,7 +434,7 @@ TEST a_trapped_method_stops_the_channel_until_acknowledged(void) {
 }
 
 // two NOTIFYs that wake the title, in one kick: two interrupts, the channel stopped after each until
-// the ISR acknowledges it
+// the ISR acknowledges it, and only while PGRAPH's FIFO access is on
 TEST each_awakening_notify_stops_the_channel_until_acknowledged(void) {
     TGuest g;
     const WlNv2aKelvin *k;
@@ -453,7 +453,12 @@ TEST each_awakening_notify_stops_the_channel_until_acknowledged(void) {
     ASSERT_EQ(1u, s.notifies);
     ASSERT(wl_nv2a_irq_pending(g.dev));
     ASSERT(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF) != 7u);
+    // the ISR with FIFO access off: acknowledged, still stopped until access is on again
+    t_mmio(&g, WL_NV2A_PGRAPH_FIFO, 0);
     t_mmio(&g, WL_NV2A_PGRAPH_INTR, WL_NV2A_PGRAPH_INTR_NOTIFY);
+    ASSERT_FALSE(wl_nv2a_irq_pending(g.dev));
+    ASSERT(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF) != 7u);
+    t_mmio(&g, WL_NV2A_PGRAPH_FIFO, 1);
     // the second NOTIFY: its own interrupt, the method after it not run yet
     ASSERT_EQ(7u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
     ASSERT(wl_nv2a_irq_pending(g.dev));
