@@ -49,6 +49,11 @@ add_test(NAME test_dolphin_run
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_dolphin_run.py)
 set_tests_properties(test_dolphin_run PROPERTIES LABELS unit)
 
+# the host's run watch (tools/host_run.py): a run ends itself, after a fail line, with no progress, at its limit
+add_test(NAME test_host_run
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_host_run.py)
+set_tests_properties(test_host_run PROPERTIES LABELS unit)
+
 # the instruction counter (tools/qemu_icount.py): its log parser on both of qemu's forms, and a loop
 # counted under qemu-ppc where it and a PowerPC Linux compiler are installed (skipped otherwise)
 add_test(NAME test_qemu_icount
