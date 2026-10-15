@@ -20,7 +20,8 @@ a little-endian one:
   back for a title short of memory);
 - `RecompXmm` and `RecompMmx` have little-endian storage, so their lane views overlay as on x86;
   the packed float arithmetic copies the lanes to host order first and is always inline, and
-  `XMM_SHUFFLE` moves lanes as bytes;
+  `XMM_SHUFFLE` moves lanes as bytes; `XMM_SHUFFLE`, `XMM_SCALAR` and the SIMD loads and stores
+  (`XMM_MEM`, `XMM_STORE`, the movlps/movhps halves, `MMX_MEM`, `MMX_STORE`) are always inline too;
 - `lock xadd`/`lock cmpxchg` (`RECOMP_ATOMIC_ADD32/CAS32`) byte-swap around a compare-and-swap loop;
 - `RECOMP_TLS` is empty: the registers are plain globals;
 - `RECOMP_FP_PC` (x87 precision control at 24 bits) rounds inline when the result is a normal float
@@ -85,7 +86,7 @@ Functions:
 | `void recomp_debug_service(uint32_t service, uint32_t arg_va)` | `int 0x2d`, the kernel debug trap (service 1 prints the ANSI_STRING at `arg_va`) |
 | `void recomp_unimpl(const char *text, uint32_t va)` | an instruction the lifter could not translate was reached |
 | `uint64_t xbox_ReadTimeStampCounter(void)` | `rdtsc`, at the Xbox's 733.33 MHz |
-| `volatile uint32_t g_xb_attention`, `void wl_xb_safe_point(void)` | `RECOMP_BACKEDGE()` before every backward jump (patch 0008): when the flag is set (another guest thread or interrupt work waits for the guest lock) the loop gives way at its back edge. With `--x87-locals` (patch 0013, the driver's default) the x87 globals are not current at a back edge, nor at a device access the runtime emulates (the function holds the stack in locals), so whatever runs there must save and restore them around itself, as wl/xboxrt's thread switch and interrupt work do with the whole register file |
+| `volatile uint32_t g_xb_attention`, `void wl_xb_safe_point(void)` | `RECOMP_BACKEDGE()` before every backward jump (patch 0008): when the flag is set (another guest thread or interrupt work waits for the guest lock) the loop gives way at its back edge. With `--x87-locals` and `--reg-locals` (patches 0013 and 0014, the driver's default) the x87 and integer register globals are not current at a back edge, nor at a device access the runtime emulates (the function holds them in locals), so whatever runs there must save and restore them around itself, as wl/xboxrt's thread switch and interrupt work do with the whole register file, and interrupt work must run on a guest stack of its own (wl/xboxrt's service thread's), not below a stale `g_esp` |
 | `uint32_t wl_xb_port_in(uint32_t port, unsigned size)`, `void wl_xb_port_out(uint32_t port, uint32_t value, unsigned size)` | x86 `in`/`out` (patch 0009) |
 
 From the C library and libgcc: `memcpy`, `memset`, `calloc` (only `recomp_dispatch_init`), libm

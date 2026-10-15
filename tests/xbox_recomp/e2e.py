@@ -18,8 +18,9 @@ image sits), then:
     with a small runtime that loads the image into guest memory and calls the lifted run(seed).
 
 Outputs (the return value and the program's out[] words) must match for every seed. Each program is
-lifted twice: with the x87 state in memory at every operation, and with --x87-locals (the lifter's
-x87_locals.py: the stack, control word and compare result in C locals inside a function).
+lifted three times: with the x87 state in memory at every operation, with --x87-locals (the lifter's
+x87_locals.py: the stack, control word and compare result in C locals inside a function), and with
+--x87-locals --reg-locals (the integer registers in locals too).
 
     e2e.py --build DIR [--target ppc-be|host|both] [-k NAME]
 
@@ -140,7 +141,7 @@ def build_image(name, spec, work: Path):
     return syms, funcs
 
 
-def lift(name, work: Path, funcs, pipe: Path, x87_locals=False):
+def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False):
     """Lift every function with the patched pipeline's FunctionTranslator; write gen/."""
     from tools.recomp import config
     from tools.recomp.translator import FunctionTranslator
@@ -160,10 +161,12 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False):
             db[a]["detection_method"] = "imm_ref_target"
     ft = FunctionTranslator(image, db)
     ft.x87_locals = x87_locals
+    ft.reg_locals = reg_locals
     # as tools.recomp does last: a called address inside a body gets a function of its own
     ft.discover_interior_entries()
     db = {a: info for a, info in ft.func_db.items() if a not in ft.owned_function_starts}
-    gen = work / (f"{name}_x87l_gen" if x87_locals else f"{name}_gen")
+    mode = "_regl" if reg_locals else "_x87l" if x87_locals else ""
+    gen = work / f"{name}{mode}_gen"
     gen.mkdir(exist_ok=True)
     chunks, protos = [], []
     for a in sorted(db):
@@ -224,11 +227,13 @@ def main(argv=None) -> int:
             entry, out = syms["run"], syms["out"]
             natives = {s: run([str(work / "loader"), f"{name}.bin", hex(entry), hex(out), str(spec["nout"]), hex(s)],
                               cwd=work) for s in SEEDS}
-            for x87_locals in (False, True):
-                gen, unimpl, x87 = lift(name, work, funcs, pipe, x87_locals)
-                if x87_locals and not x87:
+            for x87_locals, reg_locals in ((False, False), (True, False), (True, True)):
+                gen, unimpl, x87 = lift(name, work, funcs, pipe, x87_locals, reg_locals)
+                if x87_locals and not reg_locals and not x87:
                     continue  # no x87 code: the same C as the memory model
-                label = f"{name} (x87 locals: {x87})" if x87_locals else name
+                mode = "_regl" if reg_locals else "_x87l" if x87_locals else ""
+                label = (f"{name} (x87 and register locals: {x87})" if reg_locals else
+                         f"{name} (x87 locals: {x87})" if x87_locals else name)
                 code_hi = max(a + s for a, s, _ in funcs)
                 rt = (RUNTIME.replace("@BASE@", f"0x{BASE:X}").replace("@ENTRY@", f"sub_{entry:08X}")
                       .replace("@OUT@", f"0x{out:08X}").replace("@NOUT@", str(spec["nout"]))
@@ -238,7 +243,7 @@ def main(argv=None) -> int:
                          f"-I{args.header}", f"-I{gen}"]
                 srcs = [str(gen / f) for f in ("recomp_0000.c", "recomp_dispatch.c", "rt.c")]
                 for t in targets:
-                    exe = work / (f"{name}_x87l_{t}" if x87_locals else f"{name}_{t}")
+                    exe = work / f"{name}{mode}_{t}"
                     if t == "ppc-be":
                         run(["powerpc-linux-gnu-gcc", "-static", "-mcpu=750"] + flags + srcs + ["-o", str(exe), "-lm"])
                         emu = ["qemu-ppc"]

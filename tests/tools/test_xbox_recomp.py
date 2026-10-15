@@ -47,7 +47,9 @@ class DriverTest(unittest.TestCase):
     def test_outputs(self):
         tu = sorted(p.name for p in (self.out / "tu").iterdir())
         self.assertEqual(tu, ["recomp_tu_00.c", "recomp_tu_01.c", "recomp_tu_02.c",
-                              "recomp_tu_dispatch.c", "recomp_tu_patches.c", "recomp_tu_stubs.c"])
+                              "recomp_tu_dispatch.c", "recomp_tu_hot.c", "recomp_tu_patches.c",
+                              "recomp_tu_stubs.c"])
+        self.assertIn("recomp_tu_hot_empty", (self.out / "tu" / "recomp_tu_hot.c").read_text())
         self.assertIn("wl_xb_title_patch_count = 0u", (self.out / "tu" / "recomp_tu_patches.c").read_text())
         self.assertIn('#include "../gen/recomp_0000.c"', (self.out / "tu" / "recomp_tu_00.c").read_text())
         self.assertIn("recomp_tu_01_empty", (self.out / "tu" / "recomp_tu_01.c").read_text())
@@ -60,6 +62,8 @@ class DriverTest(unittest.TestCase):
         self.assertIn("void sub_00011020(void)", (gen / "recomp_0000.c").read_text())
         # patched: the shift count is masked (patch 0001)
         self.assertIn("& 31u", (gen / "recomp_0000.c").read_text())
+        # the registers in locals by default (patch 0014)
+        self.assertIn("_r_eax", (gen / "recomp_0000.c").read_text())
         self.assertTrue((self.out / "pipeline" / ".wl_pipeline.json").exists())
 
     def test_second_run_reruns_nothing(self):
@@ -79,6 +83,25 @@ class DriverTest(unittest.TestCase):
         self.assertNotIn("void my_bits(void)\n{", code)          # written by hand, not generated
         self.assertIn("my_bits", (out / "gen" / "recomp_funcs.h").read_text())
         self.assertIn("Synth", code)
+
+    def test_hot_functions_move_to_their_own_unit(self):
+        out = self.td / "hot"
+        hot = self.td / "hot.txt"
+        hot.write_text("   12   3.0%  sub_00011020\n0x00011040\n")
+        cfg = self.td / "hot.json"
+        cfg.write_text(json.dumps({"hot_functions": ["sub_00011030"], "reg_locals": False}))
+        r = run("run", str(self.xbe), "-o", str(out), "--chunks", "2", "--config", str(cfg),
+                "--hot-functions", str(hot))
+        self.assertIn("3 of 3 hot functions", r.stderr)
+        hot_tu = (out / "tu" / "recomp_tu_hot.c").read_text()
+        cold_tu = (out / "tu" / "recomp_tu_00.c").read_text()
+        for name in ("sub_00011020", "sub_00011030", "sub_00011040"):
+            self.assertIn(f"void {name}(void)\n{{", hot_tu)
+            self.assertNotIn(f"void {name}(void)\n{{", cold_tu)
+        self.assertIn("void sub_00011000(void)\n{", cold_tu)  # the rest stays
+        self.assertNotIn('#include "../gen/recomp_0000.c"', cold_tu)
+        self.assertNotIn("_r_eax", (out / "gen" / "recomp_0000.c").read_text())  # "reg_locals": false
+        self.assertEqual(json.loads((out / "xbox_recomp.json").read_text())["hot_functions"], 3)
 
     def xbe_bytes_at(self, va, n):
         d = self.xbe.read_bytes()
