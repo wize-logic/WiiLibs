@@ -1361,12 +1361,17 @@ static void vertex_pack_xf(const DrawPlan *plan, const float (*inputs)[4], Packe
 // gx->batch.vertices[n]. An indexed draw's vertex kept by its index (the memo) is not made again; the
 // others are fetched (the inputs the program reads alone) and run through the program together, and
 // their vertices made into the memo (or, where another index of the batch holds the slot, here).
-// A vertex is a function of its index, so each is the same whatever the memo held.
-static unsigned vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, uint32_t first,
-                              uint32_t count, const DrawPlan *plan) {
+// A vertex is a function of its index, so each is the same whatever the memo held. The draw's first
+// batch (`layout` not NULL) first decides its projected coordinates (projected_plan): true when the
+// plan and the layout changed, which is then to be set again.
+static bool projected_plan(WlNv2aGx *gx, DrawPlan *plan, WlGxDirectLayout *layout, unsigned runs);
+
+static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, uint32_t first,
+                          uint32_t count, DrawPlan *plan, WlGxDirectLayout *layout) {
     bool indexed = draw->source == WL_NV2A_SOURCE_ARRAYS && draw->indices != NULL;
     uint32_t batch = ++gx->batch_stamp;
     unsigned runs = 0, n, r;
+    bool changed;
 
     for (n = 0; n < count; n++) {
         uint32_t v = first + n;
@@ -1399,17 +1404,18 @@ static unsigned vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aD
         for (r = 0; r < runs; r++) {
             vertex_pack_xf(plan, (const float (*)[4])gx->batch.inputs[r], gx->batch.run_vertices[r]);
         }
-        return runs;
+        return false;
     }
     // (the transform unit's position: the program run for the other outputs alone)
     wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, runs,
                               plan->xf != NULL ? plan->live & ~(unsigned)WL_XBOX_VSH_LIVE_POSITION : plan->live,
                               gx->batch.outputs, &gx->batch.work);
+    changed = layout != NULL && projected_plan(gx, plan, layout, runs);
     for (r = 0; r < runs; r++) {
         vertex_pack(gx, k, plan, &gx->batch.outputs[r], (const float (*)[4])gx->batch.inputs[r],
                     gx->batch.run_vertices[r]);
     }
-    return runs;
+    return changed;
 }
 
 // the one input register (bit) an output's components read, 0 for none, ~0u for more or not affine
@@ -1806,7 +1812,7 @@ static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2
         if (n == 0) {
             first = v;
             vertices_make(gx, k, draw, v, draw->count - v < WL_XBOX_VSH_BATCH ? draw->count - v : WL_XBOX_VSH_BATCH,
-                          &plan);
+                          &plan, NULL);
         }
         landing_area(draw->primitive, gx->batch.vertices[n], &seen, corners, &area);
     }
@@ -1823,9 +1829,8 @@ static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2
 // input, as its analysis finds, and differs among them): sent as (s, t, q) for GX to divide at each
 // pixel, as the NV2A does, out of the stages divided per vertex. A constant q is divided here: per
 // vertex or per pixel, the same (so is a q that varies only after the first batch: divided here, as
-// before). True when the plan changed: the batch is then packed again, and the layout set again.
-static bool projected_plan(WlNv2aGx *gx, const WlNv2aKelvin *k, DrawPlan *plan, WlGxDirectLayout *layout,
-                           unsigned runs) {
+// before). True when the plan changed (the layout to be set again).
+static bool projected_plan(WlNv2aGx *gx, DrawPlan *plan, WlGxDirectLayout *layout, unsigned runs) {
     const WlXboxVshOutput *o = gx->batch.outputs;
     unsigned n, r, kept = 0, count = 0, words, chosen = 0;
     bool full;
@@ -1870,9 +1875,6 @@ static bool projected_plan(WlNv2aGx *gx, const WlNv2aKelvin *k, DrawPlan *plan, 
     layout->texcoords_projected = (uint8_t)chosen;
     plan->words += (count == 1u ? 3u : 3u * WL_GX_DIRECT_PROJECTED) - 2u * count;
     gx->stats.projected_draws++;
-    for (r = 0; r < runs; r++) {
-        vertex_pack(gx, k, plan, &o[r], (const float (*)[4])gx->batch.inputs[r], gx->batch.run_vertices[r]);
-    }
     return true;
 }
 
@@ -2102,9 +2104,8 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     wl_nv2a_fetch_constants(&gx->fetch, k, gx->batch.inputs, WL_XBOX_VSH_BATCH);
     // (the first batch, which finds the projective coordinates GX is to divide at each pixel)
     if (draw->count != 0 &&
-        projected_plan(gx, k, &plan, &layout,
-                       vertices_make(gx, k, draw, 0, draw->count < WL_XBOX_VSH_BATCH ? draw->count : WL_XBOX_VSH_BATCH,
-                                     &plan))) {
+        vertices_make(gx, k, draw, 0, draw->count < WL_XBOX_VSH_BATCH ? draw->count : WL_XBOX_VSH_BATCH, &plan,
+                      &layout)) {
         wl_gx_direct_layout(&layout);
     }
     wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
@@ -2115,7 +2116,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
         if (n == 0 && v != 0) {
             first = v;
             vertices_make(gx, k, draw, v, draw->count - v < WL_XBOX_VSH_BATCH ? draw->count - v : WL_XBOX_VSH_BATCH,
-                          &plan);
+                          &plan, NULL);
         }
         vertex = gx->batch.vertices[n];
         wl_gx_direct_vertex_words(vertex->w, plan.words);
