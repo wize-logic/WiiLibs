@@ -65,6 +65,7 @@
 #define STATUS_THREAD_IS_TERMINATING 0xC000004Bu
 
 #define NT_SUCCESS(s) ((int32_t)(s) >= 0)
+#define NT_ERROR(s) (((uint32_t)(s) >> 30) == 3u) // severity 3: an error (not a warning)
 
 // ---- Dispatcher objects (DISPATCHER_HEADER at the object's start) ------------------------------
 #define DISP_TYPE 0x00u   // UCHAR
@@ -135,8 +136,8 @@ typedef struct XkFile XkFile;
 typedef struct {
     XkObjType type;
     uint32_t body;      // guest VA of the object body (its dispatcher header), 0 for none
-    uint32_t refs;      // handles open on it
-    bool body_owned;    // the pool holds the body (freed with the last handle)
+    uint32_t refs;      // handles, references by pointer and waits on it (ob.c)
+    bool body_owned;    // the pool holds the body (freed with the last reference)
     WlXbThread *thread; // XK_OBJ_THREAD
     XkFile *file;       // XK_OBJ_FILE
     char *link_target;  // XK_OBJ_SYMLINK
@@ -147,6 +148,10 @@ uint32_t xk_handle_open(XkObject *obj);                       // a new handle (r
 XkObject *xk_handle_get(uint32_t handle);                     // NULL for a bad handle
 XkObject *xk_handle_get_type(uint32_t handle, XkObjType type);
 uint32_t xk_handle_close(uint32_t handle);                    // NTSTATUS
+// References besides handles (a wait's, a pointer's): the last release frees the object.
+void xk_object_reference(XkObject *obj);
+void xk_object_release(XkObject *obj);
+XkObject *xk_object_of_body(uint32_t body);                   // NULL for a body no object owns
 #define XK_CURRENT_THREAD 0xFFFFFFFEu
 #define XK_CURRENT_PROCESS 0xFFFFFFFFu
 // The object body a handle waits on (the dispatcher header's VA), 0 when it is not waitable.

@@ -31,7 +31,10 @@ settings).
   semaphores, mutants, timers and threads, with their `DISPATCHER_HEADER`s where the title put them.
   Waits on one or many (any or all) with timeouts, alertable waits and user APCs,
   `NtUserIoApcDispatcher`, named objects, handles (`ob.c`: up to 4096, pool blocks with headers),
-  `NtDuplicateObject`.
+  `NtDuplicateObject`. An object lives while anything refers to it: a handle, a reference by
+  pointer (`ObReferenceObjectByHandle`, `ObfReferenceObject`; `ObfDereferenceObject` finds the
+  object by its body and gives one back) or a wait on it (a handle closed under a waiting thread
+  leaves the body until the wait ends). The last reference frees it (a file is closed then).
 - **Critical sections** (`rtl.c`), with the layout XAPI's inlined fast paths use: the event, then
   LockCount at +0x10, RecursionCount at +0x14, OwningThread at +0x18.
 - **IRQL, DPCs, timers, interrupts** (`ke_irq.c`): the IRQL lives in each thread's KPCR. Timers
@@ -50,7 +53,9 @@ settings).
   (language, video and audio flags, regions, parental control, the time zone, and the 0x60-byte
   user section of `XC_MAX_OS`), `ExSaveNonVolatileSetting` kept in memory, the AV pack and the
   encoder options, `AvSetDisplayMode` passed to a hook (`wl_xk_set_display_hook`),
-  `HalReturnToFirmware` ending the process, `XeLoadSection`/`XeUnloadSection` reference counts.
+  `HalReturnToFirmware` ending the process, `XeLoadSection`/`XeUnloadSection` reference counts
+  (every section stays resident and is never read again: one changed, unloaded and loaded again
+  keeps its changes, where the console reads it again from the XBE; Halo loads and unloads none).
 - **Rtl** (`rtl.c`): strings (ANSI and Unicode), memory, integers, time fields, NTSTATUS to Win32
   errors, and a printf engine over guest varargs for `DbgPrint`, `RtlSprintf`, `RtlSnprintf`,
   `RtlVsprintf` and `RtlVsnprintf`.
@@ -75,15 +80,20 @@ resolves through the mount table:
 host's file system need not be), and `..` above a mount is refused. Covered: `NtCreateFile`,
 `NtOpenFile` and `IoCreateFile` with the six dispositions and delete-on-close; reads and writes at
 offsets or at the file position, overlapped ones completing at once (their event, the file object,
-the APC; `STATUS_PENDING` first with `async_io_pending`); the query and set information classes
+the APC; `STATUS_PENDING` first with `async_io_pending`; a request that fails touches none of them
+nor the status block, as NT); writes only through a handle opened for writing; the query and set information classes
 titles use (queries: basic, standard, internal, position, mode, network open; sets: basic,
 rename, disposition, position, allocation, end of file, mode);
 volume information (volume, size, device, full size); directory listings with wildcards, one entry per call; `NtDeleteFile`;
-`NtFlushBuffersFile`. On a sparse partition a file keeps a logical size beyond what was written, in
-a `<name>.wlsz` sidecar that listings hide. A partition opened as a device (`Partition0`, the cache
-partitions for `XMountUtilityDrive`) reads its partition table at 0x800 and keeps its first 64 KB
-in `data_dir/raw<N>.bin`. Device controls answer the geometry, partition information and the DVD
-media check.
+`NtFlushBuffersFile`. The handles on one file share a record, as NT's file control block: a delete
+asked for (delete-on-close, the disposition, `NtDeleteFile` of an open file) happens at its last
+close. On a sparse partition a file keeps a logical size beyond what was written, in a
+`<name>.wlsz` sidecar that listings hide; its handles share the size, and only one that changed it
+writes the sidecar. A partition opened as a device (`Partition0`, the cache partitions for
+`XMountUtilityDrive`) keeps its first 64 KB in `data_dir/raw<N>.bin`; `Partition0` shows a
+partition table in sector 0 (the homebrew `****PARTINFO****`), and sector 4 is XAPI's own (its
+utility drive's cache database, which it reads back at every boot). Device controls answer the
+geometry, partition information and the DVD media check.
 
 ## Halo's imports
 
@@ -102,7 +112,7 @@ Every one of the 134 imports in Halo's XBE resolves to a body or a data export (
 | `rtl.c` | DbgPrint (8), RtlCompareMemoryUlong (269), RtlEnterCriticalSection (277), RtlEqualString (279), RtlInitAnsiString (289), RtlInitializeCriticalSection (291), RtlLeaveCriticalSection (294), RtlNtStatusToDosError (301), RtlRaiseException (302, approx), RtlTimeFieldsToTime (304), RtlTimeToTimeFields (305), RtlUnicodeStringToAnsiString (308), RtlUnwind (312, approx) |
 | `ex.c` | ExQueryNonVolatileSetting (24) |
 | `io.c` | IoCreateDevice (65), IoInvalidDeviceRequest (74), IoStartNextPacket (81, stub), IoStartPacket (83, stub), IofCompleteRequest (87, stub), IoMarkIrpMustComplete (359, stub) |
-| `ob.c` | ObReferenceObjectByHandle (246), ObfDereferenceObject (250, stub) |
+| `ob.c` | ObReferenceObjectByHandle (246), ObfDereferenceObject (250) |
 | `xc.c` | XcSHAInit (335), XcSHAUpdate (336), XcSHAFinal (337), XcRC4Key (338), XcRC4Crypt (339), XcHMAC (340), XcModExp (345, stub), XcDESKeyParity (346), XcKeyTable (347, stub), XcBlockCryptCBC (349, stub) |
 | `kdata.c` (data) | ExEventObjectType (16), HalDiskCachePartitionCount (40), HalDiskModelNumber (41), HalDiskSerialNumber (42), HalBootSMCVideoMode (356), KeTickCount (156), LaunchDataPage (164), PsThreadObjectType (259), XboxHardwareInfo (322), XboxHDKey (323), XboxSignatureKey (325), XboxLANKey (353) |
 
@@ -113,7 +123,6 @@ Stubs and approximations among them:
 | HalIsResetOrShutdownPending (358) | 0: nothing is ever pending |
 | PhyGetLinkState (252) | no link (the network stays down; XNet fails cleanly) |
 | IoStartPacket, IoStartNextPacket, IofCompleteRequest, IoMarkIrpMustComplete (83, 81, 87, 359) | no IRP processing: no driver of a title's own runs |
-| ObfDereferenceObject (250) | no-op: objects live as long as their handles |
 | XcModExp, XcKeyTable, XcBlockCryptCBC (345, 347, 349) | logged stubs that do nothing (RSA, DES): no title data is signed or encrypted with them here |
 | KeSaveFloatingPointState, KeRestoreFloatingPointState (142, 139) | success without saving (the x87 state is the thread's register file) |
 | MmLockUnlockBufferPages, MmLockUnlockPhysicalPage, MmPersistContiguousMemory (175, 176, 178) | success: pages never move under a title once pinned |
@@ -140,8 +149,11 @@ translated code does, from guest functions written in C (manual lookup). It cove
 (stdcall pops, fastcall, 64-bit returns); four threads contending for a critical section; events,
 timeouts and mutants; timers with DPCs; an interrupt line with its ISR and DPC; an ISR and a thread
 switch delivered to a loop that only polls a device register (D3D's fence wait); overlapped reads
-with their APC; the read-only DVD, a sparse cache drive, listings and delete-on-close; virtual and
-contiguous memory and the GPU instance; Rtl strings, time and printf; SHA-1, HMAC (RFC 2202) and
+with their APC, and a failed one that touches nothing; the read-only DVD, a sparse cache drive and
+its size shared by handles, listings (a buffer too small, "*.*"), delete at the last close, a full
+card, read-only handles; objects kept by a reference by pointer and by a wait; virtual and
+contiguous memory and the GPU instance, a commit with no address, decommits; Rtl strings, time and
+printf past 2 KB; SHA-1, HMAC (RFC 2202) and
 RC4; the EEPROM settings. It runs on the host and on ppc-be, and again in the runtime's deterministic mode (`test_xboxkrnl_det`). `tests/xboxrt/e2e/` runs a lifted title on
 the kernel.
 

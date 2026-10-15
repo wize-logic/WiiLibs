@@ -8,6 +8,7 @@
 // The status-to-error table and the critical section's layout follow xboxrecomp's kernel_bridge.c
 // and kernel_rtl.c (MIT) in substance; the code is written here over the guest accessors.
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "wl/xboxkrnl/kernel_internal.h"
 
@@ -818,35 +819,42 @@ static void put_result(uint32_t buf, uint32_t size, const char *text, uint32_t n
     }
 }
 
+// Formats into the guest's `buf` (`size` bytes, ~0u for no limit) and returns the full length. A
+// text longer than the stack buffer is formatted again into one of its size (the arguments are
+// read again from guest memory), so the guest gets all of it and nothing is read past the text.
+static uint32_t format_to_guest(uint32_t buf, uint32_t size, uint32_t fmt, uint32_t args) {
+    char text[2048];
+    uint32_t n = guest_format(text, sizeof text, fmt, args);
+    uint32_t want = size == ~0u ? n : (n < size ? n : (size > 0 ? size - 1u : 0u));
+    char *big = want >= sizeof text ? malloc((size_t)want + 1u) : NULL;
+    if (big != NULL) {
+        guest_format(big, want + 1u, fmt, args);
+    }
+    uint32_t have = big != NULL ? want : (n < sizeof text ? n : (uint32_t)sizeof text - 1u);
+    put_result(buf, size == ~0u ? n + 1u : size, big != NULL ? big : text, n < have ? n : have);
+    free(big);
+    return n;
+}
+
 // int RtlSprintf(PCHAR Buffer, PCHAR Format, ...)
 void k_RtlSprintf(void) {
-    char text[2048];
-    uint32_t n = guest_format(text, sizeof text, ARG(1), g_esp + 8u);
-    put_result(ARG(0), n + 1u, text, n);
-    RET(n);
+    RET(format_to_guest(ARG(0), ~0u, ARG(1), g_esp + 8u));
 }
 
 // int RtlSnprintf(PCHAR Buffer, SIZE_T BufferSize, PCHAR Format, ...)
 void k_RtlSnprintf(void) {
-    char text[2048];
-    uint32_t n = guest_format(text, sizeof text, ARG(2), g_esp + 12u);
-    put_result(ARG(0), ARG(1), text, n);
+    uint32_t n = format_to_guest(ARG(0), ARG(1), ARG(2), g_esp + 12u);
     RET(n < ARG(1) ? n : 0xFFFFFFFFu);
 }
 
 // int RtlVsprintf(PCHAR Buffer, PCHAR Format, va_list ArgList)
 void k_RtlVsprintf(void) {
-    char text[2048];
-    uint32_t n = guest_format(text, sizeof text, ARG(1), ARG(2));
-    put_result(ARG(0), n + 1u, text, n);
-    RET(n);
+    RET(format_to_guest(ARG(0), ~0u, ARG(1), ARG(2)));
 }
 
 // int RtlVsnprintf(PCHAR Buffer, SIZE_T BufferSize, PCHAR Format, va_list ArgList)
 void k_RtlVsnprintf(void) {
-    char text[2048];
-    uint32_t n = guest_format(text, sizeof text, ARG(2), ARG(3));
-    put_result(ARG(0), ARG(1), text, n);
+    uint32_t n = format_to_guest(ARG(0), ARG(1), ARG(2), ARG(3));
     RET(n < ARG(1) ? n : 0xFFFFFFFFu);
 }
 

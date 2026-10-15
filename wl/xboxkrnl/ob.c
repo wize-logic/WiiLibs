@@ -114,8 +114,89 @@ uint32_t xk_pool_size(uint32_t va) {
 }
 
 // ---- Objects and handles -----------------------------------------------------------------------
+//
+// An object lives while something refers to it: its handles, the references by pointer
+// (ObReferenceObjectByHandle, ObfReferenceObject; ObfDereferenceObject gives one back, found by the
+// body's address) and the waits on it (a wait holds a reference until it ends, so a handle closed
+// under a waiting thread does not free the body it sleeps on). Threads live on: their KTHREAD is
+// the process's.
 
 static XkObject *g_handles[MAX_HANDLES];
+
+// The objects by body address (open addressing, linear probing, a power-of-two table).
+static XkObject **g_by_body;
+static uint32_t g_by_body_cap, g_by_body_used;
+
+static uint32_t body_slot(uint32_t body, uint32_t cap) {
+    return ((body >> 4) * 2654435761u) & (cap - 1u);
+}
+
+static void body_insert(XkObject **table, uint32_t cap, XkObject *o) {
+    uint32_t i = body_slot(o->body, cap);
+    while (table[i] != NULL) {
+        i = (i + 1u) & (cap - 1u);
+    }
+    table[i] = o;
+}
+
+static void body_add(XkObject *o) {
+    if (o->body == 0) {
+        return;
+    }
+    if ((g_by_body_used + 1u) * 4u > g_by_body_cap * 3u) {
+        uint32_t cap = g_by_body_cap ? g_by_body_cap * 2u : 256u;
+        XkObject **t = calloc(cap, sizeof *t);
+        if (t == NULL) {
+            return; // not found by its body: ObfDereferenceObject leaves it to its handles
+        }
+        for (uint32_t i = 0; i < g_by_body_cap; i++) {
+            if (g_by_body[i] != NULL) {
+                body_insert(t, cap, g_by_body[i]);
+            }
+        }
+        free(g_by_body);
+        g_by_body = t;
+        g_by_body_cap = cap;
+    }
+    body_insert(g_by_body, g_by_body_cap, o);
+    g_by_body_used++;
+}
+
+static void body_remove(XkObject *o) {
+    if (g_by_body_cap == 0 || o->body == 0) {
+        return;
+    }
+    uint32_t mask = g_by_body_cap - 1u, i = body_slot(o->body, g_by_body_cap);
+    while (g_by_body[i] != o) {
+        if (g_by_body[i] == NULL) {
+            return;
+        }
+        i = (i + 1u) & mask;
+    }
+    g_by_body[i] = NULL;
+    g_by_body_used--;
+    // close the gap: move up the entries of the run that would no longer be found
+    for (uint32_t j = (i + 1u) & mask; g_by_body[j] != NULL; j = (j + 1u) & mask) {
+        uint32_t home = body_slot(g_by_body[j]->body, g_by_body_cap);
+        if (((j - home) & mask) >= ((j - i) & mask)) {
+            g_by_body[i] = g_by_body[j];
+            g_by_body[j] = NULL;
+            i = j;
+        }
+    }
+}
+
+XkObject *xk_object_of_body(uint32_t body) {
+    if (g_by_body_cap == 0 || body == 0) {
+        return NULL;
+    }
+    for (uint32_t i = body_slot(body, g_by_body_cap); g_by_body[i] != NULL; i = (i + 1u) & (g_by_body_cap - 1u)) {
+        if (g_by_body[i]->body == body) {
+            return g_by_body[i];
+        }
+    }
+    return NULL;
+}
 
 XkObject *xk_object_new(XkObjType type, uint32_t body_bytes) {
     XkObject *o = calloc(1, sizeof *o);
@@ -130,9 +211,37 @@ XkObject *xk_object_new(XkObjType type, uint32_t body_bytes) {
             return NULL;
         }
         o->body_owned = true;
+        body_add(o);
     }
     g_xk_stats.objects++;
     return o;
+}
+
+void xk_object_reference(XkObject *o) {
+    o->refs++;
+}
+
+void xk_object_release(XkObject *o) {
+    if (o->refs == 0) {
+        WL_LOG_W(XK_TAG, "object %p (type %d) released once too often", (void *)o, (int)o->type);
+        return;
+    }
+    if (--o->refs > 0 || o->type == XK_OBJ_THREAD) {
+        return;
+    }
+    body_remove(o);
+    if (o->type == XK_OBJ_FILE && o->file != NULL) {
+        xk_file_close(o->file);
+    }
+    if (o->type == XK_OBJ_TIMER && o->body != 0) {
+        xk_timer_cancel(o->body);
+    }
+    if (o->body_owned) {
+        xk_pool_free(o->body);
+    }
+    free(o->link_target);
+    free(o);
+    g_xk_stats.objects--;
 }
 
 uint32_t xk_handle_open(XkObject *obj) {
@@ -174,21 +283,7 @@ uint32_t xk_handle_close(uint32_t handle) {
     }
     g_handles[(handle >> 2) - 1u] = NULL;
     g_xk_stats.handles--;
-    if (--o->refs > 0 || o->type == XK_OBJ_THREAD) {
-        return STATUS_SUCCESS; // threads live on: their KTHREAD is the process's
-    }
-    if (o->type == XK_OBJ_FILE && o->file != NULL) {
-        xk_file_close(o->file);
-    }
-    if (o->type == XK_OBJ_TIMER && o->body != 0) {
-        xk_timer_cancel(o->body);
-    }
-    if (o->body_owned) {
-        xk_pool_free(o->body);
-    }
-    free(o->link_target);
-    free(o);
-    g_xk_stats.objects--;
+    xk_object_release(o);
     return STATUS_SUCCESS;
 }
 
@@ -220,6 +315,7 @@ XkObject *xk_thread_object(WlXbThread *t) {
         o->body = t->kthread;
         o->thread = t;
         o->refs = 1; // the thread's own reference
+        body_add(o);
         k->object = o;
     }
     return k->object;
@@ -249,13 +345,22 @@ void k_ObReferenceObjectByHandle(void) {
     RET(STATUS_SUCCESS);
 }
 
-// VOID FASTCALL ObfDereferenceObject(PVOID Object) / ObfReferenceObject: objects here live as
-// long as a handle names them; the references by pointer are counted only for threads' sake
+// VOID FASTCALL ObfDereferenceObject(PVOID Object): gives back a reference by pointer; the last
+// one frees the object (a file is closed). A body the object table does not know (an object the
+// title initialised itself, KeInitializeEvent's) is left alone.
 void k_ObfDereferenceObject(void) {
+    XkObject *o = xk_object_of_body(g_ecx);
+    if (o != NULL) {
+        xk_object_release(o);
+    }
     RET(0);
 }
 
+// VOID FASTCALL ObfReferenceObject(PVOID Object)
 void k_ObfReferenceObject(void) {
+    XkObject *o = xk_object_of_body(g_ecx);
+    if (o != NULL) {
+        o->refs++;
+    }
     RET(0);
 }
-

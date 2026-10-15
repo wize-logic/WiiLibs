@@ -9,9 +9,11 @@
 // from overlapped reads, the file layer (D: read-only, Z: sparse, listings, renames), virtual and
 // contiguous memory, Rtl's strings, time and printf, the crypto exports, the EEPROM settings.
 #define _DEFAULT_SOURCE
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -40,6 +42,7 @@ static const uint16_t k_ordinals[] = {
     127, 126, 268, 53, 51, 8, 189, 225, 186, 233, 234, 235, 187, 192, 221, 255, 258, 291, 277, 294, 108, 145, 159, 158,
     113, 107, 149, 119, 109, 98, 44, 190, 202, 219, 236, 211, 226, 207, 210, 218, 184, 199, 217, 166, 171, 173, 168, 305,
     304, 289, 279, 362, 335, 336, 337, 340, 338, 339, 24, 99, 232, 238, 112, 132, 128, 156, 322, 224, 129, 161,
+    195, 246, 250, 251, 364,
 };
 enum {
     S_PERF_FREQ, S_PERF_COUNTER, S_COMPARE_MEMORY, S_INTERLOCKED_INC, S_INTERLOCKED_CMPXCHG, S_DBGPRINT,
@@ -52,7 +55,8 @@ enum {
     S_MM_GPU_INSTANCE, S_RTL_TIME_TO_FIELDS, S_RTL_FIELDS_TO_TIME, S_RTL_INIT_ANSI, S_RTL_EQUAL_STRING,
     S_RTL_SPRINTF, S_SHA_INIT, S_SHA_UPDATE, S_SHA_FINAL, S_HMAC, S_RC4_KEY, S_RC4_CRYPT, S_EX_QUERY_NV,
     S_KE_DELAY, S_NT_USER_APC, S_NT_YIELD, S_KE_INIT_SEMAPHORE, S_KE_RELEASE_SEMAPHORE, S_KE_SYSTEM_TIME,
-    S_KE_TICK_COUNT, S_HW_INFO, S_NT_RESUME, S_KE_RAISE_TO_DPC, S_KF_LOWER_IRQL,
+    S_KE_TICK_COUNT, S_HW_INFO, S_NT_RESUME, S_KE_RAISE_TO_DPC, S_KF_LOWER_IRQL, S_NT_DELETE_FILE, S_OB_REF_BY_HANDLE,
+    S_OBF_DEREF, S_OBF_REF, S_RTL_VSPRINTF,
 };
 
 static uint8_t *g_image; // the XBE's bytes
@@ -987,6 +991,370 @@ TEST rtl_crypto_settings(void) {
     PASS();
 }
 
+// ---- The exports' corner cases ----------------------------------------------------------------------
+
+static bool host_exists(const char *rel) {
+    char path[512];
+    struct stat sb;
+    snprintf(path, sizeof path, "%s/%s", g_root, rel);
+    return stat(path, &sb) == 0;
+}
+
+// A sparse file's sidecar on the host: its size, 0 when there is none.
+static uint64_t host_sidecar(const char *rel) {
+    char path[512], text[20] = {0};
+    snprintf(path, sizeof path, "%s/%s.wlsz", g_root, rel);
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    size_t n = fread(text, 1, 16, f);
+    fclose(f);
+    text[n] = '\0';
+    return strtoull(text, NULL, 16);
+}
+
+static uint64_t query_eof(uint32_t h) {
+    uint32_t iosb = gmem(8), info = gmem(24);
+    if (KN(S_NT_QUERY_INFO, h, iosb, info, 24, 5) != 0) {
+        return ~0ull;
+    }
+    return wl_xb_rd64(info + 8);
+}
+
+static uint32_t set_eof(uint32_t h, uint64_t size) {
+    uint32_t iosb = gmem(8), eof = gmem(8);
+    wl_xb_wr64(eof, size);
+    return KN(S_NT_SET_INFO, h, iosb, eof, 8, 20);
+}
+
+static uint32_t set_delete(uint32_t h, bool on) {
+    uint32_t iosb = gmem(8), disp = gmem(4);
+    wl_xb_wr8(disp, on ? 1u : 0u);
+    return KN(S_NT_SET_INFO, h, iosb, disp, 1, 13);
+}
+
+TEST files_share_one_size(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t st = 0;
+    uint32_t rw = open_path("z:\\shared.map", 0xC0000000u, 3, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    ASSERT_EQ_FMT(0u, set_eof(rw, 0x01000000u), "%08x");
+    uint32_t ro = open_path("z:\\SHARED.map", 0x80000000u, 1, 0x20, &st); // read-only, another case
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    ASSERT_EQ_FMT(0u, set_eof(rw, 0x02000000u), "%08x"); // grown through the other handle
+    ASSERT_EQ(0x02000000ull, query_eof(ro));
+    // a read-only handle cannot write, on a writable drive too
+    uint32_t iosb = gmem(8), data = gstr("abcd");
+    ASSERT_EQ_FMT(0xC0000022u, KN(S_NT_WRITE, ro, 0, 0, 0, iosb, data, 4, 0), "%08x"); // STATUS_ACCESS_DENIED
+    KN(S_NT_CLOSE, rw);
+    ASSERT_EQ(0x02000000ull, host_sidecar("hdd/Z/shared.map"));
+    KN(S_NT_CLOSE, ro); // a handle that changed nothing leaves the sidecar alone
+    ASSERT_EQ(0x02000000ull, host_sidecar("hdd/Z/shared.map"));
+    // every file slot taken: the open is refused and the size kept; one left: the sidecar is read
+    // before the file takes it
+    WlPlatformFile *held[WL_FS_MAX_FILES + 1];
+    uint32_t n = 0;
+    while (n < WL_FS_MAX_FILES + 1 && wl_platform_fs_open("sd:/title/readme.txt", WL_FILE_READ, &held[n]) == WL_OK) {
+        n++;
+    }
+    ASSERT(n > 0 && n <= WL_FS_MAX_FILES);
+    open_path("z:\\shared.map", 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0xC000009Au, st, "%08x"); // STATUS_INSUFFICIENT_RESOURCES
+    wl_platform_fs_close(held[--n]);
+    ro = open_path("z:\\shared.map", 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    ASSERT_EQ(0x02000000ull, query_eof(ro));
+    KN(S_NT_CLOSE, ro);
+    while (n > 0) {
+        wl_platform_fs_close(held[--n]);
+    }
+    ASSERT_EQ(0x02000000ull, host_sidecar("hdd/Z/shared.map"));
+    // NtDeleteFile takes the sidecar with the file
+    ASSERT_EQ_FMT(0u, KN(S_NT_DELETE_FILE, gattr("z:\\shared.map")), "%08x");
+    ASSERT(!host_exists("hdd/Z/shared.map"));
+    ASSERT(!host_exists("hdd/Z/shared.map.wlsz"));
+    PASS();
+}
+
+TEST files_failures_leave_the_request_alone(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t st = 0;
+    // an overlapped read past the end: no status block, event or APC, as NT for an error
+    uint32_t h = open_path("D:\\maps\\ui.map", 0x80000000u, 1, 0, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    uint32_t ehp = gmem(4), iosb = gmem(8), buf = gmem(16), off = gmem(8), tp = gmem(8);
+    KN(S_NT_CREATE_EVENT, ehp, 0, 0, 0);
+    uint32_t ev = wl_xb_rd32(ehp);
+    wl_xb_fill(iosb, 0xAA, 8);
+    wl_xb_wr64(off, 1000);
+    g_apc_runs = 0;
+    ASSERT_EQ_FMT(0xC0000011u, KN(S_NT_READ, h, ev, guest_fn(3, apc_routine), 0x1234u, iosb, buf, 8, off), "%08x");
+    ASSERT_EQ_FMT(0xAAAAAAAAu, wl_xb_rd32(iosb), "%08x");
+    ASSERT_EQ_FMT(0xAAAAAAAAu, wl_xb_rd32(iosb + 4), "%08x");
+    wl_xb_wr64(tp, (uint64_t)(int64_t)-100000); // 10 ms
+    ASSERT_EQ_FMT(0x102u, KN(S_NT_WAIT1EX, ev, 1, 1, tp), "%08x"); // STATUS_TIMEOUT: nothing set or queued
+    ASSERT_EQ_FMT(0u, g_apc_runs, "%u");
+    // a write on a read-only handle: the same
+    ASSERT_EQ_FMT(0xC0000022u, KN(S_NT_WRITE, h, ev, guest_fn(3, apc_routine), 0x1234u, iosb, buf, 8, off), "%08x");
+    ASSERT_EQ_FMT(0xAAAAAAAAu, wl_xb_rd32(iosb), "%08x");
+    ASSERT_EQ_FMT(0x102u, KN(S_NT_WAIT1EX, ev, 1, 1, tp), "%08x");
+    ASSERT_EQ_FMT(0u, g_apc_runs, "%u");
+    KN(S_NT_CLOSE, ev);
+    KN(S_NT_CLOSE, h);
+    // a write the card cannot take whole (a file size limit stands in for a full card): STATUS_DISK_FULL,
+    // and the bytes written count in the sparse size
+    uint32_t base_p = gmem(4), size_p = gmem(4);
+    wl_xb_wr32(size_p, 0x11000u);
+    ASSERT_EQ_FMT(0u, KN(S_NT_ALLOC_VM, base_p, 0, size_p, 0x1000, 4), "%08x");
+    uint32_t big = wl_xb_rd32(base_p);
+    h = open_path("z:\\full.map", 0xC0000000u, 2, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    struct rlimit old_lim, lim;
+    getrlimit(RLIMIT_FSIZE, &old_lim);
+    lim = old_lim;
+    lim.rlim_cur = 0x10000u;
+    void (*old_sig)(int) = signal(SIGXFSZ, SIG_IGN);
+    setrlimit(RLIMIT_FSIZE, &lim);
+    wl_xb_wr64(off, 0);
+    uint32_t status = KN(S_NT_WRITE, h, 0, 0, 0, iosb, big, 0x10010u, off);
+    setrlimit(RLIMIT_FSIZE, &old_lim);
+    signal(SIGXFSZ, old_sig);
+    ASSERT_EQ_FMT(0xC000007Fu, status, "%08x"); // STATUS_DISK_FULL
+    ASSERT_EQ(0x10000ull, query_eof(h));
+    ASSERT_EQ_FMT(0u, set_delete(h, true), "%08x");
+    KN(S_NT_CLOSE, h);
+    ASSERT(!host_exists("hdd/Z/full.map"));
+    wl_xb_wr32(base_p, big);
+    wl_xb_wr32(size_p, 0);
+    KN(S_NT_FREE_VM, base_p, size_p, 0x8000);
+    PASS();
+}
+
+TEST files_deleted_at_the_last_close(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t st = 0;
+    const char *name = "\\Device\\Harddisk0\\Partition1\\two.bin";
+    // FileDispositionInformation on one handle: the file stays while another is open
+    uint32_t a = open_path(name, 0xC0000000u, 2, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    uint32_t b = open_path(name, 0xC0000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    ASSERT_EQ_FMT(0u, set_delete(a, true), "%08x");
+    KN(S_NT_CLOSE, a);
+    ASSERT(host_exists("hdd/E/two.bin"));
+    uint32_t iosb = gmem(8), info = gmem(24);
+    ASSERT_EQ_FMT(0u, KN(S_NT_QUERY_INFO, b, iosb, info, 24, 5), "%08x");
+    ASSERT_EQ(1, wl_xb_rd8(info + 20)); // DeletePending, seen through the other handle
+    KN(S_NT_CLOSE, b);
+    ASSERT(!host_exists("hdd/E/two.bin"));
+    // FILE_DELETE_ON_CLOSE: the same
+    a = open_path(name, 0xC0000000u, 2, 0x20 | 0x1000, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    b = open_path(name, 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    KN(S_NT_CLOSE, a);
+    ASSERT(host_exists("hdd/E/two.bin"));
+    KN(S_NT_CLOSE, b);
+    ASSERT(!host_exists("hdd/E/two.bin"));
+    // NtDeleteFile of an open file: gone at its last close
+    a = open_path(name, 0xC0000000u, 2, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_DELETE_FILE, gattr(name)), "%08x");
+    ASSERT(host_exists("hdd/E/two.bin"));
+    KN(S_NT_CLOSE, a);
+    ASSERT(!host_exists("hdd/E/two.bin"));
+    PASS();
+}
+
+TEST objects_live_while_referenced(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t st = 0;
+    WlXkStats s0, s1;
+    uint32_t h = open_path("z:\\byptr.map", 0xC0000000u, 2, 0x20 | 0x1000, &st); // delete on close
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    wl_xk_stats(&s0);
+    uint32_t out = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_OB_REF_BY_HANDLE, h, 0, out), "%08x");
+    uint32_t body = wl_xb_rd32(out);
+    ASSERT(body != 0);
+    KN(S_NT_CLOSE, h); // the reference by pointer keeps the file
+    ASSERT(host_exists("hdd/Z/byptr.map"));
+    wl_xk_stats(&s1);
+    ASSERT_EQ(s0.files_open, s1.files_open);
+    g_ecx = body; // fastcall
+    K0(S_OBF_REF);
+    g_ecx = body;
+    K0(S_OBF_DEREF);
+    ASSERT(host_exists("hdd/Z/byptr.map"));
+    g_ecx = body;
+    K0(S_OBF_DEREF); // the last reference: the file closes (and is deleted)
+    ASSERT(!host_exists("hdd/Z/byptr.map"));
+    wl_xk_stats(&s1);
+    ASSERT_EQ(s0.files_open - 1u, s1.files_open);
+    ASSERT_EQ(s0.objects - 1u, s1.objects);
+    PASS();
+}
+
+static uint32_t g_wait_handle, g_wait_status, g_wait_done;
+
+static void waiter_routine(void) {
+    uint32_t esp = g_esp;
+    uint32_t tp = gmem(8);
+    wl_xb_wr64(tp, (uint64_t)(int64_t)-50000000); // 5 s
+    g_wait_status = KN(S_NT_WAIT1, g_wait_handle, 0, tp);
+    KN(S_KE_RELEASE_SEMAPHORE, g_wait_done, 0, 1, 0);
+    g_esp = esp;
+    guest_ret(8);
+}
+
+TEST a_wait_keeps_its_object(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t hp = gmem(4), out = gmem(4), tp = gmem(8);
+    ASSERT_EQ_FMT(0u, KN(S_NT_CREATE_EVENT, hp, 0, 0, 0), "%08x"); // notification, not signalled
+    g_wait_handle = wl_xb_rd32(hp);
+    ASSERT_EQ_FMT(0u, KN(S_OB_REF_BY_HANDLE, g_wait_handle, 0, out), "%08x");
+    uint32_t body = wl_xb_rd32(out);
+    g_ecx = body;
+    K0(S_OBF_DEREF); // the body's address, and only the handle holds it
+    g_wait_done = gmem(20);
+    KN(S_KE_INIT_SEMAPHORE, g_wait_done, 0, 1);
+    g_wait_status = 0xFFFFFFFFu;
+    uint32_t th = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, th, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(4, waiter_routine)), "%08x");
+    wl_xb_wr64(tp, (uint64_t)(int64_t)-100000); // 10 ms: the waiter starts its wait
+    KN(S_KE_DELAY, 0, 0, tp);
+    ASSERT_EQ_FMT(0xFFFFFFFFu, g_wait_status, "%08x");
+    KN(S_NT_CLOSE, g_wait_handle); // the last handle, closed under the waiter
+    ASSERT_EQ_FMT(0x4C504C57u, wl_xb_rd32(body - 16u), "%08x"); // still a pool block ("WLPL")
+    KN(S_KE_SET_EVENT, body, 0, 0);
+    wl_xb_wr64(tp, (uint64_t)(int64_t)-50000000);
+    ASSERT_EQ_FMT(0u, KN(S_KE_WAIT1, g_wait_done, 0, 0, 0, tp), "%08x");
+    ASSERT_EQ_FMT(0u, g_wait_status, "%08x"); // woken by the event
+    ASSERT_EQ_FMT(0u, wl_xb_rd32(body - 16u), "%08x"); // freed once the wait ended
+    KN(S_NT_CLOSE, wl_xb_rd32(th));
+    PASS();
+}
+
+TEST virtual_memory_corners(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    // MEM_COMMIT alone with no address: reserved and committed
+    uint32_t base_p = gmem(4), size_p = gmem(4), mbi = gmem(28);
+    wl_xb_wr32(size_p, 0x5000);
+    ASSERT_EQ_FMT(0u, KN(S_NT_ALLOC_VM, base_p, 0, size_p, 0x1000, 4), "%08x");
+    uint32_t base = wl_xb_rd32(base_p);
+    ASSERT(base != 0);
+    ASSERT_EQ_FMT(0x5000u, wl_xb_rd32(size_p), "%x");
+    wl_xb_wr32(base + 0x4FFCu, 0x12345678u);
+    // an unaligned decommit takes every page it touches: 0x1800 + 0x1000 is pages 1 and 2
+    wl_xb_wr32(base_p, base + 0x1800u);
+    wl_xb_wr32(size_p, 0x1000);
+    ASSERT_EQ_FMT(0u, KN(S_NT_FREE_VM, base_p, size_p, 0x4000), "%08x"); // MEM_DECOMMIT
+    ASSERT_EQ_FMT(base + 0x1000u, wl_xb_rd32(base_p), "%08x");
+    ASSERT_EQ_FMT(0x2000u, wl_xb_rd32(size_p), "%x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_QUERY_VM, base + 0x1000u, mbi), "%08x");
+    ASSERT_EQ_FMT(0x2000u, wl_xb_rd32(mbi + 16), "%x"); // MEM_RESERVE
+    ASSERT_EQ_FMT(0x2000u, wl_xb_rd32(mbi + 12), "%x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_QUERY_VM, base + 0x3000u, mbi), "%08x");
+    ASSERT_EQ_FMT(0x1000u, wl_xb_rd32(mbi + 16), "%x"); // still committed
+    // size 0: from the address to the end of the allocation
+    wl_xb_wr32(base_p, base + 0x3000u);
+    wl_xb_wr32(size_p, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_FREE_VM, base_p, size_p, 0x4000), "%08x");
+    ASSERT_EQ_FMT(0x2000u, wl_xb_rd32(size_p), "%x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_QUERY_VM, base + 0x4000u, mbi), "%08x");
+    ASSERT_EQ_FMT(0x2000u, wl_xb_rd32(mbi + 16), "%x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_QUERY_VM, base, mbi), "%08x");
+    ASSERT_EQ_FMT(0x1000u, wl_xb_rd32(mbi + 16), "%x"); // page 0 untouched
+    ASSERT_EQ_FMT(0x1000u, wl_xb_rd32(mbi + 12), "%x");
+    wl_xb_wr32(base_p, base);
+    wl_xb_wr32(size_p, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_FREE_VM, base_p, size_p, 0x8000), "%08x");
+    PASS();
+}
+
+TEST rtl_formats_past_the_stack_buffer(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    char piece[191];
+    memset(piece, 'q', 190);
+    piece[190] = '\0';
+    piece[0] = '<';
+    piece[189] = '>';
+    uint32_t s = gstr(piece), fmt = gstr("%s%s%s%s%s%s%s%s%s%s%s%s!");
+    uint32_t out = gmem(2400), esp = g_esp;
+    uint32_t n = KN(S_RTL_SPRINTF, out, fmt, s, s, s, s, s, s, s, s, s, s, s, s);
+    g_esp = esp;
+    ASSERT_EQ_FMT(12u * 190u + 1u, n, "%u");
+    for (uint32_t i = 0; i < 12; i++) { // every piece whole, past the 2 KB the text is first made in
+        ASSERT_EQ('<', wl_xb_rd8(out + i * 190u));
+        ASSERT_EQ('>', wl_xb_rd8(out + i * 190u + 189u));
+    }
+    ASSERT_EQ('!', wl_xb_rd8(out + 12u * 190u));
+    ASSERT_EQ(0, wl_xb_rd8(out + 12u * 190u + 1u));
+    // RtlVsprintf over a va_list
+    uint32_t args = gmem(48);
+    for (uint32_t i = 0; i < 12; i++) {
+        wl_xb_wr32(args + 4u * i, s);
+    }
+    wl_xb_fill(out, 0xEE, 2400);
+    esp = g_esp;
+    n = KN(S_RTL_VSPRINTF, out, fmt, args);
+    g_esp = esp;
+    ASSERT_EQ_FMT(12u * 190u + 1u, n, "%u");
+    ASSERT_EQ('>', wl_xb_rd8(out + 11u * 190u + 189u));
+    ASSERT_EQ(0, wl_xb_rd8(out + 12u * 190u + 1u));
+    PASS();
+}
+
+TEST directory_listing_keeps_entries(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    make_file("title/maps/noext", "x");
+    uint32_t st = 0;
+    uint32_t h = open_path("D:\\maps", 0x80000000u, 1, 0x21, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    uint32_t mask = gmem(8), pat = gstr("*.*"), iosb = gmem(8), dir = gmem(0x200);
+    wl_xb_wr16(mask, 3);
+    wl_xb_wr16(mask + 2, 4);
+    wl_xb_wr32(mask + 4, pat);
+    // a buffer that cannot take the name: the entry comes with the next call
+    ASSERT_EQ_FMT(0x80000005u, KN(S_NT_QUERY_DIR, h, 0, 0, 0, iosb, dir, 0x41, 1, mask, 1), "%08x");
+    bool seen_ui = false, seen_b30 = false, seen_noext = false;
+    uint32_t count = 0, status;
+    while ((status = KN(S_NT_QUERY_DIR, h, 0, 0, 0, iosb, dir, 0x200, 1, 0, 0)) == 0) {
+        char name[64] = {0};
+        uint32_t nl = wl_xb_rd32(dir + 0x3C);
+        wl_xb_copy_out(name, dir + 0x40, nl < 63u ? nl : 63u);
+        seen_ui |= strcmp(name, "ui.map") == 0;
+        seen_b30 |= strcmp(name, "b30.map") == 0;
+        seen_noext |= strcmp(name, "noext") == 0; // "*.*" takes a name without a dot, as on DOS and NT
+        count++;
+    }
+    ASSERT_EQ_FMT(0x80000006u, status, "%08x");
+    ASSERT_EQ_FMT(3u, count, "%u");
+    ASSERT(seen_ui && seen_b30 && seen_noext);
+    KN(S_NT_CLOSE, h);
+    char path[512];
+    snprintf(path, sizeof path, "%s/title/maps/noext", g_root);
+    unlink(path);
+    PASS();
+}
+
 SUITE(kernel_suite) {
     RUN_TEST(thunk_abi);
     RUN_TEST(threads_and_critical_sections);
@@ -999,6 +1367,14 @@ SUITE(kernel_suite) {
     RUN_TEST(files_sparse_cache_drive);
     RUN_TEST(virtual_and_contiguous_memory);
     RUN_TEST(rtl_crypto_settings);
+    RUN_TEST(files_share_one_size);
+    RUN_TEST(files_failures_leave_the_request_alone);
+    RUN_TEST(files_deleted_at_the_last_close);
+    RUN_TEST(objects_live_while_referenced);
+    RUN_TEST(a_wait_keeps_its_object);
+    RUN_TEST(virtual_memory_corners);
+    RUN_TEST(rtl_formats_past_the_stack_buffer);
+    RUN_TEST(directory_listing_keeps_entries);
 }
 
 GREATEST_MAIN_DEFS();

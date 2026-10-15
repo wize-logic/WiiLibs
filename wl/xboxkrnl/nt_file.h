@@ -38,22 +38,30 @@ int xk_strnicmp(const char *a, const char *b, size_t n);
 
 typedef enum { XK_FILE_REGULAR = 0, XK_FILE_DIRECTORY, XK_FILE_CDROM, XK_FILE_PARTITION } XkFileKind;
 
+// What every handle on one host file or folder shares (nt_file.c), as NT's file control block.
+typedef struct XkFcb XkFcb;
+
 struct XkFile {
     XkFileKind kind;
     WlPlatformFile *pf;     // regular files
     char host[320];
     char name[400];         // the device path it was opened by
-    bool writable;
+    bool writable;          // the mount can be written
+    bool can_write;         // ...and the handle asked for it (FILE_WRITE_DATA and the like)
     bool sparse;
-    bool delete_on_close;
+    bool delete_on_close;   // FILE_DELETE_ON_CLOSE: the file is deleted after its last handle
     bool synchronous;       // FILE_SYNCHRONOUS_IO_*: no APC, the position moves
+    bool resized;           // this handle changed a sparse file's size: it writes the sidecar
+    XkFcb *fcb;             // files and folders under a mount
     uint64_t pos;
-    uint64_t logical;       // a sparse file's size (what the title sees)
     uint32_t partition;     // XK_FILE_PARTITION
     WlPlatformDir *dir;     // a directory being listed
     char pattern[128];
     bool listing;
     uint32_t listed;        // entries returned since the restart
+    bool held;              // an entry found that did not fit the caller's buffer: returned next
+    char held_name[256];
+    WlPlatformStat held_st;
 };
 
 // Raw partition sectors (the partition table on Partition0; what the title wrote to a partition's
