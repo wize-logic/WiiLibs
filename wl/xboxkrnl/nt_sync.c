@@ -246,7 +246,9 @@ static bool timeout_of(uint32_t va, int64_t *t) {
 
 static uint32_t wait_handles(uint32_t count, const uint32_t *handles, bool all, bool alertable, bool user,
                              uint32_t timeout_va) {
-    uint32_t objs[XK_MAX_WAIT];
+    // (zeroed: the callers pass 1..XK_MAX_WAIT handles and the loop sets all of them, which GCC's
+    // -O2 cannot see through xk_wait's const pointer)
+    uint32_t objs[XK_MAX_WAIT] = {0};
     XkObject *held[XK_MAX_WAIT];
     for (uint32_t i = 0; i < count; i++) {
         held[i] = xk_handle_get(handles[i]);
