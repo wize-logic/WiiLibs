@@ -394,6 +394,46 @@ TEST the_efb_format_set_before_attaching_is_kept(void) {
     PASS();
 }
 
+// the decoded images kept by what they are, not where: the same texture at two addresses decoded
+// once (so a host run decodes the same whatever the heap's layout), and a texture changed in place
+// decoded again once the texture cache is emptied
+TEST decoded_textures_kept_by_their_bytes(void) {
+    static const uint32_t a[4] = {0xFF0000FFu, 0x00FF00FFu, 0x0000FFFFu, 0xFFFFFFFFu};
+    WlGxTexObj first, second;
+    WlGxSoftStats stats;
+    void *one, *two;
+    uint32_t decoded;
+
+    begin(0x000000FFu, false);
+    layout(1, 1);
+    texture_replace();
+    one = texture(&first, WL_GX_TEX_RGBA8, 2, 2, a, NULL, WL_GX_WRAP_CLAMP, WL_GX_FILTER_NEAREST,
+                  WL_GX_FILTER_NEAREST);
+    two = texture(&second, WL_GX_TEX_RGBA8, 2, 2, a, NULL, WL_GX_WRAP_CLAMP, WL_GX_FILTER_NEAREST,
+                  WL_GX_FILTER_NEAREST);
+    wl_gxsoft_stats(&stats);
+    decoded = stats.textures_decoded;
+    wl_gx_direct_texture(0, &first, NULL, NULL);
+    quad(0, 0, 16, 16, 0.5f, 0xFFFFFFFFu, 1, 1);
+    wl_gx_direct_texture(0, &second, NULL, NULL);
+    quad(16, 0, 32, 16, 0.5f, 0xFFFFFFFFu, 1, 1);
+    wl_gxsoft_stats(&stats);
+    ASSERT_EQ(decoded + 1u, stats.textures_decoded);
+    ASSERT_EQ(px(2, 2), px(18, 2));
+    // (the second's bytes changed in place: decoded again after the cache is emptied)
+    memset(two, 0, 16);
+    wl_gx_tex_invalidate();
+    wl_gx_direct_texture(0, &second, NULL, NULL);
+    quad(32, 0, 48, 16, 0.5f, 0xFFFFFFFFu, 1, 1);
+    wl_gxsoft_stats(&stats);
+    ASSERT_EQ(decoded + 2u, stats.textures_decoded);
+    ASSERT_EQ(0x00000000u, px(34, 2) & 0xFFFFFF00u);
+    free(one);
+    free(two);
+    end();
+    PASS();
+}
+
 TEST texture_sampling(void) {
     static const uint32_t checker[16] = {
         0xFF0000FFu, 0x00FF00FFu, 0x0000FFFFu, 0xFFFFFFFFu, 0x000000FFu, 0x808080FFu, 0xFF00FFFFu, 0x00FFFFFFu,
@@ -589,6 +629,7 @@ SUITE(gxsoft_suite) {
     RUN_TEST(blending_and_the_efb_formats);
     RUN_TEST(the_efb_format_set_before_attaching_is_kept);
     RUN_TEST(texture_sampling);
+    RUN_TEST(decoded_textures_kept_by_their_bytes);
     RUN_TEST(cmpr_and_one_map_at_two_coordinates);
     RUN_TEST(render_target_copies_and_the_back_buffer_put_back);
     RUN_TEST(what_gx_takes_as_it_is_is_flagged);

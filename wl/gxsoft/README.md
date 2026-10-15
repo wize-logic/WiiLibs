@@ -44,7 +44,9 @@ send, an empty texture map, a TLUT not loaded).
   attributes interpolated for the perspective and the depth across the screen.
 - **Textures.** Each TEV stage's own lookup (its map at its coordinate, `wl_tev_eval_stages`),
   decoded from GX's formats by wl/codec (CMPR blended 5/8 : 3/8, C4/C8 through their TLUT) and kept
-  until the texture cache is emptied and their bytes changed; the ramp (`wl_gx_ramp_bind`). Clamp,
+  by what they are (their bytes' hash, format, size, levels and palette, not their host address, so a
+  run decodes the same whatever the heap's layout), an address found again since the texture cache
+  was last emptied taken as unchanged; the ramp (`wl_gx_ramp_bind`). Clamp,
   repeat and mirror (clamp for a size not a power of two, as the Wii backend forces), nearest and
   bilinear filtering with GX's 7-bit fractions, mipmaps by a level of detail from the coordinates'
   derivatives (four fractional bits), the sampler's bias.

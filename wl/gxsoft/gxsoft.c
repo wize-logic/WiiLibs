@@ -241,8 +241,24 @@ static bool decode(Decoded *d) {
     return true;
 }
 
-// The decoded image of a texture object (or the ramp), decoded again when its bytes changed since
-// the texture cache was emptied.
+// a texture's bytes in GX's format, its levels one after the other (as decode reads them)
+static size_t source_size(uint8_t format, uint16_t width, uint16_t height, uint8_t mips) {
+    uint32_t l, levels = mips == 0 ? 1u : mips, w = width, h = height;
+    size_t bytes = 0;
+
+    levels = levels > LEVELS_MAX ? LEVELS_MAX : levels;
+    for (l = 0; l < levels; l++) {
+        bytes += wl_gxc_tex_bytes((WlGxcFormat)format, w, h);
+        w = w > 1u ? w >> 1 : 1u;
+        h = h > 1u ? h >> 1 : 1u;
+    }
+    return bytes;
+}
+
+// The decoded image of a texture object (or the ramp). Kept by what it is (its bytes' hash, format,
+// size, levels and palette), not where it is: the host memory a texture lands in changes with the
+// heap from build to build, and what is decoded must not. Its address only saves the hash: an image
+// found at the same address since the texture cache was last emptied is taken as unchanged.
 static const Decoded *decoded_get(const void *image, uint8_t format, uint16_t width, uint16_t height, uint8_t mips,
                                   const WlGxTlut *tlut) {
     Decoded *slot = NULL;
@@ -250,32 +266,34 @@ static const Decoded *decoded_get(const void *image, uint8_t format, uint16_t wi
     const void *tlut_entries = tlut != NULL ? tlut->entries : NULL;
     uint16_t tlut_count = tlut != NULL ? tlut->count : 0u;
     uint8_t tlut_format = tlut != NULL ? tlut->format : 0u;
+    uint64_t h;
 
     if (image == NULL || format >= WL_GXC_FORMAT_COUNT || width == 0 || height == 0) {
         return NULL;
     }
     mips = mips == 0 ? 1u : mips;
     g.use++;
+    // (the same address, checked since the cache was emptied)
     for (i = 0; i < DECODED_MAX; i++) {
         Decoded *d = &g.decoded[i];
 
-        if (d->memory != NULL && d->image == image && d->format == format && d->width == width &&
+        if (d->memory != NULL && d->checked && d->image == image && d->format == format && d->width == width &&
             d->height == height && d->mips == mips && d->tlut == tlut_entries && d->tlut_count == tlut_count &&
             d->tlut_format == tlut_format) {
-            if (!d->checked) {
-                uint64_t h = source_hash(image, d->source_bytes, tlut_entries, tlut_count);
+            d->used = g.use;
+            return d;
+        }
+    }
+    // (the same bytes, wherever they were)
+    h = source_hash(image, source_size(format, width, height, mips), tlut_entries, tlut_count);
+    for (i = 0; i < DECODED_MAX; i++) {
+        Decoded *d = &g.decoded[i];
 
-                d->checked = true;
-                if (h != d->hash) {
-                    free(d->memory);
-                    d->memory = NULL;
-                    if (!decode(d)) {
-                        decoded_free(d);
-                        return NULL;
-                    }
-                    d->hash = h;
-                }
-            }
+        if (d->memory != NULL && d->hash == h && d->format == format && d->width == width && d->height == height &&
+            d->mips == mips && d->tlut_count == tlut_count && d->tlut_format == tlut_format) {
+            d->image = image;
+            d->tlut = tlut_entries;
+            d->checked = true;
             d->used = g.use;
             return d;
         }
@@ -296,7 +314,7 @@ static const Decoded *decoded_get(const void *image, uint8_t format, uint16_t wi
         decoded_free(slot);
         return NULL;
     }
-    slot->hash = source_hash(image, slot->source_bytes, tlut_entries, tlut_count);
+    slot->hash = h;
     slot->checked = true;
     slot->used = g.use;
     return slot;
