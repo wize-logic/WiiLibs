@@ -180,7 +180,7 @@ void k_NtAllocateVirtualMemory(void) {
         return;
     }
     WlResult r = WL_OK;
-    if (type & MEM_RESERVE) {
+    if (base == 0 || (type & MEM_RESERVE)) { // MEM_COMMIT alone with no address reserves too, as NT does
         uint32_t va = base != 0 ? (base & ~(WL_XB_VA_GRANULE - 1u)) : 0u;
         uint32_t span = base != 0 ? (uint32_t)(((uint64_t)base + size + WL_XB_PAGE - 1u) & ~(uint64_t)(WL_XB_PAGE - 1u)) - va
                                   : size;
@@ -225,13 +225,21 @@ void k_NtFreeVirtualMemory(void) {
         r = wl_xb_va_release(base & ~(WL_XB_PAGE - 1u), &released);
         size = released;
     } else if (type & MEM_DECOMMIT) {
+        // the pages the range touches; size 0: from base to the end of its allocation
+        uint32_t first = base & ~(WL_XB_PAGE - 1u);
         if (size == 0) {
             WlXbVaInfo info;
-            if (wl_xb_va_query(base, &info) == WL_OK) {
-                size = info.size;
+            uint32_t at = first, alloc = 0;
+            while (at < WL_XB_USER_LIMIT && wl_xb_va_query(at, &info) == WL_OK && info.state != 0x10000u &&
+                   (alloc == 0 || info.allocation_base == alloc) && info.size > 0) {
+                alloc = info.allocation_base;
+                at = info.base + info.size;
             }
+            size = at - first;
+        } else {
+            size = (uint32_t)(((uint64_t)base + size + WL_XB_PAGE - 1u) & ~(uint64_t)(WL_XB_PAGE - 1u)) - first;
         }
-        r = wl_xb_va_decommit(base & ~(WL_XB_PAGE - 1u), size);
+        r = size > 0 ? wl_xb_va_decommit(first, size) : WL_ERR_RANGE;
     } else {
         RET(STATUS_INVALID_PARAMETER);
         return;

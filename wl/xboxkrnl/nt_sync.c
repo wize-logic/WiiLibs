@@ -244,15 +244,25 @@ static bool timeout_of(uint32_t va, int64_t *t) {
 static uint32_t wait_handles(uint32_t count, const uint32_t *handles, bool all, bool alertable, bool user,
                              uint32_t timeout_va) {
     uint32_t objs[XK_MAX_WAIT];
+    XkObject *held[XK_MAX_WAIT];
     for (uint32_t i = 0; i < count; i++) {
-        objs[i] = xk_handle_waitable(handles[i]);
+        held[i] = xk_handle_get(handles[i]);
+        objs[i] = held[i] != NULL ? held[i]->body : 0u;
         if (objs[i] == 0) {
             return STATUS_INVALID_HANDLE;
         }
     }
+    // the wait's references: a handle closed by another thread meanwhile leaves the bodies alive
+    for (uint32_t i = 0; i < count; i++) {
+        xk_object_reference(held[i]);
+    }
     int64_t t;
     bool has = timeout_of(timeout_va, &t);
-    return xk_wait(count, objs, all, alertable, user, has ? &t : NULL);
+    uint32_t status = xk_wait(count, objs, all, alertable, user, has ? &t : NULL);
+    for (uint32_t i = 0; i < count; i++) {
+        xk_object_release(held[i]);
+    }
+    return status;
 }
 
 // NTSTATUS NtWaitForSingleObject(HANDLE, BOOLEAN Alertable, PLARGE_INTEGER Timeout)
