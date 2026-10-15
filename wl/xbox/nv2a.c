@@ -543,9 +543,12 @@ static void puller(WlNv2a *dev, unsigned chid, unsigned subchannel, uint32_t met
     switch (ch->subchannel_class[subchannel]) {
     case WL_NV2A_CLASS_KELVIN:
         if (method == WL_NV2A_K_NO_OPERATION && param != 0) {
-            if (wl_nv2a_trap(dev, method | (uint32_t)subchannel << 13, param)) {
-                ch->suspended = 1;
-            }
+            // PGRAPH stops at a trapped method whether its interrupt is enabled or not (a driver
+            // that has the interrupts off at that moment, as D3D's ISR does until its DPC has run,
+            // sees the trap when it turns them on): the methods after it wait, and a second trap
+            // cannot overwrite the first one's TRAPPED_ADDR/DATA before the handler reads them
+            (void)wl_nv2a_trap(dev, method | (uint32_t)subchannel << 13, param);
+            ch->suspended = 1;
             return;
         }
         wl_nv2a_kelvin_method(dev, method, param);
@@ -587,11 +590,14 @@ void wl_nv2a_method(WlNv2a *dev, unsigned subchannel, uint32_t method, uint32_t 
     dev->current_channel = was;
 }
 
-// a channel stopped at a trap goes on once the ISR has cleared it
+// A channel stopped at a trap goes on once the ISR has cleared it and PGRAPH may take methods:
+// pbkit only acknowledges the interrupt; D3D turns PGRAPH_FIFO off, acknowledges, runs the software
+// method, then turns PGRAPH_FIFO on (going on at the acknowledgement ran the push buffer to its next
+// trap before D3D had read the first one: Halo's flip was queued twice and its Swap waited for good).
 static void resume_trapped(WlNv2a *dev) {
     unsigned chid;
 
-    if (dev->pgraph_intr & WL_NV2A_PGRAPH_INTR_ERROR) {
+    if ((dev->pgraph_intr & WL_NV2A_PGRAPH_INTR_ERROR) || dev->pgraph_fifo == 0) {
         return;
     }
     for (chid = 0; chid < WL_NV2A_CHANNELS; chid++) {
@@ -798,6 +804,7 @@ static void write32(WlNv2a *dev, uint32_t offset, uint32_t value) {
         break;
     case WL_NV2A_PGRAPH_FIFO:
         dev->pgraph_fifo = value;
+        resume_trapped(dev);
         break;
     case WL_NV2A_PCRTC_INTR_0:
         dev->pcrtc_intr &= ~value;

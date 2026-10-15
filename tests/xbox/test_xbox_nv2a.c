@@ -433,6 +433,46 @@ TEST a_trapped_method_stops_the_channel_until_acknowledged(void) {
     PASS();
 }
 
+// D3D's way with a software method: its ISR has the GPU's interrupts off until its DPC runs, so a
+// trap can come while they are off; the DPC turns PGRAPH_FIFO off, acknowledges the trap, reads and
+// runs the method, then turns PGRAPH_FIFO on. The channel stays stopped at the trap through all of it,
+// so the method after it (a second trap here) cannot replace TRAPPED_DATA before it is read.
+TEST a_trap_waits_for_pgraph_fifo(void) {
+    TGuest g;
+    const WlNv2aKelvin *k;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    k = wl_nv2a_kelvin(g.dev);
+    t_mmio(&g, WL_NV2A_PMC_INTR_EN_0, 0); // the ISR turned them off
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR_EN, 0xFFFFFFFFu);
+    t_m1(&g, WL_NV2A_K_NO_OPERATION, 0x304);
+    t_m1(&g, WL_NV2A_K_NO_OPERATION, 0x320);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 66);
+    t_kick(&g);
+    ASSERT_FALSE(wl_nv2a_irq_pending(g.dev)); // not delivered, but the channel waits all the same
+    ASSERT(t_get(&g) != g.put);
+    ASSERT_EQ(0x304u, t_mmio_r(&g, 0x400708));
+    // the DPC: interrupts on, PGRAPH_FIFO off, acknowledge, read, PGRAPH_FIFO on
+    t_mmio(&g, WL_NV2A_PMC_INTR_EN_0, 1);
+    ASSERT(wl_nv2a_irq_pending(g.dev));
+    t_mmio(&g, WL_NV2A_PGRAPH_FIFO, 0);
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR, WL_NV2A_PGRAPH_INTR_ERROR);
+    ASSERT_EQ(0x304u, t_mmio_r(&g, 0x400708)); // still the first: nothing ran on
+    ASSERT(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF) != 66u);
+    t_mmio(&g, WL_NV2A_PGRAPH_FIFO, 1);
+    // on to the second trap, which waits in turn
+    ASSERT_EQ(0x320u, t_mmio_r(&g, 0x400708));
+    ASSERT(t_mmio_r(&g, WL_NV2A_PGRAPH_INTR) & WL_NV2A_PGRAPH_INTR_ERROR);
+    ASSERT(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF) != 66u);
+    t_mmio(&g, WL_NV2A_PGRAPH_FIFO, 0);
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR, WL_NV2A_PGRAPH_INTR_ERROR);
+    t_mmio(&g, WL_NV2A_PGRAPH_FIFO, 1);
+    ASSERT_EQ(g.put, t_get(&g));
+    ASSERT_EQ(66u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    t_destroy(&g);
+    PASS();
+}
+
 // ---- capture and replay ---------------------------------------------------------------------------
 
 typedef struct Sink {
@@ -541,6 +581,7 @@ SUITE(nv2a_suite) {
     RUN_TEST(reports_count_the_pixels_drawn);
     RUN_TEST(vblank_interrupt_and_flip);
     RUN_TEST(a_trapped_method_stops_the_channel_until_acknowledged);
+    RUN_TEST(a_trap_waits_for_pgraph_fifo);
     RUN_TEST(capture_replays_to_the_same_draws);
 }
 
