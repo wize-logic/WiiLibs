@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "wl/base/endian.h"
+#include "wl/gfx/gfx_sqrt.h"
 
 enum { LAYOUT_SZ, LAYOUT_LU, LAYOUT_DXT };
 
@@ -391,7 +392,8 @@ void wl_nv2a_texel_rgba(uint8_t color, const uint8_t *row, uint32_t x, const uin
 
 void wl_nv2a_sphere_coordinates(const float direction[3], float st[2]) {
     float x = direction[0], y = direction[1], z = direction[2];
-    float length = sqrtf(x * x + y * y + z * z), m;
+    // (wl_sqrtf_exact: sqrtf's bits, inline, a vertex at a time)
+    float length = wl_sqrtf_exact(x * x + y * y + z * z), m;
 
     if (!(length > 1.0e-12f)) {
         st[0] = st[1] = 0.5f;
@@ -400,7 +402,7 @@ void wl_nv2a_sphere_coordinates(const float direction[3], float st[2]) {
     x /= length;
     y /= length;
     z /= length;
-    m = 2.0f * sqrtf(x * x + y * y + (z + 1.0f) * (z + 1.0f));
+    m = 2.0f * wl_sqrtf_exact(x * x + y * y + (z + 1.0f) * (z + 1.0f));
     if (!(m > 1.0e-6f)) {
         // straight behind: the disc's edge
         st[0] = 0.5f;

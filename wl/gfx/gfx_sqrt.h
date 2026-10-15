@@ -84,6 +84,21 @@ static inline float wl_sqrtf_refine(float value, double estimate) {
     return root;
 }
 
+// The same from an estimate within 6% (frsqrte's, 1/32 at worst; the host's, exact), with no neighbours: three
+// steps leave x y within 2^-28 of the root t (from 6%: 2^-4.06, then 2^-7.5, 2^-14.4, 2^-28), and one step of
+// Newton's method for the root itself, x y + (x - (x y)^2) y / 2, within 2^-52 of t, roundings included. A
+// float's root is never nearer than 2^-51 of itself to a midpoint between floats (x - m^2 is a nonzero multiple
+// of the grid m^2 lies on, 2^-48 of m^2), so the double rounds to the float t rounds to: the IEEE root. About
+// fifteen instructions fewer than wl_sqrtf_refine, and nothing through memory.
+static inline float wl_sqrtf_close(float value, double estimate) {
+    double x = (double)value, y = estimate;
+    y = y * (1.5 - 0.5 * x * y * y);
+    y = y * (1.5 - 0.5 * x * y * y);
+    y = y * (1.5 - 0.5 * x * y * y);
+    double root = x * y;
+    return (float)(root + (x - root * root) * (0.5 * y));
+}
+
 // sqrtf, correctly rounded as IEEE and newlib give it: a zero (also -0) and +infinity are themselves; a
 // negative is the NaN newlib's (x - x) / (x - x) makes, a NaN or -infinity newlib's x * x + x. On PowerPC the
 // estimate is frsqrte's, elsewhere 1 / sqrt(x) in double. The result is the same bits either way, so a test on
@@ -98,7 +113,7 @@ static inline float wl_sqrtf_exact(float x) {
         }
         return (x - x) / (x - x);
     }
-    return wl_sqrtf_refine(x, wl_rsqrt_estimate((double)x));
+    return wl_sqrtf_close(x, wl_rsqrt_estimate((double)x));
 }
 
 // ---- the same for double ------------------------------------------------------------------------------

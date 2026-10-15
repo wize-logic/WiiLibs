@@ -2,7 +2,7 @@
 // wl_sqrtf_exact and its parts against the platform's sqrtf, bit for bit. On ppc-be the platform's sqrtf is
 // glibc's and wl_sqrtf_exact runs frsqrte (qemu's, which is nearly exact, not the 750's 5-bit table), so the
 // estimate is also made as coarse as the 750's by hand and fed to wl_sqrtf_refine: the result must not depend
-// on the estimate.
+// on the estimate. wl_sqrtf_close, which wl_sqrtf_exact uses, from estimates off by up to 6%.
 #include "wl/gfx/gfx_sqrt.h"
 
 #include <math.h>
@@ -107,6 +107,31 @@ TEST refine_is_exact_from_a_coarse_estimate(void) {
     }
     ASSERT_EQ_FMT(0ul, differ, "%lu");
     ASSERT_EQ_FMT(0ul, integer_calls, "%lu");
+    PASS();
+}
+
+// wl_sqrtf_close (wl_sqrtf_exact's refinement) from estimates off by up to 6% either way (frsqrte's worst is 1/32),
+// over the floats and the perfect squares and their neighbours: the IEEE root every time.
+TEST close_is_exact_from_an_estimate_within_six_percent(void) {
+    static const double off[] = {1.0, 1.0 + 1.0 / 32.0, 1.0 - 1.0 / 32.0, 1.06, 0.94};
+    unsigned long differ = 0;
+    for (unsigned which = 0; which < sizeof off / sizeof off[0]; which++) {
+        for (uint32_t bits = 1; bits < 0x7F800000u; bits += bits < DENSE_END ? small_stride : stride) {
+            float x = bits_float(bits);
+            if (float_bits(wl_sqrtf_close(x, off[which] / sqrt((double)x))) != float_bits(platform_sqrtf(x))) {
+                differ++;
+            }
+        }
+        for (int k = 1; k <= 4096; k++) {
+            for (int step = -2; step <= 2; step++) {
+                float x = wl_float_step((float)k * (float)k, step);
+                if (float_bits(wl_sqrtf_close(x, off[which] / sqrt((double)x))) != float_bits(platform_sqrtf(x))) {
+                    differ++;
+                }
+            }
+        }
+    }
+    ASSERT_EQ_FMT(0ul, differ, "%lu");
     PASS();
 }
 
@@ -281,6 +306,7 @@ SUITE(gfx_sqrt_suite) {
     RUN_TEST(exact_matches_sqrtf_over_all_floats);
     RUN_TEST(exact_matches_sqrtf_densely_where_games_live);
     RUN_TEST(refine_is_exact_from_a_coarse_estimate);
+    RUN_TEST(close_is_exact_from_an_estimate_within_six_percent);
     RUN_TEST(perfect_squares_and_their_neighbours);
     RUN_TEST(integer_root_matches_sqrtf);
     RUN_TEST(special_values_are_ieees);

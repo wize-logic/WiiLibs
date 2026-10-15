@@ -46,13 +46,15 @@ float quantisation of GQR0 (the setting libogc leaves), plus `ps_muls0`, `ps_mad
 The 750 has no square root instruction (it lacks `fsqrt`), and newlib's `sqrtf` finds the root a bit
 at a time, about 230 to 290 instructions a call. `wl_sqrtf_exact(x)` (`wl/gfx/gfx_sqrt.h`, inline)
 takes the estimate of 1 / sqrt(x) that `frsqrte` gives (good to 5 bits at worst), refines it with
-three Newton steps in double (36 bits or more) and decides the last bit exactly, in about 60
-instructions.
+three Newton steps in double (36 bits or more) and one Newton step for the root itself, in about 30
+instructions (`wl_sqrtf_close`: from an estimate within 6%, the double is within 2^-52 of the root,
+which is never nearer than 2^-51 of itself to a midpoint between floats, so it rounds to the IEEE
+root).
 
 - The result is the IEEE round-to-nearest root, bit for bit: the one newlib, glibc and x86's `sqrtss`
-  give. The squares of the midpoints between a float's neighbours fit a double exactly and are never
-  a float, so comparing x with a midpoint's square decides the rounding without error. It does not
-  depend on the estimate's quality, only on its being within a few percent. Hence it is safe for
+  give. `wl_sqrtf_refine` decides it from the neighbours instead: the squares of the midpoints
+  between a float's neighbours fit a double exactly and are never a float, so comparing x with a
+  midpoint's square decides the rounding without error, from any estimate within a few percent. Hence it is safe for
   simulation code that must be bit-identical across machines (lockstep), and the same bits come out
   with or without `frsqrte`.
 - Zero (also -0) and +infinity are themselves; a negative, a NaN and -infinity give newlib's NaNs.
