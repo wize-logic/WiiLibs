@@ -87,6 +87,7 @@ typedef struct WlNv2aGxStats {
     uint32_t raster_kept;         // draws that left GX's raster state as the draw before (unchanged)
     uint32_t textures_kept;       // ...its textures
     uint32_t combiners_kept;      // ...its pixel program
+    uint32_t programs_unbiased;   // programs whose signed sums were made unsigned (psh_bias.h)
 } WlNv2aGxStats;
 
 // A backend over GX, which must be up (wl_gx_init). NULL when there is no memory. The device it

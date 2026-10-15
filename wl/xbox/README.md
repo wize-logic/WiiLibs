@@ -7,8 +7,8 @@ programmable stages: the pixel shaders' register combiners become TEV programs, 
 run on the processor, and, for a title whose own Direct3D runs unchanged, the NV2A itself is a
 device that executes the title's push buffers ("The NV2A as a device", below). Game-agnostic: a
 game's own knowledge (programs it recognizes and makes by hand, its list of vertex programs) stays
-with the game. Headers: `wl/xbox/psh.h`, `wl/xbox/psh_cache.h`, `wl/xbox/vsh.h`,
-`wl/xbox/vsh_native.h`, and the NV2A's `nv2a.h`, `nv2a_regs.h`, `nv2a_kelvin.h`, `nv2a_capture.h`,
+with the game. Headers: `wl/xbox/psh.h`, `wl/xbox/psh_bias.h`, `wl/xbox/psh_cache.h`,
+`wl/xbox/vsh.h`, `wl/xbox/vsh_native.h`, and the NV2A's `nv2a.h`, `nv2a_regs.h`, `nv2a_kelvin.h`, `nv2a_capture.h`,
 `nv2a_texture.h`, `nv2a_texcache.h`, `nv2a_pipeline.h`, `nv2a_record.h`. Built with
 `-ffp-contract=off` (`DETERMINISTIC`), so a vertex program gives the same bits interpreted or
 compiled, on every target.
@@ -45,6 +45,14 @@ translation): where the exact program needs more than the general translation ca
 dot product of a register, which no TEV swap reaches and the translation takes as 1. Its
 `vertices` values from `WL_XBOX_PSH_VERTICES_RECIPE` up are the caller's own.
 `wl_xbox_psh_apply` writes a program to GX.
+
+`wl_xbox_psh_unbias` (`psh_bias.h`) writes a program whose colour registers go below 0 in between
+and come back to [0, 1] (Halo's blur of the screen: the mean of four half-biased taps, the half put
+back) as one without, for the translation's clamped registers: each register followed as an
+unsigned value plus an offset (half biases, the constant 1/2, signed reads, halving and biased
+outputs move the offset), the program written with the values alone where every read of a true
+value finds the offset 0. The GX backend runs it before the cache; it leaves any other program as
+it is.
 
 ## The programs kept (`psh_cache.h`)
 

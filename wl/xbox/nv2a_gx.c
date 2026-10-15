@@ -21,6 +21,7 @@
 #include "wl/xbox/nv2a_color.h"
 #include "wl/xbox/nv2a_pipeline.h"
 #include "wl/xbox/nv2a_texture.h"
+#include "wl/xbox/psh_bias.h"
 #include "wl/xbox/psh_cache.h"
 
 #define TAG "nv2a"
@@ -818,7 +819,7 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
 
 static bool tev_setup(WlNv2aGx *gx, const WlNv2aKelvin *k) {
     WlXboxPshTextures textures;
-    uint32_t words[WL_XBOX_PSH_WORDS];
+    uint32_t words[WL_XBOX_PSH_WORDS], unbiased[WL_XBOX_PSH_WORDS];
     const WlXboxPshProgram *program;
     bool usable, translated;
 
@@ -827,6 +828,11 @@ static bool tev_setup(WlNv2aGx *gx, const WlNv2aKelvin *k) {
         wl_gx_ramp_bind(WL_XBOX_PSH_FOG_TEXMAP);
     }
     wl_nv2a_psh_words(k, words);
+    // (signed sums that come back to [0, 1] made without registers below 0, which GX's lose)
+    if (wl_xbox_psh_unbias(words, unbiased)) {
+        memcpy(words, unbiased, sizeof words);
+        gx->stats.programs_unbiased++;
+    }
     program = wl_xbox_psh_cache_program(&gx->psh, words, wl_nv2a_k(k, WL_NV2A_K_SET_SHADER_STAGE_PROGRAM), &textures,
                                         &usable, &translated);
     gx->last_program = program;
