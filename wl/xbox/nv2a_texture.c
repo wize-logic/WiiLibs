@@ -206,6 +206,7 @@ bool wl_nv2a_texture(const WlNv2aKelvin *k, unsigned stage, WlNv2aTexture *out) 
     out->enabled = (wl_nv2a_k(k, WL_NV2A_K_SET_TEXTURE_CONTROL0 + base) >> 30) & 1u;
     out->wrap_u = (uint8_t)(address & 0xFu);
     out->wrap_v = (uint8_t)((address >> 8) & 0xFu);
+    out->border_color = wl_nv2a_k(k, WL_NV2A_K_SET_TEXTURE_BORDER_COLOR + base);
     out->min_filter = (uint8_t)((filter >> WL_NV2A_TEXFILTER_MIN_SHIFT) & 0xFFu);
     out->mag_filter = (uint8_t)((filter >> WL_NV2A_TEXFILTER_MAG_SHIFT) & 0xFu);
     if (out->linear) {

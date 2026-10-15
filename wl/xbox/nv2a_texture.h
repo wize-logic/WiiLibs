@@ -40,6 +40,7 @@ typedef struct WlNv2aTexture {
     // what the stage's sampler says
     uint8_t enabled;        // CONTROL0's enable bit
     uint8_t wrap_u, wrap_v; // WL_NV2A_WRAP_*
+    uint32_t border_color;  // SET_TEXTURE_BORDER_COLOR (ARGB), read outside by WL_NV2A_WRAP_BORDER
     uint8_t min_filter, mag_filter; // WL_NV2A_FILTER_*
     // what the texels hold, as wl/xbox/psh takes it (WL_XBOX_PSH_TEXTURE_*)
     uint8_t contents;

@@ -71,6 +71,8 @@ typedef struct WlNv2aGxStats {
     uint32_t stencil_ignored;     // draws with the stencil test drawn as if it passed
     uint32_t target_draws;        // draws into a surface other than the back buffer
     uint32_t target_skipped;      // ... that had no render target (no memory, a size or format GX has not)
+    uint32_t targets_written;     // targets the guest stored to after their image was made
+    uint32_t border_clamped;      // textures bound with border addressing, clamped to their edge
     uint32_t programs_unusable;   // draws whose combiners GX cannot hold (texture 0 times colour)
     uint32_t approximations;      // draws whose combiners or blending were approximated
     uint32_t vertices_reused;     // vertices of indexed draws taken from the ones already run

@@ -227,7 +227,12 @@ even, so its winding holds).
   buffer's depth buffer, whose memory Halo's screen blur borrows) takes it through
   `wl/platform/gx_target.h`, and a texture at its address then samples its image (the back buffer's
   own address, while a target of its size has the EFB, samples its parked colour: the picture
-  being drawn); once a title
+  being drawn). A texture takes a target's image only with its texel size (4 bytes for the RGBA8
+  image, 2 for the RGB565) and within its size; with the runtime's write watch, a store to the
+  target's memory after its image was made (the memory used again for a texture the processor
+  fills) makes the guest's texels the texture's until the target is drawn again (counted as
+  `targets_written`); an image read through a format without alpha (X8R8G8B8, R5G6B5) has 1 for its
+  alpha, not the EFB's. Once a title
   samples a surface it showed (a displayed picture as a texture), each finished back buffer is
   copied out of the EFB into a target at its address too, for the next frame. The frame's first
   full clear is GX's copy clear, others are quads. A frame is shown on FLIP_INCREMENT_WRITE, on a
@@ -246,7 +251,10 @@ even, so its winding holds).
   pages saw no store is as it was, its texels not read; one whose pages did is hashed, or made
   again if large), else by a hash of the guest's texels (XXH32's rounds: 32-bit multiplies). A
   capture begun inside a frame has the textures and vertex arrays checked before it read again at
-  their next use.
+  their next use. Border addressing is clamped to the edge (GX has no border colour; the colour,
+  SET_TEXTURE_BORDER_COLOR, is decoded and the binds counted as `border_clamped`): Halo's border
+  textures (its object shadows' targets, cleared to the border's black, light masks and a lookup
+  table) have edges at or near the border colour already.
 - **The pipeline** (`nv2a_pipeline.h`) is what the GX backend does on the processor: programs
   compiled and kept, vertices run (or the fixed function's composite matrix), the NV2A's fog modes,
   what psh is told of the textures, each stage's GX coordinates, the GX mappings of the raster state.

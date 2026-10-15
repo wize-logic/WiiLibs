@@ -809,6 +809,9 @@ int main(int argc, char **argv) {
                (unsigned)gs.target_draws,
                (unsigned)gs.target_skipped, (unsigned)gs.stencil_skipped, (unsigned)gs.programs_unusable,
                (unsigned)gs.approximations, (unsigned)gs.clears, (unsigned)gs.quad_clears, (unsigned)gs.frames);
+        printf("            %u programs' signed sums made unsigned, %u textures with border addressing clamped, "
+               "%u targets stored to after their image\n",
+               (unsigned)gs.programs_unbiased, (unsigned)gs.border_clamped, (unsigned)gs.targets_written);
         printf("            %u draws (%u vertices) through GX's transform unit, %u more for their position alone\n",
                (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws);
         printf("            %u draws counted without drawing (they write nothing), %u skipped; %u kept the raster "
