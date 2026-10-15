@@ -233,6 +233,15 @@ const WlGxTarget *wl_gx_target_current(void) {
     return t.owner_is_target ? &t.owner : NULL;
 }
 
+const void *wl_gx_target_parked_colour(uint32_t *w, uint32_t *h) {
+    if (!t.parked || !t.owner_is_target || t.colour == NULL) {
+        return NULL;
+    }
+    *w = t.parked_w;
+    *h = t.parked_h;
+    return t.colour;
+}
+
 void wl_gx_target_drawn(void) {
     if (!t.owner_is_target) {
         t.drawn = true;

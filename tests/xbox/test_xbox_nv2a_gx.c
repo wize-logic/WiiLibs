@@ -3,7 +3,8 @@
 // layer (host/gx_direct_host.h). Synthetic push buffers: a quad in screen space with a texture and a
 // combiner program (the vertices as GX gets them, the TEV program applied, the texture bound), a
 // draw through a program that divides by w (the perspective projection and (x w, y w, -w)), the
-// frame's clear, culling, a stencil draw skipped, and the frame shown when the title finishes it.
+// frame's clear, culling, a stencil draw skipped, and the frame shown when the title finishes it;
+// render targets, and a screen blur through the back buffer's depth buffer drawn in one frame.
 #include <math.h>
 #include <string.h>
 
@@ -260,11 +261,76 @@ TEST partial_clears_are_quads_and_render_targets_take_the_efb(void) {
     PASS();
 }
 
+// the colour surface 640x480 at `color` (with the back buffer's depth buffer, or none), and a
+// texture: the 640x480 linear picture at `texture`
+static void blur_pass(TGuest *g, uint32_t color, bool zeta, uint32_t texture) {
+    t_m1(g, WL_NV2A_K_SET_SURFACE_FORMAT,
+         WL_NV2A_SURFACE_COLOR_A8R8G8B8 | (zeta ? WL_NV2A_SURFACE_ZETA_Z24S8 << 4 : 0u) |
+             WL_NV2A_SURFACE_TYPE_PITCH << 8);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_COLOR_OFFSET, color);
+    t_m1(g, WL_NV2A_K_SET_DEPTH_TEST_ENABLE, zeta ? 1u : 0u);
+    t_m1(g, WL_NV2A_K_SET_TEXTURE_OFFSET, texture);
+    t_m1(g, WL_NV2A_K_SET_TEXTURE_FORMAT,
+         1u | 2u << 4 | (uint32_t)WL_NV2A_TEX_LU_A8R8G8B8 << 8 | 1u << 16);
+    t_m1(g, WL_NV2A_K_SET_TEXTURE_CONTROL1, 2560u << 16);
+    t_m1(g, WL_NV2A_K_SET_TEXTURE_IMAGE_RECT, 640u << 16 | 480u);
+    f_quad(g, 0, 0, 640, 480, 0, 0xFFFFFFFFu);
+    t_kick(g);
+}
+
+// Halo's blur of the screen: the picture drawn, then read as a texture into a surface of the
+// screen's size at the back buffer's depth buffer, which is read back into the picture. That
+// surface is a render target, not another back buffer (each pass was shown as a frame of its own:
+// the flashes of a fade with the blur on), and the picture the first pass reads is the one being
+// drawn (its colour parked), not one shown before or the guest's memory.
+TEST a_blur_through_the_depth_buffer_is_drawn_in_one_frame(void) {
+    TGuest g;
+    WlNv2aGxStats stats;
+    WlGxTargetStats targets;
+    WlNv2aTexCacheStats ts;
+    uint32_t w = 0, h = 0, converted;
+    ASSERT(gx_device(&g) != NULL);
+    f_frame_setup(&g);
+    f_program(&g, 0, f_screen_program, 3);
+    wl_gx_target_stats(&targets, true);
+    // the picture, with the depth buffer at F_ZETA
+    f_clear(&g, 0xFF000000u);
+    f_quad(&g, 10, 10, 100, 100, 0.5f, 0xFFFFFFFFu);
+    t_kick(&g);
+    wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+    converted = ts.converted;
+    // the first pass: the picture into the depth buffer's memory
+    blur_pass(&g, F_ZETA, false, F_COLOR);
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT_EQ(0u, stats.frames);
+    ASSERT_EQ(1u, stats.target_draws);
+    ASSERT(wl_gx_target_parked_colour(&w, &h) != NULL);
+    ASSERT_EQ(640u, w);
+    ASSERT_EQ(480u, h);
+    ASSERT(wl_host_gx_direct()->textures[0] != NULL);
+    ASSERT_EQ(640u, wl_host_gx_direct()->textures[0]->width);
+    ASSERT_EQ((unsigned)WL_GX_TEX_RGBA8, wl_host_gx_direct()->textures[0]->format);
+    wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+    ASSERT_EQ(converted, ts.converted);
+    // the second: back into the picture, from the target
+    blur_pass(&g, F_COLOR, true, F_ZETA);
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT_EQ(0u, stats.frames);
+    wl_gx_target_stats(&targets, false);
+    ASSERT_EQ(1u, targets.resolves);
+    ASSERT_EQ(640u, wl_host_gx_direct()->textures[0]->width);
+    wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+    ASSERT_EQ(converted, ts.converted);
+    gx_done(&g);
+    PASS();
+}
+
 SUITE(gx_suite) {
     RUN_TEST(screen_space_quad_with_texture_and_combiners);
     RUN_TEST(perspective_draws_send_x_w_y_w_minus_w);
     RUN_TEST(culling_by_the_nv2a_rule_and_stencil_skipped);
     RUN_TEST(partial_clears_are_quads_and_render_targets_take_the_efb);
+    RUN_TEST(a_blur_through_the_depth_buffer_is_drawn_in_one_frame);
 }
 
 GREATEST_MAIN_DEFS();

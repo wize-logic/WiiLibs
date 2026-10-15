@@ -86,6 +86,11 @@ void wl_gx_target_set_allocator(WlGxTargetAlloc alloc, WlGxTargetFree release);
 const WlGxTarget *wl_gx_target_use(const WlGxTarget *target);
 // The owner (the layer's copy of its descriptor), or NULL for the back buffer.
 const WlGxTarget *wl_gx_target_current(void);
+// The back buffer's colour as it was parked, while it is (a target has the EFB): a texture's image
+// in WL_GX_TEX_RGBA8 of *w by *h pixels (the part parked, from the EFB's origin), valid until the
+// back buffer is put back. NULL when nothing is parked. For a caller that reads the picture it
+// was drawing as a texture while drawing into a target.
+const void *wl_gx_target_parked_colour(uint32_t *w, uint32_t *h);
 // The caller is drawing into the owner now. Only the back buffer's is recorded: it decides whether
 // a target taking the EFB parks it.
 void wl_gx_target_drawn(void);

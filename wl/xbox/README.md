@@ -215,8 +215,11 @@ even, so its winding holds).
   Direct3D's D3DCULL_CCW keeps a quad wound clockwise on the screen; GX's sense measured once at
   start); a draw with the stencil test is drawn as if the test passed (counted as `stencil_ignored`),
   one that writes only the stencil is skipped (`stencil_skipped`). The
-  EFB is the back buffer; another surface (a multisampled one among them) takes it through
-  `wl/platform/gx_target.h`, and a texture at its address then samples its image; once a title
+  EFB is the back buffer; another surface (a multisampled one among them, or one at the back
+  buffer's depth buffer, whose memory Halo's screen blur borrows) takes it through
+  `wl/platform/gx_target.h`, and a texture at its address then samples its image (the back buffer's
+  own address, while a target of its size has the EFB, samples its parked colour: the picture
+  being drawn); once a title
   samples a surface it showed (a displayed picture as a texture), each finished back buffer is
   copied out of the EFB into a target at its address too, for the next frame. The frame's first
   full clear is GX's copy clear, others are quads. A frame is shown on FLIP_INCREMENT_WRITE, on a
