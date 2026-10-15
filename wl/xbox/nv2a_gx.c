@@ -181,11 +181,12 @@ struct WlNv2aGx {
     unsigned xf_live;
     bool xf_eligible, xf_full;
     WlXboxVshDependencies xf_dependencies;
-    // the last programs' analyses (wl_xbox_vsh_analyze), by program and its hash: a frame's draws
-    // take turns among a few programs, and an analysis costs thousands of instructions
+    // the last programs' analyses (wl_xbox_vsh_analyze), by program and its serial (another compiled
+    // in its place is another): a frame's draws take turns among a few programs, and an analysis
+    // costs thousands of instructions
     struct XfAnalysis {
         const WlXboxVshProgram *program;
-        unsigned long hash, count;
+        uint32_t serial;
         uint32_t used;
         WlXboxVshDependencies dependencies;
     } xf_analyses[XF_ANALYSES];
@@ -1514,7 +1515,7 @@ static void xf_analysis(WlNv2aGx *gx, const WlXboxVshProgram *program) {
     for (i = 0; i < XF_ANALYSES; i++) {
         struct XfAnalysis *a = &gx->xf_analyses[i];
 
-        if (a->used != 0 && a->program == program && a->hash == program->hash && a->count == program->count) {
+        if (a->used != 0 && a->program == program && a->serial == program->serial) {
             a->used = gx->xf_analysis_use;
             gx->xf_dependencies = a->dependencies;
             return;
@@ -1525,8 +1526,7 @@ static void xf_analysis(WlNv2aGx *gx, const WlXboxVshProgram *program) {
     }
     wl_xbox_vsh_analyze(program, &gx->xf_dependencies);
     slot->program = program;
-    slot->hash = program->hash;
-    slot->count = program->count;
+    slot->serial = program->serial;
     slot->used = gx->xf_analysis_use;
     slot->dependencies = gx->xf_dependencies;
 }
@@ -1627,7 +1627,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
             xf->position[2][c] = -rows[3][c];
         }
     } else {
-        // (screen space: w 1 for the vertices, each a point with w 1; the depth not clamped)
+        // (screen space: w 1 for the vertices, each a point with w 1)
         for (row = 0; row < 4; row++) {
             for (c = 0; c < 3; c++) {
                 rows[row][c] = o[P_X1 + c].position[row] - o[P_W].position[row];
@@ -1649,6 +1649,17 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         xf->position[0][3] += 0.5f;
         xf->position[1][3] += 0.5f;
         xf->position[2][3] -= 1.0f;
+        // (the depth as the processor's draw clamps it to [0, 1] (as_depth), where GX clips: one the
+        // same at every vertex clamped here, and one that varies with the position, which might leave
+        // the range at a vertex the transform unit cannot clamp, left to the processor)
+        if (xf->position[2][0] != 0.0f || xf->position[2][1] != 0.0f || xf->position[2][2] != 0.0f) {
+            return false;
+        }
+        if (!(xf->position[2][3] >= -1.0f)) {
+            xf->position[2][3] = -1.0f;
+        } else if (xf->position[2][3] > 0.0f) {
+            xf->position[2][3] = 0.0f;
+        }
     }
     xf->full = full;
     xf->words = plan->words;

@@ -11,7 +11,9 @@ with the game. Headers: `wl/xbox/psh.h`, `wl/xbox/psh_bias.h`, `wl/xbox/psh_cach
 `wl/xbox/vsh.h`, `wl/xbox/vsh_native.h`, and the NV2A's `nv2a.h`, `nv2a_regs.h`, `nv2a_kelvin.h`, `nv2a_capture.h`,
 `nv2a_texture.h`, `nv2a_texcache.h`, `nv2a_pipeline.h`, `nv2a_record.h`. Built with
 `-ffp-contract=off` (`DETERMINISTIC`), so a vertex program gives the same bits interpreted or
-compiled, on every target.
+compiled. Across targets the bits are the same too, but for EXP, LOG and LIT: they call the C
+library's `exp2f`, `log2f` and `powf`, which may differ in the last bit between glibc (the host,
+ppc-be) and newlib (the Wii).
 
 Target `wl_xbox_gx` (alias `WiiLibs::xbox_gx`, header `nv2a_gx.h`) is the NV2A backend on GX. It calls
 only wl/platform (its direct GX layer, `wl/platform/gx_direct.h`, render targets and TEV programs), so
@@ -107,15 +109,18 @@ text) to C: a function for each that does what the interpreter does, its operand
 outputs a draw reads (with its loop over a batch of vertices, so a call's entry and exit are paid once
 for them; in a skinned program's, a vertex whose node indices and weights are the bits of the vertex
 before's takes the blended matrices and a0 that vertex made instead of making them again: the same
-results); one for its colours alone; and, for a program whose position reads constants
-by a0 and is converted to the screen (a skinned model's), one for four positions at once. It writes
+results); and with `--colors-positions` (the tests'), one for its colours alone and, for a
+program whose position reads constants by a0 and is converted to the screen (a skinned model's),
+one for four positions at once: nothing else calls them (`wl_xbox_vsh_run_colors`,
+`wl_xbox_vsh_run_positions`), so a title's table has NULL for them and its program no code. It writes
 a table of `WlXboxVshNative`, which the program hands to `wl_xbox_vsh_compile`; a program found in
-it by its words' hash (`wl_xbox_vsh_hash`) runs as its function. The table's name is the tool's
+it by its words' hash (`wl_xbox_vsh_hash`), count and second hash (`wl_xbox_vsh_check`) runs as its
+function. The table's name is the tool's
 third argument (`xbox_vsh_natives` by default). `--accessor name` also writes a function that gives
 the table and its count; `--if-exists` takes a missing file as no programs (an empty table).
 
 ```sh
-xbox_vsh_codegen [--if-exists] [--accessor name] microcode.inc programs.c [table]
+xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] microcode.inc programs.c [table]
 ```
 
 A recompiled title gets this without writing anything: the runtime appends each program it draws
@@ -224,7 +229,9 @@ even, so its winding holds).
   viewport and samples folded in, so the eye vector is the processor's, for the same projection)
   from the program run for eight probe vertices once a draw; the probes give a linear transform's
   columns exactly, so two programs over the same geometry get the same matrix and their passes the
-  same depths. When every other output the draw reads is affine too (a colour passed from an input
+  same depths. A screen-space draw goes to the transform unit only with a depth the same at every
+  vertex (clamped to the range, as the processor clamps each vertex's: GX would clip one beyond).
+  When every other output the draw reads is affine too (a colour passed from an input
   or constant, a texture coordinate from one input of two components or from the position, no fog,
   no sphere map, a projected stage's q 1), the program is not run at all: the coordinates come from
   the transform unit's generators. Not to the bit (`no_xf` in `WlNv2aGxConfig` keeps every vertex on

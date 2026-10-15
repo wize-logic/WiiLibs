@@ -23,11 +23,13 @@ static inline int wl_xbox_vsh_clamp(int index) {
                                                  : index;
 }
 
-/* RCC: the reciprocal, clamped away from 0 and infinity */
+/* RCC: the reciprocal, clamped away from 0 and infinity, its sign x's (the
+reciprocal of +infinity, +0, to the positive bound; in compares, without
+signbit's trip through memory on PowerPC) */
 static inline float wl_xbox_vsh_reciprocal_clamped(float x) {
     float r = 1.0f / x;
 
-    if (r > 0.0f)
+    if (r > 0.0f || x > 0.0f)
         return r < 5.42101e-20f ? 5.42101e-20f : r > 1.884467e+19f ? 1.884467e+19f : r;
     return r > -5.42101e-20f ? -5.42101e-20f : r < -1.884467e+19f ? -1.884467e+19f : r;
 }

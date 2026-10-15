@@ -34,10 +34,14 @@ bool wl_nv2a_pipeline_begin(WlNv2aPipeline *p, const WlNv2aKelvin *k) {
         p->program = NULL;
         return false;
     }
+    if (count > WL_XBOX_VSH_MAX_INSTRUCTIONS) {
+        count = WL_XBOX_VSH_MAX_INSTRUCTIONS;
+    }
     hash = wl_xbox_vsh_hash(words, count);
     p->use++;
     for (i = 0; i < WL_NV2A_PIPELINE_PROGRAMS; i++) {
-        if (p->programs[i].used != 0 && p->programs[i].hash == hash && p->programs[i].count == count) {
+        if (p->programs[i].used != 0 && p->programs[i].hash == hash && p->programs[i].count == count &&
+            memcmp(p->programs[i].words, words, count * 4u * sizeof words[0]) == 0) {
             p->programs[i].used = p->use;
             p->program = &p->programs[i].program;
             p->program_generation = k->program_generation;
@@ -52,9 +56,12 @@ bool wl_nv2a_pipeline_begin(WlNv2aPipeline *p, const WlNv2aKelvin *k) {
     p->programs[slot].hash = hash;
     p->programs[slot].count = count;
     p->programs[slot].used = p->use;
+    memcpy(p->programs[slot].words, words, count * 4u * sizeof words[0]);
     p->program = &p->programs[slot].program;
     p->program_generation = k->program_generation;
     p->compiled++;
+    // (a cache keyed by the program's address tells a slot made again by this)
+    p->programs[slot].program.serial = p->compiled;
     if (p->decoded != NULL) {
         p->decoded(p->decoded_user, words, count, p->program->native != NULL);
     }

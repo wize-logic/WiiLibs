@@ -78,9 +78,11 @@ enum {
 };
 
 /* a program compiled ahead of time, as tools/xbox_vsh_codegen.c lists them:
-found by its words' hash (wl_xbox_vsh_hash) and instruction count */
+found by its words' hash (wl_xbox_vsh_hash) and instruction count, and
+their second hash (wl_xbox_vsh_check), so that another program of the same
+hash and count is not taken for it */
 typedef struct WlXboxVshNative {
-    unsigned long hash, count;
+    unsigned long hash, count, check;
     /* (for the outputs a draw reads: WL_XBOX_VSH_LIVE_...) */
     WlXboxVshLiveProc run;
     /* its colours (d0, d1) and fog alone */
@@ -141,6 +143,10 @@ typedef struct WlXboxVshProgram {
     unsigned long count;
     /* (wl_xbox_vsh_hash: the generated programs' names) */
     unsigned long hash;
+    /* (0 from wl_xbox_vsh_compile; its owner's to set, for caches keyed by
+    the program's address to tell it from another compiled in its place:
+    the pipeline's compile count) */
+    uint32_t serial;
     WlXboxVshLiveProc native;
     /* (the compiled program's colours and fog alone; NULL on the
     interpreter) */
@@ -220,6 +226,9 @@ void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction
                          WlXboxVshProgram *program);
 /* a program's words hashed (FNV-1a), which finds its function */
 unsigned long wl_xbox_vsh_hash(const uint32_t *instructions, unsigned long instruction_count);
+/* the words hashed a second way (MurmurHash3's, 32 bits, independent of
+FNV-1a), which a compiled function's table entry carries too */
+unsigned long wl_xbox_vsh_check(const uint32_t *instructions, unsigned long instruction_count);
 
 void wl_xbox_vsh_run(const WlXboxVshProgram *program, const float (*constants)[4],
                      const float (*inputs)[4], float point_size, WlXboxVshOutput *output);

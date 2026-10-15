@@ -21,10 +21,12 @@ typedef struct WlNv2aPipeline {
     // vertex programs compiled ahead of time (tools/xbox_vsh_codegen.c), or NULL
     const WlXboxVshNative *natives;
     unsigned long native_count;
-    // the programs kept: by their words' hash and count, the least recently used replaced
+    // the programs kept: by their words' hash and count, then the words themselves (two programs of
+    // one hash are two programs), the least recently used replaced
     struct {
         unsigned long hash, count;
         uint32_t used;
+        uint32_t words[WL_XBOX_VSH_MAX_INSTRUCTIONS * 4];
         WlXboxVshProgram program;
     } programs[WL_NV2A_PIPELINE_PROGRAMS];
     uint32_t use;
