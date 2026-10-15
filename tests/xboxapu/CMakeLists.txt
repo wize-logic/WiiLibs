@@ -12,3 +12,6 @@ wl_target_defaults(bench_xboxapu)
 target_link_libraries(bench_xboxapu PRIVATE wl_xboxapu)
 add_test(NAME bench_xboxapu_checksum COMMAND bench_xboxapu 3000 0cdf232f)
 set_tests_properties(bench_xboxapu_checksum PROPERTIES LABELS "unit;be")
+# The same voices silenced on odd game ticks (a silent voice coming back as it would have played).
+add_test(NAME bench_xboxapu_blink COMMAND bench_xboxapu 3000 b5b89d04)
+set_tests_properties(bench_xboxapu_blink PROPERTIES LABELS "unit;be" ENVIRONMENT "BENCH_VOICES=blink")
