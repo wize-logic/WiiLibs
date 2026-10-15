@@ -446,7 +446,7 @@ def main() -> int:
     parser.add_argument("--until", help="stop once an OSREPORT line contains this text")
     parser.add_argument("--fail", help="a regular expression; an OSREPORT line matching it fails the run and ends it "
                                        "--fail-grace seconds later (a recompiled title's freeze, stall and crash "
-                                       "reports: 'freeze: no new frame|stall: no scheduling|GUEST CRASH|\\*\\*\\* CRASH')")
+                                       "reports: 'freeze: no new frame|stall: no scheduling|GUEST CRASH|script stopped at line|\\*\\*\\* CRASH')")
     parser.add_argument("--fail-grace", type=float, default=15,
                         help="seconds a run goes on after a --fail line, so what the program writes after it (a "
                              "freeze watch's 10 s profile) reaches the log (default 15)")
