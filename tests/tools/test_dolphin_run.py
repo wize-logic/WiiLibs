@@ -153,6 +153,11 @@ class GfxIniTests(unittest.TestCase):
         self.assertIn("EFBToTextureEnable = True", text)
         self.assertNotIn("EFBToTextureEnable = False", text)
         self.assertIn("ImmediateXFBEnable = True", text)
+        text = dolphin_run.gfx_ini(True, hacks={"Settings.CPUCull": "False"})
+        settings = text[text.index("[Settings]"):]
+        self.assertIn("CPUCull = False", settings)
+        self.assertIn("DumpFramesAsImages = True", settings)
+        self.assertNotIn("CPUCull", text[:text.index("[Settings]")])
 
 
 class CommandLineTests(unittest.TestCase):

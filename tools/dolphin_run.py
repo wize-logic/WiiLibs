@@ -222,14 +222,16 @@ def gfx_ini(dump_frames: bool, widescreen: bool = False, hacks: dict | None = No
     # (Dolphin's default keeps them in its own texture cache only and zeroes the RAM they were to go
     # to, so a copy the CPU reads, such as a render target's image, reads 0), and when the copy
     # runs, not deferred to a later synchronization; --gfx-hack adds or overrides [Hacks] entries
-    settings = {"EFBAccessEnable": "True", "EFBToTextureEnable": "False", "DeferEFBCopies": "False"}
-    settings.update(hacks or {})
-    text = "[Hacks]\n" + "".join(f"{name} = {value}\n" for name, value in settings.items())
-    # (the window, and so the capture, in the TV's shape: 1 forces 16:9, 2 forces 4:3)
-    text += f"[Settings]\nAspectRatio = {1 if widescreen else 2}\n"
+    sections = {"Hacks": {"EFBAccessEnable": "True", "EFBToTextureEnable": "False", "DeferEFBCopies": "False"},
+                # (the window, and so the capture, in the TV's shape: 1 forces 16:9, 2 forces 4:3)
+                "Settings": {"AspectRatio": str(1 if widescreen else 2)}}
     if dump_frames:
-        text += "DumpFramesAsImages = True\n"
-    return text
+        sections["Settings"]["DumpFramesAsImages"] = "True"
+    for name, value in (hacks or {}).items():
+        section, _, key = name.rpartition(".")  # "Settings.CPUCull" names its section, "X" means [Hacks]
+        sections.setdefault(section or "Hacks", {})[key] = value
+    return "".join(f"[{section}]\n" + "".join(f"{key} = {value}\n" for key, value in entries.items())
+                   for section, entries in sections.items())
 
 
 def windows_tool(name: str) -> str:
@@ -483,8 +485,9 @@ def main() -> int:
                              "Vulkan: long runs on Direct3D 11 have reset the GPU's driver)")
     parser.add_argument("--dump-frames", type=Path, help="dump every frame as PNGs into this folder")
     parser.add_argument("--gfx-hack", action="append", default=[], metavar="NAME=VALUE",
-                        help="a GFX.ini [Hacks] entry, added or overriding the defaults (EFBAccessEnable, "
-                             "EFBToTextureEnable and DeferEFBCopies), e.g. ImmediateXFBEnable=True; repeatable")
+                        help="a GFX.ini entry, added or overriding the defaults: NAME=VALUE in [Hacks] (EFBAccessEnable, "
+                             "EFBToTextureEnable and DeferEFBCopies by default), SECTION.NAME=VALUE in another "
+                             "section, e.g. Settings.CPUCull=False; repeatable")
     parser.add_argument("--name", default="wl-dolphin", help="the work folder's name under %%TEMP%%")
     parser.add_argument("--break", dest="break_at", action="append", default=[], metavar="SYMBOL",
                         help="with --backtrace: stop there (exit, abort, a function); the backtrace is then "
