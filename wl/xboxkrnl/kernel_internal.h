@@ -164,13 +164,24 @@ XkObject *xk_thread_object(WlXbThread *t);
 typedef struct {
     uint32_t routine, context, arg1, arg2; // a user APC: routine(context, arg1, arg2)
 } XkApc;
+// Mutants a thread owns at once (abandoned when it ends; more are owned but not tracked, logged).
+#define XK_MAX_OWNED 64u
 typedef struct {
     uint32_t wait_count;
     uint32_t wait_objects[XK_MAX_WAIT];
     bool waiting;
+    bool wait_all;
+    // A wait is satisfied when its objects are signalled, by the signaller (NT's satisfy at signal
+    // time): the objects acquired for this thread and the status its wait returns, so a pulse, or
+    // a set and reset before the thread runs again, still releases it.
+    bool satisfied;
+    uint32_t wait_status;
+    uint32_t wait_seq; // the order the waits began: the first waiter is satisfied first
     XkApc apcs[XK_MAX_APCS]; // a ring: apc_count entries from apc_head
     uint32_t apc_head, apc_count;
     XkObject *object; // its thread object
+    uint32_t owned[XK_MAX_OWNED]; // the mutants it owns (abandoned when it ends)
+    uint32_t owned_count;
 } XkThread;
 XkThread *xk_thread_state(WlXbThread *t);
 
@@ -180,8 +191,14 @@ XkThread *xk_thread_state(WlXbThread *t);
 // waits deliver queued APCs and return STATUS_USER_APC. Returns the NTSTATUS.
 uint32_t xk_wait(uint32_t count, const uint32_t *objects, bool wait_all, bool alertable, bool user_mode,
                  const int64_t *timeout);
-// The object's state changed: wakes every thread waiting on it (they re-check).
+// The object's state changed: the threads waiting on it whose waits it now satisfies are
+// satisfied (in the order their waits began, while the object stays signalled) and woken.
 void xk_object_signaled(uint32_t obj);
+// A thread ends: the mutants it still owns are abandoned (their next waiter gets
+// STATUS_ABANDONED_WAIT_0).
+void xk_thread_abandon_mutants(WlXbThread *t);
+// Mutant `mut` is owned by `t` now (made owned, or acquired): abandoned if `t` ends owning it.
+void xk_mutant_owned_by(WlXbThread *t, uint32_t mut);
 // Events, semaphores, mutants: the operations on the guest objects (NTSTATUS / previous state).
 int32_t xk_event_set(uint32_t ev);
 int32_t xk_event_reset(uint32_t ev);

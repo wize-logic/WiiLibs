@@ -27,6 +27,7 @@ static uint32_t g_dpc_ring[DPC_RING];
 static uint32_t g_dpc_head, g_dpc_count;
 static uint32_t g_interrupts[WL_XB_IRQ_LINES]; // connected KINTERRUPT per line
 static uint8_t g_irql_boot;                    // before any thread has a KPCR
+static bool g_timers_held; // the service came at DISPATCH_LEVEL or above: expiry waits for the IRQL
 
 uint8_t xk_irql_get(void) {
     WlXbThread *t = wl_xb_current();
@@ -43,9 +44,9 @@ uint8_t xk_irql_set(uint8_t irql) {
         prev = g_irql_boot;
         g_irql_boot = irql;
     }
-    if (prev >= DISPATCH_LEVEL && irql < DISPATCH_LEVEL && g_dpc_count > 0) {
+    if (prev >= DISPATCH_LEVEL && irql < DISPATCH_LEVEL && (g_dpc_count > 0 || g_timers_held)) {
         wl_xb_service_raise(WL_XB_SVC_DPC);
-        wl_xb_service_poll(); // the DPCs held back run now, as lowering the IRQL runs them on NT
+        wl_xb_service_poll(); // the DPCs (and timers) held back run now, as lowering the IRQL runs them on NT
     }
     return prev;
 }
@@ -158,6 +159,7 @@ bool xk_timer_cancel(uint32_t timer) {
 }
 
 static void fire_timers(void) {
+    g_timers_held = false;
     uint64_t now = wl_xb_time_us();
     for (uint32_t i = 0; i < MAX_TIMERS; i++) {
         Timer *t = &g_timers[i];
@@ -222,7 +224,11 @@ static void service(void *user, uint32_t reasons) {
     (void)user;
     (void)reasons;
     uint8_t irql = xk_irql_get();
-    fire_timers();
+    if (irql < DISPATCH_LEVEL) {
+        fire_timers(); // the clock's DPC expires them, so not at a raised IRQL
+    } else {
+        g_timers_held = true; // looked at again when the IRQL comes down
+    }
     run_isrs(irql);
     if (irql < DISPATCH_LEVEL && g_dpc_count > 0) {
         uint8_t prev = xk_irql_get();
@@ -237,8 +243,24 @@ static void service(void *user, uint32_t reasons) {
     }
 }
 
+// The lines an ISR can take now: those whose ISR's IRQL is above the current thread's, and those
+// nobody listens to (run_isrs drops them).
+static uint32_t deliverable_lines(void *user) {
+    (void)user;
+    uint8_t irql = xk_irql_get();
+    uint32_t mask = 0;
+    for (uint32_t line = 0; line < WL_XB_IRQ_LINES; line++) {
+        uint32_t ki = g_interrupts[line];
+        if (ki == 0 || irql < (uint8_t)wl_xb_rd32(ki + KINT_IRQL)) {
+            mask |= 1u << line;
+        }
+    }
+    return mask;
+}
+
 void xk_irq_init(void) {
     wl_xb_service_set_handler(service, NULL);
+    wl_xb_irq_set_mask(deliverable_lines, NULL);
 }
 
 // ---- Exports ---------------------------------------------------------------------------------------

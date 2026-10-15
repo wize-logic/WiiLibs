@@ -336,6 +336,11 @@ static void requeue(WlXbThread *self) {
     wl_xb_cpu_load(&self->cpu);
 }
 
+// The thread's IRQL (its KPCR's) is DISPATCH_LEVEL or above: it keeps the lock (yield_if_due).
+static bool irql_raised(const WlXbThread *t) {
+    return t->kpcr != 0 && wl_xb_rd8(t->kpcr + KPCR_IRQL) >= DISPATCH_LEVEL;
+}
+
 // Gives the lock to the head of the ready queue when it outranks the caller, or ties with it and
 // the caller's quantum is over. true when it did.
 static bool yield_if_due(WlXbThread *self) {
@@ -343,7 +348,7 @@ static bool yield_if_due(WlXbThread *self) {
     if (self == NULL || head == NULL || wl_xb_in_service()) {
         return false;
     }
-    if (self->kpcr != 0 && wl_xb_rd8(self->kpcr + KPCR_IRQL) >= DISPATCH_LEVEL) {
+    if (irql_raised(self)) {
         // At DISPATCH_LEVEL or above the holder keeps the processor, as on the console's one CPU:
         // no other thread runs, and the DPCs wait until it lowers its IRQL (KfLowerIrql runs them
         // then). Its own safe points still run the interrupts its IRQL lets in (their poll comes
@@ -540,9 +545,14 @@ void wl_xb_safe_point(void) {
 void wl_xb_yield(void) {
     WlXbThread *self = g_cur;
     WlXbThread *head = g_ready;
-    if (self != NULL && head != NULL && head->priority >= self->priority && !wl_xb_in_service()) {
-        requeue(self);
+    if (self == NULL || head == NULL || head->priority < self->priority || wl_xb_in_service()) {
+        return;
     }
+    if (irql_raised(self)) {
+        g_stats.raised_holds++; // the processor stays its (yield_if_due)
+        return;
+    }
+    requeue(self);
 }
 
 // ---- Threads -----------------------------------------------------------------------------------
@@ -965,17 +975,15 @@ void wl_xb_thread_set_priority(WlXbThread *t, int priority) {
     if (priority > 31 && !t->is_service) {
         priority = 31;
     }
+    wl_platform_mutex_lock(g_m);
     t->priority = priority;
-    if (g_det) {
-        wl_platform_mutex_lock(g_m);
-        if (t->ready) {
-            unqueue(t); // queued again at its new priority (a thread made and then given its priority)
-            uint64_t since = t->ready_since_us;
-            enqueue(t);
-            t->ready_since_us = since;
-        }
-        wl_platform_mutex_unlock(g_m);
+    if (t->ready) {
+        unqueue(t); // queued again at its new priority (a thread made and then given its priority)
+        uint64_t since = t->ready_since_us;
+        enqueue(t);
+        t->ready_since_us = since;
     }
+    wl_platform_mutex_unlock(g_m);
     if (t->kthread != 0) {
         wl_xb_wr8(t->kthread + 0x32, (uint8_t)(priority & 31));
     }

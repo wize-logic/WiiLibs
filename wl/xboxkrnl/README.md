@@ -31,15 +31,19 @@ settings).
   semaphores, mutants, timers and threads, with their `DISPATCHER_HEADER`s where the title put them.
   Waits on one or many (any or all) with timeouts, alertable waits and user APCs,
   `NtUserIoApcDispatcher`, named objects, handles (`ob.c`: up to 4096, pool blocks with headers),
-  `NtDuplicateObject`.
+  `NtDuplicateObject`. As on NT, a signal satisfies the waits it can at once, in the order they
+  began (so a pulse, or a set and a reset before the waiter runs, still releases it); an alertable
+  wait its objects satisfy returns their status before a queued APC; a thread that ends abandons
+  the mutants it owns (the next waiter gets `STATUS_ABANDONED_WAIT_0`).
 - **Critical sections** (`rtl.c`), with the layout XAPI's inlined fast paths use: the event, then
   LockCount at +0x10, RecursionCount at +0x14, OwningThread at +0x18.
 - **IRQL, DPCs, timers, interrupts** (`ke_irq.c`): the IRQL lives in each thread's KPCR. Timers
   have deadlines on the runtime's service. `HalGetInterruptVector` gives vector `0x30 + line` at
   IRQL `26 - line`. `KeConnectInterrupt` makes the line's ISR run at its IRQL when the line is
   asserted. DPCs drain at DISPATCH_LEVEL. The work runs at the runtime's safe points (`wl/xboxrt/irq.h`);
-  a thread at DISPATCH_LEVEL or above keeps the processor (no thread switch, no DPC) until it
-  lowers its IRQL, as on the console.
+  a thread at DISPATCH_LEVEL or above keeps the processor (no thread switch or yield, no DPC, no
+  timer expiry) until it lowers its IRQL, as on the console, and a line its IRQL masks waits
+  without running the handler.
 - **Threads** (`ps.c`): `PsCreateSystemThreadEx` makes real guest threads (optionally the first
   runs on the caller, xboxrecomp's inline model), with priorities from `KeSetBasePriorityThread`
   (base 16 plus the increment), suspend before start and resume, `PsTerminateSystemThread`.

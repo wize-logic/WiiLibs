@@ -76,6 +76,13 @@ typedef bool (*WlXbIrqLevelFn)(void *user);
 void wl_xb_irq_set_level(uint32_t line, WlXbIrqLevelFn pending, void *user);
 // The lines asserted now (bit n = line n), level sources included.
 uint32_t wl_xb_irq_lines(void);
+// The handler's view of which lines it can deliver now (the kernel: the lines whose ISR's IRQL is
+// above the current thread's, and the lines nobody listens to). Lines it masks stay asserted
+// without making the safe points run the handler. Called with the lock held.
+typedef uint32_t (*WlXbIrqMaskFn)(void *user);
+void wl_xb_irq_set_mask(WlXbIrqMaskFn fn, void *user);
+// The asserted lines the handler can deliver now (wl_xb_irq_lines through the mask). Lock held.
+uint32_t wl_xb_irq_deliverable(void);
 
 // Asks for the handler to run soon (`reasons` are passed on). Any thread.
 void wl_xb_service_raise(uint32_t reasons);

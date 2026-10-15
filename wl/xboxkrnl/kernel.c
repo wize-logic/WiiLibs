@@ -106,6 +106,7 @@ void wl_xk_config_default(WlXkConfig *cfg) {
 }
 
 static void thread_ended(WlXbThread *t) {
+    xk_thread_abandon_mutants(t);
     if (t->kthread != 0) {
         xk_object_signaled(t->kthread);
     }

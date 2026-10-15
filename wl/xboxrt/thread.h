@@ -169,7 +169,8 @@ void wl_xb_wake(WlXbThread *t);
 // (never at DISPATCH_LEVEL or above: see wl_xb_safe_point).
 // Also runs pending interrupt work (irq.h).
 void wl_xb_yield_point(void);
-// Gives the lock up to every ready thread of equal or higher priority (NtYieldExecution).
+// Gives the lock up to every ready thread of equal or higher priority (NtYieldExecution); not at
+// DISPATCH_LEVEL or above (see wl_xb_safe_point).
 void wl_xb_yield(void);
 
 // A safe point in the middle of guest code: what wl_xb_yield_point does (the interrupt work, with

@@ -48,6 +48,8 @@ static struct {
     WlXbIrqLevelFn fn;
     void *user;
 } g_level[WL_XB_IRQ_LINES];
+static WlXbIrqMaskFn g_mask_fn;
+static void *g_mask_user;
 static bool g_in_service;
 static volatile bool g_running;
 static bool g_started;
@@ -235,6 +237,16 @@ uint32_t wl_xb_irq_lines(void) {
     return lines;
 }
 
+void wl_xb_irq_set_mask(WlXbIrqMaskFn fn, void *user) {
+    g_mask_user = user;
+    g_mask_fn = fn;
+}
+
+uint32_t wl_xb_irq_deliverable(void) {
+    uint32_t lines = wl_xb_irq_lines();
+    return lines != 0 && g_mask_fn != NULL ? lines & g_mask_fn(g_mask_user) : lines;
+}
+
 void wl_xb_service_set_deadline(uint64_t when_us) {
     g_deadline = when_us;
     wl_xb_det_note_deadline(when_us);
@@ -272,8 +284,8 @@ static void run_service(void) {
         if (reasons & WL_XB_SVC_DEVICE) {
             run_ticks();
         }
-        if (wl_xb_irq_lines() != 0) {
-            reasons |= WL_XB_SVC_IRQ;
+        if (wl_xb_irq_deliverable() != 0) {
+            reasons |= WL_XB_SVC_IRQ; // (a line the holder's IRQL masks waits for it to come down)
         }
         if (reasons == 0) {
             break;
@@ -285,7 +297,8 @@ static void run_service(void) {
         g_handler(g_handler_user, reasons);
         wl_xb_cpu_load(&saved);
         if ((reasons & WL_XB_SVC_IRQ) && round + 1u == MAX_ROUNDS) {
-            WL_LOG_W(TAG, "interrupt lines 0x%08x stay asserted after %u rounds", (unsigned)wl_xb_irq_lines(), MAX_ROUNDS);
+            WL_LOG_W(TAG, "interrupt lines 0x%08x stay asserted after %u rounds", (unsigned)wl_xb_irq_deliverable(),
+                     MAX_ROUNDS);
         }
     }
     g_in_service = false;
@@ -297,11 +310,11 @@ static void poll(bool levels) {
     }
     update_tick();
     uint64_t deadline = g_deadline;
-    bool due = g_pending != 0 || g_lines != 0 || (deadline != 0 && wl_xb_time_us() >= deadline);
-    if (!due && levels) {
-        for (uint32_t i = 0; i < WL_XB_IRQ_LINES && !due; i++) {
-            due = g_level[i].fn != NULL && g_level[i].fn(g_level[i].user);
-        }
+    bool due = g_pending != 0 || (deadline != 0 && wl_xb_time_us() >= deadline);
+    if (!due && (levels || g_lines != 0)) {
+        // the lines the holder's IRQL lets in (a kernel call's poll leaves the level sources out)
+        uint32_t lines = levels ? wl_xb_irq_lines() : g_lines;
+        due = lines != 0 && (g_mask_fn == NULL || (lines & g_mask_fn(g_mask_user)) != 0);
     }
     if (!due) {
         // a kernel call's poll leaves the level sources to the service thread and the device safe points
