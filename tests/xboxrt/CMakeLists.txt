@@ -4,6 +4,13 @@ if(NOT TARGET wl_xboxrt)
 endif()
 # Guest memory on the host / ppc-be backend, with the faults through the host's decoder.
 wl_add_test(test_xboxrt_mem SOURCES test_xboxrt_mem.c LIBS wl_xboxrt LABELS unit be)
+# wl_xb_range_ok's benchmark (tools/qemu_icount.py counts its instructions on ppc-be); the count of
+# ranges that pass pins what it answers.
+add_executable(bench_range_ok bench_range_ok.c)
+wl_target_defaults(bench_range_ok)
+target_link_libraries(bench_range_ok PRIVATE wl_xboxrt)
+add_test(NAME bench_range_ok_passes COMMAND bench_range_ok 100000 98434)
+set_tests_properties(bench_range_ok_passes PROPERTIES LABELS "unit;be")
 # Demand paging under a frame limit (the Wii's model through SIGSEGV and mprotect): with a swap
 # file, and without one.
 wl_add_test(test_xboxrt_paging SOURCES test_xboxrt_paging.c LIBS wl_xboxrt LABELS unit be)

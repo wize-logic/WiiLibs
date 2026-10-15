@@ -39,7 +39,7 @@ static uint32_t g_low_pages; // the reserved low pages (the retail kernel's), le
 // A title project's own code checks every guest read with wl_xb_range_ok (Halo's play harness
 // reads object fields this way: 1.3% of a10's time on the Wii), and the 128 KB table's entry is a
 // cache miss more often than not; these 64 bytes stay in the cache. Only a decommit makes a
-// committed page fail, and it empties them.
+// committed page fail, and it empties them (and they are empty until guest memory is ready).
 #define OK_PAGES 16u
 static uint32_t g_ok_pages[OK_PAGES];
 
@@ -642,7 +642,21 @@ static bool page_ok(uint32_t va) {
     return false;
 }
 
+// The common case first: a range inside one user page the memo holds (only pages page_ok found
+// committed are there). The kernel checks every argument this way and a title's own code every
+// field it reads (2.4% of Halo's airlock fight on the Wii before this); without a frame of its own,
+// the rest is a tail call to the whole check.
 bool wl_xb_range_ok(uint32_t va, uint32_t n) {
+    uint32_t vp = va >> WL_XB_PAGE_SHIFT;
+    // n - 1 below the bytes left in va's page: n is not 0, and the range neither wraps nor crosses a page
+    if (va < WL_XB_USER_LIMIT && n - 1u < WL_XB_PAGE - (va & (WL_XB_PAGE - 1u)) &&
+        g_ok_pages[vp & (OK_PAGES - 1u)] == vp + 1u) {
+        return true;
+    }
+    return wl_xb_range_ok_slow(va, n);
+}
+
+__attribute__((noinline)) bool wl_xb_range_ok_slow(uint32_t va, uint32_t n) {
     if (!g_ready) {
         return false;
     }

@@ -163,8 +163,11 @@ uint32_t wl_xb_read_cstr(uint32_t va, char *dst, uint32_t cap);
 
 // Whether [va, va + n) is guest memory a kernel call may touch: committed user pages, or the
 // window inside the RAM. (A device range is not.) The kernel checks the buffers it is handed with
-// it, so a bad guest pointer is a status code, not a host crash.
+// it, so a bad guest pointer is a status code, not a host crash. The common case (a range inside
+// one user page found committed lately) is a few instructions; the rest goes to
+// wl_xb_range_ok_slow, the whole check, which answers every range alike.
 bool wl_xb_range_ok(uint32_t va, uint32_t n);
+bool wl_xb_range_ok_slow(uint32_t va, uint32_t n);
 
 // ---- Set-up ----------------------------------------------------------------------------------
 
