@@ -239,7 +239,7 @@ WlResult wl_xb_backend_page_fault(uint32_t ea) {
     bool write = cur == PROT_READ; // open for reading, so this was a write: the C bit
     if (write) {
         fl |= WL_XB_PG_DIRTY;
-        wl_xb_pg_wrote(p);
+        wl_xb_pg_stored(p);
     }
     // (a watched page opens for writing only on a write, so that each write after its watch was
     // armed is seen)

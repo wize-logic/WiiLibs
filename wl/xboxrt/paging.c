@@ -48,7 +48,7 @@ uint16_t *g_xb_pg_frame;
 uint16_t *g_xb_pg_slot;
 uint32_t g_xb_pg_frames;
 uint32_t *g_xb_pg_wgen;
-uint32_t g_xb_pg_epoch = 1;
+uint32_t g_xb_pg_epoch = 1; // (a test may move it to just before its wrap)
 
 static uint16_t *g_owner;  // [frames + 1] the page holding each frame, + 1 (0: free)
 static uint16_t *g_free;   // a stack of free frames
@@ -440,6 +440,9 @@ uint32_t wl_xb_pg_watch(uint32_t p, uint32_t pages) {
     for (uint32_t k = p; k < p + pages; k++) {
         g_xb_pg_flags[k] |= WL_XB_PG_WATCH;
         seen = wl_xb_mmu_watch(k) && seen;
+        if ((uint32_t)(g_xb_pg_epoch - g_xb_pg_wgen[k]) >= WL_XB_PG_EPOCH_WINDOW) {
+            g_xb_pg_wgen[k] = g_xb_pg_epoch; // too old to compare across the wrap: the present
+        }
     }
     uint32_t stamp = g_xb_pg_epoch;
     wl_xb_mmu_unlock(lv);
@@ -450,11 +453,11 @@ bool wl_xb_pg_written(uint32_t p, uint32_t pages, uint32_t stamp) {
     if (stamp == 0 || g_xb_pg_frames == 0 || pages == 0 || p >= g_xb_ram_pages || pages > g_xb_ram_pages - p) {
         return true;
     }
-    bool written = false;
     uint32_t lv = wl_xb_mmu_lock();
+    bool written = (uint32_t)(g_xb_pg_epoch - stamp) >= WL_XB_PG_EPOCH_WINDOW; // too old: may have been
     for (uint32_t k = p; k < p + pages && !written; k++) {
         g_xb_pg_flags[k] |= WL_XB_PG_WATCH; // (a page freed since lost it)
-        written = !wl_xb_mmu_watch(k) || g_xb_pg_wgen[k] > stamp;
+        written = !wl_xb_mmu_watch(k) || (int32_t)(g_xb_pg_wgen[k] - stamp) > 0;
     }
     wl_xb_mmu_unlock(lv);
     return written;

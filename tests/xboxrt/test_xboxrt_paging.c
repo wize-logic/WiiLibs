@@ -207,6 +207,35 @@ TEST stores_are_watched(void) {
     PASS();
 }
 
+// The epoch is 32 bits and wraps: a store just after the wrap is still seen by a watch armed just
+// before it, and a watch older than the comparison's window counts as written.
+TEST watch_survives_the_epoch_wrap(void) {
+    up();
+    uint32_t phys = 0;
+    ASSERT_EQ(WL_OK, wl_xb_phys_alloc(2u * PAGE, 0, 0xFFFFFFFFu, 0, &phys));
+    const uint32_t w = WL_XB_WINDOW | phys;
+    fill(w, 2, 11);
+    g_xb_pg_epoch = 0xFFFFFFF0u;
+    uint32_t stamp = wl_xb_phys_watch(phys, 2u * PAGE);
+    ASSERT(stamp >= 0xFFFFFFF0u);
+    ASSERT_FALSE(wl_xb_phys_written(phys, 2u * PAGE, stamp));
+    for (uint32_t i = 0; i < 40u; i++) { // past the wrap: stores to the second page, one watch
+        wl_xb_wr32(w + PAGE + 4u * i, i);
+        ASSERT(wl_xb_phys_written(phys + PAGE, PAGE, stamp));
+        (void)wl_xb_phys_watch(phys + PAGE, PAGE); // re-armed: the epoch moves on
+    }
+    ASSERT(g_xb_pg_epoch < 0x1000u); // wrapped
+    ASSERT_FALSE(wl_xb_phys_written(phys, PAGE, stamp)); // the first page: not stored to
+    uint32_t now = wl_xb_phys_watch(phys, 2u * PAGE);
+    ASSERT_FALSE(wl_xb_phys_written(phys, 2u * PAGE, now));
+    wl_xb_wr32(w + 8u, 7u);
+    ASSERT(wl_xb_phys_written(phys, PAGE, now));
+    // a stamp from more than the window ago: written, whatever the pages say
+    ASSERT(wl_xb_phys_written(phys + PAGE, PAGE, now - WL_XB_PG_EPOCH_WINDOW));
+    ASSERT_EQ(WL_OK, wl_xb_phys_free(phys));
+    PASS();
+}
+
 // The freeze watch's reads (wl_xb_mem_peek, without the guest lock): a resident page's bytes, and
 // nothing (no fault, no swap-in) for a page swapped out or in swap I/O.
 TEST peeks_never_fault(void) {
@@ -479,6 +508,7 @@ SUITE(paging) {
     RUN_TEST(zero_pages_go_for_nothing);
     RUN_TEST(stores_are_watched);
     RUN_TEST(peeks_never_fault);
+    RUN_TEST(watch_survives_the_epoch_wrap);
 #if !defined(WL_XBRT_PAGING_NO_SWAP)
     RUN_TEST(changed_pages_swap_out_and_back);
     RUN_TEST(clean_pages_read_back_go_for_nothing);
