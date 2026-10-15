@@ -53,6 +53,14 @@ wl_add_test(test_platform_flush_gx
     LIBS wl_base LABELS unit be)
 target_include_directories(test_platform_flush_gx BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub)
 
+# The loops that write a vertex into the write-gather pipe (gx_pipe_words.h): every store against the plain
+# loops, over a recorder. bench_gx_pipe counts their instructions under qemu (tools/qemu_icount.py).
+wl_add_test(test_platform_gx_pipe SOURCES test_platform_gx_pipe.c LIBS wl_base LABELS unit be)
+add_executable(bench_gx_pipe bench_gx_pipe.c bench_gx_pipe_data.c)
+wl_target_defaults(bench_gx_pipe)
+add_test(NAME bench_gx_pipe_runs COMMAND bench_gx_pipe new_words 6 1000)
+set_tests_properties(bench_gx_pipe_runs PROPERTIES LABELS "unit;be")
+
 # The spill-over heap: the portable core against a fake primary allocator ...
 wl_add_test(test_platform_heap_overflow SOURCES test_platform_heap_overflow.c LIBS wl_platform LABELS unit be)
 # ... and the newlib wrap layer (wii/heap_wrap_wii.c, which includes no libogc header) against a fake newlib.
