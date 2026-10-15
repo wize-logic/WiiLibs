@@ -28,7 +28,7 @@ static bool g_ready;
 static uint8_t *g_kind;   // [ram pages] K_*
 static uint32_t *g_run;   // [ram pages] pages of the allocation starting here (0: none)
 static uint16_t *g_owner; // [ram pages] the user page a K_USER page backs
-static uint8_t *g_locks;  // [ram pages] the page's lock count (MmLockUnlock*): a locked page never moves
+static uint16_t *g_locks; // [ram pages] the page's lock count (MmLockUnlock*): a locked page never moves
 static uint16_t *g_va_prot; // [user pages] protection (low 15 bits) | VA_RESERVED
 static Region *g_regions;   // reservations, sorted by base
 static uint32_t g_region_count;
@@ -159,7 +159,7 @@ static bool alloc_page_top(uint8_t kind, uint32_t *out) {
 static void free_pages(uint32_t first, uint32_t pages) {
     wl_xb_backend_release_phys(first, pages);
     mark(first, pages, K_FREE);
-    memset(g_locks + first, 0, pages); // a freed page's locks go with it
+    memset(g_locks + first, 0, pages * sizeof *g_locks); // a freed page's locks go with it
     g_used -= pages;
     if (first + pages > g_top_hint) {
         g_top_hint = first + pages;
@@ -192,7 +192,7 @@ WlResult wl_xb_phys_lock(uint32_t phys, bool lock) {
         return WL_ERR_RANGE;
     }
     if (lock) {
-        if (g_locks[p] == 0xFFu) {
+        if (g_locks[p] == 0xFFFFu) {
             return WL_ERR_LIMIT; // (the count stays: the page stays locked)
         }
         g_locks[p]++;

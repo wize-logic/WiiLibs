@@ -214,8 +214,8 @@ WlResult wl_xb_phys_alloc(uint32_t bytes, uint32_t lowest, uint32_t highest, uin
 // `phys` does not start one.
 WlResult wl_xb_phys_free(uint32_t phys);
 // Locks (or unlocks) the physical page at `phys` (MmLockUnlockBufferPages, MmLockUnlockPhysicalPage):
-// a page with locks is never moved to make room for a contiguous allocation. Counted (up to 255);
-// a freed page loses its locks.
+// a page with locks is never moved to make room for a contiguous allocation. Counted, up to 65535
+// (DirectSound locks its buffers' pages often); a freed page loses its locks.
 WlResult wl_xb_phys_lock(uint32_t phys, bool lock);
 uint32_t wl_xb_phys_lock_count(uint32_t phys);
 // The size of the allocation starting at `phys`, 0 when none does.
