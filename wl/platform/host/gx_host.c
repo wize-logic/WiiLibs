@@ -93,6 +93,10 @@ static void r_texture_invalidate(void *user) {
     exempt(false);
 }
 
+// the EFB's format as wl_gx_set_efb_alpha last chose it (kept across wl_gx_init, as the Wii's): a
+// renderer set later (the play harness's screenshots attach the software GX mid-run) is told it
+static bool g_efb_alpha;
+
 void wl_host_gx_set_renderer(const WlHostGxRenderer *renderer) {
     memset(&g_renderer, 0, sizeof g_renderer);
     if (renderer != NULL) {
@@ -112,6 +116,9 @@ void wl_host_gx_set_renderer(const WlHostGxRenderer *renderer) {
 #undef WRAP
     }
     g_renderer_set = renderer != NULL;
+    if (g_renderer_set && g_renderer.efb_alpha != NULL) {
+        g_renderer.efb_alpha(g_renderer.user, g_efb_alpha);
+    }
 }
 
 const WlHostGxRenderer *wl_host_gx_renderer(void) {
@@ -278,6 +285,7 @@ void wl_gx_set_validation(bool on) {
 }
 
 void wl_gx_set_efb_alpha(bool on) {
+    g_efb_alpha = on;
     if (g_renderer_set && g_renderer.efb_alpha != NULL) {
         g_renderer.efb_alpha(g_renderer.user, on);
     }

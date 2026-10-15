@@ -370,6 +370,30 @@ TEST blending_and_the_efb_formats(void) {
     PASS();
 }
 
+// the EFB's format chosen before the software GX attaches (as the play harness's screenshots attach
+// it mid-run): kept, so a destination alpha reads what was written, not 255 (a light added by
+// DSTALPHA came out at full strength, the a10 tunnel washed out under the flashlight)
+TEST the_efb_format_set_before_attaching_is_kept(void) {
+    WlGxSoftConfig cfg;
+
+    wl_gxsoft_detach();
+    wl_gx_set_efb_alpha(true);
+    memset(&cfg, 0, sizeof cfg);
+    cfg.frame = on_frame;
+    cfg.draw = on_draw;
+    wl_gx_init();
+    wl_host_gx_direct_reset();
+    ASSERT_EQ(WL_OK, wl_gxsoft_attach(&cfg));
+    wl_gx_begin_frame(0x00000000u);
+    // (the clear's alpha 0 kept by RGBA6; RGB8 would read 255)
+    ASSERT_EQ(0u, px(4, 4) & 0xFFu);
+    wl_gx_end_frame();
+    wl_gxsoft_detach();
+    wl_gx_set_efb_alpha(false);
+    wl_gx_shutdown();
+    PASS();
+}
+
 TEST texture_sampling(void) {
     static const uint32_t checker[16] = {
         0xFF0000FFu, 0x00FF00FFu, 0x0000FFFFu, 0xFFFFFFFFu, 0x000000FFu, 0x808080FFu, 0xFF00FFFFu, 0x00FFFFFFu,
@@ -563,6 +587,7 @@ SUITE(gxsoft_suite) {
     RUN_TEST(the_near_plane_clips);
     RUN_TEST(the_depth_test_and_its_place);
     RUN_TEST(blending_and_the_efb_formats);
+    RUN_TEST(the_efb_format_set_before_attaching_is_kept);
     RUN_TEST(texture_sampling);
     RUN_TEST(cmpr_and_one_map_at_two_coordinates);
     RUN_TEST(render_target_copies_and_the_back_buffer_put_back);

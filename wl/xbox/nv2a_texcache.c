@@ -612,6 +612,12 @@ static bool convert(WlNv2aTexCache *cache, WlNv2aTexEntry *e, const WlNv2aTextur
     if (scratch_bytes != 0 && (scratch = scratch_take(cache, scratch_bytes, e)) == NULL) {
         return false;
     }
+    // (a cube map: a light's falloff made its face, where the backend reads it so, else its
+    // sphere map)
+    if (cache->cfg.spots)
+        wl_nv2a_texture_spot(t, &e->layout, src, palette, scratch);
+    else
+        e->layout.spot = 0;
     done = wl_nv2a_texture_convert(t, &e->layout, src, palette, e->image, scratch);
     scratch_give(cache, scratch);
     if (!done) {

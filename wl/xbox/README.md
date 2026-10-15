@@ -254,7 +254,9 @@ even, so its winding holds).
   DXT, cube, P8; levels and faces) and converted into GX's formats (wl/codec's exact conversions,
   the rest decoded to RGBA8: A4R4G4B4 keeps its four bits of alpha so a glyph cache's text stays
   smooth; DXT3/5's alpha a separate I4; P8 as C8 with a TLUT; a cube map made into psh's sphere
-  map), kept by (address, format, size, palette) within a budget (4 MiB by default) or in an arena
+  map, or, for a backend that reads it so (`WlNv2aTexCacheConfig.spots`), a light's falloff cube
+  (one face holding the light, its edge dark) made that face, read through the direction's projection
+  onto it, `wl_nv2a_spot_coordinates`, so the cone keeps its shape), kept by (address, format, size, palette) within a budget (4 MiB by default) or in an arena
   of their own (a heap over it, best fit: a texture makes room by emptying the oldest window of
   the arena wide enough for it, not every image by age; one without room even so is kept smaller,
   from its next mip level or a halved sphere map, up to three levels down, and made whole again
