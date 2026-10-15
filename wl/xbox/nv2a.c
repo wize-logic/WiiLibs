@@ -219,11 +219,15 @@ static uint32_t ramht_lookup(WlNv2a *dev, unsigned chid, uint32_t handle, uint32
 // ---- time and interrupts --------------------------------------------------------------------
 
 // the time moved on from `before`: the alarm raised when it was passed (ALARM_0 against the time's
-// low word)
+// low word: the first time after `before` whose low word is ALARM_0, in 64 bits, so a jump of 2^31 ns
+// or more passes it too)
 static void time_moved(WlNv2a *dev, uint64_t before) {
-    uint32_t from = (uint32_t)before, to = (uint32_t)dev->time_ns;
+    uint64_t alarm = (before & ~(uint64_t)0xFFFFFFFFu) | dev->ptimer_alarm;
 
-    if (to != from && (int32_t)(to - dev->ptimer_alarm) >= 0 && (int32_t)(from - dev->ptimer_alarm) < 0) {
+    if (alarm <= before) {
+        alarm += (uint64_t)1 << 32;
+    }
+    if (dev->time_ns > before && dev->time_ns >= alarm) {
         dev->ptimer_intr |= WL_NV2A_PTIMER_INTR_ALARM;
     }
 }
@@ -366,7 +370,9 @@ static void run_channel(WlNv2a *dev, unsigned chid) {
     WlNv2aChannel *ch = &dev->channels[chid];
     uint32_t words = 0;
 
-    if (dev->executing || ch->suspended || ch->get == ch->put) {
+    // (nothing runs while PGRAPH's FIFO access is off: a doorbell or an acquire tried again then
+    // waits for it to come on, resume_trapped)
+    if (dev->executing || ch->suspended || ch->get == ch->put || !(dev->pgraph_fifo & 1u)) {
         return;
     }
     dev->executing = true;
@@ -625,12 +631,18 @@ bool wl_nv2a_trap(WlNv2a *dev, uint32_t method, uint32_t param) {
 
 void wl_nv2a_method(WlNv2a *dev, unsigned subchannel, uint32_t method, uint32_t param) {
     int was = dev->current_channel;
+    unsigned chid = was < 0 ? 0u : (unsigned)was;
+    uint8_t suspended = dev->channels[chid].suspended;
 
-    if (was < 0) {
-        dev->current_channel = 0;
-    }
-    puller(dev, (unsigned)dev->current_channel, subchannel & 7u, method & 0x1FFCu, param);
+    dev->current_channel = (int)chid;
+    puller(dev, chid, subchannel & 7u, method & 0x1FFCu, param);
     dev->current_channel = was;
+    if (!dev->executing) {
+        // (outside a kick there is no pusher to stop: an unmet acquire or a trap leaves no stall on
+        // the channel for its next kick to find)
+        dev->acquire_stall = false;
+        dev->channels[chid].suspended = suspended;
+    }
 }
 
 void wl_nv2a_suspend_current(WlNv2a *dev, unsigned why) {
@@ -643,7 +655,8 @@ void wl_nv2a_suspend_current(WlNv2a *dev, unsigned why) {
 // PGRAPH's FIFO access is on: pbkit only acknowledges the interrupt; D3D turns PGRAPH_FIFO off,
 // acknowledges, runs the software method, then turns PGRAPH_FIFO on (going on at the acknowledgement
 // ran the push buffer to its next trap before D3D had read the first one: Halo's intro flip was
-// queued twice and its Swap waited for good)
+// queued twice and its Swap waited for good). A channel whose doorbell came while the access was off
+// goes on too.
 static void resume_trapped(WlNv2a *dev) {
     unsigned chid;
 
@@ -652,7 +665,6 @@ static void resume_trapped(WlNv2a *dev) {
     }
     for (chid = 0; chid < WL_NV2A_CHANNELS; chid++) {
         WlNv2aChannel *ch = &dev->channels[chid];
-        uint8_t was = ch->suspended;
 
         if ((ch->suspended & WL_NV2A_SUSPEND_TRAP) && !(dev->pgraph_intr & WL_NV2A_PGRAPH_INTR_ERROR)) {
             ch->suspended &= (uint8_t)~WL_NV2A_SUSPEND_TRAP;
@@ -660,7 +672,7 @@ static void resume_trapped(WlNv2a *dev) {
         if ((ch->suspended & WL_NV2A_SUSPEND_NOTIFY) && !(dev->pgraph_intr & WL_NV2A_PGRAPH_INTR_NOTIFY)) {
             ch->suspended &= (uint8_t)~WL_NV2A_SUSPEND_NOTIFY;
         }
-        if (was != 0 && ch->suspended == 0) {
+        if (ch->suspended == 0) {
             run_channel(dev, chid);
         }
     }
@@ -671,7 +683,7 @@ static void resume_trapped(WlNv2a *dev) {
 static void retry_acquires(WlNv2a *dev) {
     unsigned chid;
 
-    if (dev->executing) {
+    if (dev->executing || !(dev->pgraph_fifo & 1u)) {
         return;
     }
     for (chid = 0; chid < WL_NV2A_CHANNELS; chid++) {

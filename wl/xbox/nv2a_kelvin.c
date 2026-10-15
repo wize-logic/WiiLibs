@@ -707,9 +707,11 @@ static void notify(WlNv2a *dev, uint32_t param) {
     dev->stats.notifies++;
     if (param & 1u) {
         // (write, then awaken: the pusher stops until the ISR has seen it, as at a trap, so two in a
-        // kick are two interrupts)
+        // kick are two interrupts. Whether the GPU's interrupt is on or not, as at a trap: D3D's
+        // PGRAPH_FIFO write runs the channel while its ISR still has the interrupts off, and two
+        // awakenings there would merge into one)
         wl_nv2a_raise_pgraph(dev, WL_NV2A_PGRAPH_INTR_NOTIFY);
-        if ((dev->pmc_intr_en & 3u) != 0 && (dev->pgraph_intr_en & WL_NV2A_PGRAPH_INTR_NOTIFY) != 0) {
+        if ((dev->pgraph_intr_en & WL_NV2A_PGRAPH_INTR_NOTIFY) != 0) {
             wl_nv2a_suspend_current(dev, WL_NV2A_SUSPEND_NOTIFY);
         }
     }
