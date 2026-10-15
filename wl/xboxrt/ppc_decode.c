@@ -2,8 +2,6 @@
 // PowerPC load/store decoding and emulation for device faults (ppc_decode.h). Encodings from the
 // PowerPC User Instruction Set Architecture (Book I), primary opcodes 32-55 and the X-form
 // extended opcodes of primary 31.
-#include <string.h>
-
 #include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/ppc_decode.h"
 
@@ -14,7 +12,11 @@ typedef struct {
     bool store, reverse, sign, update, refused;
 } XForm;
 
+// (the byte-reversed forms first: a recompiled title's device accesses are little-endian words, so
+// the search for a push buffer kick's stwbrx ends at once)
 static const XForm k_xforms[] = {
+    {534, "lwbrx", 4, false, true, false, false, false},  {662, "stwbrx", 4, true, true, false, false, false},
+    {790, "lhbrx", 2, false, true, false, false, false},  {918, "sthbrx", 2, true, true, false, false, false},
     {23, "lwzx", 4, false, false, false, false, false},   {55, "lwzux", 4, false, false, false, true, false},
     {87, "lbzx", 1, false, false, false, false, false},   {119, "lbzux", 1, false, false, false, true, false},
     {151, "stwx", 4, true, false, false, false, false},   {183, "stwux", 4, true, false, false, true, false},
@@ -22,8 +24,6 @@ static const XForm k_xforms[] = {
     {279, "lhzx", 2, false, false, false, false, false},  {311, "lhzux", 2, false, false, false, true, false},
     {343, "lhax", 2, false, false, true, false, false},   {375, "lhaux", 2, false, false, true, true, false},
     {407, "sthx", 2, true, false, false, false, false},   {439, "sthux", 2, true, false, false, true, false},
-    {534, "lwbrx", 4, false, true, false, false, false},  {662, "stwbrx", 4, true, true, false, false, false},
-    {790, "lhbrx", 2, false, true, false, false, false},  {918, "sthbrx", 2, true, true, false, false, false},
     {20, "lwarx", 4, false, false, false, false, true},   {150, "stwcx.", 4, true, false, false, false, true},
     {1014, "dcbz", 32, true, false, false, false, true},  {86, "dcbf", 0, false, false, false, false, true},
     {54, "dcbst", 0, false, false, false, false, true},   {470, "dcbi", 0, false, false, false, false, true},
@@ -42,7 +42,7 @@ static const char *const k_dnames[] = {
 };
 
 WlXbPpcDecode wl_xb_ppc_decode(uint32_t insn, WlXbPpcAccess *out) {
-    memset(out, 0, sizeof *out);
+    *out = (WlXbPpcAccess){0};
     uint32_t op = insn >> 26;
     out->rt = (uint8_t)((insn >> 21) & 31u);
     out->ra = (uint8_t)((insn >> 16) & 31u);

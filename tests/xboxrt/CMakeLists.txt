@@ -11,6 +11,13 @@ wl_target_defaults(bench_range_ok)
 target_link_libraries(bench_range_ok PRIVATE wl_xboxrt)
 add_test(NAME bench_range_ok_passes COMMAND bench_range_ok 100000 98434)
 set_tests_properties(bench_range_ok_passes PROPERTIES LABELS "unit;be")
+# A device fault's own work in C (the Wii's DSI slow path for a push buffer kick, the device's work
+# apart): tools/qemu_icount.py counts it on ppc-be.
+add_executable(bench_mmio_fault bench_mmio_fault.c)
+wl_target_defaults(bench_mmio_fault)
+target_link_libraries(bench_mmio_fault PRIVATE wl_xboxrt)
+add_test(NAME bench_mmio_fault_runs COMMAND bench_mmio_fault 1000)
+set_tests_properties(bench_mmio_fault_runs PROPERTIES LABELS "unit;be")
 # Demand paging under a frame limit (the Wii's model through SIGSEGV and mprotect): with a swap
 # file, and without one.
 wl_add_test(test_xboxrt_paging SOURCES test_xboxrt_paging.c LIBS wl_xboxrt LABELS unit be)
