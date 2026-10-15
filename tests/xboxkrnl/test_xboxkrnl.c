@@ -1417,7 +1417,8 @@ TEST files_failures_leave_the_request_alone(void) {
     ASSERT(g_ready);
     reset_scratch();
     uint32_t st = 0;
-    // an overlapped read past the end: no status block, event or APC, as NT for an error
+    // an overlapped read past the end: no status block or APC, and the event and the file object
+    // are left cleared (NT clears both before it dispatches the request), as NT for an error
     uint32_t h = open_path("D:\\maps\\ui.map", 0x80000000u, 1, 0, &st);
     ASSERT_EQ_FMT(0u, st, "%08x");
     uint32_t ehp = gmem(4), iosb = gmem(8), buf = gmem(16), off = gmem(8), tp = gmem(8);
@@ -1425,17 +1426,26 @@ TEST files_failures_leave_the_request_alone(void) {
     uint32_t ev = wl_xb_rd32(ehp);
     wl_xb_fill(iosb, 0xAA, 8);
     wl_xb_wr64(off, 1000);
+    wl_xb_wr64(tp, (uint64_t)(int64_t)-100000); // 10 ms
+    KN(S_NT_SET_EVENT, ev, 0);                                     // signalled before the request
+    ASSERT_EQ_FMT(0u, KN(S_NT_WAIT1EX, h, 0, 0, tp), "%08x"); // the idle file object is signalled
     g_apc_runs = 0;
     ASSERT_EQ_FMT(0xC0000011u, KN(S_NT_READ, h, ev, guest_fn(3, apc_routine), 0x1234u, iosb, buf, 8, off), "%08x");
     ASSERT_EQ_FMT(0xAAAAAAAAu, wl_xb_rd32(iosb), "%08x");
     ASSERT_EQ_FMT(0xAAAAAAAAu, wl_xb_rd32(iosb + 4), "%08x");
-    wl_xb_wr64(tp, (uint64_t)(int64_t)-100000); // 10 ms
-    ASSERT_EQ_FMT(0x102u, KN(S_NT_WAIT1EX, ev, 1, 1, tp), "%08x"); // STATUS_TIMEOUT: nothing set or queued
+    ASSERT_EQ_FMT(0x102u, KN(S_NT_WAIT1EX, ev, 1, 1, tp), "%08x"); // STATUS_TIMEOUT: cleared, nothing queued
+    ASSERT_EQ_FMT(0x102u, KN(S_NT_WAIT1EX, h, 0, 0, tp), "%08x");  // the file object too
     ASSERT_EQ_FMT(0u, g_apc_runs, "%u");
-    // a write on a read-only handle: the same
+    // a read that succeeds signals both again
+    wl_xb_wr64(off, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, ev, 0, 0, iosb, buf, 4, off), "%08x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_WAIT1EX, ev, 0, 0, tp), "%08x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_WAIT1EX, h, 0, 0, tp), "%08x");
+    // a write on a read-only handle is refused with the handle: the event is not looked at
+    wl_xb_fill(iosb, 0xAA, 8);
     ASSERT_EQ_FMT(0xC0000022u, KN(S_NT_WRITE, h, ev, guest_fn(3, apc_routine), 0x1234u, iosb, buf, 8, off), "%08x");
     ASSERT_EQ_FMT(0xAAAAAAAAu, wl_xb_rd32(iosb), "%08x");
-    ASSERT_EQ_FMT(0x102u, KN(S_NT_WAIT1EX, ev, 1, 1, tp), "%08x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_WAIT1EX, ev, 1, 1, tp), "%08x"); // still signalled
     ASSERT_EQ_FMT(0u, g_apc_runs, "%u");
     KN(S_NT_CLOSE, ev);
     KN(S_NT_CLOSE, h);
@@ -1503,6 +1513,102 @@ TEST files_deleted_at_the_last_close(void) {
     ASSERT(host_exists("hdd/E/two.bin"));
     KN(S_NT_CLOSE, a);
     ASSERT(!host_exists("hdd/E/two.bin"));
+    PASS();
+}
+
+TEST files_delete_pending_refuses_opens(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t st = 0;
+    const char *name = "\\Device\\Harddisk0\\Partition1\\gone.bin";
+    uint32_t a = open_path(name, 0xC0000000u, 2, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    ASSERT_EQ_FMT(0u, set_delete(a, true), "%08x");
+    // while its delete is pending, no disposition gets a handle: not one that would join the
+    // record and be deleted with it
+    static const uint32_t dispositions[] = {0, 1, 2, 3, 4, 5}; // supersede .. overwrite-if
+    for (uint32_t i = 0; i < 6; i++) {
+        open_path(name, 0xC0000000u, dispositions[i], 0x20, &st);
+        ASSERT_EQ_FMT(0xC0000056u, st, "%08x"); // STATUS_DELETE_PENDING
+    }
+    KN(S_NT_CLOSE, a);
+    ASSERT(!host_exists("hdd/E/gone.bin"));
+    // gone: a new file of the name is made, and stays after its close
+    a = open_path(name, 0xC0000000u, 2, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    KN(S_NT_CLOSE, a);
+    ASSERT(host_exists("hdd/E/gone.bin"));
+    // a pending delete taken back (the disposition set to false) lets opens in again
+    a = open_path(name, 0xC0000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, set_delete(a, true), "%08x");
+    ASSERT_EQ_FMT(0u, set_delete(a, false), "%08x");
+    uint32_t b = open_path(name, 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    KN(S_NT_CLOSE, b);
+    // NtDeleteFile of an open file makes it pending too
+    ASSERT_EQ_FMT(0u, KN(S_NT_DELETE_FILE, gattr(name)), "%08x");
+    open_path(name, 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0xC0000056u, st, "%08x");
+    KN(S_NT_CLOSE, a);
+    ASSERT(!host_exists("hdd/E/gone.bin"));
+    PASS();
+}
+
+static uint32_t rename_to(uint32_t h, const char *to, bool replace) {
+    // FILE_RENAME_INFORMATION: ReplaceIfExists, RootDirectory, then the OBJECT_STRING itself
+    uint32_t iosb = gmem(8), info = gmem(16), text = gstr(to);
+    wl_xb_wr8(info, replace ? 1u : 0u);
+    wl_xb_wr32(info + 4, 0);
+    wl_xb_wr16(info + 8, (uint16_t)strlen(to));
+    wl_xb_wr16(info + 10, (uint16_t)(strlen(to) + 1u));
+    wl_xb_wr32(info + 12, text);
+    return KN(S_NT_SET_INFO, h, iosb, info, 16, 10);
+}
+
+TEST files_rename_moves_every_handle(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t st = 0, iosb = gmem(8), off = gmem(8), buf = gmem(16);
+    const char *from = "\\Device\\Harddisk0\\Partition1\\from.bin";
+    const char *to = "\\Device\\Harddisk0\\Partition1\\to.bin";
+    uint32_t a = open_path(from, 0xC0000000u, 2, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    uint32_t a2 = open_path(from, 0xC0000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    uint32_t t = open_path(to, 0xC0000000u, 2, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    wl_xb_wr64(off, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, t, 0, 0, 0, iosb, gstr("old!"), 4, off), "%08x");
+    // the file it would replace is open: refused, and nothing moves
+    ASSERT_EQ_FMT(0xC0000035u, rename_to(a, to, false), "%08x"); // STATUS_OBJECT_NAME_COLLISION
+    ASSERT_EQ_FMT(0xC0000022u, rename_to(a, to, true), "%08x");  // STATUS_ACCESS_DENIED
+    ASSERT(host_exists("hdd/E/from.bin"));
+    KN(S_NT_CLOSE, t);
+    // closed: replaced, and the other handle on the file follows it to its new name
+    ASSERT_EQ_FMT(0u, rename_to(a, to, true), "%08x");
+    ASSERT(!host_exists("hdd/E/from.bin"));
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, a2, 0, 0, 0, iosb, gstr("new!"), 4, off), "%08x");
+    uint32_t name = gmem(64);
+    ASSERT_EQ_FMT(0u, KN(S_NT_QUERY_INFO, a2, iosb, name, 64, 9), "%08x"); // FileNameInformation
+    char text[64] = {0};
+    uint32_t nl = wl_xb_rd32(name);
+    wl_xb_copy_out(text, name + 4, nl < 63u ? nl : 63u);
+    ASSERT(strstr(text, "to.bin") != NULL);
+    // one record under the new name: a delete asked for by a new handle waits for the old ones
+    uint32_t c = open_path(to, 0xC0000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_READ, c, 0, 0, 0, iosb, buf, 4, off), "%08x");
+    wl_xb_copy_out(text, buf, 4);
+    text[4] = 0;
+    ASSERT_STR_EQ("new!", text);
+    ASSERT_EQ_FMT(0u, set_delete(c, true), "%08x");
+    KN(S_NT_CLOSE, c);
+    KN(S_NT_CLOSE, a);
+    ASSERT(host_exists("hdd/E/to.bin"));
+    KN(S_NT_CLOSE, a2);
+    ASSERT(!host_exists("hdd/E/to.bin"));
     PASS();
 }
 
@@ -1709,6 +1815,8 @@ SUITE(kernel_suite) {
     RUN_TEST(files_share_one_size);
     RUN_TEST(files_failures_leave_the_request_alone);
     RUN_TEST(files_deleted_at_the_last_close);
+    RUN_TEST(files_delete_pending_refuses_opens);
+    RUN_TEST(files_rename_moves_every_handle);
     RUN_TEST(objects_live_while_referenced);
     RUN_TEST(a_wait_keeps_its_object);
     RUN_TEST(virtual_memory_corners);
