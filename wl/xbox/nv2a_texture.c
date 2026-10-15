@@ -513,18 +513,25 @@ static bool layout_make(const WlNv2aTexture *t, bool mipmaps, uint32_t skip, WlN
     }
     for (l = 0; l < skip; l++) {
         // (a level the guest keeps, of 8 texels a side at least; not a linear texture's, whose
-        // coordinates count its texels)
-        if (t->linear || out->first_level + 1u >= t->levels || (w >> 1) < 8u || (h >> 1) < 8u) {
+        // coordinates count its texels; past the guest's levels, the smallest halved, but for a
+        // DXT's blocks and a P8's indices)
+        if (t->linear || (w >> 1) < 8u || (h >> 1) < 8u) {
             return false;
         }
-        out->first_level++;
+        if (out->first_level + 1u < t->levels && !out->shrink) {
+            out->first_level++;
+        } else if (info.layout != LAYOUT_DXT && info.gx != WL_GXC_C8) {
+            out->shrink++;
+        } else {
+            return false;
+        }
         w >>= 1;
         h >>= 1;
     }
     out->format = (WlGxcFormat)info.gx;
     out->width = w;
     out->height = h;
-    out->levels = mipmaps && !t->linear && pow2(w) && pow2(h) ? t->levels - out->first_level : 1u;
+    out->levels = mipmaps && !t->linear && !out->shrink && pow2(w) && pow2(h) ? t->levels - out->first_level : 1u;
     for (l = 0; l < out->levels; l++) {
         out->image_bytes += wl_gxc_tex_bytes(out->format, at_least_1(w >> l), at_least_1(h >> l));
     }
@@ -561,11 +568,11 @@ size_t wl_nv2a_texture_scratch_bytes(const WlNv2aTexture *t, const WlNv2aGxLayou
         return 6u * (size_t)t->width * t->height * 4u + (size_t)t->width * t->height * 4u +
                (size_t)layout->width * layout->height * 4u;
     }
-    if (info.codec >= 0) {
+    if (info.codec >= 0 && !layout->shrink) {
         return 0;
     }
     texels = (size_t)at_least_1(t->width >> layout->first_level) * at_least_1(t->height >> layout->first_level);
-    // a level unswizzled, and as RGBA
+    // a level unswizzled, and as RGBA (and halved: within the RGBA)
     return texels * (info.bytes + 4u);
 }
 
@@ -769,6 +776,34 @@ bool wl_nv2a_texture_convert(const WlNv2aTexture *t, const WlNv2aGxLayout *layou
     memset(dst, 0, layout->total_bytes);
     if (layout->sphere) {
         return scratch != NULL && convert_sphere(t, layout, src, palette, out, scratch);
+    }
+    if (layout->shrink) {
+        // (the smallest level halved, a box of 2^shrink texels a side averaged into each)
+        uint32_t level = layout->first_level, w = at_least_1(t->width >> level), h = at_least_1(t->height >> level);
+        uint32_t box = 1u << layout->shrink, x, y, i, j, c;
+        uint8_t *unswizzled = scratch, *rgba;
+
+        if (scratch == NULL || w / box != layout->width || h / box != layout->height) {
+            return false;
+        }
+        rgba = unswizzled + (size_t)w * h * t->texel_bytes;
+        decode_level(t, level, src + level_offset(t, level), palette, unswizzled, rgba);
+        for (y = 0; y < layout->height; y++) {
+            for (x = 0; x < layout->width; x++) {
+                for (c = 0; c < 4; c++) {
+                    uint32_t sum = 0;
+
+                    for (j = 0; j < box; j++) {
+                        for (i = 0; i < box; i++) {
+                            sum += rgba[(((size_t)y * box + j) * w + (size_t)x * box + i) * 4u + c];
+                        }
+                    }
+                    // (in place: each texel written after the boxes before it were read)
+                    rgba[((size_t)y * layout->width + x) * 4u + c] = (uint8_t)((sum + box * box / 2u) / (box * box));
+                }
+            }
+        }
+        return wl_gxc_encode(layout->format, rgba, layout->width, layout->height, out, layout->image_bytes) != 0;
     }
     for (l = 0; l < layout->levels; l++) {
         uint32_t level = layout->first_level + l;
