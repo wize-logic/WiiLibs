@@ -261,7 +261,8 @@ even, so its winding holds).
   onto it, `wl_nv2a_spot_coordinates`, so the cone keeps its shape), kept by (address, format, size, palette) within a budget (4 MiB by default) or in an arena
   of their own (a heap over it, best fit: a texture makes room by emptying the oldest window of
   the arena wide enough for it, not every image by age; one without room even so is kept smaller,
-  from its next mip level or a halved sphere map, up to three levels down, and made whole again
+  from its next mip level, a halved sphere map, or, past its own levels (but for DXT and P8), its
+  smallest halved by a box filter, up to three levels down, and made whole again
   once textures not drawn for 60 frames give way; one with no smaller image is not tried again in
   that frame), and checked once a frame (every use once found
   rewritten): through a write watch where the caller has one (the runtime's MMU: a texture whose
@@ -332,7 +333,11 @@ the layout does not send, an empty texture map) and whether psh's program was be
 approximated. To look closer: `--efb-after N DIR` writes the EFB after the replay's draw N,
 `--gx-dump N` prints what GX is handed for its primitive N (projection, viewport, raster state,
 texture maps, the TEV program, the first vertices) and `--gx-textures DIR` writes those maps,
-`--psh-dump N` prints draw N's combiner words and psh's program.
+`--psh-dump N` prints draw N's combiner words and psh's program. The frames and EFB pictures are
+written opaque, as a screen shows them (`--png-alpha` keeps the EFB's destination alpha);
+`--survey` counts the draws that use what GX takes approximately (the combiners' blues to alpha and
+muxes, texture stage modes, alpha kill, signed channels, LOD bias, blend equations and constants,
+psh's approximations and refusals), with the first of each.
 
 `--textures-mb N` keeps the converted textures in an arena of N MiB as the runtime does,
 `--vertex-cache-kb N` keeps the vertex arrays for GX to read by index in N KiB (none by default; the

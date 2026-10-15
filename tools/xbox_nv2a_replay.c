@@ -38,6 +38,8 @@
 //               a frame), and the best run's parts: the model's (pusher, puller, 3D state), the
 //               backend's draws, its clears and frames, the memory records put in
 //   --stream    the replay through wl_nv2a_replay_stream, as the runtime's capture bench makes it
+//   --png-alpha the frames and EFB pictures written with the EFB's destination alpha (else opaque,
+//               as a screen shows them; --gx-textures keeps the maps' alpha either way)
 //   --survey    which of the NV2A's features the capture's draws use that GX takes approximately
 //               (the combiners' blues to alpha and muxes, the texture stages' modes, alpha kill,
 //               signed channels and LOD bias, blend equations and constant factors, psh's
@@ -149,13 +151,32 @@ static void program_seen(const WlNv2aKelvin *k) {
     }
 }
 
-static bool png_write(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
-    uint8_t *png = NULL;
-    size_t len = 0;
+// a picture of the screen or the EFB: opaque, as a screen shows it (the EFB's destination alpha,
+// which blending reads, is not the picture), unless --png-alpha keeps it
+static bool g_png_alpha;
+
+static bool png_write_as(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h, bool opaque) {
+    uint8_t *png = NULL, *copy = NULL;
+    size_t len = 0, bytes = (size_t)w * h * 4u, i;
     FILE *f;
     bool ok;
+    WlResult encoded;
 
-    if (wl_png_encode(rgba, w, h, &png, &len) != WL_OK) {
+    if (opaque && !g_png_alpha) {
+        copy = malloc(bytes);
+        if (copy == NULL) {
+            fprintf(stderr, "png: no memory for %s\n", path);
+            return false;
+        }
+        memcpy(copy, rgba, bytes);
+        for (i = 3; i < bytes; i += 4) {
+            copy[i] = 0xFF;
+        }
+        rgba = copy;
+    }
+    encoded = wl_png_encode(rgba, w, h, &png, &len);
+    free(copy);
+    if (encoded != WL_OK) {
         fprintf(stderr, "png: cannot encode %s\n", path);
         return false;
     }
@@ -169,6 +190,10 @@ static bool png_write(const char *path, const uint8_t *rgba, uint32_t w, uint32_
     }
     free(png);
     return ok;
+}
+
+static bool png_write(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    return png_write_as(path, rgba, w, h, true);
 }
 
 static void tee_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
@@ -471,7 +496,7 @@ static void on_gx_primitive(void *user, WlGxDirectPrim prim, const WlGxDirectVer
                 if (image != NULL && rgba != NULL &&
                     wl_gxc_decode((WlGxcFormat)t->format, image, bytes, t->width, t->height, rgba) != 0) {
                     snprintf(path, sizeof path, "%s/gx_%u_map_%u.png", g_gx_textures_dir, (unsigned)index, n);
-                    if (png_write(path, rgba, t->width, t->height)) {
+                    if (png_write_as(path, rgba, t->width, t->height, false)) {
                         printf("      map %u -> %s\n", n, path);
                     }
                 }
@@ -752,7 +777,7 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
                     "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] "
-                    "[--stream] [--cpu-transform]\n");
+                    "[--stream] [--cpu-transform] [--png-alpha] [--survey]\n");
     return 2;
 }
 
@@ -790,6 +815,8 @@ int main(int argc, char **argv) {
             gx = true;
         } else if (strcmp(argv[i], "--psh-dump") == 0 && i + 1 < argc && g_psh_dump_count < EFB_AFTER_MAX) {
             g_psh_dump[g_psh_dump_count++] = (uint32_t)strtoul(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--png-alpha") == 0) {
+            g_png_alpha = true;
         } else if (strcmp(argv[i], "--survey") == 0) {
             g_survey = true;
             gx = true;
