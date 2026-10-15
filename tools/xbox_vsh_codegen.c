@@ -598,7 +598,10 @@ static int reuse_prefix(const WlXboxVshProgram *program, ReusePrefix *prefix) {
         int writes_a0;
 
         operands_read(instruction, reads);
-        if (instruction->captures_clip || (output && instruction->output_address == _output_position))
+        instruction_writes(instruction, writes_now, &writes_a0);
+        /* (r12 is the position: what writes it is not kept from the vertex before) */
+        if (instruction->captures_clip || (output && instruction->output_address == _output_position) ||
+            writes_now[12])
             break;
         /* (an output: from an input or a constant alone, read by the ILU's C or a
         MOV's A, so it can be written after the prefix) */
@@ -642,7 +645,6 @@ static int reuse_prefix(const WlXboxVshProgram *program, ReusePrefix *prefix) {
                     relative = 1;
             }
         }
-        instruction_writes(instruction, writes_now, &writes_a0);
         for (temporary = 0; temporary < 12; temporary++)
             written[temporary] |= writes_now[temporary];
         prefix->end = index + 1;
@@ -859,7 +861,7 @@ int main(int argc, char **argv) {
                 "{\n\tunsigned n;\n",
                 hash);
         if (reused)
-            fprintf(out, "\tfloat kept_r[12][4];\n\tint kept_a0 = 0;\n\n\t(void)kept_r;\n\t(void)kept_a0;\n");
+            fprintf(out, "\tfloat kept_r[12][4] = { { 0.0f } };\n\tint kept_a0 = 0;\n\n\t(void)kept_r;\n\t(void)kept_a0;\n");
         fprintf(out,
                 "\n\tfor (n = 0; n < count; n++)\n\t{\n"
                 "\tconst float (*v)[4] = vs[n];\n\tWlXboxVshOutput *o = &os[n];\n"

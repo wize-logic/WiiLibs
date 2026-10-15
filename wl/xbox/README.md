@@ -105,7 +105,9 @@ same whatever the draw's constants, so a static vertex buffer's can be kept), th
 `tools/xbox_vsh_codegen.c`, a host tool, compiles a file of programs (the game's microcode, as C
 text) to C: a function for each that does what the interpreter does, its operands fixed, for the
 outputs a draw reads (with its loop over a batch of vertices, so a call's entry and exit are paid once
-for them); one for its colours alone; and, for a program whose position reads constants
+for them; in a skinned program's, a vertex whose node indices and weights are the bits of the vertex
+before's takes the blended matrices and a0 that vertex made instead of making them again: the same
+results); one for its colours alone; and, for a program whose position reads constants
 by a0 and is converted to the screen (a skinned model's), one for four positions at once. It writes
 a table of `WlXboxVshNative`, which the program hands to `wl_xbox_vsh_compile`; a program found in
 it by its words' hash (`wl_xbox_vsh_hash`) runs as its function. The table's name is the tool's
