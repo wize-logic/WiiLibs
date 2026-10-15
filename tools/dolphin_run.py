@@ -14,23 +14,33 @@ Exit status: 0 when --until was seen (or not asked for) and no --fail line appea
   tools/dolphin_run.py build/wii/tests/wl_console_tests.dol --until "WLT DONE" --fail "^FAIL "
 
 Dolphin.exe: --dolphin, else WL_DOLPHIN, else Documents/Emulators/Dolphin-x64/Dolphin.exe in a
-Windows profile.
+Windows profile, else on Linux dolphin-emu-nogui, dolphin-emu, or the Flathub app (--dolphin flatpak).
+Dolphin never shows a window: Dolphin.exe runs on a Windows desktop of its own, Linux's dolphin-emu on
+a virtual X display (Xvfb), dolphin-emu-nogui on its headless platform; screenshots are taken from
+there (not from dolphin-emu-nogui).
 
 What the program wrote to the card (a log file, a save) is in the run's copy of the card, which Dolphin
 writes back when the emulation stops; --sd-out DIR copies out of it what is new or changed since --sd.
 """
 
 import argparse
+import base64
 import json
 import os
 import re
 import shutil
+import signal
+import struct
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 ON_WINDOWS = os.name == "nt"
+# a Linux Dolphin rather than Dolphin.exe through WSL; set by main()
+NATIVE = False
+FLATPAK_APP = "org.DolphinEmu.dolphin-emu"
 
 # the program's OSREPORT lines, and what Dolphin says when the GPU's commands or the processor go
 # wrong (printed as Dolphin's own lines, when they come)
@@ -52,21 +62,101 @@ WriteToWindow = False
 """
 
 # PrintWindow on Dolphin's render window (it need not be in front); prints the window title.
-CAPTURE_PS1 = r"""
-param([string]$Output, [string]$UserFolder)
-Add-Type -AssemblyName System.Drawing
+# Dolphin runs headless: this Windows build has no Qt platform but "windows" (no offscreen), and Qt
+# brings a window it restores off the screens back onto them, so Dolphin is started on a desktop of
+# its own (CreateDesktop; a process's windows live on the desktop it was started on and never show on
+# the person's). "launch" starts it there, prints its id and waits for it, so the launcher's exit is
+# Dolphin's; "close" posts WM_CLOSE to its windows there (closing it is how Dolphin writes the card back)
+DESKTOP_PS1 = r"""
+param([string]$Mode, [string]$UserFolder, [string]$Exe, [string]$Arguments)
 Add-Type @"
 using System; using System.Runtime.InteropServices;
+public static class Desk {
+  public const string Name = "WiiLibsHeadless";
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct STARTUPINFO {
+    public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+    public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+    public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError; }
+  [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION {
+    public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern IntPtr CreateDesktop(string name, IntPtr device, IntPtr mode, int flags, uint access, IntPtr sa);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern IntPtr OpenDesktop(string name, int flags, bool inherit, uint access);
+  public delegate bool Each(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumDesktopWindows(IntPtr desk, Each f, IntPtr l);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern bool CreateProcess(string app, string cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags,
+    IntPtr env, string dir, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+  [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
+  [DllImport("kernel32.dll")] public static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+  public static int Launch(string exe, string args) {
+    // (GENERIC_ALL; the desktop lasts while a handle or a thread on it does)
+    IntPtr desk = CreateDesktop(Name, IntPtr.Zero, IntPtr.Zero, 0, 0x10000000, IntPtr.Zero);
+    if (desk == IntPtr.Zero) throw new Exception("CreateDesktop failed: " + Marshal.GetLastWin32Error());
+    STARTUPINFO si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.lpDesktop = Name;
+    PROCESS_INFORMATION pi;
+    if (!CreateProcess(null, "\"" + exe + "\" " + args, IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero, null, ref si, out pi))
+      throw new Exception("CreateProcess failed: " + Marshal.GetLastWin32Error());
+    Console.WriteLine(pi.dwProcessId); Console.Out.Flush();
+    WaitForSingleObject(pi.hProcess, 0xFFFFFFFF);
+    uint code; GetExitCodeProcess(pi.hProcess, out code);
+    return (int)code;
+  }
+  public static int Close(uint[] pids) {
+    IntPtr desk = OpenDesktop(Name, 0, false, 0x10000000);
+    if (desk == IntPtr.Zero) return 0;
+    int posted = 0;
+    EnumDesktopWindows(desk, (h, l) => {
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      if (Array.IndexOf(pids, pid) >= 0) { PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero); posted++; }  // WM_CLOSE
+      return true; }, IntPtr.Zero);
+    return posted;
+  }
+}
+"@
+# (the arguments come base64-encoded: PowerShell takes a value that starts with '-' for one of its parameters)
+if ($Mode -eq "launch") { exit [Desk]::Launch($Exe, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Arguments))) }
+$pids = @(Get-CimInstance Win32_Process -Filter "Name='Dolphin.exe'" | Where-Object { $_.CommandLine -like "*$UserFolder*" } |
+  ForEach-Object { [uint32]$_.ProcessId })
+if ($pids.Count -gt 0) { [Desk]::Close([uint32[]]$pids) }
+"""
+
+CAPTURE_PS1 = r"""
+param([string]$Output, [string]$UserFolder)
+trap { Set-Content -Path "$Output.title" -Value "error: $_"; exit 1 }
+Add-Type -AssemblyName System.Drawing
+Add-Type @"
+using System; using System.Text; using System.Runtime.InteropServices;
 public static class Win {
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  public delegate bool Each(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(Each f, IntPtr l);
   public struct RECT { public int Left, Top, Right, Bottom; }
+  // the largest visible window of these processes on this desktop (the render window, not the game list)
+  public static IntPtr Largest(uint[] pids) {
+    IntPtr best = IntPtr.Zero; long area = 0;
+    EnumWindows((h, l) => {
+      uint pid; GetWindowThreadProcessId(h, out pid); RECT r;
+      if (Array.IndexOf(pids, pid) >= 0 && IsWindowVisible(h) && GetClientRect(h, out r)
+          && (long)r.Right * r.Bottom > area) { area = (long)r.Right * r.Bottom; best = h; }
+      return true; }, IntPtr.Zero);
+    return best;
+  }
+  public static string Title(IntPtr h) { StringBuilder s = new StringBuilder(256); GetWindowText(h, s, 256); return s.ToString(); }
 }
 "@
 # (this run's Dolphin: the one given this run's user folder, not another program's)
-$ids = Get-CimInstance Win32_Process -Filter "Name='Dolphin.exe'" | Where-Object { $_.CommandLine -like "*$UserFolder*" } | ForEach-Object { $_.ProcessId }
-$process = Get-Process -Id $ids -ErrorAction Stop | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-$handle = $process.MainWindowHandle
+$ids = @(Get-CimInstance Win32_Process -Filter "Name='Dolphin.exe'" | Where-Object { $_.CommandLine -like "*$UserFolder*" } |
+  ForEach-Object { [uint32]$_.ProcessId })
+$handle = [Win]::Largest([uint32[]]$ids)
+if ($handle -eq [IntPtr]::Zero) { throw "no window of Dolphin $ids on this desktop" }
 $rect = New-Object Win+RECT
 [Win]::GetClientRect($handle, [ref]$rect) | Out-Null
 $bitmap = New-Object System.Drawing.Bitmap ([Math]::Max(1, $rect.Right)), ([Math]::Max(1, $rect.Bottom))
@@ -76,7 +166,8 @@ $dc = $graphics.GetHdc()
 [Win]::PrintWindow($handle, $dc, 3) | Out-Null
 $graphics.ReleaseHdc($dc)
 $bitmap.Save($Output, [System.Drawing.Imaging.ImageFormat]::Png)
-Write-Output "$($process.MainWindowTitle)"
+# (run on Dolphin's own desktop, its output goes nowhere: the window's title goes beside the PNG)
+Set-Content -Path "$Output.title" -Value ([Win]::Title($handle))
 """
 
 
@@ -189,6 +280,9 @@ def dolphin_ini(sd_image: str, sd_folder: str, dump_frames: bool, gdb_port: int 
                 unthrottled: bool = False, dump_audio: bool = False) -> str:
     lines = ["[Interface]", "ConfirmStop = False", f"UsePanicHandlers = {panics}", "ShowLogWindow = False",
              "[Analytics]", "PermissionAsked = True", "Enabled = False",
+             # (the render window apart from the game list, at the size screenshots are taken)
+             "[Display]", "RenderToMain = False", "RenderWindowAutoSize = False",
+             "RenderWindowWidth = 640", "RenderWindowHeight = 480",
              # (the console's own clock: a person's global Dolphin.ini may overclock the CPU, which
              # would make every timing measured here look faster than the console runs)
              "[Core]", "WiiSDCard = True", "WiiSDCardAllowWrites = True",
@@ -251,7 +345,7 @@ def windows_tool(name: str) -> str:
 
 
 def to_windows(path: Path) -> str:
-    if ON_WINDOWS:
+    if ON_WINDOWS or NATIVE:
         return str(path)
     return subprocess.run(["wslpath", "-w", str(path)], capture_output=True, text=True,
                           check=True).stdout.strip()
@@ -273,8 +367,14 @@ def find_dolphin(explicit) -> Path:
         return Path(os.environ["WL_DOLPHIN"])
     users = Path("C:/Users") if ON_WINDOWS else Path("/mnt/c/Users")
     candidates = sorted(users.glob("*/Documents/Emulators/Dolphin-x64/Dolphin.exe"))
+    if not candidates and not ON_WINDOWS:
+        for name in ("dolphin-emu-nogui", "dolphin-emu"):
+            if shutil.which(name):
+                return Path(shutil.which(name))
+        if subprocess.run(["flatpak", "info", FLATPAK_APP], capture_output=True).returncode == 0:
+            return Path("flatpak")
     if not candidates:
-        sys.exit("dolphin_run.py: no Dolphin.exe; pass --dolphin or set WL_DOLPHIN")
+        sys.exit("dolphin_run.py: no Dolphin.exe, dolphin-emu or Flathub Dolphin; pass --dolphin or set WL_DOLPHIN")
     return candidates[0]
 
 
@@ -370,12 +470,12 @@ def kill_dolphin(user_folder: str) -> None:
                    capture_output=True)
 
 
-def close_dolphin(user_folder: str, seconds: float = 15) -> None:
+def close_dolphin(user_folder: str, script: Path, seconds: float = 15) -> None:
     """stops the emulation as closing its window does (ConfirmStop is off), so that Dolphin writes
-    the SD card's folder back; killed if it has not gone in time"""
-    subprocess.run([windows_tool("powershell.exe"), "-NoProfile", "-Command",
-                    f"{ours(user_folder)} | ForEach-Object {{ (Get-Process -Id $_.ProcessId).CloseMainWindow() | Out-Null }}"],
-                   capture_output=True)
+    the SD card's folder back: WM_CLOSE to its windows on its own desktop (DESKTOP_PS1); killed if it
+    has not gone in time"""
+    subprocess.run([windows_tool("powershell.exe"), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    to_windows(script), "close", user_folder], capture_output=True)
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         running = subprocess.run([windows_tool("powershell.exe"), "-NoProfile", "-Command",
@@ -384,6 +484,68 @@ def close_dolphin(user_folder: str, seconds: float = 15) -> None:
             return
         time.sleep(0.5)
     kill_dolphin(user_folder)
+
+
+def native_command(dolphin: Path, work: Path):
+    """how a Linux Dolphin starts with no window of its own: dolphin-emu-nogui on its headless platform, the Qt
+    dolphin-emu on X11 (a virtual display, start_xvfb), the Flathub app the same, seeing only the run's folder"""
+    if dolphin.name == "dolphin-emu-nogui":
+        return [str(dolphin), "-p", "headless"]
+    if str(dolphin) == "flatpak":
+        # (no session bus: Qt's desktop-portal call never answers without a desktop, 25 s lost)
+        return ["flatpak", "run", "--no-session-bus", "--nosocket=wayland", f"--filesystem={work}",
+                "--env=QT_QPA_PLATFORM=xcb", FLATPAK_APP]
+    return [str(dolphin), "-platform", "xcb"]
+
+
+def start_xvfb():
+    """a virtual X display (Xvfb) for a Linux Dolphin's windows, nothing on the screen; the X server and its
+    display's name"""
+    if not shutil.which("Xvfb"):
+        sys.exit("dolphin_run.py: Linux's dolphin-emu runs on Xvfb (the xvfb package), which is not installed")
+    read, write = os.pipe()
+    server = subprocess.Popen(["Xvfb", "-displayfd", str(write), "-screen", "0", "1024x768x24", "-nolisten", "tcp"],
+                              pass_fds=(write,), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.close(write)
+    with os.fdopen(read) as number:
+        return server, f":{number.readline().strip()}"
+
+
+def xwd_to_png(xwd: bytes, output: Path) -> None:
+    """an xwd dump of a 24- or 32-bit TrueColor window (ZPixmap) written as an RGB PNG"""
+    header = struct.unpack(">25I", xwd[:100])
+    size, width, height, byte_order, bits, line = header[0], header[4], header[5], header[7], header[11], header[12]
+    masks, colours = header[14:17], header[19]
+    if header[2] != 2 or bits not in (24, 32):
+        raise ValueError(f"an xwd dump of {bits} bits a pixel, format {header[2]}")
+    pixels = xwd[size + 12 * colours:]
+    shifts = [(mask & -mask).bit_length() - 1 for mask in masks]
+    step, order = bits // 8, "little" if byte_order == 0 else "big"
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        row = pixels[y * line:y * line + width * step]
+        for x in range(0, width * step, step):
+            value = int.from_bytes(row[x:x + step], order)
+            rows += bytes((value & mask) >> shift for mask, shift in zip(masks, shifts))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    output.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+                       + chunk(b"IDAT", zlib.compress(bytes(rows))) + chunk(b"IEND", b""))
+
+
+def x_screenshot(display: str, output: Path) -> str:
+    """the render window on a virtual X display (its title has Dolphin's ' | backend' parts), as a PNG; its title"""
+    tree = subprocess.run(["xwininfo", "-root", "-children", "-display", display], capture_output=True,
+                          text=True).stdout
+    windows = re.findall(r'^\s+(0x[0-9a-f]+) "([^"]*\| [^"]*)"', tree, re.M)
+    if not windows:
+        raise ValueError("no render window on the virtual display")
+    dump = subprocess.run(["xwd", "-silent", "-id", windows[0][0], "-display", display], capture_output=True,
+                          check=True).stdout
+    xwd_to_png(dump, output)
+    return windows[0][1]
 
 
 def dolphin_messages(log: Path, most: int = 24):
@@ -504,7 +666,15 @@ def main() -> int:
         parser.error("--sd-out needs --sd (the card it copies the changes of)")
 
     dolphin = find_dolphin(args.dolphin)
-    work = windows_temp() / args.name
+    global NATIVE
+    NATIVE = not ON_WINDOWS and dolphin.suffix.lower() != ".exe"
+    if NATIVE and args.backtrace:
+        parser.error("--backtrace needs Dolphin.exe")
+    if NATIVE and args.screenshot and dolphin.name == "dolphin-emu-nogui":
+        parser.error("--screenshot needs dolphin-emu or the Flathub app (dolphin-emu-nogui has no window)")
+    # (Linux: the user's cache rather than /tmp, which can be in memory; a staging's copy is gigabytes)
+    work = (Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "wl-dolphin" if NATIVE
+            else windows_temp()) / args.name
     user = work / "user"
     if user.exists():
         shutil.rmtree(user / "Dump", ignore_errors=True)
@@ -531,18 +701,33 @@ def main() -> int:
         log.unlink()
     program = work / args.program.name
     shutil.copyfile(args.program, program)
-    (work / "capture.ps1").write_text(CAPTURE_PS1)
-
-    kill_dolphin(to_windows(user))
+    if not NATIVE:
+        (work / "capture.ps1").write_text(CAPTURE_PS1)
+        (work / "desktop.ps1").write_text(DESKTOP_PS1)
+    xvfb = None
+    if not NATIVE:
+        kill_dolphin(to_windows(user))
+    arguments = ["-u", to_windows(user), *([] if dolphin.name == "dolphin-emu-nogui" else ["-b"]),
+                 # (the console's TV shape, SYSCONF's IPL.AR, which programs read)
+                 "-C", f"SYSCONF.IPL.AR={1 if args.wii_aspect == '16:9' else 0}",
+                 *(["-C", "SYSCONF.IPL.PGS=1"] if args.wii_progressive else []),
+                 *(["-C", f"SYSCONF.IPL.E60={1 if args.wii_eurgb60 == 'on' else 0}"] if args.wii_eurgb60 else []),
+                 "-e", to_windows(program)]
     try:
-        process = subprocess.Popen([str(dolphin), "-u", to_windows(user), "-b",
-                                    # (the console's TV shape, SYSCONF's IPL.AR, which programs read)
-                                    "-C", f"SYSCONF.IPL.AR={1 if args.wii_aspect == '16:9' else 0}",
-                                    *(["-C", "SYSCONF.IPL.PGS=1"] if args.wii_progressive else []),
-                                    *(["-C", f"SYSCONF.IPL.E60={1 if args.wii_eurgb60 == 'on' else 0}"]
-                                      if args.wii_eurgb60 else []),
-                                    "-e", to_windows(program)],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if NATIVE:
+            environment = dict(os.environ)
+            environment.pop("WAYLAND_DISPLAY", None)
+            if dolphin.name != "dolphin-emu-nogui":
+                xvfb, environment["DISPLAY"] = start_xvfb()
+            process = subprocess.Popen([*native_command(dolphin, work), *arguments], env=environment,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            # (headless: Dolphin on a desktop of its own; the launcher waits for it, so its exit is Dolphin's)
+            process = subprocess.Popen([windows_tool("powershell.exe"), "-NoProfile", "-ExecutionPolicy", "Bypass",
+                                        "-File", to_windows(work / "desktop.ps1"), "launch", to_windows(user),
+                                        to_windows(dolphin),
+                                        base64.b64encode(subprocess.list2cmdline(arguments).encode()).decode()],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
         print(f"dolphin_run.py: {error}", file=sys.stderr)
         return 3
@@ -579,22 +764,41 @@ def main() -> int:
         for line in gdb_backtrace(debugger).splitlines():
             if line.strip() and not line.startswith(("warning:", "Type ", "For help")):
                 print(f"  {line}")
-    if args.screenshot:
+    if args.screenshot and NATIVE:
+        try:
+            args.screenshot.parent.mkdir(parents=True, exist_ok=True)
+            print(f"screenshot: {args.screenshot} ({x_screenshot(environment['DISPLAY'], args.screenshot)})")
+        except (ValueError, subprocess.CalledProcessError) as error:
+            print(f"no screenshot: {error}", file=sys.stderr)
+    elif args.screenshot:
         capture = work / "capture.png"
-        title = subprocess.run([windows_tool("powershell.exe"), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                                to_windows(work / "capture.ps1"), to_windows(capture), to_windows(user)],
-                               capture_output=True, text=True)
-        if capture.exists():
+        # (a window is seen only from its own desktop: the capture runs there too)
+        subprocess.run([windows_tool("powershell.exe"), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                        to_windows(work / "desktop.ps1"), "launch", to_windows(user), "powershell.exe",
+                        base64.b64encode(subprocess.list2cmdline(
+                            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", to_windows(work / "capture.ps1"),
+                             to_windows(capture), to_windows(user)]).encode()).decode()],
+                       capture_output=True, text=True)
+        title = Path(f"{capture}.title")
+        if capture.exists() and capture.stat().st_size > 200:
             args.screenshot.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(capture), args.screenshot)
-            print(f"screenshot: {args.screenshot} ({title.stdout.strip()})")
+            print(f"screenshot: {args.screenshot} ({title.read_text().strip() if title.exists() else ''})")
         else:
-            print(f"no screenshot: {title.stderr.strip()}", file=sys.stderr)
-    close_dolphin(to_windows(user))
+            print(f"no screenshot: {title.read_text().strip() if title.exists() else 'the capture did not run'}",
+                  file=sys.stderr)
+        title.unlink(missing_ok=True)
+    if NATIVE:
+        # (Dolphin stops the emulation on SIGINT, writing the card back; flatpak passes it on)
+        process.send_signal(signal.SIGINT)
+    else:
+        close_dolphin(to_windows(user), work / "desktop.ps1")
     try:
         process.wait(timeout=30)
     except subprocess.TimeoutExpired:
         process.kill()
+    if xvfb is not None:
+        xvfb.terminate()
     if args.sd_out:
         # (Dolphin wrote the card back to the run's copy as it stopped)
         copied = copy_out(args.sd, work / "sd", args.sd_out)

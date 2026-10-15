@@ -6,10 +6,12 @@ when a run ends early (RunWatch), and the command line's refusal of --sd-out wit
 
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parents[2] / "tools"
@@ -163,6 +165,24 @@ class GfxIniTests(unittest.TestCase):
         self.assertIn("ShowFPS = True", dolphin_run.gfx_ini(False))
         self.assertNotIn("ShowFPS", dolphin_run.gfx_ini(False, fps=False))
         self.assertIn("ShowFPS = False", dolphin_run.gfx_ini(False, hacks={"Settings.ShowFPS": "False"}))
+
+
+class XwdTests(unittest.TestCase):
+    def test_a_32_bit_dump_becomes_an_rgb_png(self):
+        # (a 2x1 ZPixmap, least significant byte first, r<<16 g<<8 b, a window name, no colour map, a padded line)
+        name = b"Dolphin\0"
+        header = [100 + len(name), 7, 2, 24, 2, 1, 0, 0, 32, 0, 32, 32, 12, 4, 0xff0000, 0xff00, 0xff, 8, 0, 0,
+                  2, 1, 0, 0, 0]
+        pixels = (0x102030).to_bytes(4, "little") + (0xa0b0c0).to_bytes(4, "little") + bytes(4)
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "shot.png"
+            dolphin_run.xwd_to_png(struct.pack(">25I", *header) + name + pixels, output)
+            png = output.read_bytes()
+        self.assertEqual(b"\x89PNG", png[:4])
+        self.assertEqual((2, 1, 8, 2), struct.unpack(">IIBB", png[16:26]))
+        start = png.index(b"IDAT") + 4
+        self.assertEqual(b"\0\x10\x20\x30\xa0\xb0\xc0", zlib.decompress(png[start:start + struct.unpack(
+            ">I", png[start - 8:start - 4])[0]]))
 
 
 class CommandLineTests(unittest.TestCase):
