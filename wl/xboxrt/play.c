@@ -1293,20 +1293,36 @@ static void script_frame(void) {
             break;
         }
         case K_SCREENSHOT:
-            // the picture is of the frames after the step began: the script waits for it
+            // the picture is of the frames after the step began: the script waits for it (on the
+            // Wii a one-frame capture, written whole before the next step)
             if (P.first) {
                 P.first = false;
                 screenshot(s->arg);
             }
-            if (P.shot_frames > 0 && P.clock - P.started_clock < 10.0) {
-                return;
+            if (P.shot_frames > 0 || wl_xb_gpu_capture_busy()) {
+                if (P.clock - P.started_clock < 10.0) {
+                    return;
+                }
+                wl_xb_play_log("screenshot: not done after 10 s; the script goes on");
             }
             break;
         case K_CAPTURE: {
-            char path[WL_FS_PATH_MAX];
-            shot_path(path, sizeof path, s->arg, "cap");
-            wl_xb_gpu_capture(path, (uint32_t)s->number, 0);
-            wl_xb_play_log("capture of %u frames to %s", (unsigned)s->number, path);
+            // the capture's frames are written whole before the next step (a quit right after
+            // would cut it short): a wait of 5 s and 1 s a frame at most
+            if (P.first) {
+                P.first = false;
+                char path[WL_FS_PATH_MAX];
+                shot_path(path, sizeof path, s->arg, "cap");
+                wl_xb_gpu_capture(path, (uint32_t)s->number, 0);
+                wl_xb_play_log("capture of %u frames to %s", (unsigned)s->number, path);
+            }
+            if (wl_xb_gpu_capture_busy()) {
+                double limit = 5.0 + (double)s->number;
+                if (P.clock - P.started_clock < limit) {
+                    return;
+                }
+                wl_xb_play_log("capture: not done after %.0f s; the script goes on", limit);
+            }
             break;
         }
         case K_CONNECT:

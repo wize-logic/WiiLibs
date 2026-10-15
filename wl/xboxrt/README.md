@@ -386,6 +386,9 @@ or `script stopped at line N (...): why` with what was shown).
 - **Screenshots**: on the host wl/gxsoft draws the next two frames (the first may begin mid-frame)
   and the second becomes `<out>/<name>.png`; on the Wii a one-frame GPU capture (`<name>.cap`, for
   `tools/xbox_nv2a_replay CAP --png-gx DIR`). `capture <frames>` takes a longer capture on both.
+  Either step waits for its capture to be written whole before the next step (a `quit` right
+  after no longer cuts it short): at most 10 s for a screenshot, 5 s and a second a frame for a
+  capture, then the script goes on and logs that it did.
   With paging (the Wii, `WL_XB_FRAME_MB`) the capture's guest memory goes to the file through a
   bounce buffer (`wl_xb_file_write`): the OS cannot write a page that has no frame.
 - **Deterministic only in the deterministic mode** (above): otherwise the guest's clocks are the
