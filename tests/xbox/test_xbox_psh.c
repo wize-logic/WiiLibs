@@ -766,7 +766,7 @@ TEST random_programs_agree_with_the_combiners(void) {
     ASSERT(o.d0_exact > o.exact * 9 / 10);
     ASSERT(o.approximate + o.untranslated > 0);
     // the same programs, field for field, on every target
-    ASSERT_EQ_FMT(0x9B05DA51u, g_digest, "%08x");
+    ASSERT_EQ_FMT(0x4872F15Bu, g_digest, "%08x");
     PASS();
 }
 
@@ -797,6 +797,40 @@ TEST random_blues_to_alpha_agree_with_the_combiners(void) {
 }
 
 // ---- particular programs -----------------------------------------------------------------------
+
+// a luminance of a register (r0 = t0 * v0, then dot(r0, c0)) read only as a colour: approximated
+// as the register times the constant's sum, the colour where it would be grey, not white
+TEST a_register_luminance_is_its_colour(void) {
+    uint32_t state[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures;
+    static WlXboxPshProgram program;
+    memset(state, 0, sizeof state);
+    state[WL_XBOX_PSH_COMBINER_COUNT] = 2u | 0x100u;
+    state[WL_XBOX_PSH_CONSTANT0_0] = 0x004D961Du;      // 0.30, 0.59, 0.11
+    state[WL_XBOX_PSH_RGB_INPUTS0] = 0x08040000u;      // t0 * v0
+    state[WL_XBOX_PSH_RGB_OUTPUTS0] = 0xC0u;           // to r0
+    state[WL_XBOX_PSH_RGB_INPUTS0 + 1] = 0x0C010000u;  // dot(r0, c0)
+    state[WL_XBOX_PSH_RGB_OUTPUTS0 + 1] = 0x20C0u;     // to r0
+    state[WL_XBOX_PSH_ALPHA_INPUTS0] = 0x30000000u;    // r0.a = 1
+    state[WL_XBOX_PSH_ALPHA_OUTPUTS0] = 0xC0u;
+    g_fog_on = 0;
+    g_d0_alpha_map = 0;
+    textures_make(&textures, 1u);
+    ASSERT(wl_xbox_psh_translate(state, &textures, NULL, &program));
+    ASSERT(program.approximate);
+    Inputs in;
+    V4 maps[8];
+    memset(&in, 0, sizeof in);
+    memset(maps, 0, sizeof maps);
+    in.t[0] = (V4){{1.0f, 0.5f, 0.25f, 1.0f}};
+    in.v0 = (V4){{0.8f, 0.8f, 0.8f, 1.0f}};
+    maps[0] = in.t[0];
+    V4 got = simulate(&program, &in, maps);
+    for (int ch = 0; ch < 3; ch++) {
+        ASSERT_IN_RANGE(in.t[0].c[ch] * 0.8f, got.c[ch], 0.02f);
+    }
+    PASS();
+}
 
 // r0 = t1 or t2 by r0's alpha (t0's), a step at 128/255: the mux's two sides, exact, at each edge
 TEST the_mux_is_a_step(void) {
@@ -1132,6 +1166,7 @@ SUITE(psh_suite) {
     RUN_TEST(random_blues_to_alpha_agree_with_the_combiners);
     RUN_TEST(a_dot_product_to_the_alpha);
     RUN_TEST(the_mux_is_a_step);
+    RUN_TEST(a_register_luminance_is_its_colour);
     RUN_TEST(negated_mappings_take_no_register_of_their_own);
     RUN_TEST(an_expand_negate_is_one_stage);
     RUN_TEST(a_final_product_with_every_register_held);

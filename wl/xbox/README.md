@@ -47,7 +47,8 @@ at coordinates 1 and 2 (`WL_XBOX_PSH_BUMP_*`); D0's alpha from a texture is read
 
 A caller can make programs by hand for combiners it recognizes (`WlXboxPshRecipe`, tried before the
 translation): where the exact program needs more than the general translation can see, such as a
-dot product of a register, which no TEV swap reaches and the translation takes as 1. Its
+dot product of a register, which no TEV swap reaches: the translation makes it the register times
+the other value where only the colour reads it (a luminance the colour itself), else takes it as 1. Its
 `vertices` values from `WL_XBOX_PSH_VERTICES_RECIPE` up are the caller's own.
 `wl_xbox_psh_apply` writes a program to GX.
 

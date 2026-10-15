@@ -30,8 +30,9 @@
 // GX's inputs are unsigned and clamped: the signed mappings (expand, half bias) come out clamped
 // to [0, 1], and a negation as 0, except in a dot product, whose signed terms TEV's lerp, bias and
 // scale make exactly (the bump mapping it serves: signed dot products). A dot product of a
-// register is taken as 1 (no TEV swap reaches a register's channels); a caller that knows such a
-// program makes it by hand instead (WlXboxPshRecipe).
+// register (no TEV swap reaches a register's channels) is its product with the other value (a
+// constant's channels summed) where only the colour reads it, the colour for its grey, and else
+// taken as 1; a caller that knows such a program makes it by hand instead (WlXboxPshRecipe).
 //
 // A bumped reflection's cube map (DOT_RFLCT_SPEC) is read through GX's indirect unit, two stages
 // before each lookup making its offset from the bump map (bumped_lookups_place), and its normal's
@@ -1092,7 +1093,8 @@ but its swap tables put one channel of a texture or rasterized colour in
 all three (swap_tables_set), and its constant selections one channel of
 a constant: three products, summed in a register. Of two constants, the dot
 product is a constant. Neither can be a register (no swap reaches them): the
-product is then taken as 1, and the program marked approximate. */
+product is then the register times the other value where only the colour
+reads it (as_product), else 1, and the program marked approximate. */
 
 /* an operand's value per channel, when it is a constant */
 static bool constant_value(const struct translation *translation, const struct operand *value,
@@ -1176,7 +1178,7 @@ static bool dot_unavailable(struct translation *translation, unsigned long input
 }
 
 static struct operand emit_dot(struct translation *translation, int portion, struct operand x,
-                               struct operand y, int *temporary) {
+                               struct operand y, bool as_product, int *temporary) {
     float a[3], b[3];
     unsigned char negative = (unsigned char)(x.negative ^ y.negative);
     struct operand result;
@@ -1213,6 +1215,33 @@ static struct operand emit_dot(struct translation *translation, int portion, str
     }
     if (!terms)
         return zero;
+    if ((!broadcastable(&x) || !broadcastable(&y)) && as_product && !translation->economical) {
+        /* a register's colour, whose channels no TEV swap reaches, where only
+        the colour reads the result: its product with the other value (a
+        constant's channels summed), the colour where the dot product would
+        be its grey (a luminance), not white */
+        struct operand value = broadcastable(&x) ? y : x, other = broadcastable(&x) ? x : y;
+
+        if (constant_value(translation, &other, a)) {
+            float sum = a[0] + a[1] + a[2];
+            uint32_t level = (uint32_t)((sum > 1.0f ? 1.0f : sum) * 255.0f + 0.5f);
+
+            other = level >= 255 ? one
+                                 : operand(_kind_konst,
+                                           konst_slot(translation, (level << 24) | (level << 16) |
+                                                                       (level << 8) | level),
+                                           _channel_natural);
+        }
+        approximate(translation->program, "a dot product of a register, as its product");
+        reg = register_allocate(translation, portion);
+        if (reg < 0)
+            return one;
+        emit_product(translation, portion, value, other, zero, 0, reg);
+        *temporary = reg;
+        result = operand(_kind_register, (unsigned char)reg, _channel_natural);
+        result.negative = negative;
+        return result;
+    }
     if (!broadcastable(&x) || !broadcastable(&y) ||
         (translation->economical && (terms & (terms - 1)))) {
         approximate(translation->program, translation->economical ? "a dot product, economically"
@@ -1676,7 +1705,8 @@ static struct operand combiner_input(struct translation *translation, unsigned l
             recipe->valid && !recipe->dot ? register_allocate(translation, _portion_alpha) : -1;
 
         if (recipe->valid && recipe->dot) {
-            value = emit_dot(translation, _portion_alpha, recipe->x[0], recipe->y[0], temporary);
+            value = emit_dot(translation, _portion_alpha, recipe->x[0], recipe->y[0], false,
+                             temporary);
             /* (a negated dot product of values not below 0: the colour wrote
             it clamped, 0) */
             if (value.negative) {
@@ -2323,6 +2353,21 @@ static int mux_product_register(int portion,
     return -1;
 }
 
+/* whether the alpha half reads the blue of a dot product's output (its own
+name or the sum's) after its stage */
+static bool dot_blue_read(const struct translation *translation, int stage, unsigned long own,
+                          unsigned long sum) {
+    int index;
+
+    for (index = 0; index < 2; index++) {
+        int name = name_of(index ? sum : own);
+
+        if (name >= 0 && blue_read_later(translation, stage, name))
+            return true;
+    }
+    return false;
+}
+
 /* what the mux chooses when r0's alpha is a constant: 1 CD (its top bit set,
 or with msb false its low bit), 0 AB; -1 when it is not a constant */
 static int mux_constant(const struct translation *translation, bool msb) {
@@ -2495,7 +2540,10 @@ product with 1 */
         dot_unlit[0] = dot_unavailable(translation, inputs >> 16, stage);
         inputs_mapped[0] = dot_unlit[0] ? one
                                         : emit_dot(translation, _portion_color, inputs_mapped[0],
-                                                   inputs_mapped[1], &dot_temporaries[0]);
+                                                   inputs_mapped[1],
+                                                   !dot_blue_read(translation, stage, ab_name,
+                                                                  sum_name),
+                                                   &dot_temporaries[0]);
         inputs_mapped[1] = one;
     }
     if (portion == _portion_color && (flags & 0x01) && !signed_dot[1] && name_of(cd_name) < 0 &&
@@ -2506,7 +2554,10 @@ product with 1 */
         dot_unlit[1] = dot_unavailable(translation, inputs, stage);
         inputs_mapped[2] = dot_unlit[1] ? one
                                         : emit_dot(translation, _portion_color, inputs_mapped[2],
-                                                   inputs_mapped[3], &dot_temporaries[1]);
+                                                   inputs_mapped[3],
+                                                   !dot_blue_read(translation, stage, cd_name,
+                                                                  sum_name),
+                                                   &dot_temporaries[1]);
         inputs_mapped[3] = one;
     }
     if (portion == _portion_color) {
