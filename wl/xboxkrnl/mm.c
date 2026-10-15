@@ -94,13 +94,33 @@ void k_MmGetPhysicalAddress(void) {
     RET(phys);
 }
 
-// The physical page lock and persistence calls have nothing to do here.
+// VOID MmLockUnlockBufferPages(PVOID BaseAddress, SIZE_T NumberOfBytes, BOOLEAN UnlockPages): the
+// pages behind the buffer keep their physical addresses while locked (a contiguous allocation does
+// not move them).
 void k_MmLockUnlockBufferPages(void) {
+    uint32_t va = ARG(0), bytes = ARG(1);
+    bool lock = (ARG(2) & 0xFFu) == 0;
+    if (bytes == 0) {
+        return;
+    }
+    uint32_t first = va & ~(WL_XB_PAGE - 1u), last = (va + bytes - 1u) & ~(WL_XB_PAGE - 1u);
+    for (uint32_t page = first;; page += WL_XB_PAGE) {
+        uint32_t phys = 0;
+        if (wl_xb_va_to_phys(page, &phys)) {
+            (void)wl_xb_phys_lock(phys, lock);
+        }
+        if (page == last) {
+            break;
+        }
+    }
 }
 
+// VOID MmLockUnlockPhysicalPage(ULONG_PTR PhysicalAddress, BOOLEAN UnlockPage)
 void k_MmLockUnlockPhysicalPage(void) {
+    (void)wl_xb_phys_lock(ARG(0), (ARG(1) & 0xFFu) == 0);
 }
 
+// Persistence across a title's reboot has nothing to do here.
 void k_MmPersistContiguousMemory(void) {
 }
 

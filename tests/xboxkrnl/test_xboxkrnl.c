@@ -40,7 +40,7 @@ static const uint16_t k_ordinals[] = {
     127, 126, 268, 53, 51, 8, 189, 225, 186, 233, 234, 235, 187, 192, 221, 255, 258, 291, 277, 294, 108, 145, 159, 158,
     113, 107, 149, 119, 109, 98, 44, 190, 202, 219, 236, 211, 226, 207, 210, 218, 184, 199, 217, 166, 171, 173, 168, 305,
     304, 289, 279, 362, 335, 336, 337, 340, 338, 339, 24, 99, 232, 238, 112, 132, 128, 156, 322, 224, 129, 161,
-    123, 138, 205, 160,
+    123, 138, 205, 160, 175, 176,
 };
 enum {
     S_PERF_FREQ, S_PERF_COUNTER, S_COMPARE_MEMORY, S_INTERLOCKED_INC, S_INTERLOCKED_CMPXCHG, S_DBGPRINT,
@@ -55,6 +55,7 @@ enum {
     S_KE_DELAY, S_NT_USER_APC, S_NT_YIELD, S_KE_INIT_SEMAPHORE, S_KE_RELEASE_SEMAPHORE, S_KE_SYSTEM_TIME,
     S_KE_TICK_COUNT, S_HW_INFO, S_NT_RESUME, S_KE_RAISE_TO_DPC, S_KF_LOWER_IRQL,
     S_KE_PULSE_EVENT, S_KE_RESET_EVENT, S_NT_PULSE_EVENT, S_KF_RAISE_IRQL,
+    S_MM_LOCK_BUFFER, S_MM_LOCK_PHYS,
 };
 
 static uint8_t *g_image; // the XBE's bytes
@@ -1222,6 +1223,29 @@ TEST virtual_and_contiguous_memory(void) {
     ASSERT_EQ_FMT(0x61000u, KN(S_MM_PHYS, va), "%x");
     ASSERT_EQ_FMT(0x61000u, KN(S_MM_PHYS, 0xF0061000u), "%x"); // the tiled alias
     KN(S_MM_FREE_CONTIG, va);
+    // a locked user page keeps its physical address: a contiguous allocation over it fails rather
+    // than move it (MmLockUnlockBufferPages), and moves it once it is unlocked
+    wl_xb_wr32(base_p, 0);
+    wl_xb_wr32(size_p, 0x1000);
+    ASSERT_EQ_FMT(0u, KN(S_NT_ALLOC_VM, base_p, 0, size_p, 0x3000, 4), "%08x"); // reserve and commit
+    uint32_t user = wl_xb_rd32(base_p);
+    wl_xb_wr32(user, 0x10C4EDu);
+    uint32_t p0 = KN(S_MM_PHYS, user);
+    KN(S_MM_LOCK_BUFFER, user + 0x10u, 0x20u, 0); // lock
+    ASSERT_EQ_FMT(0u, KN(S_MM_CONTIG_EX, 0x1000u, p0, p0 + 0xFFFu, 0, 4), "%08x");
+    ASSERT_EQ_FMT(p0, KN(S_MM_PHYS, user), "%x");
+    KN(S_MM_LOCK_PHYS, p0, 0); // and once more by its physical address: two locks
+    KN(S_MM_LOCK_BUFFER, user, 0x1000u, 1); // one unlock
+    ASSERT_EQ_FMT(0u, KN(S_MM_CONTIG_EX, 0x1000u, p0, p0 + 0xFFFu, 0, 4), "%08x");
+    KN(S_MM_LOCK_PHYS, p0, 1); // the last
+    uint32_t over = KN(S_MM_CONTIG_EX, 0x1000u, p0, p0 + 0xFFFu, 0, 4);
+    ASSERT_EQ_FMT(0x80000000u | p0, over, "%08x");
+    ASSERT(KN(S_MM_PHYS, user) != p0); // moved, with its bytes
+    ASSERT_EQ_FMT(0x10C4EDu, wl_xb_rd32(user), "%x");
+    KN(S_MM_FREE_CONTIG, over);
+    wl_xb_wr32(base_p, user);
+    wl_xb_wr32(size_p, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_FREE_VM, base_p, size_p, 0x8000), "%08x");
     // the GPU's instance memory: the top of the RAM
     uint32_t pad = gmem(4);
     ASSERT_EQ_FMT(0x84000000u, KN(S_MM_GPU_INSTANCE, 0x5000, pad), "%08x");
