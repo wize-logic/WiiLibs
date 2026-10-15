@@ -432,8 +432,9 @@ def main() -> int:
     parser.add_argument("--wii-eurgb60", choices=("on", "off"), default=None,
                         help="the console's EuRGB60 setting (SYSCONF IPL.E60); it matters only in a PAL region "
                              "(a PAL NAND: Dolphin's region setting), where off gives 576i at 50 Hz")
-    parser.add_argument("--video", default="", help="Dolphin's video backend (D3D, D3D12, Vulkan, OGL; "
-                                                    "default: Dolphin's own)")
+    parser.add_argument("--video", default="Vulkan",
+                        help="Dolphin's video backend (Vulkan, D3D, D3D12, OGL, or '' for Dolphin's own; default "
+                             "Vulkan: long runs on Direct3D 11 have reset the GPU's driver)")
     parser.add_argument("--dump-frames", type=Path, help="dump every frame as PNGs into this folder")
     parser.add_argument("--name", default="wl-dolphin", help="the work folder's name under %%TEMP%%")
     parser.add_argument("--break", dest="break_at", action="append", default=[], metavar="SYMBOL",
