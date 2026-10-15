@@ -779,7 +779,10 @@ and the target is returned to the caller to record); the back buffer is put back
 whole of it that writes the parked colour and, through a Z texture (`GX_SetZTexture` replace, depth
 test always passing), the parked depth. `wl_gx_target_clear` is a clear of a rectangle once the
 frame has begun, also a quad. `wl_gx_begin_frame` gives the EFB to the back buffer, and
-`wl_gx_end_frame` puts it back if a target holds it. The target functions that draw use raw GX and
+`wl_gx_end_frame` puts it back if a target holds it. While a target holds it,
+`wl_gx_target_parked_colour` gives the back buffer's parked colour as an RGBA8 texture's image (the
+part parked), for a caller that reads the picture it is drawing while it draws into a target.
+The target functions that draw use raw GX and
 call `wl_gx_invalidate_shadow` after; what they leave set is listed with `wl_gx_target_clear`.
 The part of the EFB that is the back buffer defaults to the video mode's width and EFB height and
 is set with `wl_gx_target_set_back_buffer_size` (a game that draws a 640 by 480 picture in a taller

@@ -21,6 +21,7 @@
 #include "wl/xbox/nv2a_color.h"
 #include "wl/xbox/nv2a_pipeline.h"
 #include "wl/xbox/nv2a_texture.h"
+#include "wl/xbox/psh_bias.h"
 #include "wl/xbox/psh_cache.h"
 
 #define TAG "nv2a"
@@ -105,6 +106,9 @@ struct WlNv2aGx {
     // the frame
     bool frame_open, back_drawn;
     uint32_t back_phys;
+    // the depth buffer the back buffer was last drawn with: a colour surface there is a target
+    // (Halo's blur of the picture draws into it, the picture read back as a texture)
+    uint32_t back_zeta;
     uint32_t displays[4];
     unsigned display_next;
     uint32_t frame;
@@ -393,12 +397,16 @@ static bool is_display(const WlNv2aGx *gx, uint32_t phys) {
 
 // a surface the back buffer holds: one the display was flipped to, or one the size of the screen
 // (not a multisampled one: a title resolves that into the surface it shows, reading it as a
-// texture, so it is a render target)
+// texture, so it is a render target; nor one at the back buffer's depth buffer, whose memory a
+// title borrows for a picture of the screen's size between two passes of its own)
 static bool surface_is_screen(const WlNv2aGx *gx, const WlNv2aSurface *s) {
     uint32_t w = s->clip_width / s->samples_x, h = s->clip_height / s->samples_y;
 
     if (s->color_format == 0 || is_display(gx, s->color_phys)) {
         return true;
+    }
+    if (s->color_phys != 0 && s->color_phys == gx->back_zeta) {
+        return false;
     }
     return !s->swizzled && s->samples_x == 1 && s->samples_y == 1 && w * 4u >= gx->cfg.width * 3u &&
            h * 4u >= gx->cfg.height * 3u;
@@ -499,6 +507,9 @@ static bool surface_prepare(WlNv2aGx *gx, const WlNv2aSurface *s) {
         use_back_buffer(gx);
         if (s->color_format != 0) {
             gx->back_phys = s->color_phys;
+        }
+        if (s->zeta_format != 0 && s->zeta_phys != 0 && s->zeta_phys != s->color_phys) {
+            gx->back_zeta = s->zeta_phys;
         }
         gx->back_drawn = true;
         wl_gx_target_drawn();
@@ -660,10 +671,41 @@ static bool power_of_two(uint32_t v) {
     return v != 0 && (v & (v - 1u)) == 0;
 }
 
-// a resolved render target at a texture's address, as an entry the stages read like any texture
+// a resolved render target at a texture's address, as an entry the stages read like any texture;
+// or the back buffer of the frame being drawn, while a target has the EFB: its colour as it was
+// parked, the picture so far (Halo's blur reads it into a target of its size, and the next pass
+// back), where a kept frame would be one shown before
 static const WlNv2aTexEntry *target_texture(WlNv2aGx *gx, unsigned stage, const WlNv2aTexture *t) {
     unsigned i;
 
+    if (gx->owner != NULL && gx->frame_open && gx->back_drawn && t->phys == gx->back_phys &&
+        t->phys != 0) {
+        uint32_t w = 0, h = 0;
+        const void *parked = wl_gx_target_parked_colour(&w, &h);
+
+        if (parked != NULL && w >= (gx->cfg.width & ~3u) && h >= (gx->cfg.height & ~3u)) {
+            WlNv2aTexEntry *e = &gx->target_entries[stage];
+
+            memset(e, 0, sizeof *e);
+            e->phys = t->phys;
+            e->image = (void *)(uintptr_t)parked;
+            e->layout.format = (WlGxcFormat)WL_GX_TEX_RGBA8;
+            e->layout.width = w;
+            e->layout.height = h;
+            e->layout.levels = 1;
+            e->layout.image_bytes = wl_gx_tex_bytes(WL_GX_TEX_RGBA8, w, h);
+            e->layout.total_bytes = e->layout.image_bytes;
+            e->contents = WL_XBOX_PSH_TEXTURE_ALL;
+            e->linear = t->linear;
+            e->width = (uint16_t)t->width;
+            e->height = (uint16_t)t->height;
+            e->serial = 0x80000000u | TARGETS;
+            // (parked anew at each change of the EFB's owner: GX's texture cache may hold the
+            // last park)
+            gx->texture_memory_changed = true;
+            return e;
+        }
+    }
     for (i = 0; i < TARGETS; i++) {
         RenderTarget *r = &gx->targets[i];
 
@@ -777,7 +819,7 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
 
 static bool tev_setup(WlNv2aGx *gx, const WlNv2aKelvin *k) {
     WlXboxPshTextures textures;
-    uint32_t words[WL_XBOX_PSH_WORDS];
+    uint32_t words[WL_XBOX_PSH_WORDS], unbiased[WL_XBOX_PSH_WORDS];
     const WlXboxPshProgram *program;
     bool usable, translated;
 
@@ -786,6 +828,11 @@ static bool tev_setup(WlNv2aGx *gx, const WlNv2aKelvin *k) {
         wl_gx_ramp_bind(WL_XBOX_PSH_FOG_TEXMAP);
     }
     wl_nv2a_psh_words(k, words);
+    // (signed sums that come back to [0, 1] made without registers below 0, which GX's lose)
+    if (wl_xbox_psh_unbias(words, unbiased)) {
+        memcpy(words, unbiased, sizeof words);
+        gx->stats.programs_unbiased++;
+    }
     program = wl_xbox_psh_cache_program(&gx->psh, words, wl_nv2a_k(k, WL_NV2A_K_SET_SHADER_STAGE_PROGRAM), &textures,
                                         &usable, &translated);
     gx->last_program = program;
