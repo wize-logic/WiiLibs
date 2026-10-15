@@ -7,6 +7,11 @@
 //
 //     bench_xboxapu [frames] [expected checksum]
 //
+// BENCH_VOICES=mute plays the same voices with every target at full attenuation (silent), and
+// BENCH_VOICES=pause pauses every voice once it is on: what the voices cost when they add nothing.
+// BENCH_VOICES=blink silences every voice on odd game ticks (a silent voice going on and coming
+// back as it would have played).
+//
 // With an expected checksum (hex), exits 1 when the checksum differs (ctest runs it so). Count
 // instructions with tools/qemu_icount.py on a ppc-be build (--base with fewer frames for the cost
 // a frame).
@@ -160,6 +165,8 @@ typedef struct {
 static Voice g_voices[64];
 static uint32_t g_nvoices;
 static uint32_t g_release_voice; // released at game tick 40
+static bool g_mute, g_pause;     // BENCH_VOICES: every target silent, every voice paused
+static bool g_blink;             // BENCH_VOICES: every target silent on odd game ticks
 
 // VOLA, VOLB, VOLC of the eight attenuations: 0..5 at bits 4 and 20, 6 and 7 in the low nibbles.
 static void vol_words(const uint16_t *vol, uint32_t w[3]) {
@@ -170,8 +177,9 @@ static void vol_words(const uint16_t *vol, uint32_t w[3]) {
 }
 
 static void voice_setup(WlXboxApu *apu, uint32_t v, const Voice *d) {
+    static const uint16_t silent[8] = {X, X, X, X, X, X, X, X};
     uint32_t w[3];
-    vol_words(d->vol, w);
+    vol_words(g_mute ? silent : d->vol, w);
     m(apu, 0x2F8, v);
     m(apu, 0x300, d->vbin);
     m(apu, 0x304, d->fmt | d->bins67);
@@ -391,6 +399,9 @@ static WlXboxApu *scene(bool sum) {
         }
         m(apu, 0x120, 0xFFFFu | g_voices[v].list << 16);
         m(apu, 0x124, v | (g_voices[v].env[0] != 0 ? 2u << 28 : 0)); // EA from its attack
+        if (g_pause) {
+            m(apu, 0x140, v | 1u << 18);
+        }
     }
     return apu;
 }
@@ -402,7 +413,16 @@ static void game_tick(WlXboxApu *apu, uint32_t tick) {
     }
     for (uint32_t v = 0; v < g_nvoices; v++) {
         Voice *d = &g_voices[v];
-        if (d->moving) {
+        if (g_blink) {
+            static const uint16_t silent[8] = {X, X, X, X, X, X, X, X};
+            uint32_t w[3];
+            vol_words(tick & 1u ? silent : d->vol, w);
+            m(apu, 0x2F8, v);
+            m(apu, 0x360, w[0]);
+            m(apu, 0x364, w[1]);
+            m(apu, 0x368, w[2]);
+        }
+        if (d->moving && !g_mute) {
             d->vol[0] = (uint16_t)(0x100u + (tick * 37u + v * 11u) % 0x300u);
             d->vol[1] = (uint16_t)(0x100u + (tick * 23u + v * 7u) % 0x300u);
             uint32_t w[3];
@@ -447,6 +467,10 @@ int main(int argc, char **argv) {
     const bool check = argc > 2;
     const uint32_t expect = check ? (uint32_t)strtoul(argv[2], NULL, 16) : 0;
     const bool sum = check || getenv("BENCH_NO_SUM") == NULL; // BENCH_NO_SUM=1: the model alone
+    const char *mode = getenv("BENCH_VOICES");
+    g_mute = mode != NULL && strcmp(mode, "mute") == 0;
+    g_pause = mode != NULL && strcmp(mode, "pause") == 0;
+    g_blink = mode != NULL && strcmp(mode, "blink") == 0;
     WlXboxApu *apu = scene(sum);
     if (apu == NULL) {
         fprintf(stderr, "out of memory\n");

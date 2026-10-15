@@ -95,6 +95,12 @@ the voice processor was made for the Wii: ADPCM a block at a time through one ta
 out only when they change, the bins' additions made together up to eight voices a pass, a
 multiply-high for each), 75 million a second at 1500 frames; on the host (x86-64, -O2) about
 4 us a frame. Its checksum over 3000 frames (a ctest) pins the bins and the output bit for bit.
+`BENCH_VOICES=mute` plays the same voices with every target silent and `BENCH_VOICES=pause` pauses
+them: 49 400 instructions a frame playing, 24 200 silent (930 a voice: a silent voice is not
+interpolated or mixed, but its samples are still fetched and its ADPCM decoded, to keep its
+position, its stream's notifications and the two samples it resumes from exact) and 2 200 paused
+(85 a voice). In the game (Dolphin, the profile's log) 12 to 17 voices a frame cost 20 to 29 us,
+3 to 4% of the processor at 1500 frames a second.
 
 ## Tests
 
