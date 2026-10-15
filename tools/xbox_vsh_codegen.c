@@ -13,12 +13,16 @@
 // half is its instruction count, then four words an instruction. Programs met twice are written
 // once.
 //
-// usage: xbox_vsh_codegen [--if-exists] [--accessor name] microcode.inc output.c [table]
+// usage: xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] microcode.inc
+//            output.c [table]
 //   (table: the name of the table, default xbox_vsh_natives, and of its count, <table>_count;
 //   --if-exists: a microcode file that is not there has no programs, an empty table; --accessor:
 //   also a function of that name, const WlXboxVshNative *name(unsigned long *count), that gives
 //   the table and its count, which a runtime can declare weak: wl_add_xbox_title's
-//   wl_xb_title_vsh_natives)
+//   wl_xb_title_vsh_natives; --colors-positions: also each program's colours-only function and,
+//   for a skinned one, its four-positions function (wl_xbox_vsh_run_colors and _positions, which
+//   only the tests call: without it the table's entries for them are NULL, and a title's program
+//   is not paying for code it never runs))
 
 #include "../wl/xbox/vsh.c"
 
@@ -734,7 +738,7 @@ static void reuse_code(FILE *out, const WlXboxVshProgram *program, const ReusePr
 
 int main(int argc, char **argv) {
     static uint32_t words[MAXIMUM_WORDS];
-    static unsigned long hashes[MAXIMUM_PROGRAMS], counts[MAXIMUM_PROGRAMS];
+    static unsigned long hashes[MAXIMUM_PROGRAMS], counts[MAXIMUM_PROGRAMS], checks[MAXIMUM_PROGRAMS];
     static int positioned[MAXIMUM_PROGRAMS];
     static WlXboxVshProgram program;
     static unsigned needs[WL_XBOX_VSH_MAX_INSTRUCTIONS];
@@ -745,11 +749,13 @@ int main(int argc, char **argv) {
     FILE *in, *out;
     int in_comment = 0;
     const char *table = "xbox_vsh_natives", *accessor = NULL;
-    int if_exists = 0;
+    int if_exists = 0, colors_positions = 0;
 
     while (argc > 1 && argv[1][0] == '-' && argv[1][1] == '-') {
         if (strcmp(argv[1], "--if-exists") == 0) {
             if_exists = 1;
+        } else if (strcmp(argv[1], "--colors-positions") == 0) {
+            colors_positions = 1;
         } else if (strcmp(argv[1], "--accessor") == 0 && argc > 2) {
             accessor = argv[2];
             argc--;
@@ -762,8 +768,8 @@ int main(int argc, char **argv) {
     }
     if (argc != 3 && argc != 4) {
         fprintf(stderr,
-                "usage: xbox_vsh_codegen [--if-exists] [--accessor name] microcode.inc output.c "
-                "[table]\n");
+                "usage: xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] "
+                "microcode.inc output.c [table]\n");
         return 2;
     }
     if (argc == 4)
@@ -822,6 +828,8 @@ int main(int argc, char **argv) {
         if (!count || position > word_count)
             continue;
         hash = wl_xbox_vsh_hash(instructions, count);
+        /* (a second program of one hash and count is left to the interpreter:
+        the functions are named by the hash) */
         for (earlier = 0; earlier < program_count; earlier++) {
             if (hashes[earlier] == hash && counts[earlier] == count)
                 break;
@@ -830,24 +838,27 @@ int main(int argc, char **argv) {
             continue;
         hashes[program_count] = hash;
         counts[program_count] = count;
+        checks[program_count] = wl_xbox_vsh_check(instructions, count);
         program_count++;
         wl_xbox_vsh_compile(instructions, count, NULL, 0, &program);
         dependencies_comment(out, &program);
         constant_free_comment(out, &program);
-        /* (its colours and fog alone) */
-        fprintf(out,
-                "static void program_%08lx_colors(const float (*c)[4], const float (*v)[4], "
-                "WlXboxVshOutput *o)\n"
-                "{\n\tfloat r[12][4] = { { 0.0f } };\n\tfloat p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"
-                "\tfloat A[4], B[4], C[4], M[4], I[4];\n\tint a0 = 0;\n\n"
-                "\t(void)c;\n\t(void)v;\n\t(void)a0;\n\t(void)A;\n\t(void)B;\n\t(void)C;\n\t(void)"
-                "r;\n\t(void)p;\n",
-                hash);
-        colors_only = 1;
-        for (index = 0; index < program.count; index++)
-            instruction_code(out, &program.instructions[index], index);
-        colors_only = 0;
-        fprintf(out, "}\n\n");
+        /* (its colours and fog alone, when asked for) */
+        if (colors_positions) {
+            fprintf(out,
+                    "static void program_%08lx_colors(const float (*c)[4], const float (*v)[4], "
+                    "WlXboxVshOutput *o)\n"
+                    "{\n\tfloat r[12][4] = { { 0.0f } };\n\tfloat p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"
+                    "\tfloat A[4], B[4], C[4], M[4], I[4];\n\tint a0 = 0;\n\n"
+                    "\t(void)c;\n\t(void)v;\n\t(void)a0;\n\t(void)A;\n\t(void)B;\n\t(void)C;\n\t(void)"
+                    "r;\n\t(void)p;\n",
+                    hash);
+            colors_only = 1;
+            for (index = 0; index < program.count; index++)
+                instruction_code(out, &program.instructions[index], index);
+            colors_only = 0;
+            fprintf(out, "}\n\n");
+        }
         /* (the program, for the outputs a draw reads: each instruction
         that reaches none of them skipped) */
         /* (for count vertices at once, so the function's entry and exit, its
@@ -900,7 +911,7 @@ int main(int argc, char **argv) {
         whose every node a device may make a matrix of; the others' matrices
         are made once for a frame's constants, and their code would take the
         processor's memory for nothing) */
-        {
+        if (colors_positions) {
             WlXboxVshDependencies dependencies;
 
             wl_xbox_vsh_analyze(&program, &dependencies);
@@ -911,16 +922,18 @@ int main(int argc, char **argv) {
     }
     fprintf(out, "const WlXboxVshNative %s[] =\n{\n", table);
     for (index = 0; index < program_count; index++) {
-        char positions[40] = "NULL";
+        char colors[40] = "NULL", positions[40] = "NULL";
 
+        if (colors_positions)
+            snprintf(colors, sizeof(colors), "program_%08lx_colors", hashes[index]);
         if (positioned[index])
             snprintf(positions, sizeof(positions), "program_%08lx_positions", hashes[index]);
-        fprintf(out, "\t{ 0x%08lxUL, %lu, program_%08lx, program_%08lx_colors, %s, program_%08lx_batch },\n",
-                hashes[index], counts[index], hashes[index], hashes[index], positions, hashes[index]);
+        fprintf(out, "\t{ 0x%08lxUL, %lu, 0x%08lxUL, program_%08lx, %s, %s, program_%08lx_batch },\n",
+                hashes[index], counts[index], checks[index], hashes[index], colors, positions, hashes[index]);
     }
     /* (C has no empty array: a table of none holds one entry no program matches) */
     if (!program_count)
-        fprintf(out, "\t{ 0UL, 0, NULL, NULL, NULL, NULL },\n");
+        fprintf(out, "\t{ 0UL, 0, 0UL, NULL, NULL, NULL, NULL },\n");
     fprintf(out, "};\n\nconst unsigned long %s_count = %lu;\n", table, program_count);
     if (accessor)
         fprintf(out,

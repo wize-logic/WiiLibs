@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "greatest.h"
+#include "wl/xbox/nv2a_pipeline.h"
 #include "wl/xbox/vsh_native.h"
 
 static const uint32_t microcode[] = {
@@ -113,8 +114,10 @@ TEST compile_finds_a_function_by_hash_and_count(void) {
     unsigned long count;
     const uint32_t *words = program_words(0, &count);
     WlXboxVshNative natives[2] = {
-        {wl_xbox_vsh_hash(words, count), count + 1, native_run, native_colors, NULL, NULL},
-        {wl_xbox_vsh_hash(words, count), count, native_run, native_colors, NULL, NULL},
+        {wl_xbox_vsh_hash(words, count), count + 1, wl_xbox_vsh_check(words, count), native_run,
+         native_colors, NULL, NULL},
+        {wl_xbox_vsh_hash(words, count), count, wl_xbox_vsh_check(words, count), native_run,
+         native_colors, NULL, NULL},
     };
     wl_xbox_vsh_compile(words, count, natives, 1, &g_program); // (the count differs)
     ASSERT(g_program.native == NULL);
@@ -130,6 +133,66 @@ TEST compile_finds_a_function_by_hash_and_count(void) {
     wl_xbox_vsh_run_colors(&g_program, (const float (*)[4])g_constants,
                            (const float (*)[4])g_inputs, &output);
     ASSERT_EQ(7.0f, output.d0[0]);
+    PASS();
+}
+
+// program 0 with another constant in its first instruction, and the word its last instruction
+// leaves unused (word 0) chosen so that the two have one FNV-1a hash: two programs, one hash
+static unsigned long colliding_programs(uint32_t a[WL_XBOX_VSH_MAX_INSTRUCTIONS * 4],
+                                        uint32_t b[WL_XBOX_VSH_MAX_INSTRUCTIONS * 4]) {
+    unsigned long count, i;
+    const uint32_t *words = program_words(0, &count);
+    uint32_t ha = 2166136261u, hb = 2166136261u;
+    memcpy(a, words, count * 16);
+    memcpy(b, words, count * 16);
+    b[1] ^= 1u << 13; // (c[0] read as c[1])
+    for (i = 0; i < (count - 1) * 4; i++) {
+        ha = (ha ^ a[i]) * 16777619u;
+        hb = (hb ^ b[i]) * 16777619u;
+    }
+    b[i] = a[i] ^ ha ^ hb;
+    return count;
+}
+
+TEST another_program_of_the_same_hash_is_not_taken_for_it(void) {
+    static uint32_t a[WL_XBOX_VSH_MAX_INSTRUCTIONS * 4], b[WL_XBOX_VSH_MAX_INSTRUCTIONS * 4];
+    static WlNv2aKelvin k;
+    static WlNv2aPipeline pipeline;
+    unsigned long count = colliding_programs(a, b);
+    ASSERT_EQ(wl_xbox_vsh_hash(a, count), wl_xbox_vsh_hash(b, count));
+    ASSERT(wl_xbox_vsh_check(a, count) != wl_xbox_vsh_check(b, count));
+    // the compiled functions: a's entry is not b's
+    WlXboxVshNative natives[1] = {{wl_xbox_vsh_hash(a, count), count, wl_xbox_vsh_check(a, count),
+                                   native_run, native_colors, NULL, NULL}};
+    wl_xbox_vsh_compile(a, count, natives, 1, &g_program);
+    ASSERT(g_program.native == native_run);
+    wl_xbox_vsh_compile(b, count, natives, 1, &g_program);
+    ASSERT(g_program.native == NULL);
+    ASSERT_EQ(97u, g_program.instructions[0].constant);
+    // the pipeline's programs: b compiled, not a's found
+    wl_nv2a_pipeline_init(&pipeline, NULL, 0);
+    memset(&k, 0, sizeof k);
+    k.raw[(WL_NV2A_K_SET_TRANSFORM_EXECUTION_MODE & (WL_NV2A_K_METHODS - 1)) >> 2] =
+        WL_NV2A_XF_PROGRAM;
+    memcpy(k.program, a, count * 16);
+    k.program_generation = 1;
+    ASSERT(wl_nv2a_pipeline_begin(&pipeline, &k));
+    ASSERT_EQ(96u, pipeline.program->instructions[0].constant);
+    const WlXboxVshProgram *first = pipeline.program;
+    const uint32_t first_serial = first->serial;
+    memcpy(k.program, b, count * 16);
+    k.program_generation = 2;
+    ASSERT(wl_nv2a_pipeline_begin(&pipeline, &k));
+    ASSERT_EQ(97u, pipeline.program->instructions[0].constant);
+    ASSERT_EQ(2u, pipeline.compiled);
+    ASSERT(pipeline.program != first || pipeline.program->serial != first_serial);
+    // and a again: found
+    memcpy(k.program, a, count * 16);
+    k.program_generation = 3;
+    ASSERT(wl_nv2a_pipeline_begin(&pipeline, &k));
+    ASSERT_EQ(96u, pipeline.program->instructions[0].constant);
+    ASSERT_EQ(2u, pipeline.compiled);
+    ASSERT_EQ(1u, pipeline.found);
     PASS();
 }
 
@@ -254,6 +317,18 @@ TEST the_ilu_operations(void) {
     wl_xbox_vsh_ilu(7, (const float[4]){-0.5f, 0.25f, 0, 2.0f}, out);
     ASSERT_EQ(0.0f, out[1]);
     ASSERT_EQ(0.0f, out[2]);
+    // (n.h at or below 0: 0 whatever the power, as Direct3D's lit; not powf(0, power), 1 for a
+    // power of 0 and infinity for a negative one)
+    for (int i = 0; i < 3; i++) {
+        const float power = i == 0 ? 0.0f : i == 1 ? -2.0f : 2.0f;
+        wl_xbox_vsh_ilu(7, (const float[4]){0.5f, 0.0f, 0, power}, out);
+        ASSERT_EQ(0.5f, out[1]);
+        ASSERT_EQ(0.0f, out[2]);
+        wl_xbox_vsh_ilu(7, (const float[4]){0.5f, -0.25f, 0, power}, out);
+        ASSERT_EQ(0.0f, out[2]);
+    }
+    wl_xbox_vsh_ilu(7, (const float[4]){0.5f, 0.25f, 0, 0.0f}, out);
+    ASSERT_EQ(1.0f, out[2]);
     PASS();
 }
 
@@ -262,6 +337,11 @@ TEST shared_arithmetic(void) {
     ASSERT_EQ(-1.884467e+19f, wl_xbox_vsh_reciprocal_clamped(-0.0f));
     ASSERT_EQ(5.42101e-20f, wl_xbox_vsh_reciprocal_clamped(1.0e30f));
     ASSERT_EQ(0.25f, wl_xbox_vsh_reciprocal_clamped(4.0f));
+    // (of an infinity, the bound of its sign: 1 / +inf is +0)
+    ASSERT_EQ(5.42101e-20f, wl_xbox_vsh_reciprocal_clamped(INFINITY));
+    ASSERT_EQ(-5.42101e-20f, wl_xbox_vsh_reciprocal_clamped(-INFINITY));
+    ASSERT_EQ(-5.42101e-20f, wl_xbox_vsh_reciprocal_clamped(-1.0e30f));
+    ASSERT(isnan(wl_xbox_vsh_reciprocal_clamped(NAN)));
     ASSERT_EQ(0, wl_xbox_vsh_clamp(-3));
     ASSERT_EQ(WL_XBOX_VSH_CONSTANT_COUNT - 1, wl_xbox_vsh_clamp(500));
     for (int i = -4096; i <= 4096; i++) {
@@ -329,6 +409,7 @@ SUITE(vsh_suite) {
     RUN_TEST(compile_decodes_up_to_the_end_bit);
     RUN_TEST(the_hash_is_fnv1a_of_the_words);
     RUN_TEST(compile_finds_a_function_by_hash_and_count);
+    RUN_TEST(another_program_of_the_same_hash_is_not_taken_for_it);
     RUN_TEST(a_transform_runs_exactly);
     RUN_TEST(the_screen_conversion_captures_the_clip_position);
     RUN_TEST(relative_constants_follow_a0);

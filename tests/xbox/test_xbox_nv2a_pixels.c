@@ -764,6 +764,96 @@ TEST arrays_through_the_transform_unit_land_as_on_the_processor(void) {
     PASS();
 }
 
+// mov oPos.xyw, v0; mov oPos.z, c[0]: screen space at one depth for every vertex
+static const uint32_t f_screen_program_flat[][4] = {
+    {0x00000000, 0x0020001B, 0x0836006C, 0x0000D800}, // mov oPos.xyw, v0
+    {0x00000000, 0x002C001B, 0x0C36006C, 0x00002800}, // mov oPos.z, c[0]
+    {0x00000000, 0x0020061B, 0x0836006C, 0x0000F818}, // mov oD0, v3
+    {0x00000000, 0x0020121B, 0x0836006C, 0x0000F849}, // mov oT0, v9
+};
+
+// the EFB after two screen-space triangles from the arrays (the arrays' layout), one across depth 0
+// and one beyond the depth range, by the screen program (each vertex's depth its own) or the flat
+// one at a depth beyond the range, with or without the transform unit
+static int xf_screen_frame(uint32_t *efb, bool no_xf, bool flat, WlNv2aGxStats *stats) {
+    static const float corners[6][3] = {{100.0f, 100.0f, -4.0e6f}, {300.0f, 100.0f, 8.0e6f}, {100.0f, 300.0f, 8.0e6f},
+                                        {350.0f, 100.0f, 2.0e7f},  {550.0f, 100.0f, 2.0e7f}, {350.0f, 300.0f, 2.0e7f}};
+    TGuest g;
+    unsigned v;
+    int x, y;
+
+    g_no_xf = no_xf;
+    if (pixel_device(&g) == NULL) {
+        g_no_xf = false;
+        return 0;
+    }
+    g_no_xf = false;
+    if (flat) {
+        f_program(&g, 8, f_screen_program_flat, 4);
+        f_constant(&g, 96, 0, 0, 2.0e7f, 0);
+    } else {
+        f_program(&g, 8, f_screen_program, 3);
+    }
+    f_clear(&g, 0xFF000000u);
+    for (v = 0; v < 6; v++) {
+        uint32_t at = XF_ARRAY + 24u * v;
+
+        t_w32(&g, at, t_f(corners[v][0]));
+        t_w32(&g, at + 4, t_f(corners[v][1]));
+        t_w32(&g, at + 8, t_f(corners[v][2]));
+        t_w32(&g, at + 12, 0xFF40C080u);
+        t_w32(&g, at + 16, t_f(0.0f));
+        t_w32(&g, at + 20, t_f(0.0f));
+    }
+    t_m1(&g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT, 24u << 8 | 3u << 4 | WL_NV2A_VTX_F);
+    t_m1(&g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_OFFSET, XF_ARRAY);
+    t_m1(&g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT + 4 * 3, 24u << 8 | 4u << 4 | WL_NV2A_VTX_UB_D3D);
+    t_m1(&g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_OFFSET + 4 * 3, XF_ARRAY + 12);
+    t_m1(&g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT + 4 * 9, 24u << 8 | 2u << 4 | WL_NV2A_VTX_F);
+    t_m1(&g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_OFFSET + 4 * 9, XF_ARRAY + 16);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+    t_m1(&g, WL_NV2A_K_DRAW_ARRAYS, 5u << 24);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+    t_kick(&g);
+    for (y = 0; y < 480; y++) {
+        for (x = 0; x < 640; x++) {
+            efb[y * 640 + x] = pixel(x, y);
+        }
+    }
+    wl_nv2a_gx_stats(g_gx, stats);
+    pixel_done(&g);
+    return 1;
+}
+
+// a screen-space draw's depth clamped to the range as the processor clamps it, never clipped by GX:
+// a depth that varies with the position left to the processor, one the same at every vertex
+// clamped in the transform unit's matrix
+TEST screen_space_depths_beyond_the_range_are_clamped_on_the_transform_unit_too(void) {
+    static uint32_t cpu[640 * 480], xf[640 * 480];
+    WlNv2aGxStats cpu_stats, xf_stats;
+    unsigned i, covered, beyond, pass;
+
+    for (pass = 0; pass < 2; pass++) {
+        ASSERT(xf_screen_frame(cpu, true, pass == 1, &cpu_stats));
+        ASSERT(xf_screen_frame(xf, false, pass == 1, &xf_stats));
+        ASSERT_EQ(0u, cpu_stats.xf_draws);
+        ASSERT_EQ(pass == 1 ? 1u : 0u, xf_stats.xf_draws);
+        covered = beyond = 0;
+        for (i = 0; i < 640u * 480u; i++) {
+            if ((cpu[i] & 0xFFFFFF00u) != 0) {
+                covered++;
+            }
+            if (!near_rgb(cpu[i], xf[i], 8)) {
+                beyond++;
+            }
+        }
+        // (both triangles whole: 2 x 200 x 200 / 2)
+        ASSERT(covered > 39000u);
+        ASSERTm("pixels beyond the tolerance", beyond * 200u < covered);
+    }
+    PASS();
+}
+
 TEST a_second_pass_by_the_processor_passes_over_the_transform_units_depths(void) {
     static uint32_t efb[640 * 480];
     WlNv2aGxStats stats;
@@ -929,6 +1019,7 @@ SUITE(pixels_suite) {
     RUN_TEST(a_picture_shown_is_sampled_the_next_frame);
     RUN_TEST(capture_replays_to_the_same_pixels);
     RUN_TEST(arrays_through_the_transform_unit_land_as_on_the_processor);
+    RUN_TEST(screen_space_depths_beyond_the_range_are_clamped_on_the_transform_unit_too);
     RUN_TEST(a_second_pass_by_the_processor_passes_over_the_transform_units_depths);
     RUN_TEST(arrays_kept_for_gx_to_index_draw_to_the_bit);
     RUN_TEST(a_projective_coordinate_is_divided_at_each_pixel);

@@ -379,11 +379,13 @@ void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction
     program->native_positions = NULL;
     program->native_batch = NULL;
     program->hash = wl_xbox_vsh_hash(instructions, instruction_count);
+    program->serial = 0;
     {
         unsigned long hash = program->hash;
 
         for (index = 0; natives && index < native_count; index++) {
-            if (natives[index].hash == hash && natives[index].count == instruction_count) {
+            if (natives[index].hash == hash && natives[index].count == instruction_count &&
+                natives[index].check == wl_xbox_vsh_check(instructions, instruction_count)) {
                 program->native = natives[index].run;
                 program->native_colors = natives[index].colors;
                 program->native_positions = natives[index].positions;
@@ -660,6 +662,27 @@ unsigned long wl_xbox_vsh_hash(const uint32_t *instructions, unsigned long instr
     return hash;
 }
 
+static uint32_t rotate_left(uint32_t x, unsigned n) {
+    return (x << n) | (x >> (32u - n));
+}
+
+unsigned long wl_xbox_vsh_check(const uint32_t *instructions, unsigned long instruction_count) {
+    uint32_t hash = 0x9E3779B9u, k;
+    unsigned long index;
+
+    for (index = 0; index < instruction_count * 4; index++) {
+        k = rotate_left(instructions[index] * 0xCC9E2D51u, 15) * 0x1B873593u;
+        hash = rotate_left(hash ^ k, 13) * 5u + 0xE6546B64u;
+    }
+    hash ^= (uint32_t)(instruction_count * 16u);
+    hash ^= hash >> 16;
+    hash *= 0x85EBCA6Bu;
+    hash ^= hash >> 13;
+    hash *= 0xC2B2AE35u;
+    hash ^= hash >> 16;
+    return hash;
+}
+
 /* the ILU's exponent, logarithm and lighting (from C into I) */
 void wl_xbox_vsh_ilu(int ilu, const float c[4], float out[4]) {
     switch (ilu) {
@@ -690,7 +713,9 @@ void wl_xbox_vsh_ilu(int ilu, const float c[4], float out[4]) {
 
         out[0] = 1.0f;
         out[1] = c[0] > 0.0f ? c[0] : 0.0f;
-        out[2] = c[0] > 0.0f ? powf(c[1] > 0.0f ? c[1] : 0.0f, power) : 0.0f;
+        /* (0 unless both are above 0, as Direct3D's lit: never powf(0, power),
+        which is 1 for a power of 0 and infinity for one below) */
+        out[2] = c[0] > 0.0f && c[1] > 0.0f ? powf(c[1], power) : 0.0f;
         out[3] = 1.0f;
         break;
     }
