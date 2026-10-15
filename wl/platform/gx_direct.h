@@ -110,6 +110,8 @@ void wl_gx_direct_vertex(const WlGxDirectVertex *vertex);
 // unused zero), each colour as 0xRRGGBBAA, each texture coordinate's one or two floats (a float as its
 // bits), in that order. On the Wii the words go into the FIFO as they are, without the layout's tests.
 void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count);
+// `n` such vertices, `count` words each, one call (a renderer's batch: no call a vertex)
+void wl_gx_direct_vertices_words(const uint32_t *const *vertices, uint32_t n, uint32_t count);
 void wl_gx_direct_primitive_end(void);
 // An indexed attribute's array (WL_GX_DIRECT_ARRAY_*), for the vertices that follow: element i at
 // data + i * stride, in memory the GPU reads (32-byte aligned, written back from the cache). Its
@@ -121,6 +123,10 @@ void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride);
 // `count` words for the others, as wl_gx_direct_vertex_words takes them (the attributes the layout
 // sends, in its order, the indexed ones left out).
 void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t count);
+// `n` such vertices, one call: vertex v's index indices[v] - base (indices NULL: v), the same `count`
+// words for each
+void wl_gx_direct_vertices_index(const uint32_t *indices, uint32_t base, uint32_t n, const uint32_t *words,
+                                 uint32_t count);
 // Memory an array was read from has changed: GX's vertex cache emptied.
 void wl_gx_direct_arrays_changed(void);
 // A raster state change (an EFB copy, a token, a draw-done): the next draw is flushed first.

@@ -230,7 +230,9 @@ even, so its winding holds).
   the vertex while q is the same at every vertex of the draw's first batch; one whose q varies there
   (a projected shadow, a flashlight) is sent as (s, t, q) for GX to divide at each pixel, as the
   NV2A does (up to three a draw, as GX's normal, binormal and tangent through 3x4 generators;
-  counted as `projected_draws`). The combiners through psh's cache (with a title's `WlXboxPshRecipe`), the fog psh's ramp, a
+  counted as `projected_draws`). So is a light's falloff cube made its lit face (the texture
+  cache's `spots`, which the backend turns on): ((sc + ma) / 2, (tc + ma) / 2, ma) for its face,
+  where `wl_nv2a_spot_coordinates` divides at the vertex. The combiners through psh's cache (with a title's `WlXboxPshRecipe`), the fog psh's ramp, a
   program beyond GX texture 0 times colour. Blending, depth, alpha test and colour masks on GX
   (a constant factor ONE or ZERO by SET_BLEND_COLOR, exact where that is 1 or 0; MIN as s d, MAX as
   s + d - s d and src - dst as s (1 - d): approximated and counted); culling by the NV2A's rule on

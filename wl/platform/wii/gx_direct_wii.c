@@ -232,6 +232,21 @@ void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
     }
 }
 
+void wl_gx_direct_vertices_words(const uint32_t *const *vertices, uint32_t n, uint32_t count) {
+    uint32_t v, i;
+
+    if (!d.in_primitive) {
+        return;
+    }
+    for (v = 0; v < n; v++) {
+        const uint32_t *words = vertices[v];
+
+        for (i = 0; i < count; i++) {
+            wgPipe->U32 = words[i];
+        }
+    }
+}
+
 void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride) {
     u32 gx_attribute = attribute == WL_GX_DIRECT_ARRAY_POSITION ? (u32)GX_VA_POS
                        : attribute < WL_GX_DIRECT_ARRAY_TEXCOORD0
@@ -259,6 +274,34 @@ void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t c
         for (n = 0; n < d.order[i] && count != 0; n++, count--) {
             wgPipe->U32 = *words++;
         }
+    }
+}
+
+void wl_gx_direct_vertices_index(const uint32_t *indices, uint32_t base, uint32_t n, const uint32_t *words,
+                                 uint32_t count) {
+    uint32_t v;
+    unsigned k, words_sent = 0;
+
+    if (!d.in_primitive) {
+        return;
+    }
+    for (k = 0; k < d.order_count; k++) {
+        words_sent += d.order[k];
+    }
+    if (count == 0 && words_sent == 0) {
+        // (every attribute indexed: the vertex's index for each)
+        for (v = 0; v < n; v++) {
+            u16 index = (u16)(indices != NULL ? indices[v] - base : v);
+            unsigned i;
+
+            for (i = 0; i < d.order_count; i++) {
+                wgPipe->U16 = index;
+            }
+        }
+        return;
+    }
+    for (v = 0; v < n; v++) {
+        wl_gx_direct_vertex_index((uint16_t)(indices != NULL ? indices[v] - base : v), words, count);
     }
 }
 
