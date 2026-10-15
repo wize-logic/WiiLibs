@@ -495,7 +495,7 @@ uint32_t wl_gx_peek_rgba(int x, int y) {
     return ((uint32_t)c.r << 24) | ((uint32_t)c.g << 16) | ((uint32_t)c.b << 8) | c.a;
 }
 
-void wl_gx_copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat fmt, bool clear) {
+static void copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat fmt, bool clear, bool invalidate) {
     WL_ASSERT(g.ready);
     // I4 and I8 copy the red channel straight (0 to 255 stay 0 to 255; the luminance copy would map black to 16 and white to 235)
     static const u8 tf[WL_GX_TEX_FORMAT_COUNT] = {GX_CTF_R4, GX_CTF_R8, GX_TF_IA4, GX_TF_IA8, GX_TF_RGB565,
@@ -506,8 +506,9 @@ void wl_gx_copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat
                 "bad EFB texture copy")) {
         return;
     }
-    size_t bytes = wl_gx_tex_bytes(fmt, (uint32_t)w, (uint32_t)h);
-    wl_gpu_buffer_invalidate(dst, bytes);
+    if (invalidate) {
+        wl_gpu_buffer_invalidate(dst, wl_gx_tex_bytes(fmt, (uint32_t)w, (uint32_t)h));
+    }
     if (clear) {
         wl_gx_set_zmode(true, WL_GX_LEQUAL, true);
         wl_gx_set_color_write(true, true);
@@ -521,6 +522,14 @@ void wl_gx_copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat
     wl_gx_wii_copy_filter(true);
     GX_InvalidateTexAll();
     g.dirty = true;
+}
+
+void wl_gx_copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat fmt, bool clear) {
+    copy_efb_texture(x, y, w, h, dst, fmt, clear, true);
+}
+
+void wl_gx_copy_efb_texture_again(int x, int y, int w, int h, void *dst, WlGxTexFormat fmt, bool clear) {
+    copy_efb_texture(x, y, w, h, dst, fmt, clear, false);
 }
 
 // The copies to textures are unfiltered: the display copy's vertical (deflicker) filter, which stays set for it,

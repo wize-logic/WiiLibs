@@ -187,7 +187,7 @@ static void check_render_target(void) {
 
     memset(g_target_image, 0xEE, sizeof g_target_image);
     wl_gpu_buffer_commit(g_target_image, sizeof g_target_image);
-    WlGxTarget target = {g_target_image, g_target_image, 64, 64, WL_GX_TEX_RGBA8, 7};
+    WlGxTarget target = {g_target_image, g_target_image, 64, 64, WL_GX_TEX_RGBA8, 7, false};
 
     float cx = (float)info.fb_width / 2.0f, cy = (float)info.efb_height / 2.0f;
     const WlGxVertex tri_green[3] = {

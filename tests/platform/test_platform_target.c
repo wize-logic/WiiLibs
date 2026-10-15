@@ -58,12 +58,12 @@ static uint8_t g_memory_b[32 * 32 * 2] __attribute__((aligned(32)));
 static const int g_id_a = 1, g_id_b = 2;
 
 static WlGxTarget target_a(void) {
-    WlGxTarget t = {&g_id_a, g_memory_a, 64, 64, WL_GX_TEX_RGBA8, 0xA};
+    WlGxTarget t = {&g_id_a, g_memory_a, 64, 64, WL_GX_TEX_RGBA8, 0xA, false};
     return t;
 }
 
 static WlGxTarget target_b(void) {
-    WlGxTarget t = {&g_id_b, g_memory_b, 32, 32, WL_GX_TEX_RGB565, 0xB};
+    WlGxTarget t = {&g_id_b, g_memory_b, 32, 32, WL_GX_TEX_RGB565, 0xB, false};
     return t;
 }
 

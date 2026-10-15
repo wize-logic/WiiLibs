@@ -20,11 +20,13 @@ void wl_gx_target_be_copy_begin(void) {
     wl_gx_wii_copy_filter(false);
 }
 
-void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what) {
+void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what, bool invalidate) {
     // (the depth copy is a texture of RGBA8's size)
     static const u8 format[] = {GX_TF_RGBA8, GX_TF_RGB565, GX_TF_Z24X8};
     static const WlGxTexFormat size_of[] = {WL_GX_TEX_RGBA8, WL_GX_TEX_RGB565, WL_GX_TEX_RGBA8};
-    wl_gpu_buffer_invalidate(dst, wl_gx_tex_bytes(size_of[what], w, h));
+    if (invalidate) {
+        wl_gpu_buffer_invalidate(dst, wl_gx_tex_bytes(size_of[what], w, h));
+    }
     GX_SetTexCopySrc(0, 0, (u16)w, (u16)h);
     GX_SetTexCopyDst((u16)w, (u16)h, format[what], GX_FALSE);
     GX_CopyTex(dst, GX_FALSE);
@@ -154,7 +156,8 @@ void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int 
     quad(x0, y0, x0 + (float)rw, y0 + (float)rh, &c, z, false, false, back_w, back_h);
 }
 
-void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w) {
+void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w,
+                             bool invalidate) {
     GXTexObj map;
 
     // The finished picture out of the EFB, which the same copy clears to black for the bars. The
@@ -164,7 +167,9 @@ void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uin
     GX_SetAlphaUpdate(GX_TRUE);
     GX_SetCopyClear((GXColor){0, 0, 0, 255}, 0x00FFFFFFu);
     wl_gx_wii_copy_filter(false);
-    wl_gpu_buffer_invalidate(colour, wl_gx_tex_bytes(WL_GX_TEX_RGBA8, back_w, back_h));
+    if (invalidate) {
+        wl_gpu_buffer_invalidate(colour, wl_gx_tex_bytes(WL_GX_TEX_RGBA8, back_w, back_h));
+    }
     GX_SetTexCopySrc(0, 0, (u16)back_w, (u16)back_h);
     GX_SetTexCopyDst((u16)back_w, (u16)back_h, GX_TF_RGBA8, GX_FALSE);
     GX_CopyTex(colour, GX_TRUE);
