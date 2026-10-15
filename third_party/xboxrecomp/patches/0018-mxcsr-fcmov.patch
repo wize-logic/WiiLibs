@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Wed, 14 Oct 2026 22:00:00 -0400
+Subject: [PATCH] recomp: stmxcsr, ldmxcsr and fcmovcc
+
+- stmxcsr and ldmxcsr were not lifted: stmxcsr left its memory as it
+  was, so a save/restore pair restored garbage. MXCSR's rounding control,
+  flush-to-zero and sticky flags are not modelled (the conversions round
+  to nearest, the default), so stmxcsr stores the default 0x1F80 (every
+  exception masked, round to nearest, no flag raised) and ldmxcsr is a
+  no-op that says so. (The sticky flags read back as none raised.)
+- fcmovb/e/be/u and their negations fell into the FPU fallback, a
+  comment: the move never happened and nothing reported it. They are
+  fused with their flag setter like cmovcc (fcomi/fucomi leave exactly
+  the unsigned and parity conditions they test), and an unfused one is
+  reported through RECOMP_UNIMPL.
+
+Tests: test_sse_mxcsr_fcmov.py. Conformance cases fpu_fcmov<cc> for the
+eight conditions after fcomi with ordered, equal and unordered inputs,
+and sse_stmxcsr.
+---
+diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
+--- a/tools/conformance/cases.py
++++ b/tools/conformance/cases.py
+@@ -753,3 +753,15 @@
+ CASES.append(Case("shl_imm_zero_flags", "shl by an immediate 0 keeps the cmp's flags",
+                   ["cmp ecx, 7", "shl eax, 0", "sete dl", "sets dh", "movzx edx, dx", "xor eax, edx"],
+                   _SHIFT_COUNTS))
++
++# fcmovcc after fcomi: st0 = st1 when the condition holds, for each of the
++# eight conditions, ordered, equal and unordered inputs.
++for _cc in ("b", "e", "be", "u", "nb", "ne", "nbe", "nu"):
++    CASES.append(Case("fpu_fcmov" + _cc, "fcmov%s after fcomi" % _cc,
++                      ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fcomi st, st(1)",
++                       "fcmov%s st, st(1)" % _cc], _FP_NAN, "fpu"))
++# The control half only: the sticky exception flags (bits 0-5) are whatever
++# the CPU's earlier work raised, which the lift does not model.
++CASES.append(Case("sse_stmxcsr", "stmxcsr stores the default MXCSR controls",
++                  ["stmxcsr dword ptr [eax+32]", "and dword ptr [eax+32], 0FFFFFFC0h",
++                   "mov eax, dword ptr [eax+32]"], _SSE, "sse"))
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -1140,6 +1140,12 @@
+     return None
+ 
+ 
++# fcmovcc: st0 = st(i) when the condition holds. Only the unsigned and parity
++# conditions exist, which is what fcomi/fucomi leave.
++_FCMOVCC = {"fcmovb": "jb", "fcmove": "je", "fcmovbe": "jbe", "fcmovu": "jp",
++            "fcmovnb": "jae", "fcmovne": "jne", "fcmovnbe": "ja", "fcmovnu": "jnp"}
++
++
+ def _make_cmovcc_cond(cmov_mnemonic, flag_setter, flag_ops):
+     """Generate the condition expression for a CMOVcc instruction."""
+     cc = cmov_mnemonic[4:]
+@@ -1807,6 +1813,18 @@
+                  "movmskps",
+                  "pand", "pandn", "por", "pxor", "pcmpgtd")                 or m in _SSE_CMP_NAMED:
+             return self._lift_sse(insn, m, ops)
++
++        # ── MXCSR ──
++        # The SSE control and status register. Its rounding control and
++        # flush-to-zero are not modelled (cvtss2si rounds to nearest, which is
++        # the default), nor are its sticky exception flags, so stmxcsr stores
++        # the default value (every exception masked, round to nearest, no flag
++        # raised) and ldmxcsr changes nothing. Unlifted, stmxcsr left its
++        # memory as it was, and a save/restore pair restored garbage.
++        if m == "stmxcsr" and ops and ops[0].type == "mem":
++            return [f"MEM32({_fmt_mem(ops[0])}) = 0x1F80u; /* stmxcsr: the default MXCSR */"]
++        if m == "ldmxcsr":
++            return [f"(void)0; /* ldmxcsr {insn.op_str}: SSE rounding and flush-to-zero are not modelled */"]
+ 
+         # ── FPU ──
+         if m.startswith("f"):
+@@ -3830,6 +3848,12 @@
+         """Basic FPU instruction translation using double locals."""
+         # FPU is complex. We translate common patterns to double operations.
+         # Full accuracy would require an x87 stack emulator.
++
++        if m in _FCMOVCC:
++            # lift_basic_block fuses fcmovcc with its flag setter; one that
++            # reaches here has no tracked setter, and reading _flags would be
++            # silently wrong.
++            return self._unimplemented(insn, m, " (no tracked flag setter)")
+ 
+         if m == "fld":
+             if len(ops) >= 1:
+@@ -4303,6 +4327,15 @@
+                 i += 1
+                 continue
+ 
++        if curr.mnemonic in _FCMOVCC and last_flag_setter and curr.operands:
++            fc = _make_condition(_FCMOVCC[curr.mnemonic], last_flag_setter, last_flag_ops)
++            if fc:
++                i_st = Lifter._st_index(curr.operands[-1].reg)
++                stmts.append(f"if ({fc[0]}) fp_top() = {Lifter._st_expr(i_st)};"
++                             f" /* {curr.mnemonic} {curr.op_str} */")
++                i += 1
++                continue
++
+         if (curr.mnemonic in _CMOVCC
+                 and last_flag_setter and len(curr.operands) >= 2):
+             cond = _make_cmovcc_cond(
+diff --git a/tools/recomp/test_sse_mxcsr_fcmov.py b/tools/recomp/test_sse_mxcsr_fcmov.py
+new file mode 100644
+--- /dev/null
++++ b/tools/recomp/test_sse_mxcsr_fcmov.py
+@@ -0,0 +1,46 @@
++"""stmxcsr/ldmxcsr are lifted, and fcmovcc takes its condition from the flag setter."""
++
++import unittest
++
++from .disasm import BasicBlock, Instruction, Operand
++from .lifter import Lifter, lift_basic_block
++
++
++def _reg(r):
++    return Operand(type="reg", reg=r)
++
++
++def _block(*insns):
++    out, addr = [], 0x00011000
++    for m, op_str, ops in insns:
++        i = Instruction(addr, 2, m, op_str, "0000")
++        i.operands = ops
++        out.append(i)
++        addr += 2
++    lines, _ = lift_basic_block(Lifter(), BasicBlock(start=0x00011000, instructions=out))
++    return "\n".join(lines)
++
++
++class MxcsrTest(unittest.TestCase):
++    def test_stmxcsr_stores_the_default(self):
++        mem = Operand(type="mem", mem_base="esp", mem_size=4)
++        c = _block(("stmxcsr", "dword ptr [esp]", [mem]))
++        self.assertIn("= 0x1F80u;", c)
++        self.assertNotIn("RECOMP_UNIMPL", c)
++
++
++class FcmovTest(unittest.TestCase):
++    def test_fcmovb_after_fucomi(self):
++        c = _block(("fucomi", "st(0), st(1)", [_reg("st(0)"), _reg("st(1)")]),
++                   ("fcmovb", "st(0), st(2)", [_reg("st(0)"), _reg("st(2)")]))
++        self.assertIn("if ((g_fp_cmp < 0 || g_fp_cmp == 2)", c)
++        self.assertIn("fp_top() = g_fp_stack[(g_fp_top + 2) & 7];", c)
++
++    def test_an_unfused_fcmov_is_reported(self):
++        i = Instruction(0x00011000, 2, "fcmovnu", "st(0), st(1)", "dbd9")
++        i.operands = [_reg("st(0)"), _reg("st(1)")]
++        self.assertIn("RECOMP_UNIMPL", " ".join(Lifter().lift_instruction(i)))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+
