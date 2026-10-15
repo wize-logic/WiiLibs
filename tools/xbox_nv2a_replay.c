@@ -850,6 +850,9 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
                "alone\n", (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws);
         vertex_cache_line("bench: ");
         texture_cache_line("bench: ");
+        printf("bench: texture binds: %u draws kept the draw before's textures; %u textures bound to stages, %u GX "
+               "objects (alphas apart included) kept as made before\n",
+               (unsigned)gs.textures_kept, (unsigned)gs.texture_stages, (unsigned)gs.texture_objects_kept);
         {
             // (where each draw's vertices were transformed, a frame)
             double per = 1.0 / ((double)runs * frames);

@@ -42,8 +42,16 @@ static struct {
     // the layout's projected coordinates
     unsigned projected;
     bool in_primitive;
+    // the texture object each map holds as wl_gx_direct_texture loaded it (bit n of maps_known: map
+    // n's is known; wl_gx_wii_texmaps_forget clears it)
+    GXTexObj maps[GX_MAX_TEXMAP];
+    uint8_t maps_known;
     WlGxDirectStats stats;
 } d;
+
+void wl_gx_wii_texmaps_forget(uint32_t maps) {
+    d.maps_known &= (uint8_t)~maps;
+}
 
 void wl_gx_direct_begin(void) {
     Mtx identity;
@@ -424,8 +432,16 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
     if (tex->mips > 1u) {
         GX_InitTexObjLODBias(&obj, s->lod_bias);
     }
-    GX_LoadTexObj(&obj, (u8)(GX_TEXMAP0 + map));
     d.stats.textures++;
+    if ((d.maps_known & (1u << map)) != 0 && memcmp(&obj, &d.maps[map], sizeof obj) == 0) {
+        // (the map holds it: its registers as they would be written; GX's texture cache is
+        // wl_gx_direct_texture_invalidate's)
+        d.stats.textures_kept++;
+        return;
+    }
+    GX_LoadTexObj(&obj, (u8)(GX_TEXMAP0 + map));
+    d.maps[map] = obj;
+    d.maps_known |= (uint8_t)(1u << map);
     wl_gx_wii_note_commands();
 }
 

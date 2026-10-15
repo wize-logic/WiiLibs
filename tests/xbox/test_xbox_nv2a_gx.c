@@ -6,7 +6,8 @@
 // frame's clear, culling, a stencil draw skipped, and the frame shown when the title finishes it;
 // render targets, and a screen blur through the back buffer's depth buffer drawn in one frame. A
 // projective coordinate whose q varies sent as (s, t, q) for GX to divide at each pixel. The pixel
-// program kept from draw to draw until one of its inputs changes.
+// program kept from draw to draw until one of its inputs changes. A texture the guest rewrites drawn
+// with its new texels, a stage's GX object kept while its texture is.
 #include <math.h>
 #include <string.h>
 
@@ -16,6 +17,7 @@
 #include "wl/platform/gx_target.h"
 #include "wl/platform/host/gx_direct_host.h"
 #include "wl/platform/host/gx_host.h"
+#include "wl/platform/host/gx_renderer_host.h"
 #include "wl/platform/host/tev_host.h"
 #include "wl/xbox/nv2a_gx.h"
 
@@ -472,6 +474,96 @@ TEST a_target_the_guest_stores_to_reads_as_the_guests_texels(void) {
     PASS();
 }
 
+// a quad sampling F_TEXTURE (its offset sent again: the stages bound anew), in the frame open
+static void texture_quad(TGuest *g, float x) {
+    t_m1(g, WL_NV2A_K_SET_TEXTURE_OFFSET, F_TEXTURE2);
+    f_texture(g, F_TEXTURE, WL_NV2A_TEX_SZ_A8R8G8B8, 2, 2);
+    f_quad(g, x, 0, x + 10, 10, 0, 0xFFFFFFFFu);
+    t_kick(g);
+}
+
+// the red of the first texel of map 0's image (RGBA8's tiles: A and R pairs first)
+static uint8_t map0_red(void) {
+    const uint8_t *image = wl_host_gx_tex_image(wl_host_gx_direct()->textures[0]);
+
+    return image != NULL ? image[1] : 0u;
+}
+
+static void texture_stored(TGuest *g, uint32_t argb) {
+    unsigned i;
+
+    for (i = 0; i < 16; i++) {
+        t_w32(g, F_TEXTURE + 4 * i, argb);
+    }
+    g_stored_phys = F_TEXTURE;
+    g_stored_bytes = 64;
+}
+
+static void frame_shown(TGuest *g) {
+    t_m1(g, WL_NV2A_K_FLIP_INCREMENT_WRITE, 0);
+    t_kick(g);
+    g_stored_bytes = 0;
+}
+
+// A texture the guest rewrites (a glyph cache): with a write watch, checked at its first use in
+// each frame, and once found changed at every use, so a store between two draws of one frame is
+// drawn by the second. A stage bound again to a texture as it was keeps its GX object (not made
+// again), and keeps it also when the texels are made again where they were (GX's texture cache
+// emptied instead); one made again into a new image (the old one still read by the frame's draws)
+// gets a new object.
+TEST a_texture_the_guest_rewrites_is_drawn_with_its_new_texels(void) {
+    TGuest g;
+    WlNv2aGxConfig cfg;
+    WlNv2aGxStats stats;
+    const void *image;
+    uint32_t kept, invalidates;
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.textures.watch = fake_watch;
+    cfg.textures.written = fake_written;
+    g_stored_bytes = 0;
+    ASSERT(gx_device_with(&g, &cfg) != NULL);
+    f_frame_setup(&g);
+    f_program(&g, 0, f_screen_program, 3);
+    texture_quad(&g, 0);
+    ASSERT_EQ(0x80u, map0_red());
+    image = wl_host_gx_tex_image(wl_host_gx_direct()->textures[0]);
+    wl_nv2a_gx_stats(g_gx, &stats);
+    kept = stats.texture_objects_kept;
+    texture_quad(&g, 20);
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT_EQ(kept + 1u, stats.texture_objects_kept);
+    // stored to after its first use in the frame: drawn as it was until the next frame
+    texture_stored(&g, 0xFFFF0000u);
+    frame_shown(&g);
+    g_stored_bytes = 64;
+    invalidates = wl_host_gx_direct()->invalidates;
+    texture_quad(&g, 0);
+    // (made again where it was: the same image and object, GX's texture cache emptied)
+    ASSERT_EQ(0xFFu, map0_red());
+    ASSERT_EQ(image, wl_host_gx_tex_image(wl_host_gx_direct()->textures[0]));
+    ASSERT(wl_host_gx_direct()->invalidates > invalidates);
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT_EQ(kept + 2u, stats.texture_objects_kept);
+    // found changed once: checked at every use, a store between two draws of a frame drawn
+    texture_stored(&g, 0xFF400000u);
+    texture_quad(&g, 20);
+    ASSERT_EQ(0x40u, map0_red());
+    ASSERT(wl_host_gx_tex_image(wl_host_gx_direct()->textures[0]) != image);
+    // and not made again while nothing is stored
+    g_stored_bytes = 0;
+    image = wl_host_gx_tex_image(wl_host_gx_direct()->textures[0]);
+    wl_nv2a_gx_stats(g_gx, &stats);
+    kept = stats.texture_objects_kept;
+    texture_quad(&g, 40);
+    ASSERT_EQ(0x40u, map0_red());
+    ASSERT_EQ(image, wl_host_gx_tex_image(wl_host_gx_direct()->textures[0]));
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT_EQ(kept + 1u, stats.texture_objects_kept);
+    gx_done(&g);
+    PASS();
+}
+
 // whether the last draw's pixel program reads a texture's alpha
 static bool program_reads_texture_alpha(void) {
     bool used = false;
@@ -570,6 +662,7 @@ SUITE(gx_suite) {
     RUN_TEST(partial_clears_are_quads_and_render_targets_take_the_efb);
     RUN_TEST(a_blur_through_the_depth_buffer_is_drawn_in_one_frame);
     RUN_TEST(a_target_the_guest_stores_to_reads_as_the_guests_texels);
+    RUN_TEST(a_texture_the_guest_rewrites_is_drawn_with_its_new_texels);
     RUN_TEST(a_target_read_as_x8r8g8b8_has_no_alpha);
     RUN_TEST(the_pixel_program_is_made_again_only_when_its_inputs_change);
 }

@@ -132,6 +132,9 @@ struct WlNv2aGx {
     const WlNv2aTexEntry *entries[WL_NV2A_TEXTURES];
     WlNv2aTexEntry target_entries[WL_NV2A_TEXTURES];
     WlGxTexObj stage_objects[WL_NV2A_TEXTURES], alpha_objects[WL_NV2A_TEXTURES];
+    // what each object was made from (bit n of objects_known: stage n's, bit n + 4: its alpha's)
+    WlGxTexDesc stage_descs[WL_NV2A_TEXTURES], alpha_descs[WL_NV2A_TEXTURES];
+    uint8_t objects_known;
     WlGxTlut tluts[WL_NV2A_TEXTURES];
     bool texture_memory_changed;
     unsigned texcoords, channels;
@@ -836,6 +839,23 @@ static const WlNv2aTexEntry *target_texture(WlNv2aGx *gx, unsigned stage, const 
     return NULL;
 }
 
+// The texture object a description makes, in `obj`: the one made from the same description before
+// kept (bit `known` of objects_known), else made again. false: it cannot be made.
+static bool texture_object(WlNv2aGx *gx, WlGxTexObj *obj, WlGxTexDesc *made_from, unsigned known,
+                           const WlGxTexDesc *desc) {
+    if ((gx->objects_known & (1u << known)) != 0 && memcmp(made_from, desc, sizeof *desc) == 0) {
+        gx->stats.texture_objects_kept++;
+        return true;
+    }
+    gx->objects_known &= (uint8_t)~(1u << known);
+    if (wl_gx_tex_init_ex(obj, desc) != WL_OK) {
+        return false;
+    }
+    memcpy(made_from, desc, sizeof *desc); // (with its padding, which the compare reads)
+    gx->objects_known |= (uint8_t)(1u << known);
+    return true;
+}
+
 static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
     unsigned stage, wanted = 0;
 
@@ -888,7 +908,8 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
         desc.sampler.mag_filter = t.mag_filter == WL_NV2A_FILTER_NEAREST ? (uint8_t)WL_GX_FILTER_NEAREST
                                                                          : (uint8_t)WL_GX_FILTER_LINEAR;
         desc.sampler.pinned = true;
-        if (wl_gx_tex_init_ex(&gx->stage_objects[stage], &desc) != WL_OK) {
+        gx->stats.texture_stages++;
+        if (!texture_object(gx, &gx->stage_objects[stage], &gx->stage_descs[stage], stage, &desc)) {
             continue;
         }
         if (e->layout.format == WL_GXC_C8) {
@@ -903,7 +924,7 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
         if (e->layout.separate_alpha) {
             desc.image = (const uint8_t *)e->image + ((e->layout.image_bytes + 31u) & ~(size_t)31u);
             desc.format = WL_GX_TEX_I4;
-            if (wl_gx_tex_init_ex(&gx->alpha_objects[stage], &desc) == WL_OK) {
+            if (texture_object(gx, &gx->alpha_objects[stage], &gx->alpha_descs[stage], stage + 4u, &desc)) {
                 wl_gx_direct_texture(stage + 4u, &gx->alpha_objects[stage], NULL, NULL);
             }
         }

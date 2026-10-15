@@ -294,7 +294,9 @@ even, so its winding holds).
   their next use. Border addressing is clamped to the edge (GX has no border colour; the colour,
   SET_TEXTURE_BORDER_COLOR, is decoded and the binds counted as `border_clamped`): Halo's border
   textures (its object shadows' targets, cleared to the border's black, light masks and a lookup
-  table) have edges at or near the border colour already.
+  table) have edges at or near the border colour already. A stage bound again to a texture as
+  it was keeps its GX object (`texture_objects_kept`), and on the Wii a map that holds that object
+  is not loaded again (`wl_gx_direct_texture`).
 - **The pipeline** (`nv2a_pipeline.h`) is what the GX backend does on the processor: programs
   compiled and kept, vertices run (or the fixed function's composite matrix), the NV2A's fog modes,
   what psh is told of the textures, each stage's GX coordinates, the GX mappings of the raster state.

@@ -156,13 +156,17 @@ void wl_gx_direct_alpha_compare(WlGxCompare func, uint8_t ref);
 void wl_gx_direct_color_update(bool color, bool alpha);
 void wl_gx_direct_cull(WlGxCull cull);
 // A texture object (wl_gx_tex_init_ex) on texture map `map` (0..7), with a sampler (NULL: the
-// object's) and, for C4/C8, its TLUT (loaded into the object's slot).
+// object's) and, for C4/C8, its TLUT (loaded into the object's slot). An object the map already
+// holds as it would be loaded is not loaded again (the TLUT is: its entries may have changed);
+// wl/platform's own loads (its quads, wl_gx_tex_bind, the ramp) and wl_gx_invalidate_shadow make
+// the maps they touch unknown.
 void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler *sampler, const WlGxTlut *tlut);
 // GX's texture cache emptied: memory a texture was read from has changed.
 void wl_gx_direct_texture_invalidate(void);
 
 typedef struct WlGxDirectStats {
     uint32_t draws, vertices, flushes, layouts, textures;
+    uint32_t textures_kept; // of the textures, the ones their map held already (the Wii's; not loaded)
 } WlGxDirectStats;
 void wl_gx_direct_stats(WlGxDirectStats *out);
 
