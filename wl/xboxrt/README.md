@@ -160,6 +160,9 @@ indirect-call trace (`g_icall_trace`, `g_icall_trace_idx`, `g_icall_count`). `re
 lists them once: `regs.c` defines them, `regs.h` declares them and builds `WlXbCpu` (the per-thread
 part, saved and loaded when the guest lock changes hands), and `tests/xboxrt/test_xboxrt_abi.c`
 compiles the list against the generated code's header so a type that differs does not compile.
+One entry is the runtime's own: `g_eflags_kept`, the EFLAGS bits (AC, ID) a guest sets with
+`popfd` and reads back with `pushfd` (`thunk.c`'s `recomp_unimpl`, which also does the 16-bit
+`pushf`/`popf` and `cpuid`), kept per guest thread as `g_df` is.
 
 ## The functions generated code calls (`thunk.h`)
 

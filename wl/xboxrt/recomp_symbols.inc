@@ -23,6 +23,7 @@ WL_XB_REG(uint32_t, g_ebp, , 0)
 WL_XB_REG(uint32_t, g_seh_ebp, , 0)
 WL_XB_REG(uint32_t, g_fs_base, , 0)
 WL_XB_REG(int, g_df, , 0)
+WL_XB_REG(uint32_t, g_eflags_kept, , 0) // the runtime's (thunk.c, pushfd/popfd): EFLAGS' AC and ID
 WL_XB_REG(double, g_fp_stack, [8], {0})
 WL_XB_REG(int, g_fp_top, , 0)
 WL_XB_REG(uint16_t, g_fp_control_word, , 0x037Fu)

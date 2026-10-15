@@ -155,6 +155,27 @@ TEST processor_identification(void) {
     RECOMP_UNIMPL("popfd", 0x1007u);
     ASSERT_EQ(0, g_df);
     ASSERT_EQ_FMT(top, g_esp, "%08x");
+    // the 16-bit pair (66 9C ... 66 9D) moves esp by 2 each way and takes DF back, AC and ID alone
+    g_eflags_kept = 0x200000u;
+    g_df = 1;
+    RECOMP_UNIMPL("pushf", 0x1008u);
+    ASSERT_EQ_FMT(top - 2u, g_esp, "%08x");
+    ASSERT_EQ_FMT(0x602u, wl_xb_rd16(g_esp), "%08x"); // IF, DF and bit 1
+    g_df = 0;
+    RECOMP_UNIMPL("popf", 0x1009u);
+    ASSERT_EQ_FMT(top, g_esp, "%08x");
+    ASSERT_EQ(1, g_df);
+    ASSERT_EQ_FMT(0x200000u, g_eflags_kept, "%08x");
+    // the kept bits are a guest thread's, as DF is: another thread's register file has its own
+    WlXbCpu a, b;
+    wl_xb_cpu_save(&a);
+    wl_xb_cpu_reset(&b);
+    wl_xb_cpu_load(&b);
+    ASSERT_EQ_FMT(0u, g_eflags_kept, "%08x");
+    wl_xb_cpu_load(&a);
+    ASSERT_EQ_FMT(0x200000u, g_eflags_kept, "%08x");
+    g_eflags_kept = 0;
+    g_df = 0;
     ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
     PASS();
 }
