@@ -766,7 +766,7 @@ TEST random_programs_agree_with_the_combiners(void) {
     ASSERT(o.d0_exact > o.exact * 9 / 10);
     ASSERT(o.approximate + o.untranslated > 0);
     // the same programs, field for field, on every target
-    ASSERT_EQ_FMT(0x5DDC72FAu, g_digest, "%08x");
+    ASSERT_EQ_FMT(0x9585F0A1u, g_digest, "%08x");
     PASS();
 }
 
@@ -867,6 +867,22 @@ TEST constants_near_0_and_1_stand_for_themselves(void) {
     for (int ch = 0; ch < 3; ch++) {
         ASSERT_IN_RANGE(want.c[ch], got.c[ch], 0.03f);
     }
+    PASS();
+}
+
+// a program whose colour registers ran out (approximated before: the 497th of the first random
+// sequence) fits once a colour that is a product of values the same in every channel is made in an
+// alpha register: exact, and as the combiners make it
+TEST a_uniform_colour_made_in_the_alpha_half(void) {
+    static uint32_t state[WL_XBOX_PSH_WORDS];
+    const char *why = NULL;
+    g_rng = 0x5EED1234u;
+    g_trial_rng = 0x5EED1234u ^ 0x9E3779B9u;
+    for (int n = 0; n <= 496; n++) {
+        program_random(state);
+    }
+    g_d0_alpha_map = 0;
+    ASSERT_EQ(1, check(state, 0x7u, &why));
     PASS();
 }
 
@@ -1206,6 +1222,7 @@ SUITE(psh_suite) {
     RUN_TEST(the_mux_is_a_step);
     RUN_TEST(a_register_luminance_is_its_colour);
     RUN_TEST(constants_near_0_and_1_stand_for_themselves);
+    RUN_TEST(a_uniform_colour_made_in_the_alpha_half);
     RUN_TEST(negated_mappings_take_no_register_of_their_own);
     RUN_TEST(an_expand_negate_is_one_stage);
     RUN_TEST(a_final_product_with_every_register_held);

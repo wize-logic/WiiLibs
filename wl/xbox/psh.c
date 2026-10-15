@@ -173,6 +173,10 @@ struct translation {
     stages), 1 without (three), for the program's own constants; 0 a blend
     by r0's alpha, approximated, where the compares do not fit */
     int mux_mode;
+    /* the last attempts: a colour that is a product of values the same in
+    every channel made in the alpha half (an alpha register for it), for a
+    program whose colour registers run out */
+    bool uniform_in_alpha;
     /* where each name is, for each portion (a colour's may be a register's
     alpha: a value the same in every channel) */
     struct operand names[NUMBER_OF_PORTIONS][NUMBER_OF_NAMES];
@@ -3022,7 +3026,9 @@ product with 1 */
     reads of its blue): made in the alpha half, the colour standing for that
     register's alpha, unless this combiner stage's alpha portion reads the
     blue it had */
-    for (index = 0; portion == _portion_color && translation->signed_dots == 2 && index < 2;
+    for (index = 0;
+         portion == _portion_color && (translation->signed_dots == 2 || translation->uniform_in_alpha) &&
+         index < 2;
          index++) {
         unsigned long *name = index ? &cd_name : &ab_name;
         struct operand x = inputs_mapped[2 * index], y = inputs_mapped[2 * index + 1];
@@ -3032,7 +3038,8 @@ product with 1 */
         if (name_of(*name) < 0 || (flags & (index ? 0x01u : 0x02u)) || !uniform(&x) ||
             !uniform(&y) ||
             !((x.kind == _kind_register && x.channel == _channel_alpha) ||
-              (y.kind == _kind_register && y.channel == _channel_alpha)) ||
+              (y.kind == _kind_register && y.channel == _channel_alpha) ||
+              (translation->uniform_in_alpha && x.kind > _kind_half && y.kind > _kind_half)) ||
             blue_read_now(translation, stage, name_of(*name)) ||
             (reg = register_allocate(translation, _portion_alpha)) < 0)
             continue;
@@ -3935,7 +3942,7 @@ static void swap_tables_set(WlTevProgram *tev) {
 
 static bool translate_once(const uint32_t *render_state, const WlXboxPshTextures *textures,
                            WlXboxPshProgram *program, bool economical, bool folding, bool preload,
-                           int signed_dots, int mux_mode) {
+                           int signed_dots, int mux_mode, bool uniform_in_alpha) {
     static struct translation translation;
     unsigned long combiner_count = render_state[WL_XBOX_PSH_COMBINER_COUNT] & 0xff;
     unsigned long stage;
@@ -3952,6 +3959,7 @@ static bool translate_once(const uint32_t *render_state, const WlXboxPshTextures
     translation.folding = folding;
     translation.signed_dots = signed_dots;
     translation.mux_mode = mux_mode;
+    translation.uniform_in_alpha = uniform_in_alpha;
     wl_tev_pool_init(&translation.pools[_portion_color]);
     wl_tev_pool_init(&translation.pools[_portion_alpha]);
     names_initialize(&translation);
@@ -4194,7 +4202,7 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
     static WlXboxPshProgram approximated;
     static uint32_t rewritten[WL_XBOX_PSH_WORDS];
     bool have_approximated = false, done = false, has_mux = false;
-    int mux_mode, blues = blue_to_alpha_rewrite(render_state, rewritten);
+    int mux_mode, uniform, blues = blue_to_alpha_rewrite(render_state, rewritten);
 
     if (blues)
         render_state = rewritten;
@@ -4202,18 +4210,23 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
         has_mux = has_mux || ((render_state[WL_XBOX_PSH_RGB_OUTPUTS0 + stage] |
                                render_state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + stage]) &
                               0x4000);
-    for (mux_mode = 2; mux_mode >= (has_mux ? 0 : 2) && !done; mux_mode--) {
-        for (attempt = 0; attempt < sizeof(attempts) / sizeof(attempts[0]) && !done; attempt++) {
-            for (preload = 1; preload >= 0 && !done; preload--) {
-                if (!translate_once(render_state, textures, program, attempts[attempt].economical,
-                                    attempts[attempt].folding, preload != 0,
-                                    attempts[attempt].signed_dots, mux_mode))
-                    continue;
-                if (!program->approximate)
-                    done = true;
-                else if (!have_approximated) {
-                    approximated = *program;
-                    have_approximated = true;
+    /* (and, where none is exact, again with uniform colours in the alpha half) */
+    for (uniform = 0; uniform < 2 && !done; uniform++) {
+        for (mux_mode = 2; mux_mode >= (has_mux ? 0 : 2) && !done; mux_mode--) {
+            for (attempt = 0; attempt < sizeof(attempts) / sizeof(attempts[0]) && !done;
+                 attempt++) {
+                for (preload = 1; preload >= 0 && !done; preload--) {
+                    if (!translate_once(render_state, textures, program,
+                                        attempts[attempt].economical, attempts[attempt].folding,
+                                        preload != 0, attempts[attempt].signed_dots, mux_mode,
+                                        uniform != 0))
+                        continue;
+                    if (!program->approximate)
+                        done = true;
+                    else if (!have_approximated) {
+                        approximated = *program;
+                        have_approximated = true;
+                    }
                 }
             }
         }

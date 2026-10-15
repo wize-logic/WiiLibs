@@ -42,6 +42,8 @@ compares (three without a konst for 127/255; a blend, approximated, where they d
 alpha's low bit (MUX_LSB) it is the top bit's, approximated, but for a constant. Where a program's
 constants outrun the four konst registers (and the TEV registers preloaded with others), one within
 3/255 of 0 or 1 in every channel is read as 0 or 1, and any other takes the nearest konst's value.
+Where no attempt is exact, the attempts are made again with a colour that is a product of values the
+same in every channel made in an alpha register, for a program whose colour registers run out.
 
 The fixed places the device and the translation agree on: the fog ramp is map 7 at texture
 coordinate 4 (`WL_XBOX_PSH_FOG_*`); a bumped lookup's offset reads the bump map as map 5, its terms
