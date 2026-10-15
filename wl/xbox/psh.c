@@ -2781,13 +2781,15 @@ product with 1 */
                     operation.in[1] = parts[index][1];
                     operation.in[2] = parts[index][2];
                     operation.in[3] =
-                        index ? operand(_kind_register, (unsigned char)sum, _channel_natural) : zero;
+                        index ? operand(_kind_register, (unsigned char)sum, _channel_natural)
+                              : zero;
                     emit(translation, portion, &operation);
                 }
                 /* (the output's mapping, which a compare has not, after) */
                 if (flags & 0x38) {
                     operation = operation_new(dest);
-                    operation.in[3] = operand(_kind_register, (unsigned char)dest, _channel_natural);
+                    operation.in[3] =
+                        operand(_kind_register, (unsigned char)dest, _channel_natural);
                     output_mapping(&operation, flags);
                     emit(translation, portion, &operation);
                 }

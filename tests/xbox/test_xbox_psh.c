@@ -758,14 +758,15 @@ TEST random_programs_agree_with_the_combiners(void) {
     if (o.why != NULL) {
         FAILm(o.why);
     }
-    // (most are exact: 991 of them, 888 before the negated mappings were made in their products'
-    // stages and the alpha's blues of products in the stages that read them; 339 approximated
-    // (416) and 170 beyond GX (196), never wrong)
+    // (most are exact: 966 of them since the mux is a step (most of them by r0's alpha's top bit),
+    // 991 of the programs before it, 888 before the negated mappings were made in their products'
+    // stages and the alpha's blues of products in the stages that read them; 361 approximated and
+    // 173 beyond GX, never wrong)
     ASSERT(o.exact > RANDOM_PROGRAMS / 2);
     ASSERT(o.d0_exact > o.exact * 9 / 10);
     ASSERT(o.approximate + o.untranslated > 0);
     // the same programs, field for field, on every target
-    ASSERT_EQ_FMT(0x613B54DDu, g_digest, "%08x");
+    ASSERT_EQ_FMT(0x9B05DA51u, g_digest, "%08x");
     PASS();
 }
 
@@ -796,6 +797,45 @@ TEST random_blues_to_alpha_agree_with_the_combiners(void) {
 }
 
 // ---- particular programs -----------------------------------------------------------------------
+
+// r0 = t1 or t2 by r0's alpha (t0's), a step at 128/255: the mux's two sides, exact, at each edge
+TEST the_mux_is_a_step(void) {
+    uint32_t state[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures;
+    static WlXboxPshProgram program;
+    memset(state, 0, sizeof state);
+    state[WL_XBOX_PSH_COMBINER_COUNT] = 1u | 0x100u;
+    state[WL_XBOX_PSH_RGB_INPUTS0] = 0x09200A20u;   // t1 * 1, t2 * 1
+    state[WL_XBOX_PSH_RGB_OUTPUTS0] = 0x4C00u;      // the mux to r0
+    state[WL_XBOX_PSH_ALPHA_INPUTS0] = 0x19201A20u; // their alphas
+    state[WL_XBOX_PSH_ALPHA_OUTPUTS0] = 0x4C00u;
+    g_fog_on = 0;
+    g_d0_alpha_map = 0;
+    textures_make(&textures, 7u);
+    ASSERT(wl_xbox_psh_translate(state, &textures, NULL, &program));
+    ASSERT(!program.approximate);
+    for (unsigned level = 0; level < 256; level++) {
+        Inputs in;
+        V4 maps[8];
+        memset(&in, 0, sizeof in);
+        memset(maps, 0, sizeof maps);
+        in.t[0] = (V4){{0.0f, 0.0f, 0.0f, (float)level / 255.0f}};
+        in.t[1] = (V4){{0.25f, 0.5f, 0.75f, 0.2f}};
+        in.t[2] = (V4){{1.0f, 0.0f, 0.5f, 0.9f}};
+        for (int i = 0; i < 3; i++) {
+            maps[i] = in.t[i];
+        }
+        V4 got = simulate(&program, &in, maps), want = level >= 128 ? in.t[2] : in.t[1];
+        for (int ch = 0; ch < 4; ch++) {
+            ASSERT_IN_RANGE(want.c[ch], got.c[ch], 0.01f);
+        }
+    }
+    // (by the low bit: the top bit's, approximated)
+    state[WL_XBOX_PSH_COMBINER_COUNT] = 1u;
+    ASSERT(wl_xbox_psh_translate(state, &textures, NULL, &program));
+    ASSERT(program.approximate);
+    PASS();
+}
 
 // dp3 r1.rgba, t0_bx2, v0_bx2 (AB's blue to r1's alpha), then r0 = t1 * r1.a: the dot product in
 // the alpha, exact
@@ -1010,7 +1050,8 @@ TEST a_final_product_with_every_register_held(void) {
 // difference about one half (t1.a + (0.5 - t0), the alpha t0.b + (0.5 - t1.b)) squared and chosen
 // by the mux. Every TEV register holds a value when the half bias negates are read: each is made in
 // the stage of its sum, and the alpha's blues of t0 and t1 (products of a texture and a constant)
-// are made again in the stages that read them, so the program is exact
+// are made again in the stages that read them, so the program is exact (its mux by r0's alpha's top
+// bit: by the low bit, which TEV cannot read, it is approximated)
 static void shimmer(uint32_t *state) {
     memset(state, 0, WL_XBOX_PSH_WORDS * sizeof *state);
     state[WL_XBOX_PSH_COMBINER_COUNT] = 5u | 0x1000u | 0x10000u | 0x100u;
@@ -1090,6 +1131,7 @@ SUITE(psh_suite) {
     RUN_TEST(more_random_programs_agree_with_the_combiners);
     RUN_TEST(random_blues_to_alpha_agree_with_the_combiners);
     RUN_TEST(a_dot_product_to_the_alpha);
+    RUN_TEST(the_mux_is_a_step);
     RUN_TEST(negated_mappings_take_no_register_of_their_own);
     RUN_TEST(an_expand_negate_is_one_stage);
     RUN_TEST(a_final_product_with_every_register_held);

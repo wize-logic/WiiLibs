@@ -34,7 +34,12 @@ through TEV's lerp, bias and scale; a half bias negate or expand negate (0.5 - x
 its product's stage, with no register of its own, and the alpha's reads of a colour's blue made
 again where they are read (Halo's title-screen logo, all four TEV registers busy, is exact so). A
 program beyond GX is refused (`reason`); one that only fits approximated says so (`approximate`,
-`approximation`); of the attempts the translation makes, the first exact one is kept.
+`approximation`); of the attempts the translation makes, the first exact one is kept. A colour
+output's blue copied to its alpha (Direct3D's dp3 to rgba) becomes an alpha portion reading that
+blue right after its stage (in the next stage's idle alpha half, or a stage inserted, eight at
+most). The mux is the NV2A's step: CD where r0's alpha is 128/255 or more, through two of TEV's
+compares (three without a konst for 127/255; a blend, approximated, where they do not fit); by the
+alpha's low bit (MUX_LSB) it is the top bit's, approximated, but for a constant.
 
 The fixed places the device and the translation agree on: the fog ramp is map 7 at texture
 coordinate 4 (`WL_XBOX_PSH_FOG_*`); a bumped lookup's offset reads the bump map as map 5, its terms
