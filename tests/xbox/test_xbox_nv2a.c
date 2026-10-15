@@ -608,6 +608,9 @@ TEST the_ptimer_alarm_rises_when_the_time_passes_it(void) {
     ASSERT_EQ((uint32_t)WL_NV2A_PTIMER_INTR_ALARM, wl_nv2a_mmio_read(dev, WL_NV2A_PTIMER_INTR_0, 4));
     wl_nv2a_destroy(dev);
     free(g.ram);
+    PASS();
+}
+
 // D3D's way with a software method: its ISR has the GPU's interrupts off until its DPC runs, so a
 // trap can come while they are off; the DPC turns PGRAPH_FIFO off, acknowledges the trap, reads and
 // runs the method, then turns PGRAPH_FIFO on. The channel stays stopped at the trap through all of it,
