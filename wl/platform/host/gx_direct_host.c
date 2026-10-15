@@ -127,6 +127,23 @@ void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
         return;
     }
     memcpy(v.position, words, sizeof v.position);
+    if (s.layout.texcoords_projected) {
+        unsigned projected = 0, k;
+
+        // (the projected coordinates' (s, t, q), as the normal or normal, binormal and tangent)
+        for (n = 0; n < 8; n++) {
+            if ((s.layout.texcoords_projected & (1u << n)) && i + 3u <= count) {
+                memcpy(&v.texcoord[n][0], &words[i], sizeof(float));
+                memcpy(&v.texcoord[n][1], &words[i + 1u], sizeof(float));
+                memcpy(&v.texcoord_q[n], &words[i + 2u], sizeof(float));
+                i += 3u;
+                projected++;
+            }
+        }
+        for (k = projected; projected > 1u && k < 3u; k++) {
+            i += 3u;
+        }
+    }
     for (n = 0; n < s.layout.colors && n < 2 && i < count; n++, i++) {
         v.color[n][0] = (uint8_t)(words[i] >> 24);
         v.color[n][1] = (uint8_t)(words[i] >> 16);

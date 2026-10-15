@@ -176,6 +176,40 @@ TEST gx_direct_stub_flushes_a_renderers_own_format(void) {
     PASS();
 }
 
+// two projected coordinates through the FIFO's words, as the host records them: (s, t, q) for each
+// after the position (nine words, the third zero), then the colour and the plain coordinate
+TEST gx_direct_stub_takes_projected_coordinates_after_the_position(void) {
+    WlGxDirectLayout layout;
+    const WlHostGxDirect *d;
+    const float f[15] = {1, 2, 3, 0.5f, 0.25f, 2, 4, 8, 16, 0, 0, 0, 0, 7, 9};
+    uint32_t words[15];
+
+    memcpy(words, f, sizeof words);
+    words[12] = 0x11223344u;
+    memset(&layout, 0, sizeof layout);
+    layout.colors = 1;
+    layout.texcoords = 1u << 1;
+    layout.texcoords_projected = (1u << 0) | (1u << 2);
+    wl_host_gx_direct_reset();
+    wl_gx_direct_layout(&layout);
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 1);
+    wl_gx_direct_vertex_words(words, 15);
+    wl_gx_direct_primitive_end();
+    d = wl_host_gx_direct();
+    ASSERT_EQ(1u, d->count);
+    ASSERT_EQ(5u, d->layout.texcoords_projected);
+    ASSERT(d->vertices[0].position[2] == 3.0f);
+    ASSERT(d->vertices[0].texcoord[0][0] == 0.5f && d->vertices[0].texcoord[0][1] == 0.25f);
+    ASSERT(d->vertices[0].texcoord_q[0] == 2.0f);
+    ASSERT(d->vertices[0].texcoord[2][0] == 4.0f && d->vertices[0].texcoord[2][1] == 8.0f);
+    ASSERT(d->vertices[0].texcoord_q[2] == 16.0f);
+    ASSERT_EQ(0x11, d->vertices[0].color[0][0]);
+    ASSERT_EQ(0x44, d->vertices[0].color[0][3]);
+    ASSERT(d->vertices[0].texcoord[1][0] == 7.0f && d->vertices[0].texcoord[1][1] == 9.0f);
+    wl_host_gx_direct_reset();
+    PASS();
+}
+
 TEST audio_stub_renders_through_the_fill_callback(void) {
     uint32_t next = 0;
     ASSERT_EQ(WL_ERR_ARG, wl_platform_audio_start(32000, 256, NULL, NULL));
@@ -207,6 +241,7 @@ SUITE(host_suite) {
     RUN_TEST(filter_override_resolution);
     RUN_TEST(gx_stub_records_frames_and_draws);
     RUN_TEST(gx_direct_stub_flushes_a_renderers_own_format);
+    RUN_TEST(gx_direct_stub_takes_projected_coordinates_after_the_position);
     RUN_TEST(audio_stub_renders_through_the_fill_callback);
 }
 

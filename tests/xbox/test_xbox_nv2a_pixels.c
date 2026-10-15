@@ -9,7 +9,8 @@
 // arrays through GX's transform unit against the same draws on the processor, within a tolerance,
 // and a second pass over them by a program whose colour the processor computes (the transform unit
 // still doing its position) passing LEQUAL everywhere; the same draw with its arrays kept for GX to
-// read by index (the vertex cache), to the bit, and again after its vertices are rewritten.
+// read by index (the vertex cache), to the bit, and again after its vertices are rewritten. A
+// projective coordinate whose q varies over a quad, divided at each pixel as the NV2A divides it.
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -849,6 +850,71 @@ TEST arrays_kept_for_gx_to_index_draw_to_the_bit(void) {
     PASS();
 }
 
+// an immediate vertex with a four-component coordinate (s, t, r, q) and a white colour
+static void projective_vertex(TGuest *g, float x, float y, float s, float t, float q) {
+    t_method(g, WL_NV2A_K_SET_VERTEX_DATA4F_M + 16 * 9, 4);
+    t_word(g, t_f(s));
+    t_word(g, t_f(t));
+    t_word(g, t_f(0.0f));
+    t_word(g, t_f(q));
+    t_m1(g, WL_NV2A_K_SET_VERTEX_DATA4UB + 4 * 3, 0xFFFFFFFFu);
+    t_method(g, WL_NV2A_K_SET_VERTEX_DATA4F_M, 4);
+    t_word(g, t_f(x));
+    t_word(g, t_f(y));
+    t_word(g, t_f(0.5f * 16777215.0f));
+    t_word(g, t_f(1.0f));
+}
+
+TEST a_projective_coordinate_is_divided_at_each_pixel(void) {
+    TGuest g;
+    WlNv2aGxStats stats;
+    unsigned x, y;
+
+    ASSERT(pixel_device(&g) != NULL);
+    // the 4x4 texture's columns 0 and 1 black, 2 and 3 white (swizzled: x's bits at 0 and 2)
+    for (y = 0; y < 4; y++) {
+        for (x = 0; x < 4; x++) {
+            unsigned at = (x & 1u) | (y & 1u) << 1 | (x & 2u) << 1 | (y & 2u) << 2;
+
+            t_w32(&g, F_TEXTURE + 4 * at, x >= 2 ? 0xFFFFFFFFu : 0xFF000000u);
+        }
+    }
+    f_program(&g, 0, f_screen_program, 3);
+    f_clear(&g, 0xFF204080u);
+    // over (100, 100)-(300, 200): (s, q) from (0, 1) at the left to (2, 2) at the right, t / q 0.5.
+    // At a fraction f across, s / q is 2f / (1 + f): 0.5, the white's first column, at f = 1/3; a
+    // division at the vertices would put it at f = 0.5
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_QUADS);
+    projective_vertex(&g, 100, 100, 0, 0.5f, 1);
+    projective_vertex(&g, 300, 100, 2, 1, 2);
+    projective_vertex(&g, 300, 200, 2, 1, 2);
+    projective_vertex(&g, 100, 200, 0, 0.5f, 1);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+    t_kick(&g);
+    // f = 0.3 black, f = 0.37 and 0.45 white (the vertices' division: black there), f = 0.95 white
+    ASSERT(near_rgb(pixel(160, 150), 0x000000FFu, 4));
+    ASSERT(near_rgb(pixel(174, 150), 0xFFFFFFFFu, 4));
+    ASSERT(near_rgb(pixel(190, 150), 0xFFFFFFFFu, 4));
+    ASSERT(near_rgb(pixel(290, 150), 0xFFFFFFFFu, 4));
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT_EQ(1u, stats.projected_draws);
+    // the same with q 2 at every vertex: divided at the vertices, as before (s / q from 0 to 1)
+    f_clear(&g, 0xFF204080u);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_QUADS);
+    projective_vertex(&g, 100, 100, 0, 1, 2);
+    projective_vertex(&g, 300, 100, 2, 1, 2);
+    projective_vertex(&g, 300, 200, 2, 1, 2);
+    projective_vertex(&g, 100, 200, 0, 1, 2);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+    t_kick(&g);
+    ASSERT(near_rgb(pixel(190, 150), 0x000000FFu, 4));
+    ASSERT(near_rgb(pixel(210, 150), 0xFFFFFFFFu, 4));
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT_EQ(1u, stats.projected_draws);
+    pixel_done(&g);
+    PASS();
+}
+
 SUITE(pixels_suite) {
     RUN_TEST(console_suite_on_the_software_gx);
     RUN_TEST(textured_quad_through_the_combiners);
@@ -865,6 +931,7 @@ SUITE(pixels_suite) {
     RUN_TEST(arrays_through_the_transform_unit_land_as_on_the_processor);
     RUN_TEST(a_second_pass_by_the_processor_passes_over_the_transform_units_depths);
     RUN_TEST(arrays_kept_for_gx_to_index_draw_to_the_bit);
+    RUN_TEST(a_projective_coordinate_is_divided_at_each_pixel);
 }
 
 GREATEST_MAIN_DEFS();

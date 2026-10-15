@@ -605,7 +605,7 @@ static bool states_apply(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aSurfac
 // cull_measure: GX's names for its windings are not the screen's).
 static void cull_measure(WlNv2aGx *gx, uint32_t clear_rgba) {
     static const float corners[3][2] = {{0.0f, 0.0f}, {16.0f, 0.0f}, {0.0f, 16.0f}};
-    WlGxDirectLayout layout = {1, 0, 0, 0, 0};
+    WlGxDirectLayout layout = {1, 0, 0, 0, 0, 0};
     WlTevProgram tev;
     float m[4][4];
     unsigned pass, v;
@@ -1186,8 +1186,11 @@ typedef struct DrawPlan {
     // coordinates sent (bit n: stage n; the fog's), and a vertex's words
     unsigned colors, channels, texcoords, words;
     StagePlan stages[WL_NV2A_TEXTURES];
-    // the stages whose coordinates are sent, in order
+    // the stages whose coordinates are sent, in order; of them, the projective ones whose q varies
+    // from vertex to vertex, sent as (s, t, q) for GX to divide at each pixel (after the position:
+    // three words for one, nine for two or three), the others divided here
     unsigned stage_count, stage_list[WL_NV2A_TEXTURES];
+    unsigned projected_count, projected_list[WL_GX_DIRECT_PROJECTED];
     // the transform unit's draw (NULL: the processor's)
     const struct XfPlan *xf;
 } DrawPlan;
@@ -1229,6 +1232,14 @@ static void stage_plan(StagePlan *s, const WlNv2aTexEntry *entry, unsigned stage
         s->to_s = 1.0f / (float)entry->width;
         s->to_t = 1.0f / (float)entry->height;
     }
+}
+
+// a projective stage's coordinate for GX to divide at each pixel: (s, t, q) undivided, a linear
+// texture's s and t to a fraction (the scale and the division commute)
+static inline void stage_texcoord_projected(const StagePlan *s, const float t[4], float stq[3]) {
+    stq[0] = s->linear ? t[0] * s->to_s : t[0];
+    stq[1] = s->linear ? t[1] * s->to_t : t[1];
+    stq[2] = t[3];
 }
 
 static inline void stage_texcoord(const StagePlan *s, const float t[4], float st[2]) {
@@ -1288,6 +1299,23 @@ static void vertex_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPla
     put_float(&out->w[0], position[0]);
     put_float(&out->w[1], position[1]);
     put_float(&out->w[2], position[2]);
+    if (plan->projected_count != 0) {
+        // (the projected coordinates first, as GX's normal, binormal and tangent)
+        for (stage = 0; stage < plan->projected_count; stage++) {
+            unsigned n = plan->projected_list[stage];
+            float stq[3];
+
+            stage_texcoord_projected(&plan->stages[n], o->t[n], stq);
+            put_float(&out->w[i++], stq[0]);
+            put_float(&out->w[i++], stq[1]);
+            put_float(&out->w[i++], stq[2]);
+        }
+        for (; plan->projected_count > 1u && stage < WL_GX_DIRECT_PROJECTED; stage++) {
+            out->w[i++] = 0;
+            out->w[i++] = 0;
+            out->w[i++] = 0;
+        }
+    }
     if (plan->colors >= 1) {
         out->w[i++] = (plan->channels & 1u) ? wl_nv2a_color_word(o->d0) : 0u;
     }
@@ -1334,8 +1362,8 @@ static void vertex_pack_xf(const DrawPlan *plan, const float (*inputs)[4], Packe
 // others are fetched (the inputs the program reads alone) and run through the program together, and
 // their vertices made into the memo (or, where another index of the batch holds the slot, here).
 // A vertex is a function of its index, so each is the same whatever the memo held.
-static void vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, uint32_t first, uint32_t count,
-                          const DrawPlan *plan) {
+static unsigned vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, uint32_t first,
+                              uint32_t count, const DrawPlan *plan) {
     bool indexed = draw->source == WL_NV2A_SOURCE_ARRAYS && draw->indices != NULL;
     uint32_t batch = ++gx->batch_stamp;
     unsigned runs = 0, n, r;
@@ -1371,7 +1399,7 @@ static void vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
         for (r = 0; r < runs; r++) {
             vertex_pack_xf(plan, (const float (*)[4])gx->batch.inputs[r], gx->batch.run_vertices[r]);
         }
-        return;
+        return runs;
     }
     // (the transform unit's position: the program run for the other outputs alone)
     wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, runs,
@@ -1381,6 +1409,7 @@ static void vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
         vertex_pack(gx, k, plan, &gx->batch.outputs[r], (const float (*)[4])gx->batch.inputs[r],
                     gx->batch.run_vertices[r]);
     }
+    return runs;
 }
 
 // the one input register (bit) an output's components read, 0 for none, ~0u for more or not affine
@@ -1789,6 +1818,64 @@ static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2
     }
 }
 
+// The draw's projective stages whose q varies from vertex to vertex, up to WL_GX_DIRECT_PROJECTED of
+// them, found in the draw's first batch (its `runs` vertices just made: the program's t[n].w reads an
+// input, as its analysis finds, and differs among them): sent as (s, t, q) for GX to divide at each
+// pixel, as the NV2A does, out of the stages divided per vertex. A constant q is divided here: per
+// vertex or per pixel, the same (so is a q that varies only after the first batch: divided here, as
+// before). True when the plan changed: the batch is then packed again, and the layout set again.
+static bool projected_plan(WlNv2aGx *gx, const WlNv2aKelvin *k, DrawPlan *plan, WlGxDirectLayout *layout,
+                           unsigned runs) {
+    const WlXboxVshOutput *o = gx->batch.outputs;
+    unsigned n, r, kept = 0, count = 0, words, chosen = 0;
+    bool full;
+
+    if (gx->pipeline.program == NULL || (plan->xf != NULL && plan->xf->full) || runs < 2u) {
+        return false;
+    }
+    xf_structure(gx, plan->live, &full);
+    for (n = 0; n < plan->stage_count && count < WL_GX_DIRECT_PROJECTED; n++) {
+        unsigned stage = plan->stage_list[n];
+        const StagePlan *sp = &plan->stages[stage];
+
+        if (!sp->projective || sp->sphere || (gx->xf_dependencies.t[stage][3] & 0xFFFFu) == 0) {
+            continue;
+        }
+        for (r = 1; r < runs && o[r].t[stage][3] == o[0].t[stage][3]; r++) {
+        }
+        if (r < runs) {
+            // (the vertex's words within PACKED_WORDS: two projected cost nine words for four)
+            words = plan->words - 2u * (count + 1u) + (count == 0 ? 3u : 3u * WL_GX_DIRECT_PROJECTED);
+            if (words > PACKED_WORDS) {
+                break;
+            }
+            chosen |= 1u << stage;
+            count++;
+        }
+    }
+    if (count == 0) {
+        return false;
+    }
+    for (n = 0; n < plan->stage_count; n++) {
+        unsigned stage = plan->stage_list[n];
+
+        if (chosen & (1u << stage)) {
+            plan->projected_list[plan->projected_count++] = stage;
+            continue;
+        }
+        plan->stage_list[kept++] = stage;
+    }
+    plan->stage_count = kept;
+    layout->texcoords &= (uint8_t)~chosen;
+    layout->texcoords_projected = (uint8_t)chosen;
+    plan->words += (count == 1u ? 3u : 3u * WL_GX_DIRECT_PROJECTED) - 2u * count;
+    gx->stats.projected_draws++;
+    for (r = 0; r < runs; r++) {
+        vertex_pack(gx, k, plan, &o[r], (const float (*)[4])gx->batch.inputs[r], gx->batch.run_vertices[r]);
+    }
+    return true;
+}
+
 static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
     WlNv2aGx *gx = user;
     WlNv2aSurface surface;
@@ -1873,6 +1960,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     plan.live = WL_XBOX_VSH_LIVE_POSITION;
     plan.xf = NULL;
     plan.stage_count = 0;
+    plan.projected_count = 0;
     plan.colors = layout.colors;
     plan.channels = gx->channels;
     plan.texcoords = layout.texcoords;
@@ -2004,7 +2092,6 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
         gx->stats.indexed_vertices += draw->count;
         return 0;
     }
-    wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
     gx->memo_stamp++;
     // (the fetch decided once for the draw: the attributes the program reads, the current values'
     // written once into every run's inputs)
@@ -2013,11 +2100,19 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
                                    : wl_nv2a_pipeline_inputs(&gx->pipeline, plan.live) | 1u;
     wl_nv2a_fetch_plan(draw, attributes, &gx->fetch);
     wl_nv2a_fetch_constants(&gx->fetch, k, gx->batch.inputs, WL_XBOX_VSH_BATCH);
+    // (the first batch, which finds the projective coordinates GX is to divide at each pixel)
+    if (draw->count != 0 &&
+        projected_plan(gx, k, &plan, &layout,
+                       vertices_make(gx, k, draw, 0, draw->count < WL_XBOX_VSH_BATCH ? draw->count : WL_XBOX_VSH_BATCH,
+                                     &plan))) {
+        wl_gx_direct_layout(&layout);
+    }
+    wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
     for (v = 0; v < draw->count; v++) {
         unsigned n = (v - first) % WL_XBOX_VSH_BATCH;
         const PackedVertex *vertex;
 
-        if (n == 0) {
+        if (n == 0 && v != 0) {
             first = v;
             vertices_make(gx, k, draw, v, draw->count - v < WL_XBOX_VSH_BATCH ? draw->count - v : WL_XBOX_VSH_BATCH,
                           &plan);

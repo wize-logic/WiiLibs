@@ -4,7 +4,8 @@
 // combiner program (the vertices as GX gets them, the TEV program applied, the texture bound), a
 // draw through a program that divides by w (the perspective projection and (x w, y w, -w)), the
 // frame's clear, culling, a stencil draw skipped, and the frame shown when the title finishes it;
-// render targets, and a screen blur through the back buffer's depth buffer drawn in one frame.
+// render targets, and a screen blur through the back buffer's depth buffer drawn in one frame. A
+// projective coordinate whose q varies sent as (s, t, q) for GX to divide at each pixel.
 #include <math.h>
 #include <string.h>
 
@@ -93,6 +94,8 @@ TEST screen_space_quad_with_texture_and_combiners(void) {
     ASSERT(d->textures[0] != NULL);
     ASSERT_EQ(4u, d->textures[0]->width);
     ASSERT(d->layout.texcoords & 1u);
+    // (q 1 at every vertex: divided at the vertices, nothing projected)
+    ASSERT_EQ(0u, d->layout.texcoords_projected);
     ASSERT(d->layout.colors >= 1);
     ASSERT(d->z_test);
     ASSERT_EQ(WL_GX_LEQUAL, d->z_func);
@@ -107,6 +110,51 @@ TEST screen_space_quad_with_texture_and_combiners(void) {
     t_m1(&g, WL_NV2A_K_FLIP_INCREMENT_WRITE, 0);
     t_kick(&g);
     ASSERT_EQ(1u, wl_host_gx_state()->end_frames);
+    gx_done(&g);
+    PASS();
+}
+
+// an immediate vertex with a four-component coordinate (s, t, 0, q)
+static void projective_vertex(TGuest *g, float x, float y, float s, float t, float q) {
+    t_method(g, WL_NV2A_K_SET_VERTEX_DATA4F_M + 16 * 9, 4);
+    t_word(g, t_f(s));
+    t_word(g, t_f(t));
+    t_word(g, t_f(0.0f));
+    t_word(g, t_f(q));
+    t_m1(g, WL_NV2A_K_SET_VERTEX_DATA4UB + 4 * 3, 0xFFFFFFFFu);
+    t_method(g, WL_NV2A_K_SET_VERTEX_DATA4F_M, 4);
+    t_word(g, t_f(x));
+    t_word(g, t_f(y));
+    t_word(g, t_f(0.0f));
+    t_word(g, t_f(1.0f));
+}
+
+TEST a_projective_coordinate_whose_q_varies_is_sent_undivided(void) {
+    TGuest g;
+    const WlHostGxDirect *d;
+    WlNv2aGxStats stats;
+
+    ASSERT(gx_device(&g) != NULL);
+    f_frame_setup(&g);
+    f_program(&g, 0, f_screen_program, 3);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+    projective_vertex(&g, 100, 100, 0, 0.5f, 1);
+    projective_vertex(&g, 300, 100, 2, 1, 2);
+    projective_vertex(&g, 300, 200, 3, 3, 4);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+    t_kick(&g);
+    d = wl_host_gx_direct();
+    ASSERT_EQ(3u, d->count);
+    // (the coordinate GX's normal: s, t and q as the program left them, after the position)
+    ASSERT_EQ(1u, d->layout.texcoords_projected);
+    ASSERT_EQ(0u, d->layout.texcoords & 1u);
+    ASSERT(near(d->vertices[1].texcoord[0][0], 2.0f));
+    ASSERT(near(d->vertices[1].texcoord[0][1], 1.0f));
+    ASSERT(near(d->vertices[1].texcoord_q[0], 2.0f));
+    ASSERT(near(d->vertices[2].texcoord_q[0], 4.0f));
+    ASSERT_EQ(255, d->vertices[2].color[0][0]);
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT_EQ(1u, stats.projected_draws);
     gx_done(&g);
     PASS();
 }
@@ -459,6 +507,7 @@ TEST a_target_read_as_x8r8g8b8_has_no_alpha(void) {
 
 SUITE(gx_suite) {
     RUN_TEST(screen_space_quad_with_texture_and_combiners);
+    RUN_TEST(a_projective_coordinate_whose_q_varies_is_sent_undivided);
     RUN_TEST(perspective_draws_send_x_w_y_w_minus_w);
     RUN_TEST(culling_by_the_nv2a_rule_and_stencil_skipped);
     RUN_TEST(partial_clears_are_quads_and_render_targets_take_the_efb);

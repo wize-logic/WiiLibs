@@ -35,7 +35,9 @@ send, an empty texture map, a TLUT not loaded).
   leaves [-w, 0] (GX's near and far planes) or w reaches 0; the viewport with depth 1 + z'/w.
   Texture coordinates through identity generators (one the layout does not send from the position,
   as the Wii backend makes it), or a 2x4 matrix's (`wl_gx_direct_texgen`) from the vertex's
-  coordinate (s, t, 1, 1) or its position as sent; colours unlit from the vertex.
+  coordinate (s, t, 1, 1) or its position as sent; a projected coordinate (the layout's
+  `texcoords_projected`) through its 3x4 identity, s and t divided by its interpolated q at each
+  pixel; colours unlit from the vertex.
 - **Rasterizing.** Triangles, strips, fans, quads; lines and points a pixel wide. Culling by the
   winding on the screen: clockwise (y down) is GX's front face, so `GX_CULL_FRONT` discards it, as
   Dolphin measures it. Pixels sampled at 7/12 of a pixel (Dolphin's centre), the top-left rule,

@@ -20,11 +20,13 @@
 #define Z_FAR 0x00FFFFFFu
 
 enum {
-    // a vertex's numbers: the clip-space position, two colours (0..255), eight coordinates
+    // a vertex's numbers: the clip-space position, two colours (0..255), eight coordinates, their q
+    // (1 but for a projected one's, which s and t are divided by at each pixel)
     A_CLIP = 0,
     A_COLOR = 4,
     A_TEX = 12,
-    A_COUNT = 28,
+    A_TQ = 28,
+    A_COUNT = 36,
     CLIP_MAX = 16,
     DECODED_MAX = 96,
     LEVELS_MAX = 11,
@@ -499,7 +501,7 @@ static void plan_make(Plan *plan, WlGxDirectPrim prim, uint32_t count) {
     plan->sy1 = plan->sy1 > (int)EFB_H ? (int)EFB_H : plan->sy1;
     plan->channels = st->layout.colors > 2u ? 2u : st->layout.colors;
     for (n = 0; n < 8; n++) {
-        if ((st->layout.texcoords | st->layout.texcoords_generated) & (1u << n)) {
+        if ((st->layout.texcoords | st->layout.texcoords_generated | st->layout.texcoords_projected) & (1u << n)) {
             plan->texgens = n + 1u;
         }
     }
@@ -573,6 +575,7 @@ static void vertex_transform(const Plan *plan, const WlGxDirectVertex *v, float 
     for (n = 0; n < 8; n++) {
         float *t = &a[A_TEX + n * 2u];
 
+        a[A_TQ + n] = 1.0f;
         if (n >= plan->texgens) {
             t[0] = t[1] = 0.0f;
         } else if (plan->st->texgen[n].set) {
@@ -588,6 +591,11 @@ static void vertex_transform(const Plan *plan, const WlGxDirectVertex *v, float 
             }
             t[0] = m[0][0] * in[0] + m[0][1] * in[1] + m[0][2] * in[2] + m[0][3] * in[3];
             t[1] = m[1][0] * in[0] + m[1][1] * in[1] + m[1][2] * in[2] + m[1][3] * in[3];
+        } else if (plan->st->layout.texcoords_projected & (1u << n)) {
+            // (a projected coordinate, through its 3x4 identity: s and t divided by q at each pixel)
+            t[0] = v->texcoord[n][0];
+            t[1] = v->texcoord[n][1];
+            a[A_TQ + n] = v->texcoord_q[n];
         } else if (plan->st->layout.texcoords & (1u << n)) {
             t[0] = v->texcoord[n][0];
             t[1] = (plan->st->layout.texcoord_s & (1u << n)) ? 0.0f : v->texcoord[n][1];
@@ -777,6 +785,13 @@ static void pixel(Plan *plan, const Triangle *t, int px, int py, const double l[
 
             s = attribute(t, l, a, inv);
             tt = attribute(t, l, a + 1u, inv);
+            if (plan->st->layout.texcoords_projected & (1u << lk->texcoord)) {
+                // (a projected coordinate: divided by its q here, at the pixel)
+                float q = attribute(t, l, A_TQ + lk->texcoord, inv);
+
+                s = q != 0.0f ? s / q : 0.0f;
+                tt = q != 0.0f ? tt / q : 0.0f;
+            }
             if (lk->lod && lk->d != NULL) {
                 double lx[3], ly[3];
                 float sx, tx, sy, ty, rho_x, rho_y, rho;
@@ -789,10 +804,18 @@ static void pixel(Plan *plan, const Triangle *t, int px, int py, const double l[
                 {
                     float ix = inverse_w(t, lx), iy = inverse_w(t, ly);
 
-                    sx = attribute(t, lx, a, ix) - s;
-                    tx = attribute(t, lx, a + 1u, ix) - tt;
-                    sy = attribute(t, ly, a, iy) - s;
-                    ty = attribute(t, ly, a + 1u, iy) - tt;
+                    float qx = 1.0f, qy = 1.0f;
+
+                    if (plan->st->layout.texcoords_projected & (1u << lk->texcoord)) {
+                        qx = attribute(t, lx, A_TQ + lk->texcoord, ix);
+                        qy = attribute(t, ly, A_TQ + lk->texcoord, iy);
+                        qx = qx != 0.0f ? qx : 1.0f;
+                        qy = qy != 0.0f ? qy : 1.0f;
+                    }
+                    sx = attribute(t, lx, a, ix) / qx - s;
+                    tx = attribute(t, lx, a + 1u, ix) / qx - tt;
+                    sy = attribute(t, ly, a, iy) / qy - s;
+                    ty = attribute(t, ly, a + 1u, iy) / qy - tt;
                 }
                 sx *= (float)lk->d->width;
                 sy *= (float)lk->d->width;

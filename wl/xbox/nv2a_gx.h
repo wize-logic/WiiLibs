@@ -82,6 +82,7 @@ typedef struct WlNv2aGxStats {
     uint32_t xf_draws;            // draws whose vertices GX's transform unit transformed
     uint32_t xf_vertices;         // ...and their vertices
     uint32_t xf_position_draws;   // draws whose positions alone it transformed (the rest the program's)
+    uint32_t projected_draws;     // draws with a projective coordinate whose q varies: divided by GX per pixel
     uint32_t unwritten_counted;   // draws that write nothing (no colour, no depth) counting pixels: counted, not drawn
     uint32_t unwritten_skipped;   // ...and not counting: skipped
     uint32_t indexed_draws;       // draws through the transform unit that sent their indices alone

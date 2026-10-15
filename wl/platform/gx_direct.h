@@ -61,6 +61,8 @@ typedef struct WlGxDirectVertex {
     float position[3];
     uint8_t color[2][4];
     float texcoord[8][2];
+    // a projected coordinate's q (WlGxDirectLayout.texcoords_projected), which GX divides s and t by
+    float texcoord_q[8];
 } WlGxDirectVertex;
 
 typedef struct WlGxDirectLayout {
@@ -73,7 +75,15 @@ typedef struct WlGxDirectLayout {
     // the attributes read from arrays at the vertex's index (bit WL_GX_DIRECT_ARRAY_*: the position,
     // a colour, a texture coordinate the layout has), the others sent
     uint16_t indexed;
+    // bit n: texture coordinate n is projective, (s, t, q) with q divided per pixel (not per vertex):
+    // at most WL_GX_DIRECT_PROJECTED of them, not in texcoords. GX takes them as the vertex's normal
+    // (one) or its normal, binormal and tangent (two or three: nine numbers, the unused zero), sent
+    // after the position, and makes each through a 3x4 generator
+    uint8_t texcoords_projected;
 } WlGxDirectLayout;
+
+// projected coordinates a layout may have
+enum { WL_GX_DIRECT_PROJECTED = 3 };
 
 // an indexed attribute (WlGxDirectLayout.indexed's bit, wl_gx_direct_array's attribute): the
 // position, colour c (WL_GX_DIRECT_ARRAY_COLOR0 + c), texture coordinate n (..._TEXCOORD0 + n)
@@ -96,8 +106,9 @@ void wl_gx_direct_draw(WlGxDirectPrim prim, const WlGxDirectVertex *vertices, ui
 void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count);
 void wl_gx_direct_vertex(const WlGxDirectVertex *vertex);
 // The same vertex as the FIFO takes it in the layout set: `count` words, the position's three floats,
-// each colour as 0xRRGGBBAA, each texture coordinate's one or two floats (a float as its bits), in
-// that order. On the Wii the words go into the FIFO as they are, without the layout's tests.
+// the projected coordinates' (s, t, q) in order (three words for one, nine for two or three, the
+// unused zero), each colour as 0xRRGGBBAA, each texture coordinate's one or two floats (a float as its
+// bits), in that order. On the Wii the words go into the FIFO as they are, without the layout's tests.
 void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count);
 void wl_gx_direct_primitive_end(void);
 // An indexed attribute's array (WL_GX_DIRECT_ARRAY_*), for the vertices that follow: element i at
