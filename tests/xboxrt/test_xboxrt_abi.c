@@ -76,14 +76,18 @@ TEST registers_save_and_load(void) {
     PASS();
 }
 
-TEST memory_macros_agree(void) {
+static bool mem_up(void) {
     static bool up;
     if (!up) {
         WlXbMemConfig mc;
         wl_xb_mem_config_default(&mc);
-        ASSERT_EQ(WL_OK, wl_xb_mem_init(&mc));
-        up = true;
+        up = wl_xb_mem_init(&mc) == WL_OK;
     }
+    return up;
+}
+
+TEST memory_macros_agree(void) {
+    ASSERT(mem_up());
     static const uint32_t vas[] = {0x00010000u, 0x0BFFF000u, 0x80000000u, 0x83FFF000u, 0xF0001000u, 0xFD000000u};
     for (size_t i = 0; i < sizeof vas / sizeof vas[0]; i++) {
         ASSERT_EQ_FMT((unsigned long long)(uintptr_t)wl_xb_ptr(vas[i]), (unsigned long long)XBOX_PTR(vas[i]), "%llx");
@@ -103,6 +107,54 @@ TEST memory_macros_agree(void) {
     uint32_t phys = 0;
     ASSERT(wl_xb_va_to_phys(va, &phys));
     ASSERT_EQ_FMT(0x11223344u, MEM32(WL_XB_WINDOW | phys), "%08x"); // the window: the same page
+    ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
+    PASS();
+}
+
+// The instructions code asks the processor what it is with, which the lifter leaves to the
+// unimplemented-instruction hook (recomp_unimpl): Bink's MMX check, as the generated code runs it.
+// pushfd/popfd go through the guest stack and keep DF and the ID bit (so a CPUID-capable processor
+// is seen), and cpuid answers as the Xbox's Pentium III.
+TEST processor_identification(void) {
+    ASSERT(mem_up());
+    uint32_t va = 0;
+    ASSERT_EQ(WL_OK, wl_xb_va_alloc(&va, WL_XB_PAGE, 0x00100000u, WL_XB_PROT_READWRITE));
+    const uint32_t top = va + WL_XB_PAGE;
+    g_esp = top;
+    // pushfd; pop eax; mov ebx, eax; xor eax, 0x200000; push eax; popfd; pushfd; pop eax; push ebx; popfd
+    RECOMP_UNIMPL("pushfd", 0x1000u);
+    POP32(g_esp, g_eax);
+    g_ebx = g_eax;
+    g_eax ^= 0x200000u;
+    PUSH32(g_esp, g_eax);
+    RECOMP_UNIMPL("popfd", 0x1001u);
+    RECOMP_UNIMPL("pushfd", 0x1002u);
+    POP32(g_esp, g_eax);
+    PUSH32(g_esp, g_ebx);
+    RECOMP_UNIMPL("popfd", 0x1003u);
+    ASSERT_EQ_FMT(top, g_esp, "%08x");
+    ASSERT_EQ_FMT(0x200000u, (g_eax ^ g_ebx) & 0x200000u, "%08x"); // ID toggles: CPUID is there
+    // mov eax, 1; cpuid; test edx, 0x800000
+    g_eax = 1;
+    g_ecx = 0x5A5A5A5Au;
+    RECOMP_UNIMPL("cpuid", 0x1004u);
+    ASSERT_EQ_FMT(0x0000068Au, g_eax, "%08x");                  // family 6, model 8
+    ASSERT_EQ_FMT(0x03800000u, g_edx & 0x03800000u, "%08x");  // MMX, FXSR, SSE
+    ASSERT_EQ_FMT(0u, g_ecx, "%08x");
+    g_eax = 0;
+    RECOMP_UNIMPL("cpuid", 0x1005u);
+    ASSERT_EQ_FMT(2u, g_eax, "%u");
+    ASSERT_EQ_FMT(0x756E6547u, g_ebx, "%08x"); // "GenuineIntel"
+    ASSERT_EQ_FMT(0x49656E69u, g_edx, "%08x");
+    ASSERT_EQ_FMT(0x6C65746Eu, g_ecx, "%08x");
+    // the direction flag goes through EFLAGS both ways
+    g_df = 1;
+    RECOMP_UNIMPL("pushfd", 0x1006u);
+    ASSERT_EQ_FMT(0x400u, MEM32(g_esp) & 0x400u, "%08x");
+    MEM32(g_esp) = 0x202u;
+    RECOMP_UNIMPL("popfd", 0x1007u);
+    ASSERT_EQ(0, g_df);
+    ASSERT_EQ_FMT(top, g_esp, "%08x");
     ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
     PASS();
 }
@@ -164,6 +216,7 @@ SUITE(abi_suite) {
     RUN_TEST(unions_are_little_endian);
     RUN_TEST(registers_save_and_load);
     RUN_TEST(memory_macros_agree);
+    RUN_TEST(processor_identification);
     RUN_TEST(runtime_functions_exist);
     RUN_TEST(lookup_cache);
 }
