@@ -587,7 +587,10 @@ static uint32_t dirty_group(uint32_t method) {
     }
     if ((method >= 0x260 && method <= 0x28C) || (method >= 0xA60 && method <= 0xADC) ||
         (method >= 0x1E20 && method <= 0x1E24) || (method >= 0x1E40 && method <= 0x1E78) || method == 0x17F8) {
-        return WL_NV2A_DIRTY_COMBINERS;
+        return WL_NV2A_DIRTY_COMBINERS | WL_NV2A_DIRTY_PIXEL;
+    }
+    if (method == WL_NV2A_K_SET_FOG_ENABLE || method == WL_NV2A_K_SET_FOG_COLOR) {
+        return WL_NV2A_DIRTY_RASTER | WL_NV2A_DIRTY_PIXEL;
     }
     if (method >= 0x1B00 && method < 0x1C00) {
         return WL_NV2A_DIRTY_TEXTURES;
