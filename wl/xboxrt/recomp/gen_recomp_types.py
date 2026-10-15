@@ -21,7 +21,8 @@ WiiLibs' copy (wl/xboxrt/recomp/recomp_types.h) is that template, with WiiLibs' 
      store, reload and swap), always inline
   6. RecompXmm and RecompMmx get little-endian storage, so their lane views agree as on x86; the
      packed float arithmetic (RECOMP_XMM_LANEWISE) works on host-order copies of the lanes, inline,
-     and XMM_SHUFFLE moves lanes as bytes
+     and XMM_SHUFFLE moves lanes as bytes; XMM_SHUFFLE, the SIMD loads and stores and XMM_SCALAR are
+     always inline
   7. RECOMP_FP_PC and RECOMP_FP_PC_CW (the control word as an argument): a fast path (round to
      float when the result is a normal float) before the exact slow path, which stays out of line
   8. the indirect-call trace ring and counter are compiled only with WL_RECOMP_ICALL_TRACE
@@ -368,6 +369,19 @@ LANEWISE_NEW = """/* WiiLibs: RecompXmm's lanes are little-endian, and on a big-
     }
 """
 
+# The SIMD helpers the generated code calls at each site: plain `static inline` left GCC an
+# out-of-line copy with a frame of its own in each unit at -Os (MMX_MEM, MMX_STORE, XMM_SCALAR,
+# XMM_SHUFFLE and the movlps/movhps halves were each 0.2-0.4% of Halo's time on the Wii).
+ALWAYS_INLINE = [
+    ("XMM_SCALAR", "RecompXmm XMM_SCALAR(float v) {"),
+    ("XMM_MEM", "RecompXmm XMM_MEM(uint32_t addr) {"),
+    ("XMM_STORE", "void XMM_STORE(uint32_t addr, RecompXmm v) {"),
+    ("recomp_xmm_load_half", "void recomp_xmm_load_half(RecompXmm *dst, uint32_t addr,"),
+    ("recomp_xmm_store_half", "void recomp_xmm_store_half(uint32_t addr, RecompXmm src,"),
+    ("MMX_MEM", "RecompMmx MMX_MEM(uint32_t addr) {"),
+    ("MMX_STORE", "void MMX_STORE(uint32_t addr, RecompMmx v) {"),
+]
+
 SHUFFLE_OLD = """static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
     RecompXmm r;
     r.u[0] = a.u[(imm >> 0) & 3u]; r.u[1] = a.u[(imm >> 2) & 3u];
@@ -375,7 +389,7 @@ SHUFFLE_OLD = """static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, u
     return r;
 }
 """
-SHUFFLE_NEW = """static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
+SHUFFLE_NEW = """static inline __attribute__((always_inline)) RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
     /* WiiLibs: lanes moved as bytes (both sides are little-endian), not read with lwbrx and
      * written back with stwbrx */
     RecompXmm r;
@@ -491,6 +505,9 @@ def transform(src: str, commit: str, release: str, patches: list[str]) -> str:
         src = replace_once(src, old, new, old)
     src = replace_once(src, LANEWISE_OLD, LANEWISE_NEW, "RECOMP_XMM_LANEWISE")
     src = replace_once(src, SHUFFLE_OLD, SHUFFLE_NEW, "XMM_SHUFFLE")
+    for name, sig in ALWAYS_INLINE:
+        src = replace_once(src, "static inline " + sig, "static inline __attribute__((always_inline)) " + sig,
+                           "always inline: " + name)
     src = hoist_mmx(src)
     src = replace_once(src, BACKEDGE_OLD, BACKEDGE_NEW, "RECOMP_BACKEDGE safe point")
     src = replace_once(src, PORT_OLD, PORT_NEW, "RECOMP_PORT_IN/OUT")

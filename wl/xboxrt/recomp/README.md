@@ -20,7 +20,8 @@ a little-endian one:
   back for a title short of memory);
 - `RecompXmm` and `RecompMmx` have little-endian storage, so their lane views overlay as on x86;
   the packed float arithmetic copies the lanes to host order first and is always inline, and
-  `XMM_SHUFFLE` moves lanes as bytes;
+  `XMM_SHUFFLE` moves lanes as bytes; `XMM_SHUFFLE`, `XMM_SCALAR` and the SIMD loads and stores
+  (`XMM_MEM`, `XMM_STORE`, the movlps/movhps halves, `MMX_MEM`, `MMX_STORE`) are always inline too;
 - `lock xadd`/`lock cmpxchg` (`RECOMP_ATOMIC_ADD32/CAS32`) byte-swap around a compare-and-swap loop;
 - `RECOMP_TLS` is empty: the registers are plain globals;
 - `RECOMP_FP_PC` (x87 precision control at 24 bits) rounds inline when the result is a normal float
