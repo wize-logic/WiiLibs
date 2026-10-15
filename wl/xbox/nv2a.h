@@ -93,13 +93,14 @@ typedef struct WlNv2aStats {
     uint32_t methods;         // methods handed to objects
     uint32_t jumps, calls, returns;
     uint32_t pusher_errors;   // invalid commands, a call in a call, a return outside one, bad memory
+                              // (each stops its channel: DMA_PUSHER raised, GET at PUT)
     uint32_t unhandled;       // methods the state tracker does not handle (logged once each)
     uint32_t draws, vertices, clears;
     uint32_t flips;           // PCRTC_START writes
     uint32_t frames;          // FLIP_INCREMENT_WRITE
     uint32_t vblanks;
     uint32_t semaphores;      // semaphore releases written
-    uint32_t acquires_unmet;  // acquires whose value was not there (a synchronous GPU cannot wait)
+    uint32_t acquires_unmet;  // acquires whose value was not there at first (the channel waits for it)
     uint32_t notifies;        // notifiers written
     uint32_t reports;         // reports written
     uint32_t stencil_draws;   // draws with the stencil test or writes on, which GX cannot do

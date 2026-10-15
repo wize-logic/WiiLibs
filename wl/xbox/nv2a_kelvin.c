@@ -706,7 +706,12 @@ static void notify(WlNv2a *dev, uint32_t param) {
     }
     dev->stats.notifies++;
     if (param & 1u) {
+        // (write, then awaken: the pusher stops until the ISR has seen it, as at a trap, so two in a
+        // kick are two interrupts)
         wl_nv2a_raise_pgraph(dev, WL_NV2A_PGRAPH_INTR_NOTIFY);
+        if ((dev->pmc_intr_en & 3u) != 0 && (dev->pgraph_intr_en & WL_NV2A_PGRAPH_INTR_NOTIFY) != 0) {
+            wl_nv2a_suspend_current(dev, WL_NV2A_SUSPEND_NOTIFY);
+        }
     }
 }
 
@@ -1475,8 +1480,9 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     }
 }
 
-void wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const uint8_t *words, uint32_t count) {
+uint32_t wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const uint8_t *words, uint32_t count) {
     WlNv2aKelvin *k = &dev->kelvin;
+    const WlNv2aChannel *ch = dev->current_channel >= 0 ? &dev->channels[dev->current_channel] : NULL;
     uint32_t n;
 
     method &= WL_NV2A_K_METHODS - 4u;
@@ -1495,7 +1501,7 @@ void wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const
                 batch_index(dev, param);
             }
         }
-        return;
+        return count;
     }
     for (n = 0; n < count; n++) {
         uint32_t m = (increasing ? method + 4u * n : method) & (WL_NV2A_K_METHODS - 4u);
@@ -1515,5 +1521,10 @@ void wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const
             continue;
         }
         wl_nv2a_kelvin_method(dev, m, param);
+        if (ch != NULL && ch->suspended) {
+            // (a method stopped the channel: the rest of the run after it)
+            return n + 1u;
+        }
     }
+    return count;
 }

@@ -218,9 +218,22 @@ static uint32_t ramht_lookup(WlNv2a *dev, unsigned chid, uint32_t handle, uint32
 
 // ---- time and interrupts --------------------------------------------------------------------
 
+// the time moved on from `before`: the alarm raised when it was passed (ALARM_0 against the time's
+// low word)
+static void time_moved(WlNv2a *dev, uint64_t before) {
+    uint32_t from = (uint32_t)before, to = (uint32_t)dev->time_ns;
+
+    if (to != from && (int32_t)(to - dev->ptimer_alarm) >= 0 && (int32_t)(from - dev->ptimer_alarm) < 0) {
+        dev->ptimer_intr |= WL_NV2A_PTIMER_INTR_ALARM;
+    }
+}
+
 uint64_t wl_nv2a_time(WlNv2a *dev) {
     if (dev->cfg.time_ns != NULL) {
+        uint64_t before = dev->time_ns;
+
         dev->time_ns = dev->cfg.time_ns(dev->cfg.user);
+        time_moved(dev, before);
     }
     return dev->time_ns;
 }
@@ -251,6 +264,8 @@ void wl_nv2a_raise_pgraph(WlNv2a *dev, uint32_t bits) {
     dev->pgraph_intr |= bits;
 }
 
+static void retry_acquires(WlNv2a *dev);
+
 void wl_nv2a_vblank(WlNv2a *dev) {
     if (dev->capture != NULL) {
         wl_nv2a_capture_note_vblank(dev);
@@ -258,8 +273,14 @@ void wl_nv2a_vblank(WlNv2a *dev) {
     dev->pcrtc_intr |= WL_NV2A_PCRTC_INTR_VBLANK;
     dev->stats.vblanks++;
     if (dev->cfg.time_ns == NULL) {
+        uint64_t before = dev->time_ns;
+
         dev->time_ns += 16683333u;
+        time_moved(dev, before);
+    } else {
+        wl_nv2a_time(dev);
     }
+    retry_acquires(dev);
 }
 
 // ---- the misc registers -----------------------------------------------------------------------
@@ -320,6 +341,14 @@ static void pusher_error(WlNv2a *dev, unsigned chid, uint32_t at, uint32_t word,
     if (dev->stats.pusher_errors <= 16) {
         WL_LOG_W(WL_NV2A_TAG, "channel %u: %s at %08x (word %08x)", chid, what, (unsigned)at, (unsigned)word);
     }
+}
+
+// an error the pusher stops at, as the NV2A's does: DMA_PUSHER raised, the channel's GET at PUT (what
+// the title wrote after it is dropped)
+static void pusher_stop(WlNv2a *dev, unsigned chid, uint32_t at, uint32_t word, const char *what) {
+    pusher_error(dev, chid, at, word, what);
+    dev->pfifo_intr |= WL_NV2A_PFIFO_INTR_DMA_PUSHER;
+    dev->channels[chid].get = dev->channels[chid].put;
 }
 
 // whether a run of words to this method may go to the 3D object at once: the 3D class's own methods
@@ -389,6 +418,8 @@ static void run_channel(WlNv2a *dev, unsigned chid) {
                     run = WL_NV2A_KICK_WORD_LIMIT - (words - 1u);
                 }
                 if (run >= 2 && bulk_method(ch, ch->subchannel, method)) {
+                    // (a method that stops the channel leaves the run's rest for later)
+                    run = wl_nv2a_kelvin_methods(dev, method, !ch->non_increasing, p + i, run);
                     ch->get = at + 4u * run;
                     dev->stats.words += run - 1u;
                     dev->stats.methods += run;
@@ -397,7 +428,6 @@ static void run_channel(WlNv2a *dev, unsigned chid) {
                     if (!ch->non_increasing) {
                         ch->method += 4u * run;
                     }
-                    wl_nv2a_kelvin_methods(dev, method, !ch->non_increasing, p + i, run);
                     i += 4u * (run - 1u);
                     continue;
                 }
@@ -406,6 +436,14 @@ static void run_channel(WlNv2a *dev, unsigned chid) {
                 }
                 ch->count--;
                 puller(dev, chid, ch->subchannel, method, word);
+                if (dev->acquire_stall) {
+                    // (an acquire not met: the pusher stops before it, to try it again)
+                    dev->acquire_stall = false;
+                    ch->get = at;
+                    ch->count++;
+                    ch->method = method;
+                    ch->suspended |= WL_NV2A_SUSPEND_ACQUIRE;
+                }
                 continue;
             }
             if ((word & WL_NV2A_CMD_OLD_JUMP_MASK) == WL_NV2A_CMD_OLD_JUMP) {
@@ -418,8 +456,8 @@ static void run_channel(WlNv2a *dev, unsigned chid) {
                 redirected = true;
             } else if ((word & 3u) == WL_NV2A_CMD_CALL) {
                 if (ch->subroutine_active) {
-                    pusher_error(dev, chid, at, word, "call inside a call");
-                    continue;
+                    pusher_stop(dev, chid, at, word, "call inside a call");
+                    break;
                 }
                 ch->subroutine_return = ch->get;
                 ch->subroutine_active = 1;
@@ -428,8 +466,8 @@ static void run_channel(WlNv2a *dev, unsigned chid) {
                 redirected = true;
             } else if (word == WL_NV2A_CMD_RETURN) {
                 if (!ch->subroutine_active) {
-                    pusher_error(dev, chid, at, word, "return outside a call");
-                    continue;
+                    pusher_stop(dev, chid, at, word, "return outside a call");
+                    break;
                 }
                 ch->get = ch->subroutine_return;
                 ch->subroutine_active = 0;
@@ -442,7 +480,8 @@ static void run_channel(WlNv2a *dev, unsigned chid) {
                 ch->count = (word >> WL_NV2A_CMD_COUNT_SHIFT) & WL_NV2A_CMD_COUNT_MASK;
                 ch->non_increasing = (word & WL_NV2A_CMD_TYPE_MASK) == WL_NV2A_CMD_NON_INCREASING;
             } else {
-                pusher_error(dev, chid, at, word, "invalid command");
+                pusher_stop(dev, chid, at, word, "invalid command");
+                break;
             }
         }
     }
@@ -519,7 +558,11 @@ static void puller(WlNv2a *dev, unsigned chid, unsigned subchannel, uint32_t met
             const uint8_t *p = wl_nv2a_phys(dev, ch->semaphore_base + ch->semaphore_offset, 4);
 
             if (p == NULL || wl_rd_le32(p) != param) {
-                dev->stats.acquires_unmet++;
+                // (the NV2A waits for the value: the channel stops here until it is there)
+                if (!dev->acquire_retry) {
+                    dev->stats.acquires_unmet++;
+                }
+                dev->acquire_stall = true;
             }
             break;
         }
@@ -543,8 +586,8 @@ static void puller(WlNv2a *dev, unsigned chid, unsigned subchannel, uint32_t met
     switch (ch->subchannel_class[subchannel]) {
     case WL_NV2A_CLASS_KELVIN:
         if (method == WL_NV2A_K_NO_OPERATION && param != 0) {
-            if (wl_nv2a_trap(dev, method | (uint32_t)subchannel << 13, param)) {
-                ch->suspended = 1;
+            if (wl_nv2a_trap(dev, method | (uint32_t)subchannel << 16, param)) {
+                ch->suspended |= WL_NV2A_SUSPEND_TRAP;
             }
             return;
         }
@@ -567,9 +610,9 @@ static void puller(WlNv2a *dev, unsigned chid, unsigned subchannel, uint32_t met
 bool wl_nv2a_trap(WlNv2a *dev, uint32_t method, uint32_t param) {
     unsigned chid = dev->current_channel >= 0 ? (unsigned)dev->current_channel : 0;
 
-    // what pbkit's ISR reads of it: the method and channel, the data, the class, ERROR with a
-    // notification as its source
-    dev->pgraph_trapped_addr = (uint32_t)chid << 20 | (method & 0xFFFFu);
+    // what pbkit's ISR reads of it: the method (12:2), subchannel (18:16) and channel (24:20), the
+    // data, the class, ERROR with a notification as its source
+    dev->pgraph_trapped_addr = (uint32_t)chid << 20 | (method & 0x00071FFCu);
     dev->pgraph_trapped_data = param;
     dev->pgraph_trapped_class = WL_NV2A_CLASS_KELVIN;
     dev->pgraph_nsource |= 1u;
@@ -587,17 +630,54 @@ void wl_nv2a_method(WlNv2a *dev, unsigned subchannel, uint32_t method, uint32_t 
     dev->current_channel = was;
 }
 
-// a channel stopped at a trap goes on once the ISR has cleared it
+void wl_nv2a_suspend_current(WlNv2a *dev, unsigned why) {
+    if (dev->current_channel >= 0 && dev->executing) {
+        dev->channels[dev->current_channel].suspended |= (uint8_t)why;
+    }
+}
+
+// a channel stopped at a trap or a NOTIFY goes on once the ISR has cleared its interrupt, while
+// PGRAPH's FIFO access is on (the ISR turns it off while it works)
 static void resume_trapped(WlNv2a *dev) {
     unsigned chid;
 
-    if (dev->pgraph_intr & WL_NV2A_PGRAPH_INTR_ERROR) {
+    if (!(dev->pgraph_fifo & 1u)) {
         return;
     }
     for (chid = 0; chid < WL_NV2A_CHANNELS; chid++) {
-        if (dev->channels[chid].suspended) {
-            dev->channels[chid].suspended = 0;
+        WlNv2aChannel *ch = &dev->channels[chid];
+        uint8_t was = ch->suspended;
+
+        if ((ch->suspended & WL_NV2A_SUSPEND_TRAP) && !(dev->pgraph_intr & WL_NV2A_PGRAPH_INTR_ERROR)) {
+            ch->suspended &= (uint8_t)~WL_NV2A_SUSPEND_TRAP;
+        }
+        if ((ch->suspended & WL_NV2A_SUSPEND_NOTIFY) && !(dev->pgraph_intr & WL_NV2A_PGRAPH_INTR_NOTIFY)) {
+            ch->suspended &= (uint8_t)~WL_NV2A_SUSPEND_NOTIFY;
+        }
+        if (was != 0 && ch->suspended == 0) {
             run_channel(dev, chid);
+        }
+    }
+}
+
+// the channels stopped at an acquire try it again (a doorbell, a vertical blank: the value may be
+// there now)
+static void retry_acquires(WlNv2a *dev) {
+    unsigned chid;
+
+    if (dev->executing) {
+        return;
+    }
+    for (chid = 0; chid < WL_NV2A_CHANNELS; chid++) {
+        WlNv2aChannel *ch = &dev->channels[chid];
+
+        if (ch->suspended & WL_NV2A_SUSPEND_ACQUIRE) {
+            ch->suspended &= (uint8_t)~WL_NV2A_SUSPEND_ACQUIRE;
+            if (ch->suspended == 0) {
+                dev->acquire_retry = true;
+                run_channel(dev, chid);
+                dev->acquire_retry = false;
+            }
         }
     }
 }
@@ -666,6 +746,7 @@ static uint32_t read32(WlNv2a *dev, uint32_t offset) {
 
         if (dev->cfg.time_ns == NULL) {
             dev->time_ns += 1000u;
+            time_moved(dev, t);
         }
         return (uint32_t)t & ~0x1Fu;
     }
@@ -798,6 +879,8 @@ static void write32(WlNv2a *dev, uint32_t offset, uint32_t value) {
         break;
     case WL_NV2A_PGRAPH_FIFO:
         dev->pgraph_fifo = value;
+        // (access on again: a channel the ISR has acknowledged goes on)
+        resume_trapped(dev);
         break;
     case WL_NV2A_PCRTC_INTR_0:
         dev->pcrtc_intr &= ~value;
@@ -933,6 +1016,7 @@ static void mmio_write(WlNv2a *dev, uint32_t offset, uint32_t value, unsigned si
         ch = &dev->channels[chid];
         if ((offset & 0x1FFCu) == WL_NV2A_USER_DMA_PUT) {
             ch->put = value & 0x1FFFFFFCu;
+            retry_acquires(dev);
             run_channel(dev, chid);
         }
         return;
