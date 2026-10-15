@@ -3748,6 +3748,174 @@ static bool translate_once(const uint32_t *render_state, const WlXboxPshTextures
     return true;
 }
 
+/* ---------- blue to alpha
+
+A colour output with its blue copied into its register's alpha (the output
+word's AB_BLUE_TO_ALPHA, 0x80, and CD_BLUE_TO_ALPHA, 0x40, of its flags:
+Direct3D's dp3 to rgba, the dot product in the alpha too) is what an alpha
+portion reading that register's blue right after the stage would give. The
+program is written so before it is translated: the copy goes into the next
+stage's alpha portion where that is idle and its colour does not read the
+alpha, else into a stage of its own inserted after (eight at most); the
+stage's own alpha write to the register is given up (the blue is written
+over it). A copy nothing reads is not made. */
+
+struct combiner_words {
+    uint32_t rgb_inputs, rgb_outputs, alpha_inputs, alpha_outputs, c0, c1;
+};
+
+/* whether a register's alpha (reg, a combiner register number) is read
+after stage `after` of `count`, before an alpha write to it */
+static bool alpha_read_after(const struct combiner_words *stages, unsigned count, unsigned after,
+                             unsigned reg, uint32_t abcd, uint32_t efg) {
+    unsigned stage;
+    int shift;
+
+    for (stage = after + 1; stage < count; stage++) {
+        const struct combiner_words *words = &stages[stage];
+        uint32_t written;
+
+        for (shift = 0; shift < 32; shift += 8) {
+            unsigned long rgb = (words->rgb_inputs >> shift) & 0xff,
+                          alpha = (words->alpha_inputs >> shift) & 0xff;
+
+            if (((rgb & 0x1f) == (0x10 | reg)) || ((alpha & 0x1f) == (0x10 | reg)))
+                return true;
+        }
+        if (reg == _register_r0 && ((words->rgb_outputs | words->alpha_outputs) & 0x4000))
+            return true;
+        written = words->alpha_outputs;
+        if ((written & 0x0f) == reg || ((written >> 4) & 0x0f) == reg ||
+            ((written >> 8) & 0x0f) == reg ||
+            ((words->rgb_outputs & 0x80000) && ((words->rgb_outputs >> 4) & 0x0f) == reg) ||
+            ((words->rgb_outputs & 0x40000) && (words->rgb_outputs & 0x0f) == reg))
+            return false;
+    }
+    if (!abcd && !efg)
+        return reg == _register_r0;
+    for (shift = 0; shift < 32; shift += 8) {
+        if (((abcd >> shift) & 0x1f) == (0x10 | reg))
+            return true;
+    }
+    for (shift = 8; shift < 32; shift += 8) {
+        if (((efg >> shift) & 0x1f) == (0x10 | reg))
+            return true;
+    }
+    return false;
+}
+
+/* `out` the combiner state with its blues to alpha made alpha portions; 0
+when it has none (out untouched), 1 when written, -1 when written but a copy
+found no stage (that copy left out) */
+static int blue_to_alpha_rewrite(const uint32_t *state, uint32_t *out) {
+    struct combiner_words stages[16];
+    uint32_t combiners = state[WL_XBOX_PSH_COMBINER_COUNT];
+    uint32_t abcd = state[WL_XBOX_PSH_FINAL_INPUTS_ABCD], efg = state[WL_XBOX_PSH_FINAL_INPUTS_EFG];
+    unsigned count = combiners & 0xff, stage, index;
+    int result = 1;
+    bool any = false;
+
+    if (count > 8)
+        count = 8;
+    for (stage = 0; stage < count; stage++)
+        any = any || (state[WL_XBOX_PSH_RGB_OUTPUTS0 + stage] & 0xc0000);
+    if (!any)
+        return 0;
+    for (stage = 0; stage < count; stage++) {
+        stages[stage].rgb_inputs = state[WL_XBOX_PSH_RGB_INPUTS0 + stage];
+        stages[stage].rgb_outputs = state[WL_XBOX_PSH_RGB_OUTPUTS0 + stage];
+        stages[stage].alpha_inputs = state[WL_XBOX_PSH_ALPHA_INPUTS0 + stage];
+        stages[stage].alpha_outputs = state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + stage];
+        stages[stage].c0 = state[WL_XBOX_PSH_CONSTANT0_0 + stage];
+        stages[stage].c1 = state[WL_XBOX_PSH_CONSTANT1_0 + stage];
+    }
+    for (stage = 0; stage < count; stage++) {
+        struct combiner_words *words = &stages[stage];
+        unsigned dest[2] = {0, 0};
+        uint32_t copy_inputs = 0, copy_outputs = 0, alpha_outputs = words->alpha_outputs;
+        unsigned which;
+
+        if (!(words->rgb_outputs & 0xc0000))
+            continue;
+        if (words->rgb_outputs & 0x80000)
+            dest[0] = (words->rgb_outputs >> 4) & 0x0f;
+        if (words->rgb_outputs & 0x40000)
+            dest[1] = words->rgb_outputs & 0x0f;
+        words->rgb_outputs &= ~0xc0000u;
+        for (which = 0; which < 2; which++) {
+            if (name_of(dest[which]) < 0)
+                continue;
+            /* (the stage's own alpha write to the register: the blue's) */
+            for (index = 0; index < 3; index++) {
+                if (((alpha_outputs >> (4 * index)) & 0x0f) == dest[which])
+                    alpha_outputs &= ~(0x0fu << (4 * index));
+            }
+            if (!alpha_read_after(stages, count, stage, dest[which], abcd, efg))
+                continue;
+            /* (the blue, times 1: the zero register inverted) */
+            copy_inputs |= (uint32_t)(dest[which] << 8 | 0x20) << (16 * (1 - which));
+            copy_outputs |= (uint32_t)dest[which] << (which ? 0 : 4);
+        }
+        if (!copy_outputs) {
+            words->alpha_outputs = alpha_outputs;
+            continue;
+        }
+        if (stage + 1 < count && !(stages[stage + 1].alpha_outputs & 0xfff)) {
+            /* (the next stage's alpha portion, idle: its colour must not read
+            the alphas, which it would find still unwritten) */
+            const struct combiner_words *next = &stages[stage + 1];
+            bool reads = false;
+
+            for (which = 0; which < 2; which++) {
+                int shift;
+
+                for (shift = 0; shift < 32 && dest[which]; shift += 8)
+                    reads = reads || ((next->rgb_inputs >> shift) & 0x1f) == (0x10 | dest[which]);
+                reads = reads || (dest[which] == _register_r0 && (next->rgb_outputs & 0x4000));
+            }
+            if (!reads) {
+                words->alpha_outputs = alpha_outputs;
+                stages[stage + 1].alpha_inputs = copy_inputs;
+                stages[stage + 1].alpha_outputs = copy_outputs;
+                continue;
+            }
+        }
+        if (count < 8) {
+            words->alpha_outputs = alpha_outputs;
+            memmove(&stages[stage + 2], &stages[stage + 1],
+                    (count - stage - 1) * sizeof(stages[0]));
+            stages[stage + 1] = *words;
+            stages[stage + 1].rgb_inputs = 0;
+            stages[stage + 1].rgb_outputs = 0;
+            stages[stage + 1].alpha_inputs = copy_inputs;
+            stages[stage + 1].alpha_outputs = copy_outputs;
+            count++;
+            stage++;
+            continue;
+        }
+        /* (no stage for the copy: the alpha as the stage writes it) */
+        result = -1;
+    }
+    memcpy(out, state, WL_XBOX_PSH_WORDS * sizeof(*out));
+    for (stage = 0; stage < 8; stage++) {
+        const struct combiner_words *words = &stages[stage];
+
+        if (stage >= count) {
+            out[WL_XBOX_PSH_RGB_INPUTS0 + stage] = out[WL_XBOX_PSH_RGB_OUTPUTS0 + stage] = 0;
+            out[WL_XBOX_PSH_ALPHA_INPUTS0 + stage] = out[WL_XBOX_PSH_ALPHA_OUTPUTS0 + stage] = 0;
+            continue;
+        }
+        out[WL_XBOX_PSH_RGB_INPUTS0 + stage] = words->rgb_inputs;
+        out[WL_XBOX_PSH_RGB_OUTPUTS0 + stage] = words->rgb_outputs;
+        out[WL_XBOX_PSH_ALPHA_INPUTS0 + stage] = words->alpha_inputs;
+        out[WL_XBOX_PSH_ALPHA_OUTPUTS0 + stage] = words->alpha_outputs;
+        out[WL_XBOX_PSH_CONSTANT0_0 + stage] = words->c0;
+        out[WL_XBOX_PSH_CONSTANT1_0 + stage] = words->c1;
+    }
+    out[WL_XBOX_PSH_COMBINER_COUNT] = (combiners & ~0xffu) | count;
+    return result;
+}
+
 bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures *textures,
                            const WlXboxPshRecipe *recipe, WlXboxPshProgram *program) {
     /* the signed dot products: where the alpha half reads them, then in the
@@ -3773,8 +3941,12 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
     registers free for the program); the first exact program, or else the
     first approximated */
     static WlXboxPshProgram approximated;
+    static uint32_t rewritten[WL_XBOX_PSH_WORDS];
     bool have_approximated = false, done = false;
+    int blues = blue_to_alpha_rewrite(render_state, rewritten);
 
+    if (blues)
+        render_state = rewritten;
     for (attempt = 0; attempt < sizeof(attempts) / sizeof(attempts[0]) && !done; attempt++) {
         for (preload = 1; preload >= 0 && !done; preload--) {
             if (!translate_once(render_state, textures, program, attempts[attempt].economical,
@@ -3793,6 +3965,8 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
         return false;
     if (!done)
         *program = approximated;
+    if (blues < 0)
+        approximate(program, "a blue to alpha without a stage for its copy");
     /* (what the stages read of the vertices; a bumped lookup's offsets
     read the bump map at coordinate 0 and their terms at 1 and 2) */
     program->texcoords = (unsigned char)wl_tev_texcoords_mask(&program->tev);

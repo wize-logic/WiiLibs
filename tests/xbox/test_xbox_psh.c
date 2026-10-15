@@ -197,6 +197,9 @@ static V4 reference(const uint32_t *s, const Inputs *in, unsigned present) {
     int count = (int)(s[WL_XBOX_PSH_COMBINER_COUNT] & 0xffu);
     for (int st = 0; st < count; st++) {
         V4 next[16];
+        // (the colour's blues copied into alphas, written over the alpha portion's)
+        unsigned blue_names[2] = {0, 0};
+        float blues[2] = {0.0f, 0.0f};
         memcpy(next, regs, sizeof regs);
         for (int portion = 0; portion < 2; portion++) {
             uint32_t inputs =
@@ -245,6 +248,19 @@ static V4 reference(const uint32_t *s, const Inputs *in, unsigned present) {
                 if (sumn >= 4 && sumn != 6 && sumn != 7) {
                     next[sumn].c[ch] = out_map(sum[ch], flags);
                 }
+            }
+            if (!portion && (flags & 0x80u)) {
+                blue_names[0] = abn;
+                blues[0] = out_map(ab[2], flags);
+            }
+            if (!portion && (flags & 0x40u)) {
+                blue_names[1] = cdn;
+                blues[1] = out_map(cd[2], flags);
+            }
+        }
+        for (int k = 0; k < 2; k++) {
+            if (blue_names[k] >= 4 && blue_names[k] != 6 && blue_names[k] != 7) {
+                next[blue_names[k]].c[3] = blues[k];
             }
         }
         memcpy(regs, next, sizeof regs);
@@ -491,6 +507,10 @@ static unsigned rand_output(void) {
     return names[rnd() % 8u];
 }
 
+// (programs with blues to alpha: the new seeds' only, so the first digest's programs stay as
+// they were)
+static int g_blue_to_alpha;
+
 static void program_random(uint32_t *state) {
     memset(state, 0, WL_XBOX_PSH_WORDS * sizeof *state);
     g_fog_on = (int)(rnd() % 2u);
@@ -521,6 +541,10 @@ static void program_random(uint32_t *state) {
             unsigned flags = mapflags[rnd() % 7u] | (sum && rnd() % 4u == 0 ? 0x04u : 0u) |
                              (!portion && rnd() % 5u == 0 ? 0x02u : 0u) |
                              (!portion && rnd() % 5u == 0 ? 0x01u : 0u);
+            // (the colour's blue to its alpha, AB's and CD's: a sixth of the time each)
+            if (g_blue_to_alpha && !portion) {
+                flags |= (rnd() % 6u == 0 ? 0x80u : 0u) | (rnd() % 6u == 0 ? 0x40u : 0u);
+            }
             state[(portion ? WL_XBOX_PSH_ALPHA_INPUTS0 : WL_XBOX_PSH_RGB_INPUTS0) + st] = in;
             state[(portion ? WL_XBOX_PSH_ALPHA_OUTPUTS0 : WL_XBOX_PSH_RGB_OUTPUTS0) + st] =
                 flags << 12 | sum << 8 | ab << 4 | cd;
@@ -724,7 +748,61 @@ TEST more_random_programs_agree_with_the_combiners(void) {
     PASS();
 }
 
+// programs with the colour's blues copied to alphas: none differs
+TEST random_blues_to_alpha_agree_with_the_combiners(void) {
+    g_blue_to_alpha = 1;
+    for (uint32_t seed = 11; seed <= 14; seed++) {
+        Outcomes o = random_programs(seed, 4000);
+        if (o.why != NULL) {
+            g_blue_to_alpha = 0;
+            FAILm(o.why);
+        }
+        ASSERT(o.exact > 1000);
+    }
+    g_blue_to_alpha = 0;
+    PASS();
+}
+
 // ---- particular programs -----------------------------------------------------------------------
+
+// dp3 r1.rgba, t0_bx2, v0_bx2 (AB's blue to r1's alpha), then r0 = t1 * r1.a: the dot product in
+// the alpha, exact
+TEST a_dot_product_to_the_alpha(void) {
+    uint32_t state[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures;
+    static WlXboxPshProgram program;
+    memset(state, 0, sizeof state);
+    state[WL_XBOX_PSH_COMBINER_COUNT] = 2;
+    state[WL_XBOX_PSH_RGB_INPUTS0] = 0x48440000u;    // A t0 expanded, B v0 expanded
+    state[WL_XBOX_PSH_RGB_OUTPUTS0] = 0x820D0u;      // AB to r1, a dot product, its blue to alpha
+    state[WL_XBOX_PSH_ALPHA_INPUTS0] = 0x18140000u; // (the alpha's own write to r1: the blue's)
+    state[WL_XBOX_PSH_ALPHA_OUTPUTS0] = 0xD0u;
+    state[WL_XBOX_PSH_RGB_INPUTS0 + 1] = 0x091D0000u;   // A t1, B r1's alpha
+    state[WL_XBOX_PSH_RGB_OUTPUTS0 + 1] = 0xC0u;        // AB to r0
+    state[WL_XBOX_PSH_ALPHA_INPUTS0 + 1] = 0x1D200000u; // A r1's alpha, B 1
+    state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + 1] = 0xC0u;
+    g_fog_on = 0;
+    g_d0_alpha_map = 0;
+    textures_make(&textures, 3u);
+    ASSERT(wl_xbox_psh_translate(state, &textures, NULL, &program));
+    ASSERT(!program.approximate);
+    Inputs in;
+    V4 maps[8];
+    memset(&in, 0, sizeof in);
+    memset(maps, 0, sizeof maps);
+    // (t0 (0.9, 0.5, 0.7) and v0 (0.8, 0.6, 1.0) expanded: 0.48 + 0 + 0.4 = 0.88)
+    in.t[0] = (V4){{0.9f, 0.5f, 0.7f, 0.2f}};
+    in.v0 = (V4){{0.8f, 0.6f, 1.0f, 0.3f}};
+    in.t[1] = (V4){{1.0f, 0.5f, 0.25f, 1.0f}};
+    maps[0] = in.t[0];
+    maps[1] = in.t[1];
+    V4 want = reference(state, &in, 3u), got = simulate(&program, &in, maps);
+    ASSERT_IN_RANGE(0.88f, want.c[3], 0.01f);
+    for (int ch = 0; ch < 4; ch++) {
+        ASSERT_IN_RANGE(want.c[ch], got.c[ch], 0.01f);
+    }
+    PASS();
+}
 
 // r0 = t0 * v0, the final combiner off
 static void modulate(uint32_t *state) {
@@ -978,6 +1056,8 @@ TEST an_expand_negate_is_one_stage(void) {
 SUITE(psh_suite) {
     RUN_TEST(random_programs_agree_with_the_combiners);
     RUN_TEST(more_random_programs_agree_with_the_combiners);
+    RUN_TEST(random_blues_to_alpha_agree_with_the_combiners);
+    RUN_TEST(a_dot_product_to_the_alpha);
     RUN_TEST(negated_mappings_take_no_register_of_their_own);
     RUN_TEST(an_expand_negate_is_one_stage);
     RUN_TEST(a_final_product_with_every_register_held);
