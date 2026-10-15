@@ -32,7 +32,9 @@ static struct {
     float texgen[8][2][4];
     // a vertex of an indexed layout as the FIFO takes it: each item an index (0) or a number of
     // words; whether every attribute is indexed
-    uint8_t order[11], order_count;
+    uint8_t order[12], order_count;
+    // the layout's projected coordinates
+    unsigned projected;
     bool in_primitive;
     WlGxDirectStats stats;
 } d;
@@ -62,7 +64,7 @@ void wl_gx_direct_begin(void) {
 // an attribute's input in the layout (GX_INDEX16 or GX_DIRECT), its place in an indexed vertex's
 // order noted (an index, or its words after the words before it)
 static u8 input_of(const WlGxDirectLayout *layout, unsigned attribute, uint8_t words) {
-    if (layout->indexed & (1u << attribute)) {
+    if (attribute < 16u && (layout->indexed & (1u << attribute))) {
         d.order[d.order_count++] = 0;
         return GX_INDEX16;
     }
@@ -88,6 +90,18 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
     GX_ClearVtxDesc();
     GX_SetVtxDesc(GX_VA_POS, input_of(layout, WL_GX_DIRECT_ARRAY_POSITION, 3));
     GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+    // (projected coordinates: the normal's three numbers, or the normal, binormal and tangent's nine)
+    d.projected = 0;
+    for (n = 0; n < 8; n++) {
+        d.projected += (layout->texcoords_projected >> n) & 1u;
+    }
+    if (d.projected == 1u) {
+        GX_SetVtxDesc(GX_VA_NRM, input_of(layout, 0xFFu, 3));
+        GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+    } else if (d.projected > 1u) {
+        GX_SetVtxDesc(GX_VA_NBT, input_of(layout, 0xFFu, 9));
+        GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_NBT, GX_NRM_NBT, GX_F32, 0);
+    }
     if (layout->colors >= 1) {
         GX_SetVtxDesc(GX_VA_CLR0, input_of(layout, WL_GX_DIRECT_ARRAY_COLOR0, 1));
         GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
@@ -97,11 +111,23 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
         GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
     }
     for (n = 0; n < 8; n++) {
-        if ((layout->texcoords | layout->texcoords_generated) & (1u << n)) {
+        if ((layout->texcoords | layout->texcoords_generated | layout->texcoords_projected) & (1u << n)) {
             texgens = n + 1;
         }
     }
     for (n = 0; n < texgens; n++) {
+        if (layout->texcoords_projected & (1u << n)) {
+            // (from the normal, binormal or tangent that carries it, through a 3x4 identity: GX
+            // divides s and t by q at each pixel)
+            static const u32 sources[3] = {GX_TG_NRM, GX_TG_BINRM, GX_TG_TANGENT};
+            unsigned k, before = 0;
+
+            for (k = 0; k < n; k++) {
+                before += (layout->texcoords_projected >> k) & 1u;
+            }
+            GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX3x4, sources[before < 3u ? before : 2u], GX_IDENTITY);
+            continue;
+        }
         if (!(layout->texcoords & (1u << n))) {
             // (a coordinate no stage reads, below one that is: generated from the position, which
             // every vertex has, rather than from an input the vertex does not send)
@@ -129,6 +155,20 @@ static inline void emit(const WlGxDirectVertex *v) {
         GX_Position1x16(0);
     } else {
         GX_Position3f32(v->position[0], v->position[1], v->position[2]);
+    }
+    if (d.layout.texcoords_projected) {
+        unsigned sent = 0;
+
+        // (the projected coordinates as the normal, or normal, binormal and tangent)
+        for (n = 0; n < 8; n++) {
+            if (d.layout.texcoords_projected & (1u << n)) {
+                GX_Normal3f32(v->texcoord[n][0], v->texcoord[n][1], v->texcoord_q[n]);
+                sent++;
+            }
+        }
+        for (; d.projected > 1u && sent < 3u; sent++) {
+            GX_Normal3f32(0.0f, 0.0f, 0.0f);
+        }
     }
     for (n = 0; n < d.layout.colors && n < 2; n++) {
         if (d.layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_COLOR0 + n))) {

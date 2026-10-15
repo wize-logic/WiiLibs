@@ -224,7 +224,11 @@ even, so its winding holds).
   or constant, a texture coordinate from one input of two components or from the position, no fog,
   no sphere map, a projected stage's q 1), the program is not run at all: the coordinates come from
   the transform unit's generators. Not to the bit (`no_xf` in `WlNv2aGxConfig` keeps every vertex on
-  the processor; the runtime's `noxf` file). The combiners through psh's cache (with a title's `WlXboxPshRecipe`), the fog psh's ramp, a
+  the processor; the runtime's `noxf` file). A projective stage's coordinate is divided by its q at
+  the vertex while q is the same at every vertex of the draw's first batch; one whose q varies there
+  (a projected shadow, a flashlight) is sent as (s, t, q) for GX to divide at each pixel, as the
+  NV2A does (up to three a draw, as GX's normal, binormal and tangent through 3x4 generators;
+  counted as `projected_draws`). The combiners through psh's cache (with a title's `WlXboxPshRecipe`), the fog psh's ramp, a
   program beyond GX texture 0 times colour. Blending, depth, alpha test and colour masks on GX
   (a constant factor ONE or ZERO by SET_BLEND_COLOR, exact where that is 1 or 0; MIN as s d, MAX as
   s + d - s d and src - dst as s (1 - d): approximated and counted); culling by the NV2A's rule on
