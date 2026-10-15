@@ -292,8 +292,8 @@ int main(int argc, char **argv) {
 
 
 LOCALS = "    uint32_t ebp = 0; int _cf = 0; int _flags = 0;\n" \
-    "    uint32_t _fa = 0, _fb = 0; int32_t _fas = 0, _fbs = 0; double _fca = 0.0, _fcb = 0.0;\n" \
-    "    (void)ebp; (void)_cf; (void)_flags; (void)_fa; (void)_fb; (void)_fas; (void)_fbs; (void)_fca; (void)_fcb;"
+    "    uint32_t _fa = 0, _fb = 0; int32_t _fas = 0, _fbs = 0; double _fca = 0.0, _fcb = 0.0; uint32_t _sahf = 0;\n" \
+    "    (void)ebp; (void)_cf; (void)_flags; (void)_fa; (void)_fb; (void)_fas; (void)_fbs; (void)_fca; (void)_fcb; (void)_sahf;"
 
 
 def x87_locals_variant(p, suffix="_x87l", regs=False):
