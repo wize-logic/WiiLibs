@@ -213,6 +213,13 @@ static void gpu_status(void) {
     if (g_gx == NULL) {
         return;
     }
+    WlNv2aStats ns;
+    wl_nv2a_stats(g_gpu, &ns);
+    // the pusher and the display: whether the title's push buffers still come in and flip
+    WL_LOG_I(TAG, "status: pusher %u kicks, %u words, %u methods, %u errors, %u unmet acquires; %u flips, %u frames, "
+             "%u vblanks, %u notifies, %u semaphores", (unsigned)ns.kicks, (unsigned)ns.words, (unsigned)ns.methods,
+             (unsigned)ns.pusher_errors, (unsigned)ns.acquires_unmet, (unsigned)ns.flips, (unsigned)ns.frames,
+             (unsigned)ns.vblanks, (unsigned)ns.notifies, (unsigned)ns.semaphores);
     WlNv2aGxStats gs;
     wl_nv2a_gx_stats(g_gx, &gs);
     WlNv2aTexCacheStats ts;
