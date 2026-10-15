@@ -21,7 +21,9 @@
 #include "wl/platform/host/fs_host.h"
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/crash.h"
+#include "wl/base/endian.h"
 #include "wl/xboxrt/mem.h"
+#include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/mmio.h"
 
 #define FRAMES 64u
@@ -202,6 +204,53 @@ TEST stores_are_watched(void) {
     // outside the RAM: no watch
     ASSERT_EQ(0u, wl_xb_phys_watch(16u << 20, PAGE));
     ASSERT(wl_xb_phys_written(16u << 20, PAGE, 1u));
+    PASS();
+}
+
+// The freeze watch's reads (wl_xb_mem_peek, without the guest lock): a resident page's bytes, and
+// nothing (no fault, no swap-in) for a page swapped out or in swap I/O.
+TEST peeks_never_fault(void) {
+    up();
+    const uint32_t n = 4u;
+    uint32_t va = alloc(n);
+    ASSERT(va != 0);
+    fill(va, n, 9);
+    uint8_t b[4];
+    for (uint32_t i = 0; i < n; i++) {
+        ASSERT(wl_xb_mem_peek(va + i * PAGE + 1024u, b, 4));
+        ASSERT_EQ_FMT(word(9, i, 1024u), wl_rd_le32(b), "%08x");
+    }
+    ASSERT(!wl_xb_mem_peek(va + PAGE - 2u, b, 4)); // across two pages: refused
+    uint32_t phys = 0;
+    ASSERT(wl_xb_va_to_phys(va, &phys));
+    uint32_t p = phys >> WL_XB_PAGE_SHIFT;
+    g_xb_pg_flags[p] |= WL_XB_PG_IO; // as while its frame is written to the swap file
+    ASSERT(!wl_xb_mem_peek(va, b, 4));
+    g_xb_pg_flags[p] &= (uint8_t)~WL_XB_PG_IO;
+    ASSERT(wl_xb_mem_peek(va, b, 4));
+    ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
+#if !defined(WL_XBRT_PAGING_NO_SWAP)
+    // more pages than frames: the ones swapped out read as nothing, and the peeks bring none back
+    const uint32_t m = 4u * FRAMES;
+    va = alloc(m);
+    ASSERT(va != 0);
+    fill(va, m, 10);
+    WlXbMemStats a = stats();
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < m; i++) {
+        bool res = wl_xb_mem_resident(va + i * PAGE);
+        bool ok = wl_xb_mem_peek(va + i * PAGE, b, 4);
+        ASSERT_EQ(res, ok);
+        if (ok) {
+            ASSERT_EQ_FMT(word(10, i, 0), wl_rd_le32(b), "%08x");
+            seen++;
+        }
+    }
+    WlXbMemStats c = stats();
+    ASSERT_EQ(a.swap_ins, c.swap_ins);
+    ASSERT(seen > 0 && seen <= FRAMES);
+    ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
+#endif
     PASS();
 }
 
@@ -429,6 +478,7 @@ SUITE(paging) {
     RUN_TEST(paging_is_on);
     RUN_TEST(zero_pages_go_for_nothing);
     RUN_TEST(stores_are_watched);
+    RUN_TEST(peeks_never_fault);
 #if !defined(WL_XBRT_PAGING_NO_SWAP)
     RUN_TEST(changed_pages_swap_out_and_back);
     RUN_TEST(clean_pages_read_back_go_for_nothing);

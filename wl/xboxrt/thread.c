@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/base/endian.h"
 #include "wl/platform/mem_census.h"
 #include "wl/xboxrt/crash.h"
 #include "wl/xboxrt/irq.h"
@@ -1199,17 +1200,19 @@ void wl_xb_thread_log_guest_stacks(void) {
         line[0] = '\0';
         for (uint32_t i = 0; i < 256u && found < 14u && used + 12u < sizeof line; i++) {
             uint32_t va = esp + i * 4u;
-            if (!wl_xb_mem_resident(va)) {
+            uint8_t b[4];
+            if (!wl_xb_mem_peek(va, b, 4)) { // (no guest lock here: never a fault)
                 break;
             }
-            uint32_t w = wl_xb_rd32(va);
+            uint32_t w = wl_rd_le32(b);
             if (w >= g_xbox_code_lo && w < g_xbox_code_hi) {
                 used += (size_t)snprintf(line + used, sizeof line - used, " %x", (unsigned)w);
                 found++;
             }
         }
         // its IRQL (a holder at DISPATCH_LEVEL keeps the lock: thread.h, wl_xb_safe_point)
-        unsigned irql = t->kpcr != 0 && wl_xb_mem_resident(t->kpcr + KPCR_IRQL) ? wl_xb_rd8(t->kpcr + KPCR_IRQL) : 0u;
+        uint8_t irql8 = 0;
+        unsigned irql = t->kpcr != 0 && wl_xb_mem_peek(t->kpcr + KPCR_IRQL, &irql8, 1) ? irql8 : 0u;
         char at[16] = "";
         if (irql != 0) {
             snprintf(at, sizeof at, " irql %u", irql);

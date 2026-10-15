@@ -769,6 +769,29 @@ bool wl_xb_mem_resident(uint32_t va) {
     return g_xb_pg_frames == 0 || g_xb_pg_frame[p1 - 1u] != 0; // without paging the OS backs every page
 }
 
+bool wl_xb_mem_peek(uint32_t va, void *dst, uint32_t bytes) {
+    uint32_t p1 = g_ready ? phys_page_of(va) : 0u;
+    uint32_t off = va & (WL_XB_PAGE - 1u);
+    if (p1 == 0 || bytes == 0 || bytes > WL_XB_PAGE - off) {
+        return false;
+    }
+    if (g_xb_pg_frames == 0) {
+        memcpy(dst, wl_xb_ptr(va), bytes); // without paging the OS backs every page
+        return true;
+    }
+    // the frame as the tables say under the MMU lock: none, or in swap I/O (unmapped), is no read
+    uint32_t p = p1 - 1u;
+    bool ok = false;
+    uint32_t level = wl_xb_mmu_lock();
+    uint32_t f = g_xb_pg_frame[p];
+    if (f != 0 && (g_xb_pg_flags[p] & WL_XB_PG_IO) == 0) {
+        memcpy(dst, wl_xb_mmu_frame_ptr(p, f) + off, bytes);
+        ok = true;
+    }
+    wl_xb_mmu_unlock(level);
+    return ok;
+}
+
 // ---- Write watch -------------------------------------------------------------------------------
 
 // The pages of guest-physical [phys, phys + bytes): false when the range is empty or not RAM.

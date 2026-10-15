@@ -275,6 +275,10 @@ WlResult wl_xb_mem_pin(uint32_t va, uint32_t bytes);
 void wl_xb_mem_unpin(uint32_t va, uint32_t bytes);
 // Whether the page of `va` has a frame now (diagnostics and tests; false for anything else).
 bool wl_xb_mem_resident(uint32_t va);
+// Copies `bytes` guest bytes at `va` (within one page) when its page is resident and not in swap
+// I/O, without faulting: false otherwise. Diagnostics may call it without the guest lock (the
+// freeze watch on the service thread); the bytes are the guest's (little-endian).
+bool wl_xb_mem_peek(uint32_t va, void *dst, uint32_t bytes);
 
 // ---- Write watch ---------------------------------------------------------------------------------
 // Whether guest memory was written since a moment, from the MMU's changed bits rather than its
