@@ -7,6 +7,12 @@
 #include <string.h>
 
 #include "wl/platform/gx_direct.h"
+
+// the write-gather pipe's stores (gx_pipe_words.h): the pipe read once for a call
+#define WL_PIPE_T WGPipe *
+#define WL_PIPE_W32(pipe, v) ((pipe)->U32 = (v))
+#define WL_PIPE_W16(pipe, v) ((pipe)->U16 = (v))
+#include "wl/platform/gx_pipe_words.h"
 #include "wl/platform/wii/gx_flush_wii.h"
 #include "wl/platform/wii/gx_wii_internal.h"
 
@@ -223,27 +229,14 @@ void wl_gx_direct_vertex(const WlGxDirectVertex *vertex) {
 }
 
 void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
-    uint32_t i;
-
     if (d.in_primitive) {
-        for (i = 0; i < count; i++) {
-            wgPipe->U32 = words[i];
-        }
+        wl_gx_pipe_words(wgPipe, words, count);
     }
 }
 
 void wl_gx_direct_vertices_words(const uint32_t *const *vertices, uint32_t n, uint32_t count) {
-    uint32_t v, i;
-
-    if (!d.in_primitive) {
-        return;
-    }
-    for (v = 0; v < n; v++) {
-        const uint32_t *words = vertices[v];
-
-        for (i = 0; i < count; i++) {
-            wgPipe->U32 = words[i];
-        }
+    if (d.in_primitive) {
+        wl_gx_pipe_vertices(wgPipe, vertices, n, count);
     }
 }
 
@@ -279,29 +272,8 @@ void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t c
 
 void wl_gx_direct_vertices_index(const uint32_t *indices, uint32_t base, uint32_t n, const uint32_t *words,
                                  uint32_t count) {
-    uint32_t v;
-    unsigned k, words_sent = 0;
-
-    if (!d.in_primitive) {
-        return;
-    }
-    for (k = 0; k < d.order_count; k++) {
-        words_sent += d.order[k];
-    }
-    if (count == 0 && words_sent == 0) {
-        // (every attribute indexed: the vertex's index for each)
-        for (v = 0; v < n; v++) {
-            u16 index = (u16)(indices != NULL ? indices[v] - base : v);
-            unsigned i;
-
-            for (i = 0; i < d.order_count; i++) {
-                wgPipe->U16 = index;
-            }
-        }
-        return;
-    }
-    for (v = 0; v < n; v++) {
-        wl_gx_direct_vertex_index((uint16_t)(indices != NULL ? indices[v] - base : v), words, count);
+    if (d.in_primitive) {
+        wl_gx_pipe_vertices_index(wgPipe, d.order, d.order_count, indices, base, n, words, count);
     }
 }
 
