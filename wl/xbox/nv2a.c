@@ -586,9 +586,12 @@ static void puller(WlNv2a *dev, unsigned chid, unsigned subchannel, uint32_t met
     switch (ch->subchannel_class[subchannel]) {
     case WL_NV2A_CLASS_KELVIN:
         if (method == WL_NV2A_K_NO_OPERATION && param != 0) {
-            if (wl_nv2a_trap(dev, method | (uint32_t)subchannel << 16, param)) {
-                ch->suspended |= WL_NV2A_SUSPEND_TRAP;
-            }
+            // PGRAPH stops at a trapped method whether its interrupt is enabled or not (a driver
+            // that has the interrupts off at that moment, as D3D's ISR does until its DPC has run,
+            // sees the trap when it turns them on): the methods after it wait, and a second trap
+            // cannot overwrite the first one's TRAPPED_ADDR/DATA before the handler reads them
+            (void)wl_nv2a_trap(dev, method | (uint32_t)subchannel << 16, param);
+            ch->suspended |= WL_NV2A_SUSPEND_TRAP;
             return;
         }
         wl_nv2a_kelvin_method(dev, method, param);
@@ -637,7 +640,10 @@ void wl_nv2a_suspend_current(WlNv2a *dev, unsigned why) {
 }
 
 // a channel stopped at a trap or a NOTIFY goes on once the ISR has cleared its interrupt, while
-// PGRAPH's FIFO access is on (the ISR turns it off while it works)
+// PGRAPH's FIFO access is on: pbkit only acknowledges the interrupt; D3D turns PGRAPH_FIFO off,
+// acknowledges, runs the software method, then turns PGRAPH_FIFO on (going on at the acknowledgement
+// ran the push buffer to its next trap before D3D had read the first one: Halo's intro flip was
+// queued twice and its Swap waited for good)
 static void resume_trapped(WlNv2a *dev) {
     unsigned chid;
 

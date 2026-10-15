@@ -441,7 +441,66 @@ void wl_xb_port_out(uint32_t port, uint32_t value, unsigned size) {
     (void)size;
 }
 
+// EFLAGS bits a guest can set and read back that no generated code keeps: AC (18) and ID (21). A
+// processor that has CPUID lets ID be toggled, which is how code (Bink's MMX check) asks before it
+// runs CPUID.
+#define EFLAGS_KEPT 0x00240000u
+static uint32_t g_eflags_kept;
+
+// What the Xbox's processor (a Pentium III, family 6 model 8, at 733 MHz) answers to CPUID.
+static void cpuid(void) {
+    uint32_t leaf = g_eax;
+    g_eax = g_ebx = g_ecx = g_edx = 0;
+    switch (leaf) {
+    case 0:
+        g_eax = 2;           // the highest standard leaf
+        g_ebx = 0x756E6547u; // "Genu"
+        g_edx = 0x49656E69u; // "ineI"
+        g_ecx = 0x6C65746Eu; // "ntel"
+        break;
+    case 1:
+        g_eax = 0x0000068Au; // family 6, model 8, stepping 10
+        // FPU VME DE PSE TSC MSR PAE MCE CX8 SEP MTRR PGE MCA CMOV PAT PSE36 MMX FXSR SSE
+        g_edx = 0x0383F9FFu;
+        break;
+    case 2:
+        g_eax = 0x03020101u; // the caches' descriptors: 32 KB L1, 128 KB L2
+        g_edx = 0x0C040841u;
+        break;
+    default:
+        break;
+    }
+}
+
+// The generated code calls this for an instruction the lifter does not translate, with the
+// registers stored to their globals before the call and loaded back after it. Three are done here
+// rather than skipped, as code that asks the processor what it is uses them together: pushfd and
+// popfd (EFLAGS through the stack: DF and the bits above are kept, the arithmetic flags, which
+// live in the generated code's locals, read as clear) and cpuid. Every other one stays a no-op,
+// logged at its first run.
 __attribute__((weak)) void recomp_unimpl(const char *text, uint32_t va) {
+    if (text != NULL && (strcmp(text, "pushfd") == 0 || strcmp(text, "pushf") == 0)) {
+        uint32_t fl = 0x00000202u | (g_df ? 0x400u : 0u) | g_eflags_kept; // IF and the reserved bit 1
+        if (text[5] == 'd') {
+            g_esp -= 4u;
+            wl_xb_wr32(g_esp, fl);
+        } else {
+            g_esp -= 2u;
+            wl_xb_wr16(g_esp, (uint16_t)fl);
+        }
+        return;
+    }
+    if (text != NULL && strcmp(text, "popfd") == 0) {
+        uint32_t fl = wl_xb_rd32(g_esp);
+        g_esp += 4u;
+        g_df = (fl & 0x400u) != 0;
+        g_eflags_kept = fl & EFLAGS_KEPT;
+        return;
+    }
+    if (text != NULL && strcmp(text, "cpuid") == 0) {
+        cpuid();
+        return;
+    }
     if (first_time(va ^ 0x40000000u)) {
         WL_LOG_W(TAG, "unimplemented instruction at 0x%08x: %s", (unsigned)va, text != NULL ? text : "?");
     }
