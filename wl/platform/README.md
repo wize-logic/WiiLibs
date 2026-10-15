@@ -766,6 +766,10 @@ the red channel as is (the luminance copy would map black to 16 and white to 235
 the EFB to textures are unfiltered: the vertical (deflicker) filter that stays set for the display
 copy would blur them, so it is switched off around each copy and back on after. A copy may reach
 any of the EFB's 528 rows, below the picture too.
+Each copy invalidates the CPU's cache over its destination first; `wl_gx_copy_efb_texture_again` is for a
+destination an earlier copy filled and the CPU has not touched since, and leaves that out (a full-screen
+copy every frame is 1.2 MiB, 38400 lines). The render-target layer does the same for its own blocks (invalidated
+at the first copy into them) and for a `WlGxTarget` whose `resident` is set.
 
 **Render targets** (`gx_target.h`). GX draws into one EFB, so a texture to render into takes it
 from the back buffer and gives it back. `wl_gx_target_use(&target)` is called before each draw

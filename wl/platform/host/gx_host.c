@@ -431,6 +431,10 @@ void wl_gx_copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat
     s.efb_copy_rect[3] = h;
 }
 
+void wl_gx_copy_efb_texture_again(int x, int y, int w, int h, void *dst, WlGxTexFormat fmt, bool clear) {
+    wl_gx_copy_efb_texture(x, y, w, h, dst, fmt, clear); // (no processor cache to keep in step)
+}
+
 void wl_gx_set_viewport(int x, int y, int w, int h) {
     s.viewport[0] = x;
     s.viewport[1] = y;

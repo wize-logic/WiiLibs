@@ -96,12 +96,12 @@ static enum greatest_test_res expect_log(unsigned from, const char *const *lines
     } while (0)
 
 static WlGxTarget target_a(void) {
-    WlGxTarget t = {&g_id_a, g_memory_a, 64, 64, WL_GX_TEX_RGBA8, 0};
+    WlGxTarget t = {&g_id_a, g_memory_a, 64, 64, WL_GX_TEX_RGBA8, 0, false};
     return t;
 }
 
 static WlGxTarget target_b(void) {
-    WlGxTarget t = {&g_id_b, g_memory_b, 32, 32, WL_GX_TEX_RGB565, 0};
+    WlGxTarget t = {&g_id_b, g_memory_b, 32, 32, WL_GX_TEX_RGB565, 0, false};
     return t;
 }
 
@@ -280,7 +280,49 @@ TEST copies_leave_the_display_filter_on_and_note_the_commands(void) {
     PASS();
 }
 
+// What the GPU alone writes is invalidated once: a block a copy has filled, and memory a target says it
+// has been resolved into, is not invalidated by the next copy (the processor holds none of its lines).
+static unsigned invalidations_since(unsigned from) {
+    unsigned n = 0;
+    for (unsigned i = from; i < g_gx_stub_log_count; i++) {
+        n += strncmp(g_gx_stub_log[i], "wl_gpu_buffer_invalidate", 24) == 0 ? 1u : 0u;
+    }
+    return n;
+}
+
+TEST gpu_owned_blocks_are_invalidated_once(void) {
+    start();
+    WlGxTarget a = target_a();
+    unsigned from = g_gx_stub_log_count;
+    wl_gx_target_drawn();
+    (void)wl_gx_target_use(&a); // parks: the colour and depth blocks, new
+    ASSERT_EQ(2u, invalidations_since(from));
+    from = g_gx_stub_log_count;
+    (void)wl_gx_target_use(NULL); // a resolved (its memory is the caller's: invalidated)
+    ASSERT_EQ(1u, invalidations_since(from));
+    from = g_gx_stub_log_count;
+    wl_gx_target_frame_begun();
+    wl_gx_target_drawn();
+    (void)wl_gx_target_use(&a); // parks again, into the same blocks
+    ASSERT_EQ(0u, invalidations_since(from));
+    // a's descriptor says its memory is the GPU's now (the caller learned it from the first resolve)
+    a.resident = true;
+    (void)wl_gx_target_use(&a);
+    from = g_gx_stub_log_count;
+    (void)wl_gx_target_use(NULL); // resolved again
+    ASSERT_EQ(0u, invalidations_since(from));
+    // the squeeze goes into the colour block, larger than the park's: a new block, invalidated once
+    from = g_gx_stub_log_count;
+    ASSERT(wl_gx_target_squeeze(80, 480));
+    ASSERT_EQ(1u, invalidations_since(from));
+    from = g_gx_stub_log_count;
+    ASSERT(wl_gx_target_squeeze(80, 480));
+    ASSERT_EQ(0u, invalidations_since(from));
+    PASS();
+}
+
 SUITE(target_gx_suite) {
+    RUN_TEST(gpu_owned_blocks_are_invalidated_once);
     RUN_TEST(park_the_back_buffer_and_take_the_efb);
     RUN_TEST(resolve_a_target_into_its_memory);
     RUN_TEST(put_the_back_buffer_back_through_a_z_texture);

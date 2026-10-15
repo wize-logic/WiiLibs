@@ -592,6 +592,11 @@ uint32_t wl_gx_peek_rgba(int x, int y);
 // from the next draw on; the CPU must not write `dst` afterwards. Render-to-texture for shadows,
 // silhouettes and post effects.
 void wl_gx_copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat fmt, bool clear);
+// The same copy again into a `dst` that wl_gx_copy_efb_texture has filled (a copy of no fewer bytes) and the
+// CPU has not touched since (the contract above: it must not write `dst` afterwards): the range is not
+// invalidated again, for no line of it can be in the CPU's cache. A full-screen picture every frame leaves
+// out 1.2 MiB of invalidation. Memory made anew, or written by the CPU in between, is wl_gx_copy_efb_texture's.
+void wl_gx_copy_efb_texture_again(int x, int y, int w, int h, void *dst, WlGxTexFormat fmt, bool clear);
 
 typedef struct {
     uint32_t frames;

@@ -35,6 +35,10 @@ typedef struct {
     uint16_t width, height; // pixels: multiples of 4, within the back buffer's size to be resolved (a larger target can still be drawn)
     uint8_t format;    // WlGxTexFormat: WL_GX_TEX_RGBA8 or WL_GX_TEX_RGB565 (anything else is not resolved)
     uintptr_t user;    // the caller's own word, handed back with the target when it is resolved
+    // `memory` has been resolved into already (or filled by wl_gx_copy_efb_texture) and the processor has
+    // not touched it since: the resolve then leaves the processor's cache alone, which holds none of it.
+    // false (the zero value): the resolve invalidates the range first
+    bool resident;
 } WlGxTarget;
 
 typedef struct {
@@ -62,7 +66,8 @@ void wl_gx_target_set_back_buffer_size(uint32_t width, uint32_t height);
 // the first park and kept; a park that needs more gives them back and asks for larger ones. `alloc`
 // returns NULL when it has none: the back buffer is then not parked (a target's draws go over it)
 // and the next park asks again. Default: aligned_alloc and free. The blocks are given back to
-// `release` by wl_gx_shutdown and when the back buffer's size changes.
+// `release` by wl_gx_shutdown and when the back buffer's size changes. The processor never touches
+// the blocks: the layer invalidates its cache over a block once, at the first copy into it.
 typedef void *(*WlGxTargetAlloc)(size_t bytes);
 typedef void (*WlGxTargetFree)(void *memory);
 void wl_gx_target_set_allocator(WlGxTargetAlloc alloc, WlGxTargetFree release);

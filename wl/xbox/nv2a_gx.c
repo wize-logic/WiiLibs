@@ -350,6 +350,8 @@ static void target_image_made(WlNv2aGx *gx, RenderTarget *r) {
     const WlNv2aTexCacheConfig *c = &gx->textures.cfg;
 
     r->resolved = true;
+    // (its memory has been copied into: the processor's cache holds none of it, the copies leave it alone)
+    r->target.resident = true;
     r->stamp = c->watch != NULL && r->guest_bytes != 0 ? c->watch(c->user, r->phys, r->guest_bytes)
                                                         : 0u;
 }
@@ -520,7 +522,11 @@ static void frame_keep(WlNv2aGx *gx) {
     if (t == NULL) {
         return;
     }
-    wl_gx_copy_efb_texture(0, 0, (int)w, (int)h, t->memory, WL_GX_TEX_RGBA8, false);
+    if (t->target.resident) {
+        wl_gx_copy_efb_texture_again(0, 0, (int)w, (int)h, t->memory, WL_GX_TEX_RGBA8, false);
+    } else {
+        wl_gx_copy_efb_texture(0, 0, (int)w, (int)h, t->memory, WL_GX_TEX_RGBA8, false);
+    }
     t->guest_bytes = w * h * 4u;
     target_image_made(gx, t);
     gx->texture_memory_changed = true;

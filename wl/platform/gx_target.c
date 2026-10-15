@@ -24,6 +24,9 @@ static struct {
     uint32_t parked_w, parked_h;
     void *colour, *depth;
     size_t colour_bytes, depth_bytes; // the blocks' sizes
+    // the bytes of each block from its start that the GPU has been copied into: the processor does not
+    // touch the blocks, so what a copy has invalidated stays out of its cache
+    size_t colour_clean, depth_clean;
     WlGxTargetStats stats;
 } t;
 
@@ -45,12 +48,13 @@ static void free_parked(void) {
     }
     t.colour = t.depth = NULL;
     t.colour_bytes = t.depth_bytes = 0;
+    t.colour_clean = t.depth_clean = 0;
     t.parked = false;
 }
 
 // A block of at least `bytes` in *block: the one there, or a new one (the old given back). False,
 // and *block NULL, when the allocator has none.
-static bool block_at_least(void **block, size_t *size, size_t bytes) {
+static bool block_at_least(void **block, size_t *size, size_t *clean, size_t bytes) {
     WlGxTargetAlloc alloc = t.alloc != NULL ? t.alloc : default_alloc;
     WlGxTargetFree release = t.release != NULL ? t.release : default_free;
     if (*block != NULL && *size >= bytes) {
@@ -61,6 +65,7 @@ static bool block_at_least(void **block, size_t *size, size_t bytes) {
     }
     *block = alloc(bytes);
     *size = *block != NULL ? bytes : 0;
+    *clean = 0;
     return *block != NULL;
 }
 
@@ -138,15 +143,18 @@ static void park_size(uint32_t w, uint32_t h, uint32_t *pw, uint32_t *ph) {
 static void park(uint32_t w, uint32_t h) {
     size_t bytes = wl_gx_tex_bytes(WL_GX_TEX_RGBA8, w, h);
     // (the colour's block may be there already, and larger: wl_gx_target_squeeze's)
-    if (!block_at_least(&t.colour, &t.colour_bytes, bytes) || !block_at_least(&t.depth, &t.depth_bytes, bytes)) {
+    if (!block_at_least(&t.colour, &t.colour_bytes, &t.colour_clean, bytes) ||
+        !block_at_least(&t.depth, &t.depth_bytes, &t.depth_clean, bytes)) {
         free_parked();
         WL_LOG_W(TAG, "no memory to park the back buffer (%u bytes twice): a target's draws go over it",
                  (unsigned)bytes);
         return;
     }
     wl_gx_target_be_copy_begin();
-    wl_gx_target_be_copy(t.colour, w, h, WL_GX_TARGET_COPY_RGBA8);
-    wl_gx_target_be_copy(t.depth, w, h, WL_GX_TARGET_COPY_Z24X8);
+    wl_gx_target_be_copy(t.colour, w, h, WL_GX_TARGET_COPY_RGBA8, t.colour_clean < bytes);
+    wl_gx_target_be_copy(t.depth, w, h, WL_GX_TARGET_COPY_Z24X8, t.depth_clean < bytes);
+    t.colour_clean = t.colour_clean > bytes ? t.colour_clean : bytes;
+    t.depth_clean = t.depth_clean > bytes ? t.depth_clean : bytes;
     wl_gx_target_be_copy_end();
     t.parked = true;
     t.parked_w = w;
@@ -177,7 +185,8 @@ static const WlGxTarget *resolve(void) {
     }
     wl_gx_target_be_copy_begin();
     wl_gx_target_be_copy(t.owner.memory, t.owner.width, t.owner.height,
-                         t.owner.format == WL_GX_TEX_RGB565 ? WL_GX_TARGET_COPY_RGB565 : WL_GX_TARGET_COPY_RGBA8);
+                         t.owner.format == WL_GX_TEX_RGB565 ? WL_GX_TARGET_COPY_RGB565 : WL_GX_TARGET_COPY_RGBA8,
+                         !t.owner.resident);
     wl_gx_target_be_copy_end();
     t.stats.resolves++;
     t.resolved = t.owner;
@@ -270,7 +279,8 @@ bool wl_gx_target_squeeze(uint32_t x, uint32_t w) {
     }
     // (the block a park copies the colour into, free at the end of a frame: made as large as the
     // back buffer where a park's is smaller)
-    if (!block_at_least(&t.colour, &t.colour_bytes, wl_gx_tex_bytes(WL_GX_TEX_RGBA8, bw, bh))) {
+    size_t squeeze_bytes = wl_gx_tex_bytes(WL_GX_TEX_RGBA8, bw, bh);
+    if (!block_at_least(&t.colour, &t.colour_bytes, &t.colour_clean, squeeze_bytes)) {
         if (!t.squeeze_warned) {
             t.squeeze_warned = true;
             WL_LOG_W(TAG, "no memory to narrow the picture (%u bytes): it is shown the full width",
@@ -279,7 +289,8 @@ bool wl_gx_target_squeeze(uint32_t x, uint32_t w) {
         return false;
     }
     t.parked = false;
-    wl_gx_target_be_squeeze(t.colour, bw, bh, x, w);
+    wl_gx_target_be_squeeze(t.colour, bw, bh, x, w, t.colour_clean < squeeze_bytes);
+    t.colour_clean = t.colour_clean > squeeze_bytes ? t.colour_clean : squeeze_bytes;
     t.stats.squeezes++;
     return true;
 }

@@ -13,9 +13,11 @@ typedef enum {
 
 // Copies out of the EFB's origin, `w` by `h` pixels, unfiltered (the display copy's deflicker
 // filter is switched off for a run of copies and back on after). The destination is 32-byte
-// aligned memory of wl_gx_tex_bytes bytes; the texture cache is invalidated after the run.
+// aligned memory of wl_gx_tex_bytes bytes; the texture cache is invalidated after the run. The
+// processor's cache is invalidated over `dst` first when `invalidate` (false for memory the GPU
+// has been copied into and the processor has not touched since: no line of it can be cached).
 void wl_gx_target_be_copy_begin(void);
-void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what);
+void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what, bool invalidate);
 void wl_gx_target_be_copy_end(void);
 // The scissor: (0, 0, w, h).
 void wl_gx_target_be_scissor(uint32_t w, uint32_t h);
@@ -31,8 +33,9 @@ void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int 
 // The finished back buffer narrowed into columns [x, x + w) of itself with black around it: the EFB
 // copied (unfiltered) into `colour` (a block of wl_gx_tex_bytes(RGBA8, back_w, back_h) bytes) and
 // cleared to black by the same copy, then drawn back as one linearly filtered quad. Nothing of the
-// back buffer is kept; for the end of the frame.
-void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w);
+// back buffer is kept; for the end of the frame. `invalidate` as wl_gx_target_be_copy's.
+void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w,
+                             bool invalidate);
 
 // The video mode's framebuffer width and EFB height, the default back buffer.
 void wl_gx_target_be_default_size(uint32_t *w, uint32_t *h);

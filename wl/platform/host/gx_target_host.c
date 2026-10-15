@@ -38,7 +38,8 @@ void wl_gx_target_be_copy_begin(void) {
     (void)next_op(WL_HOST_TARGET_COPY_BEGIN);
 }
 
-void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what) {
+void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what, bool invalidate) {
+    (void)invalidate; // (no processor cache to keep in step)
     const WlHostGxRenderer *r = wl_host_gx_renderer();
     WlHostTargetOp *op = next_op(WL_HOST_TARGET_COPY);
     op->what = (uint8_t)what;
@@ -127,7 +128,9 @@ void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int 
     quad_state(back_w, back_h, colour, colour, depth, depth);
 }
 
-void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w) {
+void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w,
+                             bool invalidate) {
+    (void)invalidate;
     const WlHostGxRenderer *r = wl_host_gx_renderer();
     WlHostTargetOp *op = next_op(WL_HOST_TARGET_SQUEEZE);
     op->dst = colour;
