@@ -151,6 +151,12 @@ static inline void wl_xb_wr32_atomic(uint32_t va, uint32_t v) {
 void wl_xb_copy_in(uint32_t va, const void *src, uint32_t n);
 void wl_xb_copy_out(void *dst, uint32_t va, uint32_t n);
 void wl_xb_fill(uint32_t va, uint8_t byte, uint32_t n);
+// Host bytes that may lie in guest memory (a host pointer into it, as a device reads guest memory)
+// written to a file through a bounce buffer: with paging, the OS's write of a page without a frame
+// fails (EFAULT, or a DMA of the wrong bytes on the Wii) where a load by code faults it in. The
+// platform's write status (WL_OK when every byte went).
+struct WlPlatformFile;
+WlResult wl_xb_file_write(struct WlPlatformFile *file, const void *data, uint32_t bytes);
 // A guest NUL-terminated string into `dst` (at most cap - 1 bytes, always terminated); the length
 // copied. Stops at the first byte of an address that is not valid guest memory.
 uint32_t wl_xb_read_cstr(uint32_t va, char *dst, uint32_t cap);
