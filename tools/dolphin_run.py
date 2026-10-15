@@ -420,6 +420,9 @@ def main() -> int:
                         help="copy the audio the console sent out (Dolphin's WAV dumps) into this folder")
     parser.add_argument("--unthrottled", action="store_true",
                         help="no speed limit: a long run finishes sooner, the program sees no difference")
+    parser.add_argument("--keep-work", action="store_true",
+                        help="keep the run's copies (the card's folder and image, the program, the dumps) in its "
+                             "work folder; by default they are deleted when the run ends, keeping the logs")
     parser.add_argument("--panics", action="store_true",
                         help="show Dolphin's panic messages (they stop the emulation until answered)")
     parser.add_argument("--wii-aspect", choices=("4:3", "16:9"), default="4:3",
@@ -543,6 +546,14 @@ def main() -> int:
         for wave in waves:
             shutil.copyfile(wave, args.dump_audio / wave.name)
         print(f"audio: {len(waves)} files in {args.dump_audio}")
+    if not args.keep_work:
+        # the run's copies (the card's folder, its image, the program, the dumps) are gigabytes per
+        # run name and are made again by the next run; the logs and the configuration stay
+        for path in (work / "sd", work / "sd.raw", program, user / "Dump"):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            elif path.exists():
+                path.unlink(missing_ok=True)
 
     lines = osreport_lines(log)
     for line in lines:
