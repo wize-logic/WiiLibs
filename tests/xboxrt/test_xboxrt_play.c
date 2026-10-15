@@ -15,6 +15,7 @@
 #include "greatest.h"
 #include "wl/platform/host/fs_host.h"
 #include "wl/platform/platform.h"
+#include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/input.h"
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
@@ -148,6 +149,7 @@ static const char k_script[] =
     "frames 3\n"
     "bot 2 off\n"
     "disconnect 2\n"
+    "capture 1 cap\n"
     "repeat 2\n"
     "log twice\n"
     "end\n"
@@ -235,7 +237,7 @@ TEST script_runs(void) {
 
     WlXboxPad prev[4];
     memset(prev, 0, sizeof prev);
-    for (int i = 0; i < 1500 && !T.finished && !T.stopped; i++) {
+    for (int i = 0; i < 2500 && !T.finished && !T.stopped; i++) {
         for (uint32_t p = 0; p < 4u; p++) {
             wl_xb_input_report_sent(p); // the title read its controllers
         }
@@ -289,6 +291,17 @@ TEST script_runs(void) {
     }
     ASSERT_EQ(2, twice);
     ASSERT(lines >= 25);
+    // the capture step waits for its frames; with no GPU to take them (still armed here) it gives
+    // up after 5 s and a second a frame, says so, and the script goes on
+    int armed = 0, gave_up = 0;
+    for (int i = 0; i < T.log_count; i++) {
+        armed += strstr(T.log[i], "test_input: capture of 1 frames to") != NULL ? 1 : 0;
+        gave_up += strstr(T.log[i], "test_input: capture: not done after 6 s") != NULL ? 1 : 0;
+    }
+    ASSERT_EQ(1, armed);
+    if (wl_xb_gpu_capture_busy()) {
+        ASSERT_EQ(1, gave_up);
+    }
     PASS();
 }
 
