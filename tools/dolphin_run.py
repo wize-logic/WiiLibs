@@ -216,7 +216,7 @@ def dolphin_ini(sd_image: str, sd_folder: str, dump_frames: bool, gdb_port: int 
     return "\n".join(lines) + "\n"
 
 
-def gfx_ini(dump_frames: bool, widescreen: bool = False, hacks: dict | None = None) -> str:
+def gfx_ini(dump_frames: bool, widescreen: bool = False, hacks: dict | None = None, fps: bool = True) -> str:
     # CPU access to the EFB on (Dolphin may skip it for speed, and peeks then read 0): programs
     # and tests read pixels back; EFB copies to textures written to RAM, as the console does
     # (Dolphin's default keeps them in its own texture cache only and zeroes the RAM they were to go
@@ -227,6 +227,10 @@ def gfx_ini(dump_frames: bool, widescreen: bool = False, hacks: dict | None = No
                 "Settings": {"AspectRatio": str(1 if widescreen else 2)}}
     if dump_frames:
         sections["Settings"]["DumpFramesAsImages"] = "True"
+    if fps:
+        # (Dolphin's frame counter drawn in the window's corner: this Dolphin has no title-bar counter; a
+        # --screenshot run leaves it out, as the screenshot is the window)
+        sections["Settings"]["ShowFPS"] = "True"
     for name, value in (hacks or {}).items():
         section, _, key = name.rpartition(".")  # "Settings.CPUCull" names its section, "X" means [Hacks]
         sections.setdefault(section or "Hacks", {})[key] = value
@@ -520,7 +524,8 @@ def main() -> int:
                                                               args.panics, args.single_core, args.mmu,
                                                               args.unthrottled, bool(args.dump_audio)))
     hacks = dict(item.split("=", 1) for item in args.gfx_hack)
-    (user / "Config" / "GFX.ini").write_text(gfx_ini(bool(args.dump_frames), args.wii_aspect == "16:9", hacks))
+    (user / "Config" / "GFX.ini").write_text(gfx_ini(bool(args.dump_frames), args.wii_aspect == "16:9", hacks,
+                                                     fps=not args.screenshot))
     log = user / "Logs" / "dolphin.log"
     if log.exists():
         log.unlink()

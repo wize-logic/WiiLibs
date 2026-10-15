@@ -159,6 +159,11 @@ class GfxIniTests(unittest.TestCase):
         self.assertIn("DumpFramesAsImages = True", settings)
         self.assertNotIn("CPUCull", text[:text.index("[Settings]")])
 
+    def test_the_frame_counter(self):
+        self.assertIn("ShowFPS = True", dolphin_run.gfx_ini(False))
+        self.assertNotIn("ShowFPS", dolphin_run.gfx_ini(False, fps=False))
+        self.assertIn("ShowFPS = False", dolphin_run.gfx_ini(False, hacks={"Settings.ShowFPS": "False"}))
+
 
 class CommandLineTests(unittest.TestCase):
     def test_sd_out_without_sd_is_refused_before_dolphin_is_looked_for(self):
