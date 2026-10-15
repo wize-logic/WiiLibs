@@ -57,3 +57,19 @@ wl_add_test(test_xbox_vsh_batch SOURCES test_xbox_vsh_batch.c LIBS wl_xbox LABEL
 target_include_directories(test_xbox_vsh_batch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 wl_add_test(test_xbox_vsh_native SOURCES test_xbox_vsh_native.c ${vsh_generated} LIBS wl_xbox LABELS unit be)
 target_include_directories(test_xbox_vsh_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# the same programs' paired-single code, the Wii's (WL_XBOX_VSH_PS), emulated in C
+# (vsh_ps_emulate.py, on the build machine), against the interpreter within the console suite's
+# tolerance (suite_vsh_ps.c, which the console runs on the Gekko)
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+    set(vsh_ps_generated ${CMAKE_CURRENT_BINARY_DIR}/vsh_ps_programs.c)
+    set(vsh_ps_emulated ${CMAKE_CURRENT_BINARY_DIR}/vsh_ps_emulated.c)
+    add_custom_command(OUTPUT ${vsh_ps_emulated}
+        COMMAND xbox_vsh_codegen ${CMAKE_CURRENT_SOURCE_DIR}/vsh_programs.inc ${vsh_ps_generated} test_vsh_ps_natives
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/vsh_ps_emulate.py ${vsh_ps_generated} ${vsh_ps_emulated}
+        DEPENDS xbox_vsh_codegen ${CMAKE_CURRENT_SOURCE_DIR}/vsh_programs.inc ${CMAKE_CURRENT_SOURCE_DIR}/vsh_ps_emulate.py
+        VERBATIM)
+    set_source_files_properties(${vsh_ps_emulated} PROPERTIES COMPILE_OPTIONS "-w")
+    wl_add_test(test_xbox_vsh_ps SOURCES test_xbox_vsh_ps.c suite_vsh_ps.c ${vsh_ps_emulated} LIBS wl_xbox LABELS unit be)
+    target_include_directories(test_xbox_vsh_ps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+endif()

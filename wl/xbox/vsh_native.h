@@ -11,6 +11,16 @@
 #include <stdint.h>
 #include <string.h>
 
+/* 1 when a generated function's paired-single code is compiled (the Wii's
+Gekko; tools/xbox_vsh_codegen.c): its results may differ from the
+interpreter's in the last bits. Elsewhere, or with WL_XBOX_VSH_NO_PS
+defined, the plain C, the interpreter's bits. */
+#if defined(__wii__) && !defined(WL_XBOX_VSH_NO_PS)
+#define WL_XBOX_VSH_PS 1
+#else
+#define WL_XBOX_VSH_PS 0
+#endif
+
 /* the ILU's exponent, logarithm and lighting (from c into out) */
 void wl_xbox_vsh_ilu(int ilu, const float c[4], float out[4]);
 

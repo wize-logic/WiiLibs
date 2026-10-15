@@ -6,7 +6,7 @@
 // program hands to wl_xbox_vsh_compile: that finds a program's function by a hash of its words
 // (wl_xbox_vsh_hash); a program not among them runs on the interpreter. Functions and
 // interpreter give the same results, to the bit, when both are compiled without fused
-// multiply-adds.
+// multiply-adds; on the Wii the functions' paired singles (below) differ in the last bits.
 //
 // The microcode file is C text: hexadecimal words (0x...), comments (/* */) left out, as the
 // Xbox's Direct3D takes vertex shader functions one after another: each a header word whose high
@@ -26,6 +26,7 @@
 
 #include "../wl/xbox/vsh.c"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -127,10 +128,544 @@ from the vertex before) */
 enum { WRITE_ALL = 3, WRITE_TEMPORARIES = 1, WRITE_OUTPUTS = 2 };
 static int write_mode = WRITE_ALL;
 
+/* ---- the Wii's paired singles ----
+
+On the Wii (WL_XBOX_VSH_PS, vsh_native.h) the dot products, and the
+multiplies and adds that read a constant or an input row whole or broadcast a
+component, are written as the Gekko's paired singles: two lanes an
+instruction, a row loaded with one psq_l a pair, fused multiply-adds. Each is
+one asm statement whose pairs never leave it: what goes in and out are floats
+(ps0 of a register, as every single-precision scalar is on the Gekko), so the
+compiler never moves or spills a pair with an instruction that keeps ps0
+alone. An instruction is written so only when it costs fewer instructions than
+the plain C (loads and operations counted, ps_merge included); the plain C
+stays after #else for every other machine. The fused rounding and the dot
+products' order of adding change the last bits: the console compares these
+with the interpreter within a tolerance (tests/xbox/suite_vsh_ps.c), and the
+host and ppc-be run the plain C, the interpreter's bits. The rows read are the
+constants and the vertex's inputs, which no instruction writes. */
+
+enum { PS_REG, PS_SPLAT, PS_MEM };
+
+typedef struct {
+    int kind;
+    char lanes[4][80]; /* its lanes' values: the operand lines' (A[0] ...), or its source's */
+    char row[64];      /* PS_MEM: the row's address (a const float *) */
+    char base[64];     /* PS_MEM: the base register's value */
+    int offset;        /* PS_MEM: the row's displacement from base, in bytes */
+} PsOperand;
+
+typedef struct {
+    char code[8192];
+    char outputs[1024];
+    char inputs[3072];
+    char seen[64][160];
+    int seen_count, temporaries, results;
+} PsAsm;
+
+/* letter: the operand lines' array (A, B or C), or 0 for the source itself
+(a group's shared operand, read before its instructions' operand lines) */
+static void ps_classify(const WlXboxVshInstruction *instruction, const WlXboxVshOperand *operand,
+                        char letter, PsOperand *x) {
+    const unsigned char *s = operand->swizzle;
+    char text[64];
+    int k;
+
+    memset(x, 0, sizeof(*x));
+    source(text, sizeof(text), instruction, operand);
+    for (k = 0; k < 4; k++) {
+        if (letter)
+            snprintf(x->lanes[k], sizeof(x->lanes[k]), "%c[%d]", letter, k);
+        else
+            snprintf(x->lanes[k], sizeof(x->lanes[k]), "%s%s[%d]", operand->negate ? "-" : "",
+                     text, s[k]);
+    }
+    x->kind = PS_REG;
+    if (s[0] == s[1] && s[1] == s[2] && s[2] == s[3]) {
+        x->kind = PS_SPLAT;
+        return;
+    }
+    if (operand->negate || s[0] != 0 || s[1] != 1 || s[2] != 2 || s[3] != 3)
+        return;
+    if (operand->mux == _mux_input) {
+        x->kind = PS_MEM;
+        snprintf(x->row, sizeof(x->row), "v[%d]", instruction->input);
+        snprintf(x->base, sizeof(x->base), "(const float *)v");
+        x->offset = instruction->input * 16;
+    } else if (operand->mux == _mux_constant && instruction->relative) {
+        x->kind = PS_MEM;
+        snprintf(x->row, sizeof(x->row), "c[wl_xbox_vsh_clamp(%d + a0)]", instruction->constant);
+        snprintf(x->base, sizeof(x->base), "%s", x->row);
+    } else if (operand->mux == _mux_constant) {
+        int constant = instruction->constant < WL_XBOX_VSH_CONSTANT_COUNT
+                           ? instruction->constant
+                           : WL_XBOX_VSH_CONSTANT_COUNT - 1;
+
+        x->kind = PS_MEM;
+        snprintf(x->row, sizeof(x->row), "c[%d]", constant);
+        /* (psq_l's displacement is 12 bits, signed) */
+        if (constant * 16 + 8 < 2048) {
+            snprintf(x->base, sizeof(x->base), "(const float *)c");
+            x->offset = constant * 16;
+        } else {
+            snprintf(x->base, sizeof(x->base), "%s", x->row);
+        }
+    }
+}
+
+static void ps_line(PsAsm *a, const char *format, ...) {
+    va_list arguments;
+    size_t used = strlen(a->code);
+
+    used += (size_t)snprintf(a->code + used, sizeof(a->code) - used, "\t\t\t\"");
+    va_start(arguments, format);
+    used += (size_t)vsnprintf(a->code + used, sizeof(a->code) - used, format, arguments);
+    va_end(arguments);
+    snprintf(a->code + used, sizeof(a->code) - used, "\\n\\t\"\n");
+}
+
+static void ps_append(char *list, size_t size, const char *format, ...) {
+    va_list arguments;
+    size_t used = strlen(list);
+
+    if (used)
+        used += (size_t)snprintf(list + used, size - used, ", ");
+    va_start(arguments, format);
+    vsnprintf(list + used, size - used, format, arguments);
+    va_end(arguments);
+}
+
+/* an input of the asm (constraint and value), each value once: its name */
+static const char *ps_input(PsAsm *a, const char *constraint, const char *value, char *name,
+                            size_t size) {
+    char key[160];
+    int n;
+
+    snprintf(key, sizeof(key), "%s %s", constraint, value);
+    for (n = 0; n < a->seen_count; n++) {
+        if (strcmp(a->seen[n], key) == 0)
+            break;
+    }
+    if (n == a->seen_count) {
+        snprintf(a->seen[a->seen_count++], sizeof(a->seen[0]), "%s", key);
+        ps_append(a->inputs, sizeof(a->inputs), "[i%d] \"%s\"(%s)", n, constraint, value);
+    }
+    snprintf(name, size, "%%[i%d]", n);
+    return name;
+}
+
+/* a scalar input: the operand's lane k */
+static const char *ps_scalar(PsAsm *a, const PsOperand *x, int k, char *name, size_t size) {
+    return ps_input(a, "f", x->lanes[k], name, size);
+}
+
+static const char *ps_temporary(PsAsm *a, char *name, size_t size) {
+    snprintf(name, size, "%%[t%d]", a->temporaries);
+    ps_append(a->outputs, sizeof(a->outputs), "[t%d] \"=&f\"(t%d)", a->temporaries,
+              a->temporaries);
+    a->temporaries++;
+    return name;
+}
+
+/* an output: a float (M[k], or a group's g<index>) */
+static const char *ps_output(PsAsm *a, const char *value, char *name, size_t size) {
+    int n = a->results++;
+
+    ps_append(a->outputs, sizeof(a->outputs), "[o%d] \"=&f\"(%s)", n, value);
+    snprintf(name, size, "%%[o%d]", n);
+    return name;
+}
+
+static const char *ps_result(PsAsm *a, int k, char *name, size_t size) {
+    char value[16];
+
+    snprintf(value, sizeof(value), "M[%d]", k);
+    return ps_output(a, value, name, size);
+}
+
+/* a pair of the operand, into the register named (a new temporary when into
+is NULL): its lanes 2 half and 2 half + 1, or with one its lane 2 half and
+1.0 */
+static const char *ps_pair(PsAsm *a, const PsOperand *x, int half, int one, const char *into,
+                           char *name, size_t size) {
+    char first[16], second[16];
+
+    if (into)
+        snprintf(name, size, "%s", into);
+    else
+        ps_temporary(a, name, size);
+    if (x->kind == PS_MEM) {
+        char base[16], row[16], memory[96];
+
+        ps_input(a, "b", x->base, base, sizeof(base));
+        snprintf(memory, sizeof(memory), "*(const float (*)[4])(%s)", x->row);
+        ps_input(a, "m", memory, row, sizeof(row));
+        /* (W=1: the lane alone, and 1.0) */
+        ps_line(a, "psq_l %s, %d(%s), %d, 0", name, x->offset + 8 * half, base, one ? 1 : 0);
+        return name;
+    }
+    ps_scalar(a, x, x->kind == PS_SPLAT ? 0 : 2 * half, first, sizeof(first));
+    if (one)
+        ps_input(a, "f", "1.0f", second, sizeof(second));
+    else
+        ps_scalar(a, x, x->kind == PS_SPLAT ? 0 : 2 * half + 1, second, sizeof(second));
+    ps_line(a, "ps_merge00 %s, %s, %s", name, first, second);
+    return name;
+}
+
+static void ps_write(FILE *out, const PsAsm *a, const char *after) {
+    int n;
+
+    fprintf(out, "\t\t{\n");
+    if (a->temporaries) {
+        fprintf(out, "\t\tdouble ");
+        for (n = 0; n < a->temporaries; n++)
+            fprintf(out, "%st%d", n ? ", " : "", n);
+        fprintf(out, ";\n\n");
+    }
+    fprintf(out, "\t\t__asm__(\n%s\t\t\t: %s\n\t\t\t: %s);\n", a->code, a->outputs, a->inputs);
+    fprintf(out, "%s\t\t}\n", after);
+}
+
+/* the lanes of M (bit k: lane k) the instruction's writes read */
+static unsigned mac_lanes_used(const WlXboxVshInstruction *instruction) {
+    unsigned mask = 0, lanes = 0;
+    int k;
+
+    if ((write_mode & WRITE_TEMPORARIES) && instruction->mac != _mac_arl)
+        mask |= instruction->mac_mask;
+    if ((write_mode & WRITE_OUTPUTS) && instruction->output_is_register &&
+        !instruction->output_from_ilu)
+        mask |= instruction->output_mask;
+    for (k = 0; k < 4; k++) {
+        if (mask & (8u >> k))
+            lanes |= 1u << k;
+    }
+    return lanes;
+}
+
+/* MUL, ADD and MAD: each half (lanes 0 1, lanes 2 3) as a pair when that is
+cheaper, the other as plain C; 0 (nothing written) when neither is */
+static int ps_mac_code(FILE *out, const WlXboxVshInstruction *instruction, unsigned lanes) {
+    static const char *const plain[] = {"", "M[%d] = A[%d] * B[%d];", "M[%d] = A[%d] + C[%d];",
+                                        "M[%d] = A[%d] * B[%d] + C[%d];"};
+    int mac = instruction->mac, which = mac == _mac_mul ? 1 : mac == _mac_add ? 2 : 3;
+    int half, any = 0, ps[2] = {0, 0};
+    PsOperand x[3];
+
+    ps_classify(instruction, &instruction->operands[0], 'A', &x[0]);
+    ps_classify(instruction, &instruction->operands[1], 'B', &x[1]);
+    ps_classify(instruction, &instruction->operands[2], 'C', &x[2]);
+    for (half = 0; half < 2; half++) {
+        unsigned used = (lanes >> (2 * half)) & 3u;
+        int count = (int)(used & 1) + (int)(used >> 1), memories, scalar, paired;
+
+        if (!used)
+            continue;
+        if (mac == _mac_add) {
+            memories = (x[0].kind == PS_MEM) + (x[2].kind == PS_MEM);
+            scalar = count * (1 + memories);
+            paired = 3 + (int)(used >> 1);
+        } else {
+            int slot = x[0].kind == PS_SPLAT || x[1].kind == PS_SPLAT;
+
+            if (x[0].kind == PS_SPLAT && x[1].kind == PS_SPLAT)
+                continue;
+            memories = (x[0].kind == PS_MEM) + (x[1].kind == PS_MEM);
+            if (mac == _mac_mad)
+                memories += x[2].kind == PS_MEM;
+            scalar = count * ((mac == _mac_mad ? 2 : 1) + memories);
+            paired = (slot ? 1 : 2) + (mac == _mac_mad) + 1 + (int)(used >> 1);
+        }
+        ps[half] = paired < scalar;
+        any |= ps[half];
+    }
+    if (!any)
+        return 0;
+    fprintf(out, "#if WL_XBOX_VSH_PS\n");
+    for (half = 0; half < 2; half++) {
+        unsigned used = (lanes >> (2 * half)) & 3u;
+        char result[16], left[16], right[16], addend[16], odd[16];
+        PsAsm a;
+        int k;
+
+        if (!used)
+            continue;
+        if (!ps[half]) {
+            for (k = 2 * half; k < 2 * half + 2; k++) {
+                fprintf(out, "\t\t");
+                fprintf(out, plain[which], k, k, k, k);
+                fprintf(out, "\n");
+            }
+            continue;
+        }
+        memset(&a, 0, sizeof(a));
+        if (used & 1)
+            ps_result(&a, 2 * half, result, sizeof(result));
+        else
+            ps_temporary(&a, result, sizeof(result));
+        if (mac == _mac_add) {
+            ps_pair(&a, &x[0], half, 0, NULL, left, sizeof(left));
+            ps_pair(&a, &x[2], half, 0, NULL, addend, sizeof(addend));
+            ps_line(&a, "ps_add %s, %s, %s", result, left, addend);
+        } else {
+            /* (a broadcast multiplier is ps_muls0's and ps_madds0's scalar) */
+            const PsOperand *pair = x[0].kind == PS_SPLAT ? &x[1] : &x[0];
+            const PsOperand *other = x[0].kind == PS_SPLAT ? &x[0] : &x[1];
+            int slot = other->kind == PS_SPLAT;
+
+            ps_pair(&a, pair, half, 0, NULL, left, sizeof(left));
+            if (slot)
+                ps_scalar(&a, other, 0, right, sizeof(right));
+            else
+                ps_pair(&a, other, half, 0, NULL, right, sizeof(right));
+            if (mac == _mac_mad) {
+                ps_pair(&a, &x[2], half, 0, NULL, addend, sizeof(addend));
+                ps_line(&a, "%s %s, %s, %s, %s", slot ? "ps_madds0" : "ps_madd", result, left,
+                        right, addend);
+            } else {
+                ps_line(&a, "%s %s, %s, %s", slot ? "ps_muls0" : "ps_mul", result, left, right);
+            }
+        }
+        if (used & 2) {
+            ps_result(&a, 2 * half + 1, odd, sizeof(odd));
+            ps_line(&a, "ps_merge11 %s, %s, %s", odd, result, result);
+        }
+        ps_write(out, &a, "");
+    }
+    fprintf(out, "#else\n");
+    return 1;
+}
+
+/* ---- groups: dot products that share their first operand ----
+
+A vertex transformed by a matrix is consecutive DP4s (DPH, DP3) of one
+operand with the matrix's rows, constants or inputs. Such a run is made in one
+asm statement, the shared operand's pairs made once, into g<index> for each
+instruction, at the first one's place and for the outputs any of them reach;
+the instructions then take their M from it. An instruction made where its
+own outputs are not read changes nothing that is (its writes reach none of
+them), and none of the run before the last writes the shared operand's
+register, so each reads it as it was. */
+
+enum { PS_GROUP_MAXIMUM = 6 };
+
+/* the instruction being written takes M from g<it> (-1: none) */
+static long ps_group_member = -1;
+
+/* 1 when the instruction writes temporary register t (12: the position) */
+static int writes_temporary(const WlXboxVshInstruction *instruction, unsigned t) {
+    if (instruction->mac != _mac_nop && instruction->mac != _mac_arl && instruction->mac_mask &&
+        instruction->temporary == t)
+        return 1;
+    if (instruction->ilu != _ilu_nop && instruction->ilu_mask &&
+        (instruction->mac != _mac_nop ? 1u : instruction->temporary) == t)
+        return 1;
+    return t == 12 && instruction->output_mask && instruction->output_is_register &&
+           instruction->output_address == _output_position;
+}
+
+static int same_operand(const WlXboxVshInstruction *a, const WlXboxVshInstruction *b) {
+    const WlXboxVshOperand *x = &a->operands[0], *y = &b->operands[0];
+
+    if (x->mux != y->mux || x->negate != y->negate || memcmp(x->swizzle, y->swizzle, 4))
+        return 0;
+    if (x->mux == _mux_temporary)
+        return x->index == y->index;
+    if (x->mux == _mux_input)
+        return a->input == b->input;
+    if (x->mux == _mux_constant)
+        return a->constant == b->constant && a->relative == b->relative;
+    return 1;
+}
+
+/* the end of the group that starts at first (first itself when none) */
+static unsigned long ps_group_end(const WlXboxVshProgram *program, unsigned long first,
+                                  const unsigned *needs) {
+    const WlXboxVshInstruction *head = &program->instructions[first];
+    PsOperand shared;
+    unsigned long end, earlier;
+    /* (an asm statement has at most 30 operands: 5 temporaries, the
+    shared operand's at most 5 inputs, and each instruction's result and
+    row, its base and memory or its 4 scalars) */
+    int operands;
+
+    if (head->mac != _mac_dp3 && head->mac != _mac_dph && head->mac != _mac_dp4)
+        return first;
+    ps_classify(head, &head->operands[0], 'A', &shared);
+    operands = 5 + (shared.kind == PS_MEM ? 2 : 5);
+    for (end = first; end < program->count && end - first < PS_GROUP_MAXIMUM; end++) {
+        const WlXboxVshInstruction *instruction = &program->instructions[end];
+        const WlXboxVshOperand *row = &instruction->operands[1];
+        PsOperand x;
+
+        if (instruction->mac != head->mac || !needs[end] || !mac_lanes_used(instruction) ||
+            !same_operand(head, instruction))
+            break;
+        /* (a row of registers is merged; one of constants or inputs loaded:
+        a group of registers alone saves nothing) */
+        ps_classify(instruction, row, 'B', &x);
+        if (x.kind != PS_MEM && shared.kind != PS_MEM)
+            break;
+        operands += 1 + (x.kind == PS_MEM ? 2 : 4);
+        if (operands > 30)
+            break;
+        /* (what the group reads, none of it written before its instruction) */
+        for (earlier = first; earlier < end; earlier++) {
+            const WlXboxVshInstruction *before = &program->instructions[earlier];
+
+            if (head->operands[0].mux == _mux_temporary &&
+                writes_temporary(before, head->operands[0].index < 12 ? head->operands[0].index : 12))
+                break;
+            if (row->mux == _mux_temporary &&
+                writes_temporary(before, row->index < 12 ? row->index : 12))
+                break;
+        }
+        if (earlier < end)
+            break;
+    }
+    return end - first >= 2 ? end : first;
+}
+
+static void ps_group_code(FILE *out, const WlXboxVshProgram *program, unsigned long first,
+                          unsigned long end, const unsigned *needs) {
+    const WlXboxVshInstruction *head = &program->instructions[first];
+    int mac = head->mac, slot;
+    unsigned mask = 0;
+    unsigned long index;
+    PsOperand shared;
+    char low[16], high[16], scalar[16], b0[16], b1[16], sum[16], result[16], value[32];
+    PsAsm a;
+
+    ps_classify(head, &head->operands[0], 0, &shared);
+    if (mac == _mac_dph && shared.kind == PS_SPLAT)
+        shared.kind = PS_REG;
+    slot = shared.kind == PS_SPLAT;
+    memset(&a, 0, sizeof(a));
+    ps_temporary(&a, b0, sizeof(b0));
+    ps_temporary(&a, b1, sizeof(b1));
+    ps_temporary(&a, sum, sizeof(sum));
+    if (slot) {
+        ps_scalar(&a, &shared, 0, scalar, sizeof(scalar));
+    } else {
+        ps_pair(&a, &shared, 0, 0, NULL, low, sizeof(low));
+        if (mac == _mac_dp3 && shared.kind != PS_MEM)
+            ps_scalar(&a, &shared, 2, high, sizeof(high));
+        else
+            ps_pair(&a, &shared, 1, mac != _mac_dp4, NULL, high, sizeof(high));
+    }
+    fprintf(out, "#if WL_XBOX_VSH_PS\n\tfloat ");
+    for (index = first; index < end; index++) {
+        const WlXboxVshInstruction *instruction = &program->instructions[index];
+        PsOperand row;
+
+        mask |= needs[index];
+        fprintf(out, "%sg%lu = 0.0f", index > first ? ", " : "", index);
+        ps_classify(instruction, &instruction->operands[1], 0, &row);
+        ps_pair(&a, &row, 0, 0, b0, value, sizeof(value));
+        ps_pair(&a, &row, 1, mac == _mac_dp3, b1, value, sizeof(value));
+        snprintf(value, sizeof(value), "g%lu", index);
+        ps_output(&a, value, result, sizeof(result));
+        if (mac == _mac_dp3) {
+            /* (x y as a pair; z, ps0 of the rows' second pair, as a scalar) */
+            if (slot)
+                ps_line(&a, "ps_muls0 %s, %s, %s", sum, b0, scalar);
+            else
+                ps_line(&a, "ps_mul %s, %s, %s", sum, low, b0);
+            ps_line(&a, "ps_sum0 %s, %s, %s, %s", sum, sum, sum, sum);
+            ps_line(&a, "fmadds %s, %s, %s, %s", result, slot ? scalar : high, b1, sum);
+        } else {
+            if (slot) {
+                ps_line(&a, "ps_muls0 %s, %s, %s", sum, b0, scalar);
+                ps_line(&a, "ps_madds0 %s, %s, %s, %s", sum, b1, scalar, sum);
+            } else {
+                ps_line(&a, "ps_mul %s, %s, %s", sum, low, b0);
+                ps_line(&a, "ps_madd %s, %s, %s, %s", sum, high, b1, sum);
+            }
+            ps_line(&a, "ps_sum0 %s, %s, %s, %s", result, sum, sum, sum);
+        }
+    }
+    fprintf(out, ";\n\n\tif (live & 0x%xu)\n\t{\n", mask);
+    ps_write(out, &a, "");
+    fprintf(out, "\t}\n#endif\n");
+}
+
+/* DP3, DPH and DP4 as pairs when that is cheaper; 0 (nothing written) when
+not */
+static int ps_dot_code(FILE *out, const WlXboxVshInstruction *instruction) {
+    int mac = instruction->mac, slot, scalar, paired, memories, k;
+    PsOperand x[2];
+    const PsOperand *pair, *other;
+    char sum[16], result[16], left[16], right[16], third[16], fourth[16];
+    PsAsm a;
+
+    ps_classify(instruction, &instruction->operands[0], 'A', &x[0]);
+    ps_classify(instruction, &instruction->operands[1], 'B', &x[1]);
+    /* (DPH's A is (x y z 1): a broadcast is merged like any other) */
+    for (k = 0; k < 2; k++) {
+        if (mac == _mac_dph && x[k].kind == PS_SPLAT)
+            x[k].kind = PS_REG;
+    }
+    if (x[0].kind == PS_SPLAT && x[1].kind == PS_SPLAT)
+        return 0;
+    slot = x[0].kind == PS_SPLAT || x[1].kind == PS_SPLAT;
+    memories = (x[0].kind == PS_MEM) + (x[1].kind == PS_MEM);
+    if (mac == _mac_dp4) {
+        scalar = 7 + 4 * memories;
+        paired = (slot ? 2 : 4) + 3;
+    } else if (mac == _mac_dph) {
+        scalar = 6 + 3 * (x[0].kind == PS_MEM) + 4 * (x[1].kind == PS_MEM);
+        paired = 4 + 3;
+    } else {
+        scalar = 5 + 3 * memories;
+        paired = (slot ? 1 : 2) + 3 + memories;
+    }
+    if (paired >= scalar)
+        return 0;
+    memset(&a, 0, sizeof(a));
+    pair = x[0].kind == PS_SPLAT ? &x[1] : &x[0];
+    other = x[0].kind == PS_SPLAT ? &x[0] : &x[1];
+    ps_temporary(&a, sum, sizeof(sum));
+    ps_pair(&a, pair, 0, 0, NULL, left, sizeof(left));
+    if (slot) {
+        ps_scalar(&a, other, 0, right, sizeof(right));
+        ps_line(&a, "ps_muls0 %s, %s, %s", sum, left, right);
+    } else {
+        ps_pair(&a, other, 0, 0, NULL, right, sizeof(right));
+        ps_line(&a, "ps_mul %s, %s, %s", sum, left, right);
+    }
+    if (mac == _mac_dp3) {
+        char partial[16];
+
+        /* (x y as a pair, z as a scalar) */
+        ps_temporary(&a, partial, sizeof(partial));
+        ps_line(&a, "ps_sum0 %s, %s, %s, %s", partial, sum, sum, sum);
+        ps_result(&a, 0, result, sizeof(result));
+        ps_scalar(&a, &x[0], x[0].kind == PS_SPLAT ? 0 : 2, third, sizeof(third));
+        ps_scalar(&a, &x[1], x[1].kind == PS_SPLAT ? 0 : 2, fourth, sizeof(fourth));
+        ps_line(&a, "fmadds %s, %s, %s, %s", result, third, fourth, partial);
+    } else {
+        /* (DPH: A's second pair is (z 1), so its w term is B's w) */
+        ps_pair(&a, pair, 1, mac == _mac_dph && pair == &x[0], NULL, left, sizeof(left));
+        if (slot) {
+            ps_line(&a, "ps_madds0 %s, %s, %s, %s", sum, left, right, sum);
+        } else {
+            ps_pair(&a, other, 1, mac == _mac_dph && other == &x[0], NULL, third, sizeof(third));
+            ps_line(&a, "ps_madd %s, %s, %s, %s", sum, left, third, sum);
+        }
+        ps_result(&a, 0, result, sizeof(result));
+        ps_line(&a, "ps_sum0 %s, %s, %s, %s", result, sum, sum, sum);
+    }
+    fprintf(out, "#if WL_XBOX_VSH_PS\n");
+    ps_write(out, &a, "\t\tM[1] = M[2] = M[3] = M[0];\n");
+    fprintf(out, "#else\n");
+    return 1;
+}
+
 static void instruction_code(FILE *out, const WlXboxVshInstruction *instruction,
                              unsigned long index) {
     char text[32];
-    int component;
+    int component, paired;
 
     fprintf(out, "\t/* %lu */\n\t{\n", index);
     if (instruction->mac != _mac_nop) {
@@ -142,6 +677,24 @@ static void instruction_code(FILE *out, const WlXboxVshInstruction *instruction,
     if (instruction->ilu != _ilu_nop || instruction->mac == _mac_add ||
         instruction->mac == _mac_mad)
         operand(out, "C", instruction, &instruction->operands[2]);
+    /* (on the Wii, as paired singles when cheaper: the plain C after #else) */
+    paired = 0;
+    if (lane < 0 && mac_lanes_used(instruction)) {
+        if (instruction->mac == _mac_mul || instruction->mac == _mac_add ||
+            instruction->mac == _mac_mad)
+            paired = ps_mac_code(out, instruction, mac_lanes_used(instruction));
+        else if (instruction->mac == _mac_dp3 || instruction->mac == _mac_dph ||
+                 instruction->mac == _mac_dp4)
+        {
+            if (ps_group_member >= 0) {
+                fprintf(out, "#if WL_XBOX_VSH_PS\n\t\tM[0] = M[1] = M[2] = M[3] = g%ld;\n#else\n",
+                        ps_group_member);
+                paired = 1;
+            } else {
+                paired = ps_dot_code(out, instruction);
+            }
+        }
+    }
     switch (instruction->mac) {
     case _mac_mov:
     case _mac_arl:
@@ -206,6 +759,8 @@ static void instruction_code(FILE *out, const WlXboxVshInstruction *instruction,
         fprintf(out, "\t\tM[0] = M[1] = M[2] = M[3] = 0.0f;\n");
         break;
     }
+    if (paired)
+        fprintf(out, "#endif\n");
     switch (instruction->ilu) {
     case _ilu_mov:
         fprintf(out, "\t\tI[0] = C[0]; I[1] = C[1]; I[2] = C[2]; I[3] = C[3];\n");
@@ -885,8 +1440,19 @@ int main(int argc, char **argv) {
             reuse_code(out, &program, &prefix, needs);
         {
             unsigned open = 0;
+            unsigned long group_end = 0;
 
             for (index = reused ? prefix.end : 0; index < program.count; index++) {
+                /* (a group of dot products made ahead, outside the blocks) */
+                if (index >= group_end) {
+                    group_end = ps_group_end(&program, index, needs);
+                    if (group_end > index) {
+                        if (open)
+                            fprintf(out, "\t}\n");
+                        open = 0;
+                        ps_group_code(out, &program, index, group_end, needs);
+                    }
+                }
                 if (needs[index] != open) {
                     if (open)
                         fprintf(out, "\t}\n");
@@ -894,8 +1460,10 @@ int main(int argc, char **argv) {
                     if (open)
                         fprintf(out, "\tif (live & 0x%xu)\n\t{\n", open);
                 }
+                ps_group_member = index < group_end ? (long)index : -1;
                 if (open)
                     instruction_code(out, &program.instructions[index], index);
+                ps_group_member = -1;
             }
             if (open)
                 fprintf(out, "\t}\n");
