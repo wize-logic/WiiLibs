@@ -71,6 +71,10 @@ typedef struct WlNv2aGxLayout {
     size_t tlut_offset;
     // a cube map's sphere map (RGBA8, one level)
     bool sphere;
+    // a light's falloff cube (one face lit, the others and its edges dark): that face (1 + Direct3D's
+    // face number: +x, -x, +y, -y, +z, -z) in place of the sphere map, read through
+    // wl_nv2a_spot_coordinates; 0 a sphere map (wl_nv2a_texture_spot sets it)
+    uint8_t spot;
     size_t total_bytes;     // all of it (32-byte multiples between the parts)
 } WlNv2aGxLayout;
 
@@ -92,6 +96,17 @@ size_t wl_nv2a_texture_scratch_bytes(const WlNv2aTexture *t, const WlNv2aGxLayou
 // One texel of a linear (unswizzled) level as RGBA8: the decoder of the formats without an exact GX
 // equivalent, and the reference for the others. `row` is the level's row y.
 void wl_nv2a_texel_rgba(uint8_t color, const uint8_t *row, uint32_t x, const uint8_t *palette, uint8_t rgba[4]);
+
+// Whether a cube map is a light's falloff (a spot: one face carries the light, the other faces and
+// that face's edge texels are dark), from its texels (`scratch`: wl_nv2a_texture_scratch_bytes of its
+// sphere layout): sets layout->spot to 1 + the face, else 0. A spot's sphere map, sampled at
+// coordinates made per vertex, spreads a narrow cone over whole triangles; its face read through the
+// direction's projection onto it keeps the cone's shape.
+void wl_nv2a_texture_spot(const WlNv2aTexture *t, WlNv2aGxLayout *layout, const uint8_t *src, const uint8_t *palette,
+                          void *scratch);
+// A direction's place on a spot's face (layout->spot): its projection onto the face's plane, 0..1
+// across the face, and beyond it (to the face's dark edge) for a direction off it or behind.
+void wl_nv2a_spot_coordinates(const float direction[3], unsigned spot, float st[2]);
 
 // A direction's place on the sphere map a cube map becomes (the mirror ball's mapping: x / m + 1/2,
 // y / m + 1/2 with m = 2 |d + (0, 0, 1)|, d normalized), and its inverse.

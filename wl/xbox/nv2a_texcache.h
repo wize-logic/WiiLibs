@@ -47,6 +47,10 @@ enum {
 typedef struct WlNv2aTexCacheConfig {
     // bytes of GX images kept (0: 4 MiB, or the arena's size)
     size_t budget;
+    // a light's falloff cube made its lit face (wl_nv2a_texture_spot), for a backend whose texture
+    // coordinates read it through wl_nv2a_spot_coordinates (entry->layout.spot); false: every cube
+    // map a sphere map
+    bool spots;
     // an arena the images are kept in (the cache's alone: a heap of its own over it, so that a
     // texture finds room by evicting others, and nothing else fragments it); NULL: alloc/release
     void *arena;

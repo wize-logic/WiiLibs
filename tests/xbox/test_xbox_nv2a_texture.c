@@ -320,6 +320,64 @@ TEST cube_maps_become_sphere_maps(void) {
     PASS();
 }
 
+// a light's falloff cube (a 32x32 Y8 cube, linear, a disc of light on +x, the other faces dark): its
+// lit face in place of the sphere map, read through the direction's projection onto it; a cube lit
+// on every face stays a sphere map
+TEST a_falloff_cube_becomes_its_lit_face(void) {
+    static uint8_t src[6 * 1024];
+    static uint8_t dst[65536] __attribute__((aligned(32)));
+    static uint8_t scratch[65536];
+    WlNv2aTexture t;
+    WlNv2aGxLayout layout;
+    unsigned x, y;
+    uint8_t rgba[4];
+    float st[2];
+
+    memset(&t, 0, sizeof t);
+    t.color = WL_NV2A_TEX_LU_Y8;
+    t.known = 1;
+    t.linear = 1;
+    t.cube = 1;
+    t.width = t.height = 32;
+    t.pitch = 32;
+    t.depth = 1;
+    t.levels = 1;
+    t.texel_bytes = 1;
+    t.face_bytes = 1024;
+    t.total_bytes = 6 * 1024;
+    memset(src, 0, sizeof src);
+    for (y = 0; y < 32; y++) {
+        for (x = 0; x < 32; x++) {
+            float dx = (float)x - 15.5f, dy = (float)y - 15.5f;
+            src[y * 32 + x] = dx * dx + dy * dy < 100.0f ? 255 : 0;
+        }
+    }
+    ASSERT(wl_nv2a_texture_layout(&t, false, &layout));
+    ASSERT(wl_nv2a_texture_scratch_bytes(&t, &layout) <= sizeof scratch);
+    wl_nv2a_texture_spot(&t, &layout, src, NULL, scratch);
+    ASSERT_EQ(1, layout.spot);
+    ASSERT(wl_nv2a_texture_convert(&t, &layout, src, NULL, dst, scratch));
+    // the face fills the image: lit in the middle, dark at its edge
+    ASSERT(wl_gxc_texel_read(WL_GXC_RGBA8, dst, layout.image_bytes, layout.width, layout.height, layout.width / 2,
+                             layout.height / 2, rgba));
+    ASSERT_EQ(255, rgba[0]);
+    ASSERT(wl_gxc_texel_read(WL_GXC_RGBA8, dst, layout.image_bytes, layout.width, layout.height, 0,
+                             layout.height / 2, rgba));
+    ASSERT_EQ(0, rgba[0]);
+    // +x straight on: the middle; half way up the face; behind the light: beyond the face
+    wl_nv2a_spot_coordinates((const float[3]){1.0f, 0.0f, 0.0f}, layout.spot, st);
+    ASSERT(fabsf(st[0] - 0.5f) < 1e-6f && fabsf(st[1] - 0.5f) < 1e-6f);
+    wl_nv2a_spot_coordinates((const float[3]){2.0f, 1.0f, 0.0f}, layout.spot, st);
+    ASSERT(fabsf(st[0] - 0.5f) < 1e-6f && fabsf(st[1] - 0.25f) < 1e-6f);
+    wl_nv2a_spot_coordinates((const float[3]){-1.0f, 0.2f, 0.0f}, layout.spot, st);
+    ASSERT(st[0] < 0.0f && st[1] < 0.0f);
+    // light on every face: a sphere map
+    memset(src, 200, sizeof src);
+    wl_nv2a_texture_spot(&t, &layout, src, NULL, scratch);
+    ASSERT_EQ(0, layout.spot);
+    PASS();
+}
+
 TEST cache_keeps_finds_changes_and_evicts(void) {
     static WlNv2aTexCache cache;
     TGuest g;
@@ -739,6 +797,7 @@ SUITE(texture_suite) {
     RUN_TEST(swizzled_levels_and_luminance);
     RUN_TEST(dxt_and_palettes);
     RUN_TEST(cube_maps_become_sphere_maps);
+    RUN_TEST(a_falloff_cube_becomes_its_lit_face);
     RUN_TEST(cache_keeps_finds_changes_and_evicts);
     RUN_TEST(cache_watched_and_in_an_arena);
     RUN_TEST(cache_arena_window);

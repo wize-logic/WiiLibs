@@ -239,7 +239,10 @@ void wl_nv2a_psh_textures(const WlNv2aKelvin *k, const WlNv2aTexEntry *const ent
 
 void wl_nv2a_texcoord(const WlNv2aTexEntry *entry, unsigned stage_program, const float t[4], float st[2]) {
     if (entry != NULL && entry->sphere) {
-        wl_nv2a_sphere_coordinates(t, st);
+        if (entry->layout.spot)
+            wl_nv2a_spot_coordinates(t, entry->layout.spot, st);
+        else
+            wl_nv2a_sphere_coordinates(t, st);
         return;
     }
     st[0] = t[0];
