@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Wed, 14 Oct 2026 22:00:00 -0400
+Subject: [PATCH] recomp: the transcendentals keep a static stack depth
+
+Patch 0015 lifted fsin, fcos, fsincos and fptan with the hardware's range
+test: for |st0| >= 2^63 they leave st0 alone, push nothing and set C2.
+That made the push of fptan and fsincos conditional, and the x87 locals
+pass (--x87-locals) gives up on a function whose stack depth is not
+static: three of Halo's functions went back to the memory model and
+grew by half (19 KB between them), slower too.
+
+libm reduces any argument exactly, so the range test buys nothing: every
+argument is computed, the stack moves as for one in range, and C2 is
+cleared. A caller that tests C2 (the CRT's reduce-and-retry) goes on with
+the right value at once. fptan's push of 1.0 (a NaN for a NaN or an
+infinity) is written 1.0 + (t - t): the pass also reads a ?: on a line
+that pushes as a push that may not happen. Beyond 2^63 that differs from the hardware,
+which leaves the reduction to the caller; the conformance case
+fpu_trig_out_of_range records it.
+
+Tests: test_x87_status.py checks the four forms clear C2, branch on
+nothing and are taken by the x87 locals pass; the fpu_*_c2 cases keep their in-range, NaN and infinite inputs.
+---
+diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
+--- a/tools/conformance/cases.py
++++ b/tools/conformance/cases.py
+@@ -636,8 +636,10 @@
+           (-3.25, 0.5), (2.5, 2.0), (-2.5, 2.0), (5.5, 2.0), (1e10, 3.0),
+           (17.0, 3.0), (-17.0, -3.0), (0.0, 1.0), (-0.0, 1.0), (6.5, 1.0),
+           (7.5, 1.0), (-7.5, 1.0), (1e15, 0.1), (3.0, 3.0), (29.0, 4.0)]
+-_TRIG = [(0.5, 0.0), (-2.0, 0.0), (3.0, 0.0), (1e19, 0.0), (-1e300, 0.0),
+-         (float("inf"), 0.0), (float("nan"), 0.0)]
++# In range (|x| < 2^63), and NaN and the infinities. Beyond 2^63 the hardware
++# leaves st0 and sets C2; the lift computes the exact result with libm and
++# clears C2 (fpu_trig_out_of_range, listed as an expected difference).
++_TRIG = [(0.5, 0.0), (-2.0, 0.0), (3.0, 0.0), (float("inf"), 0.0), (float("nan"), 0.0)]
+ CASES += [
+     Case("fpu_fprem1_status", "fprem1 clears C2 and reports the quotient's low bits",
+          _UNORDERED_FIRST + ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fprem1",
+@@ -647,16 +649,20 @@
+          _UNORDERED_FIRST + ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fprem",
+                              "fnstsw ax", "sahf", "setp cl", "fstp st(1)",
+                              "and eax, 04700h", "or al, cl"], _FPREM, "fpu"),
+-    Case("fpu_fsin_c2", "fsin clears C2 in range; out of range st0 stays and C2 is set",
++    Case("fpu_trig_out_of_range", "fsin beyond 2^63: the x87 leaves st0 and sets C2, the lift computes it",
++         _UNORDERED_FIRST + ["fld qword ptr [eax]", "fsin", "fnstsw ax", "sahf",
++                             "setp cl", "and eax, 0400h", "or al, cl"],
++         [(1e19, 0.0), (-1e300, 0.0)], "fpu", tol=1e-15),
++    Case("fpu_fsin_c2", "fsin clears C2",
+          _UNORDERED_FIRST + ["fld qword ptr [eax]", "fsin", "fnstsw ax", "sahf",
+                              "setp cl", "and eax, 0400h", "or al, cl"], _TRIG, "fpu", tol=1e-15),
+-    Case("fpu_fcos_c2", "fcos reports its range in C2 the same way",
++    Case("fpu_fcos_c2", "fcos clears C2",
+          _UNORDERED_FIRST + ["fld qword ptr [eax]", "fcos", "fnstsw ax", "sahf",
+                              "setp cl", "and eax, 0400h", "or al, cl"], _TRIG, "fpu", tol=1e-15),
+-    Case("fpu_fptan_c2", "fptan pushes 1.0 only in range, and says which in C2",
++    Case("fpu_fptan_c2", "fptan pushes 1.0 (a NaN for a NaN or an infinity) and clears C2",
+          _UNORDERED_FIRST + ["fld qword ptr [eax]", "fptan", "fnstsw ax", "sahf",
+                              "setp cl", "and eax, 0400h", "or al, cl"], _TRIG, "fpu", tol=1e-15),
+-    Case("fpu_fsincos_c2", "fsincos pushes the cosine only in range",
++    Case("fpu_fsincos_c2", "fsincos pushes the cosine and clears C2",
+          _UNORDERED_FIRST + ["fld qword ptr [eax]", "fsincos", "fnstsw ax", "sahf",
+                              "setp cl", "and eax, 0400h", "or al, cl"], _TRIG, "fpu", tol=1e-15),
+     Case("fpu_fxam_sahf", "fxam's class bits reach CF, PF and ZF through sahf",
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -3894,30 +3894,32 @@
+         # real x87 are not reproduced -- fp_stack is double -- which is the same
+         # approximation every other op here already makes.
+         #
+-        # fsin, fcos, fsincos and fptan take |st0| < 2^63 only: then they clear
+-        # C2; beyond it they leave st0 alone and set C2, and the caller reduces
+-        # the argument (fprem against 2pi) and tries again. C2 was never
+-        # written, so a caller testing it read the last compare's. NaN and the
+-        # infinities go through libm (a NaN, as the hardware's masked invalid
+-        # gives) with C2 clear.
+-        trig_ok = "(fabs(_a) < 0x1p63 || !(fabs(_a) <= 0x1.fffffffffffffp1023))"
++        # The hardware takes |st0| < 2^63 only: then it clears C2; beyond, it
++        # leaves st0 alone (and pushes nothing), sets C2, and the caller reduces
++        # the argument (fprem against 2pi) and tries again. libm reduces any
++        # argument exactly, so every argument is computed here, the stack moves
++        # as for one in range and C2 is cleared: a caller that tests C2 goes on
++        # with the right value. Branching on the range made the push of fptan
++        # and fsincos conditional, and a function whose stack depth is not
++        # static loses the x87 locals (--x87-locals): three of Halo's grew by
++        # half. A NaN or infinite argument gives a NaN, as the hardware's masked
++        # invalid does.
+         if m in ("fsin", "fcos"):
+-            return [f"{{ double _a = fp_top(); if ({trig_ok}) {{ fp_top() = {m[1:]}(_a);"
+-                    f" g_fp_cc &= (uint16_t)~0x0400u; }} else g_fp_cc |= 0x0400u; }} /* {m} */"]
++            return [f"fp_top() = {m[1:]}(fp_top()); g_fp_cc &= (uint16_t)~0x0400u; /* {m} */"]
+         if m == "fsincos":
+             # Replaces st0 with sin, then pushes cos. Order matters: the push
+             # must see the sine already stored.
+-            return [f"{{ double _a = fp_top(); if ({trig_ok}) {{ fp_top() = sin(_a);"
+-                    f" fp_push(cos(_a)); g_fp_cc &= (uint16_t)~0x0400u; }}"
+-                    f" else g_fp_cc |= 0x0400u; }} /* fsincos */"]
++            return [f"{{ double _a = fp_top(); fp_top() = sin(_a); fp_push(cos(_a));"
++                    f" g_fp_cc &= (uint16_t)~0x0400u; }} /* fsincos */"]
+         if m == "fptan":
+             # st0 = tan(st0), then push 1.0. The constant push is not decoration:
+             # callers use it as the denominator of a subsequent fdiv. A NaN or
+-            # infinite argument pushes the NaN instead, as the hardware does.
+-            return [f"{{ double _a = fp_top(); if ({trig_ok}) {{ double _t = tan(_a);"
+-                    f" fp_top() = _t; fp_push(_t == _t ? 1.0 : _t);"
+-                    f" g_fp_cc &= (uint16_t)~0x0400u; }}"
+-                    f" else g_fp_cc |= 0x0400u; }} /* fptan */"]
++            # infinite argument pushes a NaN instead, as the hardware does:
++            # 1.0 + (t - t) is 1.0 for every finite t and NaN otherwise. (Not a
++            # ?: -- the x87 locals pass takes a conditional on a line that
++            # pushes for a push that may not happen, and gives the function up.)
++            return [f"{{ double _t = tan(fp_top()); fp_top() = _t; fp_push(1.0 + (_t - _t));"
++                    f" g_fp_cc &= (uint16_t)~0x0400u; }} /* fptan */"]
+         if m == "fpatan":
+             # st1 = atan2(st1, st0), pop. Argument order is st1 over st0.
+             return [f"{{ fp_st1() = atan2(fp_st1(), fp_top()); fp_pop(); }}"
+diff --git a/tools/recomp/test_lifter_fpu_reverse.py b/tools/recomp/test_lifter_fpu_reverse.py
+--- a/tools/recomp/test_lifter_fpu_reverse.py
++++ b/tools/recomp/test_lifter_fpu_reverse.py
+@@ -65,8 +65,8 @@
+     def test_transcendentals_emit_statements_rather_than_comments(self):
+         for mnemonic, expected in (
+             ("fpatan", "atan2(fp_st1(), fp_top())"),
+-            ("fsin", "fp_top() = sin(_a)"),
+-            ("fcos", "fp_top() = cos(_a)"),
++            ("fsin", "fp_top() = sin(fp_top())"),
++            ("fcos", "fp_top() = cos(fp_top())"),
+             ("frndint", "recomp_frndint(fp_top(), g_fp_control_word)"),
+             ("fyl2x", "log2(fp_top())"),
+         ):
+@@ -78,7 +78,7 @@
+     def test_fptan_pushes_the_implicit_one(self):
+         """FPTAN leaves tan(x) and then 1.0 on the stack (the NaN, for a NaN or
+         an infinity)."""
+-        self.assertIn("fp_push(_t == _t ? 1.0 : _t);", _lift("fptan", "", [])[0])
++        self.assertIn("fp_push(1.0 + (_t - _t));", _lift("fptan", "", [])[0])
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tools/recomp/test_x87_status.py b/tools/recomp/test_x87_status.py
+--- a/tools/recomp/test_x87_status.py
++++ b/tools/recomp/test_x87_status.py
+@@ -50,11 +50,23 @@
+             lifted = " ".join(Lifter().lift_instruction(Instruction(0x00011000, 2, m, "", "d9f8")))
+             self.assertIn(f"g_fp_cc = recomp_fprem_cc(fp_top(), fp_st1(), {near});", lifted)
+ 
+-    def test_the_transcendentals_report_their_range_in_c2(self):
++    def test_the_transcendentals_clear_c2_and_keep_a_static_depth(self):
+         for m in ("fsin", "fcos", "fsincos", "fptan"):
+             lifted = " ".join(Lifter().lift_instruction(Instruction(0x00011000, 2, m, "", "d9fe")))
+             self.assertIn("g_fp_cc &= (uint16_t)~0x0400u;", lifted, m)
+-            self.assertIn("g_fp_cc |= 0x0400u;", lifted, m)
++            self.assertNotIn("if (", lifted, m)  # no push or pop that may not happen
++
++    def test_the_x87_locals_pass_takes_them(self):
++        from .translator import FP_STACK_MACROS, FP_STACK_UNDEFS
++        from .x87_locals import localise_x87
++        for m in ("fsin", "fcos", "fsincos", "fptan"):
++            lifted = Lifter().lift_instruction(Instruction(0x00011000, 2, m, "", "d9fe"))
++            lines = (["void sub_00011000(void)", "{"] + FP_STACK_MACROS
++                     + ["    fp_push(MEMD(eax + 8));"] + ["    " + l for l in lifted]
++                     + ["    MEMD_SET(eax, fp_top()); fp_pop();", "    esp += 4; return;"]
++                     + FP_STACK_UNDEFS + ["}"])
++            _, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS, x87=True)
++            self.assertIsNone(why, m)
+ 
+ 
+ if __name__ == "__main__":
+-- 
+2.43.0
+

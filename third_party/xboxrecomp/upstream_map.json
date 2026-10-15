@@ -286,7 +286,7 @@
     "xbox_recomp_conformance",
     "xbox_recomp_e2e"
    ],
-   "notes": "patches 0001 (shift mask), 0002 (cvt helper), 0003 (MEMF_SET), 0004 (reserved names), 0005 (fld/fstp m80), 0007 (setp/setnp), 0009 (in/out), 0010 (a body holds code outside its range: body_addrs, absorbed switch tables), 0012 (direct targets with no function go through RECOMP_ITAIL), 0015 (sahf reads AH; fprem and the transcendentals write C2)"
+   "notes": "patches 0001 (shift mask), 0002 (cvt helper), 0003 (MEMF_SET), 0004 (reserved names), 0005 (fld/fstp m80), 0007 (setp/setnp), 0009 (in/out), 0010 (a body holds code outside its range: body_addrs, absorbed switch tables), 0012 (direct targets with no function go through RECOMP_ITAIL), 0015 (sahf reads AH; fprem and the transcendentals write C2), 0016 (the transcendentals keep a static stack depth), 0017 (integer widths and flags of mul, div, sub, add, neg, shifts; cwd), 0018 (stmxcsr, ldmxcsr, fcmovcc)"
   },
   {
    "upstream": "tools/recomp/translator.py",
@@ -299,7 +299,7 @@
     "xbox_recomp_conformance",
     "xbox_recomp_e2e"
    ],
-   "notes": "patches 0006 (--runtime-header), 0008 (RECOMP_BACKEDGE before backward jumps), 0010 (the code a jump reaches outside its function is lifted into it; test_interior_targets.py), 0011 (discover_interior_entries: a called interior address gets a function), 0012 (lifter.entry_starts; stubs dispatch by address), 0013 (--x87-locals: translate_function hands each function that uses the x87 to x87_locals.py, which the patch adds with test_x87_locals.py), 0014 (--reg-locals: the integer registers in locals too, every function; test_reg_locals.py), 0015 (a function with a sahf declares _sahf). Upstream changes to decode_function, translate_function, the discover_* passes or the stub writer need these rebased; tests/xbox_recomp/e2e.py (prog_interior.S) runs the shapes against the x86"
+   "notes": "patches 0006 (--runtime-header), 0008 (RECOMP_BACKEDGE before backward jumps), 0010 (the code a jump reaches outside its function is lifted into it; test_interior_targets.py), 0011 (discover_interior_entries: a called interior address gets a function), 0012 (lifter.entry_starts; stubs dispatch by address), 0013 (--x87-locals: translate_function hands each function that uses the x87 to x87_locals.py, which the patch adds with test_x87_locals.py), 0014 (--reg-locals: the integer registers in locals too, every function; test_reg_locals.py), 0015 (a function with a sahf declares _sahf), 0017 (and one with mul or imul the flag snapshot). Upstream changes to decode_function, translate_function, the discover_* passes or the stub writer need these rebased; tests/xbox_recomp/e2e.py (prog_interior.S) runs the shapes against the x86"
   },
   {
    "upstream": "tools/recomp/__main__.py",
@@ -351,7 +351,7 @@
    "wl_tests": [
     "xbox_recomp_conformance"
    ],
-   "notes": "patches 0001, 0002, 0005, 0007 and 0015 add cases; tests/xbox_recomp/conformance.py replays every case on ppc-be"
+   "notes": "patches 0001, 0002, 0005, 0007, 0015-0018 and 0020 add cases; tests/xbox_recomp/conformance.py replays every case on ppc-be"
   },
   {
    "upstream": "tools/conformance/harness.py",
@@ -434,14 +434,16 @@
   },
   {
    "upstream": "tools/disasm/**",
-   "kind": "vendored",
+   "kind": "patched",
    "wl": [
-    "tools/xbox_recomp.py"
+    "tools/xbox_recomp.py",
+    "third_party/xboxrecomp/patches/"
    ],
    "wl_tests": [
     "xboxrecomp_pytest",
     "xbox_recomp_synthetic_title"
-   ]
+   ],
+   "notes": "patch 0019 (a gap-bounded probe for long bodies named by an immediate or a data table; BINKDATA is data). Upstream changes to the discovery passes or the probes need it rebased"
   },
   {
    "upstream": "tools/func_id/**",
