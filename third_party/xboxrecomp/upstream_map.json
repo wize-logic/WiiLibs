@@ -351,7 +351,7 @@
    "wl_tests": [
     "xbox_recomp_conformance"
    ],
-   "notes": "patches 0001, 0002, 0005, 0007 and 0015-0018 add cases; tests/xbox_recomp/conformance.py replays every case on ppc-be"
+   "notes": "patches 0001, 0002, 0005, 0007, 0015-0018 and 0020 add cases; tests/xbox_recomp/conformance.py replays every case on ppc-be"
   },
   {
    "upstream": "tools/conformance/harness.py",
@@ -434,14 +434,16 @@
   },
   {
    "upstream": "tools/disasm/**",
-   "kind": "vendored",
+   "kind": "patched",
    "wl": [
-    "tools/xbox_recomp.py"
+    "tools/xbox_recomp.py",
+    "third_party/xboxrecomp/patches/"
    ],
    "wl_tests": [
     "xboxrecomp_pytest",
     "xbox_recomp_synthetic_title"
-   ]
+   ],
+   "notes": "patch 0019 (a gap-bounded probe for long bodies named by an immediate or a data table; BINKDATA is data). Upstream changes to the discovery passes or the probes need it rebased"
   },
   {
    "upstream": "tools/func_id/**",

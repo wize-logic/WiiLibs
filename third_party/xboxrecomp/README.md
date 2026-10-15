@@ -70,6 +70,8 @@ template header, and add conformance cases; upstream's own tests pass with them 
 | `0016-x87-trig-depth.patch` | `fsin`/`fcos`/`fsincos`/`fptan` compute every argument with libm and clear C2 (0015's range test made the push of `fptan`/`fsincos` conditional, and a function whose stack depth is not static loses the x87 locals: three of Halo's grew by half) |
 | `0017-integer-width-flags.patch` | one-operand `mul`/`imul`/`div`/`idiv` at the operand's width (AX, DX:AX), the divisor read once, a 32-bit path for `xor edx, edx; div` and `cdq; idiv`; `mul`/`imul` publish CF = OF (`seto`/`setno` fused); two- and three-operand `imul` multiply unsigned (no signed overflow in C); the signed conditions after a narrow `sub` at its width and after `add`/`neg` with OF; a shift by zero leaves the flags; `cwd` |
 | `0018-mxcsr-fcmov.patch` | `stmxcsr` stores the default MXCSR and `ldmxcsr` is a no-op (rounding and flush-to-zero are not modelled); `fcmovcc` fused with its flag setter, an unfused one reported |
+| `0019-discovery-gaps.patch` | an address taken as an immediate or found in a data table, in a gap no function covers, gets the gap as its probe budget (a long body: Bink's bitstream callback and its 89 blitters in Halo); `BINKDATA` is a data section (its tables are scanned, its bytes not disassembled) |
+| `0020-mmx-cases.patch` | conformance cases for every MMX operation in Bink's decoder, the whole 64-bit result compared |
 
 To change one: `tools/xboxrecomp_sync.py patch-repo DIR` makes a git repository of the pristine copy
 with each patch as a commit; edit there (amend, rebase), then `tools/xboxrecomp_sync.py

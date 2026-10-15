@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Wed, 14 Oct 2026 22:00:00 -0400
+Subject: [PATCH] disasm: a gap-bounded probe for long bodies; BINKDATA is data
+
+Two gaps left Bink's code untranslated in Halo (retail).
+
+- An address taken as an immediate must reach a ret within 64
+  instructions (probes_as_returning_body), and an address in a data table
+  must reach a terminator within 64 (probes_as_function_body). Bink's
+  bitstream callback (0x1BCF20, referenced only by
+  `mov [ebp-0x8c], 0x1bcf20`) has its first ret about 317 instructions
+  in; its blitters run 150 and more. When the address lies in a gap no
+  function covers, both passes now give the probe the gap as its budget
+  (_probes_in_gap, up to 2048 instructions): a ret before the next
+  function's start, forward jumps inside the gap, and nothing that data
+  decodes to (bound, arpl, in/out, ...) on the way.
+- BINKDATA is marked executable but holds Bink's tables. Analysed as
+  code, its pointers were never scanned (_pass_data_ptr_targets reads
+  data sections only) and the blitters reached through them were never
+  found; disassembled, its bytes became four garbage functions. It joins
+  DATA_SECTION_NAMES (loader.py and config.py).
+
+On Halo without seeds: 155 more functions, among them the callback and
+all 89 Bink blitters that had to be seeded by hand, and 54 others the
+title had seeded from runtime feedback; four garbage functions in
+BINKDATA are gone.
+
+Tests: test_gap_probe.py.
+---
+diff --git a/tools/disasm/config.py b/tools/disasm/config.py
+--- a/tools/disasm/config.py
++++ b/tools/disasm/config.py
+@@ -60,6 +60,7 @@
+ # executable flag (matches tools/disasm/loader.py's DATA_SECTION_NAMES).
+ _DATA_SECTION_NAMES = frozenset({
+     ".data", ".data1", ".rdata", ".idata", ".edata", ".reloc", ".tls",
++    "BINKDATA",
+ })
+ 
+ _configured_from = None
+diff --git a/tools/disasm/engine.py b/tools/disasm/engine.py
+--- a/tools/disasm/engine.py
++++ b/tools/disasm/engine.py
+@@ -446,8 +446,16 @@
+                 return ops[0].imm & 0xFFFFFFFF
+         return None
+ 
++    # Instructions an extended probe (limit_va) refuses: what data decodes to,
++    # and nothing a compiler emits in a function body.
++    _DATA_SMELL = frozenset({"bound", "arpl", "hlt", "in", "out", "insb", "insw", "insd",
++                             "outsb", "outsw", "outsd", "les", "lds", "into", "aaa", "aas",
++                             "daa", "das", "aam", "aad", "salc", "lcall", "ljmp", "iretd",
++                             "sti", "cli", "int1", "icebp", "wait"})
++
+     def probes_as_returning_body(self, addr: int,
+-                                 max_insns: int = 64) -> bool:
++                                 max_insns: int = 64,
++                                 limit_va: Optional[int] = None) -> bool:
+         """
+         Stricter sibling of probes_as_function_body: does the stream at `addr`
+         reach a `ret` without first hitting an unconditional `jmp`?
+@@ -460,6 +468,12 @@
+         covers with better evidence. Conditional branches are fine: a real
+         function has them. So is a switch dispatch through a table that
+         resync_jump_tables has measured: the probe continues in its arms.
++
++        limit_va bounds the probe to [addr, limit_va): the ret must come
++        before it, a forward jmp must stay inside it, and an instruction data
++        decodes to (bound, arpl, in/out, ...) ends it. _pass_imm_ref_targets
++        uses it with a budget the size of the unclaimed gap the address opens,
++        for a long function whose first ret is past the default 64.
+         """
+         section = self.image.get_section_at_va(addr)
+         if section is None or not section.executable:
+@@ -475,7 +489,12 @@
+         # exactly that dispatch was otherwise refused, and the switch tables
+         # it owns were translated nowhere.
+         while resume is not None and count < max_insns:
+-            data = self.image.read_bytes_at_va(resume, (max_insns - count) * 8)
++            size = (max_insns - count) * 8
++            if limit_va is not None:
++                if resume >= limit_va:
++                    return False
++                size = min(size, limit_va - resume)
++            data = self.image.read_bytes_at_va(resume, size)
+             if not data:
+                 return False
+             limit = resume + len(data)
+@@ -484,6 +503,9 @@
+             for decoded in self._cs.disasm(data, start):
+                 count += 1
+                 mnemonic = decoded.mnemonic.lower()
++                if limit_va is not None and (mnemonic in self._DATA_SMELL
++                                             or decoded.address + decoded.size > limit_va):
++                    return False
+                 if mnemonic in config.RET_MNEMONICS:
+                     return True
+                 if mnemonic in config.JMP_MNEMONICS:
+diff --git a/tools/disasm/functions.py b/tools/disasm/functions.py
+--- a/tools/disasm/functions.py
++++ b/tools/disasm/functions.py
+@@ -574,7 +574,8 @@
+             # address and passed around as values, so an immediate is exactly
+             # how they show up.
+             if not (self.engine.probes_as_returning_body(target)
+-                    or self.engine.probes_as_vcall_thunk(target)):
++                    or self.engine.probes_as_vcall_thunk(target)
++                    or self._probes_in_gap(target, starts, code_ranges)):
+                 continue
+             if target not in self.engine.instructions:
+                 if not self.engine.decode_at(target):
+@@ -586,6 +587,29 @@
+         if found:
+             print(f"  {found} function address(es) taken as an immediate")
+         return found > 0
++
++    # The largest unclaimed gap _probes_in_gap measures, in instructions.
++    GAP_PROBE_MAX_INSNS = 2048
++
++    def _probes_in_gap(self, target: int, starts, code_ranges) -> bool:
++        """A long function taken only as an immediate: its first ret may come
++        hundreds of instructions in, past probes_as_returning_body's default
++        budget of 64. When the address lies in a gap no function covers, the
++        probe gets the gap as its budget instead -- a ret before the next
++        function's start, forward jumps inside the gap, nothing data decodes
++        to on the way. Halo's Bink bitstream callback (0x1BCF20, 677 bytes,
++        its first ret about 317 instructions in) is referenced only by
++        `mov [ebp-0x8c], 0x1bcf20` and was otherwise never translated.
++        """
++        i = bisect.bisect_right(starts, target)
++        sec_end = next((hi for lo, hi in code_ranges if lo <= target < hi), None)
++        if sec_end is None:
++            return False
++        gap_end = min(starts[i], sec_end) if i < len(starts) else sec_end
++        if gap_end - target <= 64:
++            return False  # the default probe already covered it
++        return self.engine.probes_as_returning_body(
++            target, max_insns=min(gap_end - target, self.GAP_PROBE_MAX_INSNS), limit_va=gap_end)
+ 
+     def _pass_tail_jump_targets(self, sections: List[SectionInfo]) -> bool:
+         """
+@@ -763,8 +787,11 @@
+                 first = self.engine.instructions[target]
+                 if first.mnemonic.lower() in ("int3", "nop"):
+                     continue
+-                if not self.engine.probes_as_function_body(target,
+-                                                           max_insns=64):
++                # ...or, for a long body, reaches a ret inside its gap (Bink's
++                # blitters, reached only through BINKDATA's tables, run 150
++                # instructions and more before theirs).
++                if not (self.engine.probes_as_function_body(target, max_insns=64)
++                        or self._probes_in_gap(target, starts, code_ranges)):
+                     continue
+                 i = bisect.bisect_right(starts, target)
+                 sec = self.image.get_section_at_va(target)
+diff --git a/tools/disasm/loader.py b/tools/disasm/loader.py
+--- a/tools/disasm/loader.py
++++ b/tools/disasm/loader.py
+@@ -14,12 +14,16 @@
+ # Sections that hold data even when the XBE marks them executable. Excluded
+ # from disassembly by name; --extra-sections overrides this per title.
+ #
+-# Only the conventional PE data sections are listed. XDK library sections are
++# The conventional PE data sections, and BINKDATA. XDK library sections are
+ # NOT excluded even when their name suggests data (DSOUND_RD, D3D_RD, XON_RD):
+ # the linker maps class those as CODE, and they are exactly the sections we
+-# want disassembled.
++# want disassembled. BINKDATA (RAD's Bink, linked into many titles) is marked
++# executable but holds Bink's tables: analysed as code, its pointers were
++# never scanned (_pass_data_ptr_targets reads data sections only), and the
++# blitters reached only through them -- 89 in Halo -- were never translated.
+ DATA_SECTION_NAMES = frozenset({
+     ".data", ".data1", ".rdata", ".idata", ".edata", ".reloc", ".tls",
++    "BINKDATA",
+ })
+ 
+ 
+diff --git a/tools/disasm/test_gap_probe.py b/tools/disasm/test_gap_probe.py
+new file mode 100644
+--- /dev/null
++++ b/tools/disasm/test_gap_probe.py
+@@ -0,0 +1,43 @@
++"""An immediate naming a long function in an unclaimed gap: the probe's budget is the gap."""
++import struct
++from tools.disasm.test_decode_at import _engine, BASE
++from tools.disasm.functions import FunctionDetector
++from tools.disasm.loader import DATA_SECTION_NAMES
++
++
++def detector(body, gap_end_pad):
++    # mov eax, <target>; ret; padding; then the long body at target, then more padding
++    target = BASE + 16
++    head = b"\xb8" + struct.pack("<I", target) + b"\xc3"
++    data = head + b"\xcc" * (16 - len(head)) + body + b"\xcc" * gap_end_pad
++    engine, section = _engine(BASE, data)
++    engine.image.read_bytes_at_va = lambda addr, size: data[addr - BASE:addr - BASE + size]
++    for insn in engine._cs.disasm(head, BASE):
++        engine.instructions[insn.address] = engine._classify_instruction(insn)
++    det = FunctionDetector(engine, engine.image, None, None)
++    return det, section, target
++
++
++LONG = b"\x83\xec\x2c" + b"\x53" + b"\x89\xc1" * 150 + b"\x5b\x83\xc4\x2c\xc3"  # 155 insns, then ret
++
++
++def test_long_body_in_a_gap_is_found():
++    det, sec, target = detector(LONG, 32)
++    assert not det.engine.probes_as_returning_body(target)
++    det._pass_imm_ref_targets([sec])
++    assert target in det._candidates
++
++
++def test_a_ret_past_the_gap_does_not_count():
++    det, sec, target = detector(LONG, 32)
++    assert not det.engine.probes_as_returning_body(target, max_insns=2048, limit_va=target + 100)
++
++
++def test_data_smell_ends_the_extended_probe():
++    body = b"\x83\xec\x2c" + b"\x89\xc1" * 80 + b"\x62\x00" + b"\xc3"  # bound in the middle
++    det, sec, target = detector(body, 32)
++    assert not det.engine.probes_as_returning_body(target, max_insns=2048, limit_va=target + len(body))
++
++
++def test_binkdata_is_a_data_section():
++    assert "BINKDATA" in DATA_SECTION_NAMES
+-- 
+2.43.0
+
