@@ -467,7 +467,7 @@ TEST each_awakening_notify_stops_the_channel_until_acknowledged(void) {
     t_mmio(&g, WL_NV2A_PGRAPH_INTR, WL_NV2A_PGRAPH_INTR_NOTIFY);
     ASSERT_EQ(9u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
     ASSERT_EQ(g.put, t_get(&g));
-    // (with the interrupt off a NOTIFY does not stop the channel)
+    // (with PGRAPH's NOTIFY interrupt off a NOTIFY does not stop the channel)
     t_mmio(&g, WL_NV2A_PGRAPH_INTR_EN, 0);
     t_m1(&g, WL_NV2A_K_NOTIFY, 1);
     t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 11);
@@ -606,6 +606,18 @@ TEST the_ptimer_alarm_rises_when_the_time_passes_it(void) {
     g_time_ns = 6000;
     ASSERT_EQ(6000u & ~0x1Fu, wl_nv2a_mmio_read(dev, WL_NV2A_PTIMER_TIME_0, 4));
     ASSERT_EQ((uint32_t)WL_NV2A_PTIMER_INTR_ALARM, wl_nv2a_mmio_read(dev, WL_NV2A_PTIMER_INTR_0, 4));
+    // a jump of more than 2^31 ns past the alarm (a long pause) raises it too
+    wl_nv2a_mmio_write(dev, WL_NV2A_PTIMER_INTR_0, WL_NV2A_PTIMER_INTR_ALARM, 4);
+    wl_nv2a_mmio_write(dev, WL_NV2A_PTIMER_ALARM_0, 7000, 4);
+    g_time_ns = 6000u + 3000000000u;
+    (void)wl_nv2a_mmio_read(dev, WL_NV2A_PTIMER_TIME_0, 4);
+    ASSERT_EQ((uint32_t)WL_NV2A_PTIMER_INTR_ALARM, wl_nv2a_mmio_read(dev, WL_NV2A_PTIMER_INTR_0, 4));
+    // and one past a whole wrap of the low word
+    wl_nv2a_mmio_write(dev, WL_NV2A_PTIMER_INTR_0, WL_NV2A_PTIMER_INTR_ALARM, 4);
+    wl_nv2a_mmio_write(dev, WL_NV2A_PTIMER_ALARM_0, (uint32_t)g_time_ns + 10u, 4);
+    g_time_ns += ((uint64_t)1 << 32) + 5u;
+    (void)wl_nv2a_mmio_read(dev, WL_NV2A_PTIMER_TIME_0, 4);
+    ASSERT_EQ((uint32_t)WL_NV2A_PTIMER_INTR_ALARM, wl_nv2a_mmio_read(dev, WL_NV2A_PTIMER_INTR_0, 4));
     wl_nv2a_destroy(dev);
     free(g.ram);
     PASS();
@@ -647,6 +659,86 @@ TEST a_trap_waits_for_pgraph_fifo(void) {
     t_mmio(&g, WL_NV2A_PGRAPH_FIFO, 1);
     ASSERT_EQ(g.put, t_get(&g));
     ASSERT_EQ(66u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    t_destroy(&g);
+    PASS();
+}
+
+// D3D's PGRAPH_FIFO write runs the channel while its ISR still has the GPU's interrupts off: an
+// awakening NOTIFY stops it there all the same (PGRAPH_INTR_EN is what counts, as at a trap), so two
+// of them are still two interrupts
+TEST an_awakening_notify_stops_the_channel_with_the_interrupts_off(void) {
+    TGuest g;
+    const WlNv2aKelvin *k;
+    WlNv2aStats s;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    k = wl_nv2a_kelvin(g.dev);
+    t_mmio(&g, WL_NV2A_PMC_INTR_EN_0, 0);
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR_EN, WL_NV2A_PGRAPH_INTR_NOTIFY);
+    t_m1(&g, WL_NV2A_K_NOTIFY, 1);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 7);
+    t_m1(&g, WL_NV2A_K_NOTIFY, 1);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 9);
+    t_kick(&g);
+    wl_nv2a_stats(g.dev, &s);
+    ASSERT_EQ(1u, s.notifies);
+    ASSERT_FALSE(wl_nv2a_irq_pending(g.dev));
+    ASSERT(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF) != 7u);
+    t_mmio(&g, WL_NV2A_PMC_INTR_EN_0, WL_NV2A_PMC_INTR_EN_HARDWARE);
+    ASSERT(wl_nv2a_irq_pending(g.dev));
+    t_mmio(&g, WL_NV2A_PGRAPH_FIFO, 0);
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR, WL_NV2A_PGRAPH_INTR_NOTIFY);
+    t_mmio(&g, WL_NV2A_PGRAPH_FIFO, 1);
+    ASSERT_EQ(7u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    wl_nv2a_stats(g.dev, &s);
+    ASSERT_EQ(2u, s.notifies);
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR, WL_NV2A_PGRAPH_INTR_NOTIFY);
+    ASSERT_EQ(9u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    ASSERT_EQ(g.put, t_get(&g));
+    t_destroy(&g);
+    PASS();
+}
+
+// with PGRAPH's FIFO access off, a doorbell runs nothing; the methods run once it is on again
+TEST nothing_runs_while_pgraph_fifo_access_is_off(void) {
+    TGuest g;
+    const WlNv2aKelvin *k;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    k = wl_nv2a_kelvin(g.dev);
+    t_mmio(&g, WL_NV2A_PGRAPH_FIFO, 0);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 21);
+    t_kick(&g);
+    ASSERT(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF) != 21u);
+    ASSERT(t_get(&g) != g.put);
+    wl_nv2a_vblank(g.dev);
+    ASSERT(t_get(&g) != g.put);
+    t_mmio(&g, WL_NV2A_PGRAPH_FIFO, 1);
+    ASSERT_EQ(21u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    ASSERT_EQ(g.put, t_get(&g));
+    t_destroy(&g);
+    PASS();
+}
+
+// a method run outside a kick (wl_nv2a_method) leaves no stall for the channel's next kick: an
+// acquire not met and a trap stop no pusher there
+TEST a_method_outside_a_kick_leaves_no_stall(void) {
+    TGuest g;
+    const WlNv2aKelvin *k;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    k = wl_nv2a_kelvin(g.dev);
+    wl_nv2a_method(g.dev, 0, WL_NV2A_PULLER_SEMAPHORE_ACQUIRE, 0x12345678u);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 31);
+    t_kick(&g);
+    ASSERT_EQ(31u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    ASSERT_EQ(g.put, t_get(&g));
+    wl_nv2a_method(g.dev, 0, WL_NV2A_K_NO_OPERATION, 0x304);
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR, WL_NV2A_PGRAPH_INTR_ERROR);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 32);
+    t_kick(&g);
+    ASSERT_EQ(32u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    ASSERT_EQ(g.put, t_get(&g));
     t_destroy(&g);
     PASS();
 }
@@ -765,6 +857,9 @@ SUITE(nv2a_suite) {
     RUN_TEST(a_pusher_error_stops_the_channel);
     RUN_TEST(the_ptimer_alarm_rises_when_the_time_passes_it);
     RUN_TEST(a_trap_waits_for_pgraph_fifo);
+    RUN_TEST(an_awakening_notify_stops_the_channel_with_the_interrupts_off);
+    RUN_TEST(nothing_runs_while_pgraph_fifo_access_is_off);
+    RUN_TEST(a_method_outside_a_kick_leaves_no_stall);
     RUN_TEST(capture_replays_to_the_same_draws);
 }
 
