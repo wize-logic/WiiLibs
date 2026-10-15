@@ -8,6 +8,8 @@
 
 #include "wl/xbox/nv2a_pipeline.h"
 
+#include <stddef.h>
+
 #include "wl/xbox/nv2a_regs.h"
 
 WlGxCompare wl_nv2a_gx_compare(uint32_t func) {
@@ -16,9 +18,47 @@ WlGxCompare wl_nv2a_gx_compare(uint32_t func) {
                : WL_GX_ALWAYS;
 }
 
+// a constant factor (SET_BLEND_COLOR's ARGB, NULL unknown), which GX's blender has not: ONE or ZERO,
+// exact where the constant is 1 or 0 in every channel it gives (Halo's HUD blends by a white
+// constant colour), else the nearer of the two by the channels' mean (unknown: ONE)
+static WlGxBlendFactor constant_factor(uint32_t factor, const uint32_t *color, bool *exact) {
+    bool alpha = factor == WL_NV2A_BLEND_CONSTANT_ALPHA ||
+                 factor == WL_NV2A_BLEND_ONE_MINUS_CONSTANT_ALPHA;
+    bool invert = factor == WL_NV2A_BLEND_ONE_MINUS_CONSTANT_COLOR ||
+                  factor == WL_NV2A_BLEND_ONE_MINUS_CONSTANT_ALPHA;
+    unsigned low, high, sum;
+
+    if (color == NULL) {
+        *exact = false;
+        return WL_GX_BL_ONE;
+    }
+    if (alpha) {
+        low = high = sum = *color >> 24;
+        sum *= 3u;
+    } else {
+        unsigned r = (*color >> 16) & 0xFFu, g = (*color >> 8) & 0xFFu, b = *color & 0xFFu;
+
+        low = r < g ? (r < b ? r : b) : (g < b ? g : b);
+        high = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        sum = r + g + b;
+    }
+    if (invert) {
+        unsigned swap = 255u - low;
+
+        low = 255u - high;
+        high = swap;
+        sum = 765u - sum;
+    }
+    if (!(high == 0u || low == 255u)) {
+        *exact = false;
+    }
+    return sum >= 383u ? WL_GX_BL_ONE : WL_GX_BL_ZERO;
+}
+
 // GX's factor for the NV2A's (GX's colour factors are the other side's, a source's factor of the
 // destination colour, a destination's of the source colour)
-static WlGxBlendFactor gx_blend_factor(uint32_t factor, bool source, bool *exact) {
+static WlGxBlendFactor gx_blend_factor(uint32_t factor, bool source, const uint32_t *color,
+                                       bool *exact) {
     switch (factor) {
     case WL_NV2A_BLEND_ZERO:
         return WL_GX_BL_ZERO;
@@ -59,16 +99,36 @@ static WlGxBlendFactor gx_blend_factor(uint32_t factor, bool source, bool *exact
             return WL_GX_BL_ZERO;
         }
         return WL_GX_BL_INVOTHERCLR;
+    case WL_NV2A_BLEND_CONSTANT_COLOR:
+    case WL_NV2A_BLEND_ONE_MINUS_CONSTANT_COLOR:
+    case WL_NV2A_BLEND_CONSTANT_ALPHA:
+    case WL_NV2A_BLEND_ONE_MINUS_CONSTANT_ALPHA:
+        return constant_factor(factor, color, exact);
     default:
-        // (no constant colour on GX's blender)
         *exact = false;
         return WL_GX_BL_ONE;
     }
 }
 
+static bool blend_of(bool enable, uint32_t equation, uint32_t sfactor, uint32_t dfactor,
+                     const uint32_t *color, WlGxBlendMode *mode, WlGxBlendFactor *source,
+                     WlGxBlendFactor *destination);
+
 bool wl_nv2a_gx_blend_of(bool enable, uint32_t equation, uint32_t sfactor, uint32_t dfactor,
                          WlGxBlendMode *mode, WlGxBlendFactor *source,
                          WlGxBlendFactor *destination) {
+    return blend_of(enable, equation, sfactor, dfactor, NULL, mode, source, destination);
+}
+
+bool wl_nv2a_gx_blend_color_of(bool enable, uint32_t equation, uint32_t sfactor, uint32_t dfactor,
+                               uint32_t color, WlGxBlendMode *mode, WlGxBlendFactor *source,
+                               WlGxBlendFactor *destination) {
+    return blend_of(enable, equation, sfactor, dfactor, &color, mode, source, destination);
+}
+
+static bool blend_of(bool enable, uint32_t equation, uint32_t sfactor, uint32_t dfactor,
+                     const uint32_t *color, WlGxBlendMode *mode, WlGxBlendFactor *source,
+                     WlGxBlendFactor *destination) {
     bool exact = true;
 
     if (!enable) {
@@ -77,14 +137,33 @@ bool wl_nv2a_gx_blend_of(bool enable, uint32_t equation, uint32_t sfactor, uint3
         *destination = WL_GX_BL_ZERO;
         return true;
     }
-    *source = gx_blend_factor(sfactor, true, &exact);
-    *destination = gx_blend_factor(dfactor, false, &exact);
+    *source = gx_blend_factor(sfactor, true, color, &exact);
+    *destination = gx_blend_factor(dfactor, false, color, &exact);
     *mode = WL_GX_BM_BLEND;
     if (equation == WL_NV2A_BLEND_EQ_REVERSE_SUBTRACT ||
         equation == WL_NV2A_BLEND_EQ_REVERSE_SUBTRACT_SIGNED) {
         // (GX subtracts the source from the destination, its factors one)
         *mode = WL_GX_BM_SUBTRACT;
         exact = exact && *source == WL_GX_BL_ONE && *destination == WL_GX_BL_ONE;
+    } else if (equation == WL_NV2A_BLEND_EQ_MIN) {
+        // (min(s, d), the factors not read: s d, which darkens as it does and is it where either is
+        // 0 or 1; the factors' sum would brighten)
+        *source = WL_GX_BL_OTHERCLR;
+        *destination = WL_GX_BL_ZERO;
+        exact = false;
+    } else if (equation == WL_NV2A_BLEND_EQ_MAX) {
+        // (max(s, d): s + d - s d, s (1 - d) + d, as bright as the brighter or more, never over 1)
+        *source = WL_GX_BL_INVOTHERCLR;
+        *destination = WL_GX_BL_ONE;
+        exact = false;
+    } else if (equation == WL_NV2A_BLEND_EQ_SUBTRACT) {
+        // (s f - d g, which GX cannot subtract that way round: s (1 - d), the source darkened where
+        // the destination is bright, s - d where s is 1; of no destination, s f as it is)
+        if (*destination != WL_GX_BL_ZERO) {
+            *source = WL_GX_BL_INVOTHERCLR;
+            *destination = WL_GX_BL_ZERO;
+        }
+        exact = exact && dfactor == WL_NV2A_BLEND_ZERO;
     } else if (equation != WL_NV2A_BLEND_EQ_ADD) {
         exact = false;
     }

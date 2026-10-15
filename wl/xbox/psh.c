@@ -30,8 +30,9 @@
 // GX's inputs are unsigned and clamped: the signed mappings (expand, half bias) come out clamped
 // to [0, 1], and a negation as 0, except in a dot product, whose signed terms TEV's lerp, bias and
 // scale make exactly (the bump mapping it serves: signed dot products). A dot product of a
-// register is taken as 1 (no TEV swap reaches a register's channels); a caller that knows such a
-// program makes it by hand instead (WlXboxPshRecipe).
+// register (no TEV swap reaches a register's channels) is its product with the other value (a
+// constant's channels summed) where only the colour reads it, the colour for its grey, and else
+// taken as 1; a caller that knows such a program makes it by hand instead (WlXboxPshRecipe).
 //
 // A bumped reflection's cube map (DOT_RFLCT_SPEC) is read through GX's indirect unit, two stages
 // before each lookup making its offset from the bump map (bumped_lookups_place), and its normal's
@@ -120,6 +121,10 @@ enum {
     _channel_blue_all,
 };
 
+/* an operation's compare (the alpha half's A8 compares are the colour's R8
+codes, wl/platform/tev.h) */
+enum { _compare_none, _compare_greater, _compare_equal };
+
 #define MAXIMUM_OPERATIONS 48
 
 /* ---------- structures */
@@ -138,6 +143,9 @@ struct operation {
     unsigned char subtract, bias, scale, dest;
     /* (its result kept signed, for a later operation's d) */
     unsigned char unclamped;
+    /* (TEV's compare in place of the lerp: d + (a > b ? c : 0), or a == b:
+    the mux's) */
+    unsigned char compare;
     /* (its place among the combiner stage's operations as queued, both
     portions': queues_flush keeps what the order says of their registers) */
     unsigned char sequence;
@@ -161,6 +169,10 @@ struct translation {
     the colour half; 0 taken as 1; -1 as before they were made, their
     inputs clamped */
     int signed_dots;
+    /* the mux: 2 its compares with 127/255 in a konst of its own (two
+    stages), 1 without (three), for the program's own constants; 0 a blend
+    by r0's alpha, approximated, where the compares do not fit */
+    int mux_mode;
     /* where each name is, for each portion (a colour's may be a register's
     alpha: a value the same in every channel) */
     struct operand names[NUMBER_OF_PORTIONS][NUMBER_OF_NAMES];
@@ -1081,7 +1093,8 @@ but its swap tables put one channel of a texture or rasterized colour in
 all three (swap_tables_set), and its constant selections one channel of
 a constant: three products, summed in a register. Of two constants, the dot
 product is a constant. Neither can be a register (no swap reaches them): the
-product is then taken as 1, and the program marked approximate. */
+product is then the register times the other value where only the colour
+reads it (as_product), else 1, and the program marked approximate. */
 
 /* an operand's value per channel, when it is a constant */
 static bool constant_value(const struct translation *translation, const struct operand *value,
@@ -1165,7 +1178,7 @@ static bool dot_unavailable(struct translation *translation, unsigned long input
 }
 
 static struct operand emit_dot(struct translation *translation, int portion, struct operand x,
-                               struct operand y, int *temporary) {
+                               struct operand y, bool as_product, int *temporary) {
     float a[3], b[3];
     unsigned char negative = (unsigned char)(x.negative ^ y.negative);
     struct operand result;
@@ -1202,6 +1215,33 @@ static struct operand emit_dot(struct translation *translation, int portion, str
     }
     if (!terms)
         return zero;
+    if ((!broadcastable(&x) || !broadcastable(&y)) && as_product && !translation->economical) {
+        /* a register's colour, whose channels no TEV swap reaches, where only
+        the colour reads the result: its product with the other value (a
+        constant's channels summed), the colour where the dot product would
+        be its grey (a luminance), not white */
+        struct operand value = broadcastable(&x) ? y : x, other = broadcastable(&x) ? x : y;
+
+        if (constant_value(translation, &other, a)) {
+            float sum = a[0] + a[1] + a[2];
+            uint32_t level = (uint32_t)((sum > 1.0f ? 1.0f : sum) * 255.0f + 0.5f);
+
+            other = level >= 255 ? one
+                                 : operand(_kind_konst,
+                                           konst_slot(translation, (level << 24) | (level << 16) |
+                                                                       (level << 8) | level),
+                                           _channel_natural);
+        }
+        approximate(translation->program, "a dot product of a register, as its product");
+        reg = register_allocate(translation, portion);
+        if (reg < 0)
+            return one;
+        emit_product(translation, portion, value, other, zero, 0, reg);
+        *temporary = reg;
+        result = operand(_kind_register, (unsigned char)reg, _channel_natural);
+        result.negative = negative;
+        return result;
+    }
     if (!broadcastable(&x) || !broadcastable(&y) ||
         (translation->economical && (terms & (terms - 1)))) {
         approximate(translation->program, translation->economical ? "a dot product, economically"
@@ -1665,7 +1705,8 @@ static struct operand combiner_input(struct translation *translation, unsigned l
             recipe->valid && !recipe->dot ? register_allocate(translation, _portion_alpha) : -1;
 
         if (recipe->valid && recipe->dot) {
-            value = emit_dot(translation, _portion_alpha, recipe->x[0], recipe->y[0], temporary);
+            value = emit_dot(translation, _portion_alpha, recipe->x[0], recipe->y[0], false,
+                             temporary);
             /* (a negated dot product of values not below 0: the colour wrote
             it clamped, 0) */
             if (value.negative) {
@@ -2312,6 +2353,51 @@ static int mux_product_register(int portion,
     return -1;
 }
 
+/* whether the alpha half reads the blue of a dot product's output (its own
+name or the sum's) after its stage */
+static bool dot_blue_read(const struct translation *translation, int stage, unsigned long own,
+                          unsigned long sum) {
+    int index;
+
+    for (index = 0; index < 2; index++) {
+        int name = name_of(index ? sum : own);
+
+        if (name >= 0 && blue_read_later(translation, stage, name))
+            return true;
+    }
+    return false;
+}
+
+/* what the mux chooses when r0's alpha is a constant: 1 CD (its top bit set,
+or with msb false its low bit), 0 AB; -1 when it is not a constant */
+static int mux_constant(const struct translation *translation, bool msb) {
+    struct operand chooser = folded(translation->names[_portion_alpha][_name_r0]);
+    unsigned value;
+
+    switch (chooser.kind) {
+    case _kind_zero:
+        value = 0;
+        break;
+    case _kind_one:
+        value = 255;
+        break;
+    case _kind_half:
+        value = 128;
+        break;
+    case _kind_konst: {
+        uint32_t color = translation->program->tev.konst[chooser.index];
+
+        value = chooser.channel == _channel_blue ? (color >> 8) & 0xFF : color & 0xFF;
+        break;
+    }
+    default:
+        return -1;
+    }
+    if (chooser.invert)
+        value = 255 - value;
+    return msb ? value >= 128 : (int)(value & 1);
+}
+
 static void combiner_portion(struct translation *translation, int stage, int portion) {
     const uint32_t *state = translation->state;
     uint32_t inputs =
@@ -2333,6 +2419,7 @@ static void combiner_portion(struct translation *translation, int stage, int por
     unsigned char folding[4];
     unsigned long ab_name = (outputs >> 4) & 0x0f, cd_name = outputs & 0x0f,
                   sum_name = (outputs >> 8) & 0x0f;
+    bool msb = (state[WL_XBOX_PSH_COMBINER_COUNT] & 0x100) != 0;
     int dest, index;
 
     translation->product_count = 0;
@@ -2453,7 +2540,10 @@ product with 1 */
         dot_unlit[0] = dot_unavailable(translation, inputs >> 16, stage);
         inputs_mapped[0] = dot_unlit[0] ? one
                                         : emit_dot(translation, _portion_color, inputs_mapped[0],
-                                                   inputs_mapped[1], &dot_temporaries[0]);
+                                                   inputs_mapped[1],
+                                                   !dot_blue_read(translation, stage, ab_name,
+                                                                  sum_name),
+                                                   &dot_temporaries[0]);
         inputs_mapped[1] = one;
     }
     if (portion == _portion_color && (flags & 0x01) && !signed_dot[1] && name_of(cd_name) < 0 &&
@@ -2464,7 +2554,10 @@ product with 1 */
         dot_unlit[1] = dot_unavailable(translation, inputs, stage);
         inputs_mapped[2] = dot_unlit[1] ? one
                                         : emit_dot(translation, _portion_color, inputs_mapped[2],
-                                                   inputs_mapped[3], &dot_temporaries[1]);
+                                                   inputs_mapped[3],
+                                                   !dot_blue_read(translation, stage, cd_name,
+                                                                  sum_name),
+                                                   &dot_temporaries[1]);
         inputs_mapped[3] = one;
     }
     if (portion == _portion_color) {
@@ -2594,20 +2687,41 @@ product with 1 */
     /* (the sum may order its products: the inputs as they were after it) */
     memcpy(sum_saved, inputs_mapped, sizeof(sum_saved));
     if (name_of(sum_name) >= 0) {
-        if (flags & 0x04) {
-            /* the mux: r0's alpha chooses, as a blend of the two (each product
-            in a register of its own, unless it is a value as it is; a
-            negative product clamps to 0 there) */
-            struct operand ab, cd;
-            int ab_register = -1, cd_register = -1;
+        if ((flags & 0x04) && mux_constant(translation, msb) >= 0) {
+            /* (the mux by a constant: the product it chooses) */
+            int first = mux_constant(translation, msb) ? 2 : 0;
+
+            for (index = first; index < first + 2; index++) {
+                if (inputs_mapped[index].negative)
+                    approximate(translation->program, "a negative product in a mux");
+            }
+            dest = output_register(translation, portion, sum_name, later, later_count);
+            if (dest >= 0)
+                emit_product(translation, portion, inputs_mapped[first], inputs_mapped[first + 1],
+                             zero, flags, dest);
+        } else if (flags & 0x04) {
+            /* the mux: CD where r0's alpha has its top bit set (1/2 or more,
+            NV2A's MUX_MSB), else AB; with MUX_LSB its low bit, which no TEV
+            stage reads but of a constant (the top bit's, approximated). TEV's
+            compares add their c where they hold: CD where r0's alpha is above
+            127/255, AB where 1/2 is above it (without a konst for 127/255, CD
+            where it equals 1/2 and where it is above, in two). A compare has
+            no bias or scale: the output's mapping is a stage after; a negative
+            product clamps to 0 there */
+            struct operand ab, cd, half = operand(_kind_half, 0, 0);
+            struct operand parts[3][3];
+            unsigned char compares[3];
+            int ab_register = -1, cd_register = -1, sum = -1, part_count = 0, slot;
             struct operand chooser = translation->names[_portion_alpha][_name_r0];
             struct operation operation;
+            bool cd_reads, ab_reads, chooser_reads, ab_first, own_sum = false;
 
             for (index = 0; index < 4; index++) {
                 if (inputs_mapped[index].negative)
                     approximate(translation->program, "a negative product in a mux");
             }
-
+            if (!msb)
+                approximate(translation->program, "a mux by r0's low bit");
             if (portion == _portion_color && chooser.kind >= _kind_register)
                 chooser.channel =
                     chooser.channel == _channel_blue ? _channel_blue_all : _channel_alpha;
@@ -2648,12 +2762,91 @@ product with 1 */
             dest = output_register(translation, portion, sum_name, later, later_count);
             if (dest < 0)
                 return;
-            operation = operation_new(dest);
-            operation.in[0] = ab;
-            operation.in[1] = cd;
-            operation.in[2] = chooser;
-            output_mapping(&operation, flags);
-            emit(translation, portion, &operation);
+            if (!translation->mux_mode) {
+                /* (the last attempts: a blend of the two by r0's alpha, as the
+                translation made it before) */
+                approximate(translation->program, "a mux as a blend");
+                operation = operation_new(dest);
+                operation.in[0] = ab;
+                operation.in[1] = cd;
+                operation.in[2] = chooser;
+                output_mapping(&operation, flags);
+                emit(translation, portion, &operation);
+            } else {
+                /* the compares, each {a, b, c}: the first's d 0, each next's the
+                sum so far, the last's result in dest. The sum goes where the
+                later compares do not read: dest, CD's parts first or AB's; else
+                the register of the first part's product; else a register of its
+                own */
+                slot = translation->mux_mode == 2
+                           ? wl_tev_konst_slot(&translation->program->tev, 0x7F7F7F7Fu)
+                           : -1;
+                chooser_reads = operand_reads(&chooser, portion, dest, portion);
+                cd_reads = operand_reads(&cd, portion, dest, portion);
+                ab_reads = operand_reads(&ab, portion, dest, portion);
+                ab_first = false;
+                if (!chooser_reads && !ab_reads && !(slot < 0 && cd_reads)) {
+                    sum = dest;
+                } else if (!chooser_reads && !cd_reads) {
+                    sum = dest;
+                    ab_first = true;
+                } else if (slot >= 0 && cd_register >= 0) {
+                    sum = cd_register;
+                } else if (ab_register >= 0) {
+                    sum = ab_register;
+                    ab_first = true;
+                } else if ((sum = register_allocate(translation, portion)) >= 0) {
+                    own_sum = true;
+                } else {
+                    fail(translation, "no free register");
+                    return;
+                }
+                if (ab_first) {
+                    parts[part_count][0] = half;
+                    parts[part_count][1] = chooser;
+                    parts[part_count][2] = ab;
+                    compares[part_count++] = _compare_greater;
+                }
+                parts[part_count][0] = chooser;
+                parts[part_count][1] = slot >= 0 ? operand(_kind_konst, (unsigned char)slot,
+                                                           _channel_natural)
+                                                 : half;
+                parts[part_count][2] = cd;
+                compares[part_count++] = _compare_greater;
+                if (slot < 0) {
+                    parts[part_count][0] = chooser;
+                    parts[part_count][1] = half;
+                    parts[part_count][2] = cd;
+                    compares[part_count++] = _compare_equal;
+                }
+                if (!ab_first) {
+                    parts[part_count][0] = half;
+                    parts[part_count][1] = chooser;
+                    parts[part_count][2] = ab;
+                    compares[part_count++] = _compare_greater;
+                }
+                for (index = 0; index < part_count; index++) {
+                    operation = operation_new(index < part_count - 1 ? sum : dest);
+                    operation.compare = compares[index];
+                    operation.in[0] = parts[index][0];
+                    operation.in[1] = parts[index][1];
+                    operation.in[2] = parts[index][2];
+                    operation.in[3] =
+                        index ? operand(_kind_register, (unsigned char)sum, _channel_natural)
+                              : zero;
+                    emit(translation, portion, &operation);
+                }
+                /* (the output's mapping, which a compare has not, after) */
+                if (flags & 0x38) {
+                    operation = operation_new(dest);
+                    operation.in[3] =
+                        operand(_kind_register, (unsigned char)dest, _channel_natural);
+                    output_mapping(&operation, flags);
+                    emit(translation, portion, &operation);
+                }
+                if (own_sum)
+                register_free(translation, portion, sum);
+            }
             register_free(translation, portion, ab_register);
             register_free(translation, portion, cd_register);
         } else {
@@ -2931,7 +3124,13 @@ static void stage_half(WlTevStage *stage, const struct operation *operation, int
     for (index = 0; index < 4; index++)
         in[index] = input_code(&operation->in[index], portion);
     (portion == _portion_color ? wl_tev_stage_color : wl_tev_stage_alpha)(
-        stage, in[0], in[1], in[2], in[3], operation->subtract ? WL_TEV_SUB : WL_TEV_ADD,
+        stage, in[0], in[1], in[2], in[3],
+        operation->compare == _compare_greater
+            ? (portion == _portion_color ? WL_TEV_COMP_R8_GT : WL_TEV_COMP_A8_GT)
+        : operation->compare == _compare_equal
+            ? (portion == _portion_color ? WL_TEV_COMP_R8_EQ : WL_TEV_COMP_A8_EQ)
+        : operation->subtract ? WL_TEV_SUB
+                              : WL_TEV_ADD,
         operation->bias, operation->scale, !operation->unclamped, operation->dest);
 }
 
@@ -3685,7 +3884,7 @@ static void swap_tables_set(WlTevProgram *tev) {
 
 static bool translate_once(const uint32_t *render_state, const WlXboxPshTextures *textures,
                            WlXboxPshProgram *program, bool economical, bool folding, bool preload,
-                           int signed_dots) {
+                           int signed_dots, int mux_mode) {
     static struct translation translation;
     unsigned long combiner_count = render_state[WL_XBOX_PSH_COMBINER_COUNT] & 0xff;
     unsigned long stage;
@@ -3701,6 +3900,7 @@ static bool translate_once(const uint32_t *render_state, const WlXboxPshTextures
     translation.economical = economical;
     translation.folding = folding;
     translation.signed_dots = signed_dots;
+    translation.mux_mode = mux_mode;
     wl_tev_pool_init(&translation.pools[_portion_color]);
     wl_tev_pool_init(&translation.pools[_portion_alpha]);
     names_initialize(&translation);
@@ -3748,6 +3948,174 @@ static bool translate_once(const uint32_t *render_state, const WlXboxPshTextures
     return true;
 }
 
+/* ---------- blue to alpha
+
+A colour output with its blue copied into its register's alpha (the output
+word's AB_BLUE_TO_ALPHA, 0x80, and CD_BLUE_TO_ALPHA, 0x40, of its flags:
+Direct3D's dp3 to rgba, the dot product in the alpha too) is what an alpha
+portion reading that register's blue right after the stage would give. The
+program is written so before it is translated: the copy goes into the next
+stage's alpha portion where that is idle and its colour does not read the
+alpha, else into a stage of its own inserted after (eight at most); the
+stage's own alpha write to the register is given up (the blue is written
+over it). A copy nothing reads is not made. */
+
+struct combiner_words {
+    uint32_t rgb_inputs, rgb_outputs, alpha_inputs, alpha_outputs, c0, c1;
+};
+
+/* whether a register's alpha (reg, a combiner register number) is read
+after stage `after` of `count`, before an alpha write to it */
+static bool alpha_read_after(const struct combiner_words *stages, unsigned count, unsigned after,
+                             unsigned reg, uint32_t abcd, uint32_t efg) {
+    unsigned stage;
+    int shift;
+
+    for (stage = after + 1; stage < count; stage++) {
+        const struct combiner_words *words = &stages[stage];
+        uint32_t written;
+
+        for (shift = 0; shift < 32; shift += 8) {
+            unsigned long rgb = (words->rgb_inputs >> shift) & 0xff,
+                          alpha = (words->alpha_inputs >> shift) & 0xff;
+
+            if (((rgb & 0x1f) == (0x10 | reg)) || ((alpha & 0x1f) == (0x10 | reg)))
+                return true;
+        }
+        if (reg == _register_r0 && ((words->rgb_outputs | words->alpha_outputs) & 0x4000))
+            return true;
+        written = words->alpha_outputs;
+        if ((written & 0x0f) == reg || ((written >> 4) & 0x0f) == reg ||
+            ((written >> 8) & 0x0f) == reg ||
+            ((words->rgb_outputs & 0x80000) && ((words->rgb_outputs >> 4) & 0x0f) == reg) ||
+            ((words->rgb_outputs & 0x40000) && (words->rgb_outputs & 0x0f) == reg))
+            return false;
+    }
+    if (!abcd && !efg)
+        return reg == _register_r0;
+    for (shift = 0; shift < 32; shift += 8) {
+        if (((abcd >> shift) & 0x1f) == (0x10 | reg))
+            return true;
+    }
+    for (shift = 8; shift < 32; shift += 8) {
+        if (((efg >> shift) & 0x1f) == (0x10 | reg))
+            return true;
+    }
+    return false;
+}
+
+/* `out` the combiner state with its blues to alpha made alpha portions; 0
+when it has none (out untouched), 1 when written, -1 when written but a copy
+found no stage (that copy left out) */
+static int blue_to_alpha_rewrite(const uint32_t *state, uint32_t *out) {
+    struct combiner_words stages[16];
+    uint32_t combiners = state[WL_XBOX_PSH_COMBINER_COUNT];
+    uint32_t abcd = state[WL_XBOX_PSH_FINAL_INPUTS_ABCD], efg = state[WL_XBOX_PSH_FINAL_INPUTS_EFG];
+    unsigned count = combiners & 0xff, stage, index;
+    int result = 1;
+    bool any = false;
+
+    if (count > 8)
+        count = 8;
+    for (stage = 0; stage < count; stage++)
+        any = any || (state[WL_XBOX_PSH_RGB_OUTPUTS0 + stage] & 0xc0000);
+    if (!any)
+        return 0;
+    for (stage = 0; stage < count; stage++) {
+        stages[stage].rgb_inputs = state[WL_XBOX_PSH_RGB_INPUTS0 + stage];
+        stages[stage].rgb_outputs = state[WL_XBOX_PSH_RGB_OUTPUTS0 + stage];
+        stages[stage].alpha_inputs = state[WL_XBOX_PSH_ALPHA_INPUTS0 + stage];
+        stages[stage].alpha_outputs = state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + stage];
+        stages[stage].c0 = state[WL_XBOX_PSH_CONSTANT0_0 + stage];
+        stages[stage].c1 = state[WL_XBOX_PSH_CONSTANT1_0 + stage];
+    }
+    for (stage = 0; stage < count; stage++) {
+        struct combiner_words *words = &stages[stage];
+        unsigned dest[2] = {0, 0};
+        uint32_t copy_inputs = 0, copy_outputs = 0, alpha_outputs = words->alpha_outputs;
+        unsigned which;
+
+        if (!(words->rgb_outputs & 0xc0000))
+            continue;
+        if (words->rgb_outputs & 0x80000)
+            dest[0] = (words->rgb_outputs >> 4) & 0x0f;
+        if (words->rgb_outputs & 0x40000)
+            dest[1] = words->rgb_outputs & 0x0f;
+        words->rgb_outputs &= ~0xc0000u;
+        for (which = 0; which < 2; which++) {
+            if (name_of(dest[which]) < 0)
+                continue;
+            /* (the stage's own alpha write to the register: the blue's) */
+            for (index = 0; index < 3; index++) {
+                if (((alpha_outputs >> (4 * index)) & 0x0f) == dest[which])
+                    alpha_outputs &= ~(0x0fu << (4 * index));
+            }
+            if (!alpha_read_after(stages, count, stage, dest[which], abcd, efg))
+                continue;
+            /* (the blue, times 1: the zero register inverted) */
+            copy_inputs |= (uint32_t)(dest[which] << 8 | 0x20) << (16 * (1 - which));
+            copy_outputs |= (uint32_t)dest[which] << (which ? 0 : 4);
+        }
+        if (!copy_outputs) {
+            words->alpha_outputs = alpha_outputs;
+            continue;
+        }
+        if (stage + 1 < count && !(stages[stage + 1].alpha_outputs & 0xfff)) {
+            /* (the next stage's alpha portion, idle: its colour must not read
+            the alphas, which it would find still unwritten) */
+            const struct combiner_words *next = &stages[stage + 1];
+            bool reads = false;
+
+            for (which = 0; which < 2; which++) {
+                int shift;
+
+                for (shift = 0; shift < 32 && dest[which]; shift += 8)
+                    reads = reads || ((next->rgb_inputs >> shift) & 0x1f) == (0x10 | dest[which]);
+                reads = reads || (dest[which] == _register_r0 && (next->rgb_outputs & 0x4000));
+            }
+            if (!reads) {
+                words->alpha_outputs = alpha_outputs;
+                stages[stage + 1].alpha_inputs = copy_inputs;
+                stages[stage + 1].alpha_outputs = copy_outputs;
+                continue;
+            }
+        }
+        if (count < 8) {
+            words->alpha_outputs = alpha_outputs;
+            memmove(&stages[stage + 2], &stages[stage + 1],
+                    (count - stage - 1) * sizeof(stages[0]));
+            stages[stage + 1] = *words;
+            stages[stage + 1].rgb_inputs = 0;
+            stages[stage + 1].rgb_outputs = 0;
+            stages[stage + 1].alpha_inputs = copy_inputs;
+            stages[stage + 1].alpha_outputs = copy_outputs;
+            count++;
+            stage++;
+            continue;
+        }
+        /* (no stage for the copy: the alpha as the stage writes it) */
+        result = -1;
+    }
+    memcpy(out, state, WL_XBOX_PSH_WORDS * sizeof(*out));
+    for (stage = 0; stage < 8; stage++) {
+        const struct combiner_words *words = &stages[stage];
+
+        if (stage >= count) {
+            out[WL_XBOX_PSH_RGB_INPUTS0 + stage] = out[WL_XBOX_PSH_RGB_OUTPUTS0 + stage] = 0;
+            out[WL_XBOX_PSH_ALPHA_INPUTS0 + stage] = out[WL_XBOX_PSH_ALPHA_OUTPUTS0 + stage] = 0;
+            continue;
+        }
+        out[WL_XBOX_PSH_RGB_INPUTS0 + stage] = words->rgb_inputs;
+        out[WL_XBOX_PSH_RGB_OUTPUTS0 + stage] = words->rgb_outputs;
+        out[WL_XBOX_PSH_ALPHA_INPUTS0 + stage] = words->alpha_inputs;
+        out[WL_XBOX_PSH_ALPHA_OUTPUTS0 + stage] = words->alpha_outputs;
+        out[WL_XBOX_PSH_CONSTANT0_0 + stage] = words->c0;
+        out[WL_XBOX_PSH_CONSTANT1_0 + stage] = words->c1;
+    }
+    out[WL_XBOX_PSH_COMBINER_COUNT] = (combiners & ~0xffu) | count;
+    return result;
+}
+
 bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures *textures,
                            const WlXboxPshRecipe *recipe, WlXboxPshProgram *program) {
     /* the signed dot products: where the alpha half reads them, then in the
@@ -3773,19 +4141,29 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
     registers free for the program); the first exact program, or else the
     first approximated */
     static WlXboxPshProgram approximated;
-    bool have_approximated = false, done = false;
+    static uint32_t rewritten[WL_XBOX_PSH_WORDS];
+    bool have_approximated = false, done = false, has_mux = false;
+    int mux_mode, blues = blue_to_alpha_rewrite(render_state, rewritten);
 
-    for (attempt = 0; attempt < sizeof(attempts) / sizeof(attempts[0]) && !done; attempt++) {
-        for (preload = 1; preload >= 0 && !done; preload--) {
-            if (!translate_once(render_state, textures, program, attempts[attempt].economical,
-                                attempts[attempt].folding, preload != 0,
-                                attempts[attempt].signed_dots))
-                continue;
-            if (!program->approximate)
-                done = true;
-            else if (!have_approximated) {
-                approximated = *program;
-                have_approximated = true;
+    if (blues)
+        render_state = rewritten;
+    for (stage = 0; stage < 8; stage++)
+        has_mux = has_mux || ((render_state[WL_XBOX_PSH_RGB_OUTPUTS0 + stage] |
+                               render_state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + stage]) &
+                              0x4000);
+    for (mux_mode = 2; mux_mode >= (has_mux ? 0 : 2) && !done; mux_mode--) {
+        for (attempt = 0; attempt < sizeof(attempts) / sizeof(attempts[0]) && !done; attempt++) {
+            for (preload = 1; preload >= 0 && !done; preload--) {
+                if (!translate_once(render_state, textures, program, attempts[attempt].economical,
+                                    attempts[attempt].folding, preload != 0,
+                                    attempts[attempt].signed_dots, mux_mode))
+                    continue;
+                if (!program->approximate)
+                    done = true;
+                else if (!have_approximated) {
+                    approximated = *program;
+                    have_approximated = true;
+                }
             }
         }
     }
@@ -3793,6 +4171,8 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
         return false;
     if (!done)
         *program = approximated;
+    if (blues < 0)
+        approximate(program, "a blue to alpha without a stage for its copy");
     /* (what the stages read of the vertices; a bumped lookup's offsets
     read the bump map at coordinate 0 and their terms at 1 and 2) */
     program->texcoords = (unsigned char)wl_tev_texcoords_mask(&program->tev);

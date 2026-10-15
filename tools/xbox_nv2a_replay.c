@@ -38,6 +38,10 @@
 //               a frame), and the best run's parts: the model's (pusher, puller, 3D state), the
 //               backend's draws, its clears and frames, the memory records put in
 //   --stream    the replay through wl_nv2a_replay_stream, as the runtime's capture bench makes it
+//   --survey    which of the NV2A's features the capture's draws use that GX takes approximately
+//               (the combiners' blues to alpha and muxes, the texture stages' modes, alpha kill,
+//               signed channels and LOD bias, blend equations and constant factors, psh's
+//               approximations and refusals): how many draws, and the first of each
 //               (wl/xboxrt/bench.h): the capture read a piece at a time (of an odd size, so records
 //               straddle the pieces), into a guest memory given as the caller's, written a 4 KB
 //               piece at a time where it differs; the output is the same as without
@@ -88,6 +92,14 @@ static const WlNv2aGxConfig *gx_config(void) {
 static unsigned long g_program_hashes[1024];
 static unsigned g_program_count;
 static unsigned g_verbosity;
+// --survey: each feature's name, its draws and the first of them
+enum { SURVEY_MAX = 96 };
+static bool g_survey;
+static struct {
+    char name[96];
+    uint32_t draws, first;
+} g_features[SURVEY_MAX];
+static unsigned g_feature_count;
 static const char *g_png_dir;
 static unsigned g_png_count;
 static WlNv2aRecorder g_recorder;
@@ -168,6 +180,106 @@ static void tee_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
     }
 }
 
+static void survey_count(const char *name) {
+    unsigned i;
+
+    for (i = 0; i < g_feature_count; i++) {
+        if (strcmp(g_features[i].name, name) == 0) {
+            g_features[i].draws++;
+            return;
+        }
+    }
+    if (g_feature_count < SURVEY_MAX) {
+        snprintf(g_features[g_feature_count].name, sizeof g_features[0].name, "%s", name);
+        g_features[g_feature_count].draws = 1;
+        g_features[g_feature_count++].first = g_backend_draws;
+    }
+}
+
+// what of a draw's state GX takes approximately, counted by name
+static void survey_draw(const WlNv2aKelvin *k) {
+    static const char *const equations[] = {"add", "min", "max", "?", "subtract", "reverse subtract"};
+    uint32_t words[WL_XBOX_PSH_WORDS];
+    char name[96];
+    unsigned stage, count;
+
+    wl_nv2a_psh_words(k, words);
+    count = words[WL_XBOX_PSH_COMBINER_COUNT] & 0xffu;
+    for (stage = 0; stage < count && stage < 8; stage++) {
+        uint32_t rgb = words[WL_XBOX_PSH_RGB_OUTPUTS0 + stage],
+                 alpha = words[WL_XBOX_PSH_ALPHA_OUTPUTS0 + stage];
+
+        if (rgb & 0xc0000u) {
+            survey_count("combiners: a blue to alpha");
+        }
+        if ((rgb | alpha) & 0x4000u) {
+            survey_count(words[WL_XBOX_PSH_COMBINER_COUNT] & 0x100u ? "combiners: a mux by the top bit"
+                                                                   : "combiners: a mux by the low bit");
+        }
+    }
+    for (stage = 0; stage < 4; stage++) {
+        uint32_t mode = wl_nv2a_stage_program(k, stage), base = WL_NV2A_K_TEXTURE_STRIDE * stage;
+        uint32_t filter = wl_nv2a_k(k, WL_NV2A_K_SET_TEXTURE_FILTER + base),
+                 control0 = wl_nv2a_k(k, WL_NV2A_K_SET_TEXTURE_CONTROL0 + base);
+
+        if (mode == WL_NV2A_STAGE_NONE) {
+            continue;
+        }
+        if (mode > WL_NV2A_STAGE_CUBE_MAP) {
+            snprintf(name, sizeof name, "texture stage mode %02x", (unsigned)mode);
+            survey_count(name);
+        }
+        if (control0 & 4u) {
+            survey_count("texture: alpha kill");
+        }
+        if (filter >> 28) {
+            snprintf(name, sizeof name, "texture: signed channels %x", (unsigned)(filter >> 28));
+            survey_count(name);
+        }
+        if (filter & 0x1fffu) {
+            survey_count("texture: a LOD bias");
+        }
+    }
+    if (wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_ENABLE)) {
+        uint32_t equation = wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_EQUATION);
+        uint32_t factors[2] = {wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_SFACTOR),
+                               wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_DFACTOR)};
+        unsigned side;
+
+        if (equation != WL_NV2A_BLEND_EQ_ADD) {
+            if (equation >= WL_NV2A_BLEND_EQ_ADD && equation <= WL_NV2A_BLEND_EQ_REVERSE_SUBTRACT) {
+                snprintf(name, sizeof name, "blend: %s", equations[equation - WL_NV2A_BLEND_EQ_ADD]);
+            } else {
+                snprintf(name, sizeof name, "blend: equation %04x", (unsigned)equation);
+            }
+            survey_count(name);
+        }
+        for (side = 0; side < 2; side++) {
+            if (factors[side] >= WL_NV2A_BLEND_CONSTANT_COLOR &&
+                factors[side] <= WL_NV2A_BLEND_ONE_MINUS_CONSTANT_ALPHA) {
+                snprintf(name, sizeof name, "blend: a constant factor %04x/%04x, colour %08x",
+                         (unsigned)factors[0], (unsigned)factors[1],
+                         (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_COLOR));
+                survey_count(name);
+                break;
+            }
+        }
+    }
+    if (g_gx != NULL) {
+        bool used;
+        const WlXboxPshProgram *program = wl_nv2a_gx_last_program(g_gx, &used);
+
+        if (program != NULL && !used) {
+            snprintf(name, sizeof name, "psh: beyond GX (%s)", program->reason ? program->reason : "?");
+            survey_count(name);
+        } else if (program != NULL && program->approximate) {
+            snprintf(name, sizeof name, "psh: approximated (%s)",
+                     program->approximation ? program->approximation : "?");
+            survey_count(name);
+        }
+    }
+}
+
 static uint32_t tee_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
     Tee *t = user;
     uint32_t pixels = 0;
@@ -176,6 +288,9 @@ static uint32_t tee_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *dr
     program_seen(k);
     for (i = 0; i < t->count; i++) {
         pixels = t->b[i].draw(t->b[i].user, k, draw);
+    }
+    if (g_survey) {
+        survey_draw(k);
     }
     for (i = 0; i < g_psh_dump_count; i++) {
         if (g_psh_dump[i] == g_backend_draws) {
@@ -675,6 +790,9 @@ int main(int argc, char **argv) {
             gx = true;
         } else if (strcmp(argv[i], "--psh-dump") == 0 && i + 1 < argc && g_psh_dump_count < EFB_AFTER_MAX) {
             g_psh_dump[g_psh_dump_count++] = (uint32_t)strtoul(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--survey") == 0) {
+            g_survey = true;
+            gx = true;
         } else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
             g_bench = (unsigned)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--programs") == 0 && i + 1 < argc) {
@@ -830,6 +948,15 @@ int main(int argc, char **argv) {
         }
         wl_nv2a_gx_destroy(g_gx);
         wl_gxsoft_detach();
+    }
+    if (g_survey) {
+        unsigned n;
+
+        printf("survey: %u features GX takes approximately\n", g_feature_count);
+        for (n = 0; n < g_feature_count; n++) {
+            printf("  %6u draws (first %u): %s\n", (unsigned)g_features[n].draws, (unsigned)g_features[n].first,
+                   g_features[n].name);
+        }
     }
     if (g_programs != NULL) {
         printf("programs: %u distinct vertex programs written\n", g_program_count);

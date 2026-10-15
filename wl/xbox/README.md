@@ -34,7 +34,12 @@ through TEV's lerp, bias and scale; a half bias negate or expand negate (0.5 - x
 its product's stage, with no register of its own, and the alpha's reads of a colour's blue made
 again where they are read (Halo's title-screen logo, all four TEV registers busy, is exact so). A
 program beyond GX is refused (`reason`); one that only fits approximated says so (`approximate`,
-`approximation`); of the attempts the translation makes, the first exact one is kept.
+`approximation`); of the attempts the translation makes, the first exact one is kept. A colour
+output's blue copied to its alpha (Direct3D's dp3 to rgba) becomes an alpha portion reading that
+blue right after its stage (in the next stage's idle alpha half, or a stage inserted, eight at
+most). The mux is the NV2A's step: CD where r0's alpha is 128/255 or more, through two of TEV's
+compares (three without a konst for 127/255; a blend, approximated, where they do not fit); by the
+alpha's low bit (MUX_LSB) it is the top bit's, approximated, but for a constant.
 
 The fixed places the device and the translation agree on: the fog ramp is map 7 at texture
 coordinate 4 (`WL_XBOX_PSH_FOG_*`); a bumped lookup's offset reads the bump map as map 5, its terms
@@ -42,7 +47,8 @@ at coordinates 1 and 2 (`WL_XBOX_PSH_BUMP_*`); D0's alpha from a texture is read
 
 A caller can make programs by hand for combiners it recognizes (`WlXboxPshRecipe`, tried before the
 translation): where the exact program needs more than the general translation can see, such as a
-dot product of a register, which no TEV swap reaches and the translation takes as 1. Its
+dot product of a register, which no TEV swap reaches: the translation makes it the register times
+the other value where only the colour reads it (a luminance the colour itself), else takes it as 1. Its
 `vertices` values from `WL_XBOX_PSH_VERTICES_RECIPE` up are the caller's own.
 `wl_xbox_psh_apply` writes a program to GX.
 
@@ -218,7 +224,8 @@ even, so its winding holds).
   the transform unit's generators. Not to the bit (`no_xf` in `WlNv2aGxConfig` keeps every vertex on
   the processor; the runtime's `noxf` file). The combiners through psh's cache (with a title's `WlXboxPshRecipe`), the fog psh's ramp, a
   program beyond GX texture 0 times colour. Blending, depth, alpha test and colour masks on GX
-  (constant colours, MIN/MAX and src - dst approximated and counted); culling by the NV2A's rule on
+  (a constant factor ONE or ZERO by SET_BLEND_COLOR, exact where that is 1 or 0; MIN as s d, MAX as
+  s + d - s d and src - dst as s (1 - d): approximated and counted); culling by the NV2A's rule on
   the screen winding (`wl_nv2a_cull`: SET_FRONT_FACE's CW is clockwise as the screen shows it, so
   Direct3D's D3DCULL_CCW keeps a quad wound clockwise on the screen; GX's sense measured once at
   start); a draw with the stencil test is drawn as if the test passed (counted as `stencil_ignored`),

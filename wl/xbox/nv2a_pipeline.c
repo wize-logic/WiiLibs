@@ -259,9 +259,11 @@ void wl_nv2a_texcoord(const WlNv2aTexEntry *entry, unsigned stage_program, const
 
 bool wl_nv2a_gx_blend(const WlNv2aKelvin *k, WlGxBlendMode *mode, WlGxBlendFactor *source,
                       WlGxBlendFactor *destination) {
-    return wl_nv2a_gx_blend_of(wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_ENABLE) != 0, wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_EQUATION),
-                               wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_SFACTOR),
-                               wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_DFACTOR), mode, source, destination);
+    return wl_nv2a_gx_blend_color_of(wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_ENABLE) != 0,
+                                     wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_EQUATION),
+                                     wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_SFACTOR),
+                                     wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_DFACTOR),
+                                     wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_COLOR), mode, source, destination);
 }
 
 unsigned wl_nv2a_cull(const WlNv2aKelvin *k) {

@@ -89,6 +89,10 @@ bool wl_nv2a_gx_blend(const WlNv2aKelvin *k, WlGxBlendMode *mode, WlGxBlendFacto
 // the same of the values: SET_BLEND_ENABLE, _EQUATION, _FUNC_SFACTOR and _FUNC_DFACTOR's
 bool wl_nv2a_gx_blend_of(bool enable, uint32_t equation, uint32_t sfactor, uint32_t dfactor, WlGxBlendMode *mode,
                          WlGxBlendFactor *source, WlGxBlendFactor *destination);
+// and with SET_BLEND_COLOR's ARGB (D3DRS_BLENDCOLOR), which the constant factors read: ONE or ZERO, exact
+// where the constant gives 1 or 0 in every channel (without it, a constant factor is ONE, approximated)
+bool wl_nv2a_gx_blend_color_of(bool enable, uint32_t equation, uint32_t sfactor, uint32_t dfactor, uint32_t color,
+                               WlGxBlendMode *mode, WlGxBlendFactor *source, WlGxBlendFactor *destination);
 // what culling discards, by the NV2A's rule: the front face is the winding SET_FRONT_FACE names
 // as the screen shows it, its window coordinates running down (CW: clockwise on the screen, a
 // positive area in its y-down coordinates; Direct3D's D3DCULL_CCW sets front CW and culls the
