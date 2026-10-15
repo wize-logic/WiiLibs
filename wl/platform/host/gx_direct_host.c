@@ -164,6 +164,23 @@ void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
     wl_gx_direct_vertex(&v);
 }
 
+void wl_gx_direct_vertices_words(const uint32_t *const *vertices, uint32_t n, uint32_t count) {
+    uint32_t v;
+
+    for (v = 0; v < n; v++) {
+        wl_gx_direct_vertex_words(vertices[v], count);
+    }
+}
+
+void wl_gx_direct_vertices_index(const uint32_t *indices, uint32_t base, uint32_t n, const uint32_t *words,
+                                 uint32_t count) {
+    uint32_t v;
+
+    for (v = 0; v < n; v++) {
+        wl_gx_direct_vertex_index((uint16_t)(indices != NULL ? indices[v] - base : v), words, count);
+    }
+}
+
 void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride) {
     if (attribute < 11u) {
         s.arrays[attribute] = data;

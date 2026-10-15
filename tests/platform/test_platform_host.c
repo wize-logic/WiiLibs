@@ -210,6 +210,64 @@ TEST gx_direct_stub_takes_projected_coordinates_after_the_position(void) {
     PASS();
 }
 
+// a batch of vertices in one call, as the FIFO's words or as indices into arrays: recorded as the same
+// vertices one call each would make
+TEST gx_direct_stub_takes_batches_of_vertices(void) {
+    WlGxDirectLayout layout;
+    const WlHostGxDirect *d;
+    const float f0[3] = {1, 2, 3}, f1[3] = {4, 5, 6};
+    uint32_t w0[4], w1[4];
+    const uint32_t *batch[2] = {w0, w1};
+    static const uint32_t indices[3] = {12, 10, 11};
+    uint8_t positions[3 * 12];
+    unsigned i;
+
+    memcpy(w0, f0, sizeof f0);
+    memcpy(w1, f1, sizeof f1);
+    w0[3] = 0x11223344u;
+    w1[3] = 0x55667788u;
+    memset(&layout, 0, sizeof layout);
+    layout.colors = 1;
+    wl_host_gx_direct_reset();
+    wl_gx_direct_layout(&layout);
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 2);
+    wl_gx_direct_vertices_words(batch, 2, 4);
+    wl_gx_direct_primitive_end();
+    d = wl_host_gx_direct();
+    ASSERT_EQ(2u, d->count);
+    ASSERT(d->vertices[1].position[1] == 5.0f);
+    ASSERT_EQ(0x55, d->vertices[1].color[0][0]);
+    // the position from an array (big-endian floats), the index less the base
+    for (i = 0; i < 3; i++) {
+        float v[3] = {(float)i, (float)i * 2.0f, 7.0f};
+        uint32_t bits;
+        unsigned c;
+
+        for (c = 0; c < 3; c++) {
+            memcpy(&bits, &v[c], sizeof bits);
+            positions[i * 12 + c * 4] = (uint8_t)(bits >> 24);
+            positions[i * 12 + c * 4 + 1] = (uint8_t)(bits >> 16);
+            positions[i * 12 + c * 4 + 2] = (uint8_t)(bits >> 8);
+            positions[i * 12 + c * 4 + 3] = (uint8_t)bits;
+        }
+    }
+    memset(&layout, 0, sizeof layout);
+    layout.indexed = 1u << WL_GX_DIRECT_ARRAY_POSITION;
+    wl_host_gx_direct_reset();
+    wl_gx_direct_layout(&layout);
+    wl_gx_direct_array(WL_GX_DIRECT_ARRAY_POSITION, positions, 12);
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 3);
+    wl_gx_direct_vertices_index(indices, 10, 3, NULL, 0);
+    wl_gx_direct_primitive_end();
+    d = wl_host_gx_direct();
+    ASSERT_EQ(3u, d->count);
+    ASSERT(d->vertices[0].position[0] == 2.0f && d->vertices[0].position[1] == 4.0f);
+    ASSERT(d->vertices[1].position[0] == 0.0f && d->vertices[1].position[2] == 7.0f);
+    ASSERT(d->vertices[2].position[1] == 2.0f);
+    wl_host_gx_direct_reset();
+    PASS();
+}
+
 TEST audio_stub_renders_through_the_fill_callback(void) {
     uint32_t next = 0;
     ASSERT_EQ(WL_ERR_ARG, wl_platform_audio_start(32000, 256, NULL, NULL));
@@ -242,6 +300,7 @@ SUITE(host_suite) {
     RUN_TEST(gx_stub_records_frames_and_draws);
     RUN_TEST(gx_direct_stub_flushes_a_renderers_own_format);
     RUN_TEST(gx_direct_stub_takes_projected_coordinates_after_the_position);
+    RUN_TEST(gx_direct_stub_takes_batches_of_vertices);
     RUN_TEST(audio_stub_renders_through_the_fill_callback);
 }
 
