@@ -10,6 +10,7 @@
 add_library(wl_xbox STATIC psh.c psh_bias.c psh_cache.c vsh.c
     nv2a.c nv2a_kelvin.c nv2a_capture.c nv2a_texture.c nv2a_texcache.c nv2a_vcache.c nv2a_pipeline.c nv2a_raster.c nv2a_record.c)
 wl_target_defaults(wl_xbox DETERMINISTIC)
+wl_gpu_path(wl_xbox)
 target_link_libraries(wl_xbox PUBLIC wl_platform wl_gfx wl_codec m)
 add_library(WiiLibs::xbox ALIAS wl_xbox)
 
@@ -17,6 +18,7 @@ add_library(WiiLibs::xbox ALIAS wl_xbox)
 # Wii, the host's recorder elsewhere
 add_library(wl_xbox_gx STATIC nv2a_gx.c)
 wl_target_defaults(wl_xbox_gx DETERMINISTIC)
+wl_gpu_path(wl_xbox_gx)
 target_link_libraries(wl_xbox_gx PUBLIC wl_xbox wl_platform)
 add_library(WiiLibs::xbox_gx ALIAS wl_xbox_gx)
 

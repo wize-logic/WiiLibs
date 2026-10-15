@@ -92,7 +92,9 @@ cmake --build build/wii && ctest --test-dir build/wii -L dolphin --output-on-fai
 
 To use it from another CMake project: `add_subdirectory(path/to/WiiLibs)` and link
 `WiiLibs::<module>`. Tests and `-Werror` are on only when WiiLibs is the top-level project
-(`WL_BUILD_TESTS`, `WL_WERROR`).
+(`WL_BUILD_TESTS`, `WL_WERROR`). The Xbox GPU path (`wl_xbox`, `wl_xbox_gx`, `wl_platform`, `wl_gfx`,
+`wl_codec`) is built `-O3` for the Wii in Release (`WL_GPU_OPT`; `WL_GPU_LTO`, `WL_GPU_FLAGS` and
+`WL_GPU_LIBS` are there to try others: `cmake/WiiLibs.cmake`); the host and ppc-be keep the plain flags.
 
 ## Recompiling an Xbox title
 
