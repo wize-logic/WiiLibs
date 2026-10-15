@@ -277,11 +277,36 @@ void xk_raw_write(uint32_t partition, uint64_t offset, const uint8_t *src, uint3
 
 // ---- Objects ---------------------------------------------------------------------------------------
 
+// Guest pages a read filled from a file remember its bytes (wl_xb_file_pages): before the bytes
+// [off, off + len) of the file `c` names change, every handle's pages over them forget them.
+static void fcb_pages_forget(const XkFcb *c, uint64_t off, uint64_t len) {
+    for (const XkFile *o = c != NULL ? c->files : NULL; o != NULL; o = o->fcb_next) {
+        if (o->pf != NULL) {
+            wl_xb_file_forget(o->pf, off, len);
+        }
+    }
+}
+
+static void pages_forget(const XkFile *f, uint64_t off, uint64_t len) {
+    if (f->fcb != NULL) {
+        fcb_pages_forget(f->fcb, off, len);
+    } else if (f->pf != NULL) {
+        wl_xb_file_forget(f->pf, off, len);
+    }
+}
+
+void wl_xk_file_changed(const char *host) {
+    const XkFcb *c = fcb_find(host);
+    WL_LOG_I(XK_TAG, "changed outside the kernel: %s (%s)", host, c != NULL ? "open" : "not open");
+    fcb_pages_forget(c, 0, UINT64_MAX);
+}
+
 void xk_file_close(XkFile *f) {
     if (f == NULL) {
         return;
     }
     if (f->pf != NULL) {
+        wl_xb_file_forget(f->pf, 0, UINT64_MAX); // its pages' bytes are read back while it is open
         if (f->sparse && f->resized && f->fcb != NULL) {
             sidecar_write(f->host, f->fcb->logical, physical_size(f));
         }
@@ -449,6 +474,9 @@ static uint32_t open_file(uint32_t handle_out, uint32_t access, uint32_t oa, uin
                     return s;
                 }
             }
+            if (truncate) {
+                fcb_pages_forget(fcb_find(f->host), 0, UINT64_MAX); // its other handles' pages
+            }
             WlResult pr = wl_platform_fs_open(f->host, mode, &f->pf);
             if (pr == WL_OK && mode == WL_FILE_WRITE_NEW) {
                 // WRITE_NEW cannot read: reopen read-write now that it is empty
@@ -582,6 +610,11 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
         wl_xb_copy_in(buf + *done, g_bounce, chunk);
         *done += chunk;
     }
+    if (off < phys) {
+        // the whole pages filled from the file's bytes remember them: unchanged, they are read
+        // from it again rather than written to the swap file
+        wl_xb_file_pages(buf, phys - off < n ? (uint32_t)(phys - off) : n, f->pf, off);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -594,6 +627,9 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
         return STATUS_ACCESS_VIOLATION;
     }
     uint32_t status = STATUS_SUCCESS;
+    if (f->kind != XK_FILE_PARTITION) {
+        pages_forget(f, off, len);
+    }
     while (*done < len) {
         uint32_t chunk = len - *done < BOUNCE ? len - *done : BOUNCE;
         wl_xb_copy_out(g_bounce, buf + *done, chunk);
@@ -877,6 +913,7 @@ static uint32_t set_size(XkFile *f, uint64_t size) {
         return f->kind == XK_FILE_PARTITION ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
     }
     uint64_t phys = physical_size(f);
+    pages_forget(f, size, UINT64_MAX); // (a sparse file reads zero past its bytes: none remembered)
     if (f->sparse) {
         if (size < phys && wl_platform_fs_truncate(f->pf, size) != WL_OK) {
             return STATUS_DISK_FULL;
@@ -934,6 +971,7 @@ void k_NtSetInformationFile(void) {
         // not rename an open file), and all of them follow it to its new name
         for (XkFile *o = f->fcb->files; o != NULL; o = o->fcb_next) {
             if (o->pf != NULL) {
+                wl_xb_file_forget(o->pf, 0, UINT64_MAX);
                 wl_platform_fs_close(o->pf);
                 o->pf = NULL;
                 g_files_open--;

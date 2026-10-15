@@ -8,9 +8,14 @@
 //     zero); a touch gives it a zeroed frame;
 //   - resident: a frame, mapped or not; DIRTY once it changed since its zero fill or its read back
 //     (the MMU's C bits, harvested), REF when used since the clock last passed it (R bits);
-//   - swapped: no frame, a slot: its bytes are in the swap file, and a touch reads them back.
-// A resident page keeps its slot while it stays clean, so its frame goes back for nothing; a
-// dirty one gets a new slot when it is written out.
+//   - swapped: no frame, a slot: its bytes are in the swap file, and a touch reads them back;
+//   - a file copy: no frame, its bytes are a file's (the slot field's FILE_SLOT bit, the file's
+//     index in g_src and its offset in g_foff): a file read into guest memory filled it whole
+//     (wl_xb_pg_filed), and a touch reads it from the file again.
+// A resident page keeps its slot or its file copy while it stays clean, so its frame goes back for
+// nothing; a dirty one gets a new slot when it is written out. A file's copies are forgotten
+// (wl_xb_pg_forget) before its bytes change or it is closed: a resident page is marked dirty, a
+// page without a frame read back first.
 //
 // The clock goes round the frames. A pinned page, or one in I/O, is passed by. The page's R bits
 // are harvested and cleared, and a page used since the last round is passed too (its second
@@ -42,6 +47,8 @@
 #define FAST_LOOK 256u // frames the exception context's clock looks at before it gives up
 #define SLOT_ALIGN 8u  // a batch starts on 8 slots (32 KB) when it can
 #define PAGE WL_XB_PAGE
+#define FILE_SLOT 0x8000u // in g_xb_pg_slot: a file copy, its source's index + 1 in the low bits
+#define SOURCES 32u       // files with copies at once
 
 uint8_t *g_xb_pg_flags;
 uint16_t *g_xb_pg_frame;
@@ -63,9 +70,17 @@ static uint8_t *g_io;         // BATCH pages: the batch's bytes, a page read bac
 static uint16_t g_batch[BATCH];
 static uint32_t g_batch_n;
 
+static uint32_t *g_foff; // [ram pages] a file copy's offset in its file
+static struct {
+    WlPlatformFile *file; // NULL: free
+    uint32_t pages;       // file copies of it
+    uint64_t lo, hi;      // its bytes they may hold: [lo, hi) (a forget elsewhere looks at no page)
+} g_src[SOURCES];
+
 static struct {
     uint32_t evictions, clean_evictions, fast_evictions;
     uint32_t swap_ins, swap_outs, swap_writes, zero_outs, discards;
+    uint32_t file_copies, file_evictions, file_ins, file_forgets, file_forget_ins;
     uint64_t read_bytes, write_bytes, io_us;
 } g_st;
 
@@ -93,6 +108,9 @@ static void evict_clean(uint32_t q, uint32_t f) {
     wl_xb_mmu_frame_drop(q, f);
     g_st.evictions++;
     g_st.clean_evictions++;
+    if ((g_xb_pg_slot[q] & FILE_SLOT) != 0) {
+        g_st.file_evictions++;
+    }
 }
 
 // One step of the clock, at frame g_hand. Returns the frame a clean page gave back, or 0. With
@@ -153,6 +171,20 @@ static bool slot_is_used(uint32_t s) {
 static void slot_free(uint32_t s) {
     g_slot_used[s >> 5] &= ~(1u << (s & 31u));
     g_slots_used--;
+}
+
+// Page `p` forgets its copy: its slot, or its file's bytes. Lock held.
+static void copy_drop(uint32_t p) {
+    uint32_t s = g_xb_pg_slot[p];
+    if (s == 0) {
+        return;
+    }
+    if ((s & FILE_SLOT) != 0) {
+        g_src[(s & ~FILE_SLOT) - 1u].pages--;
+    } else {
+        slot_free(s - 1u);
+    }
+    g_xb_pg_slot[p] = 0;
 }
 
 // Takes the free slots from `s` on, at most `want`; how many.
@@ -233,10 +265,7 @@ static WlResult batch_write(void) {
         uint32_t p = g_batch[i];
         const uint8_t *bytes = wl_xb_mmu_frame_ptr(p, g_xb_pg_frame[p]);
         uint32_t lv = wl_xb_mmu_lock();
-        if (g_xb_pg_slot[p] != 0) {
-            slot_free(g_xb_pg_slot[p] - 1u); // its old copy is stale
-            g_xb_pg_slot[p] = 0;
-        }
+        copy_drop(p); // its old copy is stale
         if (page_is_zero(bytes)) {
             // zero again (cleared after a store): a zero page, with nothing to write or read back;
             // its bytes and its write epoch stay as they are
@@ -355,15 +384,28 @@ WlResult wl_xb_pg_fault(uint32_t p, uint32_t keep) {
         wl_xb_mmu_frame_zero(p, f);
     } else {
         uint64_t t0 = wl_platform_time_us();
-        r = wl_platform_fs_read_at(g_swap, (uint64_t)(slot - 1u) * PAGE, g_io, PAGE);
+        bool file = (slot & FILE_SLOT) != 0;
+        if (file) {
+            r = wl_platform_fs_read_at(g_src[(slot & ~FILE_SLOT) - 1u].file, g_foff[p], g_io, PAGE);
+        } else {
+            r = wl_platform_fs_read_at(g_swap, (uint64_t)(slot - 1u) * PAGE, g_io, PAGE);
+        }
         g_st.io_us += wl_platform_time_us() - t0;
         if (r != WL_OK) {
-            WL_LOG_E(TAG, "swap file read of slot %u: %s", (unsigned)(slot - 1u), wl_result_name(r));
+            if (file) {
+                WL_LOG_E(TAG, "file read of page %u (at %u): %s", (unsigned)p, (unsigned)g_foff[p], wl_result_name(r));
+            } else {
+                WL_LOG_E(TAG, "swap file read of slot %u: %s", (unsigned)(slot - 1u), wl_result_name(r));
+            }
             return WL_ERR_IO;
         }
         memcpy(wl_xb_mmu_frame_ptr(p, f), g_io, PAGE);
-        g_st.swap_ins++;
-        g_st.read_bytes += PAGE;
+        if (file) {
+            g_st.file_ins++;
+        } else {
+            g_st.swap_ins++;
+            g_st.read_bytes += PAGE;
+        }
     }
     lv = wl_xb_mmu_lock();
     g_xb_pg_flags[p] = (uint8_t)((g_xb_pg_flags[p] & ~(WL_XB_PG_IO | WL_XB_PG_DIRTY)) | WL_XB_PG_REF);
@@ -386,10 +428,7 @@ void wl_xb_pg_release(uint32_t p, uint32_t pages) {
             give_free(f);
             wl_xb_mmu_frame_drop(k, f);
         }
-        if (g_xb_pg_slot[k] != 0) {
-            slot_free(g_xb_pg_slot[k] - 1u);
-            g_xb_pg_slot[k] = 0;
-        }
+        copy_drop(k);
         if ((g_xb_pg_flags[k] & WL_XB_PG_PINNED) != 0) {
             g_pinned--;
         }
@@ -406,8 +445,7 @@ void wl_xb_pg_discard(uint32_t p, uint32_t pages) {
     for (uint32_t k = p; k < p + pages && k < g_xb_ram_pages; k++) {
         uint32_t lv = wl_xb_mmu_lock();
         if (g_xb_pg_frame[k] == 0 && g_xb_pg_slot[k] != 0 && (g_xb_pg_flags[k] & WL_XB_PG_IO) == 0) {
-            slot_free(g_xb_pg_slot[k] - 1u);
-            g_xb_pg_slot[k] = 0;
+            copy_drop(k);
             wl_xb_pg_wrote(k); // (zero until the caller's stores)
             g_st.discards++;
         }
@@ -430,6 +468,7 @@ void wl_xb_pg_move(uint32_t from, uint32_t to) {
     }
     g_xb_pg_slot[to] = g_xb_pg_slot[from];
     g_xb_pg_slot[from] = 0;
+    g_foff[to] = g_foff[from];
     g_xb_pg_flags[to] = g_xb_pg_flags[from];
     g_xb_pg_flags[from] = 0;
     wl_xb_pg_wrote(from);
@@ -438,6 +477,103 @@ void wl_xb_pg_move(uint32_t from, uint32_t to) {
         wl_xb_mmu_pinned(to);
     }
     wl_xb_mmu_unlock(lv);
+}
+
+// ---- File copies ---------------------------------------------------------------------------------
+
+uint32_t wl_xb_pg_source(WlPlatformFile *file) {
+    if (g_xb_pg_frames == 0 || g_swap == NULL || file == NULL) {
+        return 0; // (without a swap file nothing could be read back when a file's copies are forgotten)
+    }
+    uint32_t free_at = 0;
+    for (uint32_t i = 0; i < SOURCES; i++) {
+        if (g_src[i].file == file) {
+            return i + 1u;
+        }
+        if (free_at == 0 && (g_src[i].file == NULL || g_src[i].pages == 0)) {
+            free_at = i + 1u;
+        }
+    }
+    if (free_at != 0) {
+        g_src[free_at - 1u].file = file;
+        g_src[free_at - 1u].lo = UINT64_MAX;
+        g_src[free_at - 1u].hi = 0;
+    }
+    return free_at;
+}
+
+void wl_xb_pg_filed(uint32_t p, uint32_t source, uint32_t offset) {
+    if (g_xb_pg_frames == 0 || p >= g_xb_ram_pages || source == 0 || source > SOURCES) {
+        return;
+    }
+    uint32_t lv = wl_xb_mmu_lock();
+    uint8_t fl = g_xb_pg_flags[p];
+    // a pinned page's stores are not seen; a zero page (no frame, no slot) stays one
+    if ((fl & (WL_XB_PG_PINNED | WL_XB_PG_IO)) == 0 && (g_xb_pg_frame[p] != 0 || g_xb_pg_slot[p] != 0)) {
+        if (g_xb_pg_frame[p] != 0) {
+            wl_xb_mmu_unmap(p); // the copy's stores harvested; the next store is seen
+        }
+        copy_drop(p);
+        g_xb_pg_flags[p] &= (uint8_t)~WL_XB_PG_DIRTY;
+        g_xb_pg_slot[p] = (uint16_t)(FILE_SLOT | source);
+        g_foff[p] = offset;
+        g_src[source - 1u].pages++;
+        if (offset < g_src[source - 1u].lo) {
+            g_src[source - 1u].lo = offset;
+        }
+        if (offset + (uint64_t)PAGE > g_src[source - 1u].hi) {
+            g_src[source - 1u].hi = offset + (uint64_t)PAGE;
+        }
+        g_st.file_copies++;
+    }
+    wl_xb_mmu_unlock(lv);
+}
+
+WlResult wl_xb_pg_forget(WlPlatformFile *file, uint64_t offset, uint64_t bytes) {
+    if (g_xb_pg_frames == 0 || file == NULL) {
+        return WL_OK;
+    }
+    uint32_t i = 0;
+    while (i < SOURCES && g_src[i].file != file) {
+        i++;
+    }
+    if (i == SOURCES) {
+        return WL_OK;
+    }
+    uint64_t end = bytes > UINT64_MAX - offset ? UINT64_MAX : offset + bytes;
+    bool all = offset == 0 && end == UINT64_MAX;
+    if (g_src[i].pages == 0 || end <= g_src[i].lo || offset >= g_src[i].hi) {
+        if (all) {
+            g_src[i].file = NULL;
+        }
+        return WL_OK;
+    }
+    uint16_t want = (uint16_t)(FILE_SLOT | (i + 1u));
+    WlResult r = WL_OK;
+    for (uint32_t k = 0; k < g_xb_ram_pages && g_src[i].pages != 0; k++) {
+        if (g_xb_pg_slot[k] != want || g_foff[k] + (uint64_t)PAGE <= offset || g_foff[k] >= end) {
+            continue;
+        }
+        if (g_xb_pg_frame[k] == 0) {
+            // read back from the file while it still holds the bytes (the clock may take another of
+            // its pages meanwhile: one after k is met later, one before it was dirty already)
+            r = wl_xb_pg_fault(k, 0);
+            if (r != WL_OK) {
+                WL_LOG_E(TAG, "page %u lost with its file's copy: %s", (unsigned)k, wl_result_name(r));
+            } else {
+                g_st.file_forget_ins++;
+            }
+        }
+        uint32_t lv = wl_xb_mmu_lock();
+        copy_drop(k);
+        g_xb_pg_flags[k] |= WL_XB_PG_DIRTY; // written to the swap file when it goes
+        wl_xb_mmu_unlock(lv);
+        g_st.file_forgets++;
+    }
+    if (all && g_src[i].pages == 0) {
+        g_src[i].file = NULL; // (the file may be closed and its handle reused)
+    }
+    return r;
 }
 
 WlResult wl_xb_pg_pin(uint32_t p, bool pin) {
@@ -521,6 +657,11 @@ void wl_xb_pg_stats(WlXbMemStats *out) {
     out->swap_writes = g_st.swap_writes;
     out->zero_outs = g_st.zero_outs;
     out->swap_ins_spared = g_st.discards;
+    out->file_copies = g_st.file_copies;
+    out->file_evictions = g_st.file_evictions;
+    out->file_ins = g_st.file_ins;
+    out->file_forgets = g_st.file_forgets;
+    out->file_forget_ins = g_st.file_forget_ins;
     out->swap_read_bytes = g_st.read_bytes;
     out->swap_write_bytes = g_st.write_bytes;
     out->swap_us = g_st.io_us;
@@ -538,8 +679,8 @@ static void swap_open(const WlXbMemConfig *cfg) {
     uint32_t bytes = cfg->swap_bytes != 0 ? cfg->swap_bytes : cfg->ram_bytes;
     bytes &= ~(PAGE - 1u);
     g_slots = bytes / PAGE;
-    if (g_slots > 0xFFFFu) {
-        g_slots = 0xFFFFu; // slot + 1 is 16 bits
+    if (g_slots > FILE_SLOT - 1u) {
+        g_slots = FILE_SLOT - 1u; // slot + 1 is 15 bits (FILE_SLOT marks a file copy)
     }
     g_slot_used = calloc((g_slots + 31u) / 32u, sizeof *g_slot_used);
     g_io = aligned_alloc(64, BATCH * PAGE);
@@ -572,7 +713,8 @@ size_t wl_xb_pg_host_bytes(void) {
         return 0;
     }
     size_t pages = g_xb_ram_pages;
-    return pages * (sizeof *g_xb_pg_flags + sizeof *g_xb_pg_frame + sizeof *g_xb_pg_slot + sizeof *g_xb_pg_wgen) +
+    return pages * (sizeof *g_xb_pg_flags + sizeof *g_xb_pg_frame + sizeof *g_xb_pg_slot + sizeof *g_xb_pg_wgen +
+                    sizeof *g_foff) +
            (g_xb_pg_frames + 1u) * sizeof *g_owner + g_xb_pg_frames * sizeof *g_free +
            (g_slot_used != NULL ? (g_slots + 31u) / 32u * sizeof *g_slot_used : 0u) + (g_io != NULL ? BATCH * PAGE : 0u);
 }
@@ -588,8 +730,9 @@ WlResult wl_xb_pg_init(const WlXbMemConfig *cfg, uint32_t frames) {
     g_owner = calloc(frames + 1u, sizeof *g_owner);
     g_free = calloc(frames, sizeof *g_free);
     g_xb_pg_wgen = calloc(pages, sizeof *g_xb_pg_wgen);
+    g_foff = calloc(pages, sizeof *g_foff);
     if (g_xb_pg_flags == NULL || g_xb_pg_frame == NULL || g_xb_pg_slot == NULL || g_owner == NULL || g_free == NULL ||
-        g_xb_pg_wgen == NULL) {
+        g_xb_pg_wgen == NULL || g_foff == NULL) {
         return WL_ERR_NOMEM;
     }
     for (uint32_t f = frames; f >= 1u; f--) {

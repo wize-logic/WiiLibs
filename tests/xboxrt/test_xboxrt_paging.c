@@ -3,7 +3,8 @@
 // (paging.c's clock and swap file) through SIGSEGV and mprotect. Zero pages give their frames back
 // for nothing, changed pages go to the swap file in batches and come back on their next touch,
 // clean pages read back cost no write when they go again, changed pages cleared to zero go as zero
-// pages, a file read over swapped pages does not read them back first, both EAs of a page see one page
+// pages, a file read over swapped pages does not read them back first, pages a file read filled
+// whole go for nothing and come back from the file until they change or the file does, both EAs of a page see one page
 // whatever happened to its frame, pinned pages keep theirs, relocations and frees carry the
 // paging state, accesses across two pages and copies between two buffers larger than the pool
 // work, devices still fault, and the write watch sees the stores to a range (and only those: not
@@ -496,6 +497,125 @@ TEST file_reads_spare_swap_ins(void) {
     PASS();
 }
 
+#if !defined(WL_XBRT_PAGING_NO_SWAP)
+// A file of `pages` pages of pattern `seed` as the guest reads it (little-endian words), open
+// read-write.
+static WlPlatformFile *pattern_file(const char *path, uint32_t pages, uint32_t seed) {
+    WlPlatformFile *f = NULL;
+    if (wl_platform_fs_open(path, WL_FILE_READ_WRITE, &f) != WL_OK) {
+        return NULL;
+    }
+    static uint8_t page[PAGE];
+    for (uint32_t i = 0; i < pages; i++) {
+        memset(page, 0, sizeof page);
+        for (uint32_t off = 0; off < PAGE; off += 1024u) {
+            wl_wr_le32(page + off, word(seed, i, off));
+        }
+        if (wl_platform_fs_write_at(f, (uint64_t)i * PAGE, page, PAGE) != WL_OK) {
+            wl_platform_fs_close(f);
+            return NULL;
+        }
+    }
+    return f;
+}
+
+// A file read as the kernel's: `pages` pages of `f` from page `at` to `va` in 64 KB chunks, then
+// the whole pages remember the file.
+static void file_read(uint32_t va, WlPlatformFile *f, uint32_t at, uint32_t pages) {
+    static uint8_t buf[16u * PAGE];
+    for (uint32_t i = 0; i < pages; i += 16u) {
+        uint32_t k = pages - i < 16u ? pages - i : 16u;
+        if (wl_platform_fs_read_at(f, (uint64_t)(at + i) * PAGE, buf, k * PAGE) == WL_OK) {
+            wl_xb_copy_in(va + i * PAGE, buf, k * PAGE);
+        }
+    }
+    wl_xb_file_pages(va, pages * PAGE, f, (uint64_t)at * PAGE);
+}
+
+TEST file_pages_need_no_swap_out(void) {
+    up();
+    const uint32_t n = 2u * FRAMES;
+    WlPlatformFile *f = pattern_file("sd:/filed.bin", n, 21);
+    ASSERT(f != NULL);
+    uint32_t va = alloc(n);
+    ASSERT(va != 0);
+    WlXbMemStats a = stats();
+    file_read(va, f, 0, n); // (pages taken back during the read are written out, then forget it)
+    WlXbMemStats b = stats();
+    ASSERT_EQ(n, b.file_copies - a.file_copies);
+    // twice the pool read twice: each page comes back from the file and goes with nothing written
+    ASSERT(check(va, n, 21));
+    ASSERT(check(va, n, 21));
+    WlXbMemStats c = stats();
+    ASSERT_EQ(0u, c.swap_outs - b.swap_outs);
+    ASSERT_EQ(0u, c.swap_ins - b.swap_ins);
+    ASSERT(c.file_ins - b.file_ins >= n);
+    ASSERT(c.file_evictions - b.file_evictions >= n);
+    // a read over pages that went: not read back from the file to be overwritten
+    file_read(va, f, 0, n);
+    WlXbMemStats d = stats();
+    ASSERT_EQ(c.file_ins, d.file_ins);
+    ASSERT(check(va, n, 21));
+    // freed: the file's pages are gone with the memory, nothing is left to forget
+    ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
+    WlXbMemStats e = stats();
+    ASSERT_EQ(WL_OK, wl_xb_file_forget(f, 0, UINT64_MAX));
+    WlXbMemStats g = stats();
+    ASSERT_EQ(e.file_forgets, g.file_forgets);
+    wl_platform_fs_close(f);
+    wl_platform_fs_remove("sd:/filed.bin");
+    PASS();
+}
+
+TEST file_pages_forget_their_file(void) {
+    up();
+    const uint32_t n = 2u * FRAMES, half = FRAMES;
+    WlPlatformFile *f = pattern_file("sd:/forget.bin", n, 22);
+    ASSERT(f != NULL);
+    uint32_t va = alloc(n);
+    ASSERT(va != 0);
+    file_read(va, f, 0, n);
+    // a store: that page is no longer the file's (written to the swap file if it goes)
+    wl_xb_wr32(va + 5u * PAGE + 8u, 0xC0FFEEu);
+    ASSERT(check(va, n, 22)); // (every page taken back once)
+    WlXbMemStats b = stats();
+    ASSERT_EQ(0xC0FFEEu, wl_xb_rd32(va + 5u * PAGE + 8u));
+    // its first half written over: forgotten first, the guest keeps the bytes it read
+    ASSERT_EQ(WL_OK, wl_xb_file_forget(f, 0, (uint64_t)half * PAGE));
+    WlXbMemStats c = stats();
+    ASSERT(c.file_forgets - b.file_forgets >= half - 1u);
+    ASSERT(c.file_forget_ins > b.file_forget_ins);
+    static uint8_t page[PAGE];
+    memset(page, 0x5A, sizeof page);
+    for (uint32_t i = 0; i < half; i++) {
+        ASSERT_EQ(WL_OK, wl_platform_fs_write_at(f, (uint64_t)i * PAGE, page, PAGE));
+    }
+    ASSERT(check(va, n, 22));
+    ASSERT_EQ(0xC0FFEEu, wl_xb_rd32(va + 5u * PAGE + 8u));
+    // a forget of a range that starts inside a page takes that page too
+    ASSERT_EQ(WL_OK, wl_xb_file_forget(f, (uint64_t)(half + 3u) * PAGE + 100u, 1));
+    WlXbMemStats d = stats();
+    ASSERT_EQ(1u, d.file_forgets - c.file_forgets);
+    // cut short past the half and three pages: what it held stays
+    ASSERT_EQ(WL_OK, wl_xb_file_forget(f, (uint64_t)(half + 4u) * PAGE, UINT64_MAX));
+    ASSERT_EQ(WL_OK, wl_platform_fs_truncate(f, (uint64_t)(half + 4u) * PAGE));
+    ASSERT(check(va, n, 22));
+    // closed (and gone): every page forgotten, none reads from it again
+    ASSERT_EQ(WL_OK, wl_xb_file_forget(f, 0, UINT64_MAX));
+    wl_platform_fs_close(f);
+    wl_platform_fs_remove("sd:/forget.bin");
+    WlXbMemStats e = stats();
+    ASSERT(check(va, n, 22));
+    ASSERT(check(va, n, 22));
+    ASSERT_EQ(0xC0FFEEu, wl_xb_rd32(va + 5u * PAGE + 8u));
+    WlXbMemStats g = stats();
+    ASSERT_EQ(e.file_ins, g.file_ins);
+    ASSERT(g.swap_ins > e.swap_ins);
+    ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
+    PASS();
+}
+#endif
+
 TEST across_pages_and_big_copies(void) {
     up();
     const uint32_t n = 2u * FRAMES; // each buffer twice the pool
@@ -605,6 +725,8 @@ SUITE(paging) {
     RUN_TEST(freed_pages_come_back_zero);
     RUN_TEST(cleared_pages_go_out_as_zero);
     RUN_TEST(file_reads_spare_swap_ins);
+    RUN_TEST(file_pages_need_no_swap_out);
+    RUN_TEST(file_pages_forget_their_file);
     RUN_TEST(across_pages_and_big_copies);
     RUN_TEST(files_written_from_paged_out_memory);
 #else

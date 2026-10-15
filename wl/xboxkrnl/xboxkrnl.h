@@ -84,6 +84,10 @@ typedef struct {
     uint32_t pool_bytes;
 } WlXkStats;
 void wl_xk_stats(WlXkStats *out);
+// A host file the kernel may have open was changed by someone else (the play harness's checkpoint
+// snapshots): guest pages filled from its bytes forget them (mem.h, wl_xb_file_pages). Before the
+// change; `host` as the kernel names it (the data folder's path, then the file's).
+void wl_xk_file_changed(const char *host);
 
 #ifdef __cplusplus
 }
