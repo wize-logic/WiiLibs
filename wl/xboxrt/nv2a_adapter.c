@@ -41,7 +41,8 @@ static struct {
 
 static WlResult cap_write(void *user, const void *data, uint32_t bytes) {
     (void)user;
-    return g_cap.file != NULL ? wl_platform_fs_write(g_cap.file, data, bytes) : WL_ERR_STATE;
+    // (the capture's blocks of guest memory come as host pointers into it, which may be paged out)
+    return g_cap.file != NULL ? wl_xb_file_write(g_cap.file, data, bytes) : WL_ERR_STATE;
 }
 
 void wl_xb_gpu_capture(const char *path, uint32_t frames, uint32_t after_vblanks) {

@@ -680,6 +680,26 @@ void wl_xb_copy_out(void *dst, uint32_t va, uint32_t n) {
     }
 }
 
+WlResult wl_xb_file_write(struct WlPlatformFile *file, const void *data, uint32_t bytes) {
+    const uintptr_t lo = WL_XB_HOST_BASE, at = (uintptr_t)data;
+    if (at < lo || at - lo >= WL_XB_EA_SPAN || g_xb_pg_frames == 0) {
+        return wl_platform_fs_write(file, data, bytes); // host memory, or guest memory never paged
+    }
+    static uint8_t bounce[2048]; // (the guest lock's holder: one writer)
+    const uint8_t *src = data;
+    while (bytes > 0) {
+        uint32_t n = bytes < sizeof bounce ? bytes : (uint32_t)sizeof bounce;
+        memcpy(bounce, src, n); // a page without a frame faults in here
+        WlResult r = wl_platform_fs_write(file, bounce, n);
+        if (r != WL_OK) {
+            return r;
+        }
+        src += n;
+        bytes -= n;
+    }
+    return WL_OK;
+}
+
 void wl_xb_fill(uint32_t va, uint8_t byte, uint32_t n) {
     if (n != 0) {
         memset(wl_xb_ptr(va), byte, n);

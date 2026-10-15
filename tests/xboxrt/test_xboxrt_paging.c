@@ -470,6 +470,43 @@ TEST across_pages_and_big_copies(void) {
     PASS();
 }
 
+// A file written straight from guest memory (the GPU capture's blocks), its pages swapped out: the
+// bytes go through a bounce buffer, as the OS's write of a page without a frame fails instead of
+// faulting it in.
+TEST files_written_from_paged_out_memory(void) {
+    up();
+    const uint32_t n = 2u * FRAMES;
+    uint32_t a = alloc(n);
+    ASSERT(a != 0);
+    fill(a, n, 9);
+    ASSERT(!wl_xb_mem_resident(a)); // the first pages went to the swap file for the last ones
+    WlPlatformFile *f = NULL;
+    ASSERT_EQ(WL_OK, wl_platform_fs_open("sd:/capture.bin", WL_FILE_WRITE_NEW, &f));
+    ASSERT_EQ(WL_OK, wl_xb_file_write(f, wl_xb_ptr(a), n * PAGE));
+    uint32_t host_word = 0x5A5AA5A5u;
+    ASSERT_EQ(WL_OK, wl_xb_file_write(f, &host_word, 4)); // host memory as it is
+    wl_platform_fs_close(f);
+    char path[300];
+    snprintf(path, sizeof path, "%s/capture.bin", g_dir);
+    FILE *h = fopen(path, "rb");
+    ASSERT(h != NULL);
+    uint8_t buf[PAGE];
+    bool same = true;
+    for (uint32_t i = 0; i < n && same; i++) {
+        same = fread(buf, 1, PAGE, h) == PAGE;
+        for (uint32_t off = 0; same && off < PAGE; off += 1024u) {
+            same = wl_rd_le32(buf + off) == word(9, i, off);
+        }
+    }
+    uint32_t tail = 0;
+    same = same && fread(&tail, 1, 4, h) == 4 && tail == host_word;
+    fclose(h);
+    unlink(path);
+    ASSERT(same);
+    ASSERT_EQ(WL_OK, wl_xb_va_release(a, NULL));
+    PASS();
+}
+
 #else // no swap file
 
 static sigjmp_buf g_crash_jmp;
@@ -517,6 +554,7 @@ SUITE(paging) {
     RUN_TEST(relocation_carries_swapped_pages);
     RUN_TEST(freed_pages_come_back_zero);
     RUN_TEST(across_pages_and_big_copies);
+    RUN_TEST(files_written_from_paged_out_memory);
 #else
     RUN_TEST(changed_pages_need_a_swap_file);
 #endif
