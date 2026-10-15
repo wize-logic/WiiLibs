@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 #include <setjmp.h>
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "greatest.h"
@@ -223,6 +224,54 @@ static void fake_write(void *user, uint32_t off, uint32_t v, unsigned size) {
     *w = (*w & ~mask) | ((v << (size == 4 ? 0 : shift)) & mask);
 }
 
+// wl_xb_range_ok's inline half answers as the out-of-line one does (the check it always was), with
+// the memo cold and warm, over mapped, unmapped, page-crossing, wrapping and straddling ranges.
+static int range_grid_agrees(uint32_t base) {
+    static const uint32_t offs[] = {0, 1, 2, 0x7F0u, 0xFF0u, 0xFFCu, 0xFFDu, 0xFFEu, 0xFFFu};
+    static const uint32_t ns[] = {0, 1, 2, 3, 4, 8, 16, 0xFFFu, 0x1000u, 0x1001u, 0x2000u, 0x3000u, 0x10000u,
+                                  0x80000000u, 0xFFFFF000u, 0xFFFFF001u, 0xFFFFFFFEu, 0xFFFFFFFFu};
+    static const uint32_t extra[] = {0, 0x0FFFF000u, 0x10000000u, 0x80000000u, 0x83FFF000u, 0x84000000u,
+                                     0xF0000000u, 0xFD000000u, 0xFFFFF000u};
+    for (uint32_t k = 0; k < 8u + sizeof extra / sizeof extra[0]; k++) {
+        uint32_t page = k < 8u ? base + (k << WL_XB_PAGE_SHIFT) : extra[k - 8u];
+        for (unsigned o = 0; o < sizeof offs / sizeof offs[0]; o++) {
+            for (unsigned i = 0; i < sizeof ns / sizeof ns[0]; i++) {
+                uint32_t va = page + offs[o], n = ns[i];
+                bool cold = wl_xb_range_ok(va, n), slow = wl_xb_range_ok_slow(va, n), warm = wl_xb_range_ok(va, n);
+                if (cold != slow || warm != slow) {
+                    fprintf(stderr, "range_ok(%08x, %x): inline %d/%d, slow %d\n", (unsigned)va, (unsigned)n, cold, warm, slow);
+                    return 0;
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+TEST range_ok_inline_agrees(void) {
+    up();
+    uint32_t va = 0x03000000u;
+    ASSERT_EQ(WL_OK, wl_xb_va_reserve(&va, 0x8000u, 0, WL_XB_PROT_READWRITE));
+    ASSERT_EQ(WL_OK, wl_xb_va_commit(va + 0x1000u, 0x2000u, WL_XB_PROT_READWRITE)); // pages 1 and 2
+    ASSERT_EQ(WL_OK, wl_xb_va_commit(va + 0x4000u, 0x1000u, WL_XB_PROT_READWRITE)); // page 4
+    ASSERT(range_grid_agrees(va));
+    // what it answers, besides agreeing
+    ASSERT(wl_xb_range_ok(va + 0x1FFCu, 4));
+    ASSERT(wl_xb_range_ok(va + 0x1FFEu, 4));       // pages 1 and 2: crossing, both committed
+    ASSERT(!wl_xb_range_ok(va + 0x2FFEu, 4));      // into page 3, never committed
+    ASSERT(!wl_xb_range_ok(va + 0x1FFFu, 0xFFFFFFFFu)); // wraps back into its own page
+    ASSERT(wl_xb_range_ok(va + 0x1000u, 0));
+    ASSERT(!wl_xb_range_ok(va + 0x3000u, 4));
+    ASSERT_EQ(WL_OK, wl_xb_va_decommit(va + 0x2000u, 0x1000u)); // empties the memo
+    ASSERT(!wl_xb_range_ok(va + 0x2000u, 4));
+    ASSERT(!wl_xb_range_ok(va + 0x1FFEu, 4));
+    ASSERT(range_grid_agrees(va));
+    ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
+    ASSERT(!wl_xb_range_ok(va + 0x1000u, 4));
+    ASSERT(range_grid_agrees(va));
+    PASS();
+}
+
 #define DEV_VA 0xFE400000u
 
 TEST device_faults(void) {
@@ -293,6 +342,7 @@ SUITE(mem_suite) {
     RUN_TEST(contiguous_allocator);
     RUN_TEST(pinned_range_moves_user_pages);
     RUN_TEST(reservations_and_queries);
+    RUN_TEST(range_ok_inline_agrees);
     RUN_TEST(device_faults);
     RUN_TEST(crash_on_missing_memory);
 }
