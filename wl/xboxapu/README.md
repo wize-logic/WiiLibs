@@ -48,8 +48,9 @@ What the model does:
   from index 2: status 1 in byte 15) when it ends or a segment list is done, with the voice and
   notify interrupt bits; an idle voice found in a list traps the front end (FECTL trapped,
   FEDECMETH 0x8000, FEDECPARAM the voice) when FETFORCE1 asks for it, which is how DirectSound
-  takes finished voices out of its lists. The run stops at a trap so the guest's interrupt handler
-  answers before the next frame.
+  takes finished voices out of its lists. The run stops after a frame that trapped or played out a
+  stream's segment list, so the guest's interrupt handler answers (and gives the stream its next
+  list) before the next frame; the caller runs the frames left after the interrupt.
 - **The DSPs**: their memories and registers keep what is written (a title reads effect
   parameters back). Their programs do not run. DirectSound's effects program takes commands from a
   word in the GP's scratch memory (byte 0x810 of the pages GPSADDR maps) and DirectSound waits for
@@ -78,7 +79,8 @@ The primary codec's registers (ready: the powerdown register's low bits stay set
 control and status (the primary codec ready bit; `cfg.codec_ready`), the codec access semaphore
 (always free), and the bus masters: PCM out (0x110) and S/PDIF out (0x170) run through their
 buffer descriptor lists at 48 kHz stereo (`wl_xbox_ac97_advance`), setting buffer-complete and
-last-valid-buffer status, stopping at the last valid buffer until a new one is given, and raising
+last-valid-buffer status, stopping at the last valid buffer until a new one is given (an LVI write
+that names the current buffer again leaves it halted), and raising
 the interrupt line their control bits enable. What the descriptors point at is not read: the APU's
 mix is the sound.
 
@@ -101,8 +103,8 @@ guest memory: 16-bit PCM through scattered pages reaching its bins exactly, volu
 8/24/32-bit and stereo formats, pitch at half and double rate, a loop's wrap and a one-shot's end
 (position, notifier, interrupt), the idle-voice trap and the guest's answer, Xbox ADPCM against
 `wl_xbox_adpcm_decode_block` (64 samples a block, blocks across pages), a stream's two segment
-lists, its starvation and refill, the amplitude envelope's stages, a multipass voice, the GP's
+lists (each run ending with the list it played out), its starvation and refill, the amplitude envelope's stages, a multipass voice, the GP's
 command word and the fence, a 3D voice's submix bins, and the AC'97 bus master's descriptors,
-status and interrupt. `bench_xboxapu_checksum` (host and ppc-be): the benchmark's scene for 3000
+status and interrupt, and its halt at the last valid buffer. `bench_xboxapu_checksum` (host and ppc-be): the benchmark's scene for 3000
 frames, its checksum of every frame's bins and output against the one the voice processor made
 before it was reworked for speed.

@@ -408,7 +408,17 @@ TEST a_stream_plays_its_lists_in_turn_and_waits_for_more(void) {
     m(apu, 0x2F8, 50);
     m(apu, 0x35C, 0x20u << 8 | 1u); // B: entry 0x20
     int16_t out[8 * 64];
-    ASSERT_EQ(8u, wl_xbox_apu_run(apu, 8, out));
+    // a run ends after the frame that played a list out (its notifier is up for the ISR), and the
+    // caller runs the rest: list A's notifier is up when the first run ends, list B's is not yet
+    uint32_t done = wl_xbox_apu_run(apu, 8, out);
+    ASSERT(done >= 2u && done < 8u);
+    ASSERT_EQ(1, notifier(50, 0));
+    ASSERT_EQ(0, notifier(50, 1));
+    uint32_t n = wl_xbox_apu_run(apu, 8u - done, out + done * 64u);
+    ASSERT(n >= 1u && done + n < 8u);
+    ASSERT_EQ(1, notifier(50, 1)); // the second run ended with list B
+    done += n;
+    ASSERT_EQ(8u - done, wl_xbox_apu_run(apu, 8u - done, out + done * 64u)); // out of data: whole
     for (uint32_t i = 32; i < 128; i++) {
         ASSERT_EQ((int)(i + 1), out[2 * i]); // A then B back to back: 1..128
     }
@@ -422,7 +432,9 @@ TEST a_stream_plays_its_lists_in_turn_and_waits_for_more(void) {
     segment(0x30, STREAM + 256, 32, 1);
     m(apu, 0x2F8, 50);
     m(apu, 0x320, 0x30u << 8 | 1u);
-    ASSERT_EQ(2u, wl_xbox_apu_run(apu, 2, out));
+    done = wl_xbox_apu_run(apu, 2, out); // the voice fetches ahead: its 32-sample list notifies in frame 0
+    ASSERT_EQ(1u, done);
+    ASSERT_EQ(1u, wl_xbox_apu_run(apu, 1, out + 64));
     ASSERT_EQ(0, out[0]);   // from the silence ...
     ASSERT_EQ(129, out[2]); // ... into the new data (byte 256: sample 128)
     ASSERT_EQ(129 + 31, out[2 * 32]);
@@ -578,6 +590,11 @@ TEST the_ac97_bus_master_runs_its_descriptors(void) {
     wl_xbox_ac97_advance(ac, 64);                              // the last valid buffer: halt
     ASSERT_EQ(0x0Fu, wl_xbox_ac97_read(ac, 0x116, 2) & 0x0Fu); // halted, last, last done, done
     wl_xbox_ac97_write(ac, 0x116, 0x1C, 2);
+    wl_xbox_ac97_write(ac, 0x115, 1, 1); // the same last buffer again: it stays halted on it
+    ASSERT_EQ(1u, wl_xbox_ac97_read(ac, 0x114, 1));
+    ASSERT_EQ(0x01u, wl_xbox_ac97_read(ac, 0x116, 2) & 0x01u);
+    wl_xbox_ac97_advance(ac, 64);
+    ASSERT_EQ(1u, wl_xbox_ac97_read(ac, 0x114, 1)); // nothing played
     wl_xbox_ac97_write(ac, 0x115, 3, 1); // more buffers: it goes on with 2
     ASSERT_EQ(2u, wl_xbox_ac97_read(ac, 0x114, 1));
     ASSERT_EQ(0u, wl_xbox_ac97_read(ac, 0x116, 2) & 0x01u);

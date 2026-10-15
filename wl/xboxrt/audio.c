@@ -9,7 +9,9 @@
 // its own thread (the Wii), the tick keeps `latency_frames` frames queued ahead of it, so the
 // guest's audio clock follows the output's. Without one (the host's stub), frames follow the
 // wall clock. Either way a tick does at most 64 frames: the guest falling far behind skips time
-// rather than catching up in a burst.
+// rather than catching up in a burst. A run ends early after a frame that trapped or notified a
+// stream's list (the ISR answers first, as on the Xbox, where it runs within the frame); the
+// frames it left are due still, and the next tick makes them.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

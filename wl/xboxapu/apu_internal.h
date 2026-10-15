@@ -74,6 +74,7 @@ struct WlXboxApu {
     uint32_t inbuf_sge, outbuf_sge;
     uint8_t hrtf_submix[4];
     bool trap_pending; // a trap raised in this run: stop after the frame
+    bool list_notified; // a stream's segment list played out in this frame: stop after it
     uint32_t sge_gen;  // counts page table and segment table writes (voices' page caches)
     WlApuVoice voice[WL_XBOX_APU_VOICES];
     int32_t mix[WL_XBOX_APU_BINS][WL_XBOX_APU_FRAME];

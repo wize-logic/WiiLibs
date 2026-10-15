@@ -68,8 +68,10 @@ bool wl_xbox_apu_running(const WlXboxApu *apu);
 
 // Runs up to `frames` frames and writes 32 stereo samples a frame to `out` (interleaved, host
 // order; NULL drops them). While the voice processor does not run, a frame is silence. Returns
-// the frames done: fewer when the front end traps in the middle (the guest's interrupt handler
-// has to answer first), so the caller runs the rest after the interrupt.
+// the frames done: fewer when the front end traps in the middle, or when a stream played out a
+// segment list (its notifier and FE_VOICE are up: the guest's interrupt handler answers, and
+// gives the stream its next list, before the next frame), so the caller runs the rest after the
+// interrupt.
 uint32_t wl_xbox_apu_run(WlXboxApu *apu, uint32_t frames, int16_t *out);
 
 // The 32 mixbins of the last frame (bin * 32 + sample, 16-bit scale), for tests.
