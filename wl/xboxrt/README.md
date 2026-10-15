@@ -77,6 +77,10 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
   writes up to 32 of them (128 KB) in one write to consecutive free slots, then takes their frames,
   which leaves free frames for the next touches. A page read back is read alone (4 KB): only what
   is touched.
+- **Nothing written or read that need not be.** A changed page found zero again when its batch is
+  gathered becomes a zero page (no write, and its next touch zero-fills it). A file read into guest
+  memory (`wl_xb_copy_in`) overwrites whole pages: a swapped one among them forgets its slot first
+  (`wl_xb_pg_discard`), so the read does not fetch from the swap file bytes it is about to replace.
 - **The swap file**: `<the title's hard disk folder>/pagefile.sys` (`WlXbTitleConfig.swap_path`, ""
   for none), the guest RAM's size by default, grown once (the card allocates its clusters then, not
   during play) and kept; its contents mean nothing across runs. Slots are pages; a bit map says
@@ -118,9 +122,10 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
   watched page for writing only on a write. A swap-out and read back keep the page's bytes and its
   epoch. Not where the MMU does not record C, and never for a pinned page on the host (open for
   writing for good): there the caller compares the bytes.
-- **Statistics.** `WlXbMemStats` (evictions, the clean ones and those made in the fault, swap-ins,
-  swap-outs and their write calls, bytes, time in swap I/O, slots), a second `[xbirq] status:` line
-  every 10 s when paging, and a `thrashing:` warning when more than 128 pages a second (512 KB/s)
+- **Statistics.** `WlXbMemStats` (evictions, the clean ones, those made in the fault and those found
+  zero, swap-ins and those a file read spared, swap-outs and their write calls, bytes, time in swap
+  I/O, slots), two more `[xbirq] status:` lines every 10 s when paging (`paging` and `swap`: the
+  Wii's log cuts a longer one), and a `thrashing:` warning when more than 128 pages a second (512 KB/s)
   are read back (`wl_xb_mem_watch`, once a second on the service thread).
 - **The host at the Wii's size.** `WlXbMemConfig.frame_limit_bytes` (`WlXbTitleConfig.frame_pool_bytes`,
   or `WL_XB_FRAME_MB` / `WL_XB_FRAME_KB` in the environment) pages a host run as the Wii would:
@@ -528,7 +533,8 @@ Wii, `abort` elsewhere; `wl_xb_crash_set_stop` replaces it).
 - `tests/xboxrt/test_xboxrt_mem.c`: addresses, aliasing, lazy backing, pinned allocations that move
   user pages, reservations, device faults through the host's decoder, the crash path (host, ppc-be).
 - `tests/xboxrt/test_xboxrt_paging.c`: demand paging under a frame limit of 64 frames (host, ppc-be):
-  zero pages, swap-outs in batches and swap-ins, clean pages going for nothing, both EAs of a page,
+  zero pages, swap-outs in batches and swap-ins, clean pages going for nothing, changed pages
+  cleared to zero going for nothing, file reads over swapped pages not reading them back, both EAs of a page,
   pinned pages, relocations and frees of swapped pages, accesses across pages and copies between
   buffers larger than the pool; built again without a swap file (`test_xboxrt_paging_no_swap`).
 - `tests/xboxrt/test_xboxrt_decode.c`: the PowerPC decoder over a matrix of forms, the x86-64

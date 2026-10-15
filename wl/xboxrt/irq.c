@@ -470,13 +470,16 @@ static void status_report(void) {
     }
     if (m.frames_total != 0) {
         // demand paging: what the frames' shortage costs
-        WL_LOG_I(TAG, "status: paging %u of %u frames free, %u pinned; %u evictions (%u clean, %u in the fault), "
-                 "%u swap-ins (%u KB), %u swap-outs (%u KB in %u writes), swap I/O %u ms; %u of %u swap pages used",
+        // (two lines: the Wii's log cuts a long one)
+        WL_LOG_I(TAG, "status: paging %u of %u frames free, %u pinned; %u evictions (%u clean, %u in the fault, "
+                 "%u found zero); %u of %u swap pages used",
                  (unsigned)m.frames_free, (unsigned)m.frames_total, (unsigned)m.pinned_pages, (unsigned)m.evictions,
-                 (unsigned)m.clean_evictions, (unsigned)m.fast_evictions, (unsigned)m.swap_ins,
-                 (unsigned)(m.swap_read_bytes >> 10), (unsigned)m.swap_outs, (unsigned)(m.swap_write_bytes >> 10),
-                 (unsigned)m.swap_writes, (unsigned)(m.swap_us / 1000u), (unsigned)m.swap_slots_used,
-                 (unsigned)m.swap_slots);
+                 (unsigned)m.clean_evictions, (unsigned)m.fast_evictions, (unsigned)m.zero_outs,
+                 (unsigned)m.swap_slots_used, (unsigned)m.swap_slots);
+        WL_LOG_I(TAG, "status: swap %u ins (%u KB, %u spared by file reads), %u outs (%u KB in %u writes), I/O %u ms",
+                 (unsigned)m.swap_ins, (unsigned)(m.swap_read_bytes >> 10), (unsigned)m.swap_ins_spared,
+                 (unsigned)m.swap_outs, (unsigned)(m.swap_write_bytes >> 10), (unsigned)m.swap_writes,
+                 (unsigned)(m.swap_us / 1000u));
     }
 }
 

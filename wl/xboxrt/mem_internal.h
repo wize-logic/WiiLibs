@@ -98,6 +98,10 @@ uint32_t wl_xb_pg_frame_fast(uint32_t p, uint32_t keep);
 WlResult wl_xb_pg_fault(uint32_t p, uint32_t keep);
 // The pages' contents are no longer wanted: unmapped, frames and slots back, flags cleared.
 void wl_xb_pg_release(uint32_t p, uint32_t pages);
+// The pages' bytes are about to be overwritten whole (a file read into them): a swapped page forgets
+// its copy in the swap file, so that the touch that follows zero-fills it instead of reading it back.
+// Resident pages are left as they are.
+void wl_xb_pg_discard(uint32_t p, uint32_t pages);
 // The user page in physical page `from` moves to physical page `to` (free): its frame, slot and
 // flags go with it. Both are unmapped.
 void wl_xb_pg_move(uint32_t from, uint32_t to);
