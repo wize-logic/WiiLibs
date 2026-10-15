@@ -407,6 +407,30 @@ def dolphin_messages(log: Path, most: int = 24):
     return messages
 
 
+class RunWatch:
+    """when a run ends early: a --fail line ends it grace seconds later (what the program writes after it, a freeze
+    watch's profile, still reaches the log); no new line for idle seconds ends it at once (a hang that stops the
+    program's own watchers too). update() is given the log's lines and the time, and says why it changed course"""
+
+    def __init__(self, fail, grace: float, idle: float, started: float, deadline: float):
+        self.fail, self.grace, self.idle = fail, grace, idle
+        self.started, self.deadline = started, deadline
+        self.failed = self.idle_ended = False
+        self.count, self.changed = 0, started
+
+    def update(self, lines, now: float) -> str:
+        if len(lines) != self.count:
+            self.count, self.changed = len(lines), now
+        if not self.failed and self.fail is not None and any(self.fail.search(line) for line in lines):
+            self.failed = True
+            self.deadline = min(self.deadline, now + self.grace)
+            return f"a --fail line after {now - self.started:.0f} s; ending the run in {self.grace:g} s"
+        if self.idle and now - self.changed > self.idle:
+            self.failed = self.idle_ended = True
+            return f"no new OSREPORT line for {self.idle:g} s; ending the run"
+        return ""
+
+
 def osreport_lines(log: Path):
     if not log.exists():
         return []
@@ -420,7 +444,15 @@ def main() -> int:
     parser.add_argument("--dolphin", help="Dolphin.exe (default: WL_DOLPHIN, else Documents/Emulators/Dolphin-x64)")
     parser.add_argument("--seconds", type=float, default=30, help="the longest to wait (default 30)")
     parser.add_argument("--until", help="stop once an OSREPORT line contains this text")
-    parser.add_argument("--fail", help="a regular expression; an OSREPORT line matching it fails the run")
+    parser.add_argument("--fail", help="a regular expression; an OSREPORT line matching it fails the run and ends it "
+                                       "--fail-grace seconds later (a recompiled title's freeze, stall and crash "
+                                       "reports: 'freeze: no new frame|stall: no scheduling|\\*\\*\\* CRASH')")
+    parser.add_argument("--fail-grace", type=float, default=15,
+                        help="seconds a run goes on after a --fail line, so what the program writes after it (a "
+                             "freeze watch's 10 s profile) reaches the log (default 15)")
+    parser.add_argument("--idle", type=float, default=0,
+                        help="end the run, failed, when no new OSREPORT line comes for this many seconds (a hang that "
+                             "stops the program's own watchers too); 0, the default, never")
     parser.add_argument("--sd", type=Path, help="a folder synced in as the virtual SD card (sd:/)")
     parser.add_argument("--sd-out", type=Path, metavar="DIR",
                         help="after the run, copy here what the program wrote to the card (files new or changed "
@@ -511,9 +543,15 @@ def main() -> int:
     failed = False
     started = time.monotonic()
     deadline = started + args.seconds
-    while time.monotonic() < deadline and process.poll() is None:
+    watch = RunWatch(fail, args.fail_grace, args.idle, started, deadline)
+    while time.monotonic() < watch.deadline and process.poll() is None:
         lines = osreport_lines(log)
-        failed = fail is not None and any(fail.search(line) for line in lines)
+        note = watch.update(lines, time.monotonic())
+        if note:
+            print(f"dolphin_run.py: {note}", file=sys.stderr)
+        failed = watch.failed
+        if watch.idle_ended:
+            break
         if args.until and any(args.until in line for line in lines):
             seen_until = True
             time.sleep(2)  # the frame after it reaches the screen

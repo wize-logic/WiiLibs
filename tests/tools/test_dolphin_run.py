@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: MIT
 """Tests for the parts of tools/dolphin_run.py that need no Dolphin: which files of the card a run
 changed (card_changes) and their copy out (copy_out, --sd-out), the copy in of the card (copy_tree), and
-the command line's refusal of --sd-out without --sd."""
+when a run ends early (RunWatch), and the command line's refusal of --sd-out without --sd."""
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,35 @@ class CopyTreeTests(unittest.TestCase):
         write(self.copy, "hdd/raw5.bin", b"partition")
         dolphin_run.copy_tree(self.source, self.copy)
         self.assertFalse((self.copy / "hdd/raw5.bin").exists())
+
+
+class RunWatchTests(unittest.TestCase):
+    FREEZE = re.compile(r"freeze: no new frame|\*\*\* CRASH")
+
+    def test_a_fail_line_ends_the_run_after_the_grace(self):
+        watch = dolphin_run.RunWatch(self.FREEZE, 15, 0, 0.0, 1800.0)
+        self.assertEqual("", watch.update(["[I][play] ticks 30"], 10.0))
+        self.assertEqual(1800.0, watch.deadline)
+        self.assertIn("--fail line", watch.update(["[I][play] ticks 30", "[W][xbirq] freeze: no new frame for 30 s"], 40.0))
+        self.assertTrue(watch.failed)
+        self.assertEqual(55.0, watch.deadline)
+        watch.update(["a", "b", "c"], 50.0)  # a later line keeps the earlier deadline
+        self.assertEqual(55.0, watch.deadline)
+
+    def test_a_silent_program_ends_the_run_when_idle_is_set(self):
+        watch = dolphin_run.RunWatch(None, 15, 60, 0.0, 1800.0)
+        watch.update(["one"], 5.0)
+        watch.update(["one"], 64.0)
+        self.assertFalse(watch.idle_ended)
+        self.assertIn("no new OSREPORT line", watch.update(["one"], 66.0))
+        self.assertTrue(watch.idle_ended and watch.failed)
+
+    def test_lines_that_keep_coming_never_end_it(self):
+        watch = dolphin_run.RunWatch(self.FREEZE, 15, 60, 0.0, 1800.0)
+        for second in range(0, 600, 10):
+            watch.update(["status"] * (second + 1), float(second))
+        self.assertFalse(watch.failed)
+        self.assertEqual(1800.0, watch.deadline)
 
 
 class CommandLineTests(unittest.TestCase):
