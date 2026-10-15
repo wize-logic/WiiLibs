@@ -65,6 +65,31 @@ typedef struct WlNv2aGxConfig {
     bool no_xf;
 } WlNv2aGxConfig;
 
+// Where a draw's vertices were transformed, and why not further on (WlNv2aGxStats.xf_why_*)
+typedef enum WlNv2aGxXfWhy {
+    WL_NV2A_GX_XF_INDEXED,        // GX's transform unit, the arrays read by GX (the indices sent)
+    WL_NV2A_GX_XF_SENT_SOURCE,    // ...the inputs sent: not from the arrays, or the vertex cache off
+    WL_NV2A_GX_XF_SENT_SPAN,      // ...the inputs sent: indices beyond the cache's span
+    WL_NV2A_GX_XF_SENT_ARRAY,     // ...the inputs sent: an array the cache could not keep
+    WL_NV2A_GX_XF_POS_OUTPUTS,    // the position alone on it: fog, point size or a back colour live
+    WL_NV2A_GX_XF_POS_COLOR,      // ...a colour not affine in one input (lit, or of several inputs)
+    WL_NV2A_GX_XF_POS_COLOR_MIX,  // ...a colour affine in one input, but neither it as it is nor constant
+    WL_NV2A_GX_XF_POS_TEXCOORD,   // ...a coordinate not affine in one input
+    WL_NV2A_GX_XF_POS_SPHERE,     // ...a sphere map
+    WL_NV2A_GX_XF_POS_PROJECTIVE, // ...a projective coordinate whose q varies
+    WL_NV2A_GX_XF_POS_COORD,      // ...a coordinate's input not streamed, or of more than two components
+    WL_NV2A_GX_XF_OFF,            // the processor's program: the transform unit off (no_xf)
+    WL_NV2A_GX_XF_FIXED,          // ...the fixed-function mode (no program)
+    WL_NV2A_GX_XF_COUNTING,       // ...the draw counts pixels
+    WL_NV2A_GX_XF_EMPTY,          // ...too few vertices
+    WL_NV2A_GX_XF_IMMEDIATE,      // ...the attributes' current values (immediate vertices)
+    WL_NV2A_GX_XF_STRUCTURE,      // ...a position not affine in v0 alone
+    WL_NV2A_GX_XF_POSITION,       // ...a position not an array of three floats
+    WL_NV2A_GX_XF_CLIP_W,         // ...a perspective draw whose clip-space w is not captured
+    WL_NV2A_GX_XF_SCREEN,         // ...a screen-space draw whose w is not 1 or whose depth varies
+    WL_NV2A_GX_XF_WHYS
+} WlNv2aGxXfWhy;
+
 typedef struct WlNv2aGxStats {
     uint32_t draws, vertices, clears, quad_clears, frames;
     uint32_t stencil_skipped;     // draws with the stencil test that write only the stencil (skipped)
@@ -91,6 +116,8 @@ typedef struct WlNv2aGxStats {
     uint32_t textures_kept;       // ...its textures
     uint32_t combiners_kept;      // ...its pixel program
     uint32_t programs_unbiased;   // programs whose signed sums were made unsigned (psh_bias.h)
+    uint32_t xf_why_draws[WL_NV2A_GX_XF_WHYS];    // draws by where their vertices were transformed
+    uint32_t xf_why_vertices[WL_NV2A_GX_XF_WHYS]; // ...and their vertices
 } WlNv2aGxStats;
 
 // A backend over GX, which must be up (wl_gx_init). NULL when there is no memory. The device it
@@ -116,3 +143,6 @@ const WlXboxPshProgram *wl_nv2a_gx_last_program(const WlNv2aGx *gx, bool *used);
 // depth range, before the far plane's scale), and whether that was the fit kept for its transform
 // (shared with the draws of the same transform). For logs and tools.
 bool wl_nv2a_gx_last_projection(const WlNv2aGx *gx, float *a, float *b, bool *shared);
+// Where the last draw's vertices were transformed (WlNv2aGxXfWhy), or WL_NV2A_GX_XF_WHYS when it
+// was left before that was chosen (skipped, nothing written). For logs and tools.
+unsigned wl_nv2a_gx_last_xf(const WlNv2aGx *gx);
