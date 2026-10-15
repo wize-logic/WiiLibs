@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Wed, 14 Oct 2026 22:00:00 -0400
+Subject: [PATCH] conformance: every MMX operation in Bink's decoder, the whole result compared
+
+The MMX cases reported one dword of the result from a register source.
+These run each operation Halo's Bink decoder uses (and their siblings)
+over all four lanes of the vector pair, from both halves, with register
+and memory sources, and every shift by an immediate (a small count, the lane
+width, past it) and by a register count (in range and past the width);
+movd and movq in all their forms. The whole 64-bit results go to the
+scratch buffer, which the harness compares.
+
+All pass: the blocky colour in Halo's Bink intro does not come from an
+MMX operation's semantics.
+---
+diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
+--- a/tools/conformance/cases.py
++++ b/tools/conformance/cases.py
+@@ -765,3 +765,41 @@
+ CASES.append(Case("sse_stmxcsr", "stmxcsr stores the default MXCSR controls",
+                   ["stmxcsr dword ptr [eax+32]", "and dword ptr [eax+32], 0FFFFFFC0h",
+                    "mov eax, dword ptr [eax+32]"], _SSE, "sse"))
++
++# Every MMX operation in Bink's decoder (Halo's intro), the whole 64-bit
++# result stored to the scratch buffer (compared in full), from both halves of
++# the vector pair, with register and memory sources and every shift form.
++_MMX_LOAD = ["movq mm0, qword ptr [eax]", "movq mm1, qword ptr [eax+16]"]
++_MMX_LOAD_HI = ["movq mm0, qword ptr [eax+8]", "movq mm1, qword ptr [eax+24]"]
++_MMX_STORE = ["movq qword ptr [eax+32], mm0", "movq qword ptr [eax+40], mm1", "emms"]
++for _op in ("paddw", "paddsw", "psubusw", "psubusb", "psubw", "por", "pxor", "pand", "pmulhw", "pmullw",
++            "punpcklbw", "punpckhbw", "punpcklwd", "punpckhwd", "punpckldq", "punpckhdq",
++            "packuswb", "packsswb", "paddusb", "paddusw", "paddb", "psubsw"):
++    CASES.append(Case("mmx64_" + _op, _op + ": all four lanes, register source",
++                      _MMX_LOAD + [_op + " mm0, mm1"] + _MMX_STORE, _SSE, "sse"))
++    CASES.append(Case("mmx64_" + _op + "_hi", _op + ": the other halves",
++                      _MMX_LOAD_HI + [_op + " mm0, mm1"] + _MMX_STORE, _SSE, "sse"))
++    CASES.append(Case("mmx64_" + _op + "_mem", _op + ": memory source",
++                      ["movq mm0, qword ptr [eax]", _op + (" mm0, dword ptr [eax+16]" if _op.startswith("punpckl")
++                                                           else " mm0, qword ptr [eax+16]")]
++                      + ["movq qword ptr [eax+32], mm0", "emms"], _SSE, "sse"))
++for _op, _counts in (("psllw", (1, 4, 15, 16)), ("psrlw", (1, 7, 15, 16)), ("psraw", (1, 15, 16)),
++                     ("pslld", (3, 31, 32)), ("psrld", (3, 31, 32)), ("psrad", (3, 31, 32)),
++                     ("psllq", (7, 32, 63, 64)), ("psrlq", (7, 32, 63, 64))):
++    for _n in _counts:
++        CASES.append(Case("mmx64_%s_%d" % (_op, _n), "%s by an immediate %d" % (_op, _n),
++                          _MMX_LOAD + ["%s mm0, %d" % (_op, _n)] + _MMX_STORE, _SSE, "sse"))
++    CASES.append(Case("mmx64_%s_reg" % _op, _op + " by a count in a register",
++                      _MMX_LOAD + ["mov ecx, 5", "movd mm1, ecx", _op + " mm0, mm1"] + _MMX_STORE, _SSE, "sse"))
++    CASES.append(Case("mmx64_%s_regbig" % _op, _op + " by a register count past the width",
++                      _MMX_LOAD + ["mov ecx, 70", "movd mm1, ecx", _op + " mm0, mm1"] + _MMX_STORE, _SSE, "sse"))
++CASES += [
++    Case("mmx64_movd_load", "movd mm, m32 zero-extends",
++         ["movq mm0, qword ptr [eax]", "movd mm0, dword ptr [eax+20]"] + _MMX_LOAD[1:] + _MMX_STORE, _SSE, "sse"),
++    Case("mmx64_movd_store", "movd m32, mm stores the low dword",
++         _MMX_LOAD + ["movd dword ptr [eax+48], mm1", "emms"], _SSE, "sse"),
++    Case("mmx64_movd_gpr", "movd r32, mm and movd mm, r32",
++         _MMX_LOAD + ["movd ecx, mm1", "movd mm0, ecx", "movd eax, mm0"] + ["emms"], _SSE, "sse"),
++    Case("mmx64_movq_reg", "movq mm, mm copies all 64 bits",
++         _MMX_LOAD + ["movq mm0, mm1"] + _MMX_STORE, _SSE, "sse"),
++]
+-- 
+2.43.0
+
