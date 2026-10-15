@@ -682,10 +682,24 @@ __attribute__((noinline)) bool wl_xb_range_ok_slow(uint32_t va, uint32_t n) {
     return true;
 }
 
+static uint32_t phys_page_of(uint32_t va);
+
 void wl_xb_copy_in(uint32_t va, const void *src, uint32_t n) {
-    if (n != 0) {
-        memcpy(wl_xb_ptr(va), src, n);
+    if (n == 0) {
+        return;
     }
+    if (g_ready && g_xb_pg_frames != 0) {
+        // the whole pages it covers are overwritten: a swapped one is not read back first (a file
+        // read into a buffer that was swapped out)
+        uint64_t end = ((uint64_t)va + n) & ~(uint64_t)(WL_XB_PAGE - 1u);
+        for (uint64_t a = ((uint64_t)va + WL_XB_PAGE - 1u) & ~(uint64_t)(WL_XB_PAGE - 1u); a < end; a += WL_XB_PAGE) {
+            uint32_t p1 = phys_page_of((uint32_t)a);
+            if (p1 != 0) {
+                wl_xb_pg_discard(p1 - 1u, 1);
+            }
+        }
+    }
+    memcpy(wl_xb_ptr(va), src, n);
 }
 
 void wl_xb_copy_out(void *dst, uint32_t va, uint32_t n) {

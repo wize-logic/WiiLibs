@@ -317,6 +317,8 @@ typedef struct {
     uint32_t clean_evictions;                  // of those, with nothing to write (zero, or in the swap file)
     uint32_t fast_evictions;                   // of those, in the fault's exception context (the Wii)
     uint32_t swap_ins, swap_outs, swap_writes; // pages read back, pages written, write calls (batches)
+    uint32_t zero_outs;                        // evictions of changed pages found zero: nothing written
+    uint32_t swap_ins_spared;                  // swapped pages a file read overwrote whole: not read back
     uint64_t swap_read_bytes, swap_write_bytes;
     uint64_t swap_us;                          // time spent in swap file I/O
     uint32_t swap_slots, swap_slots_used;      // the swap file's pages

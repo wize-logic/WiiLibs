@@ -2,7 +2,8 @@
 // Demand paging of guest memory on the host / ppc-be backend under a frame limit: the Wii's model
 // (paging.c's clock and swap file) through SIGSEGV and mprotect. Zero pages give their frames back
 // for nothing, changed pages go to the swap file in batches and come back on their next touch,
-// clean pages read back cost no write when they go again, both EAs of a page see one page
+// clean pages read back cost no write when they go again, changed pages cleared to zero go as zero
+// pages, a file read over swapped pages does not read them back first, both EAs of a page see one page
 // whatever happened to its frame, pinned pages keep theirs, relocations and frees carry the
 // paging state, accesses across two pages and copies between two buffers larger than the pool
 // work, devices still fault, and the write watch sees the stores to a range (and only those: not
@@ -446,6 +447,55 @@ TEST freed_pages_come_back_zero(void) {
     PASS();
 }
 
+TEST cleared_pages_go_out_as_zero(void) {
+    up();
+    const uint32_t n = 3u * FRAMES;
+    uint32_t va = alloc(n);
+    ASSERT(va != 0);
+    WlXbMemStats a = stats();
+    for (uint32_t i = 0; i < n; i++) {
+        wl_xb_wr32(va + i * PAGE + 128u, 0x5A5A5A5Au); // changed, then zero again
+        wl_xb_wr32(va + i * PAGE + 128u, 0u);
+    }
+    WlXbMemStats b = stats();
+    ASSERT(b.zero_outs - a.zero_outs >= n - FRAMES - 8u); // their frames back with nothing written
+    for (uint32_t i = 0; i < n; i++) {
+        ASSERT_EQ(0u, wl_xb_rd32(va + i * PAGE + 128u));
+    }
+    WlXbMemStats c = stats();
+    ASSERT_EQ(b.swap_ins, c.swap_ins); // nothing to read back either
+    ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
+    PASS();
+}
+
+TEST file_reads_spare_swap_ins(void) {
+    up();
+    const uint32_t n = 2u * FRAMES;
+    uint32_t va = alloc(n);
+    ASSERT(va != 0);
+    fill(va, n, 8); // the first pages are in the swap file now
+    static uint8_t src[4u * PAGE];
+    for (uint32_t i = 0; i < sizeof src; i++) {
+        src[i] = (uint8_t)(i * 7u + 1u);
+    }
+    // whole pages: not read back; the partial pages at either end keep their other bytes
+    WlXbMemStats a = stats();
+    wl_xb_copy_in(va + 100u, src, 3u * PAGE);
+    WlXbMemStats b = stats();
+    ASSERT_EQ(2u, b.swap_ins_spared - a.swap_ins_spared);
+    ASSERT_EQ(2u, b.swap_ins - a.swap_ins);
+    static uint8_t got[3u * PAGE];
+    wl_xb_copy_out(got, va + 100u, sizeof got);
+    ASSERT_MEM_EQ(src, got, sizeof got);
+    ASSERT_EQ(word(8, 0, 0), wl_xb_rd32(va));
+    ASSERT_EQ(word(8, 3, 1024), wl_xb_rd32(va + 3u * PAGE + 1024u));
+    for (uint32_t i = 4; i < n; i++) { // the rest of the buffer as it was
+        ASSERT_EQ(word(8, i, 2048), wl_xb_rd32(va + i * PAGE + 2048u));
+    }
+    ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
+    PASS();
+}
+
 TEST across_pages_and_big_copies(void) {
     up();
     const uint32_t n = 2u * FRAMES; // each buffer twice the pool
@@ -553,6 +603,8 @@ SUITE(paging) {
     RUN_TEST(pinned_pages_keep_their_frames);
     RUN_TEST(relocation_carries_swapped_pages);
     RUN_TEST(freed_pages_come_back_zero);
+    RUN_TEST(cleared_pages_go_out_as_zero);
+    RUN_TEST(file_reads_spare_swap_ins);
     RUN_TEST(across_pages_and_big_copies);
     RUN_TEST(files_written_from_paged_out_memory);
 #else

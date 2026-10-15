@@ -65,7 +65,7 @@ static uint32_t g_batch_n;
 
 static struct {
     uint32_t evictions, clean_evictions, fast_evictions;
-    uint32_t swap_ins, swap_outs, swap_writes;
+    uint32_t swap_ins, swap_outs, swap_writes, zero_outs, discards;
     uint64_t read_bytes, write_bytes, io_us;
 } g_st;
 
@@ -203,6 +203,19 @@ static uint32_t slot_run(uint32_t want, uint32_t *first) {
 }
 
 // The gathered pages from `from` on stay resident (dirty, unmapped: they fault back in cheaply).
+// Whether a page's bytes are all zero (a frame: page aligned).
+static bool page_is_zero(const uint8_t *bytes) {
+    const uint64_t *w = (const uint64_t *)(const void *)bytes;
+    uint64_t any = 0;
+    for (uint32_t i = 0; i < PAGE / 8u; i += 4u) {
+        any |= w[i] | w[i + 1] | w[i + 2] | w[i + 3];
+        if (any != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void batch_abandon(uint32_t from) {
     uint32_t lv = wl_xb_mmu_lock();
     for (uint32_t i = from; i < g_batch_n; i++) {
@@ -215,17 +228,34 @@ static void batch_abandon(uint32_t from) {
 // Writes the gathered dirty pages (unmapped, marked IO) to consecutive slots and takes their
 // frames. Lock not held.
 static WlResult batch_write(void) {
-    uint32_t n = g_batch_n;
-    for (uint32_t i = 0; i < n; i++) {
+    uint32_t n = 0, zeroed = 0;
+    for (uint32_t i = 0; i < g_batch_n; i++) {
         uint32_t p = g_batch[i];
-        memcpy(g_io + i * PAGE, wl_xb_mmu_frame_ptr(p, g_xb_pg_frame[p]), PAGE);
+        const uint8_t *bytes = wl_xb_mmu_frame_ptr(p, g_xb_pg_frame[p]);
+        uint32_t lv = wl_xb_mmu_lock();
         if (g_xb_pg_slot[p] != 0) {
-            uint32_t lv = wl_xb_mmu_lock();
             slot_free(g_xb_pg_slot[p] - 1u); // its old copy is stale
             g_xb_pg_slot[p] = 0;
-            wl_xb_mmu_unlock(lv);
         }
+        if (page_is_zero(bytes)) {
+            // zero again (cleared after a store): a zero page, with nothing to write or read back;
+            // its bytes and its write epoch stay as they are
+            uint32_t f = g_xb_pg_frame[p];
+            g_xb_pg_frame[p] = 0;
+            g_xb_pg_flags[p] &= (uint8_t)~(WL_XB_PG_IO | WL_XB_PG_DIRTY | WL_XB_PG_REF);
+            give_free(f);
+            wl_xb_mmu_frame_drop(p, f);
+            wl_xb_mmu_unlock(lv);
+            zeroed++;
+            continue;
+        }
+        wl_xb_mmu_unlock(lv);
+        memcpy(g_io + n * PAGE, bytes, PAGE);
+        g_batch[n++] = (uint16_t)p;
     }
+    g_batch_n = n;
+    g_st.zero_outs += zeroed;
+    g_st.evictions += zeroed;
     uint32_t done = 0;
     while (done < n) {
         uint32_t first = 0;
@@ -266,7 +296,7 @@ static WlResult batch_write(void) {
     g_st.swap_outs += n;
     g_st.evictions += n;
     g_batch_n = 0;
-    return n != 0 ? WL_OK : WL_ERR_NOMEM;
+    return n + zeroed != 0 ? WL_OK : WL_ERR_NOMEM;
 }
 
 // A frame for the slow path: a free one, a clean page's, or a batch written out. Lock not held.
@@ -365,6 +395,22 @@ void wl_xb_pg_release(uint32_t p, uint32_t pages) {
         }
         g_xb_pg_flags[k] = 0;
         wl_xb_pg_wrote(k); // (zero from now on)
+        wl_xb_mmu_unlock(lv);
+    }
+}
+
+void wl_xb_pg_discard(uint32_t p, uint32_t pages) {
+    if (g_xb_pg_frames == 0) {
+        return;
+    }
+    for (uint32_t k = p; k < p + pages && k < g_xb_ram_pages; k++) {
+        uint32_t lv = wl_xb_mmu_lock();
+        if (g_xb_pg_frame[k] == 0 && g_xb_pg_slot[k] != 0 && (g_xb_pg_flags[k] & WL_XB_PG_IO) == 0) {
+            slot_free(g_xb_pg_slot[k] - 1u);
+            g_xb_pg_slot[k] = 0;
+            wl_xb_pg_wrote(k); // (zero until the caller's stores)
+            g_st.discards++;
+        }
         wl_xb_mmu_unlock(lv);
     }
 }
@@ -473,6 +519,8 @@ void wl_xb_pg_stats(WlXbMemStats *out) {
     out->swap_ins = g_st.swap_ins;
     out->swap_outs = g_st.swap_outs;
     out->swap_writes = g_st.swap_writes;
+    out->zero_outs = g_st.zero_outs;
+    out->swap_ins_spared = g_st.discards;
     out->swap_read_bytes = g_st.read_bytes;
     out->swap_write_bytes = g_st.write_bytes;
     out->swap_us = g_st.io_us;
