@@ -299,7 +299,7 @@
     "xbox_recomp_conformance",
     "xbox_recomp_e2e"
    ],
-   "notes": "patches 0006 (--runtime-header), 0008 (RECOMP_BACKEDGE before backward jumps), 0010 (the code a jump reaches outside its function is lifted into it; test_interior_targets.py), 0011 (discover_interior_entries: a called interior address gets a function), 0012 (lifter.entry_starts; stubs dispatch by address), 0013 (--x87-locals: translate_function hands each function that uses the x87 to x87_locals.py, which the patch adds with test_x87_locals.py). Upstream changes to decode_function, translate_function, the discover_* passes or the stub writer need these rebased; tests/xbox_recomp/e2e.py (prog_interior.S) runs the shapes against the x86"
+   "notes": "patches 0006 (--runtime-header), 0008 (RECOMP_BACKEDGE before backward jumps), 0010 (the code a jump reaches outside its function is lifted into it; test_interior_targets.py), 0011 (discover_interior_entries: a called interior address gets a function), 0012 (lifter.entry_starts; stubs dispatch by address), 0013 (--x87-locals: translate_function hands each function that uses the x87 to x87_locals.py, which the patch adds with test_x87_locals.py), 0014 (--reg-locals: the integer registers in locals too, every function; test_reg_locals.py). Upstream changes to decode_function, translate_function, the discover_* passes or the stub writer need these rebased; tests/xbox_recomp/e2e.py (prog_interior.S) runs the shapes against the x86"
   },
   {
    "upstream": "tools/recomp/__main__.py",
@@ -311,7 +311,7 @@
     "xboxrecomp_pytest",
     "xbox_recomp_conformance"
    ],
-   "notes": "patches 0006 (--runtime-header), 0013 (--x87-locals)"
+   "notes": "patches 0006 (--runtime-header), 0013 (--x87-locals), 0014 (--reg-locals)"
   },
   {
    "upstream": "tools/recomp/test_lifter_fpu.py",

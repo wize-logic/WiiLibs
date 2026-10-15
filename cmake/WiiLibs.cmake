@@ -239,6 +239,9 @@ endfunction()
 # RUNTIME (default WiiLibs::xboxrt). On the Wii it also gets its .dol (ogc_create_dol).
 # TITLE_CONFIG is the title's JSON (tools/xbox_recomp.py documents the keys: manual functions,
 # seeds, extra options). CHUNKS (default 32) is how many translation units the code is spread over.
+# The functions the config's "hot_functions" names (or the file in the cache variable
+# WL_XBOX_HOT_FUNCTIONS: sub_XXXXXXXX names, a profile report cut to them will do) are compiled at
+# WL_XBOX_HOT_OPT (default -O2) in a unit of their own, tu/recomp_tu_hot.c.
 # NO_EXECUTABLE makes only <target>_code. The driver's Python needs capstone; set
 # WL_XBOX_RECOMP_PYTHON to choose the interpreter.
 # The title config's "vertex_programs" names the list of the title's NV2A vertex programs (relative
@@ -293,13 +296,19 @@ function(wl_add_xbox_title target)
         endif()
         list(APPEND units ${out}/tu/recomp_tu_${i}.c)
     endforeach()
-    list(APPEND units ${out}/tu/recomp_tu_dispatch.c ${out}/tu/recomp_tu_stubs.c ${out}/tu/recomp_tu_patches.c)
+    list(APPEND units ${out}/tu/recomp_tu_dispatch.c ${out}/tu/recomp_tu_stubs.c ${out}/tu/recomp_tu_patches.c
+         ${out}/tu/recomp_tu_hot.c)
     # rerun when the pipeline, its patches or the driver change (the driver's own stage cache
     # decides what actually reruns)
     file(GLOB_RECURSE pipeline_files CONFIGURE_DEPENDS
         ${wl_root}/third_party/xboxrecomp/tools/*.py ${wl_root}/third_party/xboxrecomp/patches/*.patch)
     set(cmd ${python} ${driver} run ${xbe} -o ${out} --chunks ${A_CHUNKS} --stamp ${stamp} --quiet)
     set(deps ${xbe} ${driver} ${wl_root}/third_party/xboxrecomp/UPSTREAM.json ${pipeline_files})
+    if(WL_XBOX_HOT_FUNCTIONS)
+        get_filename_component(hot_list "${WL_XBOX_HOT_FUNCTIONS}" ABSOLUTE)
+        list(APPEND cmd --hot-functions ${hot_list})
+        list(APPEND deps ${hot_list})
+    endif()
     if(A_TITLE_CONFIG)
         get_filename_component(config "${A_TITLE_CONFIG}" ABSOLUTE)
         list(APPEND cmd --config ${config})
@@ -309,7 +318,7 @@ function(wl_add_xbox_title target)
         get_filename_component(config_dir "${config}" DIRECTORY)
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${config})
         file(READ ${config} config_text)
-        foreach(key seed_functions coalesce_functions manual_functions trace_functions icall_sites)
+        foreach(key seed_functions coalesce_functions manual_functions trace_functions icall_sites hot_functions)
             string(JSON kind ERROR_VARIABLE no_key TYPE "${config_text}" ${key})
             if(no_key)
                 continue()
@@ -352,6 +361,11 @@ function(wl_add_xbox_title target)
     add_library(${target}_code OBJECT ${units})
     add_dependencies(${target}_code ${target}_recomp)
     set_source_files_properties(${units} PROPERTIES GENERATED TRUE)
+    if(NOT WL_XBOX_HOT_OPT)
+        set(WL_XBOX_HOT_OPT -O2)
+    endif()
+    # after the target's ${A_OPT}: the last -O wins
+    set_source_files_properties(${out}/tu/recomp_tu_hot.c PROPERTIES COMPILE_OPTIONS "${WL_XBOX_HOT_OPT}")
     set_target_properties(${target}_code PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
     target_include_directories(${target}_code PUBLIC ${wl_root}/wl/xboxrt/recomp ${out}/gen)
     target_compile_options(${target}_code PRIVATE ${A_OPT} -ffp-contract=off -fno-strict-aliasing -w)

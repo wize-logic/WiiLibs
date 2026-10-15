@@ -1,0 +1,680 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Wed, 14 Oct 2026 13:39:13 -0400
+Subject: [PATCH] recomp: --reg-locals keeps a function's integer registers in C locals
+
+The generated code reads and writes the guest's integer registers as the
+globals g_eax .. g_edi and g_esp (`eax` is a macro for g_eax). Guest
+memory is reached through volatile, may_alias accesses, so the compiler
+has to assume that any guest store may change any of those globals: after
+each store it reloads every register it needs, and every register write
+is a store to memory. In Halo's hot functions that is a load or store of
+a global around nearly every guest instruction, and the EA of every
+esp-relative access is computed again because esp was reloaded.
+
+--reg-locals extends x87_locals.py to the registers: in each function
+they are locals (_r_eax ..), loaded where they are first needed after
+memory was the truth, and written back (those that may have been written)
+before every statement that calls out or leaves, exactly as the x87 state
+is. A register counts as written when it is assigned, incremented or
+decremented, or passed to a macro that may assign it (SET_LO8, SET_HI8,
+SET_LO16, PUSH32's stack pointer, POP32's both, and any all-capitals macro
+not known to only read its arguments). A block over several lines (a rep
+string loop) is rewritten line by line. Statements that call out run on
+the globals, unchanged, between the write-back and the next load; a
+statement whose register has its address taken runs on memory. With
+--reg-locals the pass covers every function, not only those that use the
+x87; without --x87-locals the x87 macros stay as they are.
+
+The globals are not current at RECOMP_BACKEDGE or at a guest access the
+runtime emulates. A runtime that switches guest threads or runs interrupt
+work there must save and restore the register file around it (each guest
+thread has its own), and run interrupt work on a stack of its own rather
+than below a stale g_esp.
+
+The header's SIMD helpers (XMM_*, MMX_*) are taken as not leaving the
+function, for both options: they touch guest memory and the SIMD
+registers only.
+---
+ tools/recomp/__main__.py        | 5 +++++
+ tools/recomp/test_reg_locals.py | 153 ++++++++++++++++++++++++++++++++++++++++
+ tools/recomp/translator.py      | 13 ++++++++-----
+ tools/recomp/x87_locals.py      | 212 ++++++++++++++++++++++++++++++++++++++++----------------------------------------
+ 4 files changed, 338 insertions(+), 45 deletions(-)
+
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -285,6 +285,10 @@
+                              "g_fp_* globals only where control leaves the "
+                              "function (x87_locals.py); needs a runtime header "
+                              "with RECOMP_FP_PC_CW")
++    parser.add_argument("--reg-locals", action="store_true",
++                        help="Keep each function's integer registers (eax..edi, esp) "
++                             "in C locals too, written back to the g_* globals only "
++                             "where control leaves the function (x87_locals.py)")
+     parser.add_argument("--seh-prolog", metavar="ADDR",
+                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
+     parser.add_argument("--seh-epilog", metavar="ADDR",
+@@ -364,6 +368,7 @@
+             "icall_sites.json"),
+     )
+     translator.translator.x87_locals = args.x87_locals
++    translator.translator.reg_locals = args.reg_locals
+ 
+     t_load = time.time() - t0
+     print(f"Loaded {len(translator.func_db)} functions, "
+diff --git a/tools/recomp/test_reg_locals.py b/tools/recomp/test_reg_locals.py
+new file mode 100644
+--- /dev/null
++++ b/tools/recomp/test_reg_locals.py
+@@ -0,0 +1,153 @@
++"""
++--reg-locals: a function's integer registers in C locals.
++
++The generated code names the guest registers eax .. edi and esp, macros for
++the globals g_eax .. g_esp. Guest memory is reached through volatile accesses
++the compiler must assume alias them, so every guest store made it reload
++each register. With --reg-locals, x87_locals.py keeps them in locals
++(_r_eax ..) inside a function, written back before anything that calls out
++or leaves and loaded again where next needed. These checks cover what it
++emits.
++"""
++
++import os
++import re
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
++
++from tools.recomp import config  # noqa: E402
++from tools.recomp.translator import (FunctionTranslator, FP_STACK_MACROS,  # noqa: E402
++                                     FP_STACK_UNDEFS)
++from tools.recomp.x87_locals import localise_x87  # noqa: E402
++
++BASE = 0x00010000
++
++
++def _translate(image, funcs=((0, None),), x87=True, regs=True):
++    config._install(
++        [config.Section(".text", BASE, len(image), 0x0000, len(image), True)],
++        entry_point=BASE, kernel_thunk_addr=BASE, origin="reg-locals-test")
++    db = {}
++    bounds = [off for off, _ in funcs] + [len(image)]
++    for (off, _), end in zip(funcs, bounds[1:]):
++        db[BASE + off] = {"start": f"0x{BASE + off:08X}", "end": BASE + end,
++                          "_addr": BASE + off, "size": end - off}
++    t = FunctionTranslator(image, db)
++    t.x87_locals, t.reg_locals = x87, regs
++    return t.translate_function(BASE, db[BASE]), t
++
++
++def _localise(body, x87=True):
++    lines = ["void f(void)", "{"] + body + ["}", ""]
++    return localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS, x87=x87, regs=True)
++
++
++def test_integer_code_keeps_its_registers_in_locals():
++    # mov eax, [0x2000]; add eax, 1; mov [0x2004], eax; ret
++    image = b"\xA1\x00\x20\x00\x00" b"\x83\xC0\x01" b"\xA3\x04\x20\x00\x00" b"\xC3"
++    code, t = _translate(image)
++    body = code.split("#define _LOCALS_LOAD()")[1].split("\n", 1)[1]
++    assert "_r_eax = MEM32(0x2000);" in body, code
++    assert "_r_eax = _r_eax + 1;" in body, code
++    assert "MEM32(0x2004) = _r_eax;" in body, code
++    # written back before the return, with esp (which the ret moves, on the global)
++    ret = body.index("return;")
++    assert re.search(r"g_eax = _r_eax;[^\n]*\n[^\n]*return;", body[:ret + 8]), code
++    assert t.x87_stats == {"in locals": 1}
++
++
++def test_off_by_default():
++    image = b"\xA1\x00\x20\x00\x00" b"\xC3"
++    code, t = _translate(image, x87=False, regs=False)
++    assert "_r_" not in code and "eax = MEM32(0x2000);" in code, code
++
++
++def test_a_call_writes_back_what_was_written_and_the_next_statement_loads():
++    # +0 mov eax, [0x2000]; +5 mov ecx, ebx; +7 call +16; +12 add eax, ecx; +14 ret; ... +17 ret
++    image = (b"\xA1\x00\x20\x00\x00" b"\x89\xD9" b"\xE8\x05\x00\x00\x00" b"\x01\xC8" b"\xC3"
++             b"\x90\x90" b"\xC3")
++    code, _ = _translate(image, funcs=((0, None), (17, None)))
++    call = code.index("RECOMP_ABI_CALL")
++    before = code[:call].splitlines()[-2]
++    # eax and ecx were written; ebx was only read and stays as it is in memory
++    assert "g_eax = _r_eax;" in before and "g_ecx = _r_ecx;" in before, code
++    assert "g_ebx = " not in before, code
++    after = code[call:]
++    assert after.index("_LOCALS_LOAD();") < after.index("_r_eax = _r_eax + _r_ecx;"), code
++
++
++def test_registers_a_macro_may_assign_count_as_written():
++    out, why = _localise(["    SET_LO8(eax, 1);", "    PUSH32(esp, ebx);", "    POP32(esp, edi);",
++                          "    MEM32(esi + 4) = edx;", "    return;"], x87=False)
++    assert why is None, why
++    text = "\n".join(out)
++    back = [l for l in out if "state to memory" in l][0]
++    for r in ("eax", "esp", "edi"):
++        assert f"g_{r} = _r_{r};" in back, text
++    for r in ("ebx", "esi", "edx"):
++        assert f"g_{r} = " not in back, text
++
++
++def test_a_register_whose_address_is_taken_runs_on_memory():
++    out, why = _localise(["    eax = 1;", "    { uint32_t *p = &ebx; *p = 2; }", "    ebx = ebx + eax;",
++                          "    return;"], x87=False)
++    assert why is None, why
++    text = "\n".join(out)
++    i = text.index("{ uint32_t *p = &ebx; *p = 2; }")
++    assert "g_eax = _r_eax;" in text[:i].rstrip().splitlines()[-1], text
++    assert text.index("_LOCALS_LOAD();", i) < text.index("_r_ebx = _r_ebx + _r_eax;"), text
++
++
++def test_a_block_over_several_lines_is_rewritten_line_by_line():
++    out, why = _localise(["    ecx = 4;",
++                          "    while (ecx != 0) {",
++                          "        MEM8(edi) = MEM8(esi);",
++                          "        esi++; edi++; ecx--;",
++                          "    }",
++                          "    return;"], x87=False)
++    assert why is None, why
++    text = "\n".join(out)
++    assert "    while (_r_ecx != 0) {" in text, text
++    assert "        MEM8(_r_edi) = MEM8(_r_esi);" in text, text
++    assert "        _r_esi++; _r_edi++; _r_ecx--;" in text, text
++    back = [l for l in out if "state to memory" in l][0]
++    assert all(f"g_{r} = _r_{r};" in back for r in ("ecx", "esi", "edi")), text
++
++
++def test_without_x87_locals_the_x87_macros_stay():
++    out, why = _localise(FP_STACK_MACROS + ["    fp_push(MEMF(eax + 8));",
++                                            "    MEMF_SET(ecx, (float)fp_top()); fp_pop();",
++                                            "    return;"] + FP_STACK_UNDEFS, x87=False)
++    assert why is None, why
++    text = "\n".join(out)
++    assert "    fp_push(MEMF(_r_eax + 8));" in text, text
++    assert "    MEMF_SET(_r_ecx, (float)fp_top()); fp_pop();" in text, text
++
++
++def test_the_x87_base_is_there_when_only_the_status_word_or_a_pop_needs_it():
++    out, why = _localise(FP_STACK_MACROS + [
++        "    eax = (eax & 0xFFFF0000u) | (uint32_t)(uint16_t)(((g_fp_top & 7u) << 11) | g_fp_cc);",
++        "    fp_pop();", "    return;"] + FP_STACK_UNDEFS)
++    assert why is None, why
++    text = "\n".join(out)
++    assert "uint32_t _x87t = 0;" in text and "_x87t = (uint32_t)g_fp_top;" in text, text
++    assert "g_fp_top = (int)((_x87t + 1u) & 7u);" in text, text
++
++
++def test_a_statement_that_calls_out_runs_on_the_globals():
++    out, why = _localise(["    eax = 5;", "    PUSH32(esp, eax); RECOMP_ABI_CALL(0x1000u, sub_00001000);",
++                          "    ecx = eax;", "    return;"], x87=False)
++    assert why is None, why
++    text = "\n".join(out)
++    assert "    PUSH32(esp, eax); RECOMP_ABI_CALL(0x1000u, sub_00001000);" in text, text
++    call = text.index("    PUSH32(esp, eax); RECOMP_ABI_CALL")
++    assert "g_eax = _r_eax;" in text[:call].rstrip().splitlines()[-1], text
++    assert text.index("_LOCALS_LOAD();", call) < text.index("_r_ecx = _r_eax;"), text
++
++
++if __name__ == "__main__":
++    for name, fn in sorted(globals().items()):
++        if name.startswith("test_"):
++            fn()
++    print("ok")
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -495,9 +495,11 @@
+         self.interior_entry_starts = set()
+         self._recovered_cfg = {}
+         self._ownership_ready = False
+-        # x87_locals.py: keep each body's x87 stack in C locals (--x87-locals).
+-        # x87_stats counts the functions that do and why the others do not.
++        # x87_locals.py: keep each body's x87 stack in C locals (--x87-locals),
++        # and its integer registers (--reg-locals). x87_stats counts the functions
++        # that do and why the others do not.
+         self.x87_locals = False
++        self.reg_locals = False
+         self.x87_stats = {}
+ 
+     def discover_static_indirect_targets(self, *, coalescing=False):
+@@ -3074,8 +3076,9 @@
+         lines.append(f"}}")
+         lines.append(f"")
+ 
+-        if has_fpu and self.x87_locals:
+-            lines, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS)
++        if self.reg_locals or (has_fpu and self.x87_locals):
++            lines, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS,
++                                      x87=self.x87_locals, regs=self.reg_locals)
+             key = why or "in locals"
+             self.x87_stats[key] = self.x87_stats.get(key, 0) + 1
+ 
+@@ -3476,7 +3479,7 @@
+         }
+         stats["unresolved_stubs"] = len(unresolved)
+         stats["manual_functions"] = len(manual_decls)
+-        if getattr(self.translator, "x87_locals", False):
++        if getattr(self.translator, "x87_locals", False) or getattr(self.translator, "reg_locals", False):
+             stats["x87_locals"] = dict(sorted(self.translator.x87_stats.items()))
+         # Instructions the lifter has no translation for become a comment, and
+         # a comment is a silent no-op. Surfacing the tally is the difference
+diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
+--- a/tools/recomp/x87_locals.py
++++ b/tools/recomp/x87_locals.py
+@@ -64,9 +64,10 @@
+ 
+ import re
+ 
+-__all__ = ["localise_x87", "X87_LOCALS_PREFIX"]
++__all__ = ["localise_x87", "X87_LOCALS_PREFIX", "REG_LOCALS_PREFIX"]
+ 
+ X87_LOCALS_PREFIX = "_x87"
++REG_LOCALS_PREFIX = "_r_"
+ 
+ # Function-like names that never read or write the x87 state and never leave
+ # the function: guest memory and register accessors, flag and compare helpers,
+@@ -93,11 +94,28 @@
+ 
+ # The memory model's accessors (translator.FP_STACK_MACROS) and the globals.
+ _FP_MACROS = ("fp_push", "fp_pop", "fp_top", "fp_st1", "fp_st")
+-_SCALARS = {  # global -> (local suffix, C type)
++_X87_SCALARS = {  # global -> (local suffix, C type)
+     "g_fp_control_word": ("cw", "uint16_t"),
+     "g_fp_cmp": ("cmp", "int"),
+     "g_fp_cc": ("cc", "uint16_t"),
+ }
++# The integer registers the generated code keeps in globals (`eax` is a macro
++# for g_eax; ebp is already a local of each function).
++_REGS = ("eax", "ecx", "edx", "ebx", "esp", "esi", "edi")
++_REG_SCALARS = {"g_" + r: (r, "uint32_t") for r in _REGS}
++_SCALARS = dict(_X87_SCALARS, **_REG_SCALARS)
++# Macros that assign to a register passed to them (the argument positions).
++_REG_WRITERS = {"SET_LO8": (0,), "SET_HI8": (0,), "SET_LO16": (0,), "PUSH32": (0,), "POP32": (0, 1)}
++# All-capitals macros that only read the registers passed to them. A register
++# passed to any other all-capitals name counts as written (a lower-case name is
++# a function: its arguments are values).
++_REG_READERS = frozenset("""
++    MEM8 MEM16 MEM32 MEM64 SMEM8 SMEM16 SMEM32 SMEM64 MEMF MEMD MEMF_SET MEMD_SET XBOX_PTR
++    LO8 HI8 LO16 SX8 SX16 ZX8 ZX16
++    CMP_EQ CMP_NE CMP_L CMP_LE CMP_G CMP_GE CMP_B CMP_BE CMP_A CMP_AE TEST_Z TEST_NZ
++    RECOMP_PARITY8 RECOMP_DF_STEP RECOMP_FCMP RECOMP_FCMP_CC RECOMP_FP_PC RECOMP_FP_PC_CW
++    RECOMP_ATOMIC_CAS32 RECOMP_ATOMIC_ADD32 ROL8 ROL16 ROL32 ROR8 ROR16 ROR32
++""".split())
+ 
+ _LABEL = re.compile(r"^\s*(loc_[0-9A-Fa-f]+):\s*;\s*$")
+ _GOTO = re.compile(r"\bgoto\s+([A-Za-z_]\w*)\s*;")
+@@ -112,7 +130,8 @@
+     r"|\bg_fp_stack\s*\[\s*\(\s*g_fp_top\s*\+\s*(?P<gs>\d+)u?\s*\)\s*&\s*7u?\s*\]"
+     r"|\(\s*g_fp_top\s*&\s*7u?\s*\)"
+     r"|\bRECOMP_FP_PC\s*\("
+-    r"|\b(?P<sc>g_fp_control_word|g_fp_cmp|g_fp_cc)\b")
++    r"|\b(?P<sc>g_fp_control_word|g_fp_cmp|g_fp_cc)\b"
++    r"|\b(?:g_)?(?P<rg>eax|ecx|edx|ebx|esp|esi|edi)\b")
+ _WRITE_AFTER = re.compile(r"\s*(=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)")
+ _WRITE_BEFORE = re.compile(r"(\+\+|--)\s*$")
+ _CONTROL = re.compile(r"\b(if|else|for|while|do|switch|case|default|goto|return|break|continue)\b"
+@@ -247,6 +266,8 @@
+         name = m.group(1)
+         if name in _KEYWORDS or name in _TRANSPARENT or name in _FP_MACROS:
+             continue
++        if name.startswith(("XMM_", "MMX_")):
++            continue  # the header's inline SIMD helpers: guest memory and g_xmm*/g_mm* only
+         names.add(name)
+     return names
+ 
+@@ -258,15 +279,59 @@
+ 
+ 
+ def _scalar(g):
++    if g in _REG_SCALARS:
++        return REG_LOCALS_PREFIX + _REG_SCALARS[g][0]
+     return X87_LOCALS_PREFIX + _SCALARS[g][0]
+ 
+ 
+-def _rewrite(code, k):
+-    """Rewrite one statement line at static depth k.
++_REG_TOKEN = re.compile(r"\b(?:g_)?(eax|ecx|edx|ebx|esp|esi|edi)\b")
++
++
++def _reg_written(text, start, end):
++    """Whether the register token text[start:end] may be assigned: an
++    assignment or ++/-- on it, or an argument of a macro that may assign it
++    (looked for through grouping parentheses, casts and subscripts)."""
++    if _WRITE_AFTER.match(text, end) or _WRITE_BEFORE.search(text[:start]):
++        return True
++    depth, arg, i = 0, 0, start - 1
++    while i >= 0:
++        c = text[i]
++        if c in ")]":
++            depth += 1
++        elif c in "([" and depth:
++            depth -= 1
++        elif c == "," and depth == 0:
++            arg += 1
++        elif c in "([":
++            m = re.search(r"([A-Za-z_]\w*)\s*$", text[:i]) if c == "(" else None
++            name = m.group(1) if m else None
++            if name and name not in _KEYWORDS:
++                if name in _REG_WRITERS:
++                    return arg in _REG_WRITERS[name]
++                if name in _REG_READERS or not name.isupper():
++                    return False
++                return True  # an unknown macro: it may assign its argument
++            arg = 0  # a grouping: the expression it is part of is an argument further out
++        i -= 1
++    return False
++
++
++def _unary_amp_reg(code):
++    """A register (or x87 state) whose address is taken."""
++    for m in re.finditer(r"(?<!&)&(?!&)\s*(?:g_)?(eax|ecx|edx|ebx|esp|esi|edi|fp_\w+|g_fp_\w+)\b", code):
++        prev = code[:m.start()].rstrip()
++        if not prev or not (prev[-1].isalnum() or prev[-1] in "_)]"):
++            return True
++    return False
++
++
++def _rewrite(code, k, x87=True, regs=False):
++    """Rewrite one statement line at static depth k (x87: the stack and its
++    scalars; regs: the integer registers).
+ 
+     Returns (code, k_out, written positions, read positions, scalars written,
+     scalars used) or None when the line has to run against memory."""
+-    if re.search(r"&\s*(fp_|g_fp_)", code):
++    if _unary_amp_reg(code):
+         return None
+     wr, rd, swr, sused = set(), set(), set(), set()
+     moved = [False]
+@@ -283,6 +348,23 @@
+                 return "".join(out), k
+             out.append(text[i:m.start()])
+             tok = m.group(0)
++            if m.group("rg"):
++                if not regs:
++                    out.append(tok)
++                    i = m.end()
++                    continue
++                g = "g_" + m.group("rg")
++                sused.add(g)
++                if _reg_written(text, m.start(), m.end()):
++                    swr.add(g)
++                out.append(_scalar(g))
++                i = m.end()
++                continue
++            if not x87:
++                # the x87 state stays in memory: the memory model's macros as they are
++                out.append(tok)
++                i = m.end()
++                continue
+             if tok.startswith("fp_push"):
+                 open_at = m.end() - 1
+                 close = _match_paren(text, open_at)
+@@ -340,7 +422,7 @@
+         return None
+     if moved[0] and _CONTROL.search(code):
+         return None  # a push or pop that may not happen: the depth is not static
+-    if _LEFTOVER.search(new):
++    if x87 and _LEFTOVER.search(new):
+         return None
+     return new, k_out, wr, rd, swr, sused
+ 
+@@ -348,11 +430,12 @@
+ # ------------------------------------------------------------- the pass
+ 
+ class _Node:
+-    __slots__ = ("first", "last", "code", "kind", "gotos", "terminal", "label")
++    __slots__ = ("first", "last", "code", "kind", "gotos", "terminal", "label", "x87")
+ 
+     def __init__(self, first, last):
+         self.first, self.last = first, last
+         self.code, self.kind, self.gotos, self.terminal, self.label = "", None, [], False, None
++        self.x87 = False  # it names the x87 state (and the pass keeps that in locals)
+ 
+ 
+ def _body_bounds(lines, macros, undefs):
+@@ -387,7 +470,15 @@
+             i += 1
+             continue
+         if line.lstrip().startswith("#"):
+-            raise _NotLocal("a preprocessor line in the body")
++            # a directive (the memory model's macros): no statement; its continuation lines too
++            j = i
++            while lines[j].rstrip().endswith("\\") and j + 1 < hi:
++                j += 1
++            n = _Node(i, j)
++            n.kind = "pp"
++            nodes.append(n)
++            i = j + 1
++            continue
+         code, _ = _protect(line)
+         if re.match(r"^\s*\w+\s*:(?!:)", code) and not code.lstrip().startswith(("case", "default")):
+             raise _NotLocal("a label of another form")
+@@ -434,45 +525,59 @@
+     return nodes
+ 
+ 
+-def localise_x87(lines, macros, undefs):
++def localise_x87(lines, macros, undefs, x87=True, regs=False):
+     """lines: one function as translate_function emits it. Returns (lines,
+-    None) with the x87 state in locals, or (lines unchanged, reason)."""
++    None) with the x87 state (x87) and the integer registers (regs) in locals,
++    or (lines unchanged, reason)."""
+     try:
+-        return _localise(lines, macros, undefs), None
++        return _localise(lines, macros, undefs, x87, regs), None
+     except _NotLocal as e:
+         return lines, str(e)
+ 
+ 
+-def _localise(lines, macros, undefs):
+-    bounds = _body_bounds(lines, macros, undefs)
++def _function_bounds(lines):
++    """The body: from after the function's opening brace to its closing one."""
++    try:
++        lo = lines.index("{") + 1
++        hi = len(lines) - 1 - lines[::-1].index("}")
++    except ValueError:
++        return None
++    return (lo, hi) if lo <= hi else None
++
++
++def _localise(lines, macros, undefs, x87=True, regs=False):
++    bounds = _function_bounds(lines) if regs else _body_bounds(lines, macros, undefs)
+     if bounds is None:
+-        raise _NotLocal("no x87 macros")
++        raise _NotLocal("no body" if regs else "no x87 macros")
+     lo, hi = bounds
+     text = "\n".join(lines[lo:hi])
+     if re.search(r"setjmp|longjmp", text):
+         raise _NotLocal("setjmp")
+-    if X87_LOCALS_PREFIX in text:
++    if X87_LOCALS_PREFIX in text or REG_LOCALS_PREFIX in text:
+         raise _NotLocal("the names are taken")
+     nodes = _nodes(lines, lo, hi)
+     labels = {n.label: x for x, n in enumerate(nodes) if n.kind == "label"}
+ 
+     # classify
+     for n in nodes:
+-        if n.kind == "label":
+-            continue
+-        fp = bool(_LEFTOVER.search(n.code) or re.search(r"\b(RECOMP_FP_PC|g_fp_control_word|g_fp_cmp|g_fp_cc)\b", n.code))
++        if n.kind in ("label", "pp"):
++            continue
++        fp = x87 and bool(_LEFTOVER.search(n.code) or re.search(
++            r"\b(RECOMP_FP_PC|g_fp_control_word|g_fp_cmp|g_fp_cc)\b", n.code))
++        rg = regs and bool(_REG_TOKEN.search(n.code))
++        n.x87 = fp
+         calls = _calls(n.code)
+         leaves = bool(re.search(r"\breturn\b", n.code))
+         if n.kind == "region":
+             if n.gotos:
+                 raise _NotLocal("a goto inside a conditional block")
+-            n.kind = "sync" if (fp or calls or leaves) else "plain"
++            n.kind = "sync" if (fp or calls or leaves) else "rregion" if rg else "plain"
+             continue
+         if calls or leaves:
+             if n.gotos:
+                 raise _NotLocal("a goto in a statement that calls out or returns")
+             n.kind = "sync"
+-        elif fp:
++        elif fp or rg:
+             n.kind = "fp"
+         else:
+             n.kind = "plain"
+@@ -482,9 +587,21 @@
+ 
+     # Statements this pass cannot rewrite run against memory.
+     for n in nodes:
+-        if n.kind == "fp" and _rewrite(n.code, 0) is None:
++        if n.kind == "fp" and _rewrite(n.code, 0, x87, regs) is None:
+             if n.gotos:
+-                raise _NotLocal("a goto in an x87 statement this pass cannot rewrite")
++                raise _NotLocal("a goto in a statement this pass cannot rewrite")
++            n.kind = "sync"
++        elif n.kind == "rregion":
++            parts = []
++            for li in range(n.first, n.last + 1):
++                r = _rewrite(_protect(lines[li])[0], 0, False, regs)
++                if r is None:
++                    break
++                parts.append(r)
++            else:
++                # a block over several lines: each rewritten on its own, at one depth
++                n.code = parts
++                continue
+             n.kind = "sync"
+ 
+     # The dataflow decides where memory is the truth and where the locals are,
+@@ -493,11 +610,11 @@
+     plan = _Plan()
+     while True:
+         try:
+-            flow = _flow(nodes, labels, plan)
++            flow = _flow(nodes, labels, plan, x87, regs)
+             break
+         except _Restart:
+             continue
+-    return _emit(lines, lo, hi, nodes, labels, plan, flow)
++    return _emit(lines, lo, hi, nodes, labels, plan, flow, regs)
+ 
+ 
+ # A state is MEM (memory is the truth: nothing is in the locals) or a tuple
+@@ -550,7 +667,7 @@
+     return out
+ 
+ 
+-def _flow(nodes, labels, plan):
++def _flow(nodes, labels, plan, x87=True, regs=False):
+     """The state before and after each node (None where unreachable)."""
+     state_in = [None] * len(nodes)
+     state_out = [None] * len(nodes)
+@@ -565,14 +682,21 @@
+         n, s = nodes[x], state_in[x]
+         if n.kind == "label":
+             out = MEM if x in plan.rebase else s
+-        elif n.kind == "plain":
++        elif n.kind in ("plain", "pp"):
+             out = s
+-        elif n.kind == "fp":
++        elif n.kind in ("fp", "rregion"):
+             if s == MEM:
+                 s = _LOADED  # loaded before it (see _emit)
+             r = rewrites.get(x)
+             if r is None or r[0] != s[0]:
+-                r = (s[0], _rewrite(n.code, s[0]))
++                if n.kind == "fp":
++                    one = _rewrite(n.code, s[0], x87, regs)
++                    r = (s[0], ([one[0]],) + one[1:])
++                else:  # the lines of a block: registers only, the depth does not move
++                    parts = n.code
++                    r = (s[0], ([q[0] for q in parts], s[0],
++                                set().union(*(q[2] for q in parts)), set().union(*(q[3] for q in parts)),
++                                set().union(*(q[4] for q in parts)), set().union(*(q[5] for q in parts))))
+                 rewrites[x] = r
+             new, k2, wr, rd, swr, sused = r[1]
+             positions |= wr | rd
+@@ -599,11 +723,12 @@
+             if new != state_in[y]:
+                 state_in[y] = new
+                 work.append(y)
++    x87_seen = any(n.x87 and state_in[x] is not None and n.kind == "fp" for x, n in enumerate(nodes))
+     return dict(state_in=state_in, state_out=state_out, rewrites=rewrites,
+-                positions=positions, scalars=scalars, end_state=end_state[0])
+-
+-
+-def _emit(lines, lo, hi, nodes, labels, plan, flow):
++                positions=positions, scalars=scalars, end_state=end_state[0], x87_seen=x87_seen)
++
++
++def _emit(lines, lo, hi, nodes, labels, plan, flow, regs=False):
+     state_in, state_out, rewrites = flow["state_in"], flow["state_out"], flow["rewrites"]
+     positions, scalars = flow["positions"], flow["scalars"]
+     if not positions and not scalars:
+@@ -613,7 +738,7 @@
+     pos = sorted(positions)
+     used = [g for g in _SCALARS if g in scalars]
+     t = X87_LOCALS_PREFIX + "t"
+-    load_macro = "%s_LOAD()" % X87_LOCALS_PREFIX.upper()
++    load_macro = "_LOCALS_LOAD()" if regs else "%s_LOAD()" % X87_LOCALS_PREFIX.upper()
+ 
+     def flush(s):
+         if s == MEM:
+@@ -633,20 +758,23 @@
+             return load_macro + ";"
+         return ""
+ 
++    # the x87 base index: wherever the x87 state is in locals (always there without regs, as before)
++    base = bool(pos) or flow["x87_seen"] or not regs
+     load = " ".join(
+-        ["%s = (uint32_t)g_fp_top;" % t]
++        (["%s = (uint32_t)g_fp_top;" % t] if base else [])
+         + ["%s = %s;" % (_scalar(g), g) for g in used]
+         + ["%s = g_fp_stack[(%s + %du) & 7u];" % (_slot(p), t, p & 7) for p in pos])
+ 
+     out = list(lines[:lo])
+-    decls = ["uint32_t %s = 0;" % t]
++    decls = ["uint32_t %s = 0;" % t] if base else []
+     if pos:
+         decls.append("double " + ", ".join("%s = 0.0" % _slot(p) for p in pos) + ";")
+     for g in used:
+         decls.append("%s %s = 0;" % (_SCALARS[g][1], _scalar(g)))
+-    out.append("    " + " ".join(decls) + " /* the x87 state of this body (x87_locals) */")
++    what = "state" if regs else "x87 state"
++    out.append("    " + " ".join(decls) + " /* the %s of this body (x87_locals) */" % what)
+     out.append("    #define %s do { %s } while (0) /* memory to locals */" % (load_macro, load))
+-    note = " /* x87 state to memory */"
++    note = " /* %s to memory */" % what
+     if 0 in plan.want_locals:
+         out.append("    " + on_edge(MEM, 0))  # the function entry is an edge from memory
+     cursor = lo
+@@ -663,7 +791,7 @@
+             if x in plan.rebase:
+                 out.append("    /* x87: paths join here at different depths; memory is current */")
+         else:
+-            if n.kind == "fp" and s == MEM:
++            if n.kind in ("fp", "rregion") and s == MEM:
+                 out.append(indent + load_macro + ";")
+             if n.kind == "sync":
+                 f = flush(s)
+@@ -673,7 +801,7 @@
+                 # a goto whose edge needs code gets it in a block of its own
+                 code, restore = _protect(lines[n.first])
+                 if n.kind == "fp":
+-                    code = rewrites[x][1][0]
++                    code = rewrites[x][1][0][0]
+                 for g in set(n.gotos):
+                     c = on_edge(state_out[x], labels[g])
+                     if c:
+@@ -682,6 +810,10 @@
+                     out.append(indent + restore(code).strip())
+                 else:
+                     out.extend(lines[n.first:n.last + 1])
++            elif n.kind == "rregion":
++                for li, code in zip(range(n.first, n.last + 1), rewrites[x][1][0]):
++                    restore = _protect(lines[li])[1]
++                    out.append(re.match(r"\s*", lines[li]).group(0) + restore(code).strip())
+             else:
+                 out.extend(lines[n.first:n.last + 1])
+         if not n.terminal and x + 1 < len(nodes):

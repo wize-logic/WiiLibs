@@ -21,8 +21,9 @@ instructions with a list of inputs. Here:
 
 Every case that touches the x87 runs a second time as <case>_x87l: its lines made a function and
 passed through the lifter's --x87-locals pass (x87_locals.py: the stack, control word and compare
-result in C locals, memory written back where control leaves), against the same recording. Both
-forms must match the CPU.
+result in C locals, memory written back where control leaves), against the same recording. Every
+case runs a third time as <case>_regl, through --x87-locals and --reg-locals (the integer
+registers in locals too). All forms must match the CPU.
 
 Every case must pass, or be in EXPECTED with the reason. A case in EXPECTED that passes fails the
 run too, so the list cannot go stale.
@@ -295,14 +296,15 @@ LOCALS = "    uint32_t ebp = 0; int _cf = 0; int _flags = 0;\n" \
     "    (void)ebp; (void)_cf; (void)_flags; (void)_fa; (void)_fb; (void)_fas; (void)_fbs; (void)_fca; (void)_fcb;"
 
 
-def x87_locals_variant(p):
+def x87_locals_variant(p, suffix="_x87l", regs=False):
     """The case as a function the way translate_function emits one (the x87 macros defined inside
-    it), through the --x87-locals pass: (C text, None) or (C text unchanged, why it declined)."""
+    it), through the --x87-locals pass (and --reg-locals with regs): (C text, None) or (C text
+    unchanged, why it declined)."""
     from tools.recomp.translator import FP_STACK_MACROS, FP_STACK_UNDEFS
     from tools.recomp.x87_locals import localise_x87
-    lines = ([f"static void lif_{p['name']}_x87l(void)", "{"] + LOCALS.split("\n") + FP_STACK_MACROS
+    lines = ([f"static void lif_{p['name']}{suffix}(void)", "{"] + LOCALS.split("\n") + FP_STACK_MACROS
              + [f"    {l}" for l in p["lines"]] + FP_STACK_UNDEFS + ["}"])
-    out, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS)
+    out, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS, x87=True, regs=regs)
     return "\n".join(out), why
 
 
@@ -317,7 +319,7 @@ def replay_source(prepared):
 {LOCALS}
 {body}
 }}""")
-    # the _x87l variants last: each defines the x87 macros itself and undefines them at its end
+    # the _x87l/_regl variants last: each defines the x87 macros itself and undefines them at its end
     out += [p["text"] for p in prepared if p.get("text")]
     kinds = {"gpr": 0, "fpu": 1, "sse": 2}
     out.append("static const struct kase K[] = {")
@@ -400,6 +402,15 @@ def main(argv=None) -> int:
                 declined[p["name"]] = why
             variants[p["name"] + "_x87l"] = p["name"]
             prepared.append(dict(p, name=p["name"] + "_x87l", text=text))
+        # every case again, through --x87-locals and --reg-locals
+        reg_variants, reg_declined = {}, {}
+        for p in [q for q in prepared if not q.get("text")]:
+            text, why = x87_locals_variant(p, "_regl", regs=True)
+            if why:
+                reg_declined[p["name"]] = why
+            reg_variants[p["name"] + "_regl"] = p["name"]
+            prepared.append(dict(p, name=p["name"] + "_regl", text=text))
+        variants.update(reg_variants)
         (work / "gold.c").write_text(gold_source(cases))
         run(["gcc", "-m32", "-msse2", "-fno-pic", "-no-pie", "-O0", "gold.c", "native.o", "-o", "gold_x86", "-lm"],
             cwd=work)
@@ -461,7 +472,9 @@ def main(argv=None) -> int:
             print(out)
         if not ok:
             rc = 1
-    print(f"x87 locals: {len(variants)} case(s) also run through --x87-locals"
+    print(f"reg locals: {len(reg_variants)} case(s) also run through --x87-locals --reg-locals"
+          + (f"; it kept the memory model in {len(reg_declined)}: {reg_declined}" if reg_declined else ""))
+    print(f"x87 locals: {len(variants) - len(reg_variants)} case(s) also run through --x87-locals"
           + (f"; it kept the memory model in {len(declined)}: {declined}" if declined else ""))
     if unimpl:
         print(f"note: {len(unimpl)} case(s) lifted with unimplemented instructions: {sorted(unimpl)}")
