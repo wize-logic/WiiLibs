@@ -1,0 +1,615 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Wed, 14 Oct 2026 22:00:00 -0400
+Subject: [PATCH] recomp: integer widths and flags of mul, div, sub, add, neg and shifts
+
+- One-operand mul, imul, div and idiv were lifted as the dword forms at
+  every width. `mul cl` multiplied all of EAX and wrote EDX; `div cl`
+  divided EDX:EAX. A byte operand now works in AX (AL, AH for the
+  quotient and remainder), a word in DX:AX. The divisor is read once,
+  before any write (`div eax` took the remainder by the new quotient).
+  The dword divides take a 32-bit path when EDX is only EAX's extension
+  (`xor edx, edx; div`, `cdq; idiv`): a 64-bit division is a library call
+  on a 32-bit host.
+- mul sets CF and OF (the high half is nonzero) but sat with the
+  instructions whose flags are undefined, so `mul; jo` read 0. mul and
+  every imul now publish CF = OF in _fb, and jo/jno/jc/jnc after them read
+  it. seto and setno are fused like the other SETcc forms.
+- Two- and three-operand imul multiplied as int32_t, which overflows --
+  undefined in C -- for exactly the products whose OF the hardware sets.
+  The low half is the same bits signed or unsigned: multiply in uint32_t.
+- A narrow sub followed by jl/jge/jle/jg compared the reconstructed
+  operands at 32 bits; they are cast to the operand's width, as the cmp
+  snapshot is.
+- add and neg followed by jl/jge/jle/jg tested SF alone. The signed
+  conditions are SF != OF: the sign of the exact sum (add) or of 0 - a
+  (neg), now computed in 64 bits.
+- A shift by zero leaves the flags alone but published its result
+  snapshot. A constant zero count is no longer tracked as a flag setter.
+  With a variable count the snapshot is written only for a nonzero one;
+  for zero, when the previous setter is known, its ZF and SF (taken
+  before the write) are stored as a result that reads the same, since
+  the snapshot slots need not hold a result (a cmp keeps its operands
+  there).
+- cwd was not lifted; it sets DX to AX's sign.
+
+Tests: test_integer_width_flags.py. Conformance cases mul8, imul8, mul16,
+imul16, div8, idiv8, idiv8_neg, div16, idiv16, div32_fast, div32_wide,
+idiv32_cdq, idiv32_cdq_neg, idiv32_wide, div_by_eax, mul32_cf_of,
+mul8_of, imul32_one_of, imul16_one_of, imul_two_of, imul_two_16_of,
+imul_three_of, imul_three_16_of, sub8_signed, sub16_signed,
+add32_signed, add8_signed, neg32_signed, neg8_signed, the three
+<shift>_zero_count_flags and shl_imm_zero_flags.
+---
+diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
+--- a/tools/conformance/cases.py
++++ b/tools/conformance/cases.py
+@@ -675,3 +675,81 @@
+           "seta cl", "setb ch", "setz dl", "setp dh", "shl ch, 1", "shl dl, 2", "shl dh, 3",
+           "or cl, ch", "or cl, dl", "or cl, dh", "movzx eax, cl"], _FP_NAN, "fpu"),
+ ]
++
++# One-operand mul/imul/div/idiv at each width: a byte operand works in AX, a
++# word in DX:AX. EDX starts as a marker and is folded into eax, so a form that
++# clobbers it (every narrow one did) shows. Divisors and dividends are shaped
++# so no quotient overflows (the hardware would fault).
++_W = "mov edx, 05A5A5A5Ah"
++CASES += [
++    Case("mul8", "mul r/m8: ax = al * cl, edx untouched", [_W, "mul cl", "xor eax, edx"], _PAIRS),
++    Case("imul8", "imul r/m8: ax = al * cl signed", [_W, "imul cl", "xor eax, edx"], _PAIRS),
++    Case("mul16", "mul r/m16: dx:ax = ax * cx", [_W, "mul cx", "rol edx, 8", "xor eax, edx"], _PAIRS),
++    Case("imul16", "imul r/m16: dx:ax = ax * cx signed", [_W, "imul cx", "rol edx, 8", "xor eax, edx"], _PAIRS),
++    Case("div8", "div r/m8: al = ax / cl, ah = ax % cl",
++         ["and eax, 0FFFF00FFh", "or cl, 1", _W, "div cl", "xor eax, edx"], _PAIRS),
++    Case("idiv8", "idiv r/m8, positive divisor",
++         ["cbw", "and cl, 7Fh", "or cl, 2", _W, "idiv cl", "xor eax, edx"], _PAIRS),
++    Case("idiv8_neg", "idiv r/m8, negative divisor",
++         ["cbw", "and cl, 7Fh", "or cl, 2", "neg cl", _W, "idiv cl", "xor eax, edx"], _PAIRS),
++    Case("div16", "div r/m16: ax = dx:ax / cx, dx = remainder",
++         ["mov edx, 05A5A0000h", "or cx, 1", "div cx", "rol edx, 8", "xor eax, edx"], _PAIRS),
++    Case("idiv16", "idiv r/m16 after cwd",
++         ["mov edx, 05A5A0000h", "cwd", "and cx, 7FFFh", "or cx, 2", "idiv cx",
++          "rol edx, 8", "xor eax, edx"], _PAIRS),
++    Case("div32_fast", "div r/m32 with edx = 0", ["xor edx, edx", "or ecx, 1", "div ecx", "xor eax, edx"], _PAIRS),
++    Case("div32_wide", "div r/m32 with a nonzero high half",
++         ["mov edx, ecx", "shr edx, 1", "or ecx, 1", "div ecx", "rol edx, 8", "xor eax, edx"], _PAIRS),
++    Case("idiv32_cdq", "cdq; idiv: the sign-extended dividend",
++         ["cdq", "and ecx, 7FFFFFFFh", "or ecx, 2", "idiv ecx", "rol edx, 8", "xor eax, edx"], _PAIRS),
++    Case("idiv32_cdq_neg", "cdq; idiv by a negative divisor",
++         ["cdq", "and ecx, 7FFFFFFFh", "or ecx, 2", "neg ecx", "idiv ecx", "rol edx, 8", "xor eax, edx"], _PAIRS),
++    Case("idiv32_wide", "idiv with edx not eax's sign (the 64-bit path)",
++         ["xor edx, edx", "and ecx, 7FFFFFFFh", "or ecx, 2", "idiv ecx", "rol edx, 8", "xor eax, edx"], _PAIRS),
++    Case("div_by_eax", "div eax: the divisor is read before the quotient replaces it",
++         ["or eax, 1", "xor edx, edx", "div eax", "rol edx, 8", "xor eax, edx"], _PAIRS),
++
++    # CF and OF after mul/imul: the product does not fit the low half.
++    Case("mul32_cf_of", "mul r/m32 sets CF = OF = (edx != 0)",
++         ["mul ecx", "seto cl", "setb ch", "movzx ecx, cx", "xor eax, edx", "xor eax, ecx"], _PAIRS),
++    Case("mul8_of", "mul r/m8 sets OF when ah != 0",
++         ["mul cl", "seto cl", "movzx ecx, cl", "shl ecx, 16", "xor eax, ecx"], _PAIRS),
++    Case("imul32_one_of", "imul r/m32: OF when edx:eax is not eax sign-extended",
++         ["imul ecx", "seto cl", "movzx ecx, cl", "xor eax, edx", "xor eax, ecx"], _PAIRS),
++    Case("imul16_one_of", "imul r/m16: OF when dx:ax is not ax sign-extended",
++         [_W, "imul cx", "setb cl", "movzx ecx, cl", "shl ecx, 16", "xor eax, ecx", "rol edx, 8",
++          "xor eax, edx"], _PAIRS),
++    Case("imul_two_of", "imul r32, r/m32: the low half, OF on signed overflow",
++         ["imul eax, ecx", "seto cl", "movzx ecx, cl", "xor eax, ecx"], _PAIRS),
++    Case("imul_two_16_of", "imul r16, r/m16 at word width",
++         ["imul ax, cx", "seto cl", "movzx ecx, cl", "shl ecx, 16", "xor eax, ecx"], _PAIRS),
++    Case("imul_three_of", "imul r32, r/m32, imm: OF on signed overflow",
++         ["imul eax, ecx, -3", "setb cl", "movzx ecx, cl", "xor eax, ecx"], _PAIRS),
++    Case("imul_three_16_of", "imul r16, r/m16, imm at word width",
++         ["imul ax, cx, 1000h", "seto cl", "movzx ecx, cl", "shl ecx, 16", "xor eax, ecx"], _PAIRS),
++
++    # The signed conditions after a narrow sub, and after add and neg, are
++    # SF != OF: the sign of the exact result, not of the wrapped one.
++    Case("sub8_signed", "sub al, cl; setl/setle at byte width",
++         ["sub al, cl", "setl dl", "setle dh", "movzx edx, dx", "shl edx, 16", "xor eax, edx"], _PAIRS),
++    Case("sub16_signed", "sub ax, cx; setg/setge at word width",
++         ["sub ax, cx", "setg dl", "setge dh", "movzx edx, dx", "shl edx, 16", "xor eax, edx"], _PAIRS),
++    Case("add32_signed", "add eax, ecx; setl/setle with signed overflow",
++         ["add eax, ecx", "setl dl", "setle dh", "movzx edx, dx", "xor eax, edx"], _PAIRS),
++    Case("add8_signed", "add al, cl; setg/setge at byte width",
++         ["add al, cl", "setg dl", "setge dh", "movzx edx, dx", "shl edx, 16", "xor eax, edx"], _PAIRS),
++    Case("neg32_signed", "neg eax; setl/setle (the most negative value overflows)",
++         ["neg eax", "setl dl", "setle dh", "movzx edx, dx", "xor eax, edx"], _PAIRS),
++    Case("neg8_signed", "neg al; setg/setge at byte width",
++         ["neg al", "setg dl", "setge dh", "movzx edx, dx", "shl edx, 16", "xor eax, edx"], _PAIRS),
++]
++
++# A shift by a count of zero (or a multiple of 32) leaves every flag as it
++# was: here the cmp's, which the sete/sets after the shift must still see.
++for _sh in ("shl", "shr", "sar"):
++    CASES.append(Case(_sh + "_zero_count_flags", _sh + " by cl = 0 keeps the cmp's ZF and SF",
++                      ["cmp ecx, 7", _sh + " eax, cl", "sete dl", "sets dh", "movzx edx, dx",
++                       "xor eax, edx"], _SHIFT_COUNTS))
++CASES.append(Case("shl_imm_zero_flags", "shl by an immediate 0 keeps the cmp's flags",
++                  ["cmp ecx, 7", "shl eax, 0", "sete dl", "sets dh", "movzx edx, dx", "xor eax, edx"],
++                  _SHIFT_COUNTS))
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -390,7 +390,7 @@
+ # Instructions that set arithmetic flags (primary set, fully handled)
+ FLAG_SETTERS = frozenset({
+     "cmp", "test", "sub", "add", "and", "or", "xor",
+-    "inc", "dec", "neg", "shl", "shr", "sar", "imul", "adc", "sbb",
++    "inc", "dec", "neg", "shl", "shr", "sar", "imul", "mul", "adc", "sbb",
+     "comiss", "comisd", "ucomiss", "ucomisd",  # SSE float compare
+ })
+ 
+@@ -448,7 +448,9 @@
+ 
+ # Instructions with undefined/unpredictable flags (clear tracking)
+ _FLAGS_UNDEFINED = frozenset({
+-    "mul", "div", "idiv",  # Flags partially undefined
++    # mul is not here: it defines CF and OF (the high half is nonzero), which
++    # the lift publishes in _fb like imul's.
++    "div", "idiv",         # Flags undefined
+     "rdtsc", "cpuid",      # Special instructions
+     "lock xadd",           # Lock prefix - complex flag behavior
+     # popfd REPLACES every flag with whatever was pushed. Its flags are not
+@@ -673,6 +675,16 @@
+             return f"{expr} /* {flag_setter} */", desc
+         return None
+ 
++    # ── mul/imul: CF = OF = the product does not fit the destination ──
++    #
++    # The lift publishes that in _fb; SF, ZF and PF are undefined.
++    if flag_setter in ("mul", "imul"):
++        if jcc in ("jo", "jb", "jnae", "jc"):
++            return "(_fb != 0)", desc
++        if jcc in ("jno", "jae", "jnb", "jnc"):
++            return "(_fb == 0)", desc
++        return None
++
+     # If no operands available for other flag-setters, can't generate condition
+     if lhs is None:
+         return None
+@@ -832,8 +844,14 @@
+             return f"({slhs} < 0)", desc
+         if jcc == "jns":
+             return f"({slhs} >= 0)", desc
+-        # Ordered: reconstruct original a = result + b
++        # Ordered: reconstruct original a = result + b, at the operand's width:
++        # `sub al, cl; jl` compares the bytes as int8_t, and the sum of the
++        # zero-extended snapshots evaluated at 32 bits never looked negative.
+         if cmp_macro and rhs:
++            if _sf_width in (1, 2):
++                t = _sf_utype
++                return (f"{cmp_macro}(({t})((uint32_t){lhs} + (uint32_t){rhs}),"
++                        f" ({t}){rhs})"), desc
+             return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
+         if jcc in ("jb", "jnae"):
+             return f"((uint32_t){lhs} + (uint32_t){rhs} < (uint32_t){rhs})", desc
+@@ -863,14 +881,15 @@
+             return f"({lhs} < (uint32_t){rhs})", desc
+         if jcc in ("jae", "jnb", "jnc"):
+             return f"({lhs} >= (uint32_t){rhs})", desc
+-        if jcc in ("jl", "jnge"):
+-            return f"({slhs} < 0)", desc
+-        if jcc in ("jge", "jnl"):
+-            return f"({slhs} >= 0)", desc
+-        if jcc in ("jle", "jng"):
+-            return f"({slhs} <= 0)", desc
+-        if jcc in ("jg", "jnle"):
+-            return f"({slhs} > 0)", desc
++        # The signed conditions are SF != OF (with ZF for jle/jg): the sign
++        # of the sum taken exactly, which is what they read when it
++        # overflows. SF alone answered `add eax, 1; jl` with "less" at
++        # 0x7FFFFFFF + 1. The original destination is result - source.
++        if rhs is not None and jcc in _SIGNED_ORDER:
++            st = _sf_cast
++            exact = (f"((int64_t){st}(uint32_t)((uint32_t){lhs} - (uint32_t){rhs})"
++                     f" + (int64_t){st}(uint32_t){rhs})")
++            return f"({exact} {_SIGNED_ORDER[jcc]} 0)", desc
+         return None
+ 
+     # ── adc/sbb: result-based (like add/sub but with carry) ──
+@@ -959,14 +978,12 @@
+             return f"({slhs} < 0)", desc
+         if jcc == "jns":
+             return f"({slhs} >= 0)", desc
+-        if jcc in ("jg", "jnle"):
+-            return f"({slhs} > 0)", desc
+-        if jcc in ("jge", "jnl"):
+-            return f"({slhs} >= 0)", desc
+-        if jcc in ("jl", "jnge"):
+-            return f"({slhs} < 0)", desc
+-        if jcc in ("jle", "jng"):
+-            return f"({slhs} <= 0)", desc
++        # Signed: 0 - a, compared exactly -- 0 < a for jl. The result's sign
++        # alone is wrong for the most negative value, which neg leaves as it
++        # is with OF set (SF = OF, so jl is not taken).
++        if jcc in _SIGNED_ORDER:
++            orig = f"(-(int64_t){_sf_cast}(uint32_t)(0u - (uint32_t){lhs}))"
++            return f"({orig} {_SIGNED_ORDER[jcc]} 0)", desc
+         return None
+ 
+     # ── shift: result-based ──
+@@ -1095,6 +1112,11 @@
+     return None
+ 
+ 
++# A signed condition as a comparison of the exact (unwrapped) result with 0.
++_SIGNED_ORDER = {"jl": "<", "jnge": "<", "jge": ">=", "jnl": ">=",
++                 "jle": "<=", "jng": "<=", "jg": ">", "jnle": ">"}
++
++
+ # SETcc / CMOVcc forms the lifter turns into a condition. The parity forms
+ # matter after fcomi/fucomi (and comiss/ucomiss): "a == b" on doubles is
+ # `fucomip; setnp dl; sete al; and al, dl`, because ZF alone is also set by
+@@ -1102,7 +1124,7 @@
+ # whatever it held -- and every float equality test came out wrong.
+ _SETCC = frozenset(("sete", "setne", "setb", "setae", "setbe", "seta",
+                     "setl", "setge", "setle", "setg", "sets", "setns",
+-                    "setp", "setnp", "setpe", "setpo"))
++                    "setp", "setnp", "setpe", "setpo", "seto", "setno"))
+ _CMOVCC = frozenset(("cmove", "cmovne", "cmovb", "cmovae", "cmovbe", "cmova",
+                      "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns",
+                      "cmovp", "cmovnp", "cmovpe", "cmovpo"))
+@@ -1618,6 +1640,9 @@
+             return ["edx = ((int32_t)eax < 0) ? 0xFFFFFFFF : 0; /* cdq */"]
+         if m == "cwde":
+             return ["eax = SX16(eax); /* cwde */"]
++        if m == "cwd":
++            # DX = AX's sign; was not lifted at all (idiv r/m16's setup).
++            return ["SET_LO16(edx, (eax & 0x8000u) ? 0xFFFFu : 0u); /* cwd */"]
+         if m == "cbw":
+             return ["SET_LO16(eax, SX8(eax)); /* cbw */"]
+         if m == "bswap" and nops >= 1 and ops[0].type == "reg":
+@@ -2209,47 +2234,107 @@
+         return self._lift_double_shift(insn, ops, "shrd")
+ 
+     def _lift_imul(self, insn, ops):
++        """imul, all three forms.
++
++        The two- and three-operand forms keep the low half of the product.
++        It is the same bits signed or unsigned, so the multiply is done in
++        uint32_t: `(int32_t)a * (int32_t)b` overflows -- undefined in C, and
++        an optimiser may assume it does not -- for exactly the products whose
++        CF/OF the hardware sets. Those flags (the signed product does not fit
++        the destination) go to _fb, before the write, for a jo/jc; nothing
++        reads _fb otherwise and the compiler drops it.
++
++        The one-operand form widens into DX:AX or EDX:EAX by the operand's
++        width; see _lift_muldiv.
++        """
+         nops = len(ops)
+         if nops == 1:
+-            # One operand: edx:eax = eax * ops[0]
+-            src = _fmt_operand_read(ops[0])
+-            return [
+-                f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
+-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
+-            ]
+-        elif nops == 2:
+-            # Two operand: dst = dst * src
+-            dst = _fmt_operand_read(ops[0])
+-            src = _fmt_operand_read(ops[1])
+-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} * (int32_t){src})")]
+-        elif nops == 3:
+-            # Three operand: dst = src1 * imm
+-            src = _fmt_operand_read(ops[1])
+-            imm = _fmt_operand_read(ops[2])
+-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){src} * (int32_t){imm})")]
+-        return ["/* imul: unexpected form */"]
++            return self._lift_muldiv(insn, ops, "imul")
++        if nops not in (2, 3):
++            return ["/* imul: unexpected form */"]
++        a = _fmt_operand_read(ops[0] if nops == 2 else ops[1])
++        b = _fmt_operand_read(ops[1] if nops == 2 else ops[2])
++        w = _operand_width(ops[0]) or 4
++        st = {1: "(int8_t)", 2: "(int16_t)"}.get(w, "(int32_t)")
++        return [f"{{ int64_t _p = (int64_t){st}(uint32_t)({a}) * (int64_t){st}(uint32_t)({b});"
++                f" _fb = (uint32_t)(_p != (int64_t){st}(uint32_t)(uint64_t)_p); }} /* imul CF/OF */",
++                _fmt_operand_write(ops[0], f"(uint32_t)({a}) * (uint32_t)({b})")]
+ 
+     def _lift_muldiv(self, insn, ops, m):
++        """One-operand mul, imul, div and idiv, at the operand's width.
++
++        A byte operand multiplies AL into AX and divides AX into AL
++        (quotient) and AH (remainder); a word multiplies AX into DX:AX and
++        divides DX:AX into AX and DX; a dword uses EDX:EAX. Every form was
++        lifted as the dword one, so `mul cl` clobbered EDX and multiplied
++        all of EAX, and `div cl` divided EDX:EAX.
++
++        mul and imul publish CF = OF (the product does not fit the low half)
++        in _fb. The divisor is read once, before any write: `div eax` would
++        otherwise take the remainder by the new quotient.
++
++        The dword divides take a 32-bit path when EDX is only EAX's extension
++        (`xor edx, edx; div` and `cdq; idiv`, nearly every one): a 64-bit
++        division is a library call on a 32-bit host.
++        """
+         if len(ops) < 1:
+             return [f"/* {m}: no operand */"]
+         src = _fmt_operand_read(ops[0])
+-        if m == "mul":
+-            return [
+-                f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
+-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
+-            ]
+-        elif m == "div":
+-            return [
+-                f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
+-                f"  eax = (uint32_t)(_dividend / (uint32_t){src});",
+-                f"  edx = (uint32_t)(_dividend % (uint32_t){src}); }}"
+-            ]
+-        elif m == "idiv":
+-            return [
+-                f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax;",
+-                f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t){src}));",
+-                f"  edx = (uint32_t)((int32_t)(_dividend % (int32_t){src})); }}"
+-            ]
++        w = _operand_width(ops[0]) or 4
++        al, ah, ax, dx = _fmt_reg("al"), _fmt_reg("ah"), _fmt_reg("ax"), _fmt_reg("dx")
++        if w == 1:
++            if m == "mul":
++                return [f"{{ uint32_t _r = (uint32_t)({al}) * (uint32_t)({src});"
++                        f" {_fmt_set_reg('ax', '_r')} _fb = (uint32_t)(_r > 0xFFu); }} /* mul: ax = al * r/m8 */"]
++            if m == "imul":
++                return [f"{{ int32_t _r = (int32_t)(int8_t)(uint32_t)({al}) * (int32_t)(int8_t)(uint32_t)({src});"
++                        f" {_fmt_set_reg('ax', '(uint32_t)_r')} _fb = (uint32_t)(_r != (int8_t)_r); }}"
++                        f" /* imul: ax = al * r/m8 */"]
++            if m == "div":
++                return [f"{{ uint32_t _n = {ax}, _d = (uint32_t)({src});"
++                        f" {_fmt_set_reg('al', '_n / _d')} {_fmt_set_reg('ah', '_n % _d')} }}"
++                        f" /* div: al, ah = ax / r/m8 */"]
++            if m == "idiv":
++                return [f"{{ int32_t _n = (int16_t)(uint32_t)({ax}), _d = (int8_t)(uint32_t)({src});"
++                        f" {_fmt_set_reg('al', '(uint32_t)(_n / _d)')}"
++                        f" {_fmt_set_reg('ah', '(uint32_t)(_n % _d)')} }} /* idiv: al, ah = ax / r/m8 */"]
++        elif w == 2:
++            if m == "mul":
++                return [f"{{ uint32_t _r = (uint32_t)({ax}) * (uint32_t)({src});"
++                        f" {_fmt_set_reg('ax', '_r')} {_fmt_set_reg('dx', '_r >> 16')}"
++                        f" _fb = (uint32_t)((_r >> 16) != 0); }} /* mul: dx:ax = ax * r/m16 */"]
++            if m == "imul":
++                return [f"{{ int32_t _r = (int32_t)(int16_t)(uint32_t)({ax}) * (int32_t)(int16_t)(uint32_t)({src});"
++                        f" {_fmt_set_reg('ax', '(uint32_t)_r')} {_fmt_set_reg('dx', '(uint32_t)_r >> 16')}"
++                        f" _fb = (uint32_t)(_r != (int16_t)_r); }} /* imul: dx:ax = ax * r/m16 */"]
++            if m == "div":
++                return [f"{{ uint32_t _n = ((uint32_t)({dx}) << 16) | (uint32_t)({ax}), _d = (uint32_t)({src});"
++                        f" {_fmt_set_reg('ax', '_n / _d')} {_fmt_set_reg('dx', '_n % _d')} }}"
++                        f" /* div: ax, dx = dx:ax / r/m16 */"]
++            if m == "idiv":
++                return [f"{{ int64_t _n = (int32_t)(((uint32_t)({dx}) << 16) | (uint32_t)({ax}));"
++                        f" int64_t _d = (int16_t)(uint32_t)({src});"
++                        f" {_fmt_set_reg('ax', '(uint32_t)(_n / _d)')} {_fmt_set_reg('dx', '(uint32_t)(_n % _d)')} }}"
++                        f" /* idiv: ax, dx = dx:ax / r/m16 */"]
++        else:
++            if m == "mul":
++                return [f"{{ uint64_t _r = (uint64_t)eax * (uint64_t)(uint32_t)({src});",
++                        f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); _fb = (uint32_t)(edx != 0); }}"]
++            if m == "imul":
++                return [f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t)(uint32_t)({src});",
++                        f"  eax = (uint32_t)_r; edx = (uint32_t)((uint64_t)_r >> 32);"
++                        f" _fb = (uint32_t)(_r != (int32_t)_r); }}"]
++            if m == "div":
++                return [f"{{ uint32_t _d = (uint32_t)({src});",
++                        f"  if (edx == 0) {{ uint32_t _q = eax / _d; edx = eax % _d; eax = _q; }}",
++                        f"  else {{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
++                        f"  eax = (uint32_t)(_dividend / _d); edx = (uint32_t)(_dividend % _d); }} }}"]
++            if m == "idiv":
++                return [f"{{ int32_t _d = (int32_t)(uint32_t)({src});",
++                        f"  if (edx == (uint32_t)((int32_t)eax >> 31) && _d != -1) {{",
++                        f"  int32_t _q = (int32_t)eax / _d; edx = (uint32_t)((int32_t)eax % _d); eax = (uint32_t)_q; }}",
++                        f"  else {{ int64_t _dividend = (int64_t)(((uint64_t)edx << 32) | eax);",
++                        f"  eax = (uint32_t)(int32_t)(_dividend / _d); edx = (uint32_t)(int32_t)(_dividend % _d); }} }}"]
+         return [f"/* {m}: unhandled */"]
+ 
+     def _lift_shift(self, insn, ops, c_op):
+@@ -2279,8 +2364,7 @@
+             bit = f"{cnt} - 1" if c_op == ">>" else f"({w}u - {cnt}) & 31u"
+             out.append(f"if ({cnt}) _cf = (int)((((uint32_t)({dst})) >> ({bit})) & 1);")
+         out.append(_fmt_operand_write(ops[0], f"(uint32_t)({dst}) {c_op} {cnt}"))
+-        out.append(self._result_snapshot(ops, "shift"))
+-        return out
++        return self._shift_flags(out, ops, cnt, "shift")
+ 
+     def _lift_sar(self, insn, ops):
+         """Arithmetic shift right, at the operand's own width.
+@@ -2320,7 +2404,28 @@
+         if self.needs_cf:
+             out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> (({cnt}) - 1)) & 1);")
+         out.append(_fmt_operand_write(ops[0], f"(uint32_t)(({signed}) >> {cnt})"))
+-        out.append(self._result_snapshot(ops, "sar"))
++        return self._shift_flags(out, ops, cnt, "sar")
++
++    def _shift_flags(self, out, ops, cnt, m):
++        """The result snapshot of a shift whose count may be zero.
++
++        A zero count leaves every flag as it was, so the snapshot is written
++        only for a nonzero one. The snapshot then still holds whatever the
++        previous setter left, which need not mean "result" -- a cmp keeps its
++        operands there -- so when lift_basic_block knows that setter it passes
++        its ZF and SF (shift_flags_in), evaluated before the write, and a zero
++        count stores a result that reads the same: 0 for ZF, negative for SF.
++        CF is already guarded by the count. (A constant zero count is not
++        tracked as a setter at all.)
++        """
++        snap = self._result_snapshot(ops, m)
++        keep, self.shift_flags_in = getattr(self, "shift_flags_in", None), None
++        if not keep or not out:
++            out.append(f"if ({cnt}) {{ {snap} }}")
++            return out
++        write = out.pop()
++        out.append(f"{{ int _zf0 = ({keep[0]}) != 0, _sf0 = ({keep[1]}) != 0; {write}"
++                   f" if ({cnt}) {{ {snap} }} else {{ _fa = _zf0 ? 0u : 1u; _fas = _sf0 ? -1 : 1; }} }}")
+         return out
+ 
+     def _lift_rotate_carry(self, insn, ops, m):
+@@ -4230,7 +4335,13 @@
+             results = lifter._lift_neg(
+                 curr, curr.operands, preserve_carry=preserve)
+         else:
++            if (curr.mnemonic in ("shl", "sal", "shr", "sar") and last_flag_setter
++                    and len(curr.operands) >= 2 and curr.operands[1].type != "imm"):
++                zf = _make_condition("je", last_flag_setter, last_flag_ops)
++                sf = _make_condition("js", last_flag_setter, last_flag_ops)
++                lifter.shift_flags_in = (zf[0], sf[0]) if zf and sf else None
+             results = lifter.lift_instruction(insns[i])
++            lifter.shift_flags_in = None
+             # A REPE/REPNE compare whose count is zero leaves EFLAGS alone,
+             # but `_flags` would keep whatever it last held -- 0 on entry --
+             # so the je after it read "not equal" where the hardware reads
+@@ -4255,6 +4366,10 @@
+             last_flag_ops = list(curr.operands)
+         elif curr.mnemonic in _SSE_CMP_NAMED:
+             pass  # SSE compares write a mask, not EFLAGS
++        elif (curr.mnemonic in ("shl", "sal", "shr", "sar")
++              and len(curr.operands) >= 2 and curr.operands[1].type == "imm"
++              and (curr.operands[1].imm & 31) == 0):
++            pass  # a shift by a constant zero leaves every flag alone
+         elif curr.mnemonic in FLAG_SETTERS:
+             last_flag_setter, last_flag_ops = normalise_zero_test(
+                 curr.mnemonic, list(curr.operands))
+diff --git a/tools/recomp/test_integer_width_flags.py b/tools/recomp/test_integer_width_flags.py
+new file mode 100644
+--- /dev/null
++++ b/tools/recomp/test_integer_width_flags.py
+@@ -0,0 +1,107 @@
++"""Operand widths and flags of the integer multiply, divide, sub, add, neg and shifts.
++
++One-operand mul/imul/div/idiv were lifted as the dword forms at every width;
++mul's CF/OF were never published; the signed conditions after a narrow sub
++compared at 32 bits and after add/neg ignored OF; and a shift by zero
++published a new result snapshot although it leaves the flags alone.
++"""
++
++import unittest
++
++from .disasm import BasicBlock, Instruction, Operand
++from .lifter import Lifter, lift_basic_block
++
++
++def _reg(r):
++    return Operand(type="reg", reg=r)
++
++
++def _imm(v):
++    return Operand(type="imm", imm=v)
++
++
++def _insn(m, ops):
++    i = Instruction(0x00011000, 2, m, "", "0000")
++    i.operands = ops
++    return i
++
++
++def _lift(m, ops):
++    return "\n".join(Lifter().lift_instruction(_insn(m, ops)))
++
++
++def _block(*insns):
++    out = []
++    addr = 0x00011000
++    for m, ops in insns:
++        i = Instruction(addr, 2, m, "", "0000")
++        i.operands = ops
++        out.append(i)
++        addr += 2
++    lines, _ = lift_basic_block(Lifter(), BasicBlock(start=0x00011000, instructions=out))
++    return "\n".join(lines)
++
++
++class MulDivWidthTest(unittest.TestCase):
++    def test_byte_mul_writes_ax_only(self):
++        c = _lift("mul", [_reg("cl")])
++        self.assertIn("SET_LO16(eax, _r)", c)
++        self.assertNotIn("edx =", c)
++
++    def test_word_div_divides_dx_ax(self):
++        c = _lift("div", [_reg("cx")])
++        self.assertIn("<< 16", c)
++        self.assertIn("SET_LO16(edx,", c)
++
++    def test_dword_div_reads_the_divisor_once_and_has_a_32_bit_path(self):
++        c = _lift("div", [_reg("eax")])
++        self.assertIn("uint32_t _d = (uint32_t)(eax);", c)
++        self.assertIn("if (edx == 0)", c)
++
++
++class MulFlagsTest(unittest.TestCase):
++    def test_jo_after_mul_reads_the_published_overflow(self):
++        c = _block(("mul", [_reg("ecx")]), ("seto", [_reg("al")]))
++        self.assertIn("_fb = (uint32_t)(edx != 0);", c)
++        self.assertIn("(_fb != 0)", c)
++
++    def test_two_operand_imul_multiplies_unsigned(self):
++        c = _lift("imul", [_reg("eax"), _reg("ecx")])
++        self.assertIn("(uint32_t)(eax) * (uint32_t)(ecx)", c)
++        self.assertNotIn("(int32_t)eax * (int32_t)", c)
++
++
++class SignedConditionTest(unittest.TestCase):
++    def test_narrow_sub_compares_at_its_width(self):
++        c = _block(("sub", [_reg("al"), _reg("cl")]), ("setl", [_reg("dl")]))
++        self.assertIn("CMP_L((uint8_t)((uint32_t)_fa + (uint32_t)_fb), (uint8_t)_fb)", c)
++
++    def test_add_jl_takes_the_exact_sum(self):
++        c = _block(("add", [_reg("eax"), _reg("ecx")]), ("setl", [_reg("dl")]))
++        self.assertIn("(int64_t)", c)
++        self.assertIn("< 0)", c)
++
++    def test_neg_jl_compares_zero_with_the_operand(self):
++        c = _block(("neg", [_reg("eax")]), ("setl", [_reg("dl")]))
++        self.assertIn("0u - (uint32_t)_fa", c)
++
++
++class ShiftZeroTest(unittest.TestCase):
++    def test_variable_count_snapshot_is_guarded(self):
++        c = _lift("shl", [_reg("eax"), _reg("cl")])
++        self.assertIn("if (((LO8(ecx)) & 31u)) { _fa =", c)
++
++    def test_variable_count_carries_the_previous_zf_and_sf(self):
++        c = _block(("cmp", [_reg("ecx"), _imm(7)]), ("shl", [_reg("eax"), _reg("cl")]),
++                   ("sete", [_reg("dl")]))
++        self.assertIn("int _zf0 = (CMP_EQ(_fa, _fb)) != 0", c)
++        self.assertIn("else { _fa = _zf0 ? 0u : 1u;", c)
++
++    def test_constant_zero_count_keeps_the_previous_setter(self):
++        c = _block(("cmp", [_reg("ecx"), _imm(7)]), ("shl", [_reg("eax"), _imm(0)]),
++                   ("sete", [_reg("dl")]))
++        self.assertIn("_fa == _fb", c.replace("CMP_EQ(_fa, _fb)", "_fa == _fb"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/recomp/test_interior_targets.py b/tools/recomp/test_interior_targets.py
+--- a/tools/recomp/test_interior_targets.py
++++ b/tools/recomp/test_interior_targets.py
+@@ -113,7 +113,7 @@
+     subject, code = lift(A)
+     assert f"goto loc_{B_BODY:08X};" in code, code
+     assert f"loc_{B_BODY:08X}: ;" in code
+-    assert "ebx = (uint32_t)((int32_t)ebx * (int32_t)7);" in code
++    assert "ebx = (uint32_t)(ebx) * (uint32_t)(7);" in code
+     # no call to a symbol nobody defines
+     assert f"sub_{B_BODY:08X}" not in code
+     assert B_BODY not in subject.lifter.referenced_calls
+@@ -136,7 +136,7 @@
+     assert f"RECOMP_ABI_CALL(0x{B_CORE:08X}u, sub_{B_CORE:08X});" in code, code
+     core = subject.translate_function(B_CORE, entry)
+     assert "eax = MEM32(esp + 4);" in core, core
+-    assert "ebx = (uint32_t)((int32_t)ebx * (int32_t)7);" in core
++    assert "ebx = (uint32_t)(ebx) * (uint32_t)(7);" in core
+     assert B_CORE in subject.lifter.entry_starts
+ 
+ 
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -2703,7 +2703,7 @@
+         # cmpxchg belongs here too: it snapshots the compare it performed,
+         # because eax may be replaced before the branch reads the result.
+         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
+-                                 "lock cmpxchg", "inc", "dec")
++                                 "lock cmpxchg", "inc", "dec", "mul", "imul")
+                or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
+                for insn in instructions):
+             lines.append("    uint32_t _fa = 0, _fb = 0;")
+-- 
+2.43.0
+
