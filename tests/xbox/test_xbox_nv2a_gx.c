@@ -19,14 +19,14 @@
 
 static WlNv2aGx *g_gx;
 
-static WlNv2a *gx_device(TGuest *g) {
+static WlNv2a *gx_device_with(TGuest *g, const WlNv2aGxConfig *cfg) {
     WlNv2aBackend backend;
 
     wl_gx_init();
     wl_host_gx_direct_reset();
     wl_host_tev_reset();
     wl_host_gx_clear_counters();
-    g_gx = wl_nv2a_gx_create(NULL);
+    g_gx = wl_nv2a_gx_create(cfg);
     if (g_gx == NULL) {
         return NULL;
     }
@@ -37,6 +37,10 @@ static WlNv2a *gx_device(TGuest *g) {
     wl_nv2a_gx_attach(g_gx, g->dev);
     t_setup_3d(g);
     return g->dev;
+}
+
+static WlNv2a *gx_device(TGuest *g) {
+    return gx_device_with(g, NULL);
 }
 
 static void gx_done(TGuest *g) {
@@ -325,12 +329,142 @@ TEST a_blur_through_the_depth_buffer_is_drawn_in_one_frame(void) {
     PASS();
 }
 
+// a write watch that sees the stores a test says were made: to [g_stored_phys, + g_stored_bytes)
+static uint32_t g_watch_stamp, g_stored_phys, g_stored_bytes;
+
+static uint32_t fake_watch(void *user, uint32_t phys, uint32_t bytes) {
+    (void)user;
+    (void)phys;
+    (void)bytes;
+    return ++g_watch_stamp;
+}
+
+static bool fake_written(void *user, uint32_t phys, uint32_t bytes, uint32_t stamp) {
+    (void)user;
+    (void)stamp;
+    return g_stored_bytes != 0 && phys < g_stored_phys + g_stored_bytes &&
+           g_stored_phys < phys + bytes;
+}
+
+// a triangle into the 128x128 swizzled A8R8G8B8 surface at 0x70000 (a render target), then the
+// back buffer again, its texture stage 0 at 0x70000 in `format` (128x128 swizzled)
+static void target_then_screen(TGuest *g, uint32_t format) {
+    t_m1(g, WL_NV2A_K_SET_SURFACE_FORMAT,
+         WL_NV2A_SURFACE_COLOR_A8R8G8B8 | WL_NV2A_SURFACE_TYPE_SWIZZLE << 8 | 7u << 16 | 7u << 24);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_CLIP_HORIZONTAL, 128u << 16);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_CLIP_VERTICAL, 128u << 16);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_COLOR_OFFSET, 0x70000);
+    f_quad(g, 0, 0, 10, 10, 0, 0xFFFFFFFFu);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_FORMAT,
+         WL_NV2A_SURFACE_COLOR_A8R8G8B8 | WL_NV2A_SURFACE_ZETA_Z24S8 << 4 | WL_NV2A_SURFACE_TYPE_PITCH << 8);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_CLIP_HORIZONTAL, 640u << 16);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_CLIP_VERTICAL, 480u << 16);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_COLOR_OFFSET, F_COLOR);
+    f_texture(g, 0x70000, format, 7, 7);
+    f_quad(g, 0, 0, 10, 10, 0, 0xFFFFFFFFu);
+    t_kick(g);
+}
+
+// another draw sampling stage 0 again (its texture's offset changed and put back, so the stages
+// are bound anew, as at a frame's start)
+static void screen_again(TGuest *g, uint32_t format) {
+    t_m1(g, WL_NV2A_K_SET_TEXTURE_OFFSET, F_TEXTURE);
+    f_texture(g, 0x70000, format, 7, 7);
+    f_quad(g, 20, 20, 30, 30, 0, 0xFFFFFFFFu);
+    t_kick(g);
+}
+
+// A render target's memory the guest then fills itself (a streamed bitmap, a glyph cache in a
+// surface's old memory): with a write watch, the stores make the guest's texels the texture's
+// again; until then the target's image is.
+TEST a_target_the_guest_stores_to_reads_as_the_guests_texels(void) {
+    TGuest g;
+    WlNv2aGxConfig cfg;
+    WlNv2aGxStats stats;
+    WlNv2aTexCacheStats ts;
+    uint32_t converted, i;
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.textures.watch = fake_watch;
+    cfg.textures.written = fake_written;
+    g_stored_bytes = 0;
+    ASSERT(gx_device_with(&g, &cfg) != NULL);
+    f_frame_setup(&g);
+    f_program(&g, 0, f_screen_program, 3);
+    // (the grey texture the target's draw reads is converted, the target's is its image)
+    target_then_screen(&g, WL_NV2A_TEX_SZ_A8R8G8B8);
+    wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+    converted = ts.converted;
+    ASSERT_EQ(128u, wl_host_gx_direct()->textures[0]->width);
+    screen_again(&g, WL_NV2A_TEX_SZ_A8R8G8B8);
+    wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+    ASSERT_EQ(converted, ts.converted);
+    // the guest's stores over part of it
+    for (i = 0; i < 64; i++) {
+        t_w32(&g, 0x70000 + 4 * i, 0xFF00FF00u);
+    }
+    g_stored_phys = 0x70000;
+    g_stored_bytes = 256;
+    screen_again(&g, WL_NV2A_TEX_SZ_A8R8G8B8);
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT_EQ(1u, stats.targets_written);
+    wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+    ASSERT_EQ(converted + 1u, ts.converted);
+    // drawn again: the target's image again
+    g_stored_bytes = 0;
+    target_then_screen(&g, WL_NV2A_TEX_SZ_A8R8G8B8);
+    wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+    ASSERT_EQ(converted + 1u, ts.converted);
+    // a texture of another texel size at its address is not its image
+    screen_again(&g, WL_NV2A_TEX_SZ_R5G6B5);
+    wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+    ASSERT_EQ(converted + 2u, ts.converted);
+    gx_done(&g);
+    PASS();
+}
+
+// whether the last draw's pixel program reads a texture's alpha
+static bool program_reads_texture_alpha(void) {
+    bool used = false;
+    const WlXboxPshProgram *p = wl_nv2a_gx_last_program(g_gx, &used);
+    unsigned i, j;
+
+    for (i = 0; p != NULL && i < p->tev.stage_count; i++) {
+        for (j = 0; j < 4; j++) {
+            if (p->tev.stages[i].alpha.in[j] == WL_TEV_CA_TEXA ||
+                p->tev.stages[i].color.in[j] == WL_TEV_CC_TEXA) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// A target's image read through an X8R8G8B8 texture has 1 for its alpha (the NV2A's), not the
+// EFB's alpha; through an A8R8G8B8 one, the image's alpha.
+TEST a_target_read_as_x8r8g8b8_has_no_alpha(void) {
+    TGuest g;
+
+    ASSERT(gx_device(&g) != NULL);
+    f_frame_setup(&g);
+    f_program(&g, 0, f_screen_program, 3);
+    target_then_screen(&g, WL_NV2A_TEX_SZ_A8R8G8B8);
+    ASSERT(program_reads_texture_alpha());
+    screen_again(&g, WL_NV2A_TEX_SZ_X8R8G8B8);
+    ASSERT_FALSE(program_reads_texture_alpha());
+    ASSERT_EQ(128u, wl_host_gx_direct()->textures[0]->width);
+    gx_done(&g);
+    PASS();
+}
+
 SUITE(gx_suite) {
     RUN_TEST(screen_space_quad_with_texture_and_combiners);
     RUN_TEST(perspective_draws_send_x_w_y_w_minus_w);
     RUN_TEST(culling_by_the_nv2a_rule_and_stencil_skipped);
     RUN_TEST(partial_clears_are_quads_and_render_targets_take_the_efb);
     RUN_TEST(a_blur_through_the_depth_buffer_is_drawn_in_one_frame);
+    RUN_TEST(a_target_the_guest_stores_to_reads_as_the_guests_texels);
+    RUN_TEST(a_target_read_as_x8r8g8b8_has_no_alpha);
 }
 
 GREATEST_MAIN_DEFS();

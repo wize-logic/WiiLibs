@@ -73,6 +73,10 @@ typedef struct RenderTarget {
     size_t bytes;
     bool resolved;
     uint32_t used_frame;
+    // the guest memory the surface takes, and the write watch's stamp over it since the image was
+    // resolved (0: none): a store there (the memory used again for a texture the processor fills)
+    // makes the guest's texels the texture's again
+    uint32_t guest_bytes, stamp;
     WlGxTarget target;
 } RenderTarget;
 
@@ -326,6 +330,15 @@ static void frame_begin(WlNv2aGx *gx, uint32_t clear_rgba) {
     }
 }
 
+// a target's image made (resolved): the write watch armed over its guest memory
+static void target_image_made(WlNv2aGx *gx, RenderTarget *r) {
+    const WlNv2aTexCacheConfig *c = &gx->textures.cfg;
+
+    r->resolved = true;
+    r->stamp = c->watch != NULL && r->guest_bytes != 0 ? c->watch(c->user, r->phys, r->guest_bytes)
+                                                        : 0u;
+}
+
 static void target_resolved(WlNv2aGx *gx, const WlGxTarget *resolved) {
     unsigned i;
 
@@ -334,7 +347,7 @@ static void target_resolved(WlNv2aGx *gx, const WlGxTarget *resolved) {
     }
     for (i = 0; i < TARGETS; i++) {
         if (&gx->targets[i] == (const RenderTarget *)resolved->id) {
-            gx->targets[i].resolved = true;
+            target_image_made(gx, &gx->targets[i]);
         }
     }
     gx->texture_memory_changed = true;
@@ -458,6 +471,7 @@ static RenderTarget *slot_for(WlNv2aGx *gx, uint32_t phys, uint32_t w, uint32_t 
 static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {
     uint32_t w = s->clip_width / s->samples_x, h = s->clip_height / s->samples_y;
     uint8_t format = s->color_bytes == 2 ? (uint8_t)WL_GX_TEX_RGB565 : (uint8_t)WL_GX_TEX_RGBA8;
+    RenderTarget *t;
 
     if (s->swizzled) {
         w = 1u << s->log2_width;
@@ -468,7 +482,13 @@ static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {
     if (w == 0 || h == 0 || w > 1024u || h > 1024u) {
         return NULL;
     }
-    return slot_for(gx, s->color_phys, w, h, format);
+    t = slot_for(gx, s->color_phys, w, h, format);
+    if (t != NULL) {
+        // (its rows in guest memory: a swizzled surface's texels, a linear one's pitch)
+        t->guest_bytes = s->swizzled ? (1u << s->log2_width) * (1u << s->log2_height) * s->color_bytes
+                                     : s->color_pitch * s->clip_height;
+    }
+    return t;
 }
 
 // The finished back buffer copied into a target at its address, for a title that samples a picture
@@ -486,7 +506,8 @@ static void frame_keep(WlNv2aGx *gx) {
         return;
     }
     wl_gx_copy_efb_texture(0, 0, (int)w, (int)h, t->memory, WL_GX_TEX_RGBA8, false);
-    t->resolved = true;
+    t->guest_bytes = w * h * 4u;
+    target_image_made(gx, t);
     gx->texture_memory_changed = true;
 }
 
@@ -645,6 +666,8 @@ static uint8_t gx_wrap(uint8_t wrap) {
         return WL_GX_WRAP_REPEAT;
     case WL_NV2A_WRAP_MIRROR:
         return WL_GX_WRAP_MIRROR;
+    // (border too: GX has no border colour, and the textures Halo addresses so have edges at or near
+    // theirs already, its object shadows' targets cleared to it among them)
     default:
         return WL_GX_WRAP_CLAMP;
     }
@@ -671,6 +694,54 @@ static bool power_of_two(uint32_t v) {
     return v != 0 && (v & (v - 1u)) == 0;
 }
 
+// What a texture read from a render target's image (in `format`, a WlGxTexFormat) holds: its alpha
+// where the texture's format has one and the image kept it (the EFB's), else its colour alone (an
+// X8R8G8B8 read gives 1 as its alpha on the NV2A, not what the EFB holds)
+static uint8_t target_contents(const WlNv2aTexture *t, uint8_t format) {
+    switch (t->color) {
+    case WL_NV2A_TEX_SZ_A8R8G8B8:
+    case WL_NV2A_TEX_LU_A8R8G8B8:
+    case WL_NV2A_TEX_SZ_A8B8G8R8:
+    case WL_NV2A_TEX_LU_A8B8G8R8:
+    case WL_NV2A_TEX_SZ_B8G8R8A8:
+    case WL_NV2A_TEX_LU_B8G8R8A8:
+    case WL_NV2A_TEX_SZ_R8G8B8A8:
+    case WL_NV2A_TEX_LU_R8G8B8A8:
+    case WL_NV2A_TEX_SZ_A1R5G5B5:
+    case WL_NV2A_TEX_LU_A1R5G5B5:
+    case WL_NV2A_TEX_SZ_A4R4G4B4:
+    case WL_NV2A_TEX_LU_A4R4G4B4:
+        return format == WL_GX_TEX_RGBA8 ? (uint8_t)WL_XBOX_PSH_TEXTURE_ALL
+                                         : (uint8_t)WL_XBOX_PSH_TEXTURE_COLOR;
+    default:
+        return WL_XBOX_PSH_TEXTURE_COLOR;
+    }
+}
+
+// whether a texture reads a target's image as it is: texels of the image's size (4 bytes for its
+// RGBA8, 2 for its RGB565), within its width and height
+static bool target_fits(const RenderTarget *r, const WlNv2aTexture *t) {
+    uint32_t bytes = r->format == WL_GX_TEX_RGB565 ? 2u : 4u;
+
+    return t->texel_bytes == bytes && t->width <= r->width && t->height <= r->height;
+}
+
+// whether the guest stored to a target's memory since its image was made (the write watch's; with
+// no watch, never): its image is then not the texture's (the memory holds a texture the processor
+// filled), until the target is drawn again
+static bool target_written(WlNv2aGx *gx, RenderTarget *r) {
+    const WlNv2aTexCacheConfig *c = &gx->textures.cfg;
+
+    if (r->stamp == 0 || c->written == NULL ||
+        !c->written(c->user, r->phys, r->guest_bytes, r->stamp)) {
+        return false;
+    }
+    r->resolved = false;
+    r->stamp = 0;
+    gx->stats.targets_written++;
+    return true;
+}
+
 // a resolved render target at a texture's address, as an entry the stages read like any texture;
 // or the back buffer of the frame being drawn, while a target has the EFB: its colour as it was
 // parked, the picture so far (Halo's blur reads it into a target of its size, and the next pass
@@ -695,7 +766,7 @@ static const WlNv2aTexEntry *target_texture(WlNv2aGx *gx, unsigned stage, const 
             e->layout.levels = 1;
             e->layout.image_bytes = wl_gx_tex_bytes(WL_GX_TEX_RGBA8, w, h);
             e->layout.total_bytes = e->layout.image_bytes;
-            e->contents = WL_XBOX_PSH_TEXTURE_ALL;
+            e->contents = target_contents(t, WL_GX_TEX_RGBA8);
             e->linear = t->linear;
             e->width = (uint16_t)t->width;
             e->height = (uint16_t)t->height;
@@ -709,7 +780,8 @@ static const WlNv2aTexEntry *target_texture(WlNv2aGx *gx, unsigned stage, const 
     for (i = 0; i < TARGETS; i++) {
         RenderTarget *r = &gx->targets[i];
 
-        if (r->memory != NULL && r->resolved && r->phys == t->phys && r != gx->owner) {
+        if (r->memory != NULL && r->resolved && r->phys == t->phys && r != gx->owner &&
+            target_fits(r, t) && !target_written(gx, r)) {
             WlNv2aTexEntry *e = &gx->target_entries[stage];
 
             r->used_frame = gx->frame; // (read: in use, targets_idle)
@@ -722,7 +794,7 @@ static const WlNv2aTexEntry *target_texture(WlNv2aGx *gx, unsigned stage, const 
             e->layout.levels = 1;
             e->layout.image_bytes = r->bytes;
             e->layout.total_bytes = r->bytes;
-            e->contents = WL_XBOX_PSH_TEXTURE_ALL;
+            e->contents = target_contents(t, r->format);
             e->linear = t->linear;
             e->width = (uint16_t)t->width;
             e->height = (uint16_t)t->height;
@@ -747,6 +819,9 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
             continue;
         }
         wanted |= 1u << stage;
+        if (t.wrap_u == WL_NV2A_WRAP_BORDER || t.wrap_v == WL_NV2A_WRAP_BORDER) {
+            gx->stats.border_clamped++;
+        }
         e = target_texture(gx, stage, &t);
         if (e == NULL && !gx->keep_frames && is_display(gx, t.phys)) {
             // (a picture the title showed, as a texture: kept from the next frame on)
