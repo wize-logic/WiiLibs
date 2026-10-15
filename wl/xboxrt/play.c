@@ -963,9 +963,22 @@ static void shot_frame(void *user, const uint8_t *rgba, uint32_t w, uint32_t h) 
     if (P.shot_frames <= 0 || --P.shot_frames > 0) {
         return;
     }
+    // a screen shows no alpha: the EFB's destination alpha (which blending reads) is not the picture
+    size_t bytes = (size_t)w * h * 4u;
+    uint8_t *opaque = malloc(bytes);
+    if (opaque == NULL) {
+        wl_xb_play_log("screenshot: no memory for %ux%u", (unsigned)w, (unsigned)h);
+        return;
+    }
+    memcpy(opaque, rgba, bytes);
+    for (size_t i = 3; i < bytes; i += 4) {
+        opaque[i] = 0xFF;
+    }
     uint8_t *png = NULL;
     size_t len = 0;
-    if (wl_png_encode(rgba, w, h, &png, &len) == WL_OK) {
+    WlResult encoded = wl_png_encode(opaque, w, h, &png, &len);
+    free(opaque);
+    if (encoded == WL_OK) {
         WlPlatformFile *f = NULL;
         if (wl_platform_fs_open(P.shot_path, WL_FILE_WRITE_NEW, &f) == WL_OK) {
             wl_platform_fs_write(f, png, (uint32_t)len);
