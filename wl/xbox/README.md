@@ -39,7 +39,9 @@ output's blue copied to its alpha (Direct3D's dp3 to rgba) becomes an alpha port
 blue right after its stage (in the next stage's idle alpha half, or a stage inserted, eight at
 most). The mux is the NV2A's step: CD where r0's alpha is 128/255 or more, through two of TEV's
 compares (three without a konst for 127/255; a blend, approximated, where they do not fit); by the
-alpha's low bit (MUX_LSB) it is the top bit's, approximated, but for a constant.
+alpha's low bit (MUX_LSB) it is the top bit's, approximated, but for a constant. Where a program's
+constants outrun the four konst registers (and the TEV registers preloaded with others), one within
+3/255 of 0 or 1 in every channel is read as 0 or 1, and any other takes the nearest konst's value.
 
 The fixed places the device and the translation agree on: the fog ramp is map 7 at texture
 coordinate 4 (`WL_XBOX_PSH_FOG_*`); a bumped lookup's offset reads the bump map as map 5, its terms
