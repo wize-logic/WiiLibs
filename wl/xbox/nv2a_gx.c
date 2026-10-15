@@ -47,7 +47,9 @@ enum {
     FIT_SETS = 128,
     FIT_WAYS = 2,
     // the inputs a draw's program is also run with for its transform's signature
-    CANONICAL_POINTS = 4
+    CANONICAL_POINTS = 4,
+    // programs whose analyses are kept
+    XF_ANALYSES = 8
 };
 
 // how far (in the depth's 0..1) a fit made with the canonical points may be from a draw's own
@@ -160,6 +162,7 @@ struct WlNv2aGx {
     // the runs' inputs and outputs
     struct {
         const PackedVertex *vertices[WL_XBOX_VSH_BATCH];
+        const uint32_t *words[WL_XBOX_VSH_BATCH]; // (their words)
         uint32_t run_vertex[WL_XBOX_VSH_BATCH];
         PackedVertex *run_vertices[WL_XBOX_VSH_BATCH];
         PackedVertex made[WL_XBOX_VSH_BATCH];
@@ -178,6 +181,15 @@ struct WlNv2aGx {
     unsigned xf_live;
     bool xf_eligible, xf_full;
     WlXboxVshDependencies xf_dependencies;
+    // the last programs' analyses (wl_xbox_vsh_analyze), by program and its hash: a frame's draws
+    // take turns among a few programs, and an analysis costs thousands of instructions
+    struct XfAnalysis {
+        const WlXboxVshProgram *program;
+        unsigned long hash, count;
+        uint32_t used;
+        WlXboxVshDependencies dependencies;
+    } xf_analyses[XF_ANALYSES];
+    uint32_t xf_analysis_use;
     // the state the last applied draw left in GX (state_valid; device_state ends it), what has
     // changed since (the tracker's WL_NV2A_DIRTY_* of every draw since, applied or not), whether
     // its raster state and pixel program were exact, and whether its textures must be bound again
@@ -1007,6 +1019,8 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
     float near_w = 0.0f, far_w = 0.0f, a, b, d;
     bool all_w1 = true, in_front = false, enough = false;
     WlXboxVshOutput *outputs = gx->batch.outputs;
+    WlNv2aFetchPlan fetch;
+    uint32_t numbers[FIT_BATCH];
 
     gx->last_shared = false;
     // (a program that never converts its position to the screen leaves no clip-space position)
@@ -1015,11 +1029,15 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
     }
     // the vertices' positions, FIT_BATCH at a time (the program run for them together)
     attributes = wl_nv2a_pipeline_inputs(&gx->pipeline, WL_XBOX_VSH_LIVE_POSITION);
+    // (the fetch decided once for the draw, as the draw's own: wl_nv2a_draw_fetch_some's values)
+    wl_nv2a_fetch_plan(draw, attributes, &fetch);
+    wl_nv2a_fetch_constants(&fetch, k, gx->batch.inputs, FIT_BATCH);
     for (v = 0; v < probes && n < FIT_PROBES && !enough; v += run) {
         run = probes - v < FIT_BATCH ? probes - v : FIT_BATCH;
         for (i = 0; i < run; i++) {
-            wl_nv2a_draw_fetch_some(draw, k, v + i, attributes, gx->batch.inputs[i]);
+            numbers[i] = v + i;
         }
+        wl_nv2a_fetch_vertices(&fetch, draw, numbers, run, gx->batch.inputs);
         wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, run,
                                   WL_XBOX_VSH_LIVE_POSITION, outputs, &gx->batch.work);
         for (i = 0; i < run && n < FIT_PROBES; i++) {
@@ -1275,11 +1293,16 @@ static inline void stage_texcoord_projected(const StagePlan *s, const float t[4]
 
 static inline void stage_texcoord(const StagePlan *s, const float t[4], float st[2]) {
     if (s->sphere) {
+        // (through a copy: `st` itself never goes to a call, so the caller keeps it in registers)
+        float made[2];
+
         if (s->spot) {
-            wl_nv2a_spot_coordinates(t, s->spot, st);
+            wl_nv2a_spot_coordinates(t, s->spot, made);
         } else {
-            wl_nv2a_sphere_coordinates(t, st);
+            wl_nv2a_sphere_coordinates(t, made);
         }
+        st[0] = made[0];
+        st[1] = made[1];
         return;
     }
     st[0] = t[0];
@@ -1419,6 +1442,7 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
             if (m->stamp == gx->memo_stamp && m->index == index) {
                 m->batch = batch;
                 gx->batch.vertices[n] = &m->vertex;
+                gx->batch.words[n] = m->vertex.w;
                 gx->stats.vertices_reused++;
                 continue;
             }
@@ -1430,6 +1454,7 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
             }
         }
         gx->batch.vertices[n] = made;
+        gx->batch.words[n] = made->w;
         gx->batch.run_vertex[runs] = v;
         gx->batch.run_vertices[runs] = made;
         runs++;
@@ -1480,6 +1505,32 @@ static unsigned bit_index(unsigned bit) {
 
 // the program's verdict for the outputs a draw reads: whether its position may go to the transform
 // unit (an affine function of v0), and whether all of them may (*full)
+// the program's analysis into gx->xf_dependencies: kept, or made and kept in place of the least used
+static void xf_analysis(WlNv2aGx *gx, const WlXboxVshProgram *program) {
+    struct XfAnalysis *slot = &gx->xf_analyses[0];
+    unsigned i;
+
+    gx->xf_analysis_use++;
+    for (i = 0; i < XF_ANALYSES; i++) {
+        struct XfAnalysis *a = &gx->xf_analyses[i];
+
+        if (a->used != 0 && a->program == program && a->hash == program->hash && a->count == program->count) {
+            a->used = gx->xf_analysis_use;
+            gx->xf_dependencies = a->dependencies;
+            return;
+        }
+        if (a->used < slot->used) {
+            slot = a;
+        }
+    }
+    wl_xbox_vsh_analyze(program, &gx->xf_dependencies);
+    slot->program = program;
+    slot->hash = program->hash;
+    slot->count = program->count;
+    slot->used = gx->xf_analysis_use;
+    slot->dependencies = gx->xf_dependencies;
+}
+
 static bool xf_structure(WlNv2aGx *gx, unsigned live, bool *full) {
     const WlXboxVshProgram *program = gx->pipeline.program;
     const WlXboxVshDependencies *d = &gx->xf_dependencies;
@@ -1489,11 +1540,13 @@ static bool xf_structure(WlNv2aGx *gx, unsigned live, bool *full) {
         *full = gx->xf_full;
         return gx->xf_eligible;
     }
+    if (program != gx->xf_program || gx->pipeline.compiled != gx->xf_compiled) {
+        xf_analysis(gx, program);
+    }
     gx->xf_program = program;
     gx->xf_compiled = gx->pipeline.compiled;
     gx->xf_live = live;
     gx->xf_eligible = gx->xf_full = *full = false;
-    wl_xbox_vsh_analyze(program, &gx->xf_dependencies);
     // (the clip-space position, or a screen-space one, from v0 alone)
     if (xf_source(d->clip_captured ? d->clip : d->position, 4) != 1u) {
         return false;
@@ -1929,7 +1982,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     bool exact, xf_ok, indexed = false, count_pixels = wl_nv2a_k(k, WL_NV2A_K_SET_ZPASS_PIXEL_COUNT_ENABLE) != 0;
     const void *arrays[WL_GX_DIRECT_ARRAY_TEXCOORD0 + WL_NV2A_TEXTURES] = {NULL};
     float corners[3][2], area = 0.0f;
-    uint32_t v, seen = 0, first = 0, attributes;
+    uint32_t v, seen = 0, first = 0, run, attributes;
     unsigned stage;
     bool rebind;
 
@@ -2122,15 +2175,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
             }
         }
         wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
-        if (draw->indices != NULL) {
-            for (v = 0; v < draw->count; v++) {
-                wl_gx_direct_vertex_index((uint16_t)(draw->indices[v] - draw->index_base), words, colors);
-            }
-        } else {
-            for (v = 0; v < draw->count; v++) {
-                wl_gx_direct_vertex_index((uint16_t)v, words, colors);
-            }
-        }
+        wl_gx_direct_vertices_index(draw->indices, draw->index_base, draw->count, words, colors);
         wl_gx_direct_primitive_end();
         gx->stats.indexed_draws++;
         gx->stats.indexed_vertices += draw->count;
@@ -2151,19 +2196,15 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
         wl_gx_direct_layout(&layout);
     }
     wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
-    for (v = 0; v < draw->count; v++) {
-        unsigned n = (v - first) % WL_XBOX_VSH_BATCH;
-        const PackedVertex *vertex;
-
-        if (n == 0 && v != 0) {
-            first = v;
-            vertices_make(gx, k, draw, v, draw->count - v < WL_XBOX_VSH_BATCH ? draw->count - v : WL_XBOX_VSH_BATCH,
-                          &plan, NULL);
+    for (first = 0; first < draw->count; first += run) {
+        run = draw->count - first < WL_XBOX_VSH_BATCH ? draw->count - first : WL_XBOX_VSH_BATCH;
+        if (first != 0) {
+            vertices_make(gx, k, draw, first, run, &plan, NULL);
         }
-        vertex = gx->batch.vertices[n];
-        wl_gx_direct_vertex_words(vertex->w, plan.words);
-        if (count_pixels) {
-            landing_area(draw->primitive, vertex, &seen, corners, &area);
+        // (the batch's vertices into the FIFO in one call)
+        wl_gx_direct_vertices_words(gx->batch.words, run, plan.words);
+        for (v = 0; count_pixels && v < run; v++) {
+            landing_area(draw->primitive, gx->batch.vertices[v], &seen, corners, &area);
         }
     }
     wl_gx_direct_primitive_end();

@@ -931,9 +931,9 @@ int main(int argc, char **argv) {
                "%u targets stored to after their image\n",
                (unsigned)gs.programs_unbiased, (unsigned)gs.border_clamped, (unsigned)gs.targets_written);
         printf("            %u draws (%u vertices) through GX's transform unit, %u more for their position alone; "
-               "%u with a projective coordinate GX divides at each pixel\n",
+               "%u with a projective coordinate GX divides at each pixel; %u vertices of indexed draws reused\n",
                (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws,
-               (unsigned)gs.projected_draws);
+               (unsigned)gs.projected_draws, (unsigned)gs.vertices_reused);
         printf("            %u draws counted without drawing (they write nothing), %u skipped; %u kept the raster "
                "state, %u the textures, %u the pixel program\n",
                (unsigned)gs.unwritten_counted, (unsigned)gs.unwritten_skipped, (unsigned)gs.raster_kept,
