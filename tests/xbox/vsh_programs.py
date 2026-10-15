@@ -179,6 +179,31 @@ PROGRAMS = [
         "mov oD0.xw, r4.xyxy",
         "mov oFog.x, r1.x",
     ]),
+    ("two nodes blended by v6's weights (their indices v5 by c[7].w): a prefix a vertex with the nodes and "
+     "weights of the vertex before takes from it (tools/xbox_vsh_codegen.c), and an output from v4 within it", [
+        "mul r2.xy, v5, c[7].w",
+        "arl a0.x, r2.x : imov oD0.w, v4.zzzz",
+        "mul r3, v6.xxxx, c[a0+60]",
+        "mul r4, v6.xxxx, c[a0+61]",
+        "mul r5, v6.xxxx, c[a0+62]",
+        "arl a0.x, r2.y",
+        "add r6.x, v6.w, -v6.x",
+        "mad r7, r6.xxxx, c[a0+60], r3",
+        "mad r8, r6.xxxx, c[a0+61], r4",
+        "mad r9, r6.xxxx, c[a0+62], r5",
+        "dph r10.x, v0, r7",
+        "dph r10.y, v0, r8",
+        "dph r10.z, v0, r9",
+        "dp3 r11.x, v1, r7",
+        "dp3 r11.y, v1, r8",
+        "dp3 r11.z, v1, r9",
+        "dp4 oPos.x, r10, c[0]",
+        "dp4 oPos.y, r10, c[1]",
+        "dp4 oPos.z, r10, c[2]",
+        "dp4 oPos.w, r10, c[3]",
+        "dp3 oD0.xyz, r11, c[8]",
+        "mul oT0, r9, c[a0+63]",
+    ]),
 ]
 
 

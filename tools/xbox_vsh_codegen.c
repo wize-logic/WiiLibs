@@ -116,6 +116,13 @@ drops what only they needed (for draws whose colours alone are the
 processor's) */
 static int colors_only;
 
+/* writing a batch function's reused prefix (reuse_prefix): an instruction's
+temporaries and a0 alone (WRITE_TEMPORARIES, the prefix as it is made), or its
+outputs alone (WRITE_OUTPUTS, after the prefix, whether it was made or taken
+from the vertex before) */
+enum { WRITE_ALL = 3, WRITE_TEMPORARIES = 1, WRITE_OUTPUTS = 2 };
+static int write_mode = WRITE_ALL;
+
 static void instruction_code(FILE *out, const WlXboxVshInstruction *instruction,
                              unsigned long index) {
     char text[32];
@@ -221,19 +228,21 @@ static void instruction_code(FILE *out, const WlXboxVshInstruction *instruction,
         fprintf(out, "\t\tmemcpy(clips[%d], P%d, sizeof(clips[0]));\n", lane, lane);
     else if (instruction->captures_clip && !colors_only)
         fprintf(out, "\t\tmemcpy(o->clip, p, sizeof(o->clip));\n\t\to->clip_captured = 1;\n");
-    if (instruction->mac == _mac_arl && lane >= 0)
+    if (!(write_mode & WRITE_TEMPORARIES))
+        ; /* (the outputs alone) */
+    else if (instruction->mac == _mac_arl && lane >= 0)
         fprintf(out, "\t\ta%d = wl_xbox_vsh_floor_index(M[0] + 0.001f);\n", lane);
     else if (instruction->mac == _mac_arl)
         fprintf(out, "\t\ta0 = wl_xbox_vsh_floor_index(M[0] + 0.001f);\n");
     else if (instruction->mac != _mac_nop && instruction->mac_mask)
         masked(out, temporary_name(instruction->temporary, text, sizeof(text)), "M",
                instruction->mac_mask);
-    if (instruction->ilu != _ilu_nop && instruction->ilu_mask) {
+    if (instruction->ilu != _ilu_nop && instruction->ilu_mask && (write_mode & WRITE_TEMPORARIES)) {
         unsigned temporary = instruction->mac != _mac_nop ? 1 : instruction->temporary;
 
         masked(out, temporary_name(temporary, text, sizeof(text)), "I", instruction->ilu_mask);
     }
-    if (instruction->output_mask && instruction->output_is_register &&
+    if ((write_mode & WRITE_OUTPUTS) && instruction->output_mask && instruction->output_is_register &&
         (instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0) {
         const char *value = instruction->output_from_ilu ? "I" : "M";
 
@@ -536,12 +545,199 @@ static void positions_code(FILE *out, const WlXboxVshProgram *program, const uns
     fprintf(out, "}\n\n");
 }
 
+/* A skinned program's prefix reused from the vertex before: the instructions
+from the first that build a0 and the node matrices from the vertex's indices and
+weights alone (no v0, no output but to a register the vertex's own inputs give,
+no clip capture), as long as they read only those inputs, constants and what the
+prefix itself wrote. A vertex whose inputs there are the bits of the vertex
+before's (the same nodes and weights: a mesh's neighbours mostly are) takes the
+temporaries the prefix leaves that later instructions read, as the vertex
+before made them, and a0, instead of running it: the same operations on the
+same bits, so the same results. The prefix's outputs (an output an input gives
+directly, such as a colour's alpha) are written after it either way. */
+typedef struct ReusePrefix {
+    unsigned long end;  /* instructions [0, end) */
+    unsigned long inputs; /* the input registers they read (bit n: v[n]) */
+    unsigned live_out[12]; /* the temporaries' components later instructions read (bit 3 x) */
+    int a0_out;
+} ReusePrefix;
+
+/* the temporaries' components an operand reads (bit 3 x) */
+static unsigned operand_reads(const WlXboxVshOperand *operand) {
+    unsigned bits = 0;
+    int component;
+
+    for (component = 0; component < 4; component++)
+        bits |= 8u >> (operand->swizzle[component] & 3);
+    return bits;
+}
+
+/* an instruction's operands that are read (A, B, C), as instruction_code reads them */
+static void operands_read(const WlXboxVshInstruction *instruction, int reads[3]) {
+    reads[0] = reads[1] = reads[2] = 0;
+    if (instruction->mac != _mac_nop) {
+        reads[0] = 1;
+        if (instruction->mac != _mac_mov && instruction->mac != _mac_arl && instruction->mac != _mac_add)
+            reads[1] = 1;
+    }
+    if (instruction->ilu != _ilu_nop || instruction->mac == _mac_add || instruction->mac == _mac_mad)
+        reads[2] = 1;
+}
+
+static int reuse_prefix(const WlXboxVshProgram *program, ReusePrefix *prefix) {
+    unsigned written[13] = {0};
+    int relative = 0, which, temporary;
+    unsigned long index;
+
+    memset(prefix, 0, sizeof(*prefix));
+    for (index = 0; index < program->count; index++) {
+        const WlXboxVshInstruction *instruction = &program->instructions[index];
+        int reads[3], output = instruction->output_mask && instruction->output_is_register &&
+                                   (instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0;
+        unsigned writes_now[13];
+        int writes_a0;
+
+        operands_read(instruction, reads);
+        if (instruction->captures_clip || (output && instruction->output_address == _output_position))
+            break;
+        /* (an output: from an input or a constant alone, read by the ILU's C or a
+        MOV's A, so it can be written after the prefix) */
+        if (output) {
+            const WlXboxVshOperand *from =
+                &instruction->operands[instruction->output_from_ilu ? 2 : 0];
+
+            if (instruction->output_from_ilu ? instruction->ilu != _ilu_mov : instruction->mac != _mac_mov)
+                break;
+            if (from->mux == _mux_temporary || (from->mux == _mux_constant && instruction->relative))
+                break;
+        }
+        for (which = 0; which < 3; which++) {
+            const WlXboxVshOperand *operand = &instruction->operands[which];
+
+            if (!reads[which])
+                continue;
+            if (operand->mux == _mux_input && instruction->input == 0)
+                break;
+            if (operand->mux == _mux_temporary && operand->index == 12)
+                break;
+        }
+        if (which < 3)
+            break;
+        /* (the operands that make temporaries or a0: their inputs are what a vertex
+        must share with the vertex before; an output's are read after the prefix) */
+        {
+            int mac_t = instruction->mac != _mac_nop && (instruction->mac == _mac_arl || instruction->mac_mask);
+            int ilu_t = instruction->ilu != _ilu_nop && instruction->ilu_mask;
+            int feeds[3];
+
+            feeds[0] = mac_t && reads[0];
+            feeds[1] = mac_t && reads[1];
+            feeds[2] = reads[2] && (ilu_t || (mac_t && (instruction->mac == _mac_add || instruction->mac == _mac_mad)));
+            for (which = 0; which < 3; which++) {
+                const WlXboxVshOperand *operand = &instruction->operands[which];
+
+                if (feeds[which] && operand->mux == _mux_input)
+                    prefix->inputs |= 1UL << (instruction->input & 15);
+                if (feeds[which] && operand->mux == _mux_constant && instruction->relative)
+                    relative = 1;
+            }
+        }
+        instruction_writes(instruction, writes_now, &writes_a0);
+        for (temporary = 0; temporary < 12; temporary++)
+            written[temporary] |= writes_now[temporary];
+        prefix->end = index + 1;
+    }
+    /* (worth it: a skinning blend of some length, from few inputs) */
+    if (!relative || prefix->end < 6)
+        return 0;
+    /* what the rest reads of the prefix's temporaries before writing them, and a0 */
+    {
+        unsigned pending[12];
+        int a0_pending = 1;
+
+        memcpy(pending, written, sizeof(pending));
+        for (index = prefix->end; index < program->count; index++) {
+            const WlXboxVshInstruction *instruction = &program->instructions[index];
+            int reads[3], writes_a0;
+            unsigned writes_now[13];
+
+            operands_read(instruction, reads);
+            for (which = 0; which < 3; which++) {
+                const WlXboxVshOperand *operand = &instruction->operands[which];
+
+                if (!reads[which])
+                    continue;
+                if (operand->mux == _mux_temporary && operand->index < 12)
+                    prefix->live_out[operand->index] |= pending[operand->index] & operand_reads(operand);
+                if (operand->mux == _mux_constant && instruction->relative && a0_pending)
+                    prefix->a0_out = 1;
+            }
+            instruction_writes(instruction, writes_now, &writes_a0);
+            for (temporary = 0; temporary < 12; temporary++)
+                pending[temporary] &= ~writes_now[temporary];
+            if (writes_a0)
+                a0_pending = 0;
+        }
+    }
+    return 1;
+}
+
+/* the prefix's code in a batch function: made, or taken from the vertex before */
+static void reuse_code(FILE *out, const WlXboxVshProgram *program, const ReusePrefix *prefix,
+                       const unsigned *needs) {
+    unsigned long index;
+    int input, temporary, component;
+
+    fprintf(out, "\tif (n > 0");
+    for (input = 0; input < 16; input++)
+        if (prefix->inputs & (1UL << input))
+            fprintf(out, " && memcmp(v[%d], vs[n - 1][%d], sizeof(v[%d])) == 0", input, input, input);
+    fprintf(out, ")\n\t{\n");
+    for (temporary = 0; temporary < 12; temporary++)
+        for (component = 0; component < 4; component++)
+            if (prefix->live_out[temporary] & (8u >> component))
+                fprintf(out, "\t\tr[%d][%d] = kept_r[%d][%d];\n", temporary, component, temporary, component);
+    if (prefix->a0_out)
+        fprintf(out, "\t\ta0 = kept_a0;\n");
+    fprintf(out, "\t}\n\telse\n\t{\n");
+    write_mode = WRITE_TEMPORARIES;
+    for (index = 0; index < prefix->end; index++) {
+        if (!needs[index])
+            continue;
+        fprintf(out, "\tif (live & 0x%xu)\n", needs[index]);
+        instruction_code(out, &program->instructions[index], index);
+    }
+    for (temporary = 0; temporary < 12; temporary++)
+        for (component = 0; component < 4; component++)
+            if (prefix->live_out[temporary] & (8u >> component))
+                fprintf(out, "\t\tkept_r[%d][%d] = r[%d][%d];\n", temporary, component, temporary, component);
+    if (prefix->a0_out)
+        fprintf(out, "\t\tkept_a0 = a0;\n");
+    fprintf(out, "\t}\n");
+    /* (the prefix's outputs, from the vertex's inputs) */
+    write_mode = WRITE_OUTPUTS;
+    for (index = 0; index < prefix->end; index++) {
+        const WlXboxVshInstruction *instruction = &program->instructions[index];
+
+        if (!(instruction->output_mask && instruction->output_is_register &&
+              (instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0))
+            continue;
+        if (!needs[index])
+            continue;
+        fprintf(out, "\tif (live & 0x%xu)\n", needs[index]);
+        instruction_code(out, instruction, index);
+    }
+    write_mode = WRITE_ALL;
+}
+
 int main(int argc, char **argv) {
     static uint32_t words[MAXIMUM_WORDS];
     static unsigned long hashes[MAXIMUM_PROGRAMS], counts[MAXIMUM_PROGRAMS];
     static int positioned[MAXIMUM_PROGRAMS];
     static WlXboxVshProgram program;
     static unsigned needs[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+    ReusePrefix prefix;
+    int reused;
     unsigned long word_count = 0, position, program_count = 0, index;
     char line[512];
     FILE *in, *out;
@@ -654,23 +850,30 @@ int main(int argc, char **argv) {
         that reaches none of them skipped) */
         /* (for count vertices at once, so the function's entry and exit, its
         registers saved and restored, are paid once for them) */
+        wl_xbox_vsh_live_needs(&program, needs);
+        reused = reuse_prefix(&program, &prefix);
         fprintf(out,
                 "static void program_%08lx_batch(const float (*c)[4], const float "
                 "(*vs)[WL_XBOX_VSH_INPUT_COUNT][4],\n"
                 "\tWlXboxVshOutput *os, unsigned count, unsigned live)\n"
-                "{\n\tunsigned n;\n\n\tfor (n = 0; n < count; n++)\n\t{\n"
+                "{\n\tunsigned n;\n",
+                hash);
+        if (reused)
+            fprintf(out, "\tfloat kept_r[12][4];\n\tint kept_a0 = 0;\n\n\t(void)kept_r;\n\t(void)kept_a0;\n");
+        fprintf(out,
+                "\n\tfor (n = 0; n < count; n++)\n\t{\n"
                 "\tconst float (*v)[4] = vs[n];\n\tWlXboxVshOutput *o = &os[n];\n"
                 "\tfloat r[12][4] = { { 0.0f } };\n\tfloat p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };\n"
                 "\tfloat A[4], B[4], C[4], M[4], I[4];\n\tint a0 = 0;\n\n"
                 "\t(void)c;\n\t(void)v;\n\t(void)a0;\n\t(void)A;\n\t(void)B;\n\t(void)C;\n\t(void)"
-                "r;\n\t(void)live;\n",
-                hash);
+                "r;\n\t(void)live;\n");
         live_defaults(out, &program);
-        wl_xbox_vsh_live_needs(&program, needs);
+        if (reused)
+            reuse_code(out, &program, &prefix, needs);
         {
             unsigned open = 0;
 
-            for (index = 0; index < program.count; index++) {
+            for (index = reused ? prefix.end : 0; index < program.count; index++) {
                 if (needs[index] != open) {
                     if (open)
                         fprintf(out, "\t}\n");

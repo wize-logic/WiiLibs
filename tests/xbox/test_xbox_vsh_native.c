@@ -18,7 +18,7 @@ static const uint32_t microcode[] = {
 #include "vsh_programs.inc"
 };
 
-enum { PROGRAMS = 5, TRIALS = 200 };
+enum { PROGRAMS = 6, TRIALS = 200 };
 
 static uint32_t g_rng = 0x1234567u;
 static uint32_t rnd(void) {
@@ -156,6 +156,35 @@ TEST functions_match_the_interpreter(void) {
                                       &work);
                 for (int m = 0; m < 3; m++) {
                     ASSERTm("run_batch", live_same(&want, &outs[m], live));
+                }
+            }
+            // (four vertices that share the nodes and weights (v5, v6) but for the third, their
+            // other inputs their own: each as the interpreter makes it, whether a skinned
+            // program's prefix was run or taken from the vertex before)
+            {
+                static float inputs[4][WL_XBOX_VSH_INPUT_COUNT][4];
+                static WlXboxVshOutput outs[4], one;
+                static WlXboxVshWork work;
+
+                for (int m = 0; m < 4; m++) {
+                    memcpy(inputs[m], g_inputs, sizeof inputs[m]);
+                    for (int i = 0; i < WL_XBOX_VSH_INPUT_COUNT; i++) {
+                        if (i != 5 && i != 6) {
+                            for (int c = 0; c < 4; c++) {
+                                inputs[m][i][c] = random_float();
+                            }
+                        }
+                    }
+                    memset(&outs[m], 0x7F, sizeof outs[m]);
+                }
+                inputs[2][6][0] = random_float();
+                wl_xbox_vsh_run_batch(&g_native, (const float (*)[4])g_constants,
+                                      (const float (*)[WL_XBOX_VSH_INPUT_COUNT][4])inputs, 4, 2.5f, outs, live,
+                                      &work);
+                for (int m = 0; m < 4; m++) {
+                    wl_xbox_vsh_run(&g_interpreted, (const float (*)[4])g_constants,
+                                    (const float (*)[4])inputs[m], 2.5f, &one);
+                    ASSERTm("run_batch shared nodes", live_same(&one, &outs[m], live));
                 }
             }
             memset(&got, 0, sizeof got);

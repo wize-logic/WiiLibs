@@ -129,3 +129,49 @@
 	0x00000000, 0x00200011, 0x4436006C, 0x00009818,
 	/* mov oFog.x, r1.x */
 	0x00000000, 0x00200000, 0x1436006C, 0x00008829,
+/* two nodes blended by v6's weights (their indices v5 by c[7].w): a prefix a vertex with the nodes and weights of the vertex before takes from it (tools/xbox_vsh_codegen.c), and an output from v4 within it */
+	0x00162078,
+	/* mul r2.xy, v5, c[7].w */
+	0x00000000, 0x004CEA1B, 0x09FE186C, 0x0C200000,
+	/* arl a0.x, r2.x : imov oD0.w, v4.zzzz */
+	0x00000000, 0x03A00800, 0x243602A8, 0x2000181C,
+	/* mul r3, v6.xxxx, c[a0+60] */
+	0x00000000, 0x00538C00, 0x0836186C, 0x0F300002,
+	/* mul r4, v6.xxxx, c[a0+61] */
+	0x00000000, 0x0053AC00, 0x0836186C, 0x0F400002,
+	/* mul r5, v6.xxxx, c[a0+62] */
+	0x00000000, 0x0053CC00, 0x0836186C, 0x0F500002,
+	/* arl a0.x, r2.y */
+	0x00000000, 0x01A00055, 0x2436006C, 0x00000000,
+	/* add r6.x, v6.w, -v6.x */
+	0x00000000, 0x00600CFF, 0x08360400, 0x28600000,
+	/* mad r7, r6.xxxx, c[a0+60], r3 */
+	0x00000000, 0x00938000, 0x6436186C, 0xDF700002,
+	/* mad r8, r6.xxxx, c[a0+61], r4 */
+	0x00000000, 0x0093A000, 0x6436186D, 0x1F800002,
+	/* mad r9, r6.xxxx, c[a0+62], r5 */
+	0x00000000, 0x0093C000, 0x6436186D, 0x5F900002,
+	/* dph r10.x, v0, r7 */
+	0x00000000, 0x00C0001B, 0x0836E86C, 0x08A00000,
+	/* dph r10.y, v0, r8 */
+	0x00000000, 0x00C0001B, 0x0837086C, 0x04A00000,
+	/* dph r10.z, v0, r9 */
+	0x00000000, 0x00C0001B, 0x0837286C, 0x02A00000,
+	/* dp3 r11.x, v1, r7 */
+	0x00000000, 0x00A0021B, 0x0836E86C, 0x08B00000,
+	/* dp3 r11.y, v1, r8 */
+	0x00000000, 0x00A0021B, 0x0837086C, 0x04B00000,
+	/* dp3 r11.z, v1, r9 */
+	0x00000000, 0x00A0021B, 0x0837286C, 0x02B00000,
+	/* dp4 oPos.x, r10, c[0] */
+	0x00000000, 0x00EC001B, 0xA436186C, 0x00008800,
+	/* dp4 oPos.y, r10, c[1] */
+	0x00000000, 0x00EC201B, 0xA436186C, 0x00004800,
+	/* dp4 oPos.z, r10, c[2] */
+	0x00000000, 0x00EC401B, 0xA436186C, 0x00002800,
+	/* dp4 oPos.w, r10, c[3] */
+	0x00000000, 0x00EC601B, 0xA436186C, 0x00001800,
+	/* dp3 oD0.xyz, r11, c[8] */
+	0x00000000, 0x00AD001B, 0xB436186C, 0x0000E818,
+	/* mul oT0, r9, c[a0+63] */
+	0x00000000, 0x0053E01B, 0x9436186C, 0x0000F84B,
