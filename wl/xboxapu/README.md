@@ -48,8 +48,9 @@ What the model does:
   from index 2: status 1 in byte 15) when it ends or a segment list is done, with the voice and
   notify interrupt bits; an idle voice found in a list traps the front end (FECTL trapped,
   FEDECMETH 0x8000, FEDECPARAM the voice) when FETFORCE1 asks for it, which is how DirectSound
-  takes finished voices out of its lists. The run stops at a trap so the guest's interrupt handler
-  answers before the next frame.
+  takes finished voices out of its lists. The run stops after a frame that trapped or played out a
+  stream's segment list, so the guest's interrupt handler answers (and gives the stream its next
+  list) before the next frame; the caller runs the frames left after the interrupt.
 - **The DSPs**: their memories and registers keep what is written (a title reads effect
   parameters back). Their programs do not run. DirectSound's effects program takes commands from a
   word in the GP's scratch memory (byte 0x810 of the pages GPSADDR maps) and DirectSound waits for
@@ -102,7 +103,7 @@ guest memory: 16-bit PCM through scattered pages reaching its bins exactly, volu
 8/24/32-bit and stereo formats, pitch at half and double rate, a loop's wrap and a one-shot's end
 (position, notifier, interrupt), the idle-voice trap and the guest's answer, Xbox ADPCM against
 `wl_xbox_adpcm_decode_block` (64 samples a block, blocks across pages), a stream's two segment
-lists, its starvation and refill, the amplitude envelope's stages, a multipass voice, the GP's
+lists (each run ending with the list it played out), its starvation and refill, the amplitude envelope's stages, a multipass voice, the GP's
 command word and the fence, a 3D voice's submix bins, and the AC'97 bus master's descriptors,
 status and interrupt, and its halt at the last valid buffer. `bench_xboxapu_checksum` (host and ppc-be): the benchmark's scene for 3000
 frames, its checksum of every frame's bins and output against the one the voice processor made

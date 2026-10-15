@@ -585,6 +585,7 @@ static void mix_out(WlXboxApu *apu, int16_t *out) {
 uint32_t wl_xbox_apu_run(WlXboxApu *apu, uint32_t frames, int16_t *out) {
     uint32_t done = 0;
     apu->trap_pending = false;
+    apu->list_notified = false;
     for (; done < frames; done++) {
         gp_command(apu);
         if (!wl_xbox_apu_running(apu)) {
@@ -605,8 +606,8 @@ uint32_t wl_xbox_apu_run(WlXboxApu *apu, uint32_t frames, int16_t *out) {
         if (apu->cfg.on_frame != NULL) {
             apu->cfg.on_frame(apu->cfg.on_frame_user, &apu->mix[0][0], frame_out);
         }
-        if (apu->trap_pending) {
-            done++;
+        if (apu->trap_pending || apu->list_notified) {
+            done++; // the guest answers (its ISR) before the next frame; the caller makes the rest
             break;
         }
     }

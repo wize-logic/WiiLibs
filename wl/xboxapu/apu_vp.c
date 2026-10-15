@@ -490,6 +490,7 @@ static int fetch_stream(WlXboxApu *apu, uint32_t v, WlApuVoice *vs, const VoiceF
             vs->ssl ^= 1u;
             vs->seg = 0;
             wl_apu_notify_voice(apu, v, done);
+            apu->list_notified = true; // the guest's ISR refills it before the next frame
         }
     }
     return FETCH_STARVE;
