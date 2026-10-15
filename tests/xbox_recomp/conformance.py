@@ -62,6 +62,9 @@ EXPECTED: dict[str, str] = {
                 "the same on the x86-64 build. Hardware vs libm, not a lifting or byte-order error",
     "fpu_sincos_pair": "the same for fsin/fcos of 1e10 (x87's 66-bit pi argument reduction against an "
                        "exact libm)",
+    "fpu_trig_out_of_range": "beyond 2^63 the x87's fsin leaves st0 and sets C2 for the caller to reduce the "
+                             "argument and try again; the lift computes the exact result with libm and clears C2 "
+                             "(patch 0016: a conditional push in fptan/fsincos cost the x87 locals)",
 }
 # Cases expected to differ only on one target ("ppc-be" or "host").
 EXPECTED_ON: dict[str, dict[str, str]] = {
