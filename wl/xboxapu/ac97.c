@@ -178,8 +178,9 @@ static void bm_write8(WlXboxAc97 *ac, BusMaster *b, uint32_t reg, uint8_t v) {
     }
     case 0x5:
         b->lvi = v & 31u;
-        if ((b->cr & CR_RPBM) && (b->sr & SR_DCH) && b->loaded) {
-            // halted after the last valid buffer: a new last one lets it go on with the next
+        if ((b->cr & CR_RPBM) && (b->sr & SR_DCH) && b->loaded && b->lvi != b->civ) {
+            // halted after the last valid buffer: a new last one lets it go on with the next (the
+            // same one again leaves it halted, its buffer played)
             b->sr &= (uint16_t)~(SR_DCH | SR_CELV);
             b->civ = (uint8_t)((b->civ + 1u) & 31u);
             bm_load(ac, b);
