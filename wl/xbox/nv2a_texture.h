@@ -69,6 +69,9 @@ typedef struct WlNv2aGxLayout {
     WlGxcTlutFormat tlut_format;
     uint32_t tlut_entries;
     size_t tlut_offset;
+    // the guest's first_level image halved this many times by a box filter, one level (a texture
+    // without smaller levels of its own kept smaller for want of memory)
+    uint8_t shrink;
     // a cube map's sphere map (RGBA8, one level)
     bool sphere;
     // a light's falloff cube (one face lit, the others and its edges dark): that face (1 + Direct3D's
@@ -82,8 +85,9 @@ typedef struct WlNv2aGxLayout {
 // show). `mipmaps`: keep the levels (the sampler uses them).
 bool wl_nv2a_texture_layout(const WlNv2aTexture *t, bool mipmaps, WlNv2aGxLayout *out);
 // The same texture smaller, for want of memory: `skip` more of its largest levels left out (the
-// guest's own smaller levels, first_level on; none under 8 texels a side; not a linear texture), a
-// cube map's sphere halved `skip` times (down to 8 x 8). Coordinates are unchanged (normalized).
+// guest's own smaller levels, first_level on; past them, its smallest kept halved by a box filter
+// (shrink), but for DXT and P8; none under 8 texels a side; not a linear texture), a cube map's
+// sphere halved `skip` times (down to 8 x 8). Coordinates are unchanged (normalized).
 // false when the texture has no image that small.
 bool wl_nv2a_texture_layout_reduced(const WlNv2aTexture *t, bool mipmaps, uint32_t skip, WlNv2aGxLayout *out);
 // Converts the texture (its guest bytes `src`, total_bytes of them; `palette` a P8's entries, or

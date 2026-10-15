@@ -378,6 +378,43 @@ TEST a_falloff_cube_becomes_its_lit_face(void) {
     PASS();
 }
 
+// a texture of one level kept smaller: its image halved by a box filter (a texel checker of black
+// and white comes out grey), in its own GX format
+TEST a_texture_without_levels_halved(void) {
+    static uint8_t src[16 * 16 * 4], swizzled[16 * 16 * 4];
+    static uint8_t dst[4096] __attribute__((aligned(32)));
+    static uint8_t scratch[16 * 16 * 8];
+    WlNv2aTexture t;
+    WlNv2aGxLayout layout;
+    unsigned x, y;
+    uint8_t rgba[4];
+
+    memset(&t, 0, sizeof t);
+    t.color = WL_NV2A_TEX_SZ_A8R8G8B8;
+    t.known = 1;
+    t.swizzled = 1;
+    t.width = t.height = 16;
+    t.depth = 1;
+    t.levels = 1;
+    t.texel_bytes = 4;
+    t.face_bytes = t.total_bytes = sizeof src;
+    for (y = 0; y < 16; y++) {
+        for (x = 0; x < 16; x++) {
+            wl_wr_le32(src + (y * 16 + x) * 4, (x + y) % 2 ? 0xFFFFFFFFu : 0xFF000000u);
+        }
+    }
+    wl_xbox_swizzle(src, sizeof src, 16, 16, 4, swizzled, sizeof swizzled);
+    ASSERT(wl_nv2a_texture_layout_reduced(&t, false, 1, &layout));
+    ASSERT_EQ(8u, layout.width);
+    ASSERT_EQ(WL_GXC_RGBA8, layout.format);
+    ASSERT(wl_nv2a_texture_scratch_bytes(&t, &layout) <= sizeof scratch);
+    ASSERT(wl_nv2a_texture_convert(&t, &layout, swizzled, NULL, dst, scratch));
+    ASSERT(wl_gxc_texel_read(WL_GXC_RGBA8, dst, layout.image_bytes, 8, 8, 3, 5, rgba));
+    ASSERT_EQ(128, rgba[0]);
+    ASSERT_EQ(255, rgba[3]);
+    PASS();
+}
+
 TEST cache_keeps_finds_changes_and_evicts(void) {
     static WlNv2aTexCache cache;
     TGuest g;
@@ -561,20 +598,21 @@ TEST cache_watched_and_in_an_arena(void) {
     wl_nv2a_texcache_stats(&cache, &s);
     ASSERT_EQ(0u, s.failed);
     ASSERT(s.evicted >= 1);
-    // all four in one frame: the last one drawn has no room (the others are the GPU's until the
-    // frame ends), and is not tried again in the frame
+    // all four in one frame: the last one drawn has no room whole (the others are the GPU's until
+    // the frame ends), and is kept halved (it has no smaller level of its own: a box filter's)
     for (i = 0; i < 4; i++) {
         e = wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made);
-        ASSERT(i < 3 ? e != NULL : e == NULL);
+        ASSERT(e != NULL);
     }
-    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[3], false, &made) == NULL);
+    ASSERT_EQ(1u, (unsigned)e->reduced);
+    ASSERT_EQ(8u, e->layout.width);
+    ASSERT_EQ(1u, (unsigned)e->layout.shrink);
     wl_nv2a_texcache_stats(&cache, &s);
-    ASSERT_EQ(1u, s.no_memory);
-    ASSERT_EQ(2u, s.failed);
-    // the next frame it has room again (the least recently drawn goes)
+    ASSERT_EQ(0u, s.no_memory);
+    ASSERT_EQ(0u, s.failed);
+    // the next frame it is drawn as it is kept
     wl_nv2a_texcache_frame_done(&cache);
     ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[3], false, &made) != NULL);
-    ASSERT(made);
     ASSERT(wl_heap_check(&cache.heap));
     wl_nv2a_texcache_clear(&cache);
     ASSERT_EQ(0u, cache.heap.live);
@@ -693,7 +731,11 @@ TEST cache_keeps_smaller_for_want_of_memory(void) {
     ASSERT_EQ(8u, layout.width);
     ASSERT_EQ(1u, layout.levels);
     ASSERT_FALSE(wl_nv2a_texture_layout_reduced(&big, false, 3, &layout));
-    ASSERT_FALSE(wl_nv2a_texture_layout_reduced(&t, false, 1, &layout));
+    // (a texture of one level: halved by a box filter, down to 8 texels a side)
+    ASSERT(wl_nv2a_texture_layout_reduced(&t, false, 1, &layout));
+    ASSERT_EQ(8u, layout.width);
+    ASSERT_EQ(1u, (unsigned)layout.shrink);
+    ASSERT_FALSE(wl_nv2a_texture_layout_reduced(&t, false, 2, &layout));
 
     memset(&cfg, 0, sizeof cfg);
     cfg.arena = arena;
@@ -798,6 +840,7 @@ SUITE(texture_suite) {
     RUN_TEST(dxt_and_palettes);
     RUN_TEST(cube_maps_become_sphere_maps);
     RUN_TEST(a_falloff_cube_becomes_its_lit_face);
+    RUN_TEST(a_texture_without_levels_halved);
     RUN_TEST(cache_keeps_finds_changes_and_evicts);
     RUN_TEST(cache_watched_and_in_an_arena);
     RUN_TEST(cache_arena_window);
