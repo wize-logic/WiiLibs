@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """Tests for the parts of tools/dolphin_run.py that need no Dolphin: which files of the card a run
-changed (card_changes) and their copy out (copy_out, --sd-out), and the command line's refusal of
---sd-out without --sd."""
+changed (card_changes) and their copy out (copy_out, --sd-out), the copy in of the card (copy_tree), and
+the command line's refusal of --sd-out without --sd."""
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -73,6 +74,45 @@ class CardChangeTests(unittest.TestCase):
         self.assertEqual(b"mine", (out / "apps/app/other.txt").read_bytes())
         self.assertFalse((out / "apps/app/boot.dol").exists())
         self.assertFalse((out / "apps/app/maps/big.map").exists())
+
+
+class CopyTreeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.source = self.root / "source"
+        self.copy = self.root / "copy"
+        write(self.source, "hdd/Z/cache000.map", b"c" * 64)
+        write(self.source, "play.cfg", b"script:a\n")
+        old = 1_000_000_000
+        for path in self.source.rglob("*"):
+            os.utime(path, (old, old))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_an_unchanged_copy_is_kept(self):
+        dolphin_run.copy_tree(self.source, self.copy)
+        cache = self.copy / "hdd/Z/cache000.map"
+        stamp = cache.stat().st_mtime_ns
+        dolphin_run.copy_tree(self.source, self.copy)
+        self.assertEqual(stamp, cache.stat().st_mtime_ns)
+
+    def test_a_file_a_run_wrote_back_is_copied_again(self):
+        # Dolphin syncs the card back into the copy when it stops: a cache the game rewrote (or left half
+        # written) has the source's size and a later time, and must not reach the next run
+        dolphin_run.copy_tree(self.source, self.copy)
+        cache = self.copy / "hdd/Z/cache000.map"
+        cache.write_bytes(b"x" * 64)
+        os.utime(cache, (2_000_000_000, 2_000_000_000))
+        dolphin_run.copy_tree(self.source, self.copy)
+        self.assertEqual(b"c" * 64, cache.read_bytes())
+
+    def test_what_the_source_lacks_is_removed(self):
+        dolphin_run.copy_tree(self.source, self.copy)
+        write(self.copy, "hdd/raw5.bin", b"partition")
+        dolphin_run.copy_tree(self.source, self.copy)
+        self.assertFalse((self.copy / "hdd/raw5.bin").exists())
 
 
 class CommandLineTests(unittest.TestCase):
