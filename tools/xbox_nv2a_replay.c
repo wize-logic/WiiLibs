@@ -37,6 +37,9 @@
 //               recorder): the processor's part of the frames, timed (the best run and the mean,
 //               a frame), and the best run's parts: the model's (pusher, puller, 3D state), the
 //               backend's draws, its clears and frames, the memory records put in
+//   --xf-programs  with --bench: the draws and vertices of each way (wl_nv2a_gx_last_xf) by
+//               vertex program (its hash), the most vertices first (each draw's program hashed:
+//               not for timing)
 //   --stream    the replay through wl_nv2a_replay_stream, as the runtime's capture bench makes it
 //   --png-alpha the frames and EFB pictures written with the EFB's destination alpha (else opaque,
 //               as a screen shows them; --gx-textures keeps the maps' alpha either way)
@@ -73,6 +76,7 @@ typedef struct Tee {
 } Tee;
 
 static FILE *g_programs;
+static bool g_xf_programs;
 static unsigned g_bench;
 static bool g_stream;
 
@@ -662,12 +666,70 @@ static struct {
     double draws, others;
 } g_timed;
 
+// the ways' names (WlNv2aGxXfWhy), and the draws of each way by program (--xf-programs)
+static const char *const g_xf_whys[WL_NV2A_GX_XF_WHYS + 1] = {
+    "xf, indexed",           "xf, sent: not arrays",     "xf, sent: span",
+    "xf, sent: array",       "pos: fog/point/back",      "pos: colour not affine", "pos: colour affine, mixed",
+    "pos: coordinate",       "pos: sphere map",          "pos: projective",
+    "pos: coordinate input", "cpu: xf off",              "cpu: fixed function",
+    "cpu: counting pixels",  "cpu: too few vertices",    "cpu: immediate",
+    "cpu: position not affine in v0", "cpu: position not F3", "cpu: clip w not captured",
+    "cpu: screen w/depth",   "not drawn"};
+
+enum { XF_PROGRAM_ROWS = 512 };
+
+typedef struct XfRow {
+    unsigned long hash;
+    unsigned why;
+    uint64_t draws, vertices;
+} XfRow;
+
+static XfRow g_xf_rows[XF_PROGRAM_ROWS];
+static unsigned g_xf_row_count;
+
+static void xf_program_note(const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
+    const uint32_t *words;
+    unsigned long count = 0, hash = 0;
+    unsigned why = wl_nv2a_gx_last_xf(g_gx), i;
+
+    if (why >= WL_NV2A_GX_XF_WHYS) {
+        return;
+    }
+    if (wl_nv2a_program_mode(k)) {
+        wl_nv2a_program(k, &words, &count);
+        hash = count != 0 ? wl_xbox_vsh_hash(words, count) : 0;
+    }
+    for (i = 0; i < g_xf_row_count; i++) {
+        if (g_xf_rows[i].hash == hash && g_xf_rows[i].why == why) {
+            break;
+        }
+    }
+    if (i == g_xf_row_count) {
+        if (i == XF_PROGRAM_ROWS) {
+            return;
+        }
+        g_xf_rows[g_xf_row_count++].hash = hash;
+        g_xf_rows[i].why = why;
+    }
+    g_xf_rows[i].draws++;
+    g_xf_rows[i].vertices += draw->count;
+}
+
+static int xf_row_order(const void *a, const void *b) {
+    uint64_t va = ((const XfRow *)a)->vertices, vb = ((const XfRow *)b)->vertices;
+
+    return va < vb ? 1 : va > vb ? -1 : 0;
+}
+
 static uint32_t timed_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
     double t0 = seconds_now();
     uint32_t pixels = g_timed.inner.draw(g_timed.inner.user, k, draw);
 
     (void)user;
     g_timed.draws += seconds_now() - t0;
+    if (g_xf_programs) {
+        xf_program_note(k, draw);
+    }
     return pixels;
 }
 
@@ -713,6 +775,20 @@ static void vertex_cache_line(const char *prefix) {
            (unsigned long long)vs.converted_elements, (unsigned)vs.reconverted, (unsigned)vs.refused,
            (unsigned)vs.evicted, (unsigned)vs.failed, (unsigned)(vs.bytes >> 10), (unsigned)(vs.peak_bytes >> 10),
            (unsigned)(vs.peak_frame_bytes >> 10));
+}
+
+// the texture cache's work and memory
+static void texture_cache_line(const char *prefix) {
+    WlNv2aTexCacheStats ts;
+
+    wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+    printf("%stextures: %u lookups, %u checks (%u by the write watch), %u hashes (%llu bytes), %u converted, "
+           "%u made again, %u evicted, %u failed (%u for memory), %u kept smaller (%u made whole again); %u KB kept, "
+           "%u KB drawn in a frame at most\n",
+           prefix, (unsigned)ts.lookups, (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed,
+           (unsigned long long)ts.hashed_bytes, (unsigned)ts.converted, (unsigned)ts.reconverted,
+           (unsigned)ts.evicted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.reduced,
+           (unsigned)ts.restored, (unsigned)(ts.bytes >> 10), (unsigned)(ts.peak_frame_bytes >> 10));
 }
 
 static int bench(const uint8_t *data, size_t size, unsigned runs) {
@@ -766,6 +842,31 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
         printf("bench: %u draws (%u vertices) through GX's transform unit in all runs, %u more for their position "
                "alone\n", (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws);
         vertex_cache_line("bench: ");
+        texture_cache_line("bench: ");
+        {
+            // (where each draw's vertices were transformed, a frame)
+            double per = 1.0 / ((double)runs * frames);
+            unsigned w;
+
+            printf("bench: the draws' ways a frame (draws, vertices, vertices a draw):\n");
+            for (w = 0; w < WL_NV2A_GX_XF_WHYS; w++) {
+                if (gs.xf_why_draws[w] != 0) {
+                    printf("bench:   %-32s %9.1f %10.1f %7.1f\n", g_xf_whys[w], gs.xf_why_draws[w] * per,
+                           gs.xf_why_vertices[w] * per, (double)gs.xf_why_vertices[w] / gs.xf_why_draws[w]);
+                }
+            }
+        }
+        if (g_xf_programs) {
+            double per = 1.0 / ((double)runs * frames);
+            unsigned i;
+
+            qsort(g_xf_rows, g_xf_row_count, sizeof g_xf_rows[0], xf_row_order);
+            printf("bench: by program a frame (hash, way, draws, vertices):\n");
+            for (i = 0; i < g_xf_row_count; i++) {
+                printf("bench:   %08lx %-32s %9.1f %10.1f\n", g_xf_rows[i].hash, g_xf_whys[g_xf_rows[i].why],
+                       (double)g_xf_rows[i].draws * per, (double)g_xf_rows[i].vertices * per);
+            }
+        }
     }
     printf("bench: the best run a frame: pusher %.3f ms, draws %.3f, clears and frames %.3f, memory records %.3f\n",
            (best - best_draws - best_others - best_memory) * 1000.0 / frames, best_draws * 1000.0 / frames,
@@ -776,7 +877,7 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
 
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
-                    "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] "
+                    "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] [--xf-programs] "
                     "[--stream] [--cpu-transform] [--png-alpha] [--survey]\n");
     return 2;
 }
@@ -820,6 +921,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--survey") == 0) {
             g_survey = true;
             gx = true;
+        } else if (strcmp(argv[i], "--xf-programs") == 0) {
+            g_xf_programs = true;
         } else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
             g_bench = (unsigned)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--programs") == 0 && i + 1 < argc) {
@@ -933,20 +1036,8 @@ int main(int argc, char **argv) {
 
         wl_nv2a_gx_present(g_gx);
         wl_nv2a_gx_stats(g_gx, &gs);
-        {
-            WlNv2aTexCacheStats ts;
-
-            wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
-            vertex_cache_line("");
-            printf("textures: %u lookups, %u checks (%u by the write watch), %u hashes (%llu bytes), %u converted, "
-                   "%u made again, %u evicted, %u failed (%u for memory), %u kept smaller (%u made whole again); %u KB kept, "
-                   "%u KB drawn in a frame at most\n",
-                   (unsigned)ts.lookups, (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed,
-                   (unsigned long long)ts.hashed_bytes, (unsigned)ts.converted, (unsigned)ts.reconverted,
-                   (unsigned)ts.evicted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.reduced,
-                   (unsigned)ts.restored, (unsigned)(ts.bytes >> 10),
-                   (unsigned)(ts.peak_frame_bytes >> 10));
-        }
+        vertex_cache_line("");
+        texture_cache_line("");
         wl_gxsoft_stats(&ss);
         printf("gx backend: %u draws, %u perspective (%u fits made, %u shared), %u into targets (%u without one), "
                "%u stencil skipped, %u programs beyond GX, %u approximated, %u clears (%u quads), %u frames\n",

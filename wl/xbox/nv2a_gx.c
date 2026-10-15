@@ -180,6 +180,9 @@ struct WlNv2aGx {
     uint32_t xf_compiled;
     unsigned xf_live;
     bool xf_eligible, xf_full;
+    // why the last program's vertices are not all on the transform unit (xf_full false), and the
+    // last draw's way (WL_NV2A_GX_XF_WHYS: none, a draw left before its transform was chosen)
+    uint8_t xf_partial, xf_why;
     WlXboxVshDependencies xf_dependencies;
     // the last programs' analyses (wl_xbox_vsh_analyze), by program and its serial (another compiled
     // in its place is another): a frame's draws take turns among a few programs, and an analysis
@@ -298,6 +301,10 @@ const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx) {
 
 const WlNv2aVCache *wl_nv2a_gx_vertex_cache(const WlNv2aGx *gx) {
     return &gx->vertices;
+}
+
+unsigned wl_nv2a_gx_last_xf(const WlNv2aGx *gx) {
+    return gx->xf_why;
 }
 
 bool wl_nv2a_gx_last_projection(const WlNv2aGx *gx, float *a, float *b, bool *shared) {
@@ -1585,14 +1592,19 @@ static bool xf_structure(WlNv2aGx *gx, unsigned live, bool *full) {
         return false;
     }
     gx->xf_eligible = true;
-    gx->xf_full = !(live & (WL_XBOX_VSH_LIVE_FOG | WL_XBOX_VSH_LIVE_POINT_SIZE | WL_XBOX_VSH_LIVE_BACK)) &&
-                  !((live & WL_XBOX_VSH_LIVE_D0) && xf_source(d->d0, 4) == ~0u) &&
-                  !((live & WL_XBOX_VSH_LIVE_D1) && xf_source(d->d1, 4) == ~0u);
-    for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
+    gx->xf_partial = WL_NV2A_GX_XF_INDEXED;
+    if (live & (WL_XBOX_VSH_LIVE_FOG | WL_XBOX_VSH_LIVE_POINT_SIZE | WL_XBOX_VSH_LIVE_BACK)) {
+        gx->xf_partial = WL_NV2A_GX_XF_POS_OUTPUTS;
+    } else if (((live & WL_XBOX_VSH_LIVE_D0) && xf_source(d->d0, 4) == ~0u) ||
+               ((live & WL_XBOX_VSH_LIVE_D1) && xf_source(d->d1, 4) == ~0u)) {
+        gx->xf_partial = WL_NV2A_GX_XF_POS_COLOR;
+    }
+    for (stage = 0; gx->xf_partial == WL_NV2A_GX_XF_INDEXED && stage < WL_NV2A_TEXTURES; stage++) {
         if ((live & ((unsigned)WL_XBOX_VSH_LIVE_T0 << stage)) && xf_source(d->t[stage], 4) == ~0u) {
-            gx->xf_full = false;
+            gx->xf_partial = WL_NV2A_GX_XF_POS_TEXCOORD;
         }
     }
+    gx->xf_full = gx->xf_partial == WL_NV2A_GX_XF_INDEXED;
     *full = gx->xf_full;
     return true;
 }
@@ -1622,11 +1634,22 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
     bool full;
 
     if (gx->cfg.no_xf || gx->pipeline.program == NULL || count_pixels || draw->count < XF_MIN_VERTICES ||
-        draw->source == WL_NV2A_SOURCE_IMMEDIATE || !xf_structure(gx, plan->live, &full)) {
+        draw->source == WL_NV2A_SOURCE_IMMEDIATE) {
+        gx->xf_why = gx->cfg.no_xf                         ? WL_NV2A_GX_XF_OFF
+                     : gx->pipeline.program == NULL        ? WL_NV2A_GX_XF_FIXED
+                     : count_pixels                        ? WL_NV2A_GX_XF_COUNTING
+                     : draw->count < XF_MIN_VERTICES       ? WL_NV2A_GX_XF_EMPTY
+                                                           : WL_NV2A_GX_XF_IMMEDIATE;
         return false;
     }
+    if (!xf_structure(gx, plan->live, &full)) {
+        gx->xf_why = WL_NV2A_GX_XF_STRUCTURE;
+        return false;
+    }
+    gx->xf_why = gx->xf_partial;
     // (the position an F3 array: w 1 for every vertex)
     if (!(draw->streamed & 1u) || draw->attribs[0].type != WL_NV2A_VTX_F || draw->attribs[0].size != 3) {
+        gx->xf_why = WL_NV2A_GX_XF_POSITION;
         return false;
     }
     for (n = 0; n < XF_PROBES; n++) {
@@ -1646,6 +1669,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         float w_y = (plan->to_sy != 0.0f ? plan->offset[1] * plan->to_sy : plan->offset[1] / plan->sy) + 0.5f;
 
         if (!o[P_W].clip_captured) {
+            gx->xf_why = WL_NV2A_GX_XF_CLIP_W;
             return false;
         }
         for (row = 0; row < 4; row++) {
@@ -1670,6 +1694,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         if (d->clip_captured) {
             for (n = P_W; n < XF_PROBES; n++) {
                 if (o[n].clip[3] != 1.0f) {
+                    gx->xf_why = WL_NV2A_GX_XF_SCREEN;
                     return false;
                 }
             }
@@ -1686,6 +1711,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         // same at every vertex clamped here, and one that varies with the position, which might leave
         // the range at a vertex the transform unit cannot clamp, left to the processor)
         if (xf->position[2][0] != 0.0f || xf->position[2][1] != 0.0f || xf->position[2][2] != 0.0f) {
+            gx->xf_why = WL_NV2A_GX_XF_SCREEN;
             return false;
         }
         if (!(xf->position[2][3] >= -1.0f)) {
@@ -1719,6 +1745,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
 
             if (!same4(value, probe[n][0], probe[n][1], probe[n][2], probe[n][3])) {
                 xf->full = false;
+                gx->xf_why = WL_NV2A_GX_XF_POS_COLOR_MIX;
                 return true;
             }
         }
@@ -1737,6 +1764,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         source = xf_source(d->t[stage], 4);
         if (sp->sphere || source == ~0u) {
             xf->full = false;
+            gx->xf_why = sp->sphere ? WL_NV2A_GX_XF_POS_SPHERE : WL_NV2A_GX_XF_POS_TEXCOORD;
             break;
         }
         if (sp->projective) {
@@ -1744,6 +1772,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
             }
             if (n < XF_PROBES) {
                 xf->full = false;
+                gx->xf_why = WL_NV2A_GX_XF_POS_PROJECTIVE;
                 break;
             }
         }
@@ -1755,6 +1784,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
             // (a coordinate of more than two components is beyond the vertex's s, t)
             if (!(draw->streamed & source) || draw->attribs[r].size > 2u) {
                 xf->full = false;
+                gx->xf_why = WL_NV2A_GX_XF_POS_COORD;
                 break;
             }
             xf->stage_source[stage] = r;
@@ -1792,8 +1822,11 @@ static bool xf_arrays(WlNv2aGx *gx, const WlNv2aDraw *draw, const DrawPlan *plan
 
     if (!wl_nv2a_vcache_on(&gx->vertices) || draw->source != WL_NV2A_SOURCE_ARRAYS ||
         draw->index_last - draw->index_base >= WL_NV2A_VCACHE_SPAN) {
+        gx->xf_why = draw->source == WL_NV2A_SOURCE_ARRAYS && wl_nv2a_vcache_on(&gx->vertices) ? WL_NV2A_GX_XF_SENT_SPAN
+                                                                                               : WL_NV2A_GX_XF_SENT_SOURCE;
         return false;
     }
+    gx->xf_why = WL_NV2A_GX_XF_SENT_ARRAY;
     for (c = 0; c < plan->colors && c < 2u; c++) {
         if (xf->color_source[c] < 0) {
             continue;
@@ -2032,6 +2065,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
 
     // (what changed since the last draw, kept until a draw applies it)
     gx->dirty |= k->dirty;
+    gx->xf_why = WL_NV2A_GX_XF_WHYS;
     if (wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_TEST_ENABLE)) {
         // GX has no stencil. A pass that writes only the stencil (no colour, no depth) draws
         // nothing GX can keep, and is skipped; any other is drawn as if its test passed, as
@@ -2175,6 +2209,9 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
             }
         }
         indexed = xf_arrays(gx, draw, &plan, &xf, &layout, arrays);
+        if (indexed) {
+            gx->xf_why = WL_NV2A_GX_XF_INDEXED;
+        }
         wl_gx_direct_layout(&layout);
         for (stage = 0; indexed && stage < WL_GX_DIRECT_ARRAY_TEXCOORD0 + WL_NV2A_TEXTURES; stage++) {
             if (layout.indexed & (1u << stage)) {
@@ -2214,6 +2251,8 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
         }
         gx->xf_texgens = 0;
     }
+    gx->stats.xf_why_draws[gx->xf_why]++;
+    gx->stats.xf_why_vertices[gx->xf_why] += draw->count;
 
     if (indexed) {
         // (the vertices' indices alone, and the colours' words the transform unit's draw sends)

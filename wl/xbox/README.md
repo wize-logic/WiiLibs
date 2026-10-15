@@ -366,7 +366,13 @@ the textures kept from one run to the next) and prints the best and the mean tim
 vertex programs, the fetch, the translation, what the Wii's processor does for a frame; and the best
 run's parts: the model's own (pusher, puller, state tracker), the backend's draws, its clears and
 frames, the memory records put in. The same on the console: wl/xboxrt's capture bench
-(`replay:<file> <runs>` in a title's `play.cfg`).
+(`replay:<file> <runs>` in a title's `play.cfg`). It also gives the draws' ways a frame
+(`WlNv2aGxStats.xf_why_*`): through GX's transform unit (indexed, or their inputs sent and why),
+their position alone on it and why not the rest, or the processor's program and why; with
+`--xf-programs`, the same by vertex program (its hash), the most vertices first. Bench a capture as
+the runtime keeps it, `--textures-mb 13 --vertex-cache-kb 1024 --watch`: with the default 4 MiB of
+textures a heavy scene's 8 MB of maps are converted again on every run, and the conversion is then
+most of what is counted.
 
 `--cpu-transform` keeps every vertex on the processor (the transform unit not used), for comparing:
 `tools/png_compare.py A B --threshold N --diff D` counts each frame's pixels that differ, and beyond
