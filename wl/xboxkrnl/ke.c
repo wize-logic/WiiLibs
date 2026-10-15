@@ -72,6 +72,9 @@ void k_KeInitializeMutant(void) {
     wl_xb_wr32(mut + 0x14u, mut + 0x10u);
     wl_xb_wr32(mut + KMUTANT_OWNER, owned && self != NULL ? self->kthread : 0u);
     wl_xb_wr8(mut + KMUTANT_ABANDONED, 0);
+    if (owned) {
+        xk_mutant_owned_by(self, mut);
+    }
 }
 
 // LONG KeReleaseMutant(PRKMUTANT Mutant, KPRIORITY Increment, BOOLEAN Abandoned, BOOLEAN Wait)

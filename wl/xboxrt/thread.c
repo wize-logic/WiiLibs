@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/base/endian.h"
 #include "wl/platform/mem_census.h"
 #include "wl/xboxrt/crash.h"
 #include "wl/xboxrt/irq.h"
@@ -336,6 +337,11 @@ static void requeue(WlXbThread *self) {
     wl_xb_cpu_load(&self->cpu);
 }
 
+// The thread's IRQL (its KPCR's) is DISPATCH_LEVEL or above: it keeps the lock (yield_if_due).
+static bool irql_raised(const WlXbThread *t) {
+    return t->kpcr != 0 && wl_xb_rd8(t->kpcr + KPCR_IRQL) >= DISPATCH_LEVEL;
+}
+
 // Gives the lock to the head of the ready queue when it outranks the caller, or ties with it and
 // the caller's quantum is over. true when it did.
 static bool yield_if_due(WlXbThread *self) {
@@ -343,7 +349,7 @@ static bool yield_if_due(WlXbThread *self) {
     if (self == NULL || head == NULL || wl_xb_in_service()) {
         return false;
     }
-    if (self->kpcr != 0 && wl_xb_rd8(self->kpcr + KPCR_IRQL) >= DISPATCH_LEVEL) {
+    if (irql_raised(self)) {
         // At DISPATCH_LEVEL or above the holder keeps the processor, as on the console's one CPU:
         // no other thread runs, and the DPCs wait until it lowers its IRQL (KfLowerIrql runs them
         // then). Its own safe points still run the interrupts its IRQL lets in (their poll comes
@@ -540,9 +546,14 @@ void wl_xb_safe_point(void) {
 void wl_xb_yield(void) {
     WlXbThread *self = g_cur;
     WlXbThread *head = g_ready;
-    if (self != NULL && head != NULL && head->priority >= self->priority && !wl_xb_in_service()) {
-        requeue(self);
+    if (self == NULL || head == NULL || head->priority < self->priority || wl_xb_in_service()) {
+        return;
     }
+    if (irql_raised(self)) {
+        g_stats.raised_holds++; // the processor stays its (yield_if_due)
+        return;
+    }
+    requeue(self);
 }
 
 // ---- Threads -----------------------------------------------------------------------------------
@@ -965,17 +976,15 @@ void wl_xb_thread_set_priority(WlXbThread *t, int priority) {
     if (priority > 31 && !t->is_service) {
         priority = 31;
     }
+    wl_platform_mutex_lock(g_m);
     t->priority = priority;
-    if (g_det) {
-        wl_platform_mutex_lock(g_m);
-        if (t->ready) {
-            unqueue(t); // queued again at its new priority (a thread made and then given its priority)
-            uint64_t since = t->ready_since_us;
-            enqueue(t);
-            t->ready_since_us = since;
-        }
-        wl_platform_mutex_unlock(g_m);
+    if (t->ready) {
+        unqueue(t); // queued again at its new priority (a thread made and then given its priority)
+        uint64_t since = t->ready_since_us;
+        enqueue(t);
+        t->ready_since_us = since;
     }
+    wl_platform_mutex_unlock(g_m);
     if (t->kthread != 0) {
         wl_xb_wr8(t->kthread + 0x32, (uint8_t)(priority & 31));
     }
@@ -1191,17 +1200,19 @@ void wl_xb_thread_log_guest_stacks(void) {
         line[0] = '\0';
         for (uint32_t i = 0; i < 256u && found < 14u && used + 12u < sizeof line; i++) {
             uint32_t va = esp + i * 4u;
-            if (!wl_xb_mem_resident(va)) {
+            uint8_t b[4];
+            if (!wl_xb_mem_peek(va, b, 4)) { // (no guest lock here: never a fault)
                 break;
             }
-            uint32_t w = wl_xb_rd32(va);
+            uint32_t w = wl_rd_le32(b);
             if (w >= g_xbox_code_lo && w < g_xbox_code_hi) {
                 used += (size_t)snprintf(line + used, sizeof line - used, " %x", (unsigned)w);
                 found++;
             }
         }
         // its IRQL (a holder at DISPATCH_LEVEL keeps the lock: thread.h, wl_xb_safe_point)
-        unsigned irql = t->kpcr != 0 && wl_xb_mem_resident(t->kpcr + KPCR_IRQL) ? wl_xb_rd8(t->kpcr + KPCR_IRQL) : 0u;
+        uint8_t irql8 = 0;
+        unsigned irql = t->kpcr != 0 && wl_xb_mem_peek(t->kpcr + KPCR_IRQL, &irql8, 1) ? irql8 : 0u;
         char at[16] = "";
         if (irql != 0) {
             snprintf(at, sizeof at, " irql %u", irql);

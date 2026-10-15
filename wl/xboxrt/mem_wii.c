@@ -169,7 +169,7 @@ static inline uint8_t bits_flags(uint32_t w1) {
 static inline void take_bits(uint32_t p, uint32_t w1) {
     g_xb_pg_flags[p] |= bits_flags(w1);
     if ((w1 & PTE_C) != 0) {
-        wl_xb_pg_wrote(p);
+        wl_xb_pg_stored(p);
     }
 }
 

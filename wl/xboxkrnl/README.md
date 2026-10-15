@@ -34,15 +34,20 @@ settings).
   `NtDuplicateObject`. An object lives while anything refers to it: a handle, a reference by
   pointer (`ObReferenceObjectByHandle`, `ObfReferenceObject`; `ObfDereferenceObject` finds the
   object by its body and gives one back) or a wait on it (a handle closed under a waiting thread
-  leaves the body until the wait ends). The last reference frees it (a file is closed then).
+  leaves the body until the wait ends). The last reference frees it (a file is closed then). As on
+  NT, a signal satisfies the waits it can at once, in the order they began (so a pulse, or a set and
+  a reset before the waiter runs, still releases it); an alertable wait its objects satisfy returns
+  their status before a queued APC; a thread that ends abandons the mutants it owns (the next waiter
+  gets `STATUS_ABANDONED_WAIT_0`).
 - **Critical sections** (`rtl.c`), with the layout XAPI's inlined fast paths use: the event, then
   LockCount at +0x10, RecursionCount at +0x14, OwningThread at +0x18.
 - **IRQL, DPCs, timers, interrupts** (`ke_irq.c`): the IRQL lives in each thread's KPCR. Timers
   have deadlines on the runtime's service. `HalGetInterruptVector` gives vector `0x30 + line` at
   IRQL `26 - line`. `KeConnectInterrupt` makes the line's ISR run at its IRQL when the line is
   asserted. DPCs drain at DISPATCH_LEVEL. The work runs at the runtime's safe points (`wl/xboxrt/irq.h`);
-  a thread at DISPATCH_LEVEL or above keeps the processor (no thread switch, no DPC) until it
-  lowers its IRQL, as on the console.
+  a thread at DISPATCH_LEVEL or above keeps the processor (no thread switch or yield, no DPC, no
+  timer expiry) until it lowers its IRQL, as on the console, and a line its IRQL masks waits
+  without running the handler.
 - **Threads** (`ps.c`): `PsCreateSystemThreadEx` makes real guest threads (optionally the first
   runs on the caller, xboxrecomp's inline model), with priorities from `KeSetBasePriorityThread`
   (base 16 plus the increment), suspend before start and resume, `PsTerminateSystemThread`.
@@ -105,7 +110,7 @@ Every one of the 134 imports in Halo's XBE resolves to a body or a data export (
 | `hal.c` | AvGetSavedDataAddress (1), AvSendTVEncoderOption (2), AvSetDisplayMode (3), AvSetSavedDataAddress (4), HalRegisterShutdownNotification (47, approx), HalReturnToFirmware (49), PhyGetLinkState (252, stub), PhyInitialize (253), XeLoadSection (327), XeUnloadSection (328), HalIsResetOrShutdownPending (358, stub), HalInitiateShutdown (360) |
 | `ke.c` | KeBugCheck (95), KeDelayExecutionThread (99), KeQueryInterruptTime (125), KeQueryPerformanceCounter (126), KeQueryPerformanceFrequency (127), KeQuerySystemTime (128), KeRestoreFloatingPointState (139, approx), KeSaveFloatingPointState (142, approx), KeSetEvent (145), KeStallExecutionProcessor (151), KeWaitForMultipleObjects (158), KeWaitForSingleObject (159) |
 | `ke_irq.c` | HalGetInterruptVector (44), KeCancelTimer (97), KeConnectInterrupt (98), KeDisconnectInterrupt (100), KeInitializeDpc (107), KeInitializeInterrupt (109), KeInitializeTimerEx (113), KeInsertQueueDpc (119), KeRaiseIrqlToDpcLevel (129), KeRemoveQueueDpc (137), KeSetTimer (149), KeSetTimerEx (150), KeSynchronizeExecution (153), KfRaiseIrql (160), KfLowerIrql (161) |
-| `mm.c` | ExAllocatePool (14), ExAllocatePoolWithTag (15), ExFreePool (17), ExQueryPoolBlockSize (23), MmAllocateContiguousMemory (165), MmAllocateContiguousMemoryEx (166), MmAllocateSystemMemory (167), MmClaimGpuInstanceMemory (168), MmFreeContiguousMemory (171), MmFreeSystemMemory (172), MmGetPhysicalAddress (173), MmLockUnlockBufferPages (175, approx), MmLockUnlockPhysicalPage (176, approx), MmPersistContiguousMemory (178, approx), MmQueryAddressProtect (179), MmQueryAllocationSize (180), MmQueryStatistics (181), MmSetAddressProtect (182), NtAllocateVirtualMemory (184), NtFreeVirtualMemory (199), NtQueryVirtualMemory (217) |
+| `mm.c` | ExAllocatePool (14), ExAllocatePoolWithTag (15), ExFreePool (17), ExQueryPoolBlockSize (23), MmAllocateContiguousMemory (165), MmAllocateContiguousMemoryEx (166), MmAllocateSystemMemory (167), MmClaimGpuInstanceMemory (168), MmFreeContiguousMemory (171), MmFreeSystemMemory (172), MmGetPhysicalAddress (173), MmLockUnlockBufferPages (175), MmLockUnlockPhysicalPage (176), MmPersistContiguousMemory (178, approx), MmQueryAddressProtect (179), MmQueryAllocationSize (180), MmQueryStatistics (181), MmSetAddressProtect (182), NtAllocateVirtualMemory (184), NtFreeVirtualMemory (199), NtQueryVirtualMemory (217) |
 | `nt_file.c` | IoCreateSymbolicLink (67), NtCreateFile (190), NtDeviceIoControlFile (196), NtFlushBuffersFile (198), NtFsControlFile (200, approx), NtOpenFile (202), NtOpenSymbolicLinkObject (203), NtQueryDirectoryFile (207), NtQueryFullAttributesFile (210), NtQueryInformationFile (211), NtQuerySymbolicLinkObject (215), NtQueryVolumeInformationFile (218), NtReadFile (219), NtSetInformationFile (226), NtWriteFile (236) |
 | `nt_sync.c` | NtClearEvent (186), NtClose (187), NtCreateEvent (189), NtCreateMutant (192), NtReleaseMutant (221), NtSetEvent (225), NtUserIoApcDispatcher (232), NtWaitForSingleObject (233), NtWaitForSingleObjectEx (234), NtWaitForMultipleObjectsEx (235) |
 | `ps.c` | KeSetBasePriorityThread (143), NtResumeThread (224), NtYieldExecution (238), PsCreateSystemThreadEx (255), PsTerminateSystemThread (258) |
@@ -125,7 +130,7 @@ Stubs and approximations among them:
 | IoStartPacket, IoStartNextPacket, IofCompleteRequest, IoMarkIrpMustComplete (83, 81, 87, 359) | no IRP processing: no driver of a title's own runs |
 | XcModExp, XcKeyTable, XcBlockCryptCBC (345, 347, 349) | logged stubs that do nothing (RSA, DES): no title data is signed or encrypted with them here |
 | KeSaveFloatingPointState, KeRestoreFloatingPointState (142, 139) | success without saving (the x87 state is the thread's register file) |
-| MmLockUnlockBufferPages, MmLockUnlockPhysicalPage, MmPersistContiguousMemory (175, 176, 178) | success: pages never move under a title once pinned |
+| MmPersistContiguousMemory (178) | success: nothing persists across a reboot |
 | HalRegisterShutdownNotification (47) | ignored: nothing shuts down through it |
 | RtlRaiseException (302) | logs the exception; no SEH dispatch |
 | RtlUnwind (312) | unlinks the `fs:[0]` chain to the target frame without calling the handlers |

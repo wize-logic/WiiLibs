@@ -42,7 +42,7 @@ static const uint16_t k_ordinals[] = {
     127, 126, 268, 53, 51, 8, 189, 225, 186, 233, 234, 235, 187, 192, 221, 255, 258, 291, 277, 294, 108, 145, 159, 158,
     113, 107, 149, 119, 109, 98, 44, 190, 202, 219, 236, 211, 226, 207, 210, 218, 184, 199, 217, 166, 171, 173, 168, 305,
     304, 289, 279, 362, 335, 336, 337, 340, 338, 339, 24, 99, 232, 238, 112, 132, 128, 156, 322, 224, 129, 161,
-    195, 246, 250, 251, 364,
+    195, 246, 250, 251, 364, 123, 138, 205, 160, 175, 176,
 };
 enum {
     S_PERF_FREQ, S_PERF_COUNTER, S_COMPARE_MEMORY, S_INTERLOCKED_INC, S_INTERLOCKED_CMPXCHG, S_DBGPRINT,
@@ -57,6 +57,8 @@ enum {
     S_KE_DELAY, S_NT_USER_APC, S_NT_YIELD, S_KE_INIT_SEMAPHORE, S_KE_RELEASE_SEMAPHORE, S_KE_SYSTEM_TIME,
     S_KE_TICK_COUNT, S_HW_INFO, S_NT_RESUME, S_KE_RAISE_TO_DPC, S_KF_LOWER_IRQL, S_NT_DELETE_FILE, S_OB_REF_BY_HANDLE,
     S_OBF_DEREF, S_OBF_REF, S_RTL_VSPRINTF,
+    S_KE_PULSE_EVENT, S_KE_RESET_EVENT, S_NT_PULSE_EVENT, S_KF_RAISE_IRQL,
+    S_MM_LOCK_BUFFER, S_MM_LOCK_PHYS,
 };
 
 static uint8_t *g_image; // the XBE's bytes
@@ -729,6 +731,309 @@ TEST a_raised_irql_keeps_the_processor(void) {
     PASS();
 }
 
+// ---- Waits satisfied at signal time ----------------------------------------------------------------
+// A signal satisfies the waits it can at once, as NT does, so the waiter gets the object even when
+// it runs only after the signaller has undone the signal: a pulse, a set and a reset in one go, a
+// semaphore's count taken again by the signaller. The waiter here runs below the signaller, so it
+// never gets the lock in between.
+
+static uint32_t g_w_sync, g_w_note, g_w_sem, g_w_pulse_h, g_w_tp;
+static volatile uint32_t g_w_stage;
+static uint32_t g_w_status[4];
+
+static void delay_ms(uint32_t ms) {
+    uint32_t tp = gmem(8);
+    wl_xb_wr64(tp, (uint64_t)(int64_t)-(int64_t)(ms * 10000u));
+    KN(S_KE_DELAY, 0, 0, tp);
+}
+
+// Kernel delays (the lock given up) until the stage is reached, then 20 ms more: the waiter is in
+// its next wait by then.
+static bool await_stage(uint32_t stage) {
+    for (int i = 0; i < 300 && g_w_stage < stage; i++) {
+        delay_ms(10);
+    }
+    delay_ms(20);
+    return g_w_stage >= stage;
+}
+
+static void pulse_waiter(void) {
+    // stdcall SystemRoutine(ctx1, ctx2)
+    uint32_t esp = g_esp;
+    g_w_stage = 1;
+    g_w_status[0] = KN(S_KE_WAIT1, g_w_sync, 0, 0, 0, g_w_tp); // released by KePulseEvent
+    g_w_stage = 2;
+    g_w_status[1] = KN(S_KE_WAIT1, g_w_note, 0, 0, 0, g_w_tp); // KeSetEvent then KeResetEvent
+    g_w_stage = 3;
+    g_w_status[2] = KN(S_NT_WAIT1, g_w_pulse_h, 0, g_w_tp);     // NtPulseEvent
+    g_w_stage = 4;
+    g_w_status[3] = KN(S_KE_WAIT1, g_w_sem, 0, 0, 0, g_w_tp);  // a count the releaser polls for
+    g_w_stage = 5;
+    g_esp = esp;
+    guest_ret(8);
+}
+
+static WlXbThread *created_thread(uint32_t id_out) {
+    return wl_xb_thread_by_id(wl_xb_rd32(id_out));
+}
+
+TEST a_signal_satisfies_the_waiter_at_once(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    g_w_sync = gmem(16);
+    g_w_note = gmem(16);
+    g_w_sem = gmem(20);
+    g_w_tp = gmem(8);
+    wl_xb_wr64(g_w_tp, (uint64_t)(int64_t)-20000000); // 2 s
+    KN(S_KE_INIT_EVENT, g_w_sync, 1, 0); // synchronization
+    KN(S_KE_INIT_EVENT, g_w_note, 0, 0); // notification
+    KN(S_KE_INIT_SEMAPHORE, g_w_sem, 0, 10);
+    uint32_t ehp = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_NT_CREATE_EVENT, ehp, 0, 0, 0), "%08x");
+    g_w_pulse_h = wl_xb_rd32(ehp);
+    g_w_stage = 0;
+    memset(g_w_status, 0xEE, sizeof g_w_status);
+    uint32_t hp = gmem(4), idp = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, idp, 0, 0, 0, 0, guest_fn(7, pulse_waiter)), "%08x");
+    WlXbThread *w = created_thread(idp);
+    ASSERT(w != NULL);
+    wl_xb_thread_set_priority(w, wl_xb_current()->priority - 2); // below the signaller
+
+    ASSERT(await_stage(1));
+    ASSERT_EQ_FMT(0u, KN(S_KE_PULSE_EVENT, g_w_sync, 0, 0), "%u");
+    ASSERT_EQ_FMT(0u, wl_xb_rd32(g_w_sync + 4u), "%u"); // given to the waiter: not signalled
+    ASSERT(await_stage(2));
+    ASSERT_EQ_FMT(0u, g_w_status[0], "%08x");
+    KN(S_KE_SET_EVENT, g_w_note, 0, 0);
+    KN(S_KE_RESET_EVENT, g_w_note);
+    ASSERT(await_stage(3));
+    ASSERT_EQ_FMT(0u, g_w_status[1], "%08x");
+    uint32_t prev = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_NT_PULSE_EVENT, g_w_pulse_h, prev), "%08x");
+    ASSERT(await_stage(4));
+    ASSERT_EQ_FMT(0u, g_w_status[2], "%08x");
+    // the count goes to the waiter, not to the releaser's poll right after
+    KN(S_KE_RELEASE_SEMAPHORE, g_w_sem, 0, 1, 0);
+    uint32_t zero = gmem(8);
+    ASSERT_EQ_FMT(0x102u, KN(S_KE_WAIT1, g_w_sem, 0, 0, 0, zero), "%08x");
+    ASSERT(await_stage(5));
+    ASSERT_EQ_FMT(0u, g_w_status[3], "%08x");
+    KN(S_NT_CLOSE, g_w_pulse_h);
+    KN(S_NT_CLOSE, wl_xb_rd32(hp));
+    PASS();
+}
+
+// ---- No yield at DISPATCH_LEVEL ---------------------------------------------------------------------
+// NtYieldExecution and a delay of 0 give the processor to a thread of the same priority, but not
+// from DISPATCH_LEVEL (wl_xb_yield, as the safe points' yield).
+
+static volatile uint32_t g_ran;
+
+static void mark_routine(void) {
+    // stdcall SystemRoutine(ctx1 = the value to add, ctx2)
+    g_ran += guest_arg(0);
+    guest_ret(8);
+}
+
+TEST no_yield_at_dispatch_level(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    g_ran = 0;
+    uint32_t hp = gmem(4), tp0 = gmem(8);
+    ASSERT_EQ_FMT(0u, K0(S_KE_RAISE_TO_DPC), "%u");
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 1, 0, 0, 0, guest_fn(8, mark_routine)), "%08x");
+    if (!wl_xb_deterministic()) {
+        wl_platform_thread_sleep_ms(20); // (its host thread queued for the lock)
+    }
+    for (int i = 0; i < 10; i++) {
+        K0(S_NT_YIELD);
+        KN(S_KE_DELAY, 0, 0, tp0); // 0: a yield
+    }
+    ASSERT_EQ_FMT(0u, g_ran, "%u");
+    g_ecx = 0;
+    K0(S_KF_LOWER_IRQL);
+    for (int i = 0; i < 300 && g_ran == 0; i++) {
+        delay_ms(1);
+    }
+    ASSERT_EQ_FMT(1u, g_ran, "%u");
+    KN(S_NT_CLOSE, wl_xb_rd32(hp));
+    PASS();
+}
+
+// ---- A thread that ends abandons its mutants ------------------------------------------------------
+
+static uint32_t g_mut_h, g_mut_tp;
+static volatile uint32_t g_mut_stage;
+
+static void mutant_owner(void) {
+    // stdcall SystemRoutine(ctx1, ctx2): owns the mutant, then ends without releasing it
+    uint32_t esp = g_esp;
+    KN(S_NT_WAIT1, g_mut_h, 0, g_mut_tp);
+    g_mut_stage = 1;
+    uint32_t tp = gmem(8);
+    wl_xb_wr64(tp, (uint64_t)(int64_t)-300000); // 30 ms: the main thread waits on the mutant now
+    KN(S_KE_DELAY, 0, 0, tp);
+    g_esp = esp;
+    guest_ret(8);
+}
+
+TEST an_ended_owner_abandons_its_mutants(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t mp = gmem(4), hp = gmem(4);
+    g_mut_tp = gmem(8);
+    wl_xb_wr64(g_mut_tp, (uint64_t)(int64_t)-20000000); // 2 s
+    ASSERT_EQ_FMT(0u, KN(S_NT_CREATE_MUTANT, mp, 0, 0), "%08x");
+    g_mut_h = wl_xb_rd32(mp);
+    g_mut_stage = 0;
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(9, mutant_owner)), "%08x");
+    for (int i = 0; i < 300 && g_mut_stage == 0; i++) {
+        delay_ms(1);
+    }
+    ASSERT_EQ_FMT(1u, g_mut_stage, "%u");
+    // waiting when the owner ends: STATUS_ABANDONED_WAIT_0, and the mutant is ours
+    ASSERT_EQ_FMT(0x80u, KN(S_NT_WAIT1, g_mut_h, 0, g_mut_tp), "%08x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_RELEASE_MUTANT, g_mut_h, 0), "%08x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_WAIT1, g_mut_h, 0, g_mut_tp), "%08x"); // not abandoned any more
+    ASSERT_EQ_FMT(0u, KN(S_NT_RELEASE_MUTANT, g_mut_h, 0), "%08x");
+    KN(S_NT_CLOSE, g_mut_h);
+    KN(S_NT_CLOSE, wl_xb_rd32(hp));
+    PASS();
+}
+
+// ---- A line the IRQL masks -------------------------------------------------------------------------
+// An asserted line whose ISR the holder's IRQL keeps out waits for the IRQL without making every
+// safe point run the handler (8 rounds and a warning each before).
+
+#define MASKED_LINE 11u
+
+static volatile bool g_masked_irq;
+static volatile uint32_t g_masked_isr_runs;
+
+static bool masked_level(void *user) {
+    (void)user;
+    return g_masked_irq;
+}
+
+static void masked_isr(void) {
+    // BOOLEAN ServiceRoutine(PKINTERRUPT, PVOID): acknowledge
+    g_masked_isr_runs++;
+    g_masked_irq = false;
+    g_eax = 1;
+    guest_ret(8);
+}
+
+TEST a_masked_line_waits_quietly(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    wl_xb_irq_set_level(MASKED_LINE, masked_level, NULL);
+    uint32_t irql = gmem(4), ki = gmem(0x80);
+    uint32_t vector = KN(S_HAL_VECTOR, MASKED_LINE, irql);
+    KN(S_KE_INIT_INTERRUPT, ki, guest_fn(12, masked_isr), 0, vector, wl_xb_rd8(irql), 0 /* level */, 0);
+    ASSERT_EQ_FMT(1u, KN(S_KE_CONNECT_INTERRUPT, ki), "%u");
+    g_masked_isr_runs = 0;
+    g_ecx = (uint32_t)wl_xb_rd8(irql) + 1u;
+    ASSERT_EQ_FMT(0u, K0(S_KF_RAISE_IRQL), "%u"); // above the line's IRQL
+    g_masked_irq = true;
+    WlXbServiceStats s0, s1;
+    wl_xb_service_stats(&s0);
+    for (int i = 0; i < 200; i++) {
+        (void)wl_xb_rd32(RAISED_DEV_VA + 4u);
+    }
+    wl_xb_service_stats(&s1);
+    uint32_t runs = s1.handler_runs - s0.handler_runs;
+    uint32_t isrs = g_masked_isr_runs;
+    g_ecx = 0;
+    K0(S_KF_LOWER_IRQL);
+    ASSERT_EQ_FMT(0u, isrs, "%u");
+    ASSERT(runs < 20u); // other work only (each of the 200 accesses ran it 8 times before)
+    for (int i = 0; i < 100 && g_masked_isr_runs == 0; i++) {
+        (void)wl_xb_rd32(RAISED_DEV_VA + 4u);
+    }
+    ASSERT_EQ_FMT(1u, g_masked_isr_runs, "%u"); // the line taken once the IRQL is down
+    ASSERT(!g_masked_irq);
+    PASS();
+}
+
+// ---- Timers expire below DISPATCH_LEVEL --------------------------------------------------------
+
+TEST timers_wait_for_the_irql(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t timer = gmem(0x28), dpc = gmem(0x20);
+    g_dpc_runs = 0;
+    KN(S_KE_INIT_TIMER, timer, 0);
+    KN(S_KE_INIT_DPC, dpc, guest_fn(10, dpc_routine), 0x7173u);
+    ASSERT_EQ_FMT(0u, K0(S_KE_RAISE_TO_DPC), "%u");
+    KN(S_KE_SET_TIMER, timer, (uint32_t)-20000, 0xFFFFFFFFu, dpc); // 2 ms
+    uint64_t t0 = now_ms();
+    while (now_ms() - t0 < 20u) {
+        (void)wl_xb_rd32(RAISED_DEV_VA + 4u);
+    }
+    ASSERT_EQ_FMT(0u, wl_xb_rd32(timer + 4u), "%u"); // not expired at DISPATCH_LEVEL
+    ASSERT_EQ_FMT(0u, g_dpc_runs, "%u");
+    g_ecx = 0;
+    K0(S_KF_LOWER_IRQL); // the clock catches up: expired, its DPC run
+    ASSERT_EQ_FMT(1u, wl_xb_rd32(timer + 4u), "%u");
+    ASSERT_EQ_FMT(1u, g_dpc_runs, "%u");
+    ASSERT_EQ_FMT(0x7173u, g_dpc_arg, "%08x");
+    PASS();
+}
+
+// ---- A priority change re-sorts a queued thread ----------------------------------------------------
+
+static uint32_t g_order[2];
+static volatile uint32_t g_order_n;
+
+static void order_routine(void) {
+    // stdcall SystemRoutine(ctx1 = its mark, ctx2)
+    if (g_order_n < 2u) {
+        g_order[g_order_n] = guest_arg(0);
+    }
+    g_order_n++;
+    guest_ret(8);
+}
+
+TEST a_priority_change_resorts_the_queue(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    g_order_n = 0;
+    WlXbThread *self = wl_xb_current();
+    int prio = self->priority;
+    // A, then B, queued at the base priority; the holder above them meanwhile, so the kernel
+    // calls' yield points do not let them run
+    wl_xb_thread_set_priority(self, prio + 4);
+    uint32_t ha = gmem(4), hb = gmem(4), idb = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, ha, 0, 0x4000, 0, 0, 0xA, 0, 0, 0, guest_fn(11, order_routine)), "%08x");
+    if (!wl_xb_deterministic()) {
+        wl_platform_thread_sleep_ms(30); // (its host thread queued for the lock)
+    }
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hb, 0, 0x4000, 0, idb, 0xB, 0, 0, 0, guest_fn(11, order_routine)), "%08x");
+    if (!wl_xb_deterministic()) {
+        wl_platform_thread_sleep_ms(30);
+    }
+    ASSERT_EQ_FMT(0u, g_order_n, "%u");
+    WlXbThread *b = created_thread(idb);
+    ASSERT(b != NULL);
+    wl_xb_thread_set_priority(b, prio + 2); // B ahead of A now (still below the holder)
+    wl_xb_thread_set_priority(self, prio);
+    for (int i = 0; i < 300 && g_order_n < 2u; i++) {
+        delay_ms(1);
+    }
+    ASSERT_EQ_FMT(2u, g_order_n, "%u");
+    ASSERT_EQ_FMT(0xBu, g_order[0], "%x");
+    ASSERT_EQ_FMT(0xAu, g_order[1], "%x");
+    KN(S_NT_CLOSE, wl_xb_rd32(ha));
+    KN(S_NT_CLOSE, wl_xb_rd32(hb));
+    PASS();
+}
+
 // ---- Files ----------------------------------------------------------------------------------------
 
 static uint32_t g_apc_runs, g_apc_ctx, g_apc_info;
@@ -791,11 +1096,16 @@ TEST files_dvd_and_overlapped(void) {
     ASSERT_EQ_FMT(0u, g_apc_runs, "%u"); // not before an alertable wait
     uint32_t tp = gmem(8);
     wl_xb_wr64(tp, (uint64_t)(int64_t)-10000000);
-    ASSERT_EQ_FMT(0xC0u, KN(S_NT_WAIT1EX, ev, 1, 1, tp), "%08x"); // STATUS_USER_APC
+    // the event was set too: as on NT, an alertable wait its objects satisfy returns at once and
+    // leaves the APC queued
+    ASSERT_EQ_FMT(0u, KN(S_NT_WAIT1EX, ev, 1, 1, tp), "%08x");
+    ASSERT_EQ_FMT(0u, g_apc_runs, "%u");
+    // a wait that would block delivers it: STATUS_USER_APC
+    KN(S_NT_CLEAR_EVENT, ev);
+    ASSERT_EQ_FMT(0xC0u, KN(S_NT_WAIT1EX, ev, 1, 1, tp), "%08x");
     ASSERT_EQ_FMT(1u, g_apc_runs, "%u");
     ASSERT_EQ_FMT(0xA9C0u, g_apc_ctx, "%08x");
     ASSERT_EQ_FMT(8u, g_apc_info, "%u");
-    ASSERT_EQ_FMT(0u, KN(S_NT_WAIT1EX, ev, 1, 1, tp), "%08x"); // the event was set too
     KN(S_NT_CLOSE, ev);
     KN(S_NT_CLOSE, h);
     PASS();
@@ -916,6 +1226,29 @@ TEST virtual_and_contiguous_memory(void) {
     ASSERT_EQ_FMT(0x61000u, KN(S_MM_PHYS, va), "%x");
     ASSERT_EQ_FMT(0x61000u, KN(S_MM_PHYS, 0xF0061000u), "%x"); // the tiled alias
     KN(S_MM_FREE_CONTIG, va);
+    // a locked user page keeps its physical address: a contiguous allocation over it fails rather
+    // than move it (MmLockUnlockBufferPages), and moves it once it is unlocked
+    wl_xb_wr32(base_p, 0);
+    wl_xb_wr32(size_p, 0x1000);
+    ASSERT_EQ_FMT(0u, KN(S_NT_ALLOC_VM, base_p, 0, size_p, 0x3000, 4), "%08x"); // reserve and commit
+    uint32_t user = wl_xb_rd32(base_p);
+    wl_xb_wr32(user, 0x10C4EDu);
+    uint32_t p0 = KN(S_MM_PHYS, user);
+    KN(S_MM_LOCK_BUFFER, user + 0x10u, 0x20u, 0); // lock
+    ASSERT_EQ_FMT(0u, KN(S_MM_CONTIG_EX, 0x1000u, p0, p0 + 0xFFFu, 0, 4), "%08x");
+    ASSERT_EQ_FMT(p0, KN(S_MM_PHYS, user), "%x");
+    KN(S_MM_LOCK_PHYS, p0, 0); // and once more by its physical address: two locks
+    KN(S_MM_LOCK_BUFFER, user, 0x1000u, 1); // one unlock
+    ASSERT_EQ_FMT(0u, KN(S_MM_CONTIG_EX, 0x1000u, p0, p0 + 0xFFFu, 0, 4), "%08x");
+    KN(S_MM_LOCK_PHYS, p0, 1); // the last
+    uint32_t over = KN(S_MM_CONTIG_EX, 0x1000u, p0, p0 + 0xFFFu, 0, 4);
+    ASSERT_EQ_FMT(0x80000000u | p0, over, "%08x");
+    ASSERT(KN(S_MM_PHYS, user) != p0); // moved, with its bytes
+    ASSERT_EQ_FMT(0x10C4EDu, wl_xb_rd32(user), "%x");
+    KN(S_MM_FREE_CONTIG, over);
+    wl_xb_wr32(base_p, user);
+    wl_xb_wr32(size_p, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_FREE_VM, base_p, size_p, 0x8000), "%08x");
     // the GPU's instance memory: the top of the RAM
     uint32_t pad = gmem(4);
     ASSERT_EQ_FMT(0x84000000u, KN(S_MM_GPU_INSTANCE, 0x5000, pad), "%08x");
@@ -1363,6 +1696,12 @@ SUITE(kernel_suite) {
     RUN_TEST(device_polls_are_safe_points);
     RUN_TEST(device_ticks_run_at_safe_points);
     RUN_TEST(a_raised_irql_keeps_the_processor);
+    RUN_TEST(a_signal_satisfies_the_waiter_at_once);
+    RUN_TEST(no_yield_at_dispatch_level);
+    RUN_TEST(an_ended_owner_abandons_its_mutants);
+    RUN_TEST(a_masked_line_waits_quietly);
+    RUN_TEST(timers_wait_for_the_irql);
+    RUN_TEST(a_priority_change_resorts_the_queue);
     RUN_TEST(files_dvd_and_overlapped);
     RUN_TEST(files_sparse_cache_drive);
     RUN_TEST(virtual_and_contiguous_memory);

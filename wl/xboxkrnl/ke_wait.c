@@ -3,15 +3,19 @@
 //
 // The objects' state is their DISPATCHER_HEADER's SignalState in guest memory, read afresh at every
 // check (titles initialise and reset some of them inline), and the guest lock is the dispatcher
-// lock: the waits re-check under it, so a wake is only a hint and a spurious one costs a check.
-// A waiting thread records its objects; a signal wakes every thread that waits on the object and
-// they race for it under the lock, as NT's satisfy-on-wake gives the same outcome to the first.
+// lock. A waiting thread records its objects. A signal satisfies the waits it can at once, as NT
+// does: in the order the waits began, each satisfied waiter's objects are acquired for it (a
+// synchronization event reset, a semaphore's count taken, a mutant owned) and its status kept for
+// it to return when it runs. So a pulse, or a set and a reset before the waiter runs, still
+// releases it, and a waiter of lower priority than the signaller is not overtaken.
 #include "wl/xboxkrnl/kernel_internal.h"
 
 #define FILETIME_1970 116444736000000000ull // 100 ns intervals from 1601 to 1970
 
 // The deterministic mode's calendar starts on 2004-11-15 00:00 UTC (a fixed date, not the host's).
 #define DET_EPOCH_UNIX_US 1100476800000000ull
+
+static uint32_t g_wait_seq; // counts the waits begun (XkThread.wait_seq)
 
 uint64_t xk_system_time(void) {
     if (wl_xb_deterministic()) {
@@ -45,16 +49,50 @@ static bool is_mutant(uint32_t obj) {
     return wl_xb_rd8(obj + DISP_TYPE) == OBJ_MUTANT;
 }
 
-static bool satisfied(uint32_t obj, const WlXbThread *self) {
+static bool satisfied(uint32_t obj, const WlXbThread *t) {
     int32_t signal = (int32_t)wl_xb_rd32(obj + DISP_SIGNAL);
     if (is_mutant(obj)) {
-        return signal > 0 || wl_xb_rd32(obj + KMUTANT_OWNER) == self->kthread;
+        return signal > 0 || wl_xb_rd32(obj + KMUTANT_OWNER) == t->kthread;
     }
     return signal > 0;
 }
 
-// The side effects of a satisfied wait. True when the object was an abandoned mutant.
-static bool acquire(uint32_t obj, const WlXbThread *self) {
+// ---- Owned mutants -------------------------------------------------------------------------------
+
+static void owned_remove(WlXbThread *t, uint32_t mut) {
+    XkThread *k = t != NULL ? t->kernel : NULL;
+    if (k == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < k->owned_count; i++) {
+        if (k->owned[i] == mut) {
+            k->owned[i] = k->owned[--k->owned_count];
+            return;
+        }
+    }
+}
+
+void xk_mutant_owned_by(WlXbThread *t, uint32_t mut) {
+    XkThread *k = t != NULL ? xk_thread_state(t) : NULL;
+    if (k == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < k->owned_count; i++) {
+        if (k->owned[i] == mut) {
+            return;
+        }
+    }
+    if (k->owned_count == XK_MAX_OWNED) {
+        WL_LOG_W(XK_TAG, "thread %u owns more than %u mutants: 0x%08x is not abandoned if it ends", (unsigned)t->id,
+                 (unsigned)XK_MAX_OWNED, (unsigned)mut);
+        return;
+    }
+    k->owned[k->owned_count++] = mut;
+}
+
+// The side effects of a satisfied wait for thread `t`. True when the object was an abandoned
+// mutant.
+static bool acquire(uint32_t obj, WlXbThread *t) {
     uint8_t type = wl_xb_rd8(obj + DISP_TYPE);
     int32_t signal = (int32_t)wl_xb_rd32(obj + DISP_SIGNAL);
     switch (type) {
@@ -68,13 +106,42 @@ static bool acquire(uint32_t obj, const WlXbThread *self) {
     case OBJ_MUTANT: {
         bool abandoned = wl_xb_rd8(obj + KMUTANT_ABANDONED) != 0;
         wl_xb_wr32(obj + DISP_SIGNAL, (uint32_t)(signal - 1));
-        wl_xb_wr32(obj + KMUTANT_OWNER, self->kthread);
+        wl_xb_wr32(obj + KMUTANT_OWNER, t->kthread);
         wl_xb_wr8(obj + KMUTANT_ABANDONED, 0);
+        xk_mutant_owned_by(t, obj);
         return abandoned;
     }
     default:
         return false; // notification events and timers, threads: stay signalled
     }
+}
+
+// Whether thread `t`'s wait on `objects` is satisfied now: if so its objects are acquired for it
+// and `*status` is what the wait returns.
+static bool try_satisfy(WlXbThread *t, uint32_t count, const uint32_t *objects, bool wait_all, uint32_t *status) {
+    if (wait_all) {
+        if (count == 0) {
+            return false;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            if (!satisfied(objects[i], t)) {
+                return false;
+            }
+        }
+        bool abandoned = false;
+        for (uint32_t i = 0; i < count; i++) {
+            abandoned |= acquire(objects[i], t);
+        }
+        *status = abandoned ? STATUS_ABANDONED_WAIT_0 : STATUS_WAIT_0;
+        return true;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (satisfied(objects[i], t)) {
+            *status = acquire(objects[i], t) ? STATUS_ABANDONED_WAIT_0 + i : STATUS_WAIT_0 + i;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool xk_apc_deliver(WlXbThread *t) {
@@ -124,28 +191,14 @@ uint32_t xk_wait(uint32_t count, const uint32_t *objects, bool wait_all, bool al
     uint64_t deadline = 0;
     uint32_t ms = xk_timeout_ms(timeout, &deadline);
     for (;;) {
+        // the objects first: a wait they satisfy returns their status even with an APC queued
+        uint32_t status = 0;
+        if (try_satisfy(self, count, objects, wait_all, &status)) {
+            return status;
+        }
         if (alertable && user_mode && k->apc_count > 0) {
             xk_apc_deliver(self);
             return STATUS_USER_APC;
-        }
-        if (wait_all) {
-            bool all = count > 0;
-            for (uint32_t i = 0; i < count && all; i++) {
-                all = satisfied(objects[i], self);
-            }
-            if (all) {
-                bool abandoned = false;
-                for (uint32_t i = 0; i < count; i++) {
-                    abandoned |= acquire(objects[i], self);
-                }
-                return abandoned ? STATUS_ABANDONED_WAIT_0 : STATUS_WAIT_0;
-            }
-        } else {
-            for (uint32_t i = 0; i < count; i++) {
-                if (satisfied(objects[i], self)) {
-                    return acquire(objects[i], self) ? STATUS_ABANDONED_WAIT_0 + i : STATUS_WAIT_0 + i;
-                }
-            }
         }
         uint32_t left = ms;
         if (ms != WL_WAIT_FOREVER) {
@@ -158,34 +211,60 @@ uint32_t xk_wait(uint32_t count, const uint32_t *objects, bool wait_all, bool al
         }
         k->wait_count = count;
         memcpy(k->wait_objects, objects, count * sizeof objects[0]);
+        k->wait_all = wait_all;
+        k->satisfied = false;
+        k->wait_seq = ++g_wait_seq;
         k->waiting = true;
         wl_xb_wait(self, left);
         k->waiting = false;
         k->wait_count = 0;
+        if (k->satisfied) { // by a signal while it waited (even one undone since)
+            k->satisfied = false;
+            return k->wait_status;
+        }
     }
 }
 
 typedef struct {
     uint32_t obj;
+    uint32_t after; // the wait_seq of the waiter tried last
+    WlXbThread *best; // the waiter on obj whose wait began first after it
+    uint32_t best_seq;
 } SignalCtx;
 
-static void wake_if_waiting(WlXbThread *t, void *user) {
-    const SignalCtx *c = user;
+static void next_waiter(WlXbThread *t, void *user) {
+    SignalCtx *c = user;
     XkThread *k = t->kernel;
-    if (k == NULL || !k->waiting) {
+    if (k == NULL || !k->waiting || k->satisfied || k->wait_seq <= c->after ||
+        (c->best != NULL && k->wait_seq >= c->best_seq)) {
         return;
     }
     for (uint32_t i = 0; i < k->wait_count; i++) {
         if (k->wait_objects[i] == c->obj) {
-            wl_xb_wake(t);
+            c->best = t;
+            c->best_seq = k->wait_seq;
             return;
         }
     }
 }
 
 void xk_object_signaled(uint32_t obj) {
-    SignalCtx c = {obj};
-    wl_xb_thread_foreach(wake_if_waiting, &c);
+    // the waiters on the object in the order their waits began, each satisfied if the object (for a
+    // wait for all, every object) satisfies it now
+    SignalCtx c = {obj, 0, NULL, 0};
+    for (;;) {
+        c.best = NULL;
+        wl_xb_thread_foreach(next_waiter, &c);
+        if (c.best == NULL) {
+            return;
+        }
+        c.after = c.best_seq;
+        XkThread *k = c.best->kernel;
+        if (try_satisfy(c.best, k->wait_count, k->wait_objects, k->wait_all, &k->wait_status)) {
+            k->satisfied = true;
+            wl_xb_wake(c.best);
+        }
+    }
 }
 
 int32_t xk_event_set(uint32_t ev) {
@@ -204,11 +283,9 @@ int32_t xk_event_reset(uint32_t ev) {
 }
 
 // A pulse releases the threads waiting now (one for a synchronization event) and leaves the event
-// reset. Waiters run only once the caller gives up the lock, so the pulse yields to them before
-// it resets the event.
+// reset: the set satisfies their waits at once, and they run when they get the lock.
 int32_t xk_event_pulse(uint32_t ev) {
     int32_t prev = xk_event_set(ev);
-    wl_xb_yield();
     wl_xb_wr32(ev + DISP_SIGNAL, 0);
     return prev;
 }
@@ -234,6 +311,10 @@ uint32_t xk_mutant_release(uint32_t mut, bool abandon, int32_t *previous) {
         *previous = signal;
     }
     if (abandon) {
+        uint32_t owner = wl_xb_rd32(mut + KMUTANT_OWNER);
+        if (owner != 0) {
+            owned_remove(wl_xb_thread_by_kthread(owner), mut);
+        }
         wl_xb_wr32(mut + DISP_SIGNAL, 1);
         wl_xb_wr32(mut + KMUTANT_OWNER, 0);
         wl_xb_wr8(mut + KMUTANT_ABANDONED, 1);
@@ -247,7 +328,20 @@ uint32_t xk_mutant_release(uint32_t mut, bool abandon, int32_t *previous) {
     wl_xb_wr32(mut + DISP_SIGNAL, (uint32_t)signal);
     if (signal > 0) {
         wl_xb_wr32(mut + KMUTANT_OWNER, 0);
+        owned_remove(self, mut);
         xk_object_signaled(mut);
     }
     return STATUS_SUCCESS;
+}
+
+void xk_thread_abandon_mutants(WlXbThread *t) {
+    XkThread *k = t != NULL ? t->kernel : NULL;
+    while (k != NULL && k->owned_count > 0) {
+        uint32_t mut = k->owned[k->owned_count - 1u];
+        if (wl_xb_rd32(mut + KMUTANT_OWNER) == t->kthread) {
+            xk_mutant_release(mut, true, NULL); // takes it off the list
+        } else {
+            owned_remove(t, mut);
+        }
+    }
 }

@@ -169,6 +169,9 @@ void k_NtCreateMutant(void) {
         wl_xb_wr32(o->body + 0x10u, o->body + 0x10u);
         wl_xb_wr32(o->body + 0x14u, o->body + 0x10u);
         wl_xb_wr32(o->body + KMUTANT_OWNER, owned && self != NULL ? self->kthread : 0u);
+        if (owned) {
+            xk_mutant_owned_by(self, o->body);
+        }
     }
     RET(s);
 }

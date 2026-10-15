@@ -28,6 +28,7 @@ static bool g_ready;
 static uint8_t *g_kind;   // [ram pages] K_*
 static uint32_t *g_run;   // [ram pages] pages of the allocation starting here (0: none)
 static uint16_t *g_owner; // [ram pages] the user page a K_USER page backs
+static uint16_t *g_locks; // [ram pages] the page's lock count (MmLockUnlock*): a locked page never moves
 static uint16_t *g_va_prot; // [user pages] protection (low 15 bits) | VA_RESERVED
 static Region *g_regions;   // reservations, sorted by base
 static uint32_t g_region_count;
@@ -81,7 +82,7 @@ static void census_tables(void *user, WlMemCensusReport *out) {
     (void)user;
     size_t tables, frames;
     wl_xb_backend_host_bytes(&tables, &frames);
-    out->bytes = (size_t)g_xb_ram_pages * (sizeof *g_kind + sizeof *g_run + sizeof *g_owner) +
+    out->bytes = (size_t)g_xb_ram_pages * (sizeof *g_kind + sizeof *g_run + sizeof *g_owner + sizeof *g_locks) +
                  (size_t)USER_PAGES * (sizeof *g_va_prot + sizeof *g_xb_va2phys) + MAX_REGIONS * sizeof *g_regions +
                  wl_xb_pg_host_bytes() + tables;
 }
@@ -105,11 +106,12 @@ WlResult wl_xb_mem_init(const WlXbMemConfig *cfg) {
     g_kind = calloc(pages, 1);
     g_run = calloc(pages, sizeof *g_run);
     g_owner = calloc(pages, sizeof *g_owner);
+    g_locks = calloc(pages, sizeof *g_locks);
     g_va_prot = calloc(USER_PAGES, sizeof *g_va_prot);
     g_xb_va2phys = calloc(USER_PAGES, sizeof *g_xb_va2phys);
     g_regions = calloc(MAX_REGIONS, sizeof *g_regions);
-    if (g_kind == NULL || g_run == NULL || g_owner == NULL || g_va_prot == NULL || g_xb_va2phys == NULL ||
-        g_regions == NULL) {
+    if (g_kind == NULL || g_run == NULL || g_owner == NULL || g_locks == NULL || g_va_prot == NULL ||
+        g_xb_va2phys == NULL || g_regions == NULL) {
         return WL_ERR_NOMEM;
     }
     g_xb_ram_pages = pages;
@@ -157,17 +159,19 @@ static bool alloc_page_top(uint8_t kind, uint32_t *out) {
 static void free_pages(uint32_t first, uint32_t pages) {
     wl_xb_backend_release_phys(first, pages);
     mark(first, pages, K_FREE);
+    memset(g_locks + first, 0, pages * sizeof *g_locks); // a freed page's locks go with it
     g_used -= pages;
     if (first + pages > g_top_hint) {
         g_top_hint = first + pages;
     }
 }
 
-// The run [first, first + pages) can be had: every page free, or (when `move` is set) a user page.
+// The run [first, first + pages) can be had: every page free, or (when `move` is set) a user page
+// nobody has locked (a title's DMA, or its own physical address bookkeeping, counts on it staying).
 static bool run_ok(uint32_t first, uint32_t pages, bool move) {
     for (uint32_t p = first; p < first + pages; p++) {
         uint8_t k = g_kind[p];
-        if (k != K_FREE && !(move && k == K_USER)) {
+        if (k != K_FREE && !(move && k == K_USER && g_locks[p] == 0)) {
             return false;
         }
     }
@@ -180,6 +184,27 @@ static uint32_t count_kind(uint32_t first, uint32_t pages, uint8_t kind) {
         n += g_kind[p] == kind;
     }
     return n;
+}
+
+WlResult wl_xb_phys_lock(uint32_t phys, bool lock) {
+    uint32_t p = phys >> WL_XB_PAGE_SHIFT;
+    if (!g_ready || p >= g_xb_ram_pages) {
+        return WL_ERR_RANGE;
+    }
+    if (lock) {
+        if (g_locks[p] == 0xFFFFu) {
+            return WL_ERR_LIMIT; // (the count stays: the page stays locked)
+        }
+        g_locks[p]++;
+    } else if (g_locks[p] != 0) {
+        g_locks[p]--;
+    }
+    return WL_OK;
+}
+
+uint32_t wl_xb_phys_lock_count(uint32_t phys) {
+    uint32_t p = phys >> WL_XB_PAGE_SHIFT;
+    return g_ready && p < g_xb_ram_pages ? g_locks[p] : 0u;
 }
 
 WlResult wl_xb_phys_alloc(uint32_t bytes, uint32_t lowest, uint32_t highest, uint32_t align, uint32_t *out) {
@@ -742,6 +767,29 @@ bool wl_xb_mem_resident(uint32_t va) {
         return false;
     }
     return g_xb_pg_frames == 0 || g_xb_pg_frame[p1 - 1u] != 0; // without paging the OS backs every page
+}
+
+bool wl_xb_mem_peek(uint32_t va, void *dst, uint32_t bytes) {
+    uint32_t p1 = g_ready ? phys_page_of(va) : 0u;
+    uint32_t off = va & (WL_XB_PAGE - 1u);
+    if (p1 == 0 || bytes == 0 || bytes > WL_XB_PAGE - off) {
+        return false;
+    }
+    if (g_xb_pg_frames == 0) {
+        memcpy(dst, wl_xb_ptr(va), bytes); // without paging the OS backs every page
+        return true;
+    }
+    // the frame as the tables say under the MMU lock: none, or in swap I/O (unmapped), is no read
+    uint32_t p = p1 - 1u;
+    bool ok = false;
+    uint32_t level = wl_xb_mmu_lock();
+    uint32_t f = g_xb_pg_frame[p];
+    if (f != 0 && (g_xb_pg_flags[p] & WL_XB_PG_IO) == 0) {
+        memcpy(dst, wl_xb_mmu_frame_ptr(p, f) + off, bytes);
+        ok = true;
+    }
+    wl_xb_mmu_unlock(level);
+    return ok;
 }
 
 // ---- Write watch -------------------------------------------------------------------------------

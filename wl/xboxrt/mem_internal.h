@@ -58,14 +58,28 @@ extern uint16_t *g_xb_pg_frame; // [ram pages] 1..frames, 0: none
 extern uint16_t *g_xb_pg_slot;  // [ram pages] swap slot + 1, 0: none
 extern uint32_t g_xb_pg_frames; // frames in the pool; 0: paging is off (the OS backs every page)
 // The write watch: each page's write epoch, the epoch a store to it (a C bit harvested, the host's
-// write fault) or a change of its contents (freed, moved) was last seen at; the epoch counts up
-// from 1 with each such sighting. A watch's stamp is the epoch when it was armed.
+// write fault: watched pages only) or a change of its contents (freed, moved) was last seen at; the
+// epoch counts up with each such sighting (0 skipped: no stamp). A watch's stamp is the epoch when
+// it was armed. The count wraps, so epochs compare by their difference: a watch older than
+// WL_XB_PG_EPOCH_WINDOW sightings is taken as written, and arming one brings older page epochs
+// up to the present.
 extern uint32_t *g_xb_pg_wgen;  // [ram pages]
 extern uint32_t g_xb_pg_epoch;
+#define WL_XB_PG_EPOCH_WINDOW 0x40000000u
 
 // Page `p` was seen written (exception-safe; the MMU lock or exception context).
 static inline void wl_xb_pg_wrote(uint32_t p) {
-    g_xb_pg_wgen[p] = ++g_xb_pg_epoch;
+    if (++g_xb_pg_epoch == 0) {
+        g_xb_pg_epoch = 1;
+    }
+    g_xb_pg_wgen[p] = g_xb_pg_epoch;
+}
+
+// A store to page `p` was seen: only a watched page's matters (fewer sightings, a slower wrap).
+static inline void wl_xb_pg_stored(uint32_t p) {
+    if ((g_xb_pg_flags[p] & WL_XB_PG_WATCH) != 0) {
+        wl_xb_pg_wrote(p);
+    }
 }
 
 // The paging core's tables on the heap, in bytes (0 while it is off).

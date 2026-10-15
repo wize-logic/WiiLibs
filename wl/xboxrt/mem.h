@@ -213,6 +213,11 @@ WlResult wl_xb_phys_alloc(uint32_t bytes, uint32_t lowest, uint32_t highest, uin
 // Frees an allocation by its first physical address (the size is remembered). WL_ERR_ARG when
 // `phys` does not start one.
 WlResult wl_xb_phys_free(uint32_t phys);
+// Locks (or unlocks) the physical page at `phys` (MmLockUnlockBufferPages, MmLockUnlockPhysicalPage):
+// a page with locks is never moved to make room for a contiguous allocation. Counted, up to 65535
+// (DirectSound locks its buffers' pages often); a freed page loses its locks.
+WlResult wl_xb_phys_lock(uint32_t phys, bool lock);
+uint32_t wl_xb_phys_lock_count(uint32_t phys);
 // The size of the allocation starting at `phys`, 0 when none does.
 uint32_t wl_xb_phys_size(uint32_t phys);
 // Physical pages in use (all kinds) and free.
@@ -270,6 +275,10 @@ WlResult wl_xb_mem_pin(uint32_t va, uint32_t bytes);
 void wl_xb_mem_unpin(uint32_t va, uint32_t bytes);
 // Whether the page of `va` has a frame now (diagnostics and tests; false for anything else).
 bool wl_xb_mem_resident(uint32_t va);
+// Copies `bytes` guest bytes at `va` (within one page) when its page is resident and not in swap
+// I/O, without faulting: false otherwise. Diagnostics may call it without the guest lock (the
+// freeze watch on the service thread); the bytes are the guest's (little-endian).
+bool wl_xb_mem_peek(uint32_t va, void *dst, uint32_t bytes);
 
 // ---- Write watch ---------------------------------------------------------------------------------
 // Whether guest memory was written since a moment, from the MMU's changed bits rather than its
