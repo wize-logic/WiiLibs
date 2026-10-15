@@ -505,8 +505,20 @@ static void *prof_worker(void *arg) {
 }
 
 static bool prof_in(uint32_t address, const void *function) {
+    // (within 0x80 bytes of its start, and no other of these functions starts in between: the linker may place them
+    // closer than that)
+    const void *const others[] = {(const void *)prof_busy, (const void *)prof_busy_worker, (const void *)prof_outer};
     uint32_t start = (uint32_t)(uintptr_t)function;
-    return address >= start && address < start + 0x80u;
+    if (address < start || address >= start + 0x80u) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
+        uint32_t other = (uint32_t)(uintptr_t)others[i];
+        if (other > start && other <= address) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void check_profile(void) {
