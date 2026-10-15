@@ -119,6 +119,16 @@ function. The table's name is the tool's
 third argument (`xbox_vsh_natives` by default). `--accessor name` also writes a function that gives
 the table and its count; `--if-exists` takes a missing file as no programs (an empty table).
 
+On the Wii (`WL_XBOX_VSH_PS`, vsh_native.h; `WL_XBOX_VSH_NO_PS` turns it off) the functions use the
+Gekko's paired singles where that takes fewer instructions: the dot products, a run of them that
+share an operand (a vertex by a matrix's rows: that operand's pairs made once), and the multiplies
+and adds that read a constant or input row whole or broadcast a component. Each is one asm statement
+whose pairs never leave it (floats in and out), beside the plain C every other machine compiles. The
+fused multiply-adds and the pairs' order of adding change the last bits, so the Wii's functions match
+the interpreter within a tolerance (`tests/xbox/suite_vsh_ps.c`, in the console runner; on the host
+the same code emulated in C by `tests/xbox/vsh_ps_emulate.py`), and the host's and ppc-be's, the
+plain C, to the bit. Halo's three busiest programs run 8 to 18% fewer instructions a vertex.
+
 ```sh
 xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] microcode.inc programs.c [table]
 ```
@@ -136,7 +146,8 @@ code: they stay in the title's folders, never in WiiLibs.
 evaluated directly (none differs; a digest of every program, the same on ppc-be), recipes, fog,
 bumped lookups; the cache against fresh translations, byte for byte; synthetic vertex programs
 (`vsh_programs.py` assembles `vsh_programs.inc`) interpreted exactly, analysed, and compiled by
-the tool at build time (under qemu on ppc-be) against the interpreter, bit for bit; the batch
+the tool at build time (under qemu on ppc-be) against the interpreter, bit for bit, and their
+paired-single code (emulated; on the console, run) within a tolerance; the batch
 interpreter against the plain one on random programs and live sets.
 
 The OpenCE-Wii port (Halo) checks the translation further with the game's own programs.

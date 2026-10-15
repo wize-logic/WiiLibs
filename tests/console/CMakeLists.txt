@@ -14,6 +14,31 @@ add_executable(wl_console_tests
     ${PROJECT_SOURCE_DIR}/tests/xbox/suite_nv2a.c)
 wl_target_defaults(wl_console_tests)
 target_link_libraries(wl_console_tests PRIVATE wl_audio wl_platform wl_gfx wl_xbox_gx)
+# the synthetic vertex programs compiled ahead of time with their paired-single code against the
+# interpreter (tests/xbox/suite_vsh_ps.c): tools/xbox_vsh_codegen.c built for the build machine, as
+# wl_add_xbox_title builds it
+if(NOT WL_HOST_C_COMPILER)
+    find_program(WL_HOST_C_COMPILER NAMES cc gcc clang)
+endif()
+if(WL_HOST_C_COMPILER)
+    set(vsh_tool ${CMAKE_CURRENT_BINARY_DIR}/xbox_vsh_codegen${CMAKE_HOST_EXECUTABLE_SUFFIX})
+    set(vsh_ps_generated ${CMAKE_CURRENT_BINARY_DIR}/vsh_ps_programs.c)
+    add_custom_command(OUTPUT ${vsh_tool}
+        COMMAND ${WL_HOST_C_COMPILER} -O1 -std=c11 -ffp-contract=off -I${PROJECT_SOURCE_DIR}
+            ${PROJECT_SOURCE_DIR}/tools/xbox_vsh_codegen.c ${PROJECT_SOURCE_DIR}/wl/gfx/gfx_sqrt.c -lm -o ${vsh_tool}
+        DEPENDS ${PROJECT_SOURCE_DIR}/tools/xbox_vsh_codegen.c ${PROJECT_SOURCE_DIR}/wl/xbox/vsh.c
+            ${PROJECT_SOURCE_DIR}/wl/xbox/vsh.h ${PROJECT_SOURCE_DIR}/wl/gfx/gfx_sqrt.c
+        VERBATIM)
+    add_custom_command(OUTPUT ${vsh_ps_generated}
+        COMMAND ${vsh_tool} ${PROJECT_SOURCE_DIR}/tests/xbox/vsh_programs.inc ${vsh_ps_generated} test_vsh_ps_natives
+        DEPENDS ${vsh_tool} ${PROJECT_SOURCE_DIR}/tests/xbox/vsh_programs.inc
+        VERBATIM)
+    # (as a title's: -O2, no contraction)
+    set_source_files_properties(${vsh_ps_generated} PROPERTIES COMPILE_OPTIONS "-O2;-ffp-contract=off;-w")
+    target_sources(wl_console_tests PRIVATE ${PROJECT_SOURCE_DIR}/tests/xbox/suite_vsh_ps.c ${vsh_ps_generated})
+    target_include_directories(wl_console_tests PRIVATE ${PROJECT_SOURCE_DIR}/tests/xbox)
+    target_compile_definitions(wl_console_tests PRIVATE WLT_VSH_PS=1)
+endif()
 # every way out of the runner is logged with where it came from (wii/trace_wii.c)
 wl_platform_trace_exits(wl_console_tests)
 wl_platform_heap_overflow(wl_console_tests)
