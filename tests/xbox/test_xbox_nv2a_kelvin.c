@@ -7,11 +7,13 @@
 // c[58]/c[59]; the state groups dirty on a change of value; the combiners as psh's 57 words, and
 // every method the pixel program reads dirtying it; the surface decoded. A draw's fetch plan
 // against the fetch of each vertex alone, on random formats, data and attribute sets, bit for bit.
+// Random method runs through the push buffer against each method given alone: the same 3D state.
 #include <math.h>
 #include <string.h>
 
 #include "greatest.h"
 #include "nv2a_test_util.h"
+#include "wl/xbox/nv2a_internal.h"
 #include "wl/xbox/nv2a_pipeline.h"
 
 // ---- a backend that keeps each draw's vertices -----------------------------------------------
@@ -676,6 +678,64 @@ TEST fetch_plan_matches_the_fetch_of_each_vertex(void) {
     PASS();
 }
 
+// ---- the push buffer's runs against a method at a time -----------------------------------------------
+
+// random headers (increasing and not) over plain methods, the program and constant windows, their
+// load slots, the viewport and the program's start and mode, kicked at random words (runs cut at
+// PUT): the pusher's runs leave the 3D state as wl_nv2a_kelvin_method given each word alone does
+TEST pushed_runs_match_a_method_at_a_time(void) {
+    static const struct {
+        uint16_t base, words;
+    } ranges[] = {
+        {0x0260, 12}, {0x02A0, 16}, {0x0300, 48},        {0x0440, 64}, {WL_NV2A_K_SET_VIEWPORT_OFFSET, 4},
+        {0x0A60, 32}, {WL_NV2A_K_SET_VIEWPORT_SCALE, 4}, {0x0B00, 32}, {0x0B80, 32},
+        {0x1720, 32}, {0x1B00, 64}, {0x1E40, 16},        {WL_NV2A_K_SET_TRANSFORM_EXECUTION_MODE, 1},
+        {WL_NV2A_K_SET_TRANSFORM_PROGRAM_LOAD, 1},       {WL_NV2A_K_SET_TRANSFORM_PROGRAM_START, 1},
+        {WL_NV2A_K_SET_TRANSFORM_CONSTANT_LOAD, 1},
+    };
+    static const uint32_t some[] = {0, 1, 0x3F800000u, 0xFFFFFFFFu};
+    TGuest a, b;
+    unsigned header, n;
+
+    ASSERT(t_create(&a, NULL) != NULL);
+    ASSERT(t_create(&b, NULL) != NULL);
+    t_setup_3d(&a);
+    t_setup_3d(&b);
+    for (header = 0; header < 4000; header++) {
+        unsigned r = rnd() % (sizeof ranges / sizeof ranges[0]);
+        uint32_t offset = rnd() % ranges[r].words, method = ranges[r].base + 4u * offset;
+        uint32_t count = 1u + rnd() % 24u, non_increasing = rnd() % 4u == 0;
+
+        if (!non_increasing && count > ranges[r].words - offset) {
+            count = ranges[r].words - offset;
+        }
+        t_word(&a, (non_increasing ? 0x40000000u : 0u) | (count << 18) | method);
+        for (n = 0; n < count; n++) {
+            uint32_t m = non_increasing ? method : method + 4u * n, param;
+
+            if (m == WL_NV2A_K_SET_TRANSFORM_PROGRAM_LOAD || m == WL_NV2A_K_SET_TRANSFORM_CONSTANT_LOAD) {
+                param = rnd() % 200u;
+            } else {
+                param = rnd() % 3u == 0 ? some[rnd() % 4u] : rnd();
+            }
+            t_word(&a, param);
+            wl_nv2a_kelvin_method(b.dev, m, param);
+            if (rnd() % 16u == 0) {
+                t_kick(&a);
+            }
+        }
+        if (rnd() % 4u == 0) {
+            t_kick(&a);
+        }
+    }
+    t_kick(&a);
+    ASSERT_EQ(a.put, t_get(&a));
+    ASSERT_MEM_EQm("the 3D state", wl_nv2a_kelvin(b.dev), wl_nv2a_kelvin(a.dev), sizeof(WlNv2aKelvin));
+    t_destroy(&a);
+    t_destroy(&b);
+    PASS();
+}
+
 SUITE(kelvin_suite) {
     RUN_TEST(every_array_format_decodes);
     RUN_TEST(draw_arrays_and_elements);
@@ -689,6 +749,7 @@ SUITE(kelvin_suite) {
     RUN_TEST(every_input_of_the_pixel_program_dirties_it);
     RUN_TEST(surface_decoded);
     RUN_TEST(fetch_plan_matches_the_fetch_of_each_vertex);
+    RUN_TEST(pushed_runs_match_a_method_at_a_time);
 }
 
 GREATEST_MAIN_DEFS();

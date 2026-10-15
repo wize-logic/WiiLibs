@@ -835,6 +835,8 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
     printf("bench: %u runs of %u frames (%u draws, %u vertices): best %.3f ms a frame, mean %.3f ms a frame\n",
            runs, frames, (unsigned)info.stats.draws, (unsigned)info.stats.vertices, best * 1000.0 / frames,
            total * 1000.0 / runs / frames);
+    printf("bench: a run's model: %u kicks, %u words, %u methods\n", (unsigned)info.stats.kicks,
+           (unsigned)info.stats.words, (unsigned)info.stats.methods);
     {
         WlNv2aGxStats gs;
 
