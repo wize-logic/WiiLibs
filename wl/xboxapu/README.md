@@ -78,7 +78,8 @@ The primary codec's registers (ready: the powerdown register's low bits stay set
 control and status (the primary codec ready bit; `cfg.codec_ready`), the codec access semaphore
 (always free), and the bus masters: PCM out (0x110) and S/PDIF out (0x170) run through their
 buffer descriptor lists at 48 kHz stereo (`wl_xbox_ac97_advance`), setting buffer-complete and
-last-valid-buffer status, stopping at the last valid buffer until a new one is given, and raising
+last-valid-buffer status, stopping at the last valid buffer until a new one is given (an LVI write
+that names the current buffer again leaves it halted), and raising
 the interrupt line their control bits enable. What the descriptors point at is not read: the APU's
 mix is the sound.
 
@@ -103,6 +104,6 @@ guest memory: 16-bit PCM through scattered pages reaching its bins exactly, volu
 `wl_xbox_adpcm_decode_block` (64 samples a block, blocks across pages), a stream's two segment
 lists, its starvation and refill, the amplitude envelope's stages, a multipass voice, the GP's
 command word and the fence, a 3D voice's submix bins, and the AC'97 bus master's descriptors,
-status and interrupt. `bench_xboxapu_checksum` (host and ppc-be): the benchmark's scene for 3000
+status and interrupt, and its halt at the last valid buffer. `bench_xboxapu_checksum` (host and ppc-be): the benchmark's scene for 3000
 frames, its checksum of every frame's bins and output against the one the voice processor made
 before it was reworked for speed.

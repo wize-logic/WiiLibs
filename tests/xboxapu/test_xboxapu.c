@@ -578,6 +578,11 @@ TEST the_ac97_bus_master_runs_its_descriptors(void) {
     wl_xbox_ac97_advance(ac, 64);                              // the last valid buffer: halt
     ASSERT_EQ(0x0Fu, wl_xbox_ac97_read(ac, 0x116, 2) & 0x0Fu); // halted, last, last done, done
     wl_xbox_ac97_write(ac, 0x116, 0x1C, 2);
+    wl_xbox_ac97_write(ac, 0x115, 1, 1); // the same last buffer again: it stays halted on it
+    ASSERT_EQ(1u, wl_xbox_ac97_read(ac, 0x114, 1));
+    ASSERT_EQ(0x01u, wl_xbox_ac97_read(ac, 0x116, 2) & 0x01u);
+    wl_xbox_ac97_advance(ac, 64);
+    ASSERT_EQ(1u, wl_xbox_ac97_read(ac, 0x114, 1)); // nothing played
     wl_xbox_ac97_write(ac, 0x115, 3, 1); // more buffers: it goes on with 2
     ASSERT_EQ(2u, wl_xbox_ac97_read(ac, 0x114, 1));
     ASSERT_EQ(0u, wl_xbox_ac97_read(ac, 0x116, 2) & 0x01u);
