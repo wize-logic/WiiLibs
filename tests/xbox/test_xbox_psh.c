@@ -766,7 +766,7 @@ TEST random_programs_agree_with_the_combiners(void) {
     ASSERT(o.d0_exact > o.exact * 9 / 10);
     ASSERT(o.approximate + o.untranslated > 0);
     // the same programs, field for field, on every target
-    ASSERT_EQ_FMT(0x4872F15Bu, g_digest, "%08x");
+    ASSERT_EQ_FMT(0x5DDC72FAu, g_digest, "%08x");
     PASS();
 }
 
@@ -828,6 +828,44 @@ TEST a_register_luminance_is_its_colour(void) {
     V4 got = simulate(&program, &in, maps);
     for (int ch = 0; ch < 3; ch++) {
         ASSERT_IN_RANGE(in.t[0].c[ch] * 0.8f, got.c[ch], 0.02f);
+    }
+    PASS();
+}
+
+// six constants, two of them near black and near white (Halo's characters' 00010101 and 00FDFDFD):
+// with the konst registers taken, those are read as 0 and 1, not as another constant (a near-black
+// factor read as a near-white one drew the Flood flat white)
+TEST constants_near_0_and_1_stand_for_themselves(void) {
+    uint32_t state[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures;
+    static WlXboxPshProgram program;
+    memset(state, 0, sizeof state);
+    // six stages of r0 = r0 * c0 + t(st % 2) * c1, each with constants of its own (twelve, ten of
+    // them distinct greys and colours), the last stage's near black and near white
+    state[WL_XBOX_PSH_COMBINER_COUNT] = 6u | 0x100u | 0x1000u | 0x10000u;
+    for (unsigned st = 0; st < 6; st++) {
+        state[WL_XBOX_PSH_CONSTANT0_0 + st] = 0x00402010u + st * 0x00081018u;
+        state[WL_XBOX_PSH_CONSTANT1_0 + st] = 0x00203040u + st * 0x00100804u;
+        state[WL_XBOX_PSH_RGB_INPUTS0 + st] = 0x0C010002u | ((st % 2 ? 0x09u : 0x08u) << 8);
+        state[WL_XBOX_PSH_RGB_OUTPUTS0 + st] = 0x0C00u;
+    }
+    state[WL_XBOX_PSH_CONSTANT0_0 + 5] = 0x00010101u;
+    state[WL_XBOX_PSH_CONSTANT1_0 + 5] = 0x00FDFDFDu;
+    g_fog_on = 0;
+    g_d0_alpha_map = 0;
+    textures_make(&textures, 3u);
+    ASSERT(wl_xbox_psh_translate(state, &textures, NULL, &program));
+    Inputs in;
+    V4 maps[8];
+    memset(&in, 0, sizeof in);
+    memset(maps, 0, sizeof maps);
+    in.t[0] = (V4){{0.9f, 0.6f, 0.3f, 1.0f}};
+    in.t[1] = (V4){{0.2f, 0.4f, 0.8f, 1.0f}};
+    maps[0] = in.t[0];
+    maps[1] = in.t[1];
+    V4 want = reference(state, &in, 3u), got = simulate(&program, &in, maps);
+    for (int ch = 0; ch < 3; ch++) {
+        ASSERT_IN_RANGE(want.c[ch], got.c[ch], 0.03f);
     }
     PASS();
 }
@@ -1167,6 +1205,7 @@ SUITE(psh_suite) {
     RUN_TEST(a_dot_product_to_the_alpha);
     RUN_TEST(the_mux_is_a_step);
     RUN_TEST(a_register_luminance_is_its_colour);
+    RUN_TEST(constants_near_0_and_1_stand_for_themselves);
     RUN_TEST(negated_mappings_take_no_register_of_their_own);
     RUN_TEST(an_expand_negate_is_one_stage);
     RUN_TEST(a_final_product_with_every_register_held);

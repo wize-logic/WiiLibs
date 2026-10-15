@@ -267,13 +267,55 @@ static uint32_t rgba(uint32_t color) {
 }
 
 static unsigned char konst_slot(struct translation *translation, uint32_t color) {
+    const WlTevProgram *tev = &translation->program->tev;
     int slot = wl_tev_konst_slot(&translation->program->tev, rgba(color));
+    unsigned best = 3, best_distance = ~0u, index;
 
     if (slot >= 0)
         return (unsigned char)slot;
-    /* (more than four constants: the last stands in) */
+    /* (more than four constants: the nearest stands in, channel by channel) */
     approximate(translation->program, "more than four constants");
-    return 3;
+    for (index = 0; index < WL_TEV_KONST_SLOTS; index++) {
+        unsigned distance = 0;
+        int shift;
+
+        for (shift = 0; shift < 32; shift += 8) {
+            int d = (int)((tev->konst[index] >> shift) & 0xFF) - (int)((rgba(color) >> shift) & 0xFF);
+
+            distance += (unsigned)(d < 0 ? -d : d);
+        }
+        if ((tev->konst_mask & (1u << index)) && distance < best_distance) {
+            best = index;
+            best_distance = distance;
+        }
+    }
+    return (unsigned char)best;
+}
+
+/* whether a constant has a konst register: its own already, or a free one */
+static bool konst_available(const struct translation *translation, uint32_t color) {
+    const WlTevProgram *tev = &translation->program->tev;
+    unsigned index;
+
+    for (index = 0; index < WL_TEV_KONST_SLOTS; index++) {
+        if (!(tev->konst_mask & (1u << index)) || tev->konst[index] == rgba(color))
+            return true;
+    }
+    return false;
+}
+
+/* a constant with its channels within 3/255 of 0 or 1 made 0 or 1 (where the
+konst registers are all taken: a title's near-black and near-white) */
+static uint32_t constant_snapped(uint32_t color) {
+    uint32_t out = 0;
+    int shift;
+
+    for (shift = 0; shift < 32; shift += 8) {
+        uint32_t v = (color >> shift) & 0xFF;
+
+        out |= (v <= 3 ? 0u : v >= 252 ? 255u : v) << shift;
+    }
+    return out;
 }
 
 /* a texture stage's texel, read in the portion */
@@ -577,6 +619,15 @@ static struct operand register_operand(struct translation *translation, unsigned
                 return operand(_kind_register, (unsigned char)preloaded,
                                portion == _portion_color && alpha_channel ? _channel_alpha
                                                                           : _channel_natural);
+            }
+        }
+        {
+            struct operand trivial;
+
+            if (!konst_available(translation, color) &&
+                constant_trivial(constant_snapped(color), portion, alpha_channel, &trivial)) {
+                approximate(translation->program, "a constant near 0 or 1, as it");
+                return trivial;
             }
         }
         result = operand(_kind_konst, konst_slot(translation, color), _channel_natural);
