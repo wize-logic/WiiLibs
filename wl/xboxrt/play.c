@@ -34,7 +34,7 @@
 #define PRESS_FRAMES 2
 #define SELECT_MAX 16
 #define VBLANK_HZ 59.94
-#define MAX_REG 32
+#define MAX_REG 96 // a title's texts, numbers, predicates, actions and steps (Halo's plugin has 32)
 #define PLAY_PRIORITY 31
 #define TICK_JUMP 60 // a tick moving on more than this in a frame was a checkpoint loaded, not play
 #define STILL_FACTOR 4.0 // a bot step whose game time stands still ends after this many times its length
@@ -211,6 +211,8 @@ static WlResult reg_add(RegKind kind, const char *name, void *fn, void *user, co
     Reg *r = (Reg *)reg_find(kind, name);
     if (r == NULL) {
         if (g_reg_count == MAX_REG) {
+            // said aloud: a title's step or action that is quietly missing reads later as "not an action"
+            wl_xb_play_log("cannot register \"%s\": all %d places are taken (MAX_REG)", name, MAX_REG);
             return WL_ERR_LIMIT;
         }
         r = &g_reg[g_reg_count++];

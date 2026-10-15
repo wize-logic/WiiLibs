@@ -305,10 +305,21 @@ TEST script_runs(void) {
     PASS();
 }
 
+// a title with many hooks (Halo's plugin registers 32): every one of them is kept
+TEST many_registrations_are_kept(void) {
+    char name[32];
+    for (int i = 0; i < 40; i++) {
+        snprintf(name, sizeof name, "many_%d", i);
+        ASSERT_EQ(WL_OK, wl_xb_play_register_action(name, t_load, NULL));
+    }
+    PASS();
+}
+
 SUITE(play) {
     RUN_TEST(parse_errors);
     RUN_TEST(bot_is_deterministic);
     RUN_TEST(script_runs);
+    RUN_TEST(many_registrations_are_kept);
 }
 
 GREATEST_MAIN_DEFS();
