@@ -105,6 +105,7 @@ enum {
 // ---- PTIMER [pbkit] [envy-pmc] ----------------------------------------------------------------
 enum {
     WL_NV2A_PTIMER_INTR_0 = 0x009100,
+    WL_NV2A_PTIMER_INTR_ALARM = 1u << 0, // the time passed ALARM_0
     WL_NV2A_PTIMER_INTR_EN_0 = 0x009140,
     WL_NV2A_PTIMER_NUMERATOR = 0x009200,
     WL_NV2A_PTIMER_DENOMINATOR = 0x009210,

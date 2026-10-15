@@ -25,6 +25,8 @@ enum {
     WL_NV2A_RAMIN_PAGE = 65536
 };
 
+enum { WL_NV2A_SUSPEND_TRAP = 1u, WL_NV2A_SUSPEND_NOTIFY = 2u, WL_NV2A_SUSPEND_ACQUIRE = 4u };
+
 typedef struct WlNv2aChannel {
     uint32_t put, get, ref;
     uint32_t subroutine_return;
@@ -32,7 +34,9 @@ typedef struct WlNv2aChannel {
     // the method header in progress: its method, subchannel, words left, non-increasing
     uint32_t method, count;
     uint8_t subchannel, non_increasing;
-    // stopped after a trapped method until the title's ISR acknowledges it
+    // stopped (WL_NV2A_SUSPEND_* bits): after a trapped method or a NOTIFY that wakes the title, until
+    // its ISR acknowledges the interrupt; at a semaphore acquire not met, tried again at the next
+    // doorbell and vertical blank
     uint8_t suspended;
     uint32_t subchannel_class[WL_NV2A_SUBCHANNELS];
     uint32_t subchannel_instance[WL_NV2A_SUBCHANNELS];
@@ -73,6 +77,9 @@ struct WlNv2a {
     int current_channel;
     // a kick is running (a resumed one does not start another inside it)
     bool executing;
+    // the puller met an acquire whose value is not there (the pusher stops before it); acquires
+    // tried again (not counted again)
+    bool acquire_stall, acquire_retry;
 
     WlNv2aKelvin kelvin;
     // the begin/end batch (nv2a_kelvin.c)
@@ -109,10 +116,14 @@ uint64_t wl_nv2a_time(WlNv2a *dev);
 void wl_nv2a_kelvin_init(WlNv2a *dev);
 // `count` words of one method header's run (increasing: method, method + 4, ...; else every word to
 // `method`), little-endian at `words`: what as many wl_nv2a_kelvin_method calls make of them
-void wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const uint8_t *words, uint32_t count);
+// (the words taken: fewer than `count` when a method stopped the channel, the rest left for later)
+uint32_t wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const uint8_t *words, uint32_t count);
 void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param);
-// a trap the title's ISR must see (NO_OPERATION with a parameter): true when the pusher stops
+// a trap the title's ISR must see (NO_OPERATION with a parameter; `method` with its subchannel in
+// bits 18:16, as TRAPPED_ADDR has it): true when the pusher stops
 bool wl_nv2a_trap(WlNv2a *dev, uint32_t method, uint32_t param);
+// the channel running stops after this method (WL_NV2A_SUSPEND_* `why`); nothing outside a kick
+void wl_nv2a_suspend_current(WlNv2a *dev, unsigned why);
 // the PGRAPH interrupt bits raised by a method
 void wl_nv2a_raise_pgraph(WlNv2a *dev, uint32_t bits);
 

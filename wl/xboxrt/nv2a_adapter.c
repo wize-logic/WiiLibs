@@ -19,6 +19,7 @@
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/mem.h"
+#include "wl/xboxrt/thread.h"
 
 #include "wl/xbox/nv2a.h"
 #include "wl/xbox/nv2a_capture.h"
@@ -200,6 +201,12 @@ static bool tex_written(void *user, uint32_t phys, uint32_t bytes, uint32_t stam
     return wl_xb_phys_written(phys, bytes, stamp);
 }
 
+// PTIMER's time: the guest's clock (the virtual one in the deterministic mode)
+static uint64_t gpu_time_ns(void *user) {
+    (void)user;
+    return wl_xb_time_ns();
+}
+
 static uint32_t a_read(void *gpu, uint32_t offset, unsigned size) {
     return wl_nv2a_mmio_read(gpu, offset, size);
 }
@@ -217,6 +224,13 @@ static void gpu_status(void) {
     wl_nv2a_gx_stats(g_gx, &gs);
     WlNv2aTexCacheStats ts;
     wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
+    if (g_gpu != NULL) {
+        WlNv2aStats ds;
+        wl_nv2a_stats(g_gpu, &ds);
+        WL_LOG_I(TAG, "status: %u semaphore acquires not met at once (the channel waited), %u pusher errors, %u "
+                 "notifies, %u kicks", (unsigned)ds.acquires_unmet, (unsigned)ds.pusher_errors, (unsigned)ds.notifies,
+                 (unsigned)ds.kicks);
+    }
     WL_LOG_I(TAG, "status: %u frames, %u draws (%u perspective, %u into targets, %u target-less, %u stencil "
              "only (skipped), %u stencil ignored, %u programs beyond GX, %u approximated)", (unsigned)gs.frames, (unsigned)gs.draws,
              (unsigned)gs.perspective_draws, (unsigned)gs.target_draws, (unsigned)gs.target_skipped,
@@ -395,6 +409,7 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
     memset(&cfg, 0, sizeof cfg);
     cfg.phys_ptr = phys_ptr;
     cfg.user = NULL;
+    cfg.time_ns = gpu_time_ns;
     cfg.backend = g_gx != NULL ? &backend : NULL;
     g_gpu = wl_nv2a_create(&cfg);
     if (g_gpu == NULL) {

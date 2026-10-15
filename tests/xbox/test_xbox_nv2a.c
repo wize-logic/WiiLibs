@@ -433,6 +433,179 @@ TEST a_trapped_method_stops_the_channel_until_acknowledged(void) {
     PASS();
 }
 
+// two NOTIFYs that wake the title, in one kick: two interrupts, the channel stopped after each until
+// the ISR acknowledges it
+TEST each_awakening_notify_stops_the_channel_until_acknowledged(void) {
+    TGuest g;
+    const WlNv2aKelvin *k;
+    WlNv2aStats s;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    k = wl_nv2a_kelvin(g.dev);
+    t_mmio(&g, WL_NV2A_PMC_INTR_EN_0, WL_NV2A_PMC_INTR_EN_HARDWARE);
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR_EN, WL_NV2A_PGRAPH_INTR_NOTIFY);
+    t_m1(&g, WL_NV2A_K_NOTIFY, 1);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 7);
+    t_m1(&g, WL_NV2A_K_NOTIFY, 1);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 9);
+    t_kick(&g);
+    wl_nv2a_stats(g.dev, &s);
+    ASSERT_EQ(1u, s.notifies);
+    ASSERT(wl_nv2a_irq_pending(g.dev));
+    ASSERT(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF) != 7u);
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR, WL_NV2A_PGRAPH_INTR_NOTIFY);
+    // the second NOTIFY: its own interrupt, the method after it not run yet
+    ASSERT_EQ(7u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    ASSERT(wl_nv2a_irq_pending(g.dev));
+    wl_nv2a_stats(g.dev, &s);
+    ASSERT_EQ(2u, s.notifies);
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR, WL_NV2A_PGRAPH_INTR_NOTIFY);
+    ASSERT_EQ(9u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    ASSERT_EQ(g.put, t_get(&g));
+    // (with the interrupt off a NOTIFY does not stop the channel)
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR_EN, 0);
+    t_m1(&g, WL_NV2A_K_NOTIFY, 1);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 11);
+    t_kick(&g);
+    ASSERT_EQ(11u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    t_destroy(&g);
+    PASS();
+}
+
+// an acquire whose value is not there stops the channel before it; tried again at the next vertical
+// blank and doorbell, it goes on once the value is there
+TEST an_unmet_acquire_waits_for_its_value(void) {
+    TGuest g;
+    const WlNv2aKelvin *k;
+    WlNv2aStats s;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    k = wl_nv2a_kelvin(g.dev);
+    t_w32(&g, 0x8020, 1);
+    t_m1(&g, WL_NV2A_PULLER_DMA_SEMAPHORE, 0xD0000001u);
+    t_m1(&g, WL_NV2A_PULLER_SEMAPHORE_OFFSET, 0x20);
+    t_m1(&g, WL_NV2A_PULLER_SEMAPHORE_ACQUIRE, 5);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 3);
+    t_kick(&g);
+    ASSERT(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF) != 3u);
+    ASSERT(t_get(&g) != g.put);
+    wl_nv2a_vblank(g.dev);
+    ASSERT(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF) != 3u);
+    // the title writes the value: the next vertical blank finds it
+    t_w32(&g, 0x8020, 5);
+    wl_nv2a_vblank(g.dev);
+    ASSERT_EQ(3u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    ASSERT_EQ(g.put, t_get(&g));
+    wl_nv2a_stats(g.dev, &s);
+    ASSERT_EQ(1u, s.acquires_unmet);
+    // again, met at the next doorbell (a kick with more after it)
+    t_m1(&g, WL_NV2A_PULLER_SEMAPHORE_ACQUIRE, 6);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 4);
+    t_kick(&g);
+    ASSERT_EQ(3u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    t_w32(&g, 0x8020, 6);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_FUNC, WL_NV2A_FUNC_GREATER);
+    t_kick(&g);
+    ASSERT_EQ(4u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    ASSERT_EQ((uint32_t)WL_NV2A_FUNC_GREATER, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_FUNC));
+    wl_nv2a_stats(g.dev, &s);
+    ASSERT_EQ(2u, s.acquires_unmet);
+    t_destroy(&g);
+    PASS();
+}
+
+// TRAPPED_ADDR: the method (12:2), the subchannel (18:16), the channel (24:20)
+TEST a_trap_on_another_subchannel_names_it(void) {
+    TGuest g;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    t_mmio(&g, WL_NV2A_PMC_INTR_EN_0, 1);
+    t_mmio(&g, WL_NV2A_PGRAPH_INTR_EN, 0xFFFFFFFFu);
+    // the 3D object bound to subchannel 3 too, then a NO_OPERATION with a parameter there
+    t_word(&g, (1u << 18) | (3u << 13) | 0u);
+    t_word(&g, 0x97000001u);
+    t_word(&g, (1u << 18) | (3u << 13) | WL_NV2A_K_NO_OPERATION);
+    t_word(&g, 0x55);
+    t_kick(&g);
+    ASSERT(wl_nv2a_irq_pending(g.dev));
+    ASSERT_EQ((uint32_t)(3u << 16 | WL_NV2A_K_NO_OPERATION), t_mmio_r(&g, 0x400704));
+    t_destroy(&g);
+    PASS();
+}
+
+// an invalid command stops the channel: DMA_PUSHER raised, GET at PUT, nothing after it run
+TEST a_pusher_error_stops_the_channel(void) {
+    TGuest g;
+    const WlNv2aKelvin *k;
+    WlNv2aStats s;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    k = wl_nv2a_kelvin(g.dev);
+    t_word(&g, WL_NV2A_CMD_RETURN); // (a return outside a call)
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 21);
+    t_kick(&g);
+    ASSERT(t_mmio_r(&g, WL_NV2A_PFIFO_INTR_0) & WL_NV2A_PFIFO_INTR_DMA_PUSHER);
+    ASSERT_EQ(g.put, t_get(&g));
+    ASSERT(wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF) != 21u);
+    wl_nv2a_stats(g.dev, &s);
+    ASSERT_EQ(1u, s.pusher_errors);
+    // (the channel goes on with what is written after)
+    t_mmio(&g, WL_NV2A_PFIFO_INTR_0, WL_NV2A_PFIFO_INTR_DMA_PUSHER);
+    t_m1(&g, WL_NV2A_K_SET_ALPHA_REF, 22);
+    t_kick(&g);
+    ASSERT_EQ(22u, wl_nv2a_k(k, WL_NV2A_K_SET_ALPHA_REF));
+    t_destroy(&g);
+    PASS();
+}
+
+// PTIMER's alarm: raised when the time passes ALARM_0, by its own clock (a vertical blank's time on)
+// or by the configuration's
+static uint64_t g_time_ns;
+
+static uint64_t test_time_ns(void *user) {
+    (void)user;
+    return g_time_ns;
+}
+
+TEST the_ptimer_alarm_rises_when_the_time_passes_it(void) {
+    TGuest g;
+    WlNv2aConfig cfg;
+    WlNv2a *dev;
+    uint32_t now;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_mmio(&g, WL_NV2A_PMC_INTR_EN_0, 1);
+    t_mmio(&g, WL_NV2A_PTIMER_INTR_EN_0, WL_NV2A_PTIMER_INTR_ALARM);
+    now = t_mmio_r(&g, WL_NV2A_PTIMER_TIME_0);
+    t_mmio(&g, WL_NV2A_PTIMER_ALARM_0, now + 20000000u);
+    wl_nv2a_vblank(g.dev);
+    ASSERT_EQ(0u, t_mmio_r(&g, WL_NV2A_PTIMER_INTR_0));
+    wl_nv2a_vblank(g.dev);
+    ASSERT_EQ((uint32_t)WL_NV2A_PTIMER_INTR_ALARM, t_mmio_r(&g, WL_NV2A_PTIMER_INTR_0));
+    ASSERT(t_mmio_r(&g, WL_NV2A_PMC_INTR_0) & WL_NV2A_PMC_INTR_PTIMER);
+    t_mmio(&g, WL_NV2A_PTIMER_INTR_0, WL_NV2A_PTIMER_INTR_ALARM);
+    ASSERT_EQ(0u, t_mmio_r(&g, WL_NV2A_PTIMER_INTR_0));
+    t_destroy(&g);
+    // the configuration's clock
+    memset(&cfg, 0, sizeof cfg);
+    g.ram = calloc(1, T_RAM);
+    cfg.phys_ptr = t_phys;
+    cfg.user = &g;
+    cfg.ram_bytes = T_RAM;
+    cfg.time_ns = test_time_ns;
+    g_time_ns = 1000;
+    dev = wl_nv2a_create(&cfg);
+    ASSERT(dev != NULL);
+    wl_nv2a_mmio_write(dev, WL_NV2A_PTIMER_ALARM_0, 5000, 4);
+    ASSERT_EQ(1000u & ~0x1Fu, wl_nv2a_mmio_read(dev, WL_NV2A_PTIMER_TIME_0, 4));
+    ASSERT_EQ(0u, wl_nv2a_mmio_read(dev, WL_NV2A_PTIMER_INTR_0, 4));
+    g_time_ns = 6000;
+    ASSERT_EQ(6000u & ~0x1Fu, wl_nv2a_mmio_read(dev, WL_NV2A_PTIMER_TIME_0, 4));
+    ASSERT_EQ((uint32_t)WL_NV2A_PTIMER_INTR_ALARM, wl_nv2a_mmio_read(dev, WL_NV2A_PTIMER_INTR_0, 4));
+    wl_nv2a_destroy(dev);
+    free(g.ram);
+    PASS();
+}
+
 // ---- capture and replay ---------------------------------------------------------------------------
 
 typedef struct Sink {
@@ -541,6 +714,11 @@ SUITE(nv2a_suite) {
     RUN_TEST(reports_count_the_pixels_drawn);
     RUN_TEST(vblank_interrupt_and_flip);
     RUN_TEST(a_trapped_method_stops_the_channel_until_acknowledged);
+    RUN_TEST(each_awakening_notify_stops_the_channel_until_acknowledged);
+    RUN_TEST(an_unmet_acquire_waits_for_its_value);
+    RUN_TEST(a_trap_on_another_subchannel_names_it);
+    RUN_TEST(a_pusher_error_stops_the_channel);
+    RUN_TEST(the_ptimer_alarm_rises_when_the_time_passes_it);
     RUN_TEST(capture_replays_to_the_same_draws);
 }
 
