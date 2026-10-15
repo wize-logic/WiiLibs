@@ -907,7 +907,7 @@ TEST an_ended_owner_abandons_its_mutants(void) {
 #define MASKED_LINE 11u
 
 static volatile bool g_masked_irq;
-static uint32_t g_masked_isr_runs;
+static volatile uint32_t g_masked_isr_runs;
 
 static bool masked_level(void *user) {
     (void)user;
