@@ -183,6 +183,9 @@ static float dot_of(uint32_t inputs, int k, float raw[4][4], float mapped[4][4])
     return dot > 1.0f ? 1.0f : dot < -1.0f ? -1.0f : dot;
 }
 
+// set by the reference when a mux's r0 alpha is too near 1/2 to tell the side
+static int g_mux_edge;
+
 static V4 reference(const uint32_t *s, const Inputs *in, unsigned present) {
     V4 regs[16];
     memset(regs, 0, sizeof regs);
@@ -231,8 +234,12 @@ static V4 reference(const uint32_t *s, const Inputs *in, unsigned present) {
                     cd[ch] = dot_of(inputs, 2, raw, mapped);
                 }
                 if (flags & 4u) {
-                    float m = regs[12].c[3];
-                    sum[ch] = (1.0f - m) * ab[ch] + m * cd[ch];
+                    // (CD where r0's alpha is 128/255 or more; a value at the edge is not checked)
+                    float m = clamp01(regs[12].c[3]) * 255.0f;
+                    if (fabsf(m - 127.5f) < 0.25f) {
+                        g_mux_edge = 1;
+                    }
+                    sum[ch] = m >= 127.5f ? cd[ch] : ab[ch];
                 } else {
                     sum[ch] = ab[ch] + cd[ch];
                 }
@@ -360,7 +367,22 @@ static V4 swapped(const WlXboxPshProgram *p, V4 value, unsigned table) {
     return out;
 }
 
-static float half_result(const WlTevHalf *h, const float v[4]) {
+// a, b and c as TEV's 8 bits, for a compare
+static int byte_of(float x) {
+    return (int)lroundf(tev_abc(x) * 255.0f);
+}
+
+// v: this channel's a, b, c and d; red: the red channel's a and b, which an R8 compare compares
+static float half_result(const WlTevHalf *h, const float v[4], const float red[2]) {
+    if (h->op >= WL_TEV_COMP_R8_GT) {
+        bool eq = (h->op & 1u) != 0, holds;
+        if (h->op == WL_TEV_COMP_R8_GT || h->op == WL_TEV_COMP_R8_EQ) {
+            holds = eq ? byte_of(red[0]) == byte_of(red[1]) : byte_of(red[0]) > byte_of(red[1]);
+        } else {
+            holds = eq ? byte_of(v[0]) == byte_of(v[1]) : byte_of(v[0]) > byte_of(v[1]);
+        }
+        return tev_result(v[3] + (holds ? v[2] : 0.0f), !h->clamp);
+    }
     float r = v[3] + (1.0f - v[2]) * v[0] + v[2] * v[1];
     if (h->op == WL_TEV_SUB) {
         r = v[3] - ((1.0f - v[2]) * v[0] + v[2] * v[1]);
@@ -394,6 +416,7 @@ static V4 simulate(const WlXboxPshProgram *p, const Inputs *in, const V4 *maps) 
         }
         ras = swapped(p, ras, st->ras_swap);
         memcpy(nregs, regs, sizeof regs);
+        float red[2] = {0.0f, 0.0f};
         for (int ch = 0; ch < 3; ch++) {
             float v[4];
             for (int k = 0; k < 4; k++) {
@@ -450,7 +473,11 @@ static V4 simulate(const WlXboxPshProgram *p, const Inputs *in, const V4 *maps) 
                 }
                 v[k] = k < 3 ? tev_abc(x) : x;
             }
-            nregs[st->color.dest].c[ch] = half_result(&st->color, v);
+            if (ch == 0) {
+                red[0] = v[0];
+                red[1] = v[1];
+            }
+            nregs[st->color.dest].c[ch] = half_result(&st->color, v, red);
         }
         float v[4];
         for (int k = 0; k < 4; k++) {
@@ -483,7 +510,7 @@ static V4 simulate(const WlXboxPshProgram *p, const Inputs *in, const V4 *maps) 
             }
             v[k] = k < 3 ? tev_abc(x) : x;
         }
-        nregs[st->alpha.dest].c[3] = half_result(&st->alpha, v);
+        nregs[st->alpha.dest].c[3] = half_result(&st->alpha, v, v);
         memcpy(regs, nregs, sizeof regs);
     }
     return regs[0];
@@ -516,8 +543,9 @@ static void program_random(uint32_t *state) {
     g_fog_on = (int)(rnd() % 2u);
     g_fog_color = rnd() * 2654435761u;
     unsigned count = 1 + rnd() % 4u;
-    state[WL_XBOX_PSH_COMBINER_COUNT] =
-        count | (rnd() % 2u ? 0x1000u : 0u) | (rnd() % 2u ? 0x10000u : 0u);
+    // (the mux by r0's alpha's top bit, as Direct3D sets it, but one time in eight)
+    state[WL_XBOX_PSH_COMBINER_COUNT] = count | (rnd() % 2u ? 0x1000u : 0u) |
+                                        (rnd() % 2u ? 0x10000u : 0u) | (rnd() % 8u ? 0x100u : 0u);
     for (int i = 0; i < 8; i++) {
         state[WL_XBOX_PSH_CONSTANT0_0 + i] = rnd() * 2654435761u;
         state[WL_XBOX_PSH_CONSTANT1_0 + i] = rnd() * 40503u * 65537u;
@@ -652,7 +680,10 @@ static int check(const uint32_t *state, unsigned present, const char **why) {
         for (int i = 0; i < 4; i++) {
             in.t[i] = rand4();
         }
-        in.t[0].c[3] = (float)(rnd() % 2u); // (r0.a starts as t0.a: binary, for the mux)
+        // (r0.a starts as t0.a, which the mux reads: often at its edges)
+        if (rnd() % 2u) {
+            in.t[0].c[3] = (float)(127u + rnd() % 2u) / 255.0f;
+        }
         in.v0 = rand4();
         in.v1 = rand4();
         memset(maps, 0, sizeof maps);
@@ -669,8 +700,9 @@ static int check(const uint32_t *state, unsigned present, const char **why) {
         for (int i = 0; i < 4; i++) {
             maps[i] = in.t[i];
         }
+        g_mux_edge = 0;
         V4 want = reference(state, &in, present), got = simulate(&program, &in, maps);
-        for (int ch = 0; ch < 4; ch++) {
+        for (int ch = 0; ch < 4 && !g_mux_edge; ch++) {
             if (fabsf(want.c[ch] - got.c[ch]) > 0.01f) {
                 *why = "the TEV program differs from the combiners";
                 g_rng = programs_rng;
@@ -981,7 +1013,7 @@ TEST a_final_product_with_every_register_held(void) {
 // are made again in the stages that read them, so the program is exact
 static void shimmer(uint32_t *state) {
     memset(state, 0, WL_XBOX_PSH_WORDS * sizeof *state);
-    state[WL_XBOX_PSH_COMBINER_COUNT] = 5u | 0x1000u | 0x10000u;
+    state[WL_XBOX_PSH_COMBINER_COUNT] = 5u | 0x1000u | 0x10000u | 0x100u;
     state[WL_XBOX_PSH_RGB_INPUTS0 + 0] = 0x08010902u;   // t0 * c0, t1 * c1
     state[WL_XBOX_PSH_RGB_OUTPUTS0 + 0] = 0x00000089u;  // to t0, t1
     state[WL_XBOX_PSH_ALPHA_INPUTS0 + 0] = 0x18111912u; // their alphas

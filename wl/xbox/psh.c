@@ -120,6 +120,10 @@ enum {
     _channel_blue_all,
 };
 
+/* an operation's compare (the alpha half's A8 compares are the colour's R8
+codes, wl/platform/tev.h) */
+enum { _compare_none, _compare_greater, _compare_equal };
+
 #define MAXIMUM_OPERATIONS 48
 
 /* ---------- structures */
@@ -138,6 +142,9 @@ struct operation {
     unsigned char subtract, bias, scale, dest;
     /* (its result kept signed, for a later operation's d) */
     unsigned char unclamped;
+    /* (TEV's compare in place of the lerp: d + (a > b ? c : 0), or a == b:
+    the mux's) */
+    unsigned char compare;
     /* (its place among the combiner stage's operations as queued, both
     portions': queues_flush keeps what the order says of their registers) */
     unsigned char sequence;
@@ -161,6 +168,10 @@ struct translation {
     the colour half; 0 taken as 1; -1 as before they were made, their
     inputs clamped */
     int signed_dots;
+    /* the mux: 2 its compares with 127/255 in a konst of its own (two
+    stages), 1 without (three), for the program's own constants; 0 a blend
+    by r0's alpha, approximated, where the compares do not fit */
+    int mux_mode;
     /* where each name is, for each portion (a colour's may be a register's
     alpha: a value the same in every channel) */
     struct operand names[NUMBER_OF_PORTIONS][NUMBER_OF_NAMES];
@@ -2312,6 +2323,36 @@ static int mux_product_register(int portion,
     return -1;
 }
 
+/* what the mux chooses when r0's alpha is a constant: 1 CD (its top bit set,
+or with msb false its low bit), 0 AB; -1 when it is not a constant */
+static int mux_constant(const struct translation *translation, bool msb) {
+    struct operand chooser = folded(translation->names[_portion_alpha][_name_r0]);
+    unsigned value;
+
+    switch (chooser.kind) {
+    case _kind_zero:
+        value = 0;
+        break;
+    case _kind_one:
+        value = 255;
+        break;
+    case _kind_half:
+        value = 128;
+        break;
+    case _kind_konst: {
+        uint32_t color = translation->program->tev.konst[chooser.index];
+
+        value = chooser.channel == _channel_blue ? (color >> 8) & 0xFF : color & 0xFF;
+        break;
+    }
+    default:
+        return -1;
+    }
+    if (chooser.invert)
+        value = 255 - value;
+    return msb ? value >= 128 : (int)(value & 1);
+}
+
 static void combiner_portion(struct translation *translation, int stage, int portion) {
     const uint32_t *state = translation->state;
     uint32_t inputs =
@@ -2333,6 +2374,7 @@ static void combiner_portion(struct translation *translation, int stage, int por
     unsigned char folding[4];
     unsigned long ab_name = (outputs >> 4) & 0x0f, cd_name = outputs & 0x0f,
                   sum_name = (outputs >> 8) & 0x0f;
+    bool msb = (state[WL_XBOX_PSH_COMBINER_COUNT] & 0x100) != 0;
     int dest, index;
 
     translation->product_count = 0;
@@ -2594,20 +2636,41 @@ product with 1 */
     /* (the sum may order its products: the inputs as they were after it) */
     memcpy(sum_saved, inputs_mapped, sizeof(sum_saved));
     if (name_of(sum_name) >= 0) {
-        if (flags & 0x04) {
-            /* the mux: r0's alpha chooses, as a blend of the two (each product
-            in a register of its own, unless it is a value as it is; a
-            negative product clamps to 0 there) */
-            struct operand ab, cd;
-            int ab_register = -1, cd_register = -1;
+        if ((flags & 0x04) && mux_constant(translation, msb) >= 0) {
+            /* (the mux by a constant: the product it chooses) */
+            int first = mux_constant(translation, msb) ? 2 : 0;
+
+            for (index = first; index < first + 2; index++) {
+                if (inputs_mapped[index].negative)
+                    approximate(translation->program, "a negative product in a mux");
+            }
+            dest = output_register(translation, portion, sum_name, later, later_count);
+            if (dest >= 0)
+                emit_product(translation, portion, inputs_mapped[first], inputs_mapped[first + 1],
+                             zero, flags, dest);
+        } else if (flags & 0x04) {
+            /* the mux: CD where r0's alpha has its top bit set (1/2 or more,
+            NV2A's MUX_MSB), else AB; with MUX_LSB its low bit, which no TEV
+            stage reads but of a constant (the top bit's, approximated). TEV's
+            compares add their c where they hold: CD where r0's alpha is above
+            127/255, AB where 1/2 is above it (without a konst for 127/255, CD
+            where it equals 1/2 and where it is above, in two). A compare has
+            no bias or scale: the output's mapping is a stage after; a negative
+            product clamps to 0 there */
+            struct operand ab, cd, half = operand(_kind_half, 0, 0);
+            struct operand parts[3][3];
+            unsigned char compares[3];
+            int ab_register = -1, cd_register = -1, sum = -1, part_count = 0, slot;
             struct operand chooser = translation->names[_portion_alpha][_name_r0];
             struct operation operation;
+            bool cd_reads, ab_reads, chooser_reads, ab_first, own_sum = false;
 
             for (index = 0; index < 4; index++) {
                 if (inputs_mapped[index].negative)
                     approximate(translation->program, "a negative product in a mux");
             }
-
+            if (!msb)
+                approximate(translation->program, "a mux by r0's low bit");
             if (portion == _portion_color && chooser.kind >= _kind_register)
                 chooser.channel =
                     chooser.channel == _channel_blue ? _channel_blue_all : _channel_alpha;
@@ -2648,12 +2711,89 @@ product with 1 */
             dest = output_register(translation, portion, sum_name, later, later_count);
             if (dest < 0)
                 return;
-            operation = operation_new(dest);
-            operation.in[0] = ab;
-            operation.in[1] = cd;
-            operation.in[2] = chooser;
-            output_mapping(&operation, flags);
-            emit(translation, portion, &operation);
+            if (!translation->mux_mode) {
+                /* (the last attempts: a blend of the two by r0's alpha, as the
+                translation made it before) */
+                approximate(translation->program, "a mux as a blend");
+                operation = operation_new(dest);
+                operation.in[0] = ab;
+                operation.in[1] = cd;
+                operation.in[2] = chooser;
+                output_mapping(&operation, flags);
+                emit(translation, portion, &operation);
+            } else {
+                /* the compares, each {a, b, c}: the first's d 0, each next's the
+                sum so far, the last's result in dest. The sum goes where the
+                later compares do not read: dest, CD's parts first or AB's; else
+                the register of the first part's product; else a register of its
+                own */
+                slot = translation->mux_mode == 2
+                           ? wl_tev_konst_slot(&translation->program->tev, 0x7F7F7F7Fu)
+                           : -1;
+                chooser_reads = operand_reads(&chooser, portion, dest, portion);
+                cd_reads = operand_reads(&cd, portion, dest, portion);
+                ab_reads = operand_reads(&ab, portion, dest, portion);
+                ab_first = false;
+                if (!chooser_reads && !ab_reads && !(slot < 0 && cd_reads)) {
+                    sum = dest;
+                } else if (!chooser_reads && !cd_reads) {
+                    sum = dest;
+                    ab_first = true;
+                } else if (slot >= 0 && cd_register >= 0) {
+                    sum = cd_register;
+                } else if (ab_register >= 0) {
+                    sum = ab_register;
+                    ab_first = true;
+                } else if ((sum = register_allocate(translation, portion)) >= 0) {
+                    own_sum = true;
+                } else {
+                    fail(translation, "no free register");
+                    return;
+                }
+                if (ab_first) {
+                    parts[part_count][0] = half;
+                    parts[part_count][1] = chooser;
+                    parts[part_count][2] = ab;
+                    compares[part_count++] = _compare_greater;
+                }
+                parts[part_count][0] = chooser;
+                parts[part_count][1] = slot >= 0 ? operand(_kind_konst, (unsigned char)slot,
+                                                           _channel_natural)
+                                                 : half;
+                parts[part_count][2] = cd;
+                compares[part_count++] = _compare_greater;
+                if (slot < 0) {
+                    parts[part_count][0] = chooser;
+                    parts[part_count][1] = half;
+                    parts[part_count][2] = cd;
+                    compares[part_count++] = _compare_equal;
+                }
+                if (!ab_first) {
+                    parts[part_count][0] = half;
+                    parts[part_count][1] = chooser;
+                    parts[part_count][2] = ab;
+                    compares[part_count++] = _compare_greater;
+                }
+                for (index = 0; index < part_count; index++) {
+                    operation = operation_new(index < part_count - 1 ? sum : dest);
+                    operation.compare = compares[index];
+                    operation.in[0] = parts[index][0];
+                    operation.in[1] = parts[index][1];
+                    operation.in[2] = parts[index][2];
+                    operation.in[3] =
+                        index ? operand(_kind_register, (unsigned char)sum, _channel_natural) : zero;
+                    emit(translation, portion, &operation);
+                }
+                /* (the output's mapping, which a compare has not, after) */
+                if (flags & 0x38) {
+                    operation = operation_new(dest);
+                    operation.in[3] = operand(_kind_register, (unsigned char)dest, _channel_natural);
+                    output_mapping(&operation, flags);
+                    emit(translation, portion, &operation);
+                }
+                if (own_sum)
+                register_free(translation, portion, sum);
+            }
             register_free(translation, portion, ab_register);
             register_free(translation, portion, cd_register);
         } else {
@@ -2931,7 +3071,13 @@ static void stage_half(WlTevStage *stage, const struct operation *operation, int
     for (index = 0; index < 4; index++)
         in[index] = input_code(&operation->in[index], portion);
     (portion == _portion_color ? wl_tev_stage_color : wl_tev_stage_alpha)(
-        stage, in[0], in[1], in[2], in[3], operation->subtract ? WL_TEV_SUB : WL_TEV_ADD,
+        stage, in[0], in[1], in[2], in[3],
+        operation->compare == _compare_greater
+            ? (portion == _portion_color ? WL_TEV_COMP_R8_GT : WL_TEV_COMP_A8_GT)
+        : operation->compare == _compare_equal
+            ? (portion == _portion_color ? WL_TEV_COMP_R8_EQ : WL_TEV_COMP_A8_EQ)
+        : operation->subtract ? WL_TEV_SUB
+                              : WL_TEV_ADD,
         operation->bias, operation->scale, !operation->unclamped, operation->dest);
 }
 
@@ -3685,7 +3831,7 @@ static void swap_tables_set(WlTevProgram *tev) {
 
 static bool translate_once(const uint32_t *render_state, const WlXboxPshTextures *textures,
                            WlXboxPshProgram *program, bool economical, bool folding, bool preload,
-                           int signed_dots) {
+                           int signed_dots, int mux_mode) {
     static struct translation translation;
     unsigned long combiner_count = render_state[WL_XBOX_PSH_COMBINER_COUNT] & 0xff;
     unsigned long stage;
@@ -3701,6 +3847,7 @@ static bool translate_once(const uint32_t *render_state, const WlXboxPshTextures
     translation.economical = economical;
     translation.folding = folding;
     translation.signed_dots = signed_dots;
+    translation.mux_mode = mux_mode;
     wl_tev_pool_init(&translation.pools[_portion_color]);
     wl_tev_pool_init(&translation.pools[_portion_alpha]);
     names_initialize(&translation);
@@ -3942,22 +4089,28 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
     first approximated */
     static WlXboxPshProgram approximated;
     static uint32_t rewritten[WL_XBOX_PSH_WORDS];
-    bool have_approximated = false, done = false;
-    int blues = blue_to_alpha_rewrite(render_state, rewritten);
+    bool have_approximated = false, done = false, has_mux = false;
+    int mux_mode, blues = blue_to_alpha_rewrite(render_state, rewritten);
 
     if (blues)
         render_state = rewritten;
-    for (attempt = 0; attempt < sizeof(attempts) / sizeof(attempts[0]) && !done; attempt++) {
-        for (preload = 1; preload >= 0 && !done; preload--) {
-            if (!translate_once(render_state, textures, program, attempts[attempt].economical,
-                                attempts[attempt].folding, preload != 0,
-                                attempts[attempt].signed_dots))
-                continue;
-            if (!program->approximate)
-                done = true;
-            else if (!have_approximated) {
-                approximated = *program;
-                have_approximated = true;
+    for (stage = 0; stage < 8; stage++)
+        has_mux = has_mux || ((render_state[WL_XBOX_PSH_RGB_OUTPUTS0 + stage] |
+                               render_state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + stage]) &
+                              0x4000);
+    for (mux_mode = 2; mux_mode >= (has_mux ? 0 : 2) && !done; mux_mode--) {
+        for (attempt = 0; attempt < sizeof(attempts) / sizeof(attempts[0]) && !done; attempt++) {
+            for (preload = 1; preload >= 0 && !done; preload--) {
+                if (!translate_once(render_state, textures, program, attempts[attempt].economical,
+                                    attempts[attempt].folding, preload != 0,
+                                    attempts[attempt].signed_dots, mux_mode))
+                    continue;
+                if (!program->approximate)
+                    done = true;
+                else if (!have_approximated) {
+                    approximated = *program;
+                    have_approximated = true;
+                }
             }
         }
     }
