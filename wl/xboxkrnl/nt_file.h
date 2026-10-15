@@ -53,6 +53,7 @@ struct XkFile {
     bool synchronous;       // FILE_SYNCHRONOUS_IO_*: no APC, the position moves
     bool resized;           // this handle changed a sparse file's size: it writes the sidecar
     XkFcb *fcb;             // files and folders under a mount
+    XkFile *fcb_next;       // the other handles on the same file
     uint64_t pos;
     uint32_t partition;     // XK_FILE_PARTITION
     WlPlatformDir *dir;     // a directory being listed

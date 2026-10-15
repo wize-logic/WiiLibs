@@ -80,14 +80,17 @@ resolves through the mount table:
 host's file system need not be), and `..` above a mount is refused. Covered: `NtCreateFile`,
 `NtOpenFile` and `IoCreateFile` with the six dispositions and delete-on-close; reads and writes at
 offsets or at the file position, overlapped ones completing at once (their event, the file object,
-the APC; `STATUS_PENDING` first with `async_io_pending`; a request that fails touches none of them
-nor the status block, as NT); writes only through a handle opened for writing; the query and set information classes
+the APC; `STATUS_PENDING` first with `async_io_pending`; both events are cleared before the request,
+so one that fails leaves them non-signalled and sets neither the status block nor the APC, as NT);
+writes only through a handle opened for writing; the query and set information classes
 titles use (queries: basic, standard, internal, position, mode, network open; sets: basic,
 rename, disposition, position, allocation, end of file, mode);
 volume information (volume, size, device, full size); directory listings with wildcards, one entry per call; `NtDeleteFile`;
 `NtFlushBuffersFile`. The handles on one file share a record, as NT's file control block: a delete
 asked for (delete-on-close, the disposition, `NtDeleteFile` of an open file) happens at its last
-close. On a sparse partition a file keeps a logical size beyond what was written, in a
+close, and meanwhile every open or create of the name fails with `STATUS_DELETE_PENDING`. A rename
+moves every handle on the file to the new name; one that would replace an open file is
+`STATUS_ACCESS_DENIED`. On a sparse partition a file keeps a logical size beyond what was written, in a
 `<name>.wlsz` sidecar that listings hide; its handles share the size, and only one that changed it
 writes the sidecar. A partition opened as a device (`Partition0`, the cache partitions for
 `XMountUtilityDrive`) keeps its first 64 KB in `data_dir/raw<N>.bin`; `Partition0` shows a
@@ -149,8 +152,8 @@ translated code does, from guest functions written in C (manual lookup). It cove
 (stdcall pops, fastcall, 64-bit returns); four threads contending for a critical section; events,
 timeouts and mutants; timers with DPCs; an interrupt line with its ISR and DPC; an ISR and a thread
 switch delivered to a loop that only polls a device register (D3D's fence wait); overlapped reads
-with their APC, and a failed one that touches nothing; the read-only DVD, a sparse cache drive and
-its size shared by handles, listings (a buffer too small, "*.*"), delete at the last close, a full
+with their APC, and a failed one that leaves its events cleared; the read-only DVD, a sparse cache drive and
+its size shared by handles, listings (a buffer too small, "*.*"), delete at the last close (opens refused meanwhile), a rename that moves every handle, a full
 card, read-only handles; objects kept by a reference by pointer and by a wait; virtual and
 contiguous memory and the GPU instance, a commit with no address, decommits; Rtl strings, time and
 printf past 2 KB; SHA-1, HMAC (RFC 2202) and

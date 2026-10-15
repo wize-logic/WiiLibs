@@ -121,7 +121,8 @@ static void sidecar_write(const char *host, uint64_t logical, uint64_t physical)
 struct XkFcb {
     char host[320];
     uint64_t logical; // a sparse file's size (what the title sees)
-    uint32_t opens;   // the XkFiles on it
+    uint32_t opens;   // the XkFiles on it ...
+    XkFile *files;    // ... linked by fcb_next
     bool delete_pending;
     XkFcb *next;
 };
@@ -137,21 +138,35 @@ static XkFcb *fcb_find(const char *host) {
     return NULL;
 }
 
-// The file's record, made by its first open (with `logical` as its size); NULL when out of memory.
-static XkFcb *fcb_open(const char *host, uint64_t logical) {
-    XkFcb *c = fcb_find(host);
+// Joins `f` to its file's record (f->fcb), made by the file's first open (with `logical` as its
+// size); NULL when out of memory.
+static XkFcb *fcb_open(XkFile *f, uint64_t logical) {
+    XkFcb *c = fcb_find(f->host);
     if (c == NULL) {
         c = calloc(1, sizeof *c);
         if (c == NULL) {
             return NULL;
         }
-        snprintf(c->host, sizeof c->host, "%s", host);
+        snprintf(c->host, sizeof c->host, "%s", f->host);
         c->logical = logical;
         c->next = g_fcbs;
         g_fcbs = c;
     }
     c->opens++;
+    f->fcb = c;
+    f->fcb_next = c->files;
+    c->files = f;
     return c;
+}
+
+static void fcb_leave(XkFcb *c, XkFile *f) {
+    for (XkFile **p = &c->files; *p != NULL; p = &(*p)->fcb_next) {
+        if (*p == f) {
+            *p = f->fcb_next;
+            break;
+        }
+    }
+    f->fcb_next = NULL;
 }
 
 static void fcb_unlink(XkFcb *c) {
@@ -279,6 +294,7 @@ void xk_file_close(XkFile *f) {
     }
     XkFcb *c = f->fcb;
     if (c != NULL) {
+        fcb_leave(c, f);
         if (f->delete_on_close) {
             c->delete_pending = true;
         }
@@ -367,7 +383,11 @@ static uint32_t open_file(uint32_t handle_out, uint32_t access, uint32_t oa, uin
         bool exists = wl_platform_fs_stat(f->host, &st) == WL_OK;
         bool is_dir = exists && st.is_dir;
         uint32_t fail = 0;
-        if (!exists && (disposition == FILE_OPEN || disposition == FILE_OVERWRITE)) {
+        const XkFcb *open_fcb = exists ? fcb_find(f->host) : NULL;
+        if (open_fcb != NULL && open_fcb->delete_pending) {
+            // going at its last close: no new handle, whatever the disposition, as NT
+            fail = STATUS_DELETE_PENDING;
+        } else if (!exists && (disposition == FILE_OPEN || disposition == FILE_OVERWRITE)) {
             // a missing parent is a missing path
             char parent[340];
             snprintf(parent, sizeof parent, "%s", f->host);
@@ -404,8 +424,7 @@ static uint32_t open_file(uint32_t handle_out, uint32_t access, uint32_t oa, uin
                 }
                 info = 2; // FILE_CREATED
             }
-            f->fcb = fcb_open(f->host, 0);
-            if (f->fcb == NULL) {
+            if (fcb_open(f, 0) == NULL) {
                 free(f);
                 return STATUS_NO_MEMORY;
             }
@@ -447,8 +466,7 @@ static uint32_t open_file(uint32_t handle_out, uint32_t access, uint32_t oa, uin
                 return s;
             }
             g_files_open++;
-            f->fcb = fcb_open(f->host, logical);
-            if (f->fcb == NULL) {
+            if (fcb_open(f, logical) == NULL) {
                 wl_platform_fs_close(f->pf);
                 g_files_open--;
                 free(f);
@@ -572,9 +590,6 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
     if (f->kind == XK_FILE_DIRECTORY || f->kind == XK_FILE_CDROM) {
         return STATUS_INVALID_DEVICE_REQUEST;
     }
-    if (!f->can_write) {
-        return STATUS_ACCESS_DENIED; // a read-only mount, or a handle opened without write access
-    }
     if (!wl_xb_range_ok(buf, len)) {
         return STATUS_ACCESS_VIOLATION;
     }
@@ -597,9 +612,24 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
     return status;
 }
 
+// Before an I/O is dispatched: the caller's event and the file object's are cleared, as NT does, so
+// a request that then fails leaves both non-signalled.
+static void begin_io(uint32_t handle, uint32_t event) {
+    uint32_t file_body = xk_handle_waitable(handle);
+    if (file_body != 0) {
+        xk_event_reset(file_body);
+    }
+    if (event != 0) {
+        uint32_t ev = xk_handle_waitable(event);
+        if (ev != 0) {
+            xk_event_reset(ev);
+        }
+    }
+}
+
 // After an I/O: the status block, the event, the file object, the APC (overlapped handles). An error
-// (an NT_ERROR status, STATUS_END_OF_FILE among them) is returned alone: NT touches none of them
-// for a request that fails before it is pending.
+// (an NT_ERROR status, STATUS_END_OF_FILE among them) is returned alone: NT sets none of them for a
+// request that fails before it is pending (begin_io cleared the events).
 static uint32_t complete_io(XkFile *f, uint32_t handle, uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb,
                             uint32_t status, uint32_t done) {
     if (NT_ERROR(status)) {
@@ -634,6 +664,7 @@ void k_NtReadFile(void) {
         RET(STATUS_INVALID_HANDLE);
         return;
     }
+    begin_io(handle, ARG(1));
     uint64_t off = io_offset(f, ARG(7));
     uint32_t done = 0;
     uint32_t status = do_read(f, off, ARG(5), ARG(6), &done);
@@ -651,6 +682,13 @@ void k_NtWriteFile(void) {
         RET(STATUS_INVALID_HANDLE);
         return;
     }
+    if (f->kind != XK_FILE_DIRECTORY && f->kind != XK_FILE_CDROM && !f->can_write) {
+        // a read-only mount, or a handle opened without write access: refused with the handle,
+        // before NT looks at the event
+        RET(STATUS_ACCESS_DENIED);
+        return;
+    }
+    begin_io(handle, ARG(1));
     uint64_t off = io_offset(f, ARG(7));
     uint32_t done = 0;
     uint32_t status = do_write(f, off, ARG(5), ARG(6), &done);
@@ -876,35 +914,54 @@ void k_NtSetInformationFile(void) {
         XkFile *rf = root != 0 ? file_of(root) : NULL;
         snprintf(full, sizeof full, "%s%s%s", rf != NULL ? rf->name : "", rf != NULL ? "\\" : "", name);
         XkResolved r;
-        if (!xk_resolve(full, &r) || r.kind != XK_RES_HOST || !r.mount.writable || f->pf == NULL) {
+        if (!xk_resolve(full, &r) || r.kind != XK_RES_HOST || !r.mount.writable || f->pf == NULL ||
+            f->fcb == NULL) {
             status = STATUS_ACCESS_DENIED;
             break;
         }
+        xk_resolve_case(r.host, r.root_len);
         bool replace = wl_xb_rd8(in) != 0;
         if (!replace && wl_platform_fs_exists(r.host)) {
             status = STATUS_OBJECT_NAME_COLLISION;
             break;
         }
-        wl_platform_fs_close(f->pf);
-        f->pf = NULL;
-        g_files_open--;
-        if (wl_platform_fs_rename(f->host, r.host) != WL_OK) {
+        const XkFcb *target = fcb_find(r.host);
+        if (target != NULL && target != f->fcb) {
+            status = STATUS_ACCESS_DENIED; // the file it would replace is open, as NT refuses
+            break;
+        }
+        // every handle on the file lets go of the host file while it is renamed (a FAT driver may
+        // not rename an open file), and all of them follow it to its new name
+        for (XkFile *o = f->fcb->files; o != NULL; o = o->fcb_next) {
+            if (o->pf != NULL) {
+                wl_platform_fs_close(o->pf);
+                o->pf = NULL;
+                g_files_open--;
+            }
+        }
+        char old_host[320];
+        snprintf(old_host, sizeof old_host, "%s", f->host);
+        bool moved = wl_platform_fs_rename(old_host, r.host) == WL_OK;
+        if (!moved) {
             status = STATUS_ACCESS_DENIED;
         } else {
             char a[340], b[340];
-            sidecar_path(f->host, a, sizeof a);
+            sidecar_path(old_host, a, sizeof a);
             sidecar_path(r.host, b, sizeof b);
             wl_platform_fs_remove(b); // a replaced file's size goes with it
             wl_platform_fs_rename(a, b);
-            snprintf(f->host, sizeof f->host, "%s", r.host);
-            snprintf(f->name, sizeof f->name, "%s", r.device_path);
-            if (f->fcb != NULL) {
-                snprintf(f->fcb->host, sizeof f->fcb->host, "%s", r.host);
+            snprintf(f->fcb->host, sizeof f->fcb->host, "%s", r.host);
+        }
+        for (XkFile *o = f->fcb->files; o != NULL; o = o->fcb_next) {
+            if (moved) {
+                snprintf(o->host, sizeof o->host, "%s", r.host);
+                snprintf(o->name, sizeof o->name, "%s", r.device_path);
+            }
+            if (wl_platform_fs_open(o->host, WL_FILE_READ_WRITE, &o->pf) == WL_OK) {
+                g_files_open++;
             }
         }
-        if (wl_platform_fs_open(f->host, WL_FILE_READ_WRITE, &f->pf) == WL_OK) {
-            g_files_open++;
-        }
+        g_xk_stats.files_open = g_files_open;
         break;
     }
     case 13: // FileDispositionInformation: DeleteFile
