@@ -213,6 +213,8 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
         gx->recipe = *gx->cfg.recipe;
     }
     textures = gx->cfg.textures;
+    // (a light's falloff cube as its lit face, wl_nv2a_spot_coordinates, not a sphere map)
+    textures.spots = true;
     if (textures.flush == NULL) {
         textures.flush = commit;
     }
@@ -1171,6 +1173,8 @@ static void projection_load(WlNv2aGx *gx, const WlNv2aKelvin *k, const Projectio
 typedef struct StagePlan {
     const WlNv2aTexEntry *entry;
     bool sphere, projective, linear;
+    // a cube map made a light's spot (entry->layout.spot: its face), not a sphere map
+    uint8_t spot;
     float to_s, to_t; // (a linear texture's texels to a fraction: 1 / its width, height)
 } StagePlan;
 
@@ -1226,6 +1230,7 @@ static void stage_plan(StagePlan *s, const WlNv2aTexEntry *entry, unsigned stage
     memset(s, 0, sizeof *s);
     s->entry = entry;
     s->sphere = entry != NULL && entry->sphere;
+    s->spot = s->sphere ? entry->layout.spot : 0;
     s->projective = stage_program == WL_NV2A_STAGE_2D_PROJECTIVE || stage_program == WL_NV2A_STAGE_3D_PROJECTIVE;
     s->linear = entry != NULL && entry->linear && entry->width != 0 && entry->height != 0;
     if (s->linear) {
@@ -1237,6 +1242,32 @@ static void stage_plan(StagePlan *s, const WlNv2aTexEntry *entry, unsigned stage
 // a projective stage's coordinate for GX to divide at each pixel: (s, t, q) undivided, a linear
 // texture's s and t to a fraction (the scale and the division commute)
 static inline void stage_texcoord_projected(const StagePlan *s, const float t[4], float stq[3]) {
+    if (s->spot) {
+        // a spot's face as wl_nv2a_spot_coordinates reads it, (sc / ma + 1) / 2, undivided: ((sc + ma) /
+        // 2, (tc + ma) / 2, ma). Off the face's side of the light, -1 (its dark edge) at a small q, so
+        // a primitive that reaches behind darkens toward it
+        float x = t[0], y = t[1], z = t[2], ma, sc, tc;
+
+        switch (s->spot) {
+        case 1: ma = x, sc = -z, tc = -y; break;
+        case 2: ma = -x, sc = z, tc = -y; break;
+        case 3: ma = y, sc = x, tc = z; break;
+        case 4: ma = -y, sc = x, tc = -z; break;
+        case 5: ma = z, sc = x, tc = -y; break;
+        default: ma = -z, sc = -x, tc = -y; break;
+        }
+        if (!(ma > 1.0e-6f)) {
+            float q = 1.0e-3f * (fabsf(x) + fabsf(y) + fabsf(z)) + 1.0e-12f;
+
+            stq[0] = stq[1] = -q;
+            stq[2] = q;
+            return;
+        }
+        stq[0] = (sc + ma) * 0.5f;
+        stq[1] = (tc + ma) * 0.5f;
+        stq[2] = ma;
+        return;
+    }
     stq[0] = s->linear ? t[0] * s->to_s : t[0];
     stq[1] = s->linear ? t[1] * s->to_t : t[1];
     stq[2] = t[3];
@@ -1244,7 +1275,11 @@ static inline void stage_texcoord_projected(const StagePlan *s, const float t[4]
 
 static inline void stage_texcoord(const StagePlan *s, const float t[4], float st[2]) {
     if (s->sphere) {
-        wl_nv2a_sphere_coordinates(t, st);
+        if (s->spot) {
+            wl_nv2a_spot_coordinates(t, s->spot, st);
+        } else {
+            wl_nv2a_sphere_coordinates(t, st);
+        }
         return;
     }
     st[0] = t[0];
@@ -1843,10 +1878,17 @@ static bool projected_plan(WlNv2aGx *gx, DrawPlan *plan, WlGxDirectLayout *layou
         unsigned stage = plan->stage_list[n];
         const StagePlan *sp = &plan->stages[stage];
 
-        if (!sp->projective || sp->sphere || (gx->xf_dependencies.t[stage][3] & 0xFFFFu) == 0) {
+        if (sp->spot) {
+            // (a spot: its face's projection, divided by GX where the direction varies)
+            for (r = 1; r < runs && same4(o[r].t[stage], o[0].t[stage][0], o[0].t[stage][1], o[0].t[stage][2],
+                                          o[r].t[stage][3]);
+                 r++) {
+            }
+        } else if (!sp->projective || sp->sphere || (gx->xf_dependencies.t[stage][3] & 0xFFFFu) == 0) {
             continue;
-        }
-        for (r = 1; r < runs && o[r].t[stage][3] == o[0].t[stage][3]; r++) {
+        } else {
+            for (r = 1; r < runs && o[r].t[stage][3] == o[0].t[stage][3]; r++) {
+            }
         }
         if (r < runs) {
             // (the vertex's words within PACKED_WORDS: two projected cost nine words for four)
