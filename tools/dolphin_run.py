@@ -216,15 +216,15 @@ def dolphin_ini(sd_image: str, sd_folder: str, dump_frames: bool, gdb_port: int 
     return "\n".join(lines) + "\n"
 
 
-def gfx_ini(dump_frames: bool, widescreen: bool = False) -> str:
+def gfx_ini(dump_frames: bool, widescreen: bool = False, hacks: dict | None = None) -> str:
     # CPU access to the EFB on (Dolphin may skip it for speed, and peeks then read 0): programs
-    # and tests read pixels back
-    text = "[Hacks]\nEFBAccessEnable = True\n"
-    # EFB copies to textures written to RAM, as the console does (Dolphin's default keeps them
-    # in its own texture cache only and zeroes the RAM they were to go to, so a copy the CPU
-    # reads, such as a render target's image, reads 0), and when the copy runs, not deferred to a
-    # later synchronization
-    text += "EFBToTextureEnable = False\nDeferEFBCopies = False\n"
+    # and tests read pixels back; EFB copies to textures written to RAM, as the console does
+    # (Dolphin's default keeps them in its own texture cache only and zeroes the RAM they were to go
+    # to, so a copy the CPU reads, such as a render target's image, reads 0), and when the copy
+    # runs, not deferred to a later synchronization; --gfx-hack adds or overrides [Hacks] entries
+    settings = {"EFBAccessEnable": "True", "EFBToTextureEnable": "False", "DeferEFBCopies": "False"}
+    settings.update(hacks or {})
+    text = "[Hacks]\n" + "".join(f"{name} = {value}\n" for name, value in settings.items())
     # (the window, and so the capture, in the TV's shape: 1 forces 16:9, 2 forces 4:3)
     text += f"[Settings]\nAspectRatio = {1 if widescreen else 2}\n"
     if dump_frames:
@@ -482,6 +482,9 @@ def main() -> int:
                         help="Dolphin's video backend (Vulkan, D3D, D3D12, OGL, or '' for Dolphin's own; default "
                              "Vulkan: long runs on Direct3D 11 have reset the GPU's driver)")
     parser.add_argument("--dump-frames", type=Path, help="dump every frame as PNGs into this folder")
+    parser.add_argument("--gfx-hack", action="append", default=[], metavar="NAME=VALUE",
+                        help="a GFX.ini [Hacks] entry, added or overriding the defaults (EFBAccessEnable, "
+                             "EFBToTextureEnable and DeferEFBCopies), e.g. ImmediateXFBEnable=True; repeatable")
     parser.add_argument("--name", default="wl-dolphin", help="the work folder's name under %%TEMP%%")
     parser.add_argument("--break", dest="break_at", action="append", default=[], metavar="SYMBOL",
                         help="with --backtrace: stop there (exit, abort, a function); the backtrace is then "
@@ -513,7 +516,8 @@ def main() -> int:
                                                               GDB_PORT if args.backtrace else 0, args.video,
                                                               args.panics, args.single_core, args.mmu,
                                                               args.unthrottled, bool(args.dump_audio)))
-    (user / "Config" / "GFX.ini").write_text(gfx_ini(bool(args.dump_frames), args.wii_aspect == "16:9"))
+    hacks = dict(item.split("=", 1) for item in args.gfx_hack)
+    (user / "Config" / "GFX.ini").write_text(gfx_ini(bool(args.dump_frames), args.wii_aspect == "16:9", hacks))
     log = user / "Logs" / "dolphin.log"
     if log.exists():
         log.unlink()

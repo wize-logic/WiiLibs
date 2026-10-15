@@ -145,6 +145,16 @@ class RunWatchTests(unittest.TestCase):
         self.assertEqual(1800.0, watch.deadline)
 
 
+class GfxIniTests(unittest.TestCase):
+    def test_the_defaults_and_an_override(self):
+        text = dolphin_run.gfx_ini(False)
+        self.assertIn("EFBToTextureEnable = False", text)
+        text = dolphin_run.gfx_ini(False, hacks={"EFBToTextureEnable": "True", "ImmediateXFBEnable": "True"})
+        self.assertIn("EFBToTextureEnable = True", text)
+        self.assertNotIn("EFBToTextureEnable = False", text)
+        self.assertIn("ImmediateXFBEnable = True", text)
+
+
 class CommandLineTests(unittest.TestCase):
     def test_sd_out_without_sd_is_refused_before_dolphin_is_looked_for(self):
         result = subprocess.run([sys.executable, str(TOOLS / "dolphin_run.py"), "program.dol", "--sd-out", "out"],
