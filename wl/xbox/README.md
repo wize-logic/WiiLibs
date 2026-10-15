@@ -223,7 +223,7 @@ even, so its winding holds).
   the transform unit's generators. Not to the bit (`no_xf` in `WlNv2aGxConfig` keeps every vertex on
   the processor; the runtime's `noxf` file). The combiners through psh's cache (with a title's `WlXboxPshRecipe`), the fog psh's ramp, a
   program beyond GX texture 0 times colour. Blending, depth, alpha test and colour masks on GX
-  (constant colours, MIN/MAX and src - dst approximated and counted); culling by the NV2A's rule on
+  (constant colours, MIN as s d, MAX as s + d - s d and src - dst as s (1 - d): approximated and counted); culling by the NV2A's rule on
   the screen winding (`wl_nv2a_cull`: SET_FRONT_FACE's CW is clockwise as the screen shows it, so
   Direct3D's D3DCULL_CCW keeps a quad wound clockwise on the screen; GX's sense measured once at
   start); a draw with the stencil test is drawn as if the test passed (counted as `stencil_ignored`),

@@ -51,10 +51,26 @@ TEST blending(void) {
     ASSERT(wl_nv2a_gx_blend_of(true, WL_NV2A_BLEND_EQ_REVERSE_SUBTRACT_SIGNED, WL_NV2A_BLEND_ONE,
                                WL_NV2A_BLEND_ONE, &mode, &source, &destination));
     ASSERT_EQ(WL_GX_BM_SUBTRACT, mode);
-    // MIN, MAX: blended, not exact
+    // MIN, MAX: blended, not exact; MIN darkens (s d), MAX brightens no more than s + d - s d
     ASSERT_FALSE(wl_nv2a_gx_blend_of(true, WL_NV2A_BLEND_EQ_MAX, WL_NV2A_BLEND_ONE,
                                      WL_NV2A_BLEND_ONE, &mode, &source, &destination));
     ASSERT_EQ(WL_GX_BM_BLEND, mode);
+    ASSERT_EQ(WL_GX_BL_INVOTHERCLR, source);
+    ASSERT_EQ(WL_GX_BL_ONE, destination);
+    ASSERT_FALSE(wl_nv2a_gx_blend_of(true, WL_NV2A_BLEND_EQ_MIN, WL_NV2A_BLEND_ONE,
+                                     WL_NV2A_BLEND_ONE, &mode, &source, &destination));
+    ASSERT_EQ(WL_GX_BM_BLEND, mode);
+    ASSERT_EQ(WL_GX_BL_OTHERCLR, source);
+    ASSERT_EQ(WL_GX_BL_ZERO, destination);
+    // s - d: s (1 - d), darker where the destination is bright; s f - 0 exact
+    ASSERT_FALSE(wl_nv2a_gx_blend_of(true, WL_NV2A_BLEND_EQ_SUBTRACT, WL_NV2A_BLEND_ONE,
+                                     WL_NV2A_BLEND_ONE, &mode, &source, &destination));
+    ASSERT_EQ(WL_GX_BM_BLEND, mode);
+    ASSERT_EQ(WL_GX_BL_INVOTHERCLR, source);
+    ASSERT_EQ(WL_GX_BL_ZERO, destination);
+    ASSERT(wl_nv2a_gx_blend_of(true, WL_NV2A_BLEND_EQ_SUBTRACT, WL_NV2A_BLEND_SRC_ALPHA,
+                               WL_NV2A_BLEND_ZERO, &mode, &source, &destination));
+    ASSERT_EQ(WL_GX_BL_SRCALPHA, source);
     PASS();
 }
 

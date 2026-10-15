@@ -85,6 +85,25 @@ bool wl_nv2a_gx_blend_of(bool enable, uint32_t equation, uint32_t sfactor, uint3
         // (GX subtracts the source from the destination, its factors one)
         *mode = WL_GX_BM_SUBTRACT;
         exact = exact && *source == WL_GX_BL_ONE && *destination == WL_GX_BL_ONE;
+    } else if (equation == WL_NV2A_BLEND_EQ_MIN) {
+        // (min(s, d), the factors not read: s d, which darkens as it does and is it where either is
+        // 0 or 1; the factors' sum would brighten)
+        *source = WL_GX_BL_OTHERCLR;
+        *destination = WL_GX_BL_ZERO;
+        exact = false;
+    } else if (equation == WL_NV2A_BLEND_EQ_MAX) {
+        // (max(s, d): s + d - s d, s (1 - d) + d, as bright as the brighter or more, never over 1)
+        *source = WL_GX_BL_INVOTHERCLR;
+        *destination = WL_GX_BL_ONE;
+        exact = false;
+    } else if (equation == WL_NV2A_BLEND_EQ_SUBTRACT) {
+        // (s f - d g, which GX cannot subtract that way round: s (1 - d), the source darkened where
+        // the destination is bright, s - d where s is 1; of no destination, s f as it is)
+        if (*destination != WL_GX_BL_ZERO) {
+            *source = WL_GX_BL_INVOTHERCLR;
+            *destination = WL_GX_BL_ZERO;
+        }
+        exact = exact && dfactor == WL_NV2A_BLEND_ZERO;
     } else if (equation != WL_NV2A_BLEND_EQ_ADD) {
         exact = false;
     }
