@@ -71,6 +71,25 @@ TEST blending(void) {
     ASSERT(wl_nv2a_gx_blend_of(true, WL_NV2A_BLEND_EQ_SUBTRACT, WL_NV2A_BLEND_SRC_ALPHA,
                                WL_NV2A_BLEND_ZERO, &mode, &source, &destination));
     ASSERT_EQ(WL_GX_BL_SRCALPHA, source);
+    // constant factors: of a white constant colour ONE, exact (its alpha not read); of a constant
+    // alpha of 3/4, ONE and its inverse ZERO, approximated; unknown, ONE
+    ASSERT(wl_nv2a_gx_blend_color_of(true, WL_NV2A_BLEND_EQ_ADD, WL_NV2A_BLEND_CONSTANT_COLOR,
+                                     WL_NV2A_BLEND_SRC_ALPHA, 0xBFFFFFFFu, &mode, &source,
+                                     &destination));
+    ASSERT_EQ(WL_GX_BL_ONE, source);
+    ASSERT_EQ(WL_GX_BL_SRCALPHA, destination);
+    ASSERT(wl_nv2a_gx_blend_color_of(true, WL_NV2A_BLEND_EQ_ADD,
+                                     WL_NV2A_BLEND_ONE_MINUS_CONSTANT_COLOR, WL_NV2A_BLEND_ONE,
+                                     0x00FFFFFFu, &mode, &source, &destination));
+    ASSERT_EQ(WL_GX_BL_ZERO, source);
+    ASSERT_FALSE(wl_nv2a_gx_blend_color_of(true, WL_NV2A_BLEND_EQ_ADD, WL_NV2A_BLEND_CONSTANT_ALPHA,
+                                           WL_NV2A_BLEND_ONE_MINUS_CONSTANT_ALPHA, 0xC0000000u,
+                                           &mode, &source, &destination));
+    ASSERT_EQ(WL_GX_BL_ONE, source);
+    ASSERT_EQ(WL_GX_BL_ZERO, destination);
+    ASSERT_FALSE(wl_nv2a_gx_blend_of(true, WL_NV2A_BLEND_EQ_ADD, WL_NV2A_BLEND_CONSTANT_COLOR,
+                                     WL_NV2A_BLEND_ZERO, &mode, &source, &destination));
+    ASSERT_EQ(WL_GX_BL_ONE, source);
     PASS();
 }
 
