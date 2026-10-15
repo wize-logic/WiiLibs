@@ -34,7 +34,7 @@
 #define PRESS_FRAMES 2
 #define SELECT_MAX 16
 #define VBLANK_HZ 59.94
-#define MAX_REG 32
+#define MAX_REG 64 // (a title's numbers, texts, predicates, actions and steps: Halo's outgrew 32)
 #define PLAY_PRIORITY 31
 #define TICK_JUMP 60 // a tick moving on more than this in a frame was a checkpoint loaded, not play
 #define STILL_FACTOR 4.0 // a bot step whose game time stands still ends after this many times its length
@@ -211,6 +211,7 @@ static WlResult reg_add(RegKind kind, const char *name, void *fn, void *user, co
     Reg *r = (Reg *)reg_find(kind, name);
     if (r == NULL) {
         if (g_reg_count == MAX_REG) {
+            WL_LOG_W(TAG, "no room to register \"%s\" (%u registrations)", name, (unsigned)MAX_REG);
             return WL_ERR_LIMIT;
         }
         r = &g_reg[g_reg_count++];
