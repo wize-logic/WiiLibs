@@ -48,7 +48,10 @@ enum {
     WL_NV2A_DIRTY_VIEWPORT = 1u << 6,
     WL_NV2A_DIRTY_ARRAYS = 1u << 7,
     WL_NV2A_DIRTY_TRANSFORM = 1u << 8, // the fixed function's matrices and modes
-    WL_NV2A_DIRTY_ALL = 0x1FFu
+    // what the pixel program is made from (wl_nv2a_psh_words and wl_nv2a_psh_textures read): the
+    // combiners and their stage programs, the fog's switch and colour
+    WL_NV2A_DIRTY_PIXEL = 1u << 9,
+    WL_NV2A_DIRTY_ALL = 0x3FFu
 };
 
 struct WlNv2aKelvin {

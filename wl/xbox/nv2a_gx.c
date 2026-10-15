@@ -198,6 +198,9 @@ struct WlNv2aGx {
     bool state_valid;
     uint32_t dirty;
     bool states_exact, tev_exact, textures_volatile;
+    // what of the bound textures the last pixel program was made from (texture_pixel_inputs), so
+    // that a draw whose combiners, fog and these are as they were keeps it without a lookup
+    uint32_t pixel_textures[WL_NV2A_TEXTURES];
 };
 
 // ---- creation -----------------------------------------------------------------------------------
@@ -906,6 +909,30 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
 }
 
 // ---- the pixel stage ------------------------------------------------------------------------------
+
+// what of a bound texture the pixel program reads (wl_nv2a_psh_textures: there or not, a sphere's,
+// its contents, its alpha apart; tev_setup's fallback: there or not), as one word
+static uint32_t texture_pixel_inputs(const WlNv2aTexEntry *e) {
+    if (e == NULL) {
+        return 0;
+    }
+    return 1u | (uint32_t)e->contents << 1 | (e->sphere ? 1u << 9 : 0u) |
+           (e->layout.separate_alpha ? 1u << 10 : 0u);
+}
+
+// whether the bound textures read as the last pixel program's did; they are then its
+static bool pixel_textures_same(WlNv2aGx *gx) {
+    bool same = true;
+    unsigned stage;
+
+    for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
+        uint32_t inputs = texture_pixel_inputs(gx->entries[stage]);
+
+        same = same && inputs == gx->pixel_textures[stage];
+        gx->pixel_textures[stage] = inputs;
+    }
+    return same;
+}
 
 static bool tev_setup(WlNv2aGx *gx, const WlNv2aKelvin *k) {
     WlXboxPshTextures textures;
@@ -1995,7 +2022,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     float corners[3][2], area = 0.0f;
     uint32_t v, seen = 0, first = 0, run, attributes;
     unsigned stage;
-    bool rebind;
+    bool rebind, pixel;
 
     // (what changed since the last draw, kept until a draw applies it)
     gx->dirty |= k->dirty;
@@ -2045,7 +2072,14 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     } else {
         gx->stats.textures_kept++;
     }
-    if (rebind || !gx->state_valid || (gx->dirty & WL_NV2A_DIRTY_RASTER)) {
+    // (the program is a function of the combiners, the fog and the textures as pixel_textures_same
+    // reads them, which change only where they are bound: kept, with the TEV as it left it, unless
+    // one of them changed)
+    pixel = !gx->state_valid || (gx->dirty & WL_NV2A_DIRTY_PIXEL) != 0;
+    if (rebind && !pixel_textures_same(gx)) {
+        pixel = true;
+    }
+    if (pixel) {
         gx->tev_exact = tev_setup(gx, k);
     } else {
         gx->stats.combiners_kept++;

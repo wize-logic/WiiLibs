@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 // wl/xbox/nv2a_gx: the NV2A backend over GX, run on the host's recorder of wl/platform's direct GX
-// layer (host/gx_direct_host.h). Synthetic push buffers: a quad in screen space with a texture and a
-// combiner program (the vertices as GX gets them, the TEV program applied, the texture bound), a
+// layer (host/gx_direct_host.h). Synthetic push buffers: a quad in screen space with a texture and
+// a combiner program (the vertices as GX gets them, the TEV program applied, the texture bound), a
 // draw through a program that divides by w (the perspective projection and (x w, y w, -w)), the
 // frame's clear, culling, a stencil draw skipped, and the frame shown when the title finishes it;
 // render targets, and a screen blur through the back buffer's depth buffer drawn in one frame. A
-// projective coordinate whose q varies sent as (s, t, q) for GX to divide at each pixel.
+// projective coordinate whose q varies sent as (s, t, q) for GX to divide at each pixel. The pixel
+// program kept from draw to draw until one of its inputs changes.
 #include <math.h>
 #include <string.h>
 
@@ -505,6 +506,62 @@ TEST a_target_read_as_x8r8g8b8_has_no_alpha(void) {
     PASS();
 }
 
+// a draw's pixel program, made again (a lookup and the TEV applied) only when what it is made from
+// changed: kept through a change of blending and of a texture read as the last was; made for each
+// change of a combiner, a constant, the fog, a texture read otherwise (colour alone)
+static uint32_t g_applies, g_kept;
+
+static int pixel_program_made(TGuest *g) {
+    WlNv2aGxStats stats;
+    uint32_t applies;
+    int made;
+
+    f_quad(g, 20, 20, 30, 30, 0, 0xFFFFFFFFu);
+    t_kick(g);
+    wl_nv2a_gx_stats(g_gx, &stats);
+    applies = wl_host_tev_applies();
+    made = applies != g_applies ? 1 : stats.combiners_kept != g_kept ? 0 : -1;
+    g_applies = applies;
+    g_kept = stats.combiners_kept;
+    return made;
+}
+
+TEST the_pixel_program_is_made_again_only_when_its_inputs_change(void) {
+    TGuest g;
+    const WlXboxPshProgram *program;
+    bool used;
+
+    ASSERT(gx_device(&g) != NULL);
+    f_frame_setup(&g);
+    f_program(&g, 0, f_screen_program, 3);
+    f_combiner_two_stages(&g, 0x80402010u, 0x10101010u);
+    g_applies = 0;
+    g_kept = 0;
+    ASSERT_EQ(1, pixel_program_made(&g));
+    ASSERT_EQ(0, pixel_program_made(&g));
+    t_m1(&g, WL_NV2A_K_SET_BLEND_ENABLE, 1);
+    ASSERT_EQ(0, pixel_program_made(&g));
+    // another texture of the same format: bound, the program kept
+    t_m1(&g, WL_NV2A_K_SET_TEXTURE_OFFSET, F_TEXTURE + 0x1000u);
+    ASSERT_EQ(0, pixel_program_made(&g));
+    program = wl_nv2a_gx_last_program(g_gx, &used);
+    ASSERT(program != NULL && used);
+    t_m1(&g, WL_NV2A_K_SET_COMBINER_FACTOR0, 0x80402011u);
+    ASSERT_EQ(1, pixel_program_made(&g));
+    t_m1(&g, WL_NV2A_K_SET_COMBINER_COLOR_ICW + 4, 0x0C200403u);
+    ASSERT_EQ(1, pixel_program_made(&g));
+    t_m1(&g, WL_NV2A_K_SET_FOG_ENABLE, 1);
+    ASSERT_EQ(1, pixel_program_made(&g));
+    t_m1(&g, WL_NV2A_K_SET_FOG_COLOR, 0x00102030u);
+    ASSERT_EQ(1, pixel_program_made(&g));
+    t_m1(&g, WL_NV2A_K_SET_TEXTURE_FORMAT,
+         1u | 2u << 4 | WL_NV2A_TEX_SZ_Y8 << 8 | 1u << 16 | 2u << 20 | 2u << 24);
+    ASSERT_EQ(1, pixel_program_made(&g));
+    ASSERT_EQ(0, pixel_program_made(&g));
+    gx_done(&g);
+    PASS();
+}
+
 SUITE(gx_suite) {
     RUN_TEST(screen_space_quad_with_texture_and_combiners);
     RUN_TEST(a_projective_coordinate_whose_q_varies_is_sent_undivided);
@@ -514,6 +571,7 @@ SUITE(gx_suite) {
     RUN_TEST(a_blur_through_the_depth_buffer_is_drawn_in_one_frame);
     RUN_TEST(a_target_the_guest_stores_to_reads_as_the_guests_texels);
     RUN_TEST(a_target_read_as_x8r8g8b8_has_no_alpha);
+    RUN_TEST(the_pixel_program_is_made_again_only_when_its_inputs_change);
 }
 
 GREATEST_MAIN_DEFS();

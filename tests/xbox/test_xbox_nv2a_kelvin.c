@@ -4,14 +4,15 @@
 // DRAW_ARRAYS, ARRAY_ELEMENT16 and ARRAY_ELEMENT32, from inline arrays and from immediate vertices
 // (each kind of SET_VERTEX_DATA*), disabled attributes reading their current value; long batches
 // handed over in whole primitives; the vertex program and constant windows; the viewport in
-// c[58]/c[59]; the state groups dirty on a change of value; the combiners as psh's 57 words; the
-// surface decoded. A draw's fetch plan against the fetch of each vertex alone, on random formats,
-// data and attribute sets, bit for bit.
+// c[58]/c[59]; the state groups dirty on a change of value; the combiners as psh's 57 words, and
+// every method the pixel program reads dirtying it; the surface decoded. A draw's fetch plan
+// against the fetch of each vertex alone, on random formats, data and attribute sets, bit for bit.
 #include <math.h>
 #include <string.h>
 
 #include "greatest.h"
 #include "nv2a_test_util.h"
+#include "wl/xbox/nv2a_pipeline.h"
 
 // ---- a backend that keeps each draw's vertices -----------------------------------------------
 
@@ -487,6 +488,74 @@ TEST combiners_as_the_pixel_shader_words(void) {
     PASS();
 }
 
+// (the pixel program's inputs as the backend reads them: the combiners' words and the textures,
+// every stage bound)
+static void pixel_inputs(const WlNv2aKelvin *k, uint32_t words[WL_XBOX_PSH_WORDS],
+                         WlXboxPshTextures *textures) {
+    static WlNv2aTexEntry entries[WL_NV2A_TEXTURES];
+    const WlNv2aTexEntry *bound[WL_NV2A_TEXTURES];
+    unsigned stage;
+
+    for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
+        entries[stage].contents = 1;
+        bound[stage] = &entries[stage];
+    }
+    wl_nv2a_psh_words(k, words);
+    wl_nv2a_psh_textures(k, bound, textures);
+}
+
+TEST every_input_of_the_pixel_program_dirties_it(void) {
+    TGuest g;
+    WlNv2aKelvin *k;
+    uint32_t method, before[WL_XBOX_PSH_WORDS], after[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures_before, textures_after;
+    unsigned inputs = 0;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    k = (WlNv2aKelvin *)wl_nv2a_kelvin(g.dev);
+    // (every stage a 2D texture, so that the textures are read)
+    t_m1(&g, WL_NV2A_K_SET_SHADER_STAGE_PROGRAM, 0x00008421u);
+    t_kick(&g);
+    // each method whose value the inputs read, found by changing its value alone, then sent with
+    // that value: the pixel program dirty, and nothing else of it read
+    for (method = 0; method < WL_NV2A_K_METHODS; method += 4) {
+        uint32_t old = k->raw[method >> 2];
+        bool read;
+
+        pixel_inputs(k, before, &textures_before);
+        k->raw[method >> 2] = ~old;
+        pixel_inputs(k, after, &textures_after);
+        k->raw[method >> 2] = old;
+        read = memcmp(before, after, sizeof before) != 0 ||
+               memcmp(&textures_before, &textures_after, sizeof textures_before) != 0;
+        if (!read) {
+            continue;
+        }
+        inputs++;
+        k->dirty = 0;
+        t_m1(&g, method, ~old);
+        t_kick(&g);
+        if (!(k->dirty & WL_NV2A_DIRTY_PIXEL)) {
+            FAILm("an input of the pixel program does not dirty it");
+        }
+        pixel_inputs(k, after, &textures_after);
+        ASSERT(memcmp(before, after, sizeof before) != 0 ||
+               memcmp(&textures_before, &textures_after, sizeof textures_before) != 0);
+        t_m1(&g, method, old);
+        t_kick(&g);
+    }
+    // psh's 57 words (the stage programs among them), the fog's switch and colour
+    ASSERT_EQ(59u, inputs);
+    // and a value written as it was: not dirty
+    k->dirty = 0;
+    t_m1(&g, WL_NV2A_K_SET_COMBINER_FACTOR0, k->raw[WL_NV2A_K_SET_COMBINER_FACTOR0 >> 2]);
+    t_m1(&g, WL_NV2A_K_SET_BLEND_ENABLE, 1u ^ k->raw[WL_NV2A_K_SET_BLEND_ENABLE >> 2]);
+    t_kick(&g);
+    ASSERT_EQ((uint32_t)WL_NV2A_DIRTY_RASTER, k->dirty);
+    t_destroy(&g);
+    PASS();
+}
+
 TEST surface_decoded(void) {
     TGuest g;
     WlNv2aSurface s;
@@ -617,6 +686,7 @@ SUITE(kelvin_suite) {
     RUN_TEST(program_and_constant_windows);
     RUN_TEST(dirty_on_a_change_of_value);
     RUN_TEST(combiners_as_the_pixel_shader_words);
+    RUN_TEST(every_input_of_the_pixel_program_dirties_it);
     RUN_TEST(surface_decoded);
     RUN_TEST(fetch_plan_matches_the_fetch_of_each_vertex);
 }
