@@ -21,6 +21,7 @@ writes back when the emulation stops; --sd-out DIR copies out of it what is new 
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -272,9 +273,18 @@ def find_dolphin(explicit) -> Path:
 
 
 def copy_tree(source: Path, destination: Path) -> None:
-    """contents only: a Windows drive mounted in WSL refuses the permission bits copytree copies.
-    A file already there with the same size, copied since the source last changed, is kept, and what the source lacks is removed,
-    so a large card (a game's data) is copied once, not at every run"""
+    """contents only: a Windows drive mounted in WSL refuses the permission bits copytree copies, and the setting of
+    a file's times. A record beside the copy (<destination>.copied.json) keeps, for each file copied, its source's size
+    and time and the copy's own time just after it was written. A file whose source and copy both still match is kept,
+    so a large card (a game's data) is copied once, not at every run; what the source lacks is removed. A file a run
+    wrote (Dolphin syncs the card back into the copy when it stops) has another time and is copied again, so what an
+    earlier run wrote, or left half written, never reaches the next run"""
+    record_path = destination.with_name(destination.name + ".copied.json")
+    try:
+        record = json.loads(record_path.read_text())
+    except (FileNotFoundError, ValueError):
+        record = {}
+    copied = {}
     wanted = set()
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)
@@ -284,20 +294,24 @@ def copy_tree(source: Path, destination: Path) -> None:
             target.mkdir(parents=True, exist_ok=True)
             continue
         status = path.stat()
+        key = relative.as_posix()
         try:
             present = target.stat()
-            if present.st_size == status.st_size and present.st_mtime >= status.st_mtime:
+            if record.get(key) == [status.st_size, status.st_mtime_ns, present.st_mtime_ns]:
+                copied[key] = record[key]
                 continue
         except FileNotFoundError:
             pass
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, target)
+        copied[key] = [status.st_size, status.st_mtime_ns, target.stat().st_mtime_ns]
     for path in sorted(destination.rglob("*"), reverse=True):
         if path.relative_to(destination) not in wanted:
             if path.is_dir():
                 shutil.rmtree(path, ignore_errors=True)
             else:
                 path.unlink(missing_ok=True)
+    record_path.write_text(json.dumps(copied))
 
 
 SMALL_FILE = 1 << 20
@@ -539,7 +553,10 @@ def main() -> int:
         frames = sorted((user / "Dump" / "Frames").glob("*.png"))
         args.dump_frames.mkdir(parents=True, exist_ok=True)
         for frame in frames:
-            shutil.copyfile(frame, args.dump_frames / frame.name)
+            try:
+                shutil.copyfile(frame, args.dump_frames / frame.name)
+            except FileNotFoundError:  # (removed under us: another run with the same --name started)
+                pass
         print(f"frames: {len(frames)} in {args.dump_frames}")
     if args.dump_audio:
         waves = sorted((user / "Dump" / "Audio").glob("*.wav"))
@@ -550,7 +567,7 @@ def main() -> int:
     if not args.keep_work:
         # the run's copies (the card's folder, its image, the program, the dumps) are gigabytes per
         # run name and are made again by the next run; the logs and the configuration stay
-        for path in (work / "sd", work / "sd.raw", program, user / "Dump"):
+        for path in (work / "sd", work / "sd.copied.json", work / "sd.raw", program, user / "Dump"):
             if path.is_dir():
                 shutil.rmtree(path, ignore_errors=True)
             elif path.exists():
