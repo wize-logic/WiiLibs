@@ -1590,11 +1590,13 @@ static void pr_fused_epilogue(void) {
             values[1] = pr_fused_op("fmul", pr_fused_sphere(4), length2, -1);
             pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
             pr_text("bng %s", edge);
+            /* (rounded to single by frsp, as the general path's (float): stfs of a double cuts its
+            mantissa on Broadway, one ulp low for about half the values) */
             q = pr_fused_op("fmul", half, pr_fused_root(q), -1);
-            pr_fused_store(pr_fused_op("fadd", pr_fused_op("fmul", st, q, -1), half, -1), "stfs @0, %d(%%[ad])",
-                           4 * word);
-            pr_fused_store(pr_fused_op("fadd", pr_fused_op("fmul", y, q, -1), half, -1), "stfs @0, %d(%%[ad])",
-                           4 * word + 4);
+            pr_fused_store(pr_fused_op("frsp", pr_fused_op("fadd", pr_fused_op("fmul", st, q, -1), half, -1), -1, -1),
+                           "stfs @0, %d(%%[ad])", 4 * word);
+            pr_fused_store(pr_fused_op("frsp", pr_fused_op("fadd", pr_fused_op("fmul", y, q, -1), half, -1), -1, -1),
+                           "stfs @0, %d(%%[ad])", 4 * word + 4);
             pr_text("b %s", done);
             pr_place_label(other);
             pr_fused_store(pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF), "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
