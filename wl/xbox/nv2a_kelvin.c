@@ -272,6 +272,49 @@ static inline void store_word(float *out, const uint8_t *data) {
     memcpy(out, &w, sizeof w);
 }
 
+// shorts normalized and bytes normalized, `size` (1 to 4) of them a vertex: made once for each size (a
+// constant there), so the components' loop is unrolled and its constants are loaded once a run
+static inline __attribute__((always_inline)) void fetch_s1(const uint8_t *base, uint32_t stride,
+                                                             const uint32_t *elements, uint32_t run,
+                                                             float (*in)[WL_NV2A_ATTRIBS][4], unsigned attribute,
+                                                             unsigned size) {
+    uint32_t n;
+    unsigned c;
+
+    for (n = 0; n < run; n++) {
+        const uint8_t *data = base + (size_t)elements[n] * stride;
+        float *out = in[n][attribute];
+
+        out[1] = out[2] = 0.0f;
+        out[3] = 1.0f;
+        for (c = 0; c < size; c++) {
+            // (normalized's own operations, the integer made a float by its bits)
+            float result = small_int_float((int16_t)wl_rd_le16(data + 2 * c)) * (1.0f / 32767.0f);
+
+            out[c] = result < -1.0f ? -1.0f : result;
+        }
+    }
+}
+
+static inline __attribute__((always_inline)) void fetch_ub(const uint8_t *base, uint32_t stride,
+                                                             const uint32_t *elements, uint32_t run,
+                                                             float (*in)[WL_NV2A_ATTRIBS][4], unsigned attribute,
+                                                             unsigned size) {
+    uint32_t n;
+    unsigned c;
+
+    for (n = 0; n < run; n++) {
+        const uint8_t *data = base + (size_t)elements[n] * stride;
+        float *out = in[n][attribute];
+
+        out[1] = out[2] = 0.0f;
+        out[3] = 1.0f;
+        for (c = 0; c < size; c++) {
+            out[c] = g_byte_float[data[c]];
+        }
+    }
+}
+
 void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, const uint32_t *vertices,
                             uint32_t count, float (*inputs)[WL_NV2A_ATTRIBS][4]) {
     uint32_t elements[WL_NV2A_FETCH_BATCH];
@@ -300,7 +343,7 @@ void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw,
         for (i = 0; i < plan->count; i++) {
             const uint8_t *base = plan->streamed[i].data;
             uint32_t stride = plan->streamed[i].stride;
-            unsigned attribute = plan->streamed[i].attribute, size = plan->streamed[i].size, c;
+            unsigned attribute = plan->streamed[i].attribute, size = plan->streamed[i].size;
 
             // (as wl_nv2a_attrib_decode widens them: the components left out 0, w 1)
             switch (plan->streamed[i].format) {
@@ -370,30 +413,19 @@ void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw,
                 }
                 break;
             case FETCH_S1:
-                for (n = 0; n < run; n++) {
-                    const uint8_t *data = base + (size_t)elements[n] * stride;
-                    float *out = in[n][attribute];
-
-                    out[1] = out[2] = 0.0f;
-                    out[3] = 1.0f;
-                    for (c = 0; c < size; c++) {
-                        // (normalized's own operations, the integer made a float by its bits)
-                        float result = small_int_float((int16_t)wl_rd_le16(data + 2 * c)) * (1.0f / 32767.0f);
-
-                        out[c] = result < -1.0f ? -1.0f : result;
-                    }
+                switch (size) {
+                case 1: fetch_s1(base, stride, elements, run, in, attribute, 1); break;
+                case 2: fetch_s1(base, stride, elements, run, in, attribute, 2); break;
+                case 3: fetch_s1(base, stride, elements, run, in, attribute, 3); break;
+                default: fetch_s1(base, stride, elements, run, in, attribute, 4); break;
                 }
                 break;
             case FETCH_UB:
-                for (n = 0; n < run; n++) {
-                    const uint8_t *data = base + (size_t)elements[n] * stride;
-                    float *out = in[n][attribute];
-
-                    out[1] = out[2] = 0.0f;
-                    out[3] = 1.0f;
-                    for (c = 0; c < size; c++) {
-                        out[c] = g_byte_float[data[c]];
-                    }
+                switch (size) {
+                case 1: fetch_ub(base, stride, elements, run, in, attribute, 1); break;
+                case 2: fetch_ub(base, stride, elements, run, in, attribute, 2); break;
+                case 3: fetch_ub(base, stride, elements, run, in, attribute, 3); break;
+                default: fetch_ub(base, stride, elements, run, in, attribute, 4); break;
                 }
                 break;
             default:
