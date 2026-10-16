@@ -12,6 +12,7 @@
 #include "wl/base/endian.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/mem_census.h"
+#include "wl/platform/net_stream.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/hwcount.h"
 #include "wl/platform/profile_arm.h"
@@ -24,6 +25,7 @@
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/play.h"
+#include "wl/xboxrt/runopts.h"
 #include "wl/xboxrt/thread.h"
 #include "wl/xboxrt/xbe.h"
 
@@ -436,8 +438,25 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     (void)log_dir;
     wl_platform_fs_mount(WL_DEVICE_SD);
 #endif
+    // ---- the run's options (runopts.h): the command line and netrun.txt choose the play setting and
+    // flag files as if they were in the title folder; net= opens the remote log, which also sends
+    // what the run writes in the title folder and its play folder
+    WlXbRunOptions run;
+    wl_xb_run_options_load(cfg->title_dir, cfg->arg_count, cfg->args, &run);
+    if (run.net[0] != '\0') {
+        wl_platform_log_init(NULL); // (the platform's sink feeds the stream; the host has not installed it)
+        WlResult nr = wl_net_stream_open(run.net, run.name);
+        if (nr == WL_OK) {
+            (void)wl_net_stream_watch_files(cfg->title_dir, "play");
+        } else {
+            WL_LOG_E(TAG, "net=%s: %s", run.net, wl_result_name(nr));
+        }
+    }
     WL_LOG_I(TAG, "title %s, data %s", xbe_path, data_dir);
-    const char *play = play_setting(cfg);
+    if (run.virtual_files > 0u || run.play[0] != '\0') {
+        WL_LOG_I(TAG, "run options: %u files, play \"%s\"", (unsigned)run.virtual_files, run.play);
+    }
+    const char *play = run.play[0] != '\0' ? run.play : play_setting(cfg);
     if (wl_xb_bench_setting(play)) {
         return bench_boot(cfg, data_dir, play);
     }
