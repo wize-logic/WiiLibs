@@ -1108,13 +1108,19 @@ static void pr_instruction(const WlXboxVshInstruction *in, int mode) {
         pr_new_label(slow, sizeof(slow));
         pr_new_label(store, sizeof(store));
         pr_new_label(whole, sizeof(whole));
+        /* (floor: fctiwz's own for y at least 0, a NaN, or of 2^23 and more; else y rounded to
+        a whole number by - 2^23 + 2^23, less 1 when that is above y) */
         y = pr_op3("fadds", mac[0].value, pr_k(1, PRK_ARL), -1);
+        values[0] = y;
+        values[1] = pr_k(0, PRK_ZERO);
+        pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
+        pr_text("bnl %s", slow);
         z = pr_op3("fabs", y, -1, -1);
         values[0] = z;
         values[1] = big;
         pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
         pr_text("bnl %s", slow);
-        w = pr_op3("fsel", y, big, minus);
+        w = minus;
         values[0] = z;
         values[1] = y;
         values[2] = w;
@@ -1333,6 +1339,58 @@ static int pr_fused_components(unsigned format) {
     return 0;
 }
 
+/* an array of packed normals (the fetch's tables in %[t11], %[t10]) */
+static int pr_fused_cmp(void) {
+    int n;
+
+    for (n = 0; n < 16; n++)
+        if (pr_fuse->format[n] == WL_XBOX_VSH_FUSED_CMP)
+            return 1;
+    return 0;
+}
+
+/* the arrays whose element 0 and stride are operands (bit n: v[n]'s): as many as GCC's 30
+operands allow past the others (a "+" operand counts twice; %[c2] and %[fdata] counted when
+they may be needed) */
+static unsigned pr_fused_held;
+
+static void pr_fused_operands(const WlXboxVshProgram *program, const unsigned *needs, int reused) {
+    int left = 30 - (2 + 3 + 2 + 2 + 1 + (reused ? 2 : 0)) - 6 - 2 * pr_fused_cmp(), all = 0, n, which;
+    unsigned long index;
+
+    /* (%[c2]: a row from 127 on read by its number, as pr_constant_row reads it) */
+    for (index = 0; index < program->count; index++) {
+        const WlXboxVshInstruction *in = &program->instructions[index];
+
+        for (which = 0; which < 3; which++)
+            if (needs[index] && in->operands[which].mux == _mux_constant && !in->relative && in->constant >= 127) {
+                left--;
+                index = program->count - 1;
+                break;
+            }
+    }
+    pr_fused_held = 0;
+    for (n = 0; n < 16; n++)
+        all += 2 * (pr_fuse->format[n] != WL_XBOX_VSH_FUSED_NONE);
+    if (all > left)
+        left--;
+    for (n = 0; n < 16; n++)
+        if (pr_fuse->format[n] != WL_XBOX_VSH_FUSED_NONE && left >= 2) {
+            pr_fused_held |= 1u << n;
+            left -= 2;
+        }
+}
+
+/* %[fdata] needed: an array not held */
+static int pr_fused_fdata(void) {
+    int n;
+
+    for (n = 0; n < 16; n++)
+        if (pr_fuse->format[n] != WL_XBOX_VSH_FUSED_NONE && !(pr_fused_held & (1u << n)))
+            return 1;
+    return 0;
+}
+
 /* the floats and doubles of WlXboxVshFused */
 static int pr_fused_pack(int kind, int index) {
     return pr_load(kind, "%[f]", (int)offsetof(WlXboxVshFused, pack) + 4 * index, 1);
@@ -1343,7 +1401,8 @@ static int pr_fused_sphere(int index) {
 }
 
 /* (before the loop: the GQRs; the outputs no instruction writes, once) */
-static void pr_fused_start(const WlXboxVshProgram *program) {
+static void pr_fused_start(const WlXboxVshProgram *program, const unsigned *needs, int reused) {
+    pr_fused_operands(program, needs, reused);
     pr_op(1, 0, 0, NULL, "mfspr 0, 918");
     pr_op(1, 0, 0, NULL, "stw 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, saved));
     pr_op(1, 0, 0, NULL, "mfspr 0, 919");
@@ -1412,10 +1471,16 @@ static void pr_fused_prologue(void) {
 
         if (format == WL_XBOX_VSH_FUSED_NONE)
             continue;
-        pr_text("lwz %%[ad], %%[fdata]+%%[ptr]*%d(%%[f])", n);
-        pr_text("lwz 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, stride) + 4 * n);
-        pr_text("mullw 0, 0, %%[g]");
-        pr_text("add %%[ad], %%[ad], 0");
+        /* (its element 0 and stride in registers, %[dn] and %[sn], while GCC's 30 operands allow) */
+        if (pr_fused_held & (1u << n)) {
+            pr_text("mullw 0, %%[s%d], %%[g]", n);
+            pr_text("add %%[ad], %%[d%d], 0", n);
+        } else {
+            pr_text("lwz %%[ad], %%[fdata]+%%[ptr]*%d(%%[f])", n);
+            pr_text("lwz 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, stride) + 4 * n);
+            pr_text("mullw 0, 0, %%[g]");
+            pr_text("add %%[ad], %%[ad], 0");
+        }
         if (format >= WL_XBOX_VSH_FUSED_F1 && format <= WL_XBOX_VSH_FUSED_F4) {
             size = (int)(format - WL_XBOX_VSH_FUSED_F1) + 1;
             for (c = 0; c < size; c++) {
@@ -1428,14 +1493,12 @@ static void pr_fused_prologue(void) {
             /* (11, 11 and 10 bits through the fetch's tables) */
             static const char *const fields[3] = {"2, 19, 29", "23, 19, 29", "12, 20, 29"};
 
-            pr_text("lwbrx %%[x], 0, %%[ad]");
+            pr_text("lwbrx %%[ad], 0, %%[ad]");
             for (c = 0; c < 3; c++) {
                 int value;
 
-                if (c != 1)
-                    pr_text("lwz %%[ad], %%[fdata]+%%[ptr]*%d(%%[f])", c == 0 ? 17 : 18);
-                pr_text("rlwinm 0, %%[x], %s", fields[c]);
-                value = pr_fused_new("lfsx @0, %%[ad], 0");
+                pr_text("rlwinm 0, %%[ad], %s", fields[c]);
+                value = pr_fused_new("lfsx @0, %s, 0", c < 2 ? "%[t11]" : "%[t10]");
                 pr_fused_store(value, "stfs @0, %d(%%[v])", at + 4 * c);
             }
         } else if (format >= WL_XBOX_VSH_FUSED_S1 && format < WL_XBOX_VSH_FUSED_UB) {
@@ -1716,7 +1779,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     /* (fused: the vertex's inputs read from its arrays first; the first
     vertex's prefix always made) */
     if (pr_fuse) {
-        pr_fused_start(program);
+        pr_fused_start(program, needs, reused);
         if (reused) {
             pr_fused_prologue();
             pr_forget();
@@ -2003,12 +2066,21 @@ static void pr_print(FILE *out, int reused) {
     unsigned used = pr_used;
     int n, k;
 
-    if (pr_fuse)
+    if (pr_fuse) {
+        /* (each array's element 0 and stride, and the packed normal's tables, in registers; the
+        count through slot, live unused: GCC's 30 operands and the GPRs) */
         fprintf(out, "\tif (count) {\n\t\tconst char *vp = (const char *)fused->inputs[1];\n"
                      "\t\tconst char *pvp = (const char *)fused->inputs[0];\n\t\tchar *op = (char *)&fused->output;\n"
                      "\t\tconst uint32_t *ep = fused->elements;\n\t\tuint32_t *const *wp = fused->words;\n"
-                     "\t\tint slot[2];\n\t\tlong g, ra, a0, ad, x;\n\n\t\t(void)pvp;\n");
-    else
+                     "\t\tint slot[2];\n\t\tlong g, ra, a0, ad;\n");
+        for (k = 0; k < 16; k++)
+            if (pr_fused_held & (1u << k))
+                fprintf(out, "\t\tconst char *d%d = (const char *)fused->data[%d];\n\t\tlong s%d = (long)fused->stride[%d];\n",
+                        k, k, k, k);
+        if (pr_fused_cmp())
+            fprintf(out, "\t\tconst float *t11 = fused->cmp11, *t10 = fused->cmp10;\n");
+        fprintf(out, "\n\t\t(void)pvp;\n\t\t(void)live;\n\t\tslot[0] = (int)count;\n");
+    } else
         fprintf(out, "\tif (count) {\n\t\tconst char *vp = (const char *)vs;\n\t\tchar *op = (char *)os;\n"
                      "\t\tint slot[2];\n\t\tlong g, ra, a0;\n\n");
     fprintf(out, "\t\t__asm__ volatile(\n");
@@ -2027,7 +2099,10 @@ static void pr_print(FILE *out, int reused) {
                             pr_need_values[k], 27 - k, 4 + k, 4 + k);
                 fprintf(out, "\t\t\t\"mtcrf 127, %%[g]\\n\\t\"\n");
             }
-            fprintf(out, "\t\t\t\"mtctr %%[n]\\n\\t\"\n");
+            if (pr_fuse)
+                fprintf(out, "\t\t\t\"lwz 0, 0(%%[slot])\\n\\t\"\n\t\t\t\"mtctr 0\\n\\t\"\n");
+            else
+                fprintf(out, "\t\t\t\"mtctr %%[n]\\n\\t\"\n");
             if (pr_first[0])
                 fprintf(out, "\t\t\t\"b %s\\n\\t\"\n", pr_first);
             continue;
@@ -2059,16 +2134,28 @@ static void pr_print(FILE *out, int reused) {
         }
         fprintf(out, "\\n\\t\"\n");
     }
-    fprintf(out, "\t\t\t: [v] \"+b\"(vp), [o] \"+b\"(op), [g] \"=&r\"(g), [ra] \"=&b\"(ra), [a0] \"=&r\"(a0)");
     if (pr_fuse)
-        fprintf(out, ",\n\t\t\t  [e] \"+b\"(ep), [w] \"+b\"(wp), [ad] \"=&b\"(ad), [x] \"=&b\"(x)%s",
+        fprintf(out, "\t\t\t: [v] \"+b\"(vp), [g] \"=&r\"(g), [ra] \"=&b\"(ra), [a0] \"=&r\"(a0),\n"
+                     "\t\t\t  [e] \"+b\"(ep), [w] \"+b\"(wp), [ad] \"=&b\"(ad)%s",
                 reused ? ", [pv] \"+b\"(pvp)" : "");
-    fprintf(out, "\n\t\t\t: [c] \"b\"(c), [c2] \"b\"(c + 128), [k] \"b\"(wl_xbox_vsh_pairs_k), "
-                 "[live] \"r\"(live), [n] \"r\"(count), [slot] \"b\"(slot),\n");
-    if (pr_fuse)
-        fprintf(out, "\t\t\t  [f] \"b\"(fused), [ptr] \"i\"(sizeof(void *)), "
-                     "[fdata] \"i\"(offsetof(WlXboxVshFused, data))\n");
     else
+        fprintf(out, "\t\t\t: [v] \"+b\"(vp), [o] \"+b\"(op), [g] \"=&r\"(g), [ra] \"=&b\"(ra), [a0] \"=&r\"(a0)");
+    if (pr_fuse) {
+        fprintf(out, "\n\t\t\t: [o] \"b\"(op), [c] \"b\"(c), %s[k] \"b\"(wl_xbox_vsh_pairs_k), [slot] \"b\"(slot), "
+                     "[f] \"b\"(fused), [ptr] \"i\"(sizeof(void *))%s",
+                pr_uses_c2 ? "[c2] \"b\"(c + 128), " : "",
+                pr_fused_fdata() ? ", [fdata] \"i\"(offsetof(WlXboxVshFused, data))" : "");
+        for (k = 0; k < 16; k++)
+            if (pr_fused_held & (1u << k))
+                fprintf(out, ",\n\t\t\t  [d%d] \"b\"(d%d), [s%d] \"r\"(s%d)", k, k, k, k);
+        if (pr_fused_cmp())
+            fprintf(out, ",\n\t\t\t  [t11] \"b\"(t11), [t10] \"b\"(t10)");
+        fprintf(out, "\n");
+    } else {
+        fprintf(out, "\n\t\t\t: [c] \"b\"(c), [c2] \"b\"(c + 128), [k] \"b\"(wl_xbox_vsh_pairs_k), "
+                     "[live] \"r\"(live), [n] \"r\"(count), [slot] \"b\"(slot),\n");
+    }
+    if (!pr_fuse)
         fprintf(out, "\t\t\t  [vs] \"i\"(sizeof(vs[0])), [os] \"i\"(sizeof(*os)),\n");
     if (pr_fuse)
         fprintf(out, "\t\t\t: \"r0\", \"cr0\", \"cr1\", \"cr2\", \"cr3\", \"cr4\", \"cr5\", "
@@ -2087,5 +2174,5 @@ static void pr_print(FILE *out, int reused) {
         if (used & (1u << k))
             fprintf(out, ", \"fr%d\"", k);
     fprintf(out, ");\n\t\t(void)g;\n\t\t(void)ra;\n\t\t(void)a0;\n%s\t}\n",
-            pr_fuse ? "\t\t(void)ad;\n\t\t(void)x;\n" : "");
+            pr_fuse ? "\t\t(void)ad;\n" : "");
 }
