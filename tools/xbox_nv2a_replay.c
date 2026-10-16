@@ -50,6 +50,8 @@
 //               is kept from one run to the next (through wl_nv2a_replay_stream), as a title's is
 //               from one frame to the next: a later run's records change (and --watch sees stored
 //               to) only what differs, not every block the capture holds
+//   --model-only  with --bench: the backend's calls do nothing (the model's work alone, as
+//               tools/qemu_icount.py counts the pusher's instructions without the draws')
 //   --xf-programs  with --bench: the draws and vertices of each way (wl_nv2a_gx_last_xf) by
 //               vertex program (its hash), the most vertices first (each draw's program hashed:
 //               not for timing)
@@ -91,6 +93,7 @@ typedef struct Tee {
 static FILE *g_programs;
 static bool g_xf_programs;
 static unsigned g_bench;
+static bool g_model_only;
 static bool g_stream;
 
 // a title's vertex programs compiled ahead of time, when a build of this tool links them (the C
@@ -784,6 +787,24 @@ static void timed_flip(void *user, const WlNv2aKelvin *k, uint32_t phys) {
     g_timed.others += seconds_now() - t0;
 }
 
+// (--model-only: a backend that does nothing)
+static uint32_t null_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
+    (void)user, (void)k, (void)draw;
+    return 0;
+}
+
+static void null_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
+    (void)user, (void)k, (void)flags;
+}
+
+static void null_frame(void *user, const WlNv2aKelvin *k) {
+    (void)user, (void)k;
+}
+
+static void null_flip(void *user, const WlNv2aKelvin *k, uint32_t phys) {
+    (void)user, (void)k, (void)phys;
+}
+
 // the vertex cache's work and memory, when it is on
 static void vertex_cache_line(const char *prefix) {
     WlNv2aVCacheStats vs;
@@ -871,6 +892,12 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
         return 1;
     }
     wl_nv2a_gx_backend(g_gx, &g_timed.inner);
+    if (g_model_only) {
+        g_timed.inner.draw = null_draw;
+        g_timed.inner.clear = null_clear;
+        g_timed.inner.frame_done = null_frame;
+        g_timed.inner.flip = null_flip;
+    }
     memset(&backend, 0, sizeof backend);
     backend.draw = timed_draw;
     backend.clear = timed_clear;
@@ -992,7 +1019,7 @@ static void fused_seen(void *user, unsigned long hash, const WlXboxVshFusedKey *
 
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
-                    "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] [--xf-programs] "
+                    "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] [--model-only] [--xf-programs] "
                     "[--stream] [--cpu-transform] [--no-fused] [--fused-forms] [--no-xf-light] [--overlap] [--png-alpha] [--survey]\n");
     return 2;
 }
@@ -1040,6 +1067,8 @@ int main(int argc, char **argv) {
             g_xf_programs = true;
         } else if (strcmp(argv[i], "--overlap") == 0) {
             g_gcfg.overlap = true;
+        } else if (strcmp(argv[i], "--model-only") == 0) {
+            g_model_only = true;
         } else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
             g_bench = (unsigned)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--programs") == 0 && i + 1 < argc) {
