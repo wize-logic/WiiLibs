@@ -171,6 +171,9 @@ typedef struct {
     bool no_quads;     // no quad of the targets (the back buffer's restore, the clears, the squeeze)
     bool no_z_restore; // the back buffer's restore puts back the colour only (no Z texture)
     bool no_copies;    // no texture copy out of the EFB (the display's copy stays)
+    // the texture coordinates in the vertex descriptor's slots of their own names, gaps and all
+    // (TEX0, TEX2, TEX3), as before they were sent in its first slots: the hang of such draws back
+    bool texcoord_gaps;
 } WlGxBisect;
 void wl_gx_bisect_set(const WlGxBisect *bisect);
 // The switches set (all off before wl_gx_bisect_set).

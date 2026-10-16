@@ -16,6 +16,11 @@
 //   --gx-dump   what GX is handed for its primitive N (counted as -v's "gx N" lines): the
 //               projection, viewport, scissor, raster state, TEV program and vertices (may be given
 //               several times)
+//   --gx-dump-all  with --gx-dump, every vertex of the primitive (not the first 12): its floats'
+//               bits, the position matrix and texgens, and each vertex's clip and window coordinates
+//   --gx-scan   every GX primitive's vertices checked for floats GX may not take (not finite,
+//               denormal, over 1e7) and for w at or near 0: a line for each primitive that has any;
+//               the primitives whose texture coordinates leave a gap counted
 //   --gx-textures DIR  with --gx-dump, each texture map of the primitive dumped as
 //               DIR/gx_N_map_M.png (its first level, decoded from GX's format)
 //   --psh-dump  the combiner words (psh.h's 57, in hex) of the replay's draw N, and what psh made of
@@ -65,6 +70,7 @@
 //               (wl/xboxrt/bench.h): the capture read a piece at a time (of an odd size, so records
 //               straddle the pieces), into a guest memory given as the caller's, written a 4 KB
 //               piece at a time where it differs; the output is the same as without
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,6 +153,9 @@ static struct {
 static unsigned g_efb_after_count;
 static uint32_t g_gx_dump[EFB_AFTER_MAX];
 static unsigned g_gx_dump_count;
+static bool g_gx_dump_all;
+static bool g_gx_scan;
+static unsigned long g_gx_scan_issues, g_gx_scan_vertices, g_gx_scan_gaps, g_gx_scan_gap_vertices;
 static const char *g_gx_textures_dir;
 static uint32_t g_gx_primitives;
 static uint32_t g_psh_dump[EFB_AFTER_MAX];
@@ -483,6 +492,161 @@ static void on_gx_draw(void *user, const WlGxSoftDraw *d) {
     printf("\n");
 }
 
+// a vertex's position through the position matrix and the projection, as GX's transform unit
+// takes it: clip coordinates and the window's (the viewport after the divide by w)
+static void gx_vertex_clip(const WlHostGxDirect *st, const WlGxDirectVertex *v, float clip[4], float window[3]) {
+    float p[3];
+    unsigned r;
+
+    for (r = 0; r < 3; r++) {
+        p[r] = st->position_matrix_set ? st->position_matrix[r][0] * v->position[0] +
+                                             st->position_matrix[r][1] * v->position[1] +
+                                             st->position_matrix[r][2] * v->position[2] + st->position_matrix[r][3]
+                                       : v->position[r];
+    }
+    for (r = 0; r < 4; r++) {
+        clip[r] = st->projection[r][0] * p[0] + st->projection[r][1] * p[1] + st->projection[r][2] * p[2] +
+                  st->projection[r][3];
+    }
+    if (st->orthographic) {
+        clip[3] = 1.0f;
+    }
+    window[0] = st->viewport[0] + st->viewport[2] * 0.5f * (1.0f + clip[0] / clip[3]);
+    window[1] = st->viewport[1] + st->viewport[3] * 0.5f * (1.0f - clip[1] / clip[3]);
+    window[2] = clip[2] / clip[3];
+}
+
+// a float GX may not take as it is: not finite, denormal, or huge
+static const char *gx_float_issue(float f) {
+    uint32_t bits;
+
+    memcpy(&bits, &f, 4);
+    if ((bits & 0x7F800000u) == 0x7F800000u) {
+        return (bits & 0x007FFFFFu) ? "nan" : "inf";
+    }
+    if ((bits & 0x7F800000u) == 0 && (bits & 0x007FFFFFu) != 0) {
+        return "denormal";
+    }
+    if (fabsf(f) > 1.0e7f) {
+        return "huge";
+    }
+    return NULL;
+}
+
+// the first of a vertex's floats GX is sent that it may not take: the position, the normal when
+// lit, the coordinates
+static const char *gx_vertex_issue(const WlHostGxDirect *st, const WlGxDirectVertex *v) {
+    const char *issue = NULL;
+    unsigned n;
+
+    for (n = 0; n < 3 && issue == NULL; n++) {
+        issue = gx_float_issue(v->position[n]);
+        if (issue == NULL && st->layout.lit) {
+            issue = gx_float_issue(v->normal[n]);
+        }
+    }
+    for (n = 0; n < 8 && issue == NULL; n++) {
+        if ((st->layout.texcoords | st->layout.texcoords_projected) & (1u << n)) {
+            issue = gx_float_issue(v->texcoord[n][0]);
+            if (issue == NULL) {
+                issue = gx_float_issue(v->texcoord[n][1]);
+            }
+            if (issue == NULL && (st->layout.texcoords_projected & (1u << n))) {
+                issue = gx_float_issue(v->texcoord_q[n]);
+            }
+        }
+    }
+    return issue;
+}
+
+// every vertex of a primitive: what GX is sent, its position's bits, and where it lands
+static void gx_vertices_dump(const WlHostGxDirect *st, const WlGxDirectVertex *v, uint32_t count) {
+    uint32_t i, r;
+    unsigned n;
+
+    if (st->position_matrix_set) {
+        printf("      position matrix:");
+        for (r = 0; r < 3; r++) {
+            printf(" [%g %g %g %g]", (double)st->position_matrix[r][0], (double)st->position_matrix[r][1],
+                   (double)st->position_matrix[r][2], (double)st->position_matrix[r][3]);
+        }
+        printf("\n");
+    }
+    for (n = 0; n < 8; n++) {
+        if (st->texgen[n].set) {
+            printf("      texgen %u: source %u [%g %g %g %g] [%g %g %g %g]\n", n, (unsigned)st->texgen[n].source,
+                   (double)st->texgen[n].m[0][0], (double)st->texgen[n].m[0][1], (double)st->texgen[n].m[0][2],
+                   (double)st->texgen[n].m[0][3], (double)st->texgen[n].m[1][0], (double)st->texgen[n].m[1][1],
+                   (double)st->texgen[n].m[1][2], (double)st->texgen[n].m[1][3]);
+        }
+    }
+    for (i = 0; i < count; i++) {
+        float clip[4], window[3];
+        uint32_t bits[3];
+        const char *issue = gx_vertex_issue(st, &v[i]);
+
+        gx_vertex_clip(st, &v[i], clip, window);
+        memcpy(bits, v[i].position, sizeof bits);
+        printf("      v%u: (%.9g, %.9g, %.9g) [%08x %08x %08x] c0 %02x%02x%02x%02x", (unsigned)i,
+               (double)v[i].position[0], (double)v[i].position[1], (double)v[i].position[2], (unsigned)bits[0],
+               (unsigned)bits[1], (unsigned)bits[2], v[i].color[0][0], v[i].color[0][1], v[i].color[0][2],
+               v[i].color[0][3]);
+        for (n = 0; n < 8; n++) {
+            if (st->layout.texcoords & (1u << n)) {
+                printf(" t%u (%.6g, %.6g)", n, (double)v[i].texcoord[n][0], (double)v[i].texcoord[n][1]);
+            }
+        }
+        printf(" | clip (%.6g %.6g %.6g %.6g) window (%.6g, %.6g, %.6g)%s%s\n", (double)clip[0], (double)clip[1],
+               (double)clip[2], (double)clip[3], (double)window[0], (double)window[1], (double)window[2],
+               issue != NULL ? " ISSUE " : "", issue != NULL ? issue : "");
+    }
+}
+
+// a primitive's vertices checked for floats GX may not take and for positions at or near the
+// eye's plane (w at or below 0, or under 1e-4): a line for each primitive that has any
+static void gx_vertices_scan(const WlHostGxDirect *st, const WlGxDirectVertex *v, uint32_t count, uint32_t index) {
+    uint32_t i, issues = 0, behind = 0, near = 0, first = UINT32_MAX;
+    float most = 0.0f;
+    const char *what = NULL;
+
+    for (i = 0; i < count; i++) {
+        float clip[4], window[3];
+        const char *issue = gx_vertex_issue(st, &v[i]);
+
+        gx_vertex_clip(st, &v[i], clip, window);
+        if (issue != NULL) {
+            issues++;
+            what = what != NULL ? what : issue;
+            first = first < i ? first : i;
+        }
+        if (clip[3] <= 0.0f) {
+            behind++;
+        } else if (clip[3] < 1.0e-4f) {
+            near++;
+        }
+        if (clip[3] > 0.0f && fabsf(window[0]) > most) {
+            most = fabsf(window[0]);
+        }
+        if (clip[3] > 0.0f && fabsf(window[1]) > most) {
+            most = fabsf(window[1]);
+        }
+    }
+    if (issues != 0 || near != 0 || most > 1.0e5f) {
+        printf("    gx %u scan: %u vertices, %u with a float GX may not take (%s, first v%u), %u behind the eye, %u "
+               "within 1e-4 of it, window coordinates up to %g\n",
+               (unsigned)index, (unsigned)count, (unsigned)issues, what != NULL ? what : "-",
+               (unsigned)(first == UINT32_MAX ? 0 : first), (unsigned)behind, (unsigned)near, (double)most);
+    }
+    g_gx_scan_issues += issues;
+    g_gx_scan_vertices += count;
+    // (a layout whose coordinates leave a gap: TEX0, TEX2 and TEX3, which the console's direct
+    // layer sends in the descriptor's first slots)
+    if ((st->layout.texcoords & (st->layout.texcoords + 1u)) != 0) {
+        g_gx_scan_gaps++;
+        g_gx_scan_gap_vertices += count;
+    }
+}
+
 // GX's primitive as it is handed over (the host's direct layer hook, before it is drawn)
 static void on_gx_primitive(void *user, WlGxDirectPrim prim, const WlGxDirectVertex *v, uint32_t count) {
     const WlHostGxDirect *st = wl_host_gx_direct();
@@ -492,6 +656,9 @@ static void on_gx_primitive(void *user, WlGxDirectPrim prim, const WlGxDirectVer
     bool dump = false;
 
     (void)user;
+    if (g_gx_scan) {
+        gx_vertices_scan(st, v, count, index);
+    }
     for (d = 0; d < g_gx_dump_count; d++) {
         dump = dump || g_gx_dump[d] == index;
     }
@@ -557,6 +724,10 @@ static void on_gx_primitive(void *user, WlGxDirectPrim prim, const WlGxDirectVer
                    s->alpha.in[3], (unsigned)s->alpha.op, (unsigned)s->alpha.bias, (unsigned)s->alpha.scale,
                    (unsigned)s->alpha.clamp, (unsigned)s->alpha.dest);
         }
+    }
+    if (g_gx_dump_all) {
+        gx_vertices_dump(st, v, count);
+        return;
     }
     for (i = 0; i < count && i < 12u; i++) {
         printf("      v%u: (%g, %g, %g) c0 %02x%02x%02x%02x c1 %02x%02x%02x%02x t0 (%g, %g) t1 (%g, %g) t2 (%g, %g) t4 %g\n",
@@ -1018,7 +1189,7 @@ static void fused_seen(void *user, unsigned long hash, const WlXboxVshFusedKey *
 }
 
 static int usage(void) {
-    fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
+    fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] [--gx-dump-all] [--gx-scan] "
                     "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] [--model-only] [--xf-programs] "
                     "[--stream] [--cpu-transform] [--no-fused] [--fused-forms] [--no-xf-light] [--overlap] [--png-alpha] [--survey]\n");
     return 2;
@@ -1051,6 +1222,10 @@ int main(int argc, char **argv) {
             g_efb_after[g_efb_after_count].draw = (uint32_t)strtoul(argv[++i], NULL, 0);
             g_efb_after[g_efb_after_count++].dir = argv[++i];
             gx = true;
+        } else if (strcmp(argv[i], "--gx-dump-all") == 0) {
+            g_gx_dump_all = true;
+        } else if (strcmp(argv[i], "--gx-scan") == 0) {
+            g_gx_scan = true;
         } else if (strcmp(argv[i], "--gx-textures") == 0 && i + 1 < argc) {
             g_gx_textures_dir = argv[++i];
         } else if (strcmp(argv[i], "--gx-dump") == 0 && i + 1 < argc && g_gx_dump_count < EFB_AFTER_MAX) {
@@ -1146,7 +1321,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         wl_nv2a_gx_backend(g_gx, &tee.b[tee.count++]);
-        if (g_gx_dump_count != 0) {
+        if (g_gx_dump_count != 0 || g_gx_scan) {
             wl_host_gx_direct_hook(on_gx_primitive, NULL);
         }
     }
@@ -1237,6 +1412,11 @@ int main(int argc, char **argv) {
                        l->texcoords_projected, l->lit);
             }
             printf("\n");
+            if (g_gx_scan) {
+                printf("GX scan: %lu of %lu vertices with a float GX may not take; %lu primitives (%lu vertices) "
+                       "with a gap in their texture coordinates\n",
+                       g_gx_scan_issues, g_gx_scan_vertices, g_gx_scan_gaps, g_gx_scan_gap_vertices);
+            }
             for (bit = 0; bit < WL_GX_CHECKS; bit++) {
                 if (st->check_draws[bit] != 0) {
                     printf("GX check: %u primitives (the first %u of %u): %s\n", (unsigned)st->check_draws[bit],

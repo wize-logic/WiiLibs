@@ -37,6 +37,10 @@ static struct {
     Mtx position;
     uint8_t texgen_set; // bit n: coordinate n has a matrix of its own
     uint8_t texgen_source[8];
+    // each coordinate's input as the transform unit numbers them: the vertex's coordinates in order
+    // (GX_TG_TEX0 + the coordinates the vertex sends before it; wl_gx_direct_layout)
+    uint8_t tex_input[8];
+    bool gaps_logged;
     float texgen[8][2][4];
     // a vertex of an indexed layout as the FIFO takes it: each item an index (0) or a number of
     // words; whether every attribute is indexed
@@ -200,7 +204,7 @@ static u8 input_of(const WlGxDirectLayout *layout, unsigned attribute, uint8_t w
 }
 
 void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
-    unsigned n, texgens = 0;
+    unsigned n, texgens = 0, texcoord_inputs;
 
     if (d.layout_known && memcmp(&d.layout, layout, sizeof d.layout) == 0) {
         return;
@@ -242,6 +246,25 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
             texgens = n + 1;
         }
     }
+    // (the coordinates the vertex sends go in the descriptor's first slots, in order, and each
+    // generator reads the input its coordinate went in. The transform unit is told how many
+    // coordinates a vertex has, not which (XF 0x1008), so a layout of TEX0, TEX2 and TEX3 has GX
+    // read TEX2's numbers as its input 1 and TEX3's as input 2, and coordinate 3 an input no vertex
+    // sends: the console's GPU stopped for good within the first few draws of such a layout (a10's
+    // and a30's benches alike), where Dolphin, which files each coordinate by its name, drew them.
+    // The bytes are the same either way. The switch gxtexgap puts the gaps back)
+    texcoord_inputs = 0;
+    for (n = 0; n < 8; n++) {
+        bool sent = (layout->texcoords & (1u << n)) != 0;
+
+        d.tex_input[n] = (u8)(GX_TG_TEX0 + (d.bisect.texcoord_gaps || !sent ? n : texcoord_inputs));
+        texcoord_inputs += sent ? 1u : 0u;
+    }
+    if (!d.gaps_logged && !d.bisect.texcoord_gaps && layout->texcoords != (1u << texcoord_inputs) - 1u) {
+        d.gaps_logged = true;
+        WL_LOG_I("GX", "texture coordinates %02x sent as the first %u of the vertex (the first layout with a gap)",
+                 (unsigned)layout->texcoords, texcoord_inputs);
+    }
     for (n = 0; n < texgens; n++) {
         if (layout->texcoords_projected & (1u << n)) {
             // (from the normal, binormal or tangent that carries it, through a 3x4 identity: GX
@@ -261,11 +284,11 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
             GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4, GX_TG_POS, GX_IDENTITY);
             continue;
         }
-        GX_SetVtxDesc((u8)(GX_VA_TEX0 + n),
+        GX_SetVtxDesc((u8)(GX_VA_TEX0 + (d.tex_input[n] - GX_TG_TEX0)),
                       input_of(layout, WL_GX_DIRECT_ARRAY_TEXCOORD0 + n, (layout->texcoord_s & (1u << n)) ? 1 : 2));
-        GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_TEX0 + n, (layout->texcoord_s & (1u << n)) ? GX_TEX_S : GX_TEX_ST, GX_F32,
-                         0);
-        GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4, GX_TG_TEX0 + n, GX_IDENTITY);
+        GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_TEX0 + (d.tex_input[n] - GX_TG_TEX0),
+                         (layout->texcoord_s & (1u << n)) ? GX_TEX_S : GX_TEX_ST, GX_F32, 0);
+        GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4, d.tex_input[n], GX_IDENTITY);
     }
     // (never no channel and no coordinate at once: the console's GPU stops for good on a primitive
     // with neither that follows others in the pipeline, where Dolphin draws it. One channel then,
@@ -537,7 +560,7 @@ void wl_gx_direct_texgen(unsigned n, WlGxDirectTexSource source, const float m[2
         }
         d.texgen_set &= (uint8_t)~(1u << n);
         GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4,
-                          (d.layout.texcoords & (1u << n)) ? (u32)(GX_TG_TEX0 + n) : (u32)GX_TG_POS, GX_IDENTITY);
+                          (d.layout.texcoords & (1u << n)) ? (u32)d.tex_input[n] : (u32)GX_TG_POS, GX_IDENTITY);
         wl_gx_wii_note_commands();
         return;
     }
@@ -552,7 +575,7 @@ void wl_gx_direct_texgen(unsigned n, WlGxDirectTexSource source, const float m[2
     memcpy(matrix, m, sizeof d.texgen[n]);
     GX_LoadTexMtxImm(matrix, (u32)(GX_TEXMTX0 + 3u * n), GX_MTX2x4);
     GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4,
-                      source == WL_GX_DIRECT_TG_POSITION ? (u32)GX_TG_POS : (u32)(GX_TG_TEX0 + n),
+                      source == WL_GX_DIRECT_TG_POSITION ? (u32)GX_TG_POS : (u32)d.tex_input[n],
                       (u32)(GX_TEXMTX0 + 3u * n));
     wl_gx_wii_note_commands();
 }
