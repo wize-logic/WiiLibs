@@ -44,6 +44,7 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `stop.h`, `stop.c`, `stop_backend.h` | the bring-up text console (libogc's, in one of the video's framebuffers) and the stop screen: a message on it and in the log, then a wait for HOME or START to leave; `wl_platform_missing_symbol` is what `tools/link_stubs.py` points its stubs at; `wii/stop_wii.c` and `host/stop_host.c` are the backends; see "Console and stop screen" |
 | `profile_arm.h`, `profile_arm.c` | arming the profiler from a control file (`profile.txt` in the program's folder): the settings' parser, the watcher thread that waits for the program's own readiness hooks, samples for a time and writes `profile<N>.txt`; see "Arming it from a file" under the sampling profiler |
 | `hwcount.h`, `hwcount.c`, `hwcount_app.c` | the console measuring itself: the Broadway's performance monitor (PMC1 to PMC4) and GX's counters read once a frame in rotating groups, medians a second, a verdict on what bounds the frame, marks and the FIFO's fill as a timeline; armed by `hwcount.txt`; `wii/hwcount_wii.c` is the Wii's machine; see "Hardware counters" |
+| `net_stream.h`, `net_stream.c` | the remote log: every log line and the files a run writes sent over one TCP connection to `tools/wii_net_run.py`, off the program's threads and free when off; see "The remote log" |
 | `net.h`, `net.c`, `net_internal.h` | IPv4 TCP and UDP sockets over IOS (libogc) or the host: addresses as host-order values, errors as results, poll for select, the network started in the background; `net.c` has the errno mapping and the address text; see below |
 | `gx_common.c` | GX helpers needing no hardware: texture sizes, sampler filter resolution, the ramp texture's image |
 | `gx_direct.h` | GX driven directly, for a renderer beyond `wl_gx`'s recipes and its one vertex layout (an emulated GPU's: `wl/xbox`'s NV2A backend): up to two colours and eight texture coordinates a vertex, drawn at once or a vertex at a time into the FIFO (or as the FIFO's own words, `wl_gx_direct_vertex_words`: the position's floats, each colour as 0xRRGGBBAA, the texture coordinates' floats, written as they are on the Wii; a batch of them in one call, `wl_gx_direct_vertices_words`), the transform unit's position matrix and 2x4 texture coordinate generators from a coordinate or the position (`wl_gx_direct_position_matrix`, `wl_gx_direct_texgen`; a layout's `texcoords_generated` for coordinates made from the position, not sent), projective coordinates divided at each pixel (a layout's `texcoords_projected`: up to three (s, t, q) sent after the position as the normal, binormal and tangent, each through a 3x4 generator), colour and alpha channels lit by the transform unit from the vertex's normal (a layout's `lit`, `wl_gx_direct_lighting`: the normal matrix, one light at infinity a channel, the signed dot product plus an ambient register, the host stub computing the same per vertex), any blend factors, its own projection, depth, alpha compare, cull, colour updates, textures on any map; it bypasses and invalidates `wl_gx`'s shadow. The first draw after `wl_gx_direct_begin` or `wl_gx_direct_flush_after` is preceded by eight vertices of zeros in its own format, the remedy for GX's transform unit hanging on a clipped primitive after an EFB copy, a token or a draw-done (libogc's `GX_Begin` sends nothing for `GX_MT_XF_FLUSH`; OpenCE-Wii's finding). Attributes can be indexed (`WlGxDirectLayout.indexed`): the vertex sends a 16-bit index (`wl_gx_direct_vertex_index`, or a draw's in one call, `wl_gx_direct_vertices_index`) and GX reads the position, normal, colour or texture coordinate from an array set with `wl_gx_direct_array` (big-endian floats and colour bytes, 32-byte aligned, written back from the cache), which geometry converted once costs the processor two bytes an attribute a vertex; `wl_gx_direct_arrays_changed` says memory an array came from has changed. A renderer that sets its own vertex descriptors and formats (indexed arrays, matrix indices: a Direct3D device's, OpenCE-Wii's) keeps the flush through `wl_gx_direct_vertex_format` (each direct attribute's size remembered) and `wl_gx_direct_flush_pending` / `wl_gx_direct_begin_format` (the strip sized by libogc's descriptor), and asks `wl_gx_direct_vertex_shape_ok` whether GX reads its vertices right (`gx_vertex.c` the sizes; `wii/gx_flush_wii.c`, libogc's GX alone, so a host harness over a stand-in links it). `wii/gx_direct_wii.c` (its stores into the write-gather pipe are the loops of `gx_pipe_words.h`: the pointer read once, a vertex of a known size without a loop counter, two indices as one 32-bit store; `test_platform_gx_pipe` checks every byte sent against the plain loops, `bench_gx_pipe` counts their instructions under `tools/qemu_icount.py`); `host/gx_direct_host.c` records what was asked (`host/gx_direct_host.h`) |
@@ -484,6 +485,57 @@ loopback (`tests/platform/test_platform_net.c`, also on the big-endian build) an
   console runner checks it when the network comes up (UDP and TCP to the console's own address),
   which needs a Dolphin with a network or a console. `wl_net_connect_result` reads `SO_ERROR`, whose
   numbering through IOS has not been checked against hardware.
+
+## The remote log (`net_stream.h`)
+
+A run on a console with no cable to a computer is started, watched and collected over Wi-Fi:
+`tools/wii_net_run.py` sends the DOL with wiiload, takes the log and the files the run writes, and
+sends `QUIT` when the run must end, so that the Homebrew Channel is there for the next one.
+
+```c
+wl_net_stream_open("192.168.1.20:7777", "a30 bench");  // or "listen:7777": the PC connects to the Wii
+wl_net_stream_watch_files("sd:/xbox/halo", "play");    // what the run writes there is sent when closed
+...
+wl_net_stream_close(3000);                              // END, after at most 3 s of flushing (also a shutdown hook)
+```
+
+- **Free when off.** The log sinks (`wii/log_wii.c`, the host's) test one atomic flag per line
+  (`wl_net_stream_tee`, `net_internal.h`). Open, a line is a copy into a 32 KB ring under a short lock.
+- **It never stalls the program.** One thread (priority of the system watcher, 24 KB stack) does all the
+  network work: brings the network up (`wl_net_start`), connects with retries a second apart (or listens),
+  and empties the ring. A ring that is full drops the new line and counts it; the next line that fits is
+  preceded by `[W][wlnet] N lines dropped`. A peer that takes nothing for `WL_NET_STREAM_STALL_MS` (3 s)
+  is let go: the lines in flight are counted as lost, the thread connects again and says so. The lines
+  logged before the first connection wait in the ring.
+- **Which end connects.** `host:port` (the program connects to a listener) or `listen:port` (it accepts the
+  PC). The second is for a PC behind a NAT, WSL2's for one; see `tools/wii_net_run.py`.
+- **The protocol.** Text lines, then raw bytes where a line says so: `HELLO WLNET1 <run>`, the log lines as the
+  sink formats them, `FILE <name> <size>` and that many bytes, and `END` last. A line of the log that would
+  start like a control line gets a space before it. From the PC: `QUIT`, which makes the program leave
+  (`wl_platform_exit(WL_EXIT_LOADER)`, so the shutdown hooks and the card's flush run). The thread hears it
+  whatever the title is doing, which is how a hung run is ended.
+- **The files.** `wl_net_stream_watch_files(root, dirs)` sends a file once it is closed (the written hook
+  below), when it is directly in `root` or in a subfolder named in `dirs`, no larger than 16 MB. The thread
+  reads it from the card when its turn comes; a file written again before then is sent once. The profiler's
+  dumps (`profileN.txt`, written with stdio) tell the hook themselves.
+- **The stop screen** (`wii/stop_wii.c`) leaves for the loader by itself 10 s after it appears while the
+  remote log is open, so an unattended run that crashes does not keep the Homebrew Channel away.
+- **Tests.** `test_platform_net_stream` over loopback (host, Release and big-endian): lines and files
+  arrive in the protocol's form, the escape, a full ring drops and says so, QUIT, the listen mode, and the
+  two file features below.
+
+## Virtual files and the written hook (`platform.h`)
+
+Two small things in the file API that the remote log and the run options (`wl/xboxrt/runopts.h`) rest on.
+A **virtual file** (`wl_platform_fs_virtual_set(path, data, size)`) exists only in memory under a path and
+answers like a file on the card: `exists`, `stat`, `open` for reading, `read_at`, `read_some_at`, `size`. It
+shadows a real file; writing to it is `WL_ERR_DENIED`. A program whose options are files in its folder (a
+flag file, a settings text) can so be given them in its command line, and the code that reads them does not
+change. Code that reads with stdio (the profiler's and the counters' settings loaders) asks
+`wl_platform_fs_virtual_get` first. The **written hook** (`wl_platform_fs_set_written_hook`) is called with
+the path of each file opened for writing and written to, once it is closed, and of each file
+`wl_platform_fs_rename` moved into place; code that writes with stdio calls `wl_platform_fs_notify_written`
+after `fclose`. It costs a pointer test per close when no hook is set. Tests: `test_platform_net_stream`.
 
 ## malloc that spills into MEM2 (`heap_overflow.h`)
 

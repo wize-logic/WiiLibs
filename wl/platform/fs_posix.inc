@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -22,9 +23,84 @@ struct WlPlatformFile {
     atomic_bool busy;
     int fd;
     uint64_t size;
+    const uint8_t *virt;        // a virtual file's bytes (fd is -1): read-only, see wl_platform_fs_virtual_set
+    bool dirty;                 // something was written through this handle
+    char wpath[WL_FS_PATH_MAX]; // the path of a file opened for writing while a written hook is set
 };
 
 static WlPlatformFile g_files[WL_FS_MAX_FILES];
+
+// ---- virtual files and the written hook (platform.h) ---------------------------------------------
+
+typedef struct {
+    char path[WL_FS_PATH_MAX];
+    uint8_t *data;
+    uint32_t size;
+} FsVirtual;
+
+static FsVirtual g_virtual[WL_FS_VIRTUAL_MAX];
+static atomic_uint g_virtual_count;
+static WlFsWrittenFn g_written_fn;
+static void *g_written_user;
+
+WlResult wl_platform_fs_virtual_set(const char *path, const void *data, uint32_t size) {
+    if (path == NULL || (data == NULL && size > 0u) || strlen(path) >= WL_FS_PATH_MAX ||
+        (strncmp(path, "sd:/", 4) != 0 && strncmp(path, "usb:/", 5) != 0)) {
+        return WL_ERR_ARG;
+    }
+    unsigned n = atomic_load(&g_virtual_count);
+    for (unsigned i = 0; i < n; i++) {
+        if (strcmp(g_virtual[i].path, path) == 0) {
+            return WL_ERR_STATE; // (set once: a reader may hold its bytes)
+        }
+    }
+    if (n >= WL_FS_VIRTUAL_MAX) {
+        return WL_ERR_LIMIT;
+    }
+    uint8_t *copy = malloc(size > 0u ? size : 1u);
+    if (copy == NULL) {
+        return WL_ERR_NOMEM;
+    }
+    if (size > 0u) {
+        memcpy(copy, data, size);
+    }
+    strcpy(g_virtual[n].path, path);
+    g_virtual[n].data = copy;
+    g_virtual[n].size = size;
+    atomic_store(&g_virtual_count, n + 1u); // (set from one thread, before the readers look)
+    return WL_OK;
+}
+
+bool wl_platform_fs_virtual_get(const char *path, const void **data, uint32_t *size) {
+    if (path == NULL) {
+        return false;
+    }
+    unsigned n = atomic_load(&g_virtual_count);
+    for (unsigned i = 0; i < n; i++) {
+        if (strcmp(g_virtual[i].path, path) == 0) {
+            if (data != NULL) {
+                *data = g_virtual[i].data;
+            }
+            if (size != NULL) {
+                *size = g_virtual[i].size;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void wl_platform_fs_set_written_hook(WlFsWrittenFn fn, void *user) {
+    g_written_user = user;
+    g_written_fn = fn; // (user first: set from the main thread before the files it watches)
+}
+
+void wl_platform_fs_notify_written(const char *path) {
+    WlFsWrittenFn fn = g_written_fn;
+    if (fn != NULL && path != NULL) {
+        fn(g_written_user, path);
+    }
+}
 
 static WlResult fs_errno_result(int e) {
     return (e == ENOENT || e == ENOTDIR) ? WL_ERR_NOT_FOUND : WL_ERR_IO;
@@ -44,6 +120,23 @@ static WlPlatformFile *fs_slot_claim(void) {
 WlResult wl_platform_fs_open(const char *path, WlPlatformFileMode mode, WlPlatformFile **out) {
     if (path == NULL || out == NULL) {
         return WL_ERR_ARG;
+    }
+    if (mode == WL_FILE_READ) {
+        const void *bytes;
+        uint32_t vsize;
+        if (wl_platform_fs_virtual_get(path, &bytes, &vsize)) {
+            WlPlatformFile *vf = fs_slot_claim();
+            if (vf == NULL) {
+                return WL_ERR_LIMIT;
+            }
+            vf->fd = -1;
+            vf->size = vsize;
+            vf->virt = bytes;
+            vf->dirty = false;
+            vf->wpath[0] = '\0';
+            *out = vf;
+            return WL_OK;
+        }
     }
     char real[WL_FS_PATH_MAX + 64];
     WlResult r = fs_resolve(path, real, sizeof real);
@@ -76,6 +169,12 @@ WlResult wl_platform_fs_open(const char *path, WlPlatformFileMode mode, WlPlatfo
     }
     f->fd = fd;
     f->size = (uint64_t)st.st_size;
+    f->virt = NULL;
+    f->dirty = false;
+    f->wpath[0] = '\0';
+    if (mode != WL_FILE_READ && g_written_fn != NULL) {
+        snprintf(f->wpath, sizeof f->wpath, "%s", path);
+    }
     *out = f;
     return WL_OK;
 }
@@ -91,6 +190,10 @@ WlResult wl_platform_fs_read_at(WlPlatformFile *file, uint64_t offset, void *dst
         return WL_ERR_RANGE;
     }
     if (size == 0) {
+        return WL_OK;
+    }
+    if (file->virt != NULL) {
+        memcpy(dst, file->virt + offset, size);
         return WL_OK;
     }
     if (lseek(file->fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
@@ -119,6 +222,10 @@ WlResult wl_platform_fs_write(WlPlatformFile *file, const void *src, uint32_t si
     if (file == NULL || (src == NULL && size > 0)) {
         return WL_ERR_ARG;
     }
+    if (file->virt != NULL) {
+        return WL_ERR_DENIED;
+    }
+    file->dirty = true;
     const uint8_t *p = src;
     uint32_t left = size;
     while (left > 0) {
@@ -146,7 +253,7 @@ WlResult wl_platform_fs_flush(WlPlatformFile *file) {
     if (file == NULL) {
         return WL_ERR_ARG;
     }
-    return fsync(file->fd) == 0 ? WL_OK : WL_ERR_IO;
+    return file->virt != NULL || fsync(file->fd) == 0 ? WL_OK : WL_ERR_IO;
 }
 
 uint64_t wl_platform_fs_size(const WlPlatformFile *file) {
@@ -157,9 +264,22 @@ void wl_platform_fs_close(WlPlatformFile *file) {
     if (file == NULL || !atomic_load(&file->busy)) {
         return;
     }
-    close(file->fd);
+    char written[WL_FS_PATH_MAX];
+    bool notify = file->dirty && file->wpath[0] != '\0';
+    if (notify) {
+        memcpy(written, file->wpath, sizeof written);
+    }
+    if (file->fd >= 0) {
+        close(file->fd);
+    }
     file->fd = -1;
+    file->virt = NULL;
+    file->dirty = false;
+    file->wpath[0] = '\0';
     atomic_store(&file->busy, false);
+    if (notify) {
+        wl_platform_fs_notify_written(written);
+    }
 }
 
 WlResult wl_platform_fs_rename(const char *from, const char *to) {
@@ -173,6 +293,7 @@ WlResult wl_platform_fs_rename(const char *from, const char *to) {
         return r;
     }
     if (rename(a, b) == 0) {
+        wl_platform_fs_notify_written(to);
         return WL_OK;
     }
     int e = errno;
@@ -182,6 +303,7 @@ WlResult wl_platform_fs_rename(const char *from, const char *to) {
     }
     // FAT cannot rename over an existing file: remove the target and try once more.
     if (stat(b, &st) == 0 && !S_ISDIR(st.st_mode) && unlink(b) == 0 && rename(a, b) == 0) {
+        wl_platform_fs_notify_written(to);
         return WL_OK;
     }
     return fs_errno_result(e);
@@ -216,6 +338,9 @@ WlResult wl_platform_fs_mkdir(const char *path) {
 bool wl_platform_fs_exists(const char *path) {
     char real[WL_FS_PATH_MAX + 64];
     struct stat st;
+    if (wl_platform_fs_virtual_get(path, NULL, NULL)) {
+        return true;
+    }
     return fs_resolve(path, real, sizeof real) == WL_OK && stat(real, &st) == 0;
 }
 
@@ -246,6 +371,10 @@ WlResult wl_platform_fs_write_at(WlPlatformFile *file, uint64_t offset, const vo
     if (offset > 0xFFFFFFFFull) {
         return WL_ERR_RANGE;
     }
+    if (file->virt != NULL) {
+        return WL_ERR_DENIED;
+    }
+    file->dirty = true;
     if (lseek(file->fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
         return WL_ERR_IO;
     }
@@ -267,6 +396,11 @@ WlResult wl_platform_fs_read_some_at(WlPlatformFile *file, uint64_t offset, void
     }
     if (offset + size > file->size) {
         size = (uint32_t)(file->size - offset);
+    }
+    if (file->virt != NULL) {
+        memcpy(dst, file->virt + offset, size);
+        *got = size;
+        return WL_OK;
     }
     if (lseek(file->fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
         return WL_ERR_IO;
@@ -295,6 +429,10 @@ WlResult wl_platform_fs_truncate(WlPlatformFile *file, uint64_t size) {
     if (size > 0xFFFFFFFFull) {
         return WL_ERR_RANGE;
     }
+    if (file->virt != NULL) {
+        return WL_ERR_DENIED;
+    }
+    file->dirty = true;
     if (ftruncate(file->fd, (off_t)size) != 0) {
         return WL_ERR_IO;
     }
@@ -314,6 +452,14 @@ WlResult wl_platform_fs_stat(const char *path, WlPlatformStat *out) {
         return WL_ERR_ARG;
     }
     char real[WL_FS_PATH_MAX + 64];
+    const void *vbytes;
+    uint32_t vsize;
+    if (wl_platform_fs_virtual_get(path, &vbytes, &vsize)) {
+        memset(out, 0, sizeof *out);
+        out->size = vsize;
+        out->read_only = true;
+        return WL_OK;
+    }
     WlResult r = fs_resolve(path, real, sizeof real);
     if (r != WL_OK) {
         return r;
@@ -329,6 +475,12 @@ WlResult wl_platform_fs_stat(const char *path, WlPlatformStat *out) {
 WlResult wl_platform_fs_fstat(WlPlatformFile *file, WlPlatformStat *out) {
     if (file == NULL || out == NULL) {
         return WL_ERR_ARG;
+    }
+    if (file->virt != NULL) {
+        memset(out, 0, sizeof *out);
+        out->size = file->size;
+        out->read_only = true;
+        return WL_OK;
     }
     struct stat st;
     if (fstat(file->fd, &st) != 0) {

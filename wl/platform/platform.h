@@ -816,6 +816,32 @@ WlResult wl_platform_fs_mkdir(const char *path);
 // device and a path the file API refuses.
 bool wl_platform_fs_exists(const char *path);
 
+// ---- Virtual files and the written hook ----
+// A virtual file is a read-only file that exists only in memory, under a path (device prefix
+// included) that the file API then answers exactly as for a file on the card: exists, stat, open
+// for reading, read, size. It shadows a real file of the same path. Made for a program's run
+// options, which are files in its folder (a flag file, a settings text) and can instead be given
+// in the command line (a Homebrew Channel's arguments): the code that reads the file does not
+// change. `data` is copied. Up to WL_FS_VIRTUAL_MAX; a path is set once (WL_ERR_STATE again),
+// from one thread before the code that reads them runs. WL_ERR_ARG for a path without a device
+// prefix or too long. Opening one for writing, removing or renaming it go to the real path.
+#define WL_FS_VIRTUAL_MAX 24u
+WlResult wl_platform_fs_virtual_set(const char *path, const void *data, uint32_t size);
+// The bytes of a virtual file (valid for ever), for code that reads files with the C library's
+// stdio and so cannot see them. False when `path` is not one.
+bool wl_platform_fs_virtual_get(const char *path, const void **data, uint32_t *size);
+
+// A function called with the path of each file written through this API once it is closed (opened
+// WRITE_NEW or READ_WRITE and written to, truncated or not), and of each file wl_platform_fs_rename
+// moved into place: the place for a remote copy of a program's results. It runs on the thread that
+// closed the file, so it must be short and may not use the file API on that path's handle. Code
+// that writes with the C library's stdio calls wl_platform_fs_notify_written itself after fclose.
+// One hook (NULL removes it); set it from the main thread before the files it watches are opened:
+// a file opened before is not reported. Costs one pointer test per close when none is set.
+typedef void (*WlFsWrittenFn)(void *user, const char *path);
+void wl_platform_fs_set_written_hook(WlFsWrittenFn fn, void *user);
+void wl_platform_fs_notify_written(const char *path);
+
 // ---- Files at offsets, sizes, directories (for code that ports another system's file API) ----
 // Writes all `size` bytes at `offset` (past the end the file grows; a gap reads as zeros) and
 // leaves the handle's position after them. WL_ERR_IO for a device error or a full card.

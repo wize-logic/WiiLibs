@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/platform/platform.h"
 #include "wl/platform/profile_arm.h"
 
 #define SETTINGS_FILE_LIMIT (16u * 1024u)
@@ -163,13 +164,24 @@ WlResult wl_profile_arm_settings_load(WlProfileArmSettings *settings, const char
     if (settings == NULL || path == NULL) {
         return WL_ERR_ARG;
     }
-    file = fopen(path, "r");
-    if (file == NULL) {
-        return WL_ERR_NOT_FOUND;
+    {
+        const void *virt;
+        uint32_t virt_size;
+        if (wl_platform_fs_virtual_get(path, &virt, &virt_size)) { // (given in the command line)
+            length = virt_size <= sizeof text ? virt_size : sizeof text;
+            memcpy(text, virt, length);
+            failed = 0;
+            file = NULL;
+        } else {
+            file = fopen(path, "r");
+            if (file == NULL) {
+                return WL_ERR_NOT_FOUND;
+            }
+            length = fread(text, 1, sizeof text, file);
+            failed = ferror(file);
+            fclose(file);
+        }
     }
-    length = fread(text, 1, sizeof text, file);
-    failed = ferror(file);
-    fclose(file);
     if (failed != 0) {
         return WL_ERR_IO;
     }
