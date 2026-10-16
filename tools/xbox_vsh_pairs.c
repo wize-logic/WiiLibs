@@ -14,10 +14,12 @@
 //
 // What differs from the plain C: the multiply-adds and the dot products are fused and add in
 // another order, RSQ is frsqrte's estimate made exact by Newton's steps in double (to a bit), and
-// MIN/MAX choose by the sign of a difference (+0 for -0 when equal). The host checks the code the
-// Wii runs with tests/xbox/vsh_ps_emulate.py's C emulation against the interpreter. A program
-// with what is not written here (EXP, LOG, LIT, DST, SLT, SGE) or that needs more registers than
-// the Gekko has keeps the per-instruction code.
+// MIN/MAX choose by the sign of a difference (+0 for -0 when equal). EXP and LOG are vsh.c's
+// (ilu_floor, ilu_power_of_two, ilu_exp2, ilu_log2) with the float's bits made and taken apart
+// through the slot, their polynomials' multiply-adds fused, EXP's lanes made only where read.
+// The host checks the code the Wii runs with tests/xbox/vsh_ps_emulate.py's C emulation against
+// the interpreter. A program with what is not written here (LIT, DST, SLT, SGE) or that needs
+// more registers than the Gekko has keeps the per-instruction code.
 
 enum { PR_VALUES = 4096, PR_OPS = 4096, PR_CACHE = 512, PR_KEYS = 256 };
 
@@ -82,6 +84,21 @@ enum {
     PRK_RCC_HIGH = 44,
     PRK_RCC_NLOW = 48,
     PRK_RCC_NHIGH = 52,
+    PRK_128 = 56,
+    PRK_M150 = 60,
+    PRK_M126 = 64,
+    PRK_127 = 68,
+    PRK_191 = 72,
+    PRK_2M64 = 76,    /* 2^-64 */
+    PRK_INFINITY = 80,
+    PRK_ROUND = 84,   /* 1.5 2^23 */
+    PRK_EXP2 = 88,    /* 2^f's polynomial, 6 floats (and 1) */
+    PRK_LOG_ZERO = 112, /* -1e30 */
+    PRK_NORMAL = 116, /* the least normal float */
+    PRK_BIAS = 120,   /* 2^23 + 127 */
+    PRK_BIAS_SUB = 124, /* 2^23 + 127 + 23 */
+    PRK_SQRT2 = 128,
+    PRK_LOG2 = 132,   /* log2's polynomial in t^2, 5 floats */
 };
 
 static int pr_new(void) {
@@ -575,6 +592,8 @@ static int pr_supported(const WlXboxVshInstruction *in) {
     case _ilu_rcp:
     case _ilu_rcc:
     case _ilu_rsq:
+    case _ilu_exp:
+    case _ilu_log:
         return 1;
     default:
         return 0;
@@ -765,6 +784,239 @@ static void pr_mac(const WlXboxVshInstruction *in, unsigned needed, PrLane resul
     }
 }
 
+/* d (a value made before) written again: d = name(a, b, c) */
+static void pr_set(int d, const char *name, int a, int b, int c) {
+    int values[4] = {d, a, b, c}, count = c >= 0 ? 4 : b >= 0 ? 3 : 2;
+    static const char *const formats[3] = {"%s @0, @1", "%s @0, @1, @2", "%s @0, @1, @2, @3"};
+
+    pr_op(0, 1, count, values, formats[count - 2], name);
+}
+
+static void pr_compare(int a, int b) {
+    int values[2] = {a, b};
+
+    pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
+}
+
+/* a value each way of a branch writes (not a splat: an fmr leaves ps1) */
+static int pr_ways_value(void) {
+    int d = pr_new();
+
+    pr_values[d].fresh = 0;
+    return d;
+}
+
+/* d made from the word at 0(%[slot]) in r0: rotated, masked (begin to end), ored with
+high << 16, stored at offset and loaded as a float */
+static void pr_bits(int d, int rotate, int begin, int end, unsigned high, int offset) {
+    pr_text("lwz 0, 0(%%[slot])");
+    pr_text("rlwinm 0, 0, %d, %d, %d", rotate, begin, end);
+    if (high)
+        pr_text("oris 0, 0, %u", high);
+    pr_text("stw 0, %d(%%[slot])", offset);
+    pr_op(0, 1, 1, &d, "lfs @0, %d(%%[slot])", offset);
+}
+
+/* the ILU's floor (vsh.c's ilu_floor): 2^23 added and taken away (by x's sign), 1 less where
+that rounded up; from 2^23 on, and a NaN, x */
+static int pr_floor(int x) {
+    int big = pr_k(1, PRK_2P23), minus = pr_k(1, PRK_M2P23), one = pr_k(1, PRK_ONE),
+        zero = pr_k(0, PRK_ZERO), mark = pr_cache_count, a, w = pr_ways_value();
+    char same[24], negative[24], check[24], done[24];
+
+    pr_new_label(same, sizeof(same));
+    pr_new_label(negative, sizeof(negative));
+    pr_new_label(check, sizeof(check));
+    pr_new_label(done, sizeof(done));
+    a = pr_op3("fabs", x, -1, -1);
+    pr_compare(a, big);
+    pr_text("bnl %s", same);
+    pr_compare(x, zero);
+    pr_text("blt %s", negative);
+    pr_set(w, "fadds", x, big, -1);
+    pr_set(w, "fsubs", w, big, -1);
+    pr_text("b %s", check);
+    pr_place_label(negative);
+    pr_set(w, "fadds", x, minus, -1);
+    pr_set(w, "fsubs", w, minus, -1);
+    pr_place_label(check);
+    pr_compare(w, x);
+    pr_text("bng %s", done);
+    pr_set(w, "fsubs", w, one, -1);
+    pr_text("b %s", done);
+    pr_place_label(same);
+    pr_set(w, "fmr", x, -1, -1);
+    pr_place_label(done);
+    pr_cache_trim(mark);
+    return w;
+}
+
+/* 2^n for a whole n (vsh.c's ilu_power_of_two from 2^-149 to 2^127; below, 0; above, infinity;
+a NaN, itself): n + 127 the float's exponent (below 2^-126, n + 191's times 2^-64) */
+static int pr_power_of_two(int n) {
+    int high = pr_k(1, PRK_128), low = pr_k(1, PRK_M150), least = pr_k(1, PRK_M126),
+        bias = pr_k(1, PRK_127), bias_sub = pr_k(1, PRK_191), scale = pr_k(1, PRK_2M64),
+        infinity = pr_k(1, PRK_INFINITY), zero = pr_k(0, PRK_ZERO), mark = pr_cache_count,
+        r = pr_ways_value(), t = pr_ways_value();
+    char above[24], below[24], subnormal[24], made[24], done[24];
+
+    pr_new_label(above, sizeof(above));
+    pr_new_label(below, sizeof(below));
+    pr_new_label(subnormal, sizeof(subnormal));
+    pr_new_label(made, sizeof(made));
+    pr_new_label(done, sizeof(done));
+    pr_compare(n, high);
+    pr_text("bnl %s", above);
+    pr_compare(n, low);
+    pr_text("bng %s", below);
+    pr_compare(n, least);
+    pr_text("blt %s", subnormal);
+    pr_set(t, "fadds", n, bias, -1);
+    pr_text("b %s", made);
+    pr_place_label(subnormal);
+    pr_set(t, "fadds", n, bias_sub, -1);
+    pr_place_label(made);
+    pr_set(t, "fctiwz", t, -1, -1);
+    pr_op(0, 0, 1, &t, "stfiwx @0, 0, %%[slot]");
+    pr_bits(r, 23, 1, 8, 0, 0);
+    pr_compare(n, least);
+    pr_text("bnl %s", done);
+    pr_set(r, "fmuls", r, scale, -1);
+    pr_text("b %s", done);
+    pr_place_label(above);
+    pr_set(r, "fadds", n, infinity, -1);
+    pr_text("b %s", done);
+    pr_place_label(below);
+    pr_set(r, "fmr", zero, -1, -1);
+    pr_place_label(done);
+    pr_cache_trim(mark);
+    return r;
+}
+
+/* 2^x (vsh.c's ilu_exp2): x rounded to a whole n, 2^(x - n) by the polynomial, times 2^n; from
+128 on infinity (a NaN itself), to -150 0 */
+static int pr_exp2(int x) {
+    int high = pr_k(1, PRK_128), low = pr_k(1, PRK_M150), round = pr_k(1, PRK_ROUND),
+        infinity = pr_k(1, PRK_INFINITY), zero = pr_k(0, PRK_ZERO), one = pr_k(1, PRK_ONE),
+        mark = pr_cache_count, r = pr_ways_value(), n, f, p, c;
+    char above[24], below[24], done[24];
+
+    pr_new_label(above, sizeof(above));
+    pr_new_label(below, sizeof(below));
+    pr_new_label(done, sizeof(done));
+    pr_compare(x, high);
+    pr_text("bnl %s", above);
+    pr_compare(x, low);
+    pr_text("bng %s", below);
+    n = pr_op3("fadds", x, round, -1);
+    pr_set(n, "fsubs", n, round, -1);
+    f = pr_op3("fsubs", x, n, -1);
+    p = pr_k(1, PRK_EXP2);
+    for (c = 1; c < 7; c++)
+        p = pr_op3("fmadds", p, f, c < 6 ? pr_k(1, PRK_EXP2 + 4 * c) : one);
+    pr_set(r, "fmuls", p, pr_power_of_two(n), -1);
+    pr_text("b %s", done);
+    pr_place_label(above);
+    pr_set(r, "fadds", x, infinity, -1);
+    pr_text("b %s", done);
+    pr_place_label(below);
+    pr_set(r, "fmr", zero, -1, -1);
+    pr_place_label(done);
+    pr_cache_trim(mark);
+    return r;
+}
+
+/* EXP: (2^floor(x), x - floor(x), 2^x, 1), the lanes needed (bit 3 x) */
+static void pr_exp(int x, unsigned needed, PrLane result[4]) {
+    int whole = -1, k;
+
+    for (k = 0; k < 4; k++)
+        result[k].lane = 0;
+    if (needed & 0xc)
+        whole = pr_floor(x);
+    if (needed & 8)
+        result[0].value = pr_power_of_two(whole);
+    if (needed & 4)
+        result[1].value = pr_op3("fsubs", x, whole, -1);
+    if (needed & 2)
+        result[2].value = pr_exp2(x);
+    result[3].value = pr_k(1, PRK_ONE);
+}
+
+/* LOG of |x| (vsh.c's ilu_log2): (its exponent e, its mantissa m = |x| / 2^e in [1, 2), log2 |x|,
+1) from its bits, a subnormal's times 2^23; 0: (-1e30, 1, -1e30, 1); infinity and a NaN: (|x|,
+NaN, |x|, 1) */
+static void pr_log(int x, PrLane result[4]) {
+    int zero = pr_k(0, PRK_ZERO), one = pr_k(1, PRK_ONE), infinity = pr_k(1, PRK_INFINITY),
+        normal = pr_k(1, PRK_NORMAL), big = pr_k(1, PRK_2P23), bias = pr_k(1, PRK_BIAS),
+        bias_sub = pr_k(1, PRK_BIAS_SUB), root = pr_k(1, PRK_SQRT2), half = pr_k(1, PRK_HALF),
+        nothing = pr_k(1, PRK_LOG_ZERO), mark = pr_cache_count, a, s = pr_ways_value(),
+        offset = pr_ways_value(), e = pr_ways_value(), m = pr_ways_value(), l = pr_ways_value(),
+        mm = pr_ways_value(), ee = pr_ways_value(), t, t2, p, c, k;
+    char special[24], scaled[24], split[24], kept[24], finite[24], done[24];
+
+    pr_new_label(special, sizeof(special));
+    pr_new_label(scaled, sizeof(scaled));
+    pr_new_label(split, sizeof(split));
+    pr_new_label(kept, sizeof(kept));
+    pr_new_label(finite, sizeof(finite));
+    pr_new_label(done, sizeof(done));
+    a = pr_op3("fabs", x, -1, -1);
+    pr_compare(a, zero);
+    pr_text("beq %s", special);
+    pr_compare(a, infinity);
+    pr_text("bnl %s", special);
+    pr_compare(a, normal);
+    pr_text("blt %s", scaled);
+    pr_set(s, "fmr", a, -1, -1);
+    pr_set(offset, "fmr", bias, -1, -1);
+    pr_text("b %s", split);
+    pr_place_label(scaled);
+    pr_set(s, "fmuls", a, big, -1);
+    pr_set(offset, "fmr", bias_sub, -1, -1);
+    pr_place_label(split);
+    /* (the mantissa's bits with 127's exponent at 4(%[slot]), then the exponent's as 2^23 + it) */
+    pr_op(0, 0, 1, &s, "stfs @0, 0(%%[slot])");
+    pr_bits(m, 0, 9, 31, 0x3f80, 4);
+    pr_bits(e, 9, 24, 31, 0x4b00, 0);
+    pr_set(e, "fsubs", e, offset, -1);
+    pr_compare(m, root);
+    pr_text("blt %s", kept);
+    pr_set(mm, "fmuls", m, half, -1);
+    pr_set(ee, "fadds", e, one, -1);
+    pr_text("b %s", finite);
+    pr_place_label(kept);
+    pr_set(mm, "fmr", m, -1, -1);
+    pr_set(ee, "fmr", e, -1, -1);
+    pr_place_label(finite);
+    t = pr_op3("fsubs", mm, one, -1);
+    t = pr_op3("fdivs", t, pr_op3("fadds", mm, one, -1), -1);
+    t2 = pr_op3("fmuls", t, t, -1);
+    p = pr_k(1, PRK_LOG2);
+    for (c = 1; c < 5; c++)
+        p = pr_op3("fmadds", p, t2, pr_k(1, PRK_LOG2 + 4 * c));
+    pr_set(l, "fmadds", t, p, ee);
+    pr_text("b %s", done);
+    /* (0: -1e30, 1, -1e30; infinity or a NaN: a, a - a, a) */
+    pr_place_label(special);
+    pr_compare(a, zero);
+    pr_set(e, "fmr", a, -1, -1);
+    pr_set(m, "fsubs", a, a, -1);
+    pr_set(l, "fmr", a, -1, -1);
+    pr_text("bne %s", done);
+    pr_set(e, "fmr", nothing, -1, -1);
+    pr_set(m, "fmr", one, -1, -1);
+    pr_set(l, "fmr", nothing, -1, -1);
+    pr_place_label(done);
+    pr_cache_trim(mark);
+    for (k = 0; k < 4; k++)
+        result[k].lane = 0;
+    result[0].value = e;
+    result[1].value = m;
+    result[2].value = l;
+    result[3].value = one;
+}
+
 /* the ILU's result lanes */
 static void pr_ilu(const WlXboxVshInstruction *in, unsigned needed, PrLane result[4]) {
     const WlXboxVshOperand *c = &in->operands[2];
@@ -786,6 +1038,14 @@ static void pr_ilu(const WlXboxVshInstruction *in, unsigned needed, PrLane resul
     }
     x = pr_scalar(in, c, 0, &negate);
     x = pr_negated(x, negate);
+    if (in->ilu == _ilu_exp) {
+        pr_exp(x, needed, result);
+        return;
+    }
+    if (in->ilu == _ilu_log) {
+        pr_log(x, result);
+        return;
+    }
     if (in->ilu == _ilu_rcp) {
         s = pr_op3("fdivs", pr_k(1, PRK_ONE), x, -1);
     } else if (in->ilu == _ilu_rcc) {

@@ -184,6 +184,9 @@ def emu_line(line, immediates):
         return "%s = cr_insert(0u, (uint32_t)%s, %s, %s, %s);" % (emu_gpr(a[0]), emu_gpr(a[1]), a[2], a[3], a[4])
     if op == "ori":
         return "%s = (intptr_t)(int32_t)((uint32_t)%s | %s);" % (emu_gpr(a[0]), emu_gpr(a[1]), a[2])
+    if op == "oris":
+        return "%s = (intptr_t)(int32_t)((uint32_t)%s | ((uint32_t)%s << 16));" % (
+            emu_gpr(a[0]), emu_gpr(a[1]), a[2])
     if op == "mr":
         return "%s = %s;" % (emu_gpr(a[0]), emu_gpr(a[1]))
     if op == "cmpwi":
@@ -238,8 +241,8 @@ def emu_line(line, immediates):
                                                    fa(a[2], "b"))
     if op in ("fadd", "fsub"):
         return "f_double(&%s, %s.a %s %s.a);" % (F(a[0]), F(a[1]), "+" if op == "fadd" else "-", F(a[2]))
-    if op in ("fadds", "fsubs", "fdivs"):
-        sym = {"fadds": "+", "fsubs": "-", "fdivs": "/"}[op]
+    if op in ("fadds", "fsubs", "fdivs", "fmuls"):
+        sym = {"fadds": "+", "fsubs": "-", "fdivs": "/", "fmuls": "*"}[op]
         return "f_set(&%s, %s %s %s);" % (F(a[0]), fa(a[1], "a"), sym, fa(a[2], "a"))
     if op in ("fmadds", "fnmadds"):
         return "f_set(&%s, %sfmaf(%s, %s, %s));" % (F(a[0]), "-" if op == "fnmadds" else "", fa(a[1], "a"),

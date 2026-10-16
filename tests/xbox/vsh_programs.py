@@ -204,6 +204,18 @@ PROGRAMS = [
         "dp3 oD0.xyz, r11, c[8]",
         "mul oT0, r9, c[a0+63]",
     ]),
+    ("the exponent and logarithm, all their lanes and one at a time", [
+        "dp4 oPos, v0, c[0]",
+        "ilog r5, v4.x",
+        "iexp r6, v4.y",
+        "ilog r7.z, -v4.z",
+        "iexp r8.x, v4.w",
+        "iexp r8.z, -v4.x",
+        "mov oT0, r5",
+        "mov oT1, r6",
+        "mov oT2, r8",
+        "mov oFog.x, r7.z",
+    ]),
 ]
 
 
