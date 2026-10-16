@@ -57,6 +57,17 @@ void wl_gx_direct_set_xf_flush(bool on) {
     g_flush_off = !on;
 }
 
+// (the Wii's bisection switches: kept, and nothing on the host left out for them)
+static WlGxBisect g_bisect;
+
+void wl_gx_bisect_set(const WlGxBisect *bisect) {
+    g_bisect = *bisect;
+}
+
+const WlGxBisect *wl_gx_bisect(void) {
+    return &g_bisect;
+}
+
 void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
     unsigned n;
 

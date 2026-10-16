@@ -160,6 +160,22 @@ void wl_gx_direct_flush_after(void);
 // Whether the flush is sent (on by default).
 void wl_gx_direct_set_xf_flush(bool on);
 
+// Work left out of what GX gets, to find on a console what hangs its GPU by halving (each a switch
+// of the title's folder; all off by default, and off they cost a branch). The host takes and
+// ignores them.
+typedef struct {
+    bool no_textures;  // every map's texture one fixed 4x4 RGBA8 texture in MEM1 (no TLUT loads)
+    bool no_tlut;      // C4 and C8 textures that fixed texture (no TLUT loads); the others as they are
+    bool tlut_mem1;    // each TLUT copied into MEM1 before it is loaded (the entries are in MEM2)
+    uint32_t max_draws; // only the first max_draws primitives of a frame reach GX (0: all)
+    bool no_quads;     // no quad of the targets (the back buffer's restore, the clears, the squeeze)
+    bool no_z_restore; // the back buffer's restore puts back the colour only (no Z texture)
+    bool no_copies;    // no texture copy out of the EFB (the display's copy stays)
+} WlGxBisect;
+void wl_gx_bisect_set(const WlGxBisect *bisect);
+// The switches set (all off before wl_gx_bisect_set).
+const WlGxBisect *wl_gx_bisect(void);
+
 // The transform unit's position matrix for the draws that follow (row-major 3x4: (x', y', z') =
 // m (x, y, z, 1), before the projection), NULL the identity (as wl_gx_direct_begin leaves it).
 void wl_gx_direct_position_matrix(const float m[3][4]);

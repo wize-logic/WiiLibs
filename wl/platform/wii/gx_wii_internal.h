@@ -15,6 +15,11 @@ void wl_gx_wii_note_efb_copy(void);
 // Texture maps loaded behind gx_direct_wii.c's back (bit n: GX_TEXMAPn): what they hold is unknown
 // to it, so its next wl_gx_direct_texture on them loads.
 void wl_gx_wii_texmaps_forget(uint32_t maps);
+// Texture maps given a texture behind its back (forgotten, as above, and counted as loaded by
+// WL_GX_CHECK's empty-map finding).
+void wl_gx_wii_texmaps_loaded(uint32_t maps);
+// A frame begun: the bisection's count of primitives (WlGxBisect.max_draws) starts again.
+void wl_gx_wii_bisect_frame(void);
 // A draw-sync token sent into the FIFO now (0 before wl_gx_init): hwcount.h's marks.
 uint32_t wl_gx_wii_mark_token(void);
 

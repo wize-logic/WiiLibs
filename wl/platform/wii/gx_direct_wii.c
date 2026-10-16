@@ -2,6 +2,7 @@
 // GX driven directly (gx_direct.h) over libogc. The transform unit's flush before a primitive is
 // OpenCE-Wii's (d3d8_gx.c, "GX's transform unit kept from hanging"), moved here with the vertex
 // layout it needs to know: a strip of eight vertices of zeros in the draw's own format.
+#include <ogc/cache.h>
 #include <ogc/gu.h>
 #include <ogc/gx.h>
 #include <string.h>
@@ -50,6 +51,15 @@ static struct {
     // n's is known; wl_gx_wii_texmaps_forget clears it)
     GXTexObj maps[GX_MAX_TEXMAP];
     uint8_t maps_known;
+    // the maps that have been given a texture, by this layer or behind its back (never cleared: GX's
+    // maps keep what they were loaded with)
+    uint8_t maps_loaded;
+    // the bisection's switches (wl_gx_bisect_set), whether any is on, the primitives of this frame,
+    // the fixed texture that stands for the textures left out, and the TLUTs' copies in MEM1
+    WlGxBisect bisect;
+    bool bisect_on;
+    uint32_t frame_draws;
+    GXTexObj fixed;
     // the colour channels and texture coordinates GX makes for the layout
     uint32_t chans, texgens;
     WlGxDirectStats stats;
@@ -62,7 +72,7 @@ static struct {
 // the draw's state checked (wl_gx_check_draw): the first findings logged with the state, then a count
 static void check_draw(void) {
     const WlTevProgram *tev = wl_gx_wii_tev_last();
-    uint32_t found = wl_gx_check_draw(d.chans, d.texgens, d.maps_known, tev), bit, i;
+    uint32_t found = wl_gx_check_draw(d.chans, d.texgens, d.maps_loaded, tev), bit, i;
 
     if (found == 0) {
         return;
@@ -81,7 +91,7 @@ static void check_draw(void) {
                         "channels %u, coordinates %u, maps loaded %02x",
              d.layout.indexed, d.layout.colors, d.layout.texcoords, d.layout.texcoord_s,
              d.layout.texcoords_generated, d.layout.texcoords_projected, d.layout.lit, (unsigned)d.chans,
-             (unsigned)d.texgens, d.maps_known);
+             (unsigned)d.texgens, d.maps_loaded);
     for (i = 0; tev != NULL && i < tev->stage_count && i < WL_TEV_MAX_STAGES; i++) {
         const WlTevStage *s = &tev->stages[i];
 
@@ -95,6 +105,59 @@ static void check_draw(void) {
 
 void wl_gx_wii_texmaps_forget(uint32_t maps) {
     d.maps_known &= (uint8_t)~maps;
+}
+
+void wl_gx_wii_texmaps_loaded(uint32_t maps) {
+    d.maps_known &= (uint8_t)~maps;
+    d.maps_loaded |= (uint8_t)maps;
+}
+
+// ---- the bisection (wl_gx_bisect_set) -----------------------------------------------------------
+
+#define TLUT_COPIES 256u
+#define TLUT_COPY_BYTES 512u
+
+// a mid grey, opaque: RGBA8's 4x4 tile, its AR half then its GB half
+static uint8_t fixed_texels[64] __attribute__((aligned(32)));
+// the TLUTs' copies (in the program's own memory, MEM1), each slot used in turn
+static uint8_t tlut_copies[TLUT_COPIES][TLUT_COPY_BYTES] __attribute__((aligned(32)));
+static uint32_t tlut_next;
+
+void wl_gx_bisect_set(const WlGxBisect *bisect) {
+    unsigned i;
+
+    d.bisect = *bisect;
+    d.bisect_on = bisect->no_textures || bisect->no_tlut || bisect->tlut_mem1 || bisect->max_draws != 0 ||
+                  bisect->no_quads || bisect->no_z_restore || bisect->no_copies;
+    for (i = 0; i < 32u; i += 2u) {
+        fixed_texels[i] = 0xFF;
+        fixed_texels[i + 1u] = 0x80;
+        fixed_texels[32u + i] = 0x80;
+        fixed_texels[32u + i + 1u] = 0x80;
+    }
+    DCFlushRange(fixed_texels, sizeof fixed_texels);
+    GX_InitTexObj(&d.fixed, fixed_texels, 4, 4, GX_TF_RGBA8, GX_REPEAT, GX_REPEAT, GX_FALSE);
+    GX_InitTexObjFilterMode(&d.fixed, GX_NEAR, GX_NEAR);
+}
+
+const WlGxBisect *wl_gx_bisect(void) {
+    return &d.bisect;
+}
+
+void wl_gx_wii_bisect_frame(void) {
+    d.frame_draws = 0;
+}
+
+// a TLUT as the switch tlut_mem1 loads it: its entries copied into MEM1
+static void tlut_from_mem1(const WlGxTlut *tlut, GXTlutObj *table) {
+    static const u8 formats[] = {GX_TL_IA8, GX_TL_RGB565, GX_TL_RGB5A3};
+    uint8_t *copy = tlut_copies[tlut_next++ % TLUT_COPIES];
+    uint32_t bytes = (uint32_t)tlut->count * 2u;
+
+    bytes = bytes <= TLUT_COPY_BYTES ? bytes : TLUT_COPY_BYTES;
+    memcpy(copy, tlut->entries, bytes);
+    DCFlushRange(copy, TLUT_COPY_BYTES);
+    GX_InitTlutObj(table, copy, formats[tlut->format <= 2u ? tlut->format : 0u], (u16)(bytes / 2u));
 }
 
 void wl_gx_direct_begin(void) {
@@ -333,6 +396,9 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     d.in_primitive = false;
     if (count == 0 || count > 65535u || (unsigned)prim >= sizeof prims || !d.layout_known) {
         return;
+    }
+    if (d.bisect_on && d.bisect.max_draws != 0 && d.frame_draws++ >= d.bisect.max_draws) {
+        return; // (left out: its vertices go nowhere)
     }
     // (noted before its commands: the flush, the state GX_Begin sends, the primitive)
     wl_gx_wii_hang_event('P', (uint32_t)prim << 16 | count, d.stats.draws);
@@ -588,10 +654,28 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
     if (map >= GX_MAX_TEXMAP) {
         return;
     }
+    if (d.bisect_on && (d.bisect.no_textures ||
+                        (d.bisect.no_tlut && (tex->format == WL_GX_TEX_C4 || tex->format == WL_GX_TEX_C8)))) {
+        d.stats.textures++;
+        if ((d.maps_known & (1u << map)) == 0 || memcmp(&d.fixed, &d.maps[map], sizeof d.fixed) != 0) {
+            GX_LoadTexObj(&d.fixed, (u8)(GX_TEXMAP0 + map));
+            wl_gx_wii_hang_event('T', (uint32_t)(uintptr_t)fixed_texels,
+                                 map << 28 | (uint32_t)WL_GX_TEX_RGBA8 << 22 | 4u << 11 | 4u);
+            d.maps[map] = d.fixed;
+            d.maps_known |= (uint8_t)(1u << map);
+            d.maps_loaded |= (uint8_t)(1u << map);
+            wl_gx_wii_note_commands();
+        }
+        return;
+    }
     if (tlut != NULL && (tex->format == WL_GX_TEX_C4 || tex->format == WL_GX_TEX_C8)) {
         GXTlutObj table;
 
-        memcpy(&table, tlut->opaque, sizeof table);
+        if (d.bisect_on && d.bisect.tlut_mem1) {
+            tlut_from_mem1(tlut, &table);
+        } else {
+            memcpy(&table, tlut->opaque, sizeof table);
+        }
         GX_LoadTlut(&table, tex->tlut);
         wl_gx_wii_hang_event('U', (uint32_t)(uintptr_t)tlut->entries, (uint32_t)tex->tlut << 16 | tlut->count);
         wl_gx_tlut_invalidate();
@@ -621,6 +705,7 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
                              (tex->height & 2047u));
     d.maps[map] = obj;
     d.maps_known |= (uint8_t)(1u << map);
+    d.maps_loaded |= (uint8_t)(1u << map);
     wl_gx_wii_note_commands();
 }
 

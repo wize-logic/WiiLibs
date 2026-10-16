@@ -32,7 +32,9 @@
 #define TAG "GXHANG"
 #define HANG_SECONDS 10u
 #define LEAVE_SECONDS 20u
-#define RING 1024u
+// (the ring reaches back a full FIFO: a megabyte of commands, at worst about 64 bytes an event
+// (a texture's or an array's registers); a30's bench averaged 650, the game's frames less)
+#define RING 16384u
 #define LAST 16u
 #define AROUND_BEFORE 24u
 #define AROUND_AFTER 6u
@@ -245,8 +247,21 @@ static void stopped_after(void) {
         }
     }
     if (!found) {
+        uint32_t kept = h.head - oldest;
+
         WL_LOG_E(TAG, "the GPU stopped %u bytes behind the writer, before the oldest of the %u events kept (%u bytes "
-                      "behind)", (unsigned)backlog, (unsigned)(h.head - oldest), (unsigned)behind);
+                      "behind)", (unsigned)backlog, (unsigned)kept, (unsigned)behind);
+        if (h.head <= RING) {
+            WL_LOG_E(TAG, "  why: the ring holds every event since GX began: the GPU stopped in commands sent before "
+                          "the first event (wl_gx_init's own)");
+        } else if (behind == 0) {
+            WL_LOG_E(TAG, "  why: none of the %u events kept sent commands", (unsigned)kept);
+        } else {
+            WL_LOG_E(TAG, "  why: %u events of %u bytes on average reach %u bytes back; %u bytes need about %u events "
+                          "(RING in gx_hang_wii.c is %u)",
+                     (unsigned)kept, (unsigned)(behind / kept), (unsigned)behind, (unsigned)backlog,
+                     (unsigned)(backlog / (behind / kept != 0 ? behind / kept : 1u) + 1u), (unsigned)RING);
+        }
         return;
     }
     WL_LOG_E(TAG, "the GPU stopped %u bytes behind the writer: in the commands after event %u, %u bytes into them",

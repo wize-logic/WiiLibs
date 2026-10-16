@@ -6,6 +6,7 @@
 #include <ogc/gx.h>
 #include <string.h>
 
+#include "wl/platform/gx_direct.h"
 #include "wl/platform/gx_target_internal.h"
 #include "wl/platform/wii/gx_wii_internal.h"
 
@@ -24,6 +25,9 @@ void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what
     // (the depth copy is a texture of RGBA8's size)
     static const u8 format[] = {GX_TF_RGBA8, GX_TF_RGB565, GX_TF_Z24X8};
     static const WlGxTexFormat size_of[] = {WL_GX_TEX_RGBA8, WL_GX_TEX_RGB565, WL_GX_TEX_RGBA8};
+    if (wl_gx_bisect()->no_copies) {
+        return; // (the bisection: the destination keeps what it held)
+    }
     if (invalidate) {
         wl_gpu_buffer_invalidate(dst, wl_gx_tex_bytes(size_of[what], w, h));
     }
@@ -55,6 +59,10 @@ static void quad(float x0, float y0, float x1, float y1, const GXColor *colour, 
     Mtx identity;
     static const float corners[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
 
+    if (wl_gx_bisect()->no_quads) {
+        wl_gx_invalidate_shadow(); // (the bisection: no quad; the state its callers set stays)
+        return;
+    }
     memset(matrix, 0, sizeof matrix);
     matrix[0][0] = 2.0f / (float)back_w;
     matrix[0][3] = -1.0f;
@@ -143,7 +151,8 @@ void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, 
     GX_InitTexObj(&colour_map, (void *)colour, (u16)w, (u16)h, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
     GX_InitTexObjFilterMode(&colour_map, GX_NEAR, GX_NEAR);
     GX_LoadTexObj(&colour_map, GX_TEXMAP0);
-    if (depth == NULL) {
+    wl_gx_wii_texmaps_loaded(1u << GX_TEXMAP0);
+    if (depth == NULL || wl_gx_bisect()->no_z_restore) {
         // (the colour alone: the depth there is the back buffer's still)
         GX_SetColorUpdate(GX_TRUE);
         GX_SetAlphaUpdate(GX_TRUE);
@@ -155,6 +164,7 @@ void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, 
     GX_InitTexObj(&depth_map, (void *)depth, (u16)w, (u16)h, GX_TF_Z24X8, GX_CLAMP, GX_CLAMP, GX_FALSE);
     GX_InitTexObjFilterMode(&depth_map, GX_NEAR, GX_NEAR);
     GX_LoadTexObj(&depth_map, GX_TEXMAP1);
+    wl_gx_wii_texmaps_loaded(1u << GX_TEXMAP1);
     GX_SetColorUpdate(GX_TRUE);
     GX_SetAlphaUpdate(GX_TRUE);
     GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
@@ -199,6 +209,7 @@ void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uin
     GX_InitTexObj(&map, colour, (u16)back_w, (u16)back_h, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
     GX_InitTexObjFilterMode(&map, GX_LINEAR, GX_LINEAR);
     GX_LoadTexObj(&map, GX_TEXMAP0);
+    wl_gx_wii_texmaps_loaded(1u << GX_TEXMAP0);
     GX_SetScissor(0, 0, (u32)back_w, (u32)back_h);
     GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
     quad((float)x, 0.0f, (float)(x + w), (float)back_h, NULL, 0.0f, true, false, back_w, back_h);
