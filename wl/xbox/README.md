@@ -11,9 +11,10 @@ with the game. Headers: `wl/xbox/psh.h`, `wl/xbox/psh_bias.h`, `wl/xbox/psh_cach
 `wl/xbox/vsh.h`, `wl/xbox/vsh_native.h`, and the NV2A's `nv2a.h`, `nv2a_regs.h`, `nv2a_kelvin.h`, `nv2a_capture.h`,
 `nv2a_texture.h`, `nv2a_texcache.h`, `nv2a_pipeline.h`, `nv2a_record.h`. Built with
 `-ffp-contract=off` (`DETERMINISTIC`), so a vertex program gives the same bits interpreted or
-compiled. Across targets the bits are the same too, but for EXP, LOG and LIT: they call the C
-library's `exp2f`, `log2f` and `powf`, which may differ in the last bit between glibc (the host,
-ppc-be) and newlib (the Wii).
+compiled. Across targets the bits are the same too: EXP, LOG and LIT's power are polynomials of
+their own (2^x and log2 within an ulp or two of the C library's, the exponent and mantissa exact),
+not the C library's `exp2f`, `log2f` and `powf`, which differ in the last bit between glibc and
+newlib and on the Wii were most of the time of a program that used them (newlib's `exp2f` is its `powf`).
 
 Target `wl_xbox_gx` (alias `WiiLibs::xbox_gx`, header `nv2a_gx.h`) is the NV2A backend on GX. It calls
 only wl/platform (its direct GX layer, `wl/platform/gx_direct.h`, render targets and TEV programs), so

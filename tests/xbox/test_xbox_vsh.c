@@ -299,13 +299,13 @@ TEST the_ilu_operations(void) {
     wl_xbox_vsh_ilu(5, (const float[4]){3.5f, 0, 0, 0}, out);
     ASSERT_EQ(8.0f, out[0]);
     ASSERT_EQ(0.5f, out[1]);
-    ASSERT_EQ(exp2f(3.5f), out[2]);
+    ASSERT(fabsf(out[2] - exp2f(3.5f)) <= 2.0e-7f * exp2f(3.5f));
     ASSERT_EQ(1.0f, out[3]);
     // LOG: the exponent, the mantissa, log2 |x|, 1; of 0, -1e30 and 1
     wl_xbox_vsh_ilu(6, (const float[4]){-12.0f, 0, 0, 0}, out);
     ASSERT_EQ(3.0f, out[0]);
     ASSERT_EQ(1.5f, out[1]);
-    ASSERT_EQ(log2f(12.0f), out[2]);
+    ASSERT(fabsf(out[2] - log2f(12.0f)) <= 4.0e-7f);
     wl_xbox_vsh_ilu(6, (const float[4]){0.0f, 0, 0, 0}, out);
     ASSERT_EQ(-1.0e30f, out[0]);
     ASSERT_EQ(1.0f, out[1]);
@@ -329,6 +329,54 @@ TEST the_ilu_operations(void) {
     }
     wl_xbox_vsh_ilu(7, (const float[4]){0.5f, 0.25f, 0, 0.0f}, out);
     ASSERT_EQ(1.0f, out[2]);
+    PASS();
+}
+
+// EXP, LOG and LIT's power by polynomials (not newlib's exp2f, log2f, powf): within an ulp or two of
+// libm's over the range, exact at whole powers of two, the exponent and mantissa exact
+TEST the_ilu_operations_are_near_libms(void) {
+    float out[4], x, worst_exp = 0.0f, worst_log = 0.0f, worst_pow = 0.0f;
+    int i;
+
+    for (i = -149 * 16; i < 128 * 16; i++) {
+        x = (float)i / 16.0f + 0.0123f;
+        wl_xbox_vsh_ilu(5, (const float[4]){x, 0, 0, 0}, out);
+        ASSERT_EQ(exp2f(floorf(x)), out[0]);
+        ASSERT_EQ(x - floorf(x), out[1]);
+        if (exp2f(x) > 1.0e-37f && exp2f(x) < 1.0e38f) {
+            float e = fabsf(out[2] - exp2f(x)) / exp2f(x);
+
+            worst_exp = e > worst_exp ? e : worst_exp;
+        }
+    }
+    for (i = -40; i < 40; i++) {
+        wl_xbox_vsh_ilu(5, (const float[4]){(float)i, 0, 0, 0}, out);
+        ASSERT_EQ(exp2f((float)i), out[2]);
+    }
+    wl_xbox_vsh_ilu(5, (const float[4]){200.0f, 0, 0, 0}, out);
+    ASSERT_EQ(INFINITY, out[2]);
+    wl_xbox_vsh_ilu(5, (const float[4]){-200.0f, 0, 0, 0}, out);
+    ASSERT_EQ(0.0f, out[2]);
+    for (x = 1.0e-44f; x < 1.0e38f; x *= 1.37f) {
+        wl_xbox_vsh_ilu(6, (const float[4]){x, 0, 0, 0}, out);
+        ASSERT_EQ(floorf(log2f(x)), out[0]);
+        ASSERT_EQ(x / exp2f(floorf(log2f(x))), out[1]);
+        worst_log = fabsf(out[2] - log2f(x)) > worst_log ? fabsf(out[2] - log2f(x)) : worst_log;
+    }
+    for (x = 1.0e-3f; x < 1.0f; x *= 1.1f) {
+        for (i = 1; i < 128; i += 7) {
+            float want = powf(x, (float)i), e;
+
+            wl_xbox_vsh_ilu(7, (const float[4]){1.0f, x, 0, (float)i}, out);
+            if (want > 1.0e-30f) {
+                e = fabsf(out[2] - want) / want;
+                worst_pow = e > worst_pow ? e : worst_pow;
+            }
+        }
+    }
+    ASSERT(worst_exp < 2.5e-7f);
+    ASSERT(worst_log < 5.0e-7f);
+    ASSERT(worst_pow < 1.0e-5f);
     PASS();
 }
 
@@ -414,6 +462,7 @@ SUITE(vsh_suite) {
     RUN_TEST(the_screen_conversion_captures_the_clip_position);
     RUN_TEST(relative_constants_follow_a0);
     RUN_TEST(the_ilu_operations);
+    RUN_TEST(the_ilu_operations_are_near_libms);
     RUN_TEST(shared_arithmetic);
     RUN_TEST(the_analysis_of_a_transform);
     RUN_TEST(the_analysis_finds_what_is_not_affine);

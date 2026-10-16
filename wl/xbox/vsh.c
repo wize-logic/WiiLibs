@@ -683,39 +683,143 @@ unsigned long wl_xbox_vsh_check(const uint32_t *instructions, unsigned long inst
     return hash;
 }
 
+/* floorf for the ILU, without newlib's call: 2^23 added and taken away
+rounds to a whole number (wl_xbox_vsh_floor_index's way), 1 less where it
+rounded up; from 2^23 on (and a NaN) every float is its own floor */
+static float ilu_floor(float x) {
+    float whole;
+
+    if (!(x > -8388608.0f && x < 8388608.0f))
+        return x;
+    whole = x >= 0.0f ? (x + 8388608.0f) - 8388608.0f : (x - 8388608.0f) + 8388608.0f;
+    return whole > x ? whole - 1.0f : whole;
+}
+
+/* 2^n for a whole n in -149..127 (below, 0; above, infinity), made from its
+bits */
+static float ilu_power_of_two(int n) {
+    union {
+        uint32_t u;
+        float f;
+    } bits;
+
+    if (n > 127)
+        return INFINITY;
+    if (n < -149)
+        return 0.0f;
+    if (n < -126) {
+        bits.u = (uint32_t)(n + 64 + 127) << 23;
+        return bits.f * 5.42101086e-20f; /* (2^-64) */
+    }
+    bits.u = (uint32_t)(n + 127) << 23;
+    return bits.f;
+}
+
+/* 2^x without newlib's exp2f (which is its powf, on the Wii most of a
+heavy program's time): x split into a whole n and f in [-1/2, 1/2], 2^f a
+polynomial fitted to it (a relative error of 2e-9 before the float's
+rounding: within an ulp or two of exp2f), 2^n from its bits. The NV2A's
+own EXP and LOG are approximations too. */
+static float ilu_exp2(float x) {
+    float n, f, p;
+
+    if (!(x < 128.0f))
+        return x != x ? x : INFINITY;
+    if (!(x > -150.0f))
+        return 0.0f;
+    n = (x + 12582912.0f) - 12582912.0f; /* (1.5 * 2^23: x rounded to the nearest) */
+    f = x - n;
+    p = 1.53375775e-4f;
+    p = p * f + 1.33998599e-3f;
+    p = p * f + 9.61851981e-3f;
+    p = p * f + 5.55032901e-2f;
+    p = p * f + 2.40226462e-1f;
+    p = p * f + 6.93147182e-1f;
+    p = p * f + 1.0f;
+    if (n < -126.0f)
+        return p * ilu_power_of_two((int)n + 64) * 5.42101086e-20f;
+    return p * ilu_power_of_two((int)n);
+}
+
+/* log2 of a finite x > 0, its exponent e (floor(log2(x)), exactly) and
+mantissa m (x / 2^e in [1, 2), exactly) from its bits; the logarithm e +
+log2(m), log2(m) as t P(t^2) with t = (m - 1) / (m + 1), m taken to
+[sqrt(1/2), sqrt(2)) (an error of 6e-12 before the float's rounding) */
+static float ilu_log2(float x, float *exponent, float *mantissa) {
+    union {
+        uint32_t u;
+        float f;
+    } bits;
+    int e;
+    float m, t, t2, p;
+
+    bits.f = x;
+    e = -127;
+    if ((bits.u & 0x7F800000u) == 0) {
+        bits.f = x * 8388608.0f; /* (a subnormal: 2^23 times it) */
+        e -= 23;
+    }
+    e += (int)((bits.u >> 23) & 0xFFu);
+    bits.u = (bits.u & 0x007FFFFFu) | 0x3F800000u;
+    m = bits.f;
+    *exponent = (float)e;
+    *mantissa = m;
+    if (m >= 1.41421356f) {
+        m *= 0.5f;
+        e++;
+    }
+    t = (m - 1.0f) / (m + 1.0f);
+    t2 = t * t;
+    p = 3.39634150e-1f;
+    p = p * t2 + 4.11730886e-1f;
+    p = p * t2 + 5.77082634e-1f;
+    p = p * t2 + 9.61796701e-1f;
+    p = p * t2 + 2.88539004e+0f;
+    return (float)e + t * p;
+}
+
 /* the ILU's exponent, logarithm and lighting (from C into I) */
 void wl_xbox_vsh_ilu(int ilu, const float c[4], float out[4]) {
     switch (ilu) {
-    case _ilu_exp:
-        out[0] = exp2f(floorf(c[0]));
-        out[1] = c[0] - floorf(c[0]);
-        out[2] = exp2f(c[0]);
+    case _ilu_exp: {
+        float whole = ilu_floor(c[0]);
+
+        out[0] = whole > -150.0f && whole < 128.0f ? ilu_power_of_two((int)whole) : ilu_exp2(whole);
+        out[1] = c[0] - whole;
+        out[2] = ilu_exp2(c[0]);
         out[3] = 1.0f;
         break;
+    }
     case _ilu_log: {
         float x = fabsf(c[0]);
 
         if (x == 0.0f) {
             out[0] = out[2] = -1.0e30f;
             out[1] = out[3] = 1.0f;
-        } else {
-            float exponent = floorf(log2f(x));
-
-            out[0] = exponent;
-            out[1] = x / exp2f(exponent);
+        } else if (!(x < INFINITY)) {
+            /* (infinity or a NaN: as libm's) */
+            out[0] = floorf(log2f(x));
+            out[1] = x / exp2f(out[0]);
             out[2] = log2f(x);
+            out[3] = 1.0f;
+        } else {
+            out[2] = ilu_log2(x, &out[0], &out[1]);
             out[3] = 1.0f;
         }
         break;
     }
     case _ilu_lit: {
         float power = c[3] < -127.9961f ? -127.9961f : c[3] > 127.9961f ? 127.9961f : c[3];
+        float exponent, mantissa;
 
         out[0] = 1.0f;
         out[1] = c[0] > 0.0f ? c[0] : 0.0f;
-        /* (0 unless both are above 0, as Direct3D's lit: never powf(0, power),
-        which is 1 for a power of 0 and infinity for one below) */
-        out[2] = c[0] > 0.0f && c[1] > 0.0f ? powf(c[1], power) : 0.0f;
+        /* (0 unless both are above 0, as Direct3D's lit: never 0 to the power,
+        which is 1 for a power of 0 and infinity for one below; c[1] to the power
+        as 2 to the power times its logarithm) */
+        out[2] = c[0] > 0.0f && c[1] > 0.0f
+                     ? (c[1] < INFINITY ? ilu_exp2(power * ilu_log2(c[1], &exponent, &mantissa)) : powf(c[1], power))
+                     : 0.0f;
         out[3] = 1.0f;
         break;
     }
