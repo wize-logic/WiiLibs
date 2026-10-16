@@ -18,7 +18,7 @@ static const uint32_t microcode[] = {
 #include "vsh_programs.inc"
 };
 
-enum { PROGRAMS = 6, TRIALS = 200 };
+enum { PROGRAMS = 7, TRIALS = 200 };
 
 static uint32_t g_rng = 0x1234567u;
 static uint32_t rnd(void) {

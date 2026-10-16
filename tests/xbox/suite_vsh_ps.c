@@ -40,6 +40,16 @@ static float ps_value(void) {
     return (float)((int)(ps_rnd() % 129) - 64) / 16.0f;
 }
 
+// the exponent's and logarithm's edges: 0, subnormals, the least normal, the powers of two's
+// range (2^-149 to 2^127), whole numbers past 2^23, a mantissa about the square root of 2,
+// infinities and a NaN
+static const float ps_edges[] = {
+    0.0f,        -0.0f,         1.4e-45f,     -1.0e-40f,   1.17549435e-38f, 3.0e38f,       -3.0e38f,
+    INFINITY,    -INFINITY,     NAN,          127.99f,     128.0f,          200.0f,        -149.5f,
+    -150.0f,     -160.0f,       -126.5f,      -127.0f,     8388609.0f,      -8388607.5f,   1.0e10f,
+    -1.0e10f,    0.75f,         1.41421354f,  1.41421366f, -5.5f,           2.5e-39f,      -0.001f,
+};
+
 static float g_ps_constants[WL_XBOX_VSH_CONSTANT_COUNT][4];
 static float g_ps_inputs[PS_VERTICES][WL_XBOX_VSH_INPUT_COUNT][4];
 static WlXboxVshProgram g_ps_native, g_ps_interpreted;
@@ -124,6 +134,13 @@ void wlt_suite_vsh_ps(void) {
                 }
                 // (v1.x a node's index: rows c[a0 + 10] to c[a0 + 13] within the constants)
                 g_ps_inputs[m][1][0] = (float)(ps_rnd() % 40);
+                // (a fifth of the trials with v4, which the ILU's EXP and LOG read, at their edges)
+                if (trial % 5 == 4) {
+                    for (int c = 0; c < 4; c++) {
+                        uint32_t e = ps_rnd() % (sizeof ps_edges / sizeof ps_edges[0]);
+                        g_ps_inputs[m][4][c] = ps_edges[e];
+                    }
+                }
             }
             // (now and then the vertex before's nodes and weights, which a batch reuses)
             if (trial % 4 == 0) {
