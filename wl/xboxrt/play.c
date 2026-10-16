@@ -15,6 +15,7 @@
 #include "wl/xboxrt/input.h"
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
+#include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/play.h"
 #include "wl/xboxrt/thread.h"
 
@@ -66,6 +67,7 @@ enum {
     K_LOG,
     K_SCREENSHOT,
     K_CAPTURE,
+    K_DUMP,
     K_CONNECT,
     K_BOT_PLAYER,
     K_QUIT,
@@ -619,6 +621,11 @@ static int parse_line(char *line, int number, Step *s) {
         }
         return 1;
     }
+    if (strcmp(w0, "dump") == 0 && count == 2) {
+        s->kind = K_DUMP;
+        snprintf(s->arg, sizeof s->arg, "%s", words[1]);
+        return 1;
+    }
     if (strcmp(w0, "capture") == 0 && (count == 2 || count == 3)) {
         s->kind = K_CAPTURE;
         if (!parse_number(words[1], &s->number)) {
@@ -648,7 +655,7 @@ static int parse_line(char *line, int number, Step *s) {
     static const char *const verbs[] = {"wait", "frames", "vblanks", "screen", "focus", "play", "checkpoint", "ticks",
                                         "press", "select", "hold", "down", "up", "release", "stick", "trigger",
                                         "until", "do", "load", "memory", "peek", "player", "connect", "disconnect",
-                                        "bot", "look", "screenshot", "capture", "repeat", "end", "quit", "log"};
+                                        "bot", "look", "screenshot", "capture", "dump", "repeat", "end", "quit", "log"};
     for (size_t i = 0; i < WL_ARRAY_COUNT(verbs); i++) {
         if (strcmp(w0, verbs[i]) == 0) {
             return -1;
@@ -994,6 +1001,33 @@ static void shot_frame(void *user, const uint8_t *rgba, uint32_t w, uint32_t h) 
 }
 #endif
 
+// Guest RAM, physical page 0 up, into <name>.bin in the output folder (a host run and a Wii run
+// compared byte for byte). Each page is copied out before it is written, so a page that faults in
+// does so here and not inside the card's driver; a page with no frame and nothing in the swap file
+// (never touched, or all zero) is written as zeros without being brought in.
+static void dump_ram(const char *name) {
+    char path[WL_FS_PATH_MAX];
+    shot_path(path, sizeof path, name, "bin");
+    WlPlatformFile *f = NULL;
+    if (wl_platform_fs_open(path, WL_FILE_WRITE_NEW, &f) != WL_OK) {
+        wl_xb_play_log("dump: cannot write %s", path);
+        return;
+    }
+    static uint8_t page[WL_XB_PAGE];
+    uint32_t held = 0;
+    for (uint32_t p = 0; p < g_xb_ram_pages; p++) {
+        if (g_xb_pg_frames != 0 && g_xb_pg_frame[p] == 0 && g_xb_pg_slot[p] == 0) {
+            memset(page, 0, sizeof page);
+        } else {
+            memcpy(page, wl_xb_phys_ptr(p * WL_XB_PAGE), sizeof page);
+            held++;
+        }
+        wl_platform_fs_write(f, page, sizeof page);
+    }
+    wl_platform_fs_close(f);
+    wl_xb_play_log("dump %s: %u pages, %u held data", path, (unsigned)g_xb_ram_pages, (unsigned)held);
+}
+
 static void screenshot(const char *name) {
 #if defined(WL_XBRT_HAVE_GXSOFT)
     if (wl_gxsoft_attached()) {
@@ -1327,6 +1361,9 @@ static void script_frame(void) {
             }
             break;
         }
+        case K_DUMP:
+            dump_ram(s->arg);
+            break;
         case K_CONNECT:
             wl_xb_input_set_mode((uint32_t)s->sticks[0], (WlXbPortMode)(int)s->sticks[1]);
             break;

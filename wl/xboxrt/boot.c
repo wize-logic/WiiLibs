@@ -249,7 +249,11 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
     if (r == WL_OK) {
         WlXbThreadConfig tc;
         wl_xb_thread_config_default(&tc);
-        tc.deterministic = cfg->deterministic;
+        // a file "deterministic" in the title's folder (WL_XB_DETERMINISTIC on the host): the virtual
+        // clock on the console too, for a run to compare with the host's
+        char det_flag[WL_FS_PATH_MAX];
+        snprintf(det_flag, sizeof det_flag, "%s/deterministic", cfg->title_dir);
+        tc.deterministic = cfg->deterministic || wl_platform_fs_exists(det_flag);
 #if !defined(__wii__)
         // the deterministic mode's costs: WL_XB_DET_NS=<backward jump>,<kernel call>,<device access>
         const char *det_ns = getenv("WL_XB_DET_NS");

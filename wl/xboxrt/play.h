@@ -50,6 +50,7 @@
 //     screenshot [<name>]                the picture (the host: a PNG through wl/gxsoft; the
 //                                        Wii: a one-frame GPU capture), in the output folder
 //     capture <frames> [<name>]          the GPU's work for that many frames (xbox_nv2a_replay)
+//     dump <name>                        guest RAM (physical page 0 up) to <name>.bin there
 //     player <n> / <n>: <step>           the steps after it / the one step drive controller n
 //     connect <n> [real] / disconnect <n>    controller n there (real: as the host has it) / gone
 //     bot <n> <seed>|off                 controller n plays as the bot alongside the steps
