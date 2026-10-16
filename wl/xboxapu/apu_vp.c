@@ -892,10 +892,8 @@ static void pend_flush_bin(WlXboxApu *apu, uint32_t b) {
 
 // Makes every waiting addition: before a multipass voice reads a bin, and at the frame's end.
 static void pend_flush(WlXboxApu *apu) {
-    for (uint32_t b = 0, bins = apu->pend_bins; bins != 0; b++, bins >>= 1) {
-        if (bins & 1u) {
-            pend_flush_bin(apu, b);
-        }
+    for (uint32_t bins = apu->pend_bins; bins != 0; bins &= bins - 1u) {
+        pend_flush_bin(apu, (uint32_t)__builtin_ctz(bins));
     }
     apu->pend_bins = 0;
     apu->pend_frames = 0;
@@ -918,10 +916,8 @@ static void mix_targets(WlXboxApu *apu, int32_t *const fr[2], uint32_t channels,
                         const uint32_t bins[8], const uint16_t *from, const uint16_t gains[8],
                         uint32_t act) {
     uint32_t used = 0;
-    for (uint32_t t = 0; act != 0; t++, act >>= 1) {
-        if ((act & 1u) == 0) {
-            continue;
-        }
+    for (; act != 0; act &= act - 1u) { // the targets in act, lowest first
+        const uint32_t t = (uint32_t)__builtin_ctz(act);
         const uint32_t g1 = gains[t], bin = bins[t];
         const int32_t *frame = fr[t & (channels - 1u)]; // t % channels (1 or 2)
         used |= 1u << bin;
@@ -1136,10 +1132,8 @@ void wl_apu_vp_frame(WlXboxApu *apu) {
         wl_apu_set_reg(apu, regs + 4u, WL_APU_NO_VOICE);
     }
     pend_flush(apu);
-    for (uint32_t b = 0, stale = apu->mix_used & ~apu->mix_live; stale != 0; b++, stale >>= 1) {
-        if (stale & 1u) {
-            frame_zero(apu->mix[b]);
-        }
+    for (uint32_t stale = apu->mix_used & ~apu->mix_live; stale != 0; stale &= stale - 1u) {
+        frame_zero(apu->mix[__builtin_ctz(stale)]);
     }
     apu->mix_used = apu->mix_live;
     apu->stats.voice_frames += voices;

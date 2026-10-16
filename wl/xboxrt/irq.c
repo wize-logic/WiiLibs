@@ -48,6 +48,10 @@ static struct {
     WlXbIrqLevelFn fn;
     void *user;
 } g_level[WL_XB_IRQ_LINES];
+// the lines with a level source, in line order: wl_xb_irq_lines runs at every device access, and
+// looks at these (four or five) instead of all 32
+static uint8_t g_level_line[WL_XB_IRQ_LINES];
+static uint32_t g_level_n;
 static WlXbIrqMaskFn g_mask_fn;
 static void *g_mask_user;
 static bool g_in_service;
@@ -154,8 +158,9 @@ bool wl_xb_in_service(void) {
     return g_in_service;
 }
 
-uint32_t wl_xb_tick_ms(void) {
-    uint64_t us = wl_xb_time_us() - g_tick_start_us;
+// KeTickCount at now (us of wl_xb_time_us)
+static uint32_t tick_ms_at(uint64_t now) {
+    uint64_t us = now - g_tick_start_us;
     // a 32-bit division for the first 71 minutes: on the Wii this runs at every poll (update_tick),
     // and libgcc's 64-bit __udivdi3 took 0.4% of a10's time there
     if ((us >> 32) == 0) {
@@ -164,11 +169,21 @@ uint32_t wl_xb_tick_ms(void) {
     return (uint32_t)(us / 1000u);
 }
 
-static void update_tick(void) {
+uint32_t wl_xb_tick_ms(void) {
+    return tick_ms_at(wl_xb_time_us());
+}
+
+// written at every poll, not only when its millisecond moves on: a checkpoint snapshot's load puts
+// back the guest RAM it is in
+static void update_tick_at(uint64_t now) {
     uint32_t va = g_tick_va;
     if (va != 0) {
-        wl_xb_wr32_atomic(va, wl_xb_tick_ms());
+        wl_xb_wr32_atomic(va, tick_ms_at(now));
     }
+}
+
+static void update_tick(void) {
+    update_tick_at(wl_xb_time_us());
 }
 
 void wl_xb_service_set_tick_va(uint32_t va) {
@@ -224,13 +239,22 @@ void wl_xb_irq_set_level(uint32_t line, WlXbIrqLevelFn pending, void *user) {
     if (line < WL_XB_IRQ_LINES) {
         g_level[line].user = user;
         g_level[line].fn = pending;
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < WL_XB_IRQ_LINES; i++) {
+            if (g_level[i].fn != NULL) {
+                g_level_line[n++] = (uint8_t)i;
+            }
+        }
+        g_level_n = n;
     }
 }
 
 uint32_t wl_xb_irq_lines(void) {
     uint32_t lines = g_lines;
-    for (uint32_t i = 0; i < WL_XB_IRQ_LINES; i++) {
-        if (g_level[i].fn != NULL && g_level[i].fn(g_level[i].user)) {
+    for (uint32_t k = 0, n = g_level_n; k < n; k++) {
+        const uint32_t i = g_level_line[k];
+        const WlXbIrqLevelFn fn = g_level[i].fn; // (NULL: being taken away)
+        if (fn != NULL && fn(g_level[i].user)) {
             lines |= 1u << i;
         }
     }
@@ -308,9 +332,10 @@ static void poll(bool levels) {
     if (g_in_service) {
         return;
     }
-    update_tick();
+    const uint64_t now = wl_xb_time_us();
+    update_tick_at(now);
     uint64_t deadline = g_deadline;
-    bool due = g_pending != 0 || (deadline != 0 && wl_xb_time_us() >= deadline);
+    bool due = g_pending != 0 || (deadline != 0 && now >= deadline);
     if (!due && (levels || g_lines != 0)) {
         // the lines the holder's IRQL lets in (a kernel call's poll leaves the level sources out)
         uint32_t lines = levels ? wl_xb_irq_lines() : g_lines;
