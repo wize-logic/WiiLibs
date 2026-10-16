@@ -302,7 +302,7 @@ WlNv2aGx *wl_xb_gpu_nv2a_gx(void) {
     return g_gx;
 }
 
-static bool g_no_xf, g_no_overlap;
+static bool g_no_xf, g_no_overlap = true;
 
 void wl_xb_gpu_set_transform_unit(bool on) {
     g_no_xf = !on;

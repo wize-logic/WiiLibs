@@ -489,7 +489,7 @@ guest RAM's size.
 | `noxf` | GX's transform unit is kept out of the vertices (every vertex through the program on the processor), for an A/B; `WL_XB_NO_XF` on the host |
 | `vcache` | the vertex arrays' cache size in KB, its text (1024 when empty); the default is 1 MB, kept in the end of the textures' arena |
 | `novcache` | turns the vertex arrays' cache off (beats `vcache`) |
-| `nooverlap` | each frame's end waits for GX to finish it (by default the processor goes on with the next frame while GX draws), for an A/B; `WL_XB_NO_OVERLAP` on the host |
+| `overlap` | the processor goes on with the next frame while GX draws (by default each frame's end waits for GX to finish it: the caches' frame-late reuse still shows stale content in some frames); `WL_XB_OVERLAP` on the host |
 | `noaudio` | the idle APU and AC'97 (DirectSound fails, the title runs silent), for an A/B; `WL_XB_AUDIO=0` on the host |
 | `deterministic` | the virtual clock (`thread.h`'s deterministic mode), so a run of a script on the Wii is the same game as the host's with `WL_XB_DETERMINISTIC=1`: guest RAM (the play step `dump`) and captures compare byte for byte; `WL_XB_DETERMINISTIC` on the host |
 | `play/` | where screenshots and captures go (`WL_XB_PLAY_OUT` on the host); scripts and `replay:` captures are looked for relative to the title folder |
