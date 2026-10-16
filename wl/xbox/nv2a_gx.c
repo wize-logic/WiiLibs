@@ -727,6 +727,57 @@ static void cull_measure(WlNv2aGx *gx, uint32_t clear_rgba) {
     gx->projection_loaded = false;
 }
 
+// A clear of some of the colour's channels (WL_NV2A_CLEAR_R..A in `flags`), the rectangle [x0, x1) by
+// [y0, y1) of the EFB's owner: a quad of the clear's colour with GX's colour and alpha updates as the
+// channels have them (wl_gx_target_clear writes all four). Halo clears the alpha alone before its
+// fog pass writes the fog's amount there; a clear of the colour as well left the picture black and
+// the fog's colour over all of it. GX updates red, green and blue together: any of them, all three.
+static void clear_channels(WlNv2aGx *gx, uint32_t flags, uint32_t rgba, uint32_t x0, uint32_t y0, uint32_t x1,
+                           uint32_t y1) {
+    const float corners[4][2] = {{(float)x0, (float)y0}, {(float)x1, (float)y0}, {(float)x0, (float)y1},
+                                 {(float)x1, (float)y1}};
+    static const uint8_t order[6] = {0, 1, 2, 2, 1, 3};
+    WlGxDirectLayout layout = {1, 0, 0, 0, 0, 0, 0};
+    WlGxDirectVertex vertices[6];
+    WlTevProgram tev;
+    float m[4][4];
+    unsigned v;
+
+    device_state(gx);
+    memset(m, 0, sizeof m);
+    m[0][0] = 2.0f / (float)gx->cfg.width;
+    m[0][3] = -1.0f;
+    m[1][1] = -2.0f / (float)gx->cfg.height;
+    m[1][3] = 1.0f;
+    m[2][2] = 1.0f;
+    m[3][3] = 1.0f;
+    wl_gx_direct_projection((const float (*)[4])m, true);
+    wl_gx_direct_viewport(0.0f, 0.0f, (float)gx->cfg.width, (float)gx->cfg.height);
+    wl_gx_direct_scissor(0, 0, gx->view_w, gx->view_h);
+    wl_gx_direct_blend(WL_GX_BM_NONE, WL_GX_BL_ONE, WL_GX_BL_ZERO);
+    wl_gx_direct_alpha_compare(WL_GX_ALWAYS, 0);
+    wl_gx_direct_zmode(false, WL_GX_ALWAYS, false);
+    wl_gx_direct_cull(WL_GX_CULL_NONE);
+    wl_gx_direct_color_update((flags & (WL_NV2A_CLEAR_R | WL_NV2A_CLEAR_G | WL_NV2A_CLEAR_B)) != 0,
+                              (flags & WL_NV2A_CLEAR_A) != 0);
+    wl_tev_recipe(&tev, WL_GX_RECIPE_VERTEX_COLOR);
+    wl_tev_apply_unchecked(&tev);
+    wl_gx_direct_layout(&layout);
+    memset(vertices, 0, sizeof vertices);
+    for (v = 0; v < 6; v++) {
+        vertices[v].position[0] = corners[order[v]][0];
+        vertices[v].position[1] = corners[order[v]][1];
+        vertices[v].position[2] = -0.5f;
+        vertices[v].color[0][0] = (uint8_t)(rgba >> 24);
+        vertices[v].color[0][1] = (uint8_t)(rgba >> 16);
+        vertices[v].color[0][2] = (uint8_t)(rgba >> 8);
+        vertices[v].color[0][3] = (uint8_t)rgba;
+    }
+    wl_gx_direct_draw(WL_GX_DIRECT_TRIANGLES, vertices, 6);
+    gx->stats.quad_clears++;
+    device_state(gx);
+}
+
 // ---- textures -------------------------------------------------------------------------------------
 
 static uint8_t gx_wrap(uint8_t wrap) {
@@ -2937,6 +2988,13 @@ static void backend_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
     }
     if (x0 >= x1 || y0 >= y1) {
         return;
+    }
+    if (colour && (flags & WL_NV2A_CLEAR_COLOR) != WL_NV2A_CLEAR_COLOR) {
+        clear_channels(gx, flags, rgba, x0, y0, x1, y1);
+        if (!depth) {
+            return;
+        }
+        colour = false;
     }
     wl_gx_target_clear(colour, depth, rgba, z, (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
     gx->stats.quad_clears++;

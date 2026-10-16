@@ -273,6 +273,26 @@ TEST partial_clears_are_quads_and_render_targets_take_the_efb(void) {
     t_kick(&g);
     wl_nv2a_gx_stats(g_gx, &stats);
     ASSERT_EQ(1u, stats.quad_clears);
+    // a clear of the alpha alone (Halo's before its fog pass): a quad of the clear's colour that
+    // writes the alpha and leaves the colour
+    t_m1(&g, WL_NV2A_K_SET_COLOR_CLEAR_VALUE, 0x40102030u);
+    t_m1(&g, WL_NV2A_K_CLEAR_SURFACE, WL_NV2A_CLEAR_A);
+    t_kick(&g);
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT_EQ(2u, stats.quad_clears);
+    {
+        const WlHostGxDirect *d = wl_host_gx_direct();
+        ASSERT_EQ(WL_GX_DIRECT_TRIANGLES, d->prim);
+        ASSERT_EQ(6u, d->count);
+        ASSERT(!d->color_update);
+        ASSERT(d->alpha_update);
+        ASSERT_EQ(WL_GX_BM_NONE, d->blend_mode);
+        ASSERT(!d->z_write);
+        ASSERT(near(d->vertices[0].position[0], 10.0f));
+        ASSERT(near(d->vertices[5].position[1], 100.0f));
+        ASSERT_EQ(0x10, d->vertices[0].color[0][0]);
+        ASSERT_EQ(0x40, d->vertices[0].color[0][3]);
+    }
     // a 128x128 swizzled surface at 0x70000: a render target, its texture then read from the image
     t_m1(&g, WL_NV2A_K_SET_SURFACE_FORMAT,
          WL_NV2A_SURFACE_COLOR_A8R8G8B8 | WL_NV2A_SURFACE_TYPE_SWIZZLE << 8 | 7u << 16 | 7u << 24);
