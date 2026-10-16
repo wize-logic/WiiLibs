@@ -39,6 +39,7 @@ static struct {
     atomic_bool abandon;   // stop at once
     atomic_bool done;      // the thread has sent END (or has nothing more to do)
     bool in_sender_exit;   // the thread itself is leaving (QUIT): it flushes inline
+    bool quit_seen;        // a QUIT was acted on (a second one, read while flushing inline, is not)
     void (*quit_fn)(void);
 
     char host[64];
@@ -343,7 +344,8 @@ static bool read_peer(void) {
                 line[fill < sizeof line ? fill : sizeof line - 1u] = '\0';
                 bool quit = strcmp(line, "QUIT") == 0 || strcmp(line, "QUIT\r") == 0;
                 fill = 0;
-                if (quit) {
+                if (quit && !g.quit_seen) {
+                    g.quit_seen = true;
                     quit_requested();
                 }
             } else if (fill < sizeof line - 1u) {
@@ -622,6 +624,7 @@ WlResult wl_net_stream_open(const char *spec, const char *run_name) {
     g.lost_note = 0;
     g.sock = g.listener = WL_SOCKET_INVALID;
     g.in_sender_exit = false;
+    g.quit_seen = false;
     g.joined = false;
     atomic_store(&g.closing, false);
     atomic_store(&g.abandon, false);
