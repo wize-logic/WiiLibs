@@ -20,6 +20,12 @@ add_library(wl_xbox_gx STATIC nv2a_gx.c)
 wl_target_defaults(wl_xbox_gx DETERMINISTIC)
 wl_gpu_path(wl_xbox_gx)
 target_link_libraries(wl_xbox_gx PUBLIC wl_xbox wl_platform)
+# (a diagnostic build: each fused batch run the general way too, the first word that differs in a draw
+# logged; the Wii's flags stay the toolchain's, which -DCMAKE_C_FLAGS would replace)
+option(WL_XBOX_FUSED_CHECK "Check each fused vertex batch against the general path (slow; logs differences)" OFF)
+if(WL_XBOX_FUSED_CHECK)
+    target_compile_definitions(wl_xbox_gx PRIVATE WL_XBOX_FUSED_CHECK)
+endif()
 add_library(WiiLibs::xbox_gx ALIAS wl_xbox_gx)
 
 # the vertex program compiler, a host tool (it includes vsh.c for its decoder's internals), and the

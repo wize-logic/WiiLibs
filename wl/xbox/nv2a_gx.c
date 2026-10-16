@@ -11,6 +11,7 @@
 
 #include <math.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1775,6 +1776,94 @@ static const WlXboxVshFusedForm *fused_for(WlNv2aGx *gx, DrawPlan *plan, const W
     return plan->fused;
 }
 
+#ifdef WL_XBOX_FUSED_CHECK
+// (a build with WL_XBOX_FUSED_CHECK: each fused batch run the general way too, and the first word
+// that differs in a draw logged with the vertex's inputs, FUSED_CHECK_LINES lines a run at most; the
+// fused words are kept, so the picture is the fused build's)
+enum { FUSED_CHECK_LINES = 48 };
+
+// an array's element size as the fused form reads it (0: none)
+static unsigned fused_check_bytes(unsigned format) {
+    return format >= WL_XBOX_VSH_FUSED_F1 && format <= WL_XBOX_VSH_FUSED_F4 ? 4u * (format - WL_XBOX_VSH_FUSED_F1 + 1u)
+           : format == WL_XBOX_VSH_FUSED_D3DCOLOR || format == WL_XBOX_VSH_FUSED_CMP ? 4u
+           : format >= WL_XBOX_VSH_FUSED_S1 && format < WL_XBOX_VSH_FUSED_UB       ? 2u * (format - WL_XBOX_VSH_FUSED_S1 + 1u)
+           : format >= WL_XBOX_VSH_FUSED_UB && format < WL_XBOX_VSH_FUSED_FORMATS  ? format - WL_XBOX_VSH_FUSED_UB + 1u
+                                                                                   : 0u;
+}
+
+static void fused_check(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, DrawPlan *plan, unsigned runs,
+                        const WlXboxVshFusedForm *form) {
+    static PackedVertex fused[WL_XBOX_VSH_BATCH];
+    static unsigned lines, checked, differing;
+    static uint32_t logged_stamp;
+    const WlXboxVshProgram *program = gx->pipeline.program;
+    const WlNv2aFetchPlan *fetch = &gx->fetch;
+    const unsigned words = 3u + plan->colors + 2u * plan->stage_count;
+    unsigned r, n, w;
+
+    for (r = 0; r < runs; r++) {
+        fused[r] = *gx->batch.run_vertices[r];
+    }
+    wl_nv2a_fetch_vertices(&gx->fetch, draw, gx->batch.run_vertex, runs, gx->batch.inputs);
+    wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, runs,
+                              plan->live, gx->batch.outputs, &gx->batch.work);
+    vertices_pack(gx, k, plan, runs);
+    checked += runs;
+    for (r = 0; r < runs; r++) {
+        uint32_t *general = gx->batch.run_vertices[r]->w;
+        unsigned first = words, count = 0;
+
+        for (w = 0; w < words; w++) {
+            if (fused[r].w[w] != general[w]) {
+                first = first < w ? first : w;
+                count++;
+            }
+        }
+        if (count != 0) {
+            differing++;
+        }
+        if (count != 0 && logged_stamp != gx->memo_stamp && lines + 3u <= FUSED_CHECK_LINES) {
+            char text[400];
+            size_t at = 0;
+
+            logged_stamp = gx->memo_stamp;
+            lines += 3u;
+            for (w = first; w < words; w++) {
+                if (fused[r].w[w] != general[w]) {
+                    at += (size_t)snprintf(text + at, sizeof text - at, " w%u %08x/%08x", w, fused[r].w[w], general[w]);
+                }
+            }
+            WL_LOG_W(TAG,
+                     "fused check: program %08lx form %u live %03x vertex %u element %u (%u of %u vertices differ so "
+                     "far); words fused/general:%s",
+                     program->hash, (unsigned)(form - program->native_fused), plan->live,
+                     (unsigned)gx->batch.run_vertex[r], (unsigned)gx->batch.elements[r], differing, checked, text);
+            at = 0;
+            for (n = 0; n < fetch->count && at < sizeof text - 48u; n++) {
+                unsigned bytes = fused_check_bytes(wl_nv2a_fetch_fused_format(fetch, n)), b;
+                const uint8_t *p = fetch->streamed[n].data + (size_t)fetch->streamed[n].stride * gx->batch.elements[r];
+
+                at += (size_t)snprintf(text + at, sizeof text - at, " v%u", (unsigned)fetch->streamed[n].attribute);
+                for (b = 0; b < bytes && at < sizeof text - 4u; b++) {
+                    at += (size_t)snprintf(text + at, sizeof text - at, "%s%02x", b % 4u ? "" : " ", p[b]);
+                }
+            }
+            WL_LOG_W(TAG, "fused check:  arrays%s", text);
+            at = 0;
+            for (n = 0; n < fetch->count && at < sizeof text - 64u; n++) {
+                const float *v = gx->batch.inputs[r][fetch->streamed[n].attribute];
+
+                at += (size_t)snprintf(text + at, sizeof text - at, " v%u %g %g %g %g",
+                                       (unsigned)fetch->streamed[n].attribute, (double)v[0], (double)v[1],
+                                       (double)v[2], (double)v[3]);
+            }
+            WL_LOG_W(TAG, "fused check:  inputs%s", text);
+        }
+        memcpy(gx->batch.run_vertices[r]->w, fused[r].w, sizeof fused[r].w);
+    }
+}
+#endif
+
 static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, uint32_t first,
                           uint32_t count, DrawPlan *plan, WlGxDirectLayout *layout) {
     bool indexed = draw->source == WL_NV2A_SOURCE_ARRAYS && draw->indices != NULL;
@@ -1825,6 +1914,9 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
             gx->fused.words = gx->batch.words_made;
             form->run((const float (*)[4])k->constants, &gx->fused, runs, plan->live);
             gx->stats.vertices_fused += runs;
+#ifdef WL_XBOX_FUSED_CHECK
+            fused_check(gx, k, draw, plan, runs, form);
+#endif
             return false;
         }
     }
