@@ -54,6 +54,12 @@ add_test(NAME test_host_run
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_host_run.py)
 set_tests_properties(test_host_run PROPERTIES LABELS unit)
 
+# the Wii network runner (tools/wii_net_run.py) against a pretend wiiload and a pretend Wii: both ways of
+# connecting, a run that ends, crashes or hangs, the protocol parser, a file of runs
+add_test(NAME test_wii_net_run
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_wii_net_run.py)
+set_tests_properties(test_wii_net_run PROPERTIES LABELS unit)
+
 # the instruction counter (tools/qemu_icount.py): its log parser on both of qemu's forms, and a loop
 # counted under qemu-ppc where it and a PowerPC Linux compiler are installed (skipped otherwise)
 add_test(NAME test_qemu_icount
