@@ -28,6 +28,7 @@ TEST cmpr_palette_uses_hardware_weights(void) {
     ASSERT_EQ(255, pal[3][3]);
     wl_gxc_cmpr_palette(0x0000u, 0xF800u, pal); // c0 <= c1: three colours, index 3 transparent
     ASSERT_EQ(127, pal[2][0]);
+    ASSERT_EQ(127, pal[3][0]); // the clear index has index 2's colour on the hardware, not S3TC's black
     ASSERT_EQ(0, pal[3][3]);
     PASS();
 }

@@ -101,9 +101,10 @@ void wl_gxc_cmpr_palette(uint32_t c0, uint32_t c1, uint8_t pal[4][4]) {
         }
         pal[2][3] = pal[3][3] = 255;
     } else {
+        // (index 3's colour is index 2's, not black as S3TC's: the hardware's, and Dolphin's since it
+        // was measured on one; a draw that blends without the alpha shows it)
         for (int k = 0; k < 3; k++) {
-            pal[2][k] = (uint8_t)((pal[0][k] + pal[1][k]) >> 1);
-            pal[3][k] = 0;
+            pal[2][k] = pal[3][k] = (uint8_t)((pal[0][k] + pal[1][k]) >> 1);
         }
         pal[2][3] = 255;
         pal[3][3] = 0;

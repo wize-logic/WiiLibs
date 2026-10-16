@@ -350,6 +350,10 @@ size_t wl_xbox_dxt_to_cmpr(WlXboxFormat dxt, const void *src, size_t src_len, ui
                 } else if (c0 == c1) {
                     memset(idx, 0, sizeof idx);
                 }
+            } else if (c0 <= c1 && (idx[0] & idx[1] & idx[2] & idx[3]) == 0xFFu) {
+                // A block all clear: S3TC's clear texels are black, CMPR's the endpoints' mean, which a
+                // draw blending without the alpha shows (the decals' atlas margins drew white frames).
+                c0 = c1 = 0;
             }
             put_be16(o, c0);
             put_be16(o + 2, c1);

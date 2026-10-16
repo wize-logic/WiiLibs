@@ -122,20 +122,36 @@ TEST dxt1_to_cmpr_reorders_without_changing_a_bit_of_meaning(void) {
 }
 
 TEST dxt1_three_colour_blocks_keep_their_transparent_index(void) {
-    // c0 = 0x001F < c1 = 0xF800: three colours and index 3 clear; all texels index 3 -> 0xFF in every CMPR byte
-    const uint8_t b[8] = {0x1F, 0x00, 0x00, 0xF8, 0xFF, 0xFF, 0xFF, 0xFF};
+    // c0 = 0x001F < c1 = 0xF800: three colours and index 3 clear; texel 0 index 0, the rest index 3
+    const uint8_t b[8] = {0x1F, 0x00, 0x00, 0xF8, 0xFC, 0xFF, 0xFF, 0xFF};
     uint8_t out[32];
     ASSERT_EQ(32u, wl_xbox_dxt_to_cmpr(WL_XBOX_DXT1, b, 8, 4, 4, out, sizeof out));
     ASSERT_EQ(0x00, out[0]);
     ASSERT_EQ(0x1F, out[1]);
     ASSERT_EQ(0xF8, out[2]);
     ASSERT_EQ(0x00, out[3]);
-    for (int i = 4; i < 8; i++) {
+    ASSERT_EQ(0x3F, out[4]);
+    for (int i = 5; i < 8; i++) {
         ASSERT_EQ(0xFF, out[i]);
     }
     uint8_t px[16][4];
     wl_gxc_cmpr_decode_block(out, px);
+    ASSERT_EQ(255, px[0][2]);
     ASSERT_EQ(0, px[5][3]);
+    PASS();
+}
+
+TEST dxt1_clear_blocks_are_clear_black(void) {
+    // all texels index 3: S3TC shows transparent black, CMPR the endpoints' mean, so the endpoints become black
+    const uint8_t b[8] = {0x1F, 0x00, 0x00, 0xF8, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t out[32];
+    ASSERT_EQ(32u, wl_xbox_dxt_to_cmpr(WL_XBOX_DXT1, b, 8, 4, 4, out, sizeof out));
+    uint8_t px[16][4];
+    wl_gxc_cmpr_decode_block(out, px);
+    for (int i = 0; i < 16; i++) {
+        const uint8_t clear[4] = {0, 0, 0, 0};
+        ASSERT_MEM_EQ(clear, px[i], 4);
+    }
     PASS();
 }
 
@@ -605,6 +621,7 @@ SUITE(xbox_tex_suite) {
     RUN_TEST(unswizzle_follows_the_masks_and_round_trips);
     RUN_TEST(dxt1_to_cmpr_reorders_without_changing_a_bit_of_meaning);
     RUN_TEST(dxt1_three_colour_blocks_keep_their_transparent_index);
+    RUN_TEST(dxt1_clear_blocks_are_clear_black);
     RUN_TEST(dxt5_colour_is_forced_into_four_colour_mode);
     RUN_TEST(dxt_alpha_blocks_decode_as_s3tc_says);
     RUN_TEST(dxt_alpha_i4_takes_the_top_nibble_in_gx_tiles);
