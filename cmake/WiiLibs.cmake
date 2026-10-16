@@ -295,7 +295,10 @@ endfunction()
 # commit it or the list), compiled into the executable (-O2, no fused multiply-adds: the same bits
 # as the interpreter), whose wl_xb_title_vsh_natives the runtime finds them by. A list that is not
 # there yet is an empty table. The executable also gets sqrtf and sqrt as wl_sqrtf_exact and
-# wl_sqrt_exact (wl_gfx_wrap_sqrtf, wl_gfx_wrap_sqrt: the same bits, faster on the Wii).
+# wl_sqrt_exact (wl_gfx_wrap_sqrtf, wl_gfx_wrap_sqrt: the same bits, faster on the Wii). The cache
+# variable WL_XBOX_VSH_FORMS names the title's fused forms (the lines xbox_nv2a_replay --fused-forms
+# prints, derived from the title: never commit it): on the Wii each gets one loop that reads the
+# arrays, runs the program and writes GX's words (xbox_vsh_codegen --fused).
 # (a cache entry: a project that adds WiiLibs with add_subdirectory calls the functions below from its
 # own scope, where a plain variable of this directory is not seen)
 set(WL_CMAKE_DIR ${CMAKE_CURRENT_LIST_DIR} CACHE INTERNAL "WiiLibs' cmake directory")
@@ -468,13 +471,20 @@ function(wl_add_xbox_title target)
                 ${wl_root}/wl/xbox/vsh_native.h ${wl_root}/wl/gfx/gfx_sqrt.c ${wl_root}/wl/gfx/gfx_sqrt.h
             COMMENT "Building the vertex program compiler for the build machine"
             VERBATIM)
+        set(vsh_fused)
+        set(vsh_deps ${vsh_tool})
+        if(WL_XBOX_VSH_FORMS)
+            get_filename_component(vsh_forms "${WL_XBOX_VSH_FORMS}" ABSOLUTE)
+            set(vsh_fused --fused ${vsh_forms})
+            list(APPEND vsh_deps ${vsh_forms})
+        endif()
         # (run at every build, the list being the runtime's; the C is replaced only when it changes)
         add_custom_target(${target}_vsh
-            COMMAND ${vsh_tool} --if-exists --accessor wl_xb_title_vsh_natives ${vsh_list} ${vsh_c}.new
-                wl_xb_vsh_natives
+            COMMAND ${vsh_tool} --if-exists ${vsh_fused} --accessor wl_xb_title_vsh_natives ${vsh_list}
+                ${vsh_c}.new wl_xb_vsh_natives
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${vsh_c}.new ${vsh_c}
             BYPRODUCTS ${vsh_c}
-            DEPENDS ${vsh_tool}
+            DEPENDS ${vsh_deps}
             COMMENT "Compiling the vertex programs of ${vsh_list}"
             VERBATIM)
         target_sources(${target} PRIVATE ${vsh_c})

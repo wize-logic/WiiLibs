@@ -19,7 +19,7 @@
 // once.
 //
 // usage: xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] [--no-pairs]
-//            microcode.inc output.c [table]
+//            [--fused forms.txt] microcode.inc output.c [table]
 //   (table: the name of the table, default xbox_vsh_natives, and of its count, <table>_count;
 //   --if-exists: a microcode file that is not there has no programs, an empty table; --accessor:
 //   also a function of that name, const WlXboxVshNative *name(unsigned long *count), that gives
@@ -28,7 +28,9 @@
 //   for a skinned one, its four-positions function (wl_xbox_vsh_run_colors and _positions, which
 //   only the tests call: without it the table's entries for them are NULL, and a title's program
 //   is not paying for code it never runs; --no-pairs: no whole-program assembly, the Wii's batches
-//   per instruction as before))
+//   per instruction as before; --fused: for each form the file names, "<hash> <form> ...", as
+//   xbox_nv2a_replay --fused-forms prints them, the Wii's loop that reads the arrays, runs the
+//   program and writes GX's words))
 
 #include "../wl/xbox/vsh.c"
 
