@@ -36,7 +36,10 @@
 //   --bench N   the capture replayed N times through the GX backend alone (no software GX, no
 //               recorder): the processor's part of the frames, timed (the best run and the mean,
 //               a frame), and the best run's parts: the model's (pusher, puller, 3D state), the
-//               backend's draws, its clears and frames, the memory records put in
+//               backend's draws, its clears and frames, the memory records put in. The guest memory
+//               is kept from one run to the next (through wl_nv2a_replay_stream), as a title's is
+//               from one frame to the next: a later run's records change (and --watch sees stored
+//               to) only what differs, not every block the capture holds
 //   --xf-programs  with --bench: the draws and vertices of each way (wl_nv2a_gx_last_xf) by
 //               vertex program (its hash), the most vertices first (each draw's program hashed:
 //               not for timing)
@@ -628,21 +631,25 @@ static WlResult replay(const uint8_t *data, size_t size, const WlNv2aBackend *ba
     WlNv2aReplayMemory memory = {NULL, stream_phys, 0};
     WlResult result;
 
-    if (!g_stream) {
+    if (!g_stream && g_bench == 0) {
         return wl_nv2a_replay(data, size, backend, hooks, info);
     }
     g_src.data = data;
     g_src.size = size;
     g_src.at = 0;
     g_src.ram_bytes = size >= 16 ? wl_rd_le32(data + 12) : 0u; // (the header's RAM size)
-    g_src.ram = calloc(1, g_src.ram_bytes != 0 ? g_src.ram_bytes : 1u);
+    if (g_src.ram == NULL) {
+        g_src.ram = calloc(1, g_src.ram_bytes != 0 ? g_src.ram_bytes : 1u);
+    }
     if (g_src.ram == NULL) {
         return WL_ERR_NOMEM;
     }
     memory.ram_bytes = g_src.ram_bytes;
     result = wl_nv2a_replay_stream(&source, &memory, backend, hooks, info);
-    free(g_src.ram);
-    g_src.ram = NULL;
+    if (g_bench == 0) {
+        free(g_src.ram);
+        g_src.ram = NULL;
+    }
     return result;
 }
 
@@ -845,6 +852,9 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
                "alone\n", (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws);
         vertex_cache_line("bench: ");
         texture_cache_line("bench: ");
+        printf("bench: texture binds: %u draws kept the draw before's textures; %u textures bound to stages, %u GX "
+               "objects (alphas apart included) kept as made before\n",
+               (unsigned)gs.textures_kept, (unsigned)gs.texture_stages, (unsigned)gs.texture_objects_kept);
         {
             // (where each draw's vertices were transformed, a frame)
             double per = 1.0 / ((double)runs * frames);
@@ -1087,5 +1097,6 @@ int main(int argc, char **argv) {
     free(data);
     free(arena);
     free(g_page_epoch);
+    free(g_src.ram);
     return 0;
 }

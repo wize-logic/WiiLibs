@@ -10,5 +10,8 @@
 void wl_gx_wii_copy_filter(bool display);
 // GX commands were submitted behind the shadow's back (wl_gx_peek_rgba then syncs first).
 void wl_gx_wii_note_commands(void);
+// Texture maps loaded behind gx_direct_wii.c's back (bit n: GX_TEXMAPn): what they hold is unknown
+// to it, so its next wl_gx_direct_texture on them loads.
+void wl_gx_wii_texmaps_forget(uint32_t maps);
 // A draw-sync token sent into the FIFO now (0 before wl_gx_init): hwcount.h's marks.
 uint32_t wl_gx_wii_mark_token(void);

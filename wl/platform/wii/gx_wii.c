@@ -305,6 +305,7 @@ void wl_gx_stats(WlGxStats *out) {
 
 void wl_gx_invalidate_shadow(void) {
     g.known = 0;
+    wl_gx_wii_texmaps_forget(0xFFu);
     g.nrm_valid = false;
     memset(g.tlut, 0, sizeof g.tlut);
 }
@@ -1199,6 +1200,7 @@ void wl_gx_tex_bind_ex(const WlGxTexObj *tex, const WlGxSampler *sampler, const 
         g.tex = obj;
         g.tex_bound = true;
         GX_LoadTexObj(&g.tex, GX_TEXMAP0);
+        wl_gx_wii_texmaps_forget(1u << GX_TEXMAP0);
         g.stats.tex_loads++;
         g.dirty = true;
     }
@@ -1228,6 +1230,7 @@ void wl_gx_ramp_bind(uint32_t texmap) {
         made = true;
     }
     GX_LoadTexObj(&ramp, (u8)texmap);
+    wl_gx_wii_texmaps_forget(1u << texmap);
     if (texmap == GX_TEXMAP0) {
         g.known &= ~(uint32_t)K_TEX;
     }

@@ -114,6 +114,8 @@ typedef struct WlNv2aGxStats {
     uint32_t indexed_vertices;    // ...and their vertices
     uint32_t raster_kept;         // draws that left GX's raster state as the draw before (unchanged)
     uint32_t textures_kept;       // ...its textures
+    uint32_t texture_stages;      // textures bound to a stage (the draws that did not keep them)
+    uint32_t texture_objects_kept; // ...and alphas apart, whose GX object was the one made before
     uint32_t combiners_kept;      // ...its pixel program
     uint32_t programs_unbiased;   // programs whose signed sums were made unsigned (psh_bias.h)
     uint32_t xf_why_draws[WL_NV2A_GX_XF_WHYS];    // draws by where their vertices were transformed
