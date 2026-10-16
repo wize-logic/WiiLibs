@@ -196,6 +196,13 @@ TEST a_full_ring_drops_and_says_so(void) {
     ASSERT_EQ(WL_OK, wl_net_listen(l, 1));
     WlSocket c = accept_within(l, 6000);
     ASSERT(c != WL_SOCKET_INVALID);
+    // (accept returns as the connection completes, before the thread has taken a line out of the full
+    // ring: wait for it, or "after" is dropped too, or fits in the sliver left and the note does not)
+    for (int i = 0; i < 500 && st.lines_sent == 0u; i++) {
+        wl_platform_thread_sleep_ms(10);
+        wl_net_stream_stats(&st);
+    }
+    ASSERT(st.lines_sent > 0u);
     WL_LOG_I("flood", "after");
     wl_net_stream_close(3000);
     size_t size;

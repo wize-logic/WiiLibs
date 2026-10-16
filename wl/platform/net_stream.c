@@ -83,6 +83,22 @@ static void ring_put(const char *data, uint32_t n) {
     g.head += n;
 }
 
+// Puts the "lines dropped" note in the ring when `extra` more bytes fit beside it (the lock is held).
+// The producer tries before each line; the sender tries too, so a note still waiting when the log goes
+// quiet (the line after the drops fitted, the note beside it did not) is sent once the ring has room.
+static void ring_drop_note(uint32_t extra) {
+    char note[48];
+
+    if (g.pending_drop == 0u) {
+        return;
+    }
+    int m = snprintf(note, sizeof note, "[W][" TAG "] %u lines dropped\n", (unsigned)g.pending_drop);
+    if (m > 0 && RING_BYTES - (g.head - g.tail) >= (uint32_t)m + extra) {
+        ring_put(note, (uint32_t)m);
+        g.pending_drop = 0;
+    }
+}
+
 static bool starts_with_word(const char *text, size_t len) {
     return (len >= 5u && memcmp(text, "FILE ", 5) == 0) || (len >= 6u && memcmp(text, "HELLO ", 6) == 0) ||
            (len >= 3u && memcmp(text, "END", 3) == 0) || (len >= 4u && memcmp(text, "QUIT", 4) == 0);
@@ -106,16 +122,8 @@ void wl_net_stream_log_line(const char *text, size_t len) {
     }
     line[n++] = '\n';
     wl_platform_mutex_lock(g.lock);
+    ring_drop_note(n);
     uint32_t space = RING_BYTES - (g.head - g.tail);
-    if (g.pending_drop > 0u) {
-        char note[48];
-        int m = snprintf(note, sizeof note, "[W][" TAG "] %u lines dropped\n", (unsigned)g.pending_drop);
-        if (m > 0 && space >= (uint32_t)m + n) {
-            ring_put(note, (uint32_t)m);
-            space -= (uint32_t)m;
-            g.pending_drop = 0;
-        }
-    }
     if (space < n) {
         g.pending_drop++;
         atomic_fetch_add(&g.lines_dropped, 1u);
@@ -131,6 +139,7 @@ static uint32_t ring_take(char *out, uint32_t cap, uint32_t *lines) {
 
     *lines = 0;
     wl_platform_mutex_lock(g.lock);
+    ring_drop_note(0u);
     uint32_t avail = g.head - g.tail;
     if (avail > cap) {
         avail = cap;
