@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "greatest.h"
+#include "wl/platform/gx_direct.h"
 #include "wl/platform/gx_target_internal.h"
 #include "wl/platform/wii/gx_wii_internal.h"
 
@@ -54,6 +55,16 @@ void wl_gx_wii_hang_event(char kind, uint32_t a, uint32_t b) {
     (void)b;
 }
 
+void wl_gx_wii_texmaps_loaded(uint32_t maps) {
+    (void)maps;
+}
+
+static WlGxBisect g_bisect; // (the bisection's switches, as a test sets them)
+
+const WlGxBisect *wl_gx_bisect(void) {
+    return &g_bisect;
+}
+
 bool wl_gx_sync(void) {
     return true; // (the stub GPU is never behind)
 }
@@ -86,6 +97,7 @@ static void start(void) {
     gx_stub_name_memory(g_memory_b, "B");
     g_alloc_calls = 0;
     g_commands = g_shadow = 0;
+    memset(&g_bisect, 0, sizeof g_bisect);
     wl_gx_target_set_allocator(park_alloc, park_free);
     wl_gx_target_set_back_buffer_size(640, 480);
     wl_gx_target_set_lazy_depth(false);
@@ -297,8 +309,8 @@ TEST clear_quad_colour_and_depth(void) {
     EXPECT(from, "GX_SetColorUpdate 1", "GX_SetAlphaUpdate 1", "GX_SetZMode 1 7 1", "GX_SetZCompLoc 1",
            "GX_LoadProjectionMtx ortho 0.003125 -1 -0.00416667 1 1 0 1", "GX_SetViewport 0 0 640 480 0 1",
            "GX_SetBlendMode 0 1 0 0", "GX_SetAlphaCompare 7 0 0 7 0", "GX_SetCullMode 0",
-           "GX_SetNumIndStages 0", "GX_SetTevDirect 0", "GX_SetTevDirect 1", "GX_SetNumChans 0",
-           "GX_SetNumTevStages 1", "GX_SetNumTexGens 0",
+           "GX_SetNumIndStages 0", "GX_SetTevDirect 0", "GX_SetTevDirect 1", "GX_SetNumChans 1",
+           "GX_SetChanCtrl 4 0 0 0 0 0 2", "GX_SetNumTevStages 1", "GX_SetNumTexGens 0",
            // the colour in register 0 (red, green, blue, alpha), passed through as the stage's output
            "GX_SetTevColor 1 255 128 64 32",
            "GX_SetTevOrder 0 255 255 255", "GX_SetTevSwapMode 0 0 0",
@@ -387,7 +399,39 @@ TEST gpu_owned_blocks_are_invalidated_once(void) {
     PASS();
 }
 
+// The bisection's switches (gx_direct.h): no copy out of the EFB, the back buffer put back without
+// its Z texture, no quad at all.
+TEST bisection_leaves_out_copies_the_z_restore_and_quads(void) {
+    start();
+    WlGxTarget a = target_a();
+    g_bisect.no_copies = true;
+    (void)wl_gx_target_use(&a);
+    unsigned from = g_gx_stub_log_count;
+    ASSERT(wl_gx_target_use(NULL) != NULL);
+    ASSERT_EQ(0u, log_count(from, "GX_CopyTex"));
+
+    start();
+    wl_gx_target_drawn();
+    g_bisect.no_z_restore = true;
+    (void)wl_gx_target_use(&a);
+    from = g_gx_stub_log_count;
+    ASSERT(wl_gx_target_use(NULL) != NULL);
+    ASSERT_EQ(0u, log_count(from, "GX_LoadTexObj PD"));
+    ASSERT_EQ(1u, log_count(from, "GX_SetNumTevStages 1"));
+    ASSERT_EQ(1u, log_count(from, "GX_Begin"));
+
+    start();
+    wl_gx_target_drawn();
+    g_bisect.no_quads = true;
+    (void)wl_gx_target_use(&a);
+    from = g_gx_stub_log_count;
+    ASSERT(wl_gx_target_use(NULL) != NULL);
+    ASSERT_EQ(0u, log_count(from, "GX_Begin"));
+    PASS();
+}
+
 SUITE(target_gx_suite) {
+    RUN_TEST(bisection_leaves_out_copies_the_z_restore_and_quads);
     RUN_TEST(gpu_owned_blocks_are_invalidated_once);
     RUN_TEST(park_the_back_buffer_and_take_the_efb);
     RUN_TEST(resolve_a_target_into_its_memory);

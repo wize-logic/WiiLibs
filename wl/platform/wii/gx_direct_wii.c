@@ -2,6 +2,7 @@
 // GX driven directly (gx_direct.h) over libogc. The transform unit's flush before a primitive is
 // OpenCE-Wii's (d3d8_gx.c, "GX's transform unit kept from hanging"), moved here with the vertex
 // layout it needs to know: a strip of eight vertices of zeros in the draw's own format.
+#include <ogc/cache.h>
 #include <ogc/gu.h>
 #include <ogc/gx.h>
 #include <string.h>
@@ -36,6 +37,10 @@ static struct {
     Mtx position;
     uint8_t texgen_set; // bit n: coordinate n has a matrix of its own
     uint8_t texgen_source[8];
+    // each coordinate's input as the transform unit numbers them: the vertex's coordinates in order
+    // (GX_TG_TEX0 + the coordinates the vertex sends before it; wl_gx_direct_layout)
+    uint8_t tex_input[8];
+    bool gaps_logged;
     float texgen[8][2][4];
     // a vertex of an indexed layout as the FIFO takes it: each item an index (0) or a number of
     // words; whether every attribute is indexed
@@ -50,11 +55,113 @@ static struct {
     // n's is known; wl_gx_wii_texmaps_forget clears it)
     GXTexObj maps[GX_MAX_TEXMAP];
     uint8_t maps_known;
+    // the maps that have been given a texture, by this layer or behind its back (never cleared: GX's
+    // maps keep what they were loaded with)
+    uint8_t maps_loaded;
+    // the bisection's switches (wl_gx_bisect_set), whether any is on, the primitives of this frame,
+    // the fixed texture that stands for the textures left out, and the TLUTs' copies in MEM1
+    WlGxBisect bisect;
+    bool bisect_on;
+    uint32_t frame_draws;
+    GXTexObj fixed;
+    // the colour channels and texture coordinates GX makes for the layout
+    uint32_t chans, texgens;
     WlGxDirectStats stats;
+#ifdef WL_GX_CHECK
+    uint32_t check_findings;
+#endif
 } d;
+
+#ifdef WL_GX_CHECK
+// the draw's state checked (wl_gx_check_draw): the first findings logged with the state, then a count
+static void check_draw(void) {
+    const WlTevProgram *tev = wl_gx_wii_tev_last();
+    uint32_t found = wl_gx_check_draw(d.chans, d.texgens, d.maps_loaded, tev), bit, i;
+
+    if (found == 0) {
+        return;
+    }
+    d.check_findings++;
+    if (d.check_findings > 8u && (d.check_findings & 1023u) != 0) {
+        return;
+    }
+    for (bit = 0; bit < WL_GX_CHECKS; bit++) {
+        if (found & (1u << bit)) {
+            WL_LOG_E("GXCHECK", "draw %u (finding %u): %s", (unsigned)d.stats.draws, (unsigned)d.check_findings,
+                     wl_gx_check_name(bit));
+        }
+    }
+    WL_LOG_E("GXCHECK", "  layout indexed %04x colours %u texcoords %02x s %02x generated %02x projected %02x lit %x; "
+                        "channels %u, coordinates %u, maps loaded %02x",
+             d.layout.indexed, d.layout.colors, d.layout.texcoords, d.layout.texcoord_s,
+             d.layout.texcoords_generated, d.layout.texcoords_projected, d.layout.lit, (unsigned)d.chans,
+             (unsigned)d.texgens, d.maps_loaded);
+    for (i = 0; tev != NULL && i < tev->stage_count && i < WL_TEV_MAX_STAGES; i++) {
+        const WlTevStage *s = &tev->stages[i];
+
+        WL_LOG_E("GXCHECK", "  stage %u: coordinate %d map %d channel %d, colour %u %u %u %u, alpha %u %u %u %u",
+                 (unsigned)i, s->texcoord == WL_TEV_NONE ? -1 : s->texcoord, s->texmap == WL_TEV_NONE ? -1 : s->texmap,
+                 s->channel == WL_TEV_NONE ? -1 : s->channel, s->color.in[0], s->color.in[1], s->color.in[2],
+                 s->color.in[3], s->alpha.in[0], s->alpha.in[1], s->alpha.in[2], s->alpha.in[3]);
+    }
+}
+#endif
 
 void wl_gx_wii_texmaps_forget(uint32_t maps) {
     d.maps_known &= (uint8_t)~maps;
+}
+
+void wl_gx_wii_texmaps_loaded(uint32_t maps) {
+    d.maps_known &= (uint8_t)~maps;
+    d.maps_loaded |= (uint8_t)maps;
+}
+
+// ---- the bisection (wl_gx_bisect_set) -----------------------------------------------------------
+
+#define TLUT_COPIES 256u
+#define TLUT_COPY_BYTES 512u
+
+// a mid grey, opaque: RGBA8's 4x4 tile, its AR half then its GB half
+static uint8_t fixed_texels[64] __attribute__((aligned(32)));
+// the TLUTs' copies (in the program's own memory, MEM1), each slot used in turn
+static uint8_t tlut_copies[TLUT_COPIES][TLUT_COPY_BYTES] __attribute__((aligned(32)));
+static uint32_t tlut_next;
+
+void wl_gx_bisect_set(const WlGxBisect *bisect) {
+    unsigned i;
+
+    d.bisect = *bisect;
+    d.bisect_on = bisect->no_textures || bisect->no_tlut || bisect->tlut_mem1 || bisect->max_draws != 0 ||
+                  bisect->no_quads || bisect->no_z_restore || bisect->no_copies;
+    for (i = 0; i < 32u; i += 2u) {
+        fixed_texels[i] = 0xFF;
+        fixed_texels[i + 1u] = 0x80;
+        fixed_texels[32u + i] = 0x80;
+        fixed_texels[32u + i + 1u] = 0x80;
+    }
+    DCFlushRange(fixed_texels, sizeof fixed_texels);
+    GX_InitTexObj(&d.fixed, fixed_texels, 4, 4, GX_TF_RGBA8, GX_REPEAT, GX_REPEAT, GX_FALSE);
+    GX_InitTexObjFilterMode(&d.fixed, GX_NEAR, GX_NEAR);
+}
+
+const WlGxBisect *wl_gx_bisect(void) {
+    return &d.bisect;
+}
+
+void wl_gx_wii_bisect_frame(void) {
+    d.frame_draws = 0;
+}
+
+// a TLUT as the switch tlut_mem1 loads it: its entries copied into MEM1
+static void tlut_from_mem1(const WlGxTlut *tlut, GXTlutObj *table) {
+    static const u8 formats[] = {GX_TL_IA8, GX_TL_RGB565, GX_TL_RGB5A3};
+    uint8_t *copy = tlut_copies[tlut_next++ % TLUT_COPIES];
+    uint32_t bytes = (uint32_t)tlut->count * 2u;
+
+    bytes = bytes <= TLUT_COPY_BYTES ? bytes : TLUT_COPY_BYTES;
+    memcpy(copy, tlut->entries, bytes);
+    DCFlushRange(copy, TLUT_COPY_BYTES);
+    GX_InitTlutObj(table, copy, formats[tlut->format <= 2u ? tlut->format : 0u], (u16)(bytes / 2u));
 }
 
 void wl_gx_direct_begin(void) {
@@ -97,7 +204,7 @@ static u8 input_of(const WlGxDirectLayout *layout, unsigned attribute, uint8_t w
 }
 
 void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
-    unsigned n, texgens = 0;
+    unsigned n, texgens = 0, texcoord_inputs;
 
     if (d.layout_known && memcmp(&d.layout, layout, sizeof d.layout) == 0) {
         return;
@@ -139,6 +246,25 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
             texgens = n + 1;
         }
     }
+    // (the coordinates the vertex sends go in the descriptor's first slots, in order, and each
+    // generator reads the input its coordinate went in. The transform unit is told how many
+    // coordinates a vertex has, not which (XF 0x1008), so a layout of TEX0, TEX2 and TEX3 has GX
+    // read TEX2's numbers as its input 1 and TEX3's as input 2, and coordinate 3 an input no vertex
+    // sends: the console's GPU stopped for good within the first few draws of such a layout (a10's
+    // and a30's benches alike), where Dolphin, which files each coordinate by its name, drew them.
+    // The bytes are the same either way. The switch gxtexgap puts the gaps back)
+    texcoord_inputs = 0;
+    for (n = 0; n < 8; n++) {
+        bool sent = (layout->texcoords & (1u << n)) != 0;
+
+        d.tex_input[n] = (u8)(GX_TG_TEX0 + (d.bisect.texcoord_gaps || !sent ? n : texcoord_inputs));
+        texcoord_inputs += sent ? 1u : 0u;
+    }
+    if (!d.gaps_logged && !d.bisect.texcoord_gaps && layout->texcoords != (1u << texcoord_inputs) - 1u) {
+        d.gaps_logged = true;
+        WL_LOG_I("GX", "texture coordinates %02x sent as the first %u of the vertex (the first layout with a gap)",
+                 (unsigned)layout->texcoords, texcoord_inputs);
+    }
     for (n = 0; n < texgens; n++) {
         if (layout->texcoords_projected & (1u << n)) {
             // (from the normal, binormal or tangent that carries it, through a 3x4 identity: GX
@@ -158,21 +284,28 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
             GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4, GX_TG_POS, GX_IDENTITY);
             continue;
         }
-        GX_SetVtxDesc((u8)(GX_VA_TEX0 + n),
+        GX_SetVtxDesc((u8)(GX_VA_TEX0 + (d.tex_input[n] - GX_TG_TEX0)),
                       input_of(layout, WL_GX_DIRECT_ARRAY_TEXCOORD0 + n, (layout->texcoord_s & (1u << n)) ? 1 : 2));
-        GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_TEX0 + n, (layout->texcoord_s & (1u << n)) ? GX_TEX_S : GX_TEX_ST, GX_F32,
-                         0);
-        GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4, GX_TG_TEX0 + n, GX_IDENTITY);
+        GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_TEX0 + (d.tex_input[n] - GX_TG_TEX0),
+                         (layout->texcoord_s & (1u << n)) ? GX_TEX_S : GX_TEX_ST, GX_F32, 0);
+        GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4, d.tex_input[n], GX_IDENTITY);
     }
-    GX_SetNumTexGens(texgens);
-    GX_SetNumChans(layout->colors);
+    // (never no channel and no coordinate at once: the console's GPU stops for good on a primitive
+    // with neither that follows others in the pipeline, where Dolphin draws it. One channel then,
+    // from the registers, which no stage of such a draw reads; wl_gx_direct_layout_outputs)
+    wl_gx_direct_layout_outputs(layout, &d.chans, &d.texgens);
+    GX_SetNumTexGens((u8)d.texgens);
+    GX_SetNumChans((u8)d.chans);
     wl_gx_wii_hang_event('L', layout->indexed | (uint32_t)layout->colors << 16 | (uint32_t)layout->lit << 20 |
                                   (uint32_t)layout->texcoords_projected << 24,
                          layout->texcoords | (uint32_t)layout->texcoords_generated << 8 |
                              (uint32_t)layout->texcoord_s << 16);
     if (!layout->lit) {
-        GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
-        GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+        // (a channel the vertex has no colour for: its material the register's)
+        GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, layout->colors >= 1 ? GX_SRC_VTX : GX_SRC_REG,
+                       GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+        GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, layout->colors >= 2 ? GX_SRC_VTX : GX_SRC_REG,
+                       GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
     } else {
         // (a lit channel: its material and ambient the registers', its light n, the signed dot
         // product, no attenuation; the others the vertex's colour)
@@ -287,6 +420,14 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     if (count == 0 || count > 65535u || (unsigned)prim >= sizeof prims || !d.layout_known) {
         return;
     }
+    if (d.bisect_on && d.bisect.max_draws != 0 && d.frame_draws++ >= d.bisect.max_draws) {
+        return; // (left out: its vertices go nowhere)
+    }
+    // (noted before its commands: the flush, the state GX_Begin sends, the primitive)
+    wl_gx_wii_hang_event('P', (uint32_t)prim << 16 | count, d.stats.draws);
+#ifdef WL_GX_CHECK
+    check_draw();
+#endif
     if (wl_gx_flush_wii_take()) {
         static const WlGxDirectVertex zero;
 
@@ -299,7 +440,6 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
         wl_gx_wii_hang_event('X', 0, 0);
     }
     GX_Begin(prims[prim], DIRECT_FORMAT, (u16)count);
-    wl_gx_wii_hang_event('P', (uint32_t)prim << 16 | count, d.stats.draws);
     d.in_primitive = true;
     d.stats.draws++;
     d.stats.vertices += count;
@@ -420,7 +560,7 @@ void wl_gx_direct_texgen(unsigned n, WlGxDirectTexSource source, const float m[2
         }
         d.texgen_set &= (uint8_t)~(1u << n);
         GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4,
-                          (d.layout.texcoords & (1u << n)) ? (u32)(GX_TG_TEX0 + n) : (u32)GX_TG_POS, GX_IDENTITY);
+                          (d.layout.texcoords & (1u << n)) ? (u32)d.tex_input[n] : (u32)GX_TG_POS, GX_IDENTITY);
         wl_gx_wii_note_commands();
         return;
     }
@@ -435,7 +575,7 @@ void wl_gx_direct_texgen(unsigned n, WlGxDirectTexSource source, const float m[2
     memcpy(matrix, m, sizeof d.texgen[n]);
     GX_LoadTexMtxImm(matrix, (u32)(GX_TEXMTX0 + 3u * n), GX_MTX2x4);
     GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4,
-                      source == WL_GX_DIRECT_TG_POSITION ? (u32)GX_TG_POS : (u32)(GX_TG_TEX0 + n),
+                      source == WL_GX_DIRECT_TG_POSITION ? (u32)GX_TG_POS : (u32)d.tex_input[n],
                       (u32)(GX_TEXMTX0 + 3u * n));
     wl_gx_wii_note_commands();
 }
@@ -537,10 +677,28 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
     if (map >= GX_MAX_TEXMAP) {
         return;
     }
+    if (d.bisect_on && (d.bisect.no_textures ||
+                        (d.bisect.no_tlut && (tex->format == WL_GX_TEX_C4 || tex->format == WL_GX_TEX_C8)))) {
+        d.stats.textures++;
+        if ((d.maps_known & (1u << map)) == 0 || memcmp(&d.fixed, &d.maps[map], sizeof d.fixed) != 0) {
+            GX_LoadTexObj(&d.fixed, (u8)(GX_TEXMAP0 + map));
+            wl_gx_wii_hang_event('T', (uint32_t)(uintptr_t)fixed_texels,
+                                 map << 28 | (uint32_t)WL_GX_TEX_RGBA8 << 22 | 4u << 11 | 4u);
+            d.maps[map] = d.fixed;
+            d.maps_known |= (uint8_t)(1u << map);
+            d.maps_loaded |= (uint8_t)(1u << map);
+            wl_gx_wii_note_commands();
+        }
+        return;
+    }
     if (tlut != NULL && (tex->format == WL_GX_TEX_C4 || tex->format == WL_GX_TEX_C8)) {
         GXTlutObj table;
 
-        memcpy(&table, tlut->opaque, sizeof table);
+        if (d.bisect_on && d.bisect.tlut_mem1) {
+            tlut_from_mem1(tlut, &table);
+        } else {
+            memcpy(&table, tlut->opaque, sizeof table);
+        }
         GX_LoadTlut(&table, tex->tlut);
         wl_gx_wii_hang_event('U', (uint32_t)(uintptr_t)tlut->entries, (uint32_t)tex->tlut << 16 | tlut->count);
         wl_gx_tlut_invalidate();
@@ -570,6 +728,7 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
                              (tex->height & 2047u));
     d.maps[map] = obj;
     d.maps_known |= (uint8_t)(1u << map);
+    d.maps_loaded |= (uint8_t)(1u << map);
     wl_gx_wii_note_commands();
 }
 

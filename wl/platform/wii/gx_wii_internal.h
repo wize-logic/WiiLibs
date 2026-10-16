@@ -15,6 +15,11 @@ void wl_gx_wii_note_efb_copy(void);
 // Texture maps loaded behind gx_direct_wii.c's back (bit n: GX_TEXMAPn): what they hold is unknown
 // to it, so its next wl_gx_direct_texture on them loads.
 void wl_gx_wii_texmaps_forget(uint32_t maps);
+// Texture maps given a texture behind its back (forgotten, as above, and counted as loaded by
+// WL_GX_CHECK's empty-map finding).
+void wl_gx_wii_texmaps_loaded(uint32_t maps);
+// A frame begun: the bisection's count of primitives (WlGxBisect.max_draws) starts again.
+void wl_gx_wii_bisect_frame(void);
 // A draw-sync token sent into the FIFO now (0 before wl_gx_init): hwcount.h's marks.
 uint32_t wl_gx_wii_mark_token(void);
 
@@ -23,6 +28,11 @@ uint32_t wl_gx_wii_mark_token(void);
 // the frame (safe in an interrupt: plain reads).
 void wl_gx_wii_hang_init(void);
 void wl_gx_wii_hang_event(char kind, uint32_t a, uint32_t b);
+#ifdef WL_GX_CHECK
+#include "wl/platform/tev.h"
+// the TEV program last applied (wl_tev_apply), NULL before the first: WL_GX_CHECK builds only
+const WlTevProgram *wl_gx_wii_tev_last(void);
+#endif
 void wl_gx_wii_hang_state(uint32_t *token_sent, uint32_t *frames_ended, bool *in_frame);
 // The calling thread made libogc's GX thread (the one it suspends at the FIFO's high-water mark)
 // when it is not already.

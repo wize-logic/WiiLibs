@@ -14,6 +14,7 @@
 #include "wl/platform/mem_census.h"
 #include "wl/platform/net_stream.h"
 #include "wl/platform/platform.h"
+#include "wl/platform/gx_direct.h"
 #include "wl/platform/hwcount.h"
 #include "wl/platform/profile_arm.h"
 #include "wl/xboxkrnl/xboxkrnl.h"
@@ -302,7 +303,55 @@ static const char *play_setting(const WlXbTitleConfig *cfg) {
     return play;
 }
 
-// The GPU's options from the title's folder: a file "noxf" (or WL_XB_NO_XF on the host) keeps GX's
+// The switches that leave work out of what GX gets (gx_direct.h, WlGxBisect), to find what hangs a
+// console's GPU by halving: files of the title's folder (or switch=), each off when absent. "gxnotex":
+// every texture one fixed texture; "gxnotlut": the colour-indexed ones only; "gxtlutmem1": the TLUTs
+// loaded from copies in MEM1; "gxmaxdraws" (its text N): only a frame's first N primitives;
+// "gxnoquad": no quad of the targets; "gxnozrestore": the back buffer's restore without its depth;
+// "gxnocopy": no texture copy out of the EFB; "gxtexgap": the vertex's texture coordinates in the
+// descriptor's slots of their own names, gaps and all (the layout that hung).
+static bool title_flag(const WlXbTitleConfig *cfg, const char *name, uint32_t *value) {
+    char flag[WL_FS_PATH_MAX];
+    WlPlatformFile *f = NULL;
+    char text[16];
+    uint32_t got = 0;
+
+    snprintf(flag, sizeof flag, "%s/%s", cfg->title_dir, name);
+    if (!wl_platform_fs_exists(flag)) {
+        return false;
+    }
+    if (value != NULL && wl_platform_fs_open(flag, WL_FILE_READ, &f) == WL_OK) {
+        wl_platform_fs_read_some_at(f, 0, text, sizeof text - 1u, &got);
+        wl_platform_fs_close(f);
+        text[got] = '\0';
+        *value = (uint32_t)strtoul(text, NULL, 10);
+    }
+    return true;
+}
+
+static void gx_bisect_options(const WlXbTitleConfig *cfg) {
+    WlGxBisect b;
+
+    memset(&b, 0, sizeof b);
+    b.no_textures = title_flag(cfg, "gxnotex", NULL);
+    b.no_tlut = title_flag(cfg, "gxnotlut", NULL);
+    b.tlut_mem1 = title_flag(cfg, "gxtlutmem1", NULL);
+    title_flag(cfg, "gxmaxdraws", &b.max_draws);
+    b.no_quads = title_flag(cfg, "gxnoquad", NULL);
+    b.no_z_restore = title_flag(cfg, "gxnozrestore", NULL);
+    b.no_copies = title_flag(cfg, "gxnocopy", NULL);
+    b.texcoord_gaps = title_flag(cfg, "gxtexgap", NULL);
+    if (b.no_textures || b.no_tlut || b.tlut_mem1 || b.max_draws != 0 || b.no_quads || b.no_z_restore ||
+        b.no_copies || b.texcoord_gaps) {
+        WL_LOG_W(TAG, "GX bisection:%s%s%s max draws %u%s%s%s%s", b.no_textures ? " gxnotex" : "",
+                 b.no_tlut ? " gxnotlut" : "", b.tlut_mem1 ? " gxtlutmem1" : "", (unsigned)b.max_draws,
+                 b.no_quads ? " gxnoquad" : "", b.no_z_restore ? " gxnozrestore" : "",
+                 b.no_copies ? " gxnocopy" : "", b.texcoord_gaps ? " gxtexgap" : "");
+    }
+    wl_gx_bisect_set(&b);
+}
+
+// The GPU's options from the title's folder: a file "noxf\" (or WL_XB_NO_XF on the host) keeps GX's
 // transform unit out of the vertices, for an A/B on the console; a file "overlap" (or
 // WL_XB_OVERLAP) lets the processor go on with the next frame while GX draws (off by default: the
 // caches' frame-late reuse shows stale content in some frames, the tunnel's lights and the HUD's pips). The static geometry's vertex
@@ -349,6 +398,7 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
     }
 #endif
     wl_xb_gpu_set_vertex_cache(NULL, vcache_kb << 10);
+    gx_bisect_options(cfg);
 }
 
 // The capture bench (bench.h) in place of the title: guest memory and the GPU as the title has

@@ -5,6 +5,9 @@
 
 #include "wl/platform/gx_shadow.h"
 #include "wl/platform/tev.h"
+#ifdef WL_GX_CHECK
+#include "wl/platform/wii/gx_wii_internal.h"
+#endif
 
 _Static_assert(WL_TEV_CC_CPREV == GX_CC_CPREV && WL_TEV_CC_APREV == GX_CC_APREV && WL_TEV_CC_C0 == GX_CC_C0 &&
                    WL_TEV_CC_A0 == GX_CC_A0 && WL_TEV_CC_C1 == GX_CC_C1 && WL_TEV_CC_A1 == GX_CC_A1 &&
@@ -55,8 +58,23 @@ static GXColor unpack(uint32_t rgba) {
     return c;
 }
 
+#ifdef WL_GX_CHECK
+// the program GX holds, for the draws' check (gx_direct_wii.c)
+static WlTevProgram g_last;
+static bool g_last_set;
+
+const WlTevProgram *wl_gx_wii_tev_last(void) {
+    return g_last_set ? &g_last : NULL;
+}
+#endif
+
 void wl_tev_apply_unchecked_ex(const WlTevProgram *p, uint32_t flags) {
     WlTevSend send;
+
+#ifdef WL_GX_CHECK
+    g_last = *p;
+    g_last_set = true;
+#endif
 
     // (what to send: everything, or with WL_TEV_APPLY_CHANGES what GX does not hold already)
     wl_tev_shadow_plan(p, flags, &send);

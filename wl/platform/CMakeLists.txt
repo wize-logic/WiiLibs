@@ -31,3 +31,9 @@ else()
     endif()
 endif()
 add_library(WiiLibs::platform ALIAS wl_platform)
+# Each direct-layer draw's GX state checked on the Wii (gx_direct.h, wl_gx_check_draw): findings
+# logged under [GXCHECK]. Off: no cost.
+option(WL_GX_CHECK "Check each GX draw's state on the Wii and log what the console's GPU cannot draw" OFF)
+if(WL_GX_CHECK)
+    target_compile_definitions(wl_platform PRIVATE WL_GX_CHECK=1)
+endif()

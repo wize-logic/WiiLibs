@@ -428,6 +428,7 @@ void wl_gx_begin_frame(uint32_t clear_rgba) {
     wl_hwcount_frame_begin(); // (closes the last frame's window, opens this one's: the counters' selections queue here)
     wl_gx_wii_own_thread();
     wl_gx_wii_hang_event('F', g.stats.frames, 0);
+    wl_gx_wii_bisect_frame();
     wl_gx_reset_state();
     if (clear_rgba != g.clear_next) {
         clear_efb(clear_rgba);
@@ -914,8 +915,10 @@ void wl_gx_set_recipe(WlGxRecipe recipe) {
     WlTevProgram prog;
     wl_tev_recipe(&prog, recipe);
     wl_tev_apply_unchecked(&prog);
-    GX_SetNumChans((u8)wl_tev_channels_used(&prog));
     uint32_t texgens = wl_tev_texcoords_used(&prog);
+    // (never no channel and no coordinate at once: gx_direct_wii.c; channel 0's material is the
+    // register's when the vertices carry no colour, apply_chan)
+    GX_SetNumChans((u8)(wl_tev_channels_used(&prog) != 0 || texgens != 0 ? wl_tev_channels_used(&prog) : 1u));
     GX_SetNumTexGens((u8)texgens);
     if (texgens != 0) {
         texgen0();
@@ -1233,7 +1236,7 @@ void wl_gx_tex_bind_ex(const WlGxTexObj *tex, const WlGxSampler *sampler, const 
         g.tex = obj;
         g.tex_bound = true;
         GX_LoadTexObj(&g.tex, GX_TEXMAP0);
-        wl_gx_wii_texmaps_forget(1u << GX_TEXMAP0);
+        wl_gx_wii_texmaps_loaded(1u << GX_TEXMAP0);
         g.stats.tex_loads++;
         g.dirty = true;
     }
@@ -1263,7 +1266,7 @@ void wl_gx_ramp_bind(uint32_t texmap) {
         made = true;
     }
     GX_LoadTexObj(&ramp, (u8)texmap);
-    wl_gx_wii_texmaps_forget(1u << texmap);
+    wl_gx_wii_texmaps_loaded(1u << texmap);
     if (texmap == GX_TEXMAP0) {
         g.known &= ~(uint32_t)K_TEX;
     }

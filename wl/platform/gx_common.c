@@ -2,6 +2,7 @@
 // GX helpers that need no hardware: texture size arithmetic shared by the Wii backend, the host stub and
 // the tools that lay out texture memory (declarations in platform.h).
 #include "wl/platform/platform.h"
+#include "wl/platform/gx_direct.h"
 
 size_t wl_gx_tex_bytes(WlGxTexFormat fmt, uint32_t width, uint32_t height) {
     // tile width, tile height, bytes per tile
@@ -68,4 +69,66 @@ void wl_gx_resolve_filters(const WlGxSampler *s, uint32_t mips, WlGxFilterOverri
     }
     *min_out = minf;
     *mag_out = magf;
+}
+
+uint32_t wl_gx_check_draw(uint32_t chans, uint32_t texgens, uint32_t maps_loaded, const WlTevProgram *tev) {
+    uint32_t found = 0, i, k;
+
+    if (chans == 0 && texgens == 0) {
+        found |= WL_GX_CHECK_NO_OUTPUT;
+    }
+    if (tev == NULL) {
+        return found;
+    }
+    if (tev->stage_count == 0 || tev->stage_count > WL_TEV_MAX_STAGES) {
+        return found | WL_GX_CHECK_STAGES;
+    }
+    for (i = 0; i < tev->stage_count; i++) {
+        const WlTevStage *s = &tev->stages[i];
+        bool ras = false, texel = false;
+
+        for (k = 0; k < 4; k++) {
+            ras = ras || s->color.in[k] == WL_TEV_CC_RASC || s->color.in[k] == WL_TEV_CC_RASA ||
+                  s->alpha.in[k] == WL_TEV_CA_RASA;
+            texel = texel || s->color.in[k] == WL_TEV_CC_TEXC || s->color.in[k] == WL_TEV_CC_TEXA ||
+                    s->alpha.in[k] == WL_TEV_CA_TEXA;
+        }
+        if ((s->channel == WL_TEV_CH_COLOR0A0 && chans < 1u) || (s->channel == WL_TEV_CH_COLOR1A1 && chans < 2u)) {
+            found |= WL_GX_CHECK_CHANNEL;
+        }
+        if (ras && s->channel == WL_TEV_NONE) {
+            found |= WL_GX_CHECK_RAS_NULL;
+        }
+        if (s->texcoord != WL_TEV_NONE && s->texcoord >= texgens) {
+            found |= WL_GX_CHECK_TEXCOORD;
+        }
+        if (texel && s->texmap == WL_TEV_NONE) {
+            found |= WL_GX_CHECK_TEX_NULL;
+        }
+        if (s->texmap != WL_TEV_NONE && (s->texmap >= 8u || !(maps_loaded & (1u << s->texmap)))) {
+            found |= WL_GX_CHECK_TEXMAP;
+        }
+    }
+    return found;
+}
+
+const char *wl_gx_check_name(unsigned bit) {
+    static const char *const names[WL_GX_CHECKS] = {
+        "no colour channel and no texture coordinate", "a stage's colour channel not made",
+        "the rasterised colour read with no channel", "a stage's texture coordinate not made",
+        "the texel read with no texture map", "a stage's texture map empty", "no TEV stage or too many"};
+
+    return bit < WL_GX_CHECKS ? names[bit] : "?";
+}
+
+void wl_gx_direct_layout_outputs(const WlGxDirectLayout *layout, uint32_t *chans, uint32_t *texgens) {
+    uint32_t n, made = 0;
+
+    for (n = 0; n < 8; n++) {
+        if ((layout->texcoords | layout->texcoords_generated | layout->texcoords_projected) & (1u << n)) {
+            made = n + 1u;
+        }
+    }
+    *texgens = made;
+    *chans = layout->colors != 0 || made != 0 ? layout->colors : 1u;
 }
