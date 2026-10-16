@@ -132,7 +132,7 @@ void wl_gx_bisect_set(const WlGxBisect *bisect) {
 
     d.bisect = *bisect;
     d.bisect_on = bisect->no_textures || bisect->no_tlut || bisect->tlut_mem1 || bisect->max_draws != 0 ||
-                  bisect->no_quads || bisect->no_z_restore || bisect->no_copies;
+                  bisect->no_quads || bisect->no_z_restore || bisect->no_copies || bisect->late_z || bisect->vtx_inval;
     for (i = 0; i < 32u; i += 2u) {
         fixed_texels[i] = 0xFF;
         fixed_texels[i + 1u] = 0x80;
@@ -423,6 +423,9 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     if (d.bisect_on && d.bisect.max_draws != 0 && d.frame_draws++ >= d.bisect.max_draws) {
         return; // (left out: its vertices go nowhere)
     }
+    if (d.bisect_on && d.bisect.vtx_inval) {
+        GX_InvVtxCache();
+    }
     // (noted before its commands: the flush, the state GX_Begin sends, the primitive)
     wl_gx_wii_hang_event('P', (uint32_t)prim << 16 | count, d.stats.draws);
 #ifdef WL_GX_CHECK
@@ -631,6 +634,7 @@ void wl_gx_direct_zmode(bool test, WlGxCompare func, bool write) {
 }
 
 void wl_gx_direct_zcompare_early(bool early) {
+    early = early && !(d.bisect_on && d.bisect.late_z);
     const uint8_t value = early;
 
     if (!wl_gx_shadow_differs(WL_GX_SHADOW_ZEARLY, &value, sizeof value)) {

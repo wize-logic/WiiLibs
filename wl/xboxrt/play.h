@@ -49,6 +49,9 @@
 //     log <text>                         a line in the log, with the title's values
 //     screenshot [<name>]                the picture (the host: a PNG through wl/gxsoft; the
 //                                        Wii: a one-frame GPU capture), in the output folder
+//     shot [<name>]                      the picture the console itself drew (the Wii: the next
+//                                        frame's EFB, a 640x480 BMP in shots/ of the title
+//                                        folder; the host: as screenshot)
 //     capture <frames> [<name>]          the GPU's work for that many frames (xbox_nv2a_replay)
 //     dump <name>                        guest RAM (physical page 0 up) to <name>.bin there
 //     player <n> / <n>: <step>           the steps after it / the one step drive controller n

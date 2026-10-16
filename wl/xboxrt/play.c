@@ -4,6 +4,9 @@
 // from OpenCE-Wii's port/linux/src/test_input.c (CC0); the observation of the game is the title's,
 // through the registrations, and the controller is the ports of input.h.
 #include <math.h>
+#if defined(__wii__)
+#include <malloc.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,6 +69,7 @@ enum {
     K_TITLE_STEP,
     K_LOG,
     K_SCREENSHOT,
+    K_SHOT,
     K_CAPTURE,
     K_DUMP,
     K_CONNECT,
@@ -155,6 +159,9 @@ static struct {
     // a screenshot in progress (the host)
     char shot_path[WL_FS_PATH_MAX];
     int shot_frames;
+    // a shot of the console's picture in progress (the Wii): its EFB copy, and the file it goes to
+    void *shot_tiles;
+    char shot_bmp[WL_FS_PATH_MAX];
     uint32_t shots;
 } P;
 
@@ -621,6 +628,18 @@ static int parse_line(char *line, int number, Step *s) {
         }
         return 1;
     }
+    if (strcmp(w0, "shot") == 0 && count <= 2) {
+        // (the host's picture is the software GX's: a screenshot)
+#if defined(__wii__)
+        s->kind = K_SHOT;
+#else
+        s->kind = K_SCREENSHOT;
+#endif
+        if (count == 2) {
+            snprintf(s->arg, sizeof s->arg, "%s", words[1]);
+        }
+        return 1;
+    }
     if (strcmp(w0, "dump") == 0 && count == 2) {
         s->kind = K_DUMP;
         snprintf(s->arg, sizeof s->arg, "%s", words[1]);
@@ -655,7 +674,7 @@ static int parse_line(char *line, int number, Step *s) {
     static const char *const verbs[] = {"wait", "frames", "vblanks", "screen", "focus", "play", "checkpoint", "ticks",
                                         "press", "select", "hold", "down", "up", "release", "stick", "trigger",
                                         "until", "do", "load", "memory", "peek", "player", "connect", "disconnect",
-                                        "bot", "look", "screenshot", "capture", "dump", "repeat", "end", "quit", "log"};
+                                        "bot", "look", "screenshot", "shot", "capture", "dump", "repeat", "end", "quit", "log"};
     for (size_t i = 0; i < WL_ARRAY_COUNT(verbs); i++) {
         if (strcmp(w0, verbs[i]) == 0) {
             return -1;
@@ -1054,6 +1073,90 @@ static void screenshot(const char *name) {
 #endif
 }
 
+#if defined(__wii__)
+// The console's own picture (the step shot): the next finished frame copied out of the EFB
+// (wl_gx_shot_request), then written as a 24-bit BMP to shots/<name>.bmp in the title folder. Its
+// 1.2 MB are asked for at the step and given back when the file is written.
+static void shot_begin(const char *name) {
+    WlVideoInfo vi;
+    char dir[WL_FS_PATH_MAX];
+
+    wl_platform_video_info(&vi);
+    P.shot_tiles = memalign(32, wl_gx_tex_bytes(WL_GX_TEX_RGBA8, vi.fb_width, vi.efb_height));
+    if (P.shot_tiles == NULL) {
+        wl_xb_play_log("shot: no memory for %ux%u", (unsigned)vi.fb_width, (unsigned)vi.efb_height);
+        return;
+    }
+    snprintf(dir, sizeof dir, "%s/shots", P.base_dir);
+    (void)wl_platform_fs_mkdir(dir);
+    if (name[0] != '\0') {
+        snprintf(P.shot_bmp, sizeof P.shot_bmp, "%s/%s.bmp", dir, name);
+    } else {
+        snprintf(P.shot_bmp, sizeof P.shot_bmp, "%s/shot_%04u.bmp", dir, (unsigned)P.shots);
+    }
+    P.shots++;
+    wl_gx_shot_request(P.shot_tiles);
+}
+
+static void shot_le32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+// GX's RGBA8 tiles (4x4 pixels: 32 bytes of A,R pairs, then 32 of G,B) into the BMP's rows, bottom up
+static void shot_write(void) {
+    enum { ROWS = 8 };
+    static uint8_t rows[ROWS * 640u * 3u];
+    uint8_t head[54];
+    WlVideoInfo vi;
+    WlPlatformFile *f = NULL;
+
+    wl_platform_video_info(&vi);
+    uint32_t w = vi.fb_width, h = vi.efb_height, pitch = w * 3u;
+    const uint8_t *tiles = P.shot_tiles;
+    wl_gpu_buffer_invalidate(P.shot_tiles, wl_gx_tex_bytes(WL_GX_TEX_RGBA8, w, h));
+    if (w > 640u || wl_platform_fs_open(P.shot_bmp, WL_FILE_WRITE_NEW, &f) != WL_OK) {
+        wl_xb_play_log("shot: cannot write %s", P.shot_bmp);
+        free(P.shot_tiles);
+        P.shot_tiles = NULL;
+        return;
+    }
+    memset(head, 0, sizeof head);
+    head[0] = 'B';
+    head[1] = 'M';
+    shot_le32(head + 2, 54u + pitch * h);
+    shot_le32(head + 10, 54u);
+    shot_le32(head + 14, 40u);
+    shot_le32(head + 18, w);
+    shot_le32(head + 22, h);
+    head[26] = 1;
+    head[28] = 24;
+    shot_le32(head + 34, pitch * h);
+    wl_platform_fs_write(f, head, sizeof head);
+    for (uint32_t y0 = 0; y0 < h; y0 += ROWS) {
+        uint32_t n = h - y0 < ROWS ? h - y0 : ROWS;
+        for (uint32_t r = 0; r < n; r++) {
+            uint32_t y = h - 1u - (y0 + r);
+            uint8_t *out = rows + r * pitch;
+            for (uint32_t x = 0; x < w; x++) {
+                const uint8_t *t = tiles + ((size_t)(y / 4u) * (w / 4u) + x / 4u) * 64u;
+                uint32_t i = (y % 4u) * 4u + x % 4u;
+                out[x * 3u] = t[32u + 2u * i + 1u];
+                out[x * 3u + 1u] = t[32u + 2u * i];
+                out[x * 3u + 2u] = t[2u * i + 1u];
+            }
+        }
+        wl_platform_fs_write(f, rows, n * pitch);
+    }
+    wl_platform_fs_close(f);
+    free(P.shot_tiles);
+    P.shot_tiles = NULL;
+    wl_xb_play_log("shot %s (%ux%u, frame %u)", P.shot_bmp, (unsigned)w, (unsigned)h, (unsigned)P.frames);
+}
+#endif
+
 // the host's software GX detached once its frames are kept
 static void screenshot_poll(void) {
 #if defined(WL_XBRT_HAVE_GXSOFT)
@@ -1341,6 +1444,28 @@ static void script_frame(void) {
                 }
                 wl_xb_play_log("screenshot: not done after 10 s; the script goes on");
             }
+            break;
+        case K_SHOT:
+#if defined(__wii__)
+            // the next finished frame, written before the next step (10 s at most: a GPU that never
+            // passes the copy keeps the block, which it may still write)
+            if (P.first) {
+                P.first = false;
+                shot_begin(s->arg);
+            }
+            if (P.shot_tiles != NULL) {
+                if (!wl_gx_shot_done()) {
+                    if (P.clock - P.started_clock < 10.0) {
+                        return;
+                    }
+                    wl_gx_shot_request(NULL);
+                    P.shot_tiles = NULL;
+                    wl_xb_play_log("shot: not done after 10 s; the script goes on");
+                } else {
+                    shot_write();
+                }
+            }
+#endif
             break;
         case K_CAPTURE: {
             // the capture's frames are written whole before the next step (a quit right after
