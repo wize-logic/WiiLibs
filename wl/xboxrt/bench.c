@@ -85,6 +85,10 @@ static void t_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
 static uint32_t t_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
     (void)user;
     uint64_t t0 = now_ticks();
+    // (the hang report's: the run, its frame and the draw in it)
+    wl_gx_hang_where(1, "bench run", B.run);
+    wl_gx_hang_where(2, "bench frame", (uint32_t)B.frames);
+    wl_gx_hang_where(3, "bench draw in the frame", (uint32_t)(B.draws - B.frame_draws));
     uint32_t pixels = B.gx.draw(B.gx.user, k, draw);
     B.phase[PHASE_DRAW] += now_ticks() - t0;
     B.draws++;

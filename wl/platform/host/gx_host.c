@@ -269,6 +269,12 @@ uint32_t wl_platform_video_dropped_count(void) {
     return 0;
 }
 
+void wl_gx_hang_where(unsigned slot, const char *name, uint32_t value) {
+    (void)slot;
+    (void)name;
+    (void)value;
+}
+
 WlResult wl_gx_init(void) {
     memset(&s, 0, sizeof s);
     s.ready = true;

@@ -17,3 +17,13 @@ void wl_gx_wii_note_efb_copy(void);
 void wl_gx_wii_texmaps_forget(uint32_t maps);
 // A draw-sync token sent into the FIFO now (0 before wl_gx_init): hwcount.h's marks.
 uint32_t wl_gx_wii_mark_token(void);
+
+// The GPU hang report (gx_hang_wii.c): started by wl_gx_init; an event for its ring of the last
+// GX events (kind a letter, gx_hang_wii.c's event_name; two numbers); and what gx_wii.c knows of
+// the frame (safe in an interrupt: plain reads).
+void wl_gx_wii_hang_init(void);
+void wl_gx_wii_hang_event(char kind, uint32_t a, uint32_t b);
+void wl_gx_wii_hang_state(uint32_t *token_sent, uint32_t *frames_ended, bool *in_frame);
+// The calling thread made libogc's GX thread (the one it suspends at the FIFO's high-water mark)
+// when it is not already.
+void wl_gx_wii_own_thread(void);

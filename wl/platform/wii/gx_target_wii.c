@@ -31,6 +31,7 @@ void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what
     GX_SetTexCopyDst((u16)w, (u16)h, format[what], GX_FALSE);
     GX_CopyTex(dst, GX_FALSE);
     GX_PixModeSync();
+    wl_gx_wii_hang_event('C', (uint32_t)(uintptr_t)dst, w << 16 | h);
     wl_gx_wii_note_efb_copy();
 }
 
@@ -112,6 +113,7 @@ static void quad(float x0, float y0, float x1, float y1, const GXColor *colour, 
         GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
     }
 
+    wl_gx_wii_hang_event('Q', (textured ? 1u : 0u) | (z_texture ? 2u : 0u), back_w << 16 | back_h);
     GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
     for (int corner = 0; corner < 4; corner++) {
         GX_Position3f32(x0 + (x1 - x0) * corners[corner][0], y0 + (y1 - y0) * corners[corner][1], depth - 1.0f);
@@ -184,6 +186,7 @@ void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uin
     GX_SetTexCopyDst((u16)back_w, (u16)back_h, GX_TF_RGBA8, GX_FALSE);
     GX_CopyTex(colour, GX_TRUE);
     GX_PixModeSync();
+    wl_gx_wii_hang_event('C', (uint32_t)(uintptr_t)colour, back_w << 16 | back_h);
     wl_gx_wii_note_efb_copy();
     wl_gx_wii_copy_filter(true);
     GX_InvalidateTexAll();

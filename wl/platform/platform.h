@@ -472,6 +472,12 @@ bool wl_gx_frame_retired(uint32_t index);
 bool wl_gx_frame_wait(uint32_t index);
 // Flush the FIFO and wait for the GPU to finish everything submitted. False on timeout.
 bool wl_gx_sync(void);
+// What the program is at, for the GPU hang report: slot 0..3 a name (a string that lives on) and a
+// number (a frame, a draw), two stores. On the Wii, when the GPU has read no command for 10 s while
+// it has work, the report logs these, the command processor's FIFO registers and the bytes at its
+// read pointer, and the last GX events, syncs the log to the SD card and leaves to the loader 20 s
+// later (wii/gx_hang_wii.c). Host: nothing.
+void wl_gx_hang_where(unsigned slot, const char *name, uint32_t value);
 // Restores the default state through the shadow (afterwards shadow == GPU).
 void wl_gx_reset_state(void);
 // Marks the shadow unknown: the next setter of each kind always writes.

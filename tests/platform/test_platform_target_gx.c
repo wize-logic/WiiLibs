@@ -48,6 +48,12 @@ void wl_gx_wii_note_commands(void) {
 
 void wl_gx_wii_note_efb_copy(void) {}
 
+void wl_gx_wii_hang_event(char kind, uint32_t a, uint32_t b) {
+    (void)kind;
+    (void)a;
+    (void)b;
+}
+
 bool wl_gx_sync(void) {
     return true; // (the stub GPU is never behind)
 }
