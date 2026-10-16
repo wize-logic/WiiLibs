@@ -1524,6 +1524,81 @@ TEST files_deleted_at_the_last_close(void) {
     PASS();
 }
 
+// wl/xboxkrnl/nt_file.h (internal): every mount as on a volume that folds the case, or not
+void xk_paths_set_folds_case(bool folds);
+
+static void host_write(const char *rel, const char *text) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", g_root, rel);
+    FILE *f = fopen(path, "wb");
+    if (f != NULL) {
+        fputs(text, f);
+        fclose(f);
+    }
+}
+
+// A name looked up in another case where it can be (the last component when its folder is there as
+// written, else from the mount's root, and not at all on a volume that folds the case itself), and a
+// sparse file's sidecar removed when the kernel cannot know there is none.
+TEST files_lookups_for_a_new_name(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t st = 0, iosb = gmem(8), info = gmem(24);
+    char path[512];
+    snprintf(path, sizeof path, "%s/hdd/Z/Lists", g_root);
+    ASSERT(mkdir(path, 0777) == 0 || host_exists("hdd/Z/Lists"));
+    host_write("hdd/Z/Lists/Old.lst", "abc");
+    // the last component in another case, its folder as written; then both
+    uint32_t h = open_path("z:\\Lists\\OLD.LST", 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_QUERY_INFO, h, iosb, info, 24, 5), "%08x");
+    ASSERT_EQ_FMT(3u, wl_xb_rd32(info + 8), "%u");
+    KN(S_NT_CLOSE, h);
+    h = open_path("z:\\LISTS\\old.LST", 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    KN(S_NT_CLOSE, h);
+    // a new name in a folder written in another case: made in the folder that is there
+    h = open_path("z:\\LISTS\\New.lst", 0xC0000000u, 2, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    uint32_t data = gstr("blam"), off = gmem(8);
+    wl_xb_wr64(off, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h, 0, 0, 0, iosb, data, 4, off), "%08x");
+    KN(S_NT_CLOSE, h);
+    ASSERT(host_exists("hdd/Z/Lists/New.lst"));
+    ASSERT(!host_exists("hdd/Z/Lists/New.lst.wlsz"));
+    // a missing folder: the name is not found, with the path's status
+    open_path("z:\\Lists\\none\\x.lst", 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0xC000003Au, st, "%08x");
+    open_path("z:\\lists\\none.lst", 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0xC0000034u, st, "%08x");
+    // a lost file's sidecar goes when a file is made at its name; deleted at close, it leaves none
+    host_write("hdd/Z/Lists/Gone.lst.wlsz", "0000000000100000");
+    h = open_path("z:\\Lists\\Gone.lst", 0xC0000000u, 2, 0x20 | 0x1000, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    ASSERT(!host_exists("hdd/Z/Lists/Gone.lst.wlsz"));
+    ASSERT_EQ_FMT(0u, KN(S_NT_QUERY_INFO, h, iosb, info, 24, 5), "%08x");
+    ASSERT_EQ_FMT(0u, wl_xb_rd32(info + 8), "%u");
+    KN(S_NT_CLOSE, h);
+    ASSERT(!host_exists("hdd/Z/Lists/Gone.lst"));
+    // a sidecar written behind an open file's back (a checkpoint's restore) is still removed
+    h = open_path("z:\\Lists\\New.lst", 0xC0000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    host_write("hdd/Z/Lists/New.lst.wlsz", "0000000000100000");
+    snprintf(path, sizeof path, "sd:/hdd/Z/Lists/New.lst");
+    wl_xk_file_changed(path);
+    ASSERT_EQ_FMT(0u, set_delete(h, true), "%08x");
+    KN(S_NT_CLOSE, h);
+    ASSERT(!host_exists("hdd/Z/Lists/New.lst"));
+    ASSERT(!host_exists("hdd/Z/Lists/New.lst.wlsz"));
+    // on a volume that folds the case itself, a miss is final: no listing finds another spelling
+    xk_paths_set_folds_case(true);
+    open_path("z:\\Lists\\OLD.LST", 0x80000000u, 1, 0x20, &st);
+    xk_paths_set_folds_case(false);
+    ASSERT_EQ_FMT(0xC0000034u, st, "%08x");
+    PASS();
+}
+
 TEST files_delete_pending_refuses_opens(void) {
     boot();
     ASSERT(g_ready);
@@ -1912,6 +1987,7 @@ SUITE(kernel_suite) {
     RUN_TEST(files_share_one_size);
     RUN_TEST(files_failures_leave_the_request_alone);
     RUN_TEST(files_deleted_at_the_last_close);
+    RUN_TEST(files_lookups_for_a_new_name);
     RUN_TEST(files_delete_pending_refuses_opens);
     RUN_TEST(files_rename_moves_every_handle);
     RUN_TEST(files_pages_keep_what_was_read);
