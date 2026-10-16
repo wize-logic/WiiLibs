@@ -95,7 +95,8 @@ static void link_entry(WlNv2aTexCache *cache, WlNv2aTexEntry *e) {
 // whether the GPU may still read an image drawn in frame `used`: this frame's, or one of the
 // gpu_lag frames before it that the GPU may not have finished
 static bool gpu_reads(const WlNv2aTexCache *cache, uint32_t used) {
-    return used != 0 && used + cache->cfg.gpu_lag >= cache->frame;
+    return used != 0 && used + cache->cfg.gpu_lag >= cache->frame &&
+           (used >= cache->waited_frame || cache->waited_frame != cache->frame);
 }
 
 // an image the GPU may still read: given back at the end of the frame the GPU is then past
@@ -109,6 +110,29 @@ static bool release_image(WlNv2aTexCache *cache, void *image, bool used_now) {
     }
     cache->pending_frame[cache->pending_count] = cache->frame;
     cache->pending[cache->pending_count++] = image;
+    return true;
+}
+
+// No room while frames the GPU may still be drawing hold memory: the GPU waited for (once a frame),
+// and the images given back in the frames before this one freed. True when it waited.
+static bool wait_for_gpu(WlNv2aTexCache *cache) {
+    unsigned i, kept = 0;
+
+    if (cache->cfg.gpu_lag == 0 || cache->cfg.gpu_wait == NULL || cache->waited_frame == cache->frame) {
+        return false;
+    }
+    cache->cfg.gpu_wait();
+    cache->waited_frame = cache->frame;
+    cache->stats.gpu_waits++;
+    for (i = 0; i < cache->pending_count; i++) {
+        if (cache->pending_frame[i] < cache->frame) {
+            image_free(cache, cache->pending[i]);
+        } else {
+            cache->pending_frame[kept] = cache->pending_frame[i];
+            cache->pending[kept++] = cache->pending[i];
+        }
+    }
+    cache->pending_count = kept;
     return true;
 }
 
@@ -532,6 +556,9 @@ static bool arena_make_room(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTex
 static void *image_for(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTexEntry *keep) {
     void *image = image_alloc(cache, bytes);
 
+    if (image == NULL && wait_for_gpu(cache)) {
+        image = image_alloc(cache, bytes);
+    }
     if (image == NULL && cache->cfg.arena != NULL) {
         if (arena_make_room(cache, bytes, keep)) {
             image = image_alloc(cache, bytes);
@@ -670,13 +697,15 @@ static void *image_stale(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTexEnt
 // one made again where it fails), tried at its first use in a frame (the GPU has finished with the
 // smaller image) once in WL_NV2A_TEXCACHE_RESTORE_FRAMES. `src` and `palette` its guest bytes when
 // they were read (NULL: read now). *made true when its image was made anew; false when the entry
-// is gone (no memory even for the smaller image again, or bad texels).
+// is gone (no memory even for the smaller image again, or bad texels). One the GPU may still read
+// (`drawn_now`: in a frame it has not finished, as every frame's texture is under frame overlap) is
+// made whole only beside its smaller image, which goes back once the GPU is past it.
 static bool restore(WlNv2aTexCache *cache, WlNv2a *dev, WlNv2aTexEntry *e, const WlNv2aTexture *t, bool drawn_now,
                     const uint8_t *src, const uint8_t *palette, bool *made) {
     WlNv2aGxLayout whole, small = e->layout;
     void *image;
 
-    if (e->reduced == 0 || drawn_now || cache->frame - e->restore_frame < WL_NV2A_TEXCACHE_RESTORE_FRAMES) {
+    if (e->reduced == 0 || cache->frame - e->restore_frame < WL_NV2A_TEXCACHE_RESTORE_FRAMES) {
         return true;
     }
     e->restore_frame = cache->frame;
@@ -691,10 +720,24 @@ static bool restore(WlNv2aTexCache *cache, WlNv2a *dev, WlNv2aTexEntry *e, const
         }
     }
     image = image_stale(cache, whole.total_bytes, e);
+    if (drawn_now) {
+        // (the smaller image kept for the GPU: no room beside it, or no place to keep it, and the
+        // texture stays smaller until the next try)
+        if (image == NULL) {
+            return true;
+        }
+        if (!release_image(cache, e->image, true)) {
+            image_free(cache, image);
+            return true;
+        }
+        e->image = NULL;
+    }
     if (made != NULL) {
         *made = true; // (from here on its image is made anew, or it is gone)
     }
-    if (image != NULL) {
+    if (drawn_now) {
+        // (given back above)
+    } else if (image != NULL) {
         image_free(cache, e->image);
     } else {
         // (the smaller image beside the room: given back, and made again if the whole one still

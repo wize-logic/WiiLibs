@@ -505,6 +505,9 @@ const void *wl_nv2a_vcache_get(WlNv2aVCache *cache, WlNv2a *dev, const WlNv2aAtt
                     if (array != NULL) {
                         array_free(cache, array);
                     }
+                    // (its array the old contents still: the watch armed by the check forgotten, so
+                    // the next check hashes the source again and finds it changed, not "unwritten")
+                    e->stamp = 0;
                     cache->stats.failed++;
                     return NULL;
                 }
