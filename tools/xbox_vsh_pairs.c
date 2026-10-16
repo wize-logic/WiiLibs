@@ -13,7 +13,7 @@
 // the rest are values from one instruction to the next.
 //
 // What differs from the plain C: the multiply-adds and the dot products are fused and add in
-// another order, RSQ is frsqrte's estimate made exact by Newton's steps in double (to a bit), and
+// another order, RSQ is frsqrte's estimate and two Newton's steps in single precision (two ulps), and
 // MIN/MAX choose by the sign of a difference (+0 for -0 when equal). EXP and LOG are vsh.c's
 // (ilu_floor, ilu_power_of_two, ilu_exp2, ilu_log2) with the float's bits made and taken apart
 // through the slot, their polynomials' multiply-adds fused, EXP's lanes made only where read.
@@ -65,6 +65,10 @@ static char pr_first[24];       /* where the first vertex starts (the prefix mad
 so each block runs or is left out, with no test */
 static const WlXboxVshFusedKey *pr_fuse;
 static int pr_fused_captured;   /* (fused) the clip-space position captured, always */
+/* (fused, GX taking the clip-space position: the instructions whose writes nothing reads, the
+screen-space position's divide and viewport among them; pr_dead_now: the one being written's) */
+static unsigned char pr_dead[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+static int pr_dead_now;
 
 /* the constants that may be loaded once a batch, and how often each is loaded in a vertex */
 static char pr_keys[PR_KEYS][80];
@@ -170,7 +174,8 @@ static int pr_op3(const char *name, int a, int b, int c) {
     if ((strcmp(name, "ps_merge00") == 0 || strcmp(name, "ps_merge11") == 0) && a == b)
         pr_values[d].splat = 1;
     if (strcmp(name, "fadds") == 0 || strcmp(name, "fsubs") == 0 || strcmp(name, "fdivs") == 0 ||
-        strcmp(name, "fmadds") == 0 || strcmp(name, "fnmadds") == 0)
+        strcmp(name, "fmadds") == 0 || strcmp(name, "fnmadds") == 0 || strcmp(name, "fmuls") == 0 ||
+        strcmp(name, "fnmsubs") == 0)
         pr_values[d].splat = 1;
     if (strcmp(name, "ps_neg") == 0 && pr_values[a].splat)
         pr_values[d].splat = 1;
@@ -1095,39 +1100,32 @@ static void pr_ilu(const WlXboxVshInstruction *in, unsigned needed, PrLane resul
         pr_op(0, 1, 2, values, "fmr @0, @1");
         pr_place_label(done);
     } else {
-        /* RSQ: 1.0f / sqrtf(|x|), as the C: frsqrte's estimate made exact
-        by four Newton's steps in double, |x| times it rounded to a float
-        (sqrtf's bits), its reciprocal; 0, infinity and NaN, where the steps
-        make a NaN, take the estimate (exact for them) */
+        /* RSQ: 1 / sqrt(|x|) in single precision: frsqrte's estimate (Broadway's
+        table, within 1/2^12.4) and two Newton's steps, within two ulps of the
+        C's 1.0f / sqrtf (no division: frames the same on the captures); 0,
+        infinity and NaN, where the steps make a NaN, take the estimate (exact
+        for them) */
         int a, e, h, t, step, one = pr_k(1, PRK_ONE), halves = pr_k(1, PRK_HALF),
                               three_halves = pr_k(1, PRK_THREE_HALVES), values[3];
-        char special[24], done[24];
+        char done[24];
 
         a = pr_op3("fabs", x, -1, -1);
         e = pr_op3("frsqrte", a, -1, -1);
-        h = pr_op3("fmul", a, halves, -1);
-        for (step = 0; step < 4; step++) {
-            t = pr_op3("fmul", e, e, -1);
-            t = pr_op3("fnmsub", h, t, three_halves);
-            values[0] = e;
-            values[1] = t;
-            pr_op(0, 1, 2, values, "fmul @0, @0, @1");
+        h = pr_op3("fmuls", a, halves, -1);
+        for (step = 0; step < 2; step++) {
+            t = pr_op3("fmuls", e, e, -1);
+            t = pr_op3("fnmsubs", h, t, three_halves);
+            e = pr_op3("fmuls", e, t, -1);
         }
-        pr_new_label(special, sizeof(special));
+        s = e;
         pr_new_label(done, sizeof(done));
-        values[0] = e;
-        pr_op(0, 0, 1, values, "fcmpu 0, @0, @0");
-        pr_text("bun %s", special);
-        values[1] = a;
-        pr_op(0, 1, 2, values, "fmul @0, @1, @0");
-        pr_op(0, 1, 1, values, "frsp @0, @0");
-        s = pr_op3("fdivs", one, e, -1);
-        pr_text("b %s", done);
-        pr_place_label(special);
         values[0] = s;
+        pr_op(0, 0, 1, values, "fcmpu 0, @0, @0");
+        pr_text("bnu %s", done);
         values[1] = a;
         pr_op(0, 1, 2, values, "frsqrte @0, @1");
         pr_op(0, 1, 1, values, "frsp @0, @0");
+        (void)one;
         pr_place_label(done);
     }
     for (half = 0; half < 4; half++) {
@@ -1175,9 +1173,121 @@ static int pr_owned(int value) {
     return d;
 }
 
+/* ---- (fused) the output's scratch forwarded ----
+A fused batch's output scratch (%[o]) is read by its epilogue alone: a value
+the loop stores there is taken from its register while that still holds it
+(pr_fused_output), and a store nothing loads back is left out
+(pr_forward_finish). */
+enum { PR_FORWARDS = 64 };
+
+typedef struct {
+    int offset, size; /* bytes in WlXboxVshOutput */
+    int value;        /* lane 0 (and 1 for 8 bytes) of it; -1: partly written over since */
+    int op;           /* the store, in pr_body */
+    int covered;      /* written over whole: the store is dead */
+} PrForward;
+
+static PrForward pr_forwards[PR_FORWARDS];
+static int pr_forward_count, pr_forward_on;
+static unsigned char pr_forward_read[sizeof(WlXboxVshOutput)];
+
+static void pr_forward_reset(void) {
+    pr_forward_count = pr_forward_on = 0;
+    memset(pr_forward_read, 0, sizeof(pr_forward_read));
+}
+
+/* an output field's operand ("%[od0]", "%[ot]+16", ...; NULL: the position) as its offset */
+static int pr_field_offset(const char *field) {
+    static const struct {
+        const char *name;
+        int offset;
+    } fields[] = {
+        {"%[od0]", (int)offsetof(WlXboxVshOutput, d0)}, {"%[od1]", (int)offsetof(WlXboxVshOutput, d1)},
+        {"%[ob0]", (int)offsetof(WlXboxVshOutput, b0)}, {"%[ob1]", (int)offsetof(WlXboxVshOutput, b1)},
+        {"%[ot]", (int)offsetof(WlXboxVshOutput, t)},   {"%[oclip]", (int)offsetof(WlXboxVshOutput, clip)},
+    };
+    size_t n;
+
+    if (field == NULL)
+        return (int)offsetof(WlXboxVshOutput, position);
+    for (n = 0; n < sizeof(fields) / sizeof(fields[0]); n++) {
+        size_t length = strlen(fields[n].name);
+
+        if (strncmp(field, fields[n].name, length) == 0)
+            return fields[n].offset + (field[length] == '+' ? atoi(field + length + 1) : 0);
+    }
+    pr_failed = 1;
+    return 0;
+}
+
+/* the store just written (the last op): size bytes at offset from value's lanes */
+static void pr_forward_store(int offset, int size, int value) {
+    int n;
+
+    if (!pr_fuse || !pr_forward_on)
+        return;
+    for (n = 0; n < pr_forward_count; n++) {
+        PrForward *f = &pr_forwards[n];
+
+        if (f->offset >= offset && f->offset + f->size <= offset + size)
+            f->covered = 1;
+        else if (f->offset < offset + size && offset < f->offset + f->size)
+            f->value = -1;
+    }
+    if (pr_forward_count >= PR_FORWARDS) {
+        pr_failed = 1;
+        return;
+    }
+    pr_forwards[pr_forward_count].offset = offset;
+    pr_forwards[pr_forward_count].size = size;
+    pr_forwards[pr_forward_count].value = value;
+    pr_forwards[pr_forward_count].op = pr_body_count - 1;
+    pr_forwards[pr_forward_count].covered = 0;
+    pr_forward_count++;
+}
+
+/* the value the loop stored as size bytes at offset, still in its register; -1 when none */
+static int pr_forward_find(int offset, int size) {
+    int n, k, at;
+
+    for (n = pr_forward_count - 1; n >= 0; n--) {
+        const PrForward *f = &pr_forwards[n];
+
+        if (f->offset != offset || f->size != size || f->value < 0 || f->covered)
+            continue;
+        /* (not when its register is written again later: a temporary's web) */
+        for (at = f->op + 1; at < pr_body_count; at++)
+            for (k = 0; k < pr_body[at].count; k++)
+                if ((pr_body[at].defines & (1u << k)) && pr_root(pr_body[at].values[k]) == pr_root(f->value))
+                    return -1;
+        return f->value;
+    }
+    return -1;
+}
+
+/* the stores no load reads back left out (once the epilogue is written) */
+static void pr_forward_finish(void) {
+    int n, kept = 0, at;
+
+    for (n = 0; n < pr_forward_count; n++) {
+        const PrForward *f = &pr_forwards[n];
+        int read = 0, b;
+
+        for (b = f->offset; b < f->offset + f->size; b++)
+            read |= pr_forward_read[b];
+        if (f->covered || !read)
+            pr_body[f->op].text[0] = 0;
+    }
+    for (at = 0; at < pr_body_count; at++)
+        if (pr_body[at].text[0])
+            pr_body[kept++] = pr_body[at];
+    pr_body_count = kept;
+    pr_forward_count = 0;
+}
+
 /* the result's lanes written to the output at offset (mask bit 3 x) */
 static void pr_store(const PrLane result[4], unsigned mask, const char *field) {
-    int half;
+    int half, at = pr_fuse && pr_forward_on ? pr_field_offset(field) : 0;
 
     for (half = 0; half < 2; half++) {
         int l0 = 2 * half, l1 = l0 + 1, values[1];
@@ -1185,15 +1295,18 @@ static void pr_store(const PrLane result[4], unsigned mask, const char *field) {
         if ((mask & (8u >> l0)) && (mask & (8u >> l1))) {
             values[0] = pr_merged(result[l0], result[l1]);
             pr_op(0, 0, 1, values, "psq_st @0, %s+%d(%%[o]), 0, 0", field, 8 * half);
+            pr_forward_store(at + 8 * half, 8, values[0]);
             continue;
         }
         if (mask & (8u >> l0)) {
             values[0] = pr_lane0(result[l0]);
             pr_op(0, 0, 1, values, "stfs @0, %s+%d(%%[o])", field, 8 * half);
+            pr_forward_store(at + 8 * half, 4, values[0]);
         }
         if (mask & (8u >> l1)) {
             values[0] = pr_lane0(result[l1]);
             pr_op(0, 0, 1, values, "stfs @0, %s+%d(%%[o])", field, 8 * half + 4);
+            pr_forward_store(at + 8 * half + 4, 4, values[0]);
         }
     }
 }
@@ -1286,9 +1399,11 @@ static const char *pr_output_field(unsigned address, char *text, size_t size) {
 
 /* one instruction (mode: WRITE_TEMPORARIES, WRITE_OUTPUTS or both) */
 static void pr_instruction(const WlXboxVshInstruction *in, int mode) {
-    int mac_t = in->mac != _mac_nop && (in->mac == _mac_arl || in->mac_mask) && (mode & WRITE_TEMPORARIES);
-    int ilu_t = in->ilu != _ilu_nop && in->ilu_mask && (mode & WRITE_TEMPORARIES);
-    int out = in->output_mask && in->output_is_register &&
+    /* (an instruction pr_liveness found dead writes nothing: its clip-space capture alone) */
+    int mac_t = !pr_dead_now && in->mac != _mac_nop && (in->mac == _mac_arl || in->mac_mask) &&
+                (mode & WRITE_TEMPORARIES);
+    int ilu_t = !pr_dead_now && in->ilu != _ilu_nop && in->ilu_mask && (mode & WRITE_TEMPORARIES);
+    int out = !pr_dead_now && in->output_mask && in->output_is_register &&
               (in->output_from_ilu ? in->ilu : in->mac) != 0 && (mode & WRITE_OUTPUTS);
     unsigned mac_lanes = (mac_t ? in->mac_mask : 0) | (out && !in->output_from_ilu ? in->output_mask : 0);
     unsigned ilu_lanes = (ilu_t ? in->ilu_mask : 0) | (out && in->output_from_ilu ? in->output_mask : 0);
@@ -1469,22 +1584,42 @@ static void pr_instruction(const WlXboxVshInstruction *in, int mode) {
 }
 
 /* the temporaries' lanes read after each instruction (bit 3 x), the
-position's all read at the end; instructions no output needs left out */
+position's all read at the end; instructions no output needs left out.
+drop_position (fused, GX taking the clip-space position the program captures):
+the position read by none at the end, and an instruction whose writes are then
+all unread is dead (pr_dead), reading nothing but for its capture */
 static void pr_liveness(const WlXboxVshProgram *program, const unsigned *needs, unsigned long from,
-                        unsigned (*after)[13]) {
+                        unsigned (*after)[13], int drop_position) {
     unsigned live[13];
     long index;
     int t, which;
 
     memset(live, 0, sizeof(live));
-    live[12] = 0xf;
+    live[12] = drop_position ? 0 : 0xf;
     for (index = (long)program->count - 1; index >= (long)from; index--) {
         const WlXboxVshInstruction *in = &program->instructions[index];
         unsigned reads[3];
 
         memcpy(after[index], live, sizeof(live));
+        pr_dead[index] = 0;
         if (!needs[index])
             continue;
+        if (drop_position && in->mac != _mac_arl && !(in->output_mask && !in->output_is_register)) {
+            int out = in->output_mask && in->output_is_register && (in->output_from_ilu ? in->ilu : in->mac) != 0;
+            unsigned mac_live = in->mac != _mac_nop && in->mac_mask
+                                    ? live[pr_temporary_index(in->temporary)] & in->mac_mask : 0;
+            unsigned ilu_live = in->ilu != _ilu_nop && in->ilu_mask
+                                    ? live[pr_temporary_index(in->mac != _mac_nop ? 1 : in->temporary)] & in->ilu_mask
+                                    : 0;
+            unsigned out_live = out ? (in->output_address == _output_position ? live[12] & in->output_mask : 1u) : 0;
+
+            if (!mac_live && !ilu_live && !out_live) {
+                pr_dead[index] = 1;
+                if (in->captures_clip)
+                    live[12] = 0xf;
+                continue;
+            }
+        }
         if (in->mac != _mac_nop && in->mac != _mac_arl && in->mac_mask)
             live[pr_temporary_index(in->temporary)] &= ~in->mac_mask;
         if (in->ilu != _ilu_nop && in->ilu_mask)
@@ -1501,6 +1636,9 @@ static void pr_liveness(const WlXboxVshProgram *program, const unsigned *needs, 
     }
     (void)t;
 }
+
+/* (each output's components the instructions write, bit 3 x: pr_defaults') */
+static unsigned pr_written[8];
 
 /* the outputs' components no instruction writes, as live_defaults */
 static void pr_defaults(const WlXboxVshProgram *program) {
@@ -1529,6 +1667,7 @@ static void pr_defaults(const WlXboxVshProgram *program) {
         else if (in->output_address >= _output_t0 && in->output_address < _output_t0 + 4)
             written[4 + in->output_address - _output_t0] |= in->output_mask;
     }
+    memcpy(pr_written, written, sizeof(pr_written));
     /* (two lanes at once: (0, 0) and (0, 1) as pairs; a lane alone from r0) */
     {
         int pairs[2], values[1];
@@ -1709,6 +1848,34 @@ static int pr_fused_op(const char *name, int a, int b, int c) {
     return values[0];
 }
 
+/* an output read back (field as pr_field_offset takes it, plus offset): a pair (kind 0),
+a float in both lanes (1) or in lane 0 alone (2); from the register the loop stored it from
+when it can be (pr_forward_find), else loaded */
+static int pr_fused_output(int kind, const char *field, int offset) {
+    int at = pr_field_offset(field) + offset, v, b;
+
+    if (kind == 0) {
+        int low, high;
+
+        if ((v = pr_forward_find(at, 8)) >= 0)
+            return v;
+        low = pr_forward_find(at, 4);
+        high = pr_forward_find(at + 4, 4);
+        if (low >= 0 && high >= 0)
+            return pr_fused_op("ps_merge00", low, high, -1);
+    } else {
+        if ((v = pr_forward_find(at, 4)) >= 0 || (v = pr_forward_find(at, 8)) >= 0)
+            return kind == 2 || pr_values[v].splat ? v : pr_fused_op("ps_merge00", v, v, -1);
+        if ((v = pr_forward_find(at - 4, 8)) >= 0)
+            return pr_fused_op("ps_merge11", v, v, -1);
+    }
+    for (b = at; b < at + (kind == 0 ? 8 : 4) && b < (int)sizeof(pr_forward_read); b++)
+        pr_forward_read[b] = 1;
+    if (kind == 0)
+        return pr_fused_new("psq_l @0, %s+%d(%%[o]), 0, 0", field != NULL ? field : "0", offset);
+    return pr_fused_new("lfs @0, %s+%d(%%[o])", field != NULL ? field : "0", offset);
+}
+
 static void pr_fused_store(int value, const char *format, ...) {
     va_list arguments;
     char text[96];
@@ -1809,19 +1976,17 @@ static void pr_fused_prologue(void) {
     }
 }
 
-/* 1 / sqrt(x) in double: frsqrte's estimate and three of Newton's steps
-(nv2a_texture.c's reciprocal_root) */
-static int pr_fused_root(int x) {
+/* 1 / sqrt(x) in single precision for x a float, given x / 2: frsqrte's estimate (Broadway's
+table: 1/2^12 or better, as Dolphin's model of it) and two of Newton's steps, y (3/2 - x/2 y y),
+each fused (a float's worth: the sphere map's coordinates need no more) */
+static int pr_fused_root(int x, int half_x) {
     int y = pr_fused_op("frsqrte", x, -1, -1), three_halves = pr_fused_sphere(2), step;
-    /* (0.5 x made once: the same double at each step) */
-    int half_x = pr_fused_op("fmul", pr_fused_sphere(3), x, -1);
 
-    for (step = 0; step < 3; step++) {
-        int t = pr_fused_op("fmul", half_x, y, -1);
+    for (step = 0; step < 2; step++) {
+        int t = pr_fused_op("fmuls", y, y, -1);
 
-        t = pr_fused_op("fmul", t, y, -1);
-        t = pr_fused_op("fsub", three_halves, t, -1);
-        y = pr_fused_op("fmul", y, t, -1);
+        t = pr_fused_op("fnmsubs", half_x, t, three_halves);
+        y = pr_fused_op("fmuls", y, t, -1);
     }
     return y;
 }
@@ -1853,15 +2018,16 @@ static void pr_fused_epilogue(void) {
                 pr_text("cmpwi 0, 0");
                 pr_text("beq %s", other);
             }
-            xy = pr_fused_new("psq_l @0, %%[oclip](%%[o]), 0, 0");
-            zw = pr_fused_new("psq_l @0, %%[oclip]+8(%%[o]), 0, 0");
+            xy = pr_fused_output(0, "%[oclip]", 0);
+            zw = pr_fused_output(0, "%[oclip]", 8);
             x = pr_fused_op("ps_mul", xy, pr_fused_pack(0, WL_XBOX_VSH_FUSED_SCALE), -1);
             x = pr_fused_op("ps_add", x, pr_fused_op("ps_muls1", pr_fused_pack(0, WL_XBOX_VSH_FUSED_OFFSET), zw, -1),
                             -1);
             x = pr_fused_op("ps_mul", x, to_samples, -1);
             h = pr_fused_op("ps_muls1", half, zw, -1);
+            /* (-w as (-z, -w) at word 1, which x and y then write over) */
+            pr_fused_store(pr_fused_op("ps_neg", zw, -1, -1), "psq_st @0, 4(%%[ad]), 0, 0");
             pr_fused_store(pr_fused_op("ps_add", x, h, -1), "psq_st @0, 0(%%[ad]), 0, 0");
-            pr_fused_store(pr_fused_op("ps_neg", pr_fused_op("ps_merge11", zw, zw, -1), -1, -1), "stfs @0, 8(%%[ad])");
             if (screen)
                 pr_text("b %s", done);
         }
@@ -1870,8 +2036,8 @@ static void pr_fused_epilogue(void) {
 
             pr_place_label(other);
             pr_cache_trim(mark);
-            xy = pr_fused_new("psq_l @0, 0(%%[o]), 0, 0");
-            z = pr_fused_new("lfs @0, 8(%%[o])");
+            xy = pr_fused_output(0, NULL, 0);
+            z = pr_fused_output(2, NULL, 8);
             one = pr_fused_pack(1, WL_XBOX_VSH_FUSED_ONES);
             xy = pr_fused_op("ps_mul", xy, to_samples, -1);
             pr_fused_store(pr_fused_op("ps_add", xy, half, -1), "psq_st @0, 0(%%[ad]), 0, 0");
@@ -1897,10 +2063,12 @@ static void pr_fused_epilogue(void) {
             continue;
         }
         for (half = 0; half < 2; half++) {
-            int value = pr_fused_new("psq_l @0, %s+%d(%%[o]), 0, 0", field, 8 * half);
+            int value = pr_fused_output(0, field, 8 * half);
 
-            value = pr_fused_op("ps_mul", value, pr_fused_pack(0, WL_XBOX_VSH_FUSED_255), -1);
-            value = pr_fused_op("ps_add", value, pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF), -1);
+            /* (fused: a byte apart from the general path's two roundings only where value * 255
+               + 1/2 is within an ulp of a whole number) */
+            value = pr_fused_op("ps_madd", value, pr_fused_pack(0, WL_XBOX_VSH_FUSED_255),
+                                pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF));
             /* a NaN made 0 before the store, as wl_nv2a_color_byte's selects make it (Dolphin
                quantizes a NaN to 255) */
             value = pr_fused_op("ps_sel", value, value, pr_k(0, PRK_ZERO));
@@ -1910,18 +2078,25 @@ static void pr_fused_epilogue(void) {
     /* the texture coordinates (stage_texcoord's) */
     for (n = 0; n < key->stage_count; n++, word += 2) {
         unsigned stage = key->stages[n] & 3u, kind = key->stages[n] >> 2;
-        int at = 16 * (int)stage, st = pr_fused_new("psq_l @0, %%[ot]+%d(%%[o]), 0, 0", at);
+        int at = 16 * (int)stage, st = pr_fused_output(0, "%[ot]", at);
         int linear = kind == WL_XBOX_VSH_FUSED_STAGE_LINEAR || kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR;
         int to = linear ? pr_fused_pack(0, WL_XBOX_VSH_FUSED_TO_TEXELS + 2 * (int)stage) : -1;
         int mark = pr_cache_count;
 
+        /* (projective with a q no instruction writes: its default 1, never divided by) */
+        if (!(pr_written[4 + stage] & 1u)) {
+            if (kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE)
+                kind = WL_XBOX_VSH_FUSED_STAGE_PLAIN;
+            else if (kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR)
+                kind = WL_XBOX_VSH_FUSED_STAGE_LINEAR;
+        }
         if (kind == WL_XBOX_VSH_FUSED_STAGE_PLAIN) {
             pr_fused_store(st, "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
         } else if (kind == WL_XBOX_VSH_FUSED_STAGE_LINEAR) {
             pr_fused_store(pr_fused_op("ps_mul", st, to, -1), "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
         } else if (kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE || kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR) {
             /* (divided by q unless q is 1 or within 1e-12 of 0, or a NaN) */
-            int q = pr_fused_new("lfs @0, %%[ot]+%d(%%[o])", at + 12), values[2], divided;
+            int q = pr_fused_output(1, "%[ot]", at + 12), values[2], divided;
             int one = pr_fused_pack(1, WL_XBOX_VSH_FUSED_ONES), tiny = pr_fused_pack(1, WL_XBOX_VSH_FUSED_TINY);
 
             mark = pr_cache_count;
@@ -1945,18 +2120,23 @@ static void pr_fused_epilogue(void) {
             pr_place_label(done);
             pr_cache_trim(mark);
         } else {
-            /* a sphere map (wl_nv2a_sphere_coordinates), in double: x k + 1/2, y k + 1/2 with
-            k = 1 / (2 sqrt(2 L (L + z))), L = |d|; the disc's centre for a direction too short
-            or too long, its edge straight behind */
+            /* a sphere map (wl_nv2a_sphere_coordinates' coordinates, in single precision): with
+            n = d / |d|, x k + 1/2, y k + 1/2 for k = 1 / (2 sqrt(2 (1 + z))); the disc's centre
+            for a direction too short or too long, its edge straight behind. Toward the back
+            (z < 0), 1 + z is r / (1 - z), r = x x + y y, which cancels nothing: k is
+            a / 2 / sqrt(2 r a) there, a = 1 + |z|, and 1 / 2 / sqrt(2 a) in front. (A float's
+            worth: within 2^-20 of the general path's double, below what GX's coordinates show) */
             char edge[24];
-            int z = pr_fused_new("lfs @0, %%[ot]+%d(%%[o])", at + 8), y = pr_fused_op("ps_merge11", st, st, -1);
-            int length2, root, length, q, values[2], half = pr_fused_sphere(3);
+            int z = pr_fused_output(2, "%[ot]", at + 8), half = pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF);
+            int one = pr_fused_pack(1, WL_XBOX_VSH_FUSED_ONES);
+            int squares, across, length2, root, xy, r, a, s, u, k, values[2];
 
             pr_new_label(other, sizeof(other));
             pr_new_label(edge, sizeof(edge));
             pr_new_label(done, sizeof(done));
-            length2 = pr_fused_op("fadd", pr_fused_op("fmul", st, st, -1), pr_fused_op("fmul", y, y, -1), -1);
-            length2 = pr_fused_op("fadd", length2, pr_fused_op("fmul", z, z, -1), -1);
+            squares = pr_fused_op("ps_mul", st, st, -1);
+            across = pr_fused_op("ps_sum0", squares, squares, squares);
+            length2 = pr_fused_op("fmadds", z, z, across);
             values[0] = length2;
             values[1] = pr_fused_sphere(0);
             pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
@@ -1965,21 +2145,22 @@ static void pr_fused_epilogue(void) {
             values[1] = pr_fused_sphere(1);
             pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
             pr_text("bnl %s", other);
-            root = pr_fused_root(length2);
-            length = pr_fused_op("fmul", length2, root, -1);
-            q = pr_fused_op("fmul", pr_fused_op("fmul", pr_fused_sphere(5), length, -1),
-                            pr_fused_op("fadd", length, z, -1), -1);
-            values[0] = q;
-            values[1] = pr_fused_op("fmul", pr_fused_sphere(4), length2, -1);
+            root = pr_fused_root(length2, pr_fused_op("fmuls", length2, half, -1));
+            xy = pr_fused_op("ps_muls0", st, root, -1);
+            z = pr_fused_op("fmuls", z, root, -1);
+            r = pr_fused_op("fmuls", across, pr_fused_op("fmuls", root, root, -1), -1);
+            a = pr_fused_op("fadds", one, pr_fused_op("fabs", z, -1, -1), -1);
+            /* (s: 1 in front, r behind, where r below 2.5e-13 is the edge; the root's
+            argument 2 a s, its half a s) */
+            s = pr_fused_op("fsel", z, one, r);
+            values[0] = s;
+            values[1] = pr_fused_sphere(4);
             pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
             pr_text("bng %s", edge);
-            /* (rounded to single by frsp, as the general path's (float): stfs of a double cuts its
-            mantissa on Broadway, one ulp low for about half the values) */
-            q = pr_fused_op("fmul", half, pr_fused_root(q), -1);
-            pr_fused_store(pr_fused_op("frsp", pr_fused_op("fadd", pr_fused_op("fmul", st, q, -1), half, -1), -1, -1),
-                           "stfs @0, %d(%%[ad])", 4 * word);
-            pr_fused_store(pr_fused_op("frsp", pr_fused_op("fadd", pr_fused_op("fmul", y, q, -1), half, -1), -1, -1),
-                           "stfs @0, %d(%%[ad])", 4 * word + 4);
+            u = pr_fused_op("fmuls", a, s, -1);
+            k = pr_fused_root(pr_fused_op("fadds", u, u, -1), u);
+            k = pr_fused_op("fmuls", k, pr_fused_op("fsel", z, half, pr_fused_op("fmuls", a, half, -1)), -1);
+            pr_fused_store(pr_fused_op("ps_madds0", xy, k, half), "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
             pr_text("b %s", done);
             pr_place_label(other);
             pr_fused_store(pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF), "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
@@ -2012,6 +2193,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     pr_new();
     pr_needs = ~0u;
     pr_fused_captured = 0;
+    pr_forward_reset();
     /* (fused: live is the form's, each instruction always written or left out) */
     if (pr_fuse) {
         static unsigned fused_needs[WL_XBOX_VSH_MAX_INSTRUCTIONS];
@@ -2023,7 +2205,14 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     for (index = 0; index < program->count; index++)
         if (needs[index] && !pr_supported(&program->instructions[index]))
             return 0;
-    pr_liveness(program, needs, 0, after);
+    {
+        int drop = 0;
+
+        if (pr_fuse && pr_fuse->perspective)
+            for (index = 0; index < program->count; index++)
+                drop |= needs[index] && program->instructions[index].captures_clip;
+        pr_liveness(program, needs, 0, after, drop);
+    }
     /* (each block's test: a condition register bit set once a batch) */
     pr_need_count = 0;
     for (index = 0; index < program->count && !pr_fuse; index++)
@@ -2095,6 +2284,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
                 open = pr_needs = needs[index];
             }
             memcpy(pr_live_after, after[index], sizeof(pr_live_after));
+            pr_dead_now = pr_dead[index];
             pr_instruction(in, WRITE_TEMPORARIES);
         }
         if (open != ~0u)
@@ -2102,6 +2292,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         open = ~0u;
         pr_needs = ~0u;
         pr_place_label(made);
+        pr_forward_on = 1;
         /* (the halves the rest reads of the prefix: kept for the vertex after) */
         for (t = 0; t < 12; t++)
             for (h = 0; h < 2; h++)
@@ -2124,11 +2315,13 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
                 open = pr_needs = needs[index];
             }
             memcpy(pr_live_after, after[index], sizeof(pr_live_after));
+            pr_dead_now = pr_dead[index];
             pr_instruction(in, WRITE_OUTPUTS);
         }
     } else {
         pr_first[0] = 0;
         pr_place_label(made);
+        pr_forward_on = 1;
     }
     for (index = start; index < program->count && !pr_failed; index++) {
         if (!needs[index])
@@ -2141,8 +2334,10 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
             open = pr_needs = needs[index];
         }
         memcpy(pr_live_after, after[index], sizeof(pr_live_after));
+        pr_dead_now = pr_dead[index];
         pr_instruction(&program->instructions[index], WRITE_ALL);
     }
+    pr_dead_now = 0;
     if (open != ~0u)
         pr_place_label(skip);
     pr_needs = ~0u;
@@ -2154,8 +2349,10 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         if (!(pr_fuse->perspective && pr_fused_captured)) {
             values[0] = live ? pr_half(12, 0) : pr_k(0, PRK_ZERO);
             pr_op(0, 0, 1, values, "psq_st @0, 0(%%[o]), 0, 0");
+            pr_forward_store(0, 8, values[0]);
             values[0] = live ? pr_half(12, 1) : pr_k(0, PRK_W1);
             pr_op(0, 0, 1, values, "psq_st @0, 8(%%[o]), 0, 0");
+            pr_forward_store(8, 8, values[0]);
         }
     } else {
         char other[24], done[24];
@@ -2179,6 +2376,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     }
     if (pr_fuse) {
         pr_fused_epilogue();
+        pr_forward_finish();
         /* (the inputs' two sets swapped: this vertex's are the vertex before's) */
         if (reused) {
             pr_text("mr %%[ad], %%[v]");

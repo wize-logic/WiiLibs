@@ -247,6 +247,8 @@ def emu_line(line, immediates):
     if op in ("fmadds", "fnmadds"):
         return "f_set(&%s, %sfmaf(%s, %s, %s));" % (F(a[0]), "-" if op == "fnmadds" else "", fa(a[1], "a"),
                                                      fa(a[2], "a"), fa(a[3], "a"))
+    if op == "fnmsubs":
+        return "f_set(&%s, -fmaf(%s, %s, -%s));" % (F(a[0]), fa(a[1], "a"), fa(a[2], "a"), fa(a[3], "a"))
     if op == "fabs":
         return "f_double(&%s, fabs(%s.a));" % (F(a[0]), F(a[1]))
     if op == "fmr":
