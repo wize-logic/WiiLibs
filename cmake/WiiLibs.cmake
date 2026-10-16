@@ -21,6 +21,49 @@ function(wl_target_defaults target)
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>)
 endfunction()
 
+# The GPU path's compiler settings (the Xbox GPU on GX: wl_xbox, wl_xbox_gx and the libraries they
+# spend their time in), for Release builds. They change speed and size, never results: no
+# -ffast-math, and -ffp-contract=off stays. On the Wii -O3 is on (ppc-be, a30 capture: -7.9%
+# instructions for +139 KB of the title's DOL); the host and ppc-be keep the plain flags, so
+# their results and the goldens do not move (ppc-be can turn one on to count its effect). LTO
+# (-0.6% more with -O3, -1.1% and -27 KB alone) and -fno-math-errno;-fno-trapping-math (-0.01%:
+# the 750 has no fsqrt, floor or lround to inline) are off; -fno-semantic-interposition does
+# nothing in static, non-PIC code.
+if(WL_PLATFORM STREQUAL "wii")
+    set(WL_GPU_DEFAULT_OPT "-O3")
+else()
+    set(WL_GPU_DEFAULT_OPT "")
+endif()
+set(WL_GPU_DEFAULT_LTO OFF)
+set(WL_GPU_DEFAULT_FLAGS "")
+set(WL_GPU_OPT "${WL_GPU_DEFAULT_OPT}" CACHE STRING
+    "Optimization level for the GPU path in Release builds (-O3, ...; empty keeps the build type's)")
+option(WL_GPU_LTO "Link-time optimization across the GPU path's libraries" ${WL_GPU_DEFAULT_LTO})
+set(WL_GPU_FLAGS "${WL_GPU_DEFAULT_FLAGS}" CACHE STRING
+    "Extra compile options for the GPU path (a ;-list, e.g. -fno-math-errno;-fno-trapping-math)")
+
+set(WL_GPU_LIBS "xbox;xbox_gx;platform;gfx;codec" CACHE STRING
+    "The libraries (wl_<name>) wl_gpu_path applies the settings to")
+
+# wl_gpu_path(<library>): applies WL_GPU_OPT, WL_GPU_LTO and WL_GPU_FLAGS to a library of the GPU path.
+function(wl_gpu_path target)
+    string(REGEX REPLACE "^wl_" "" short ${target})
+    if(NOT short IN_LIST WL_GPU_LIBS)
+        return()
+    endif()
+    if(WL_GPU_OPT)
+        target_compile_options(${target} PRIVATE $<$<CONFIG:Release,RelWithDebInfo>:${WL_GPU_OPT}>)
+    endif()
+    if(WL_GPU_FLAGS)
+        target_compile_options(${target} PRIVATE ${WL_GPU_FLAGS})
+    endif()
+    if(WL_GPU_LTO)
+        # objects carry GIMPLE only; a program that links the library must link with -flto too
+        target_compile_options(${target} PRIVATE -flto=auto -fno-fat-lto-objects)
+        target_link_options(${target} INTERFACE -flto=auto)
+    endif()
+endfunction()
+
 # wl_add_test(<name> SOURCES <files...> [LIBS <targets...>] [LABELS <labels...>] [ARGS <args...>])
 # Builds a greatest test executable and registers it with ctest. Labels: unit, be (also runs
 # on the big-endian ppc-be build), dump (needs real game files, skipped without them).

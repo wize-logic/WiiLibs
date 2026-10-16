@@ -4,5 +4,6 @@
 # builds everywhere with bit-identical output on little- and big-endian targets.
 add_library(wl_codec STATIC gx_tex.c xbox_tex.c dsp_adpcm.c)
 wl_target_defaults(wl_codec DETERMINISTIC)
+wl_gpu_path(wl_codec)
 target_link_libraries(wl_codec PUBLIC wl_base)
 add_library(WiiLibs::codec ALIAS wl_codec)
