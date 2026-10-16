@@ -49,7 +49,12 @@ A title's own knowledge is data, passed with --config (JSON; relative paths are 
       "extra_sections": ["XIPS"],            sections to treat as code
       "text_only": false,                    true restores disasm --text-only
       "manual_functions": {"0x00012345": "my_name"} or ["0x00012345"] or "manual.json",
-                                             functions the title project writes by hand
+                                             functions the title project writes by hand (their
+                                             direct calls go through the lookup; a hand-written
+                                             `void sub_X(void)` that keeps the generated body as
+                                             `extern void sub_X_gen(void);`, for a fast path, is
+                                             "recomp_args": ["--exclude-manual", "<its .c>"]:
+                                             direct calls reach it as a plain call)
       "coalesce_functions": ["bounds.json"], owner bounds for recomp --coalesce-functions
       "trace_functions": ["0x00012345"],     entry traces (recomp --trace-functions)
       "icall_sites": "icall_sites.json",     measured indirect-call targets (recomp --icall-sites)
