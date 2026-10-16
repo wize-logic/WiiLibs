@@ -156,12 +156,16 @@ struct WlNv2aGx {
     } signatures[FIT_SETS][FIT_WAYS];
     uint32_t signature_use;
     bool last_shared;
-    // (stamp: the draw; batch: the batch that last used the slot, which no other index may then
-    // take until it is sent)
+    // (stamp: the draw; memo_batch: the batch that last used the slot, which no other index may then
+    // take until it is sent; memo_vertices: the slot's vertex. Apart, the tags a lookup reads are four
+    // to a 32-byte cache line, a strip's neighbouring indices in one, and each vertex starts a line:
+    // on the Wii a vertex beside its tags missed the cache on most lookups, 1.8% of a30's time)
     struct WlNv2aGxMemo {
-        uint32_t index, stamp, batch;
-        PackedVertex vertex;
+        uint32_t index, stamp;
     } memo[MEMO];
+    uint32_t memo_batch[MEMO];
+    PackedVertex *memo_vertices; // (memo_space's first 32-byte boundary)
+    PackedVertex memo_space[MEMO + 1];
     uint32_t memo_stamp, batch_stamp;
     // a batch of a draw's vertices (WL_XBOX_VSH_BATCH): each one's vertex (in the memo, or made
     // here), the program run for those not kept (their elements as the fetch takes them, where their
@@ -243,6 +247,7 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     if (gx->cfg.recipe != NULL) {
         gx->recipe = *gx->cfg.recipe;
     }
+    gx->memo_vertices = (PackedVertex *)(void *)(((uintptr_t)gx->memo_space + 31u) & ~(uintptr_t)31u);
     textures = gx->cfg.textures;
     // (a light's falloff cube as its lit face, wl_nv2a_spot_coordinates, not a sphere map)
     textures.spots = true;
@@ -1894,33 +1899,50 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
     bool changed;
 
     // (each vertex made: its element as the fetch takes it, wl_nv2a_fetch_element's, and where its
-    // words go)
-    for (n = 0; n < count; n++) {
-        uint32_t v = first + n, element = v;
-        PackedVertex *made = &gx->batch.made[runs];
+    // words go; the draw's and the tables' addresses in locals, which the stores would otherwise
+    // have the compiler load again for each vertex)
+    if (indexed) {
+        const uint32_t *indices = draw->indices + first;
+        const uint32_t stamp = gx->memo_stamp, index_base = draw->index_base;
+        struct WlNv2aGxMemo *const memo = gx->memo;
+        uint32_t *const memo_batch = gx->memo_batch;
+        PackedVertex *const memo_vertices = gx->memo_vertices, *const batch_made = gx->batch.made;
+        const uint32_t **const words = gx->batch.words;
 
-        if (indexed) {
-            uint32_t index = draw->indices[v];
-            struct WlNv2aGxMemo *m = &gx->memo[index & (MEMO - 1u)];
+        for (n = 0; n < count; n++) {
+            uint32_t index = indices[n], slot = index & (MEMO - 1u);
+            struct WlNv2aGxMemo *m = &memo[slot];
+            PackedVertex *made;
 
-            if (m->stamp == gx->memo_stamp && m->index == index) {
-                m->batch = batch;
-                gx->batch.words[n] = m->vertex.w;
+            if (m->stamp == stamp && m->index == index) {
+                memo_batch[slot] = batch;
+                words[n] = memo_vertices[slot].w;
                 continue;
             }
-            if (m->stamp != gx->memo_stamp || m->batch != batch) {
-                m->stamp = gx->memo_stamp;
+            if (m->stamp != stamp || memo_batch[slot] != batch) {
+                m->stamp = stamp;
                 m->index = index;
-                m->batch = batch;
-                made = &m->vertex;
+                memo_batch[slot] = batch;
+                made = &memo_vertices[slot];
+            } else {
+                made = &batch_made[runs];
             }
-            element = index - draw->index_base;
+            words[n] = made->w;
+            gx->batch.elements[runs] = index - index_base;
+            gx->batch.words_made[runs] = made->w;
+            gx->batch.run_vertices[runs] = made;
+            runs++;
         }
-        gx->batch.words[n] = made->w;
-        gx->batch.elements[runs] = element;
-        gx->batch.words_made[runs] = made->w;
-        gx->batch.run_vertices[runs] = made;
-        runs++;
+    } else {
+        for (n = 0; n < count; n++) {
+            PackedVertex *made = &gx->batch.made[n];
+
+            gx->batch.words[n] = made->w;
+            gx->batch.elements[n] = first + n;
+            gx->batch.words_made[n] = made->w;
+            gx->batch.run_vertices[n] = made;
+        }
+        runs = count;
     }
     gx->stats.vertices_reused += count - runs;
     if (plan->xf == NULL && runs != 0) {
