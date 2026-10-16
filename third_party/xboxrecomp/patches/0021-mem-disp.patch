@@ -24,7 +24,7 @@ diff --git a/tools/recomp/mem_disp.py b/tools/recomp/mem_disp.py
 new file mode 100644
 --- /dev/null
 +++ b/tools/recomp/mem_disp.py
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,79 @@
 +"""--mem-disp: a guest access's small constant displacement as its own operand.
 +
 +The lifter writes a memory operand as one address expression, the
@@ -58,6 +58,10 @@ new file mode 100644
 +    if not m:
 +        return None
 +    base = m.group("base")
++    if base.endswith("+") and m.group("op") == "-":  # _fmt_mem's `ebp + - 0x4`
++        base = base[:-1].rstrip()
++    if base.endswith(("+", "-", "~", "!")):
++        return None
 +    depth = 0
 +    for c in base:  # the base must be a sum of terms: balanced, and at its top level no operator
 +        depth += (c == "(") - (c == ")")  # that binds less tightly than + (a << 2 + 4 is a << 6)
@@ -104,7 +108,7 @@ diff --git a/tools/recomp/test_mem_disp.py b/tools/recomp/test_mem_disp.py
 new file mode 100644
 --- /dev/null
 +++ b/tools/recomp/test_mem_disp.py
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,49 @@
 +"""
 +--mem-disp: MEMxx(base + disp) written as MEMxx_D(base, disp).
 +
@@ -126,6 +130,8 @@ new file mode 100644
 +    check("MEM32(_r_esp + 0x108) = MEM32(_r_esi + _r_eax * 4 + 0x14);",
 +          "MEM32_D(_r_esp, 0x108) = MEM32_D(_r_esi + _r_eax * 4, 0x14);", 2)
 +    check("MEMF(ebp - 0x10)", "MEMF_D(ebp, -0x10)", 1)
++    check("SMEM32(ebp + - 0x4)", "SMEM32_D(ebp, -0x4)", 1)  # _fmt_mem's negative displacement
++    check("MEM32(a - - 4)", "MEM32(a - - 4)", 0)
 +    check("x = SMEM16(ecx + 2);", "x = SMEM16_D(ecx, 0x2);", 1)
 +
 +
