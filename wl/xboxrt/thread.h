@@ -254,11 +254,26 @@ typedef struct {
     uint32_t service_starved; // the service thread waited a second or more for the lock (logged)
     // safe points that kept the lock from a waiting thread: the holder was at DISPATCH_LEVEL or above
     uint32_t raised_holds;
+    // yield points (wl_xb_yield_point: every kernel call's, and a stall's looks): a thread doing file
+    // I/O alone moves on by them, as the deterministic mode counts a safe point only when something
+    // is due
+    uint32_t kernel_calls;
 } WlXbThreadStats;
 void wl_xb_thread_stats(WlXbThreadStats *out);
-// The service thread's status, every 10 s: after 20 s with no scheduling at all, the lock's holder
-// and every thread's state are logged (once a minute while the stall lasts).
-void wl_xb_thread_stall_check(void);
+// What the stall watch counts as the guest moving on: hand-offs, safe points, waits, wakes,
+// timeouts and kernel calls.
+uint32_t wl_xb_thread_progress(void);
+// The stall watch's state: one look every 10 s at a progress count (wl_xb_thread_progress plus the
+// paging's faults and reads). Returns the seconds without progress when the look reports a stall
+// (after two quiet looks, then once a minute while it lasts), else 0.
+typedef struct {
+    uint32_t last, quiet;
+} WlXbStallWatch;
+uint32_t wl_xb_stall_watch_look(WlXbStallWatch *w, uint32_t progress);
+// The service thread's status, every 10 s: after 20 s with no progress at all
+// (wl_xb_thread_progress plus `paging`, the paging's faults and reads), the lock's holder and every
+// thread's state are logged (once a minute while the stall lasts).
+void wl_xb_thread_stall_check(uint32_t paging);
 // Each guest thread's stack scanned for return addresses into the image, for a frozen title.
 void wl_xb_thread_log_guest_stacks(void);
 

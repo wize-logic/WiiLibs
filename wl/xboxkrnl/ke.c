@@ -171,19 +171,27 @@ void k_KeQuerySystemTime(void) {
     }
 }
 
-// VOID KeStallExecutionProcessor(ULONG MicroSeconds): a busy wait, as on the console (short ones)
+// VOID KeStallExecutionProcessor(ULONG MicroSeconds): a busy wait, as on the console, where the
+// interrupts its IRQL lets in still come (and their DPCs, and a thread switch when one is due). So
+// the wait looks at them as a safe point does instead of holding the guest lock unseen: a sleep
+// with the lock held kept the service thread and every interrupt out for the whole stall. A long
+// stall sleeps a millisecond between looks, giving the host its CPU.
 void k_KeStallExecutionProcessor(void) {
     uint32_t us = ARG(0);
     if (wl_xb_deterministic()) {
         wl_xb_time_spend_us(us); // the virtual clock moves on by it, at once
         return;
     }
-    if (us >= 2000u) {
-        wl_platform_thread_sleep_ms(us / 1000u); // long stalls give the host its CPU
-        return;
-    }
     uint64_t end = wl_xb_time_us() + us;
-    while (wl_xb_time_us() < end) {
+    for (;;) {
+        wl_xb_yield_point();
+        uint64_t now = wl_xb_time_us();
+        if (now >= end) {
+            break;
+        }
+        if (end - now >= 2000u) {
+            wl_platform_thread_sleep_ms(1);
+        }
     }
 }
 

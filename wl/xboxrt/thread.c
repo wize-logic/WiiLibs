@@ -453,6 +453,7 @@ static void det_point(uint32_t ns, bool levels) {
 }
 
 void wl_xb_yield_point(void) {
+    g_stats.kernel_calls++; // (the holder's: a kernel call's own yield point)
     if (g_det) {
         det_point(g_det_call_ns, false);
         return;
@@ -489,6 +490,12 @@ bool wl_xb_det_idle_take(WlXbThread *self, uint32_t timeout_ms) {
     wl_platform_mutex_lock(g_m);
     if (g_owner != self && g_idle == self) {
         wl_platform_cond_wait_timeout(self->cond, g_m, timeout_ms);
+    }
+    if (g_owner == NULL && g_idle == self) {
+        // nobody holds the lock: the idle thread gave it up when every thread waited for good and
+        // nothing was due (wl_xb_det_idle_step -1). It takes it back to look again (a wake or an
+        // interrupt line a host thread raised since), as no hand-off would ever reach it.
+        g_owner = self;
     }
     bool took = g_owner == self;
     wl_platform_mutex_unlock(g_m);
@@ -1151,24 +1158,39 @@ uint32_t wl_xb_thread_reap(void) {
     return freed;
 }
 
-// A stall: the scheduler made no progress (no hand-off, safe point, wait or wake) since the last
-// look. Called from the service thread's status (every 10 s); after two quiet looks it logs who
-// holds the guest lock and every thread's state, once a minute while it lasts, so a hang names its
-// threads.
-void wl_xb_thread_stall_check(void) {
-    static uint32_t last, quiet;
-    uint32_t now = g_stats.handoffs + g_stats.safe_points + g_stats.waits + g_stats.wakes + g_stats.timeouts;
-    if (now != last) {
-        last = now;
-        quiet = 0;
-        return;
+uint32_t wl_xb_thread_progress(void) {
+    return g_stats.handoffs + g_stats.safe_points + g_stats.waits + g_stats.wakes + g_stats.timeouts +
+           g_stats.kernel_calls;
+}
+
+uint32_t wl_xb_stall_watch_look(WlXbStallWatch *w, uint32_t progress) {
+    if (progress != w->last) {
+        w->last = progress;
+        w->quiet = 0;
+        return 0;
     }
-    if (++quiet < 2u || (quiet - 2u) % 6u != 0u) {
+    if (++w->quiet < 2u || (w->quiet - 2u) % 6u != 0u) {
+        return 0;
+    }
+    return w->quiet * 10u;
+}
+
+// A stall: the guest made no progress (no hand-off, safe point, wait, wake, kernel call or page
+// fault) since the last look. Called from the service thread's status (every 10 s); after two
+// quiet looks it logs who holds the guest lock and every thread's state, once a minute while it
+// lasts, so a hang names its threads. Kernel calls and faults count because the deterministic mode
+// counts a safe point only when something is due on the virtual clock, which a kernel call moves on
+// 400 ns and file I/O not at all: a lone thread rebuilding a map's cache slot on a loaded disk (10 ms
+// a call) went 25 s between counted events and was reported as a stall.
+void wl_xb_thread_stall_check(uint32_t paging) {
+    static WlXbStallWatch watch;
+    uint32_t quiet_s = wl_xb_stall_watch_look(&watch, wl_xb_thread_progress() + paging);
+    if (quiet_s == 0) {
         return;
     }
     wl_platform_mutex_lock(g_m);
     WlXbThread *owner = g_owner;
-    WL_LOG_W(TAG, "stall: no scheduling for %u s; the lock is %s's (%u), the ready queue's head %s", (unsigned)(quiet * 10u),
+    WL_LOG_W(TAG, "stall: no scheduling for %u s; the lock is %s's (%u), the ready queue's head %s", (unsigned)quiet_s,
              owner != NULL ? owner->name : "nobody's", owner != NULL ? (unsigned)owner->id : 0u,
              g_ready != NULL ? g_ready->name : "(empty)");
     for (WlXbThread *t = g_all; t != NULL; t = t->next_all) {

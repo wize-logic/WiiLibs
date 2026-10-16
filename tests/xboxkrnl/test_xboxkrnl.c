@@ -46,7 +46,7 @@ static const uint16_t k_ordinals[] = {
     127, 126, 268, 53, 51, 8, 189, 225, 186, 233, 234, 235, 187, 192, 221, 255, 258, 291, 277, 294, 108, 145, 159, 158,
     113, 107, 149, 119, 109, 98, 44, 190, 202, 219, 236, 211, 226, 207, 210, 218, 184, 199, 217, 166, 171, 173, 168, 305,
     304, 289, 279, 362, 335, 336, 337, 340, 338, 339, 24, 99, 232, 238, 112, 132, 128, 156, 322, 224, 129, 161,
-    195, 246, 250, 251, 364, 123, 138, 205, 160, 175, 176,
+    195, 246, 250, 251, 364, 123, 138, 205, 160, 175, 176, 151,
 };
 enum {
     S_PERF_FREQ, S_PERF_COUNTER, S_COMPARE_MEMORY, S_INTERLOCKED_INC, S_INTERLOCKED_CMPXCHG, S_DBGPRINT,
@@ -62,7 +62,7 @@ enum {
     S_KE_TICK_COUNT, S_HW_INFO, S_NT_RESUME, S_KE_RAISE_TO_DPC, S_KF_LOWER_IRQL, S_NT_DELETE_FILE, S_OB_REF_BY_HANDLE,
     S_OBF_DEREF, S_OBF_REF, S_RTL_VSPRINTF,
     S_KE_PULSE_EVENT, S_KE_RESET_EVENT, S_NT_PULSE_EVENT, S_KF_RAISE_IRQL,
-    S_MM_LOCK_BUFFER, S_MM_LOCK_PHYS,
+    S_MM_LOCK_BUFFER, S_MM_LOCK_PHYS, S_KE_STALL,
 };
 
 static uint8_t *g_image; // the XBE's bytes
@@ -1966,7 +1966,96 @@ TEST directory_listing_keeps_entries(void) {
     PASS();
 }
 
+// ---- The stall watch ---------------------------------------------------------------------------
+// A thread doing kernel calls alone (file I/O: a map's cache slot rebuilt) moves the guest on, though
+// the deterministic mode counts no safe point until something is due on the virtual clock; a guest
+// that does nothing at all is reported after two quiet looks (20 s), then once a minute.
+
+TEST stall_watch_counts_kernel_calls(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t st = gmem(8);
+    WlXbThreadStats ts0, ts1;
+    wl_xb_thread_stats(&ts0);
+    uint32_t p0 = wl_xb_thread_progress();
+    WlXbStallWatch w = {0};
+    for (uint32_t look = 0; look < 12u; look++) {
+        for (uint32_t i = 0; i < 20u; i++) {
+            KN(S_KE_SYSTEM_TIME, st);
+        }
+        ASSERT_EQ_FMT(0u, wl_xb_stall_watch_look(&w, wl_xb_thread_progress()), "%u");
+    }
+    wl_xb_thread_stats(&ts1);
+    ASSERT(wl_xb_thread_progress() - p0 >= 240u);
+    if (wl_xb_deterministic()) {
+        // 240 calls move the virtual clock on 96 us: no safe point counted, nothing else moved
+        uint32_t sched0 = ts0.handoffs + ts0.safe_points + ts0.waits + ts0.wakes + ts0.timeouts;
+        uint32_t sched1 = ts1.handoffs + ts1.safe_points + ts1.waits + ts1.wakes + ts1.timeouts;
+        ASSERT(sched1 - sched0 < 10u);
+    }
+    // no progress: the second quiet look reports (20 s), then every sixth (once a minute)
+    uint32_t p = wl_xb_thread_progress();
+    ASSERT_EQ_FMT(0u, wl_xb_stall_watch_look(&w, p + 1u), "%u");
+    ASSERT_EQ_FMT(0u, wl_xb_stall_watch_look(&w, p + 1u), "%u");
+    ASSERT_EQ_FMT(20u, wl_xb_stall_watch_look(&w, p + 1u), "%u");
+    for (uint32_t i = 0; i < 5u; i++) {
+        ASSERT_EQ_FMT(0u, wl_xb_stall_watch_look(&w, p + 1u), "%u");
+    }
+    ASSERT_EQ_FMT(80u, wl_xb_stall_watch_look(&w, p + 1u), "%u");
+    ASSERT_EQ_FMT(0u, wl_xb_stall_watch_look(&w, p + 2u), "%u"); // moving again
+    ASSERT_EQ_FMT(0u, wl_xb_stall_watch_look(&w, p + 2u), "%u");
+    ASSERT_EQ_FMT(20u, wl_xb_stall_watch_look(&w, p + 2u), "%u");
+    PASS();
+}
+
+// KeStallExecutionProcessor busy-waits as the console does: a timer's DPC due in the middle of the
+// stall runs before it returns (the guest lock was held unseen, the interrupts kept out).
+TEST a_stall_takes_interrupts(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    if (wl_xb_deterministic()) {
+        PASS(); // the virtual clock jumps over the stall at once: the next kernel call looks
+    }
+    uint32_t timer = gmem(0x28), dpc = gmem(0x20);
+    g_dpc_runs = 0;
+    KN(S_KE_INIT_TIMER, timer, 0);
+    KN(S_KE_INIT_DPC, dpc, guest_fn(1, dpc_routine), 0x57A1u);
+    KN(S_KE_SET_TIMER, timer, (uint32_t)-20000, 0xFFFFFFFFu, dpc); // 2 ms
+    KN(S_KE_STALL, 30000u);
+    ASSERT_EQ_FMT(1u, g_dpc_runs, "%u");
+    ASSERT_EQ_FMT(0x57A1u, g_dpc_arg, "%08x");
+    KN(S_KE_STALL, 50u); // a short one still ends
+    PASS();
+}
+
+// The deterministic mode: every thread waits for good and nothing is due, so the idle thread gives
+// the lock up; a wake from a host thread (a device's) must still reach the waiter.
+static _Alignas(32) uint8_t g_waker_stack[64 * 1024];
+
+static void *late_waker(void *arg) {
+    wl_platform_thread_sleep_ms(50);
+    wl_xb_wake((WlXbThread *)arg);
+    return NULL;
+}
+
+TEST an_idle_lock_is_taken_back(void) {
+    boot();
+    ASSERT(g_ready);
+    WlXbThread *self = wl_xb_current();
+    WlPlatformThread waker;
+    ASSERT_EQ(WL_OK, wl_platform_thread_create(&waker, late_waker, self, g_waker_stack, sizeof g_waker_stack, WL_THREAD_PRIO_MAIN));
+    bool woke = false;
+    while (!woke) {
+        woke = wl_xb_wait(self, WL_WAIT_FOREVER);
+    }
+    ASSERT_EQ(WL_OK, wl_platform_thread_join(waker, NULL));
+    PASS();
+}
+
 SUITE(kernel_suite) {
+    RUN_TEST(an_idle_lock_is_taken_back); // first: no other test's timer keeps the clock going
     RUN_TEST(thunk_abi);
     RUN_TEST(threads_and_critical_sections);
     RUN_TEST(events_timeouts_mutants);
@@ -1996,6 +2085,8 @@ SUITE(kernel_suite) {
     RUN_TEST(virtual_memory_corners);
     RUN_TEST(rtl_formats_past_the_stack_buffer);
     RUN_TEST(directory_listing_keeps_entries);
+    RUN_TEST(stall_watch_counts_kernel_calls);
+    RUN_TEST(a_stall_takes_interrupts);
 }
 
 GREATEST_MAIN_DEFS();
