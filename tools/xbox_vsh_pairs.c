@@ -13,7 +13,7 @@
 // the rest are values from one instruction to the next.
 //
 // What differs from the plain C: the multiply-adds and the dot products are fused and add in
-// another order, RSQ is frsqrte's estimate made exact by Newton's steps in double (to a bit), and
+// another order, RSQ is frsqrte's estimate and two Newton's steps in single precision (two ulps), and
 // MIN/MAX choose by the sign of a difference (+0 for -0 when equal). EXP and LOG are vsh.c's
 // (ilu_floor, ilu_power_of_two, ilu_exp2, ilu_log2) with the float's bits made and taken apart
 // through the slot, their polynomials' multiply-adds fused, EXP's lanes made only where read.
@@ -1096,41 +1096,32 @@ static void pr_ilu(const WlXboxVshInstruction *in, unsigned needed, PrLane resul
         pr_op(0, 1, 2, values, "fmr @0, @1");
         pr_place_label(done);
     } else {
-        /* RSQ: 1.0f / sqrtf(|x|), as the C: frsqrte's estimate (Broadway's
-        table, within 1/2^12.4) made exact by two Newton's steps in double,
-        |x| times it rounded to a float (sqrtf's bits: checked for every
-        float against the table as Dolphin models it), its reciprocal; 0,
-        infinity and NaN, where the steps make a NaN, take the estimate
-        (exact for them) */
+        /* RSQ: 1 / sqrt(|x|) in single precision: frsqrte's estimate (Broadway's
+        table, within 1/2^12.4) and two Newton's steps, within two ulps of the
+        C's 1.0f / sqrtf (no division: frames the same on the captures); 0,
+        infinity and NaN, where the steps make a NaN, take the estimate (exact
+        for them) */
         int a, e, h, t, step, one = pr_k(1, PRK_ONE), halves = pr_k(1, PRK_HALF),
                               three_halves = pr_k(1, PRK_THREE_HALVES), values[3];
-        char special[24], done[24];
+        char done[24];
 
         a = pr_op3("fabs", x, -1, -1);
         e = pr_op3("frsqrte", a, -1, -1);
-        h = pr_op3("fmul", a, halves, -1);
+        h = pr_op3("fmuls", a, halves, -1);
         for (step = 0; step < 2; step++) {
-            t = pr_op3("fmul", e, e, -1);
-            t = pr_op3("fnmsub", h, t, three_halves);
-            values[0] = e;
-            values[1] = t;
-            pr_op(0, 1, 2, values, "fmul @0, @0, @1");
+            t = pr_op3("fmuls", e, e, -1);
+            t = pr_op3("fnmsubs", h, t, three_halves);
+            e = pr_op3("fmuls", e, t, -1);
         }
-        pr_new_label(special, sizeof(special));
+        s = e;
         pr_new_label(done, sizeof(done));
-        values[0] = e;
-        pr_op(0, 0, 1, values, "fcmpu 0, @0, @0");
-        pr_text("bun %s", special);
-        values[1] = a;
-        pr_op(0, 1, 2, values, "fmul @0, @1, @0");
-        pr_op(0, 1, 1, values, "frsp @0, @0");
-        s = pr_op3("fdivs", one, e, -1);
-        pr_text("b %s", done);
-        pr_place_label(special);
         values[0] = s;
+        pr_op(0, 0, 1, values, "fcmpu 0, @0, @0");
+        pr_text("bnu %s", done);
         values[1] = a;
         pr_op(0, 1, 2, values, "frsqrte @0, @1");
         pr_op(0, 1, 1, values, "frsp @0, @0");
+        (void)one;
         pr_place_label(done);
     }
     for (half = 0; half < 4; half++) {
