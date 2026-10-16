@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "wl/platform/hwcount.h"
+#include "wl/platform/platform.h"
 
 #define SETTINGS_FILE_LIMIT (4u * 1024u)
 #define LINE_MAX_CHARS 200u
@@ -209,12 +210,14 @@ uint32_t wl_hwcount_settings_parse(WlHwcountSettings *s, const char *text, size_
 }
 
 WlResult wl_hwcount_settings_load(WlHwcountSettings *s, const char *path, WlHwcountIssueFn issue, void *user) {
-    FILE *f = fopen(path, "rb");
+    const void *virt = NULL;
+    uint32_t virt_size = 0;
+    FILE *f = wl_platform_fs_virtual_get(path, &virt, &virt_size) ? NULL : fopen(path, "rb");
     char *text;
     size_t got;
 
     wl_hwcount_settings_default(s);
-    if (f == NULL) {
+    if (f == NULL && virt == NULL) {
         return WL_ERR_NOT_FOUND;
     }
     text = malloc(SETTINGS_FILE_LIMIT + 1u);
@@ -222,8 +225,13 @@ WlResult wl_hwcount_settings_load(WlHwcountSettings *s, const char *path, WlHwco
         fclose(f);
         return WL_ERR_NOMEM;
     }
-    got = fread(text, 1, SETTINGS_FILE_LIMIT + 1u, f);
-    fclose(f);
+    if (f == NULL) { // (given in the command line)
+        got = virt_size <= SETTINGS_FILE_LIMIT + 1u ? virt_size : SETTINGS_FILE_LIMIT + 1u;
+        memcpy(text, virt, got);
+    } else {
+        got = fread(text, 1, SETTINGS_FILE_LIMIT + 1u, f);
+        fclose(f);
+    }
     if (got > SETTINGS_FILE_LIMIT) {
         free(text);
         return WL_ERR_LIMIT;

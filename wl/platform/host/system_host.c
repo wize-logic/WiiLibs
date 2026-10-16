@@ -3,6 +3,7 @@
 // (wl_host_system_raise in system_host.h); exit calls exit(0); the log sink keeps the same
 // in-memory ring as the console and prints to stderr.
 #include "wl/platform/host/system_host.h"
+#include "wl/platform/net_internal.h"
 #include "wl/platform/shutdown_internal.h"
 #include "wl/platform/shutdown_internal.h"
 
@@ -60,6 +61,7 @@ void wl_platform_log_sink(void *user, WlLogLevel level, const char *tag, const c
     if (n < 0) {
         return;
     }
+    wl_net_stream_tee(text, (size_t)n < sizeof text ? (size_t)n : sizeof text - 1u);
     unsigned slot = atomic_fetch_add(&g_ring_count, 1u) % RING_LINES;
     memcpy(g_ring[slot], text, sizeof text);
     fprintf(stderr, "%s\n", text);

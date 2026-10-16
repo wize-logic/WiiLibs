@@ -3,6 +3,7 @@
 //   1. the in-memory ring (crash screen, overlay),
 //   2. the EXI UART via SYS_Report (Dolphin OSREPORT log; always on, harmless on hardware),
 //   3. the on-screen console via printf (debug builds only; needs CON_Init by the caller),
+//   3b. the remote log of net_stream.h when a program opened it (one flag test otherwise),
 //   4. <sd_dir>/log-NN.log when wl_platform_log_init was given a directory (buffered; written out
 //      and synced to the card when the buffer fills, every WL_LOG_SYNC_SECONDS of the lines
 //      coming, on wl_platform_log_flush (the stop screens, the profiler, wl_platform_exit) and on
@@ -23,6 +24,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "wl/platform/net_internal.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/timebase.h"
 
@@ -79,6 +81,7 @@ void wl_platform_log_sink(void *user, WlLogLevel level, const char *tag, const c
     slot[keep] = '\0';
     g_ring_count++;
 
+    wl_net_stream_tee(text, len); // the remote log (net_stream.h), when it is on
     SYS_Report("%s\n", text); // EXI UART -> Dolphin OSREPORT
 #ifndef NDEBUG
     printf("%s\n", text); // on-screen console

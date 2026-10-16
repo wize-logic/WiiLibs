@@ -5,6 +5,7 @@
 #include <gccore.h>
 #include <stdio.h>
 
+#include "wl/platform/net_stream.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/stop.h"
 #include "wl/platform/stop_backend.h"
@@ -61,9 +62,12 @@ void wl_platform_stop_wait(const char *message, bool again) {
         VIDEO_SetNextFramebuffer(g_console_fb);
         VIDEO_Flush();
     }
+    // an unattended run (the remote log is open) leaves by itself, after the log has had time to
+    // reach the PC, so that the Homebrew Channel is there for the next wiiload
+    uint32_t frames = 0;
     for (;;) {
         WlRawInput input;
-        bool leave = false;
+        bool leave = wl_net_stream_active() && ++frames > 600u;
         wl_platform_input_poll(&input);
         for (uint32_t i = 0; i < WL_INPUT_MAX_REMOTES; i++) {
             leave |= input.remotes[i].connected && (input.remotes[i].buttons & WL_WM_HOME) != 0u;

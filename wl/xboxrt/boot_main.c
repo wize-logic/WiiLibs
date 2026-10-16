@@ -8,8 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/platform/net_stream.h"
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/boot.h"
+#include "wl/xboxrt/runopts.h"
 
 #if !defined(__wii__)
 #include "wl/platform/host/fs_host.h"
@@ -40,22 +42,28 @@ int main(int argc, char **argv) {
     WlXbTitleConfig cfg;
     wl_xb_title_config_default(&cfg);
 #if defined(__wii__)
-    (void)argc;
-    (void)argv;
     cfg.title_dir = "sd:/xbox/" WL_XB_TITLE_NAME;
+    // a loader's arguments (wiiload <dol> play=... switch=... net=...): runopts.h
+    cfg.arg_count = argc > 1 ? argc - 1 : 0;
+    cfg.args = argc > 1 ? argv + 1 : NULL;
 #else
     static char title[512], data[512];
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <title folder with default.xbe> [hard disk folder]\n", argv[0]);
+        fprintf(stderr, "usage: %s <title folder with default.xbe> [hard disk folder] [option=value ...]\n", argv[0]);
         return 2;
     }
     wl_host_fs_set_root(WL_DEVICE_SD, "/");
     platform_path(argv[1], title, sizeof title);
     cfg.title_dir = title;
-    if (argc >= 3) {
+    int first_option = 2;
+    if (argc >= 3 && !wl_xb_run_option_is(argv[2])) {
         platform_path(argv[2], data, sizeof data);
         cfg.data_dir = data;
+        first_option = 3;
     }
+    // options as on the Wii's command line (runopts.h: play=, switch=, file=, net=, run=)
+    cfg.arg_count = argc > first_option ? argc - first_option : 0;
+    cfg.args = argc > first_option ? argv + first_option : NULL;
     if (getenv("WL_XB_TRACE") != NULL) {
         cfg.trace_kernel_calls = true;
     }
@@ -107,6 +115,7 @@ int main(int argc, char **argv) {
     WL_LOG_I("xbmain", "the title left with %d", code);
     wl_platform_exit(WL_EXIT_LOADER);
 #else
+    wl_net_stream_close(3000); // (the Wii's exit does this in a shutdown hook)
     return code < 0 ? 1 : code;
 #endif
 }

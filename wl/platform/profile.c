@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "wl/platform/platform.h"
 #include "wl/platform/profile.h"
 
 WlResult wl_profile_ring_init(WlProfileRing *ring, uint32_t *storage, uint32_t words, uint32_t depth,
@@ -163,6 +164,9 @@ WlResult wl_profile_dump_file(const WlProfileRing *ring, const WlProfileDumpInfo
     }
     if (fclose(file) != 0) {
         result = WL_ERR_IO;
+    }
+    if (result == WL_OK) {
+        wl_platform_fs_notify_written(path); // (a remote copy of the dump, if a hook is set)
     }
     return result;
 }

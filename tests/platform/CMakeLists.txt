@@ -13,6 +13,7 @@ wl_add_test(test_platform_video_mode SOURCES test_platform_video_mode.c LIBS wl_
 wl_add_test(test_platform_fs SOURCES test_platform_fs.c suite_fs.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_backtrace SOURCES test_platform_backtrace.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_net SOURCES test_platform_net.c LIBS wl_platform LABELS unit be)
+wl_add_test(test_platform_net_stream SOURCES test_platform_net_stream.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_posix SOURCES test_platform_posix.c suite_posix.c LIBS wl_platform LABELS unit be)
 # Crash-safe file replacement and the sweep after a cut one; the directory listing cache (POSIX paths, a temp folder).
 wl_add_test(test_platform_file_replace SOURCES test_platform_file_replace.c LIBS wl_platform LABELS unit be)

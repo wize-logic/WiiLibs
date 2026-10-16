@@ -492,9 +492,39 @@ guest RAM's size.
 | `overlap` | the processor goes on with the next frame while GX draws (by default each frame's end waits for GX to finish it: the caches' frame-late reuse still shows stale content in some frames); `WL_XB_OVERLAP` on the host |
 | `noaudio` | the idle APU and AC'97 (DirectSound fails, the title runs silent), for an A/B; `WL_XB_AUDIO=0` on the host |
 | `deterministic` | the virtual clock (`thread.h`'s deterministic mode), so a run of a script on the Wii is the same game as the host's with `WL_XB_DETERMINISTIC=1`: guest RAM (the play step `dump`) and captures compare byte for byte; `WL_XB_DETERMINISTIC` on the host |
+| `netrun.txt` | options in the command line's form, one a line (`#` comments), for a run started without arguments (Dolphin): `net=127.0.0.1:7777`, `switch=...`, `play=...`; the command line wins (below) |
 | `play/` | where screenshots and captures go (`WL_XB_PLAY_OUT` on the host); scripts and `replay:` captures are looked for relative to the title folder |
 | `hdd/pagefile.sys` | the paging's swap file |
 | `hdd/recomp_seeds.json`, `hdd/vsh_programs.inc` | what the run found for the next build (below) |
+
+**Runs chosen by the command line, and the network** (`runopts.h`, `wl/platform/net_stream.h`). A Homebrew
+Channel loader passes arguments after the DOL, so each run can be chosen from the PC with no change to the SD
+card. Each argument is one option:
+
+| Option | Effect |
+|---|---|
+| `play=<setting>` | the play setting, as the first line of `play.cfg` (`script:`, `bot:`, `look:`, `replay:<capture> <runs>`) |
+| `switch=a,b,c=v` | flag files of the title folder, as if they were there: `noxf`, `novcache`, `noaudio`, `deterministic`, `vcache=2048` (the text after `=` is the file's), `profile` and `hwcount` (profile.txt and hwcount.txt with the defaults), and any switch a build reads, such as `overlap` or `noskin` |
+| `file=<name>:<text>` | a file of the title folder with this text, `;` for a line end: `file=profile.txt:after 30;seconds 10;repeat 2` |
+| `net=<spec>` | the remote log: `<pc ip>:<port>` (the Wii connects) or `listen:<port>` (the PC connects to the Wii) |
+| `run=<name>` | the run's name in the remote log's first line |
+
+The files are virtual (`wl_platform_fs_virtual_set`): the code that reads them is unchanged, and nothing is
+written to the card. The host's `prog <title folder> [hard disk folder] [option ...]` takes the same options.
+With `net=`, every log line goes to the PC, and so do the files the run writes in the title folder and its
+`play/` folder when they are closed (`profileN.txt`, screenshots, bench summaries; those over 16 MB are not
+sent). The title ends as usual by returning to the loader, which flushes the stream and sends `END`; a PC
+that sees a failure line or a silence sends `QUIT`, which the stream's thread acts on whatever the title is
+doing; and a stop screen (a crash) leaves by itself after 10 s. All of it is `tools/wii_net_run.py`'s side:
+
+```sh
+tools/wii_net_run.py --wii <wii ip> --dol halo.dol --name a30 --out ~/wl-work/netruns \
+    --arg 'play=replay:play/a30_peak.cap 5' --arg switch=overlap,profile
+```
+
+Once per setup: the Wii's IP (the Homebrew Channel's network screen shows it) and the title folder staged on
+the SD card (`sd:/xbox/<title>` with `default.xbe`, the maps and `hdd/`; the options replace only the
+small files). With `netrun.txt` and no PC command line, a Dolphin run sends its log too.
 
 **Environment variables** (host only; the Wii has files instead):
 
@@ -542,6 +572,10 @@ Wii, `abort` elsewhere; `wl_xb_crash_set_stop` replaces it).
 
 ## Tests
 
+- `tests/xboxrt/test_xboxrt_runopts.c`: the command line's options and netrun.txt (flag and settings files read
+  through the file API and through the profiler's stdio loader, the play and net strings, the refusals, the
+  order); `test_platform_net_stream` and `test_wii_net_run` (tools/wii_net_run.py against a pretend Wii)
+  cover the stream and the PC side.
 - `tests/xboxrt/test_xboxrt_mem.c`: addresses, aliasing, lazy backing, pinned allocations that move
   user pages, reservations, device faults through the host's decoder, the crash path (host, ppc-be).
 - `tests/xboxrt/test_xboxrt_paging.c`: demand paging under a frame limit of 64 frames (host, ppc-be):

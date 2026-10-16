@@ -142,7 +142,10 @@ typedef enum {
 } WlNetOption;
 WlResult wl_net_set_option(WlSocket socket, WlNetOption option, int32_t value);
 // How a non-blocking connect ended, once the socket polls writable: WL_OK in `out` when it is
-// connected, otherwise the result of its failure (WL_ERR_NET_REFUSED, ...).
+// connected, otherwise the result of its failure (WL_ERR_NET_REFUSED, ...). The Wii asks IOS the
+// way IOS answers (connecting again: EISCONN is connected, EALREADY is still going on), and then
+// `out` can be WL_ERR_NET_INPROGRESS: not finished, ask again. Calling wl_net_connect again on a
+// socket whose connect is pending is the portable form of the same question.
 WlResult wl_net_connect_result(WlSocket socket, WlResult *out);
 
 // ---- waiting for several sockets (select) -----------------------------------------------------
