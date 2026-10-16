@@ -17,6 +17,7 @@
 
 #include <math.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 enum {
@@ -378,6 +379,8 @@ void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction
     program->native_colors = NULL;
     program->native_positions = NULL;
     program->native_batch = NULL;
+    program->native_fused = NULL;
+    program->native_fused_count = 0;
     program->hash = wl_xbox_vsh_hash(instructions, instruction_count);
     program->serial = 0;
     {
@@ -390,6 +393,8 @@ void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction
                 program->native_colors = natives[index].colors;
                 program->native_positions = natives[index].positions;
                 program->native_batch = natives[index].batch;
+                program->native_fused = natives[index].fused;
+                program->native_fused_count = natives[index].fused_count;
                 break;
             }
         }
@@ -1440,4 +1445,114 @@ int wl_xbox_vsh_run_positions(const WlXboxVshProgram *program, const float (*con
         return 0;
     program->native_positions(constants, inputs, points, clips, positions);
     return 1;
+}
+
+/* ---------- fused forms as text */
+
+static const char g_fused_kinds[] = "NLPQS";
+
+static const char *fused_format_name(unsigned format, char name[8]) {
+    static const char *const names[] = {"-", "F1", "F2", "F3", "F4", "D3D", "CMP"};
+
+    if (format < WL_XBOX_VSH_FUSED_S1)
+        return names[format];
+    name[0] = format < WL_XBOX_VSH_FUSED_UB ? 'S' : 'U';
+    name[1] = format < WL_XBOX_VSH_FUSED_UB ? '1' : 'B';
+    name[2] = '.';
+    name[3] = (char)('1' + (format - WL_XBOX_VSH_FUSED_S1) % 4u);
+    name[4] = 0;
+    return name;
+}
+
+int wl_xbox_vsh_fused_text(const WlXboxVshFusedKey *key, char *text, unsigned long size) {
+    char stages[32] = "-", formats[160] = "-", name[8];
+    unsigned n, at = 0;
+
+    for (n = 0; n < key->stage_count && n < 4; n++)
+        at += (unsigned)snprintf(stages + at, sizeof(stages) - at, "%s%u%c", n ? "," : "", key->stages[n] & 3u,
+                                 g_fused_kinds[(key->stages[n] >> 2) % 5u]);
+    at = 0;
+    for (n = 0; n < 16; n++)
+        if (key->format[n] != WL_XBOX_VSH_FUSED_NONE)
+            at += (unsigned)snprintf(formats + at, sizeof(formats) - at, "%s%u:%s", at ? "," : "", n,
+                                     fused_format_name(key->format[n] % WL_XBOX_VSH_FUSED_FORMATS, name));
+    return snprintf(text, size, "%x %c %u %u %s %s", key->live, key->perspective ? 'p' : 'o', key->colors,
+                    key->channels, stages, formats);
+}
+
+/* a number at *p (base 10 or 16), past it */
+static int fused_number(const char **p, unsigned base, unsigned *value) {
+    const char *s = *p;
+    unsigned v = 0;
+
+    while (*s == ' ')
+        s++;
+    if (!((*s >= '0' && *s <= '9') || (base == 16 && ((*s >= 'a' && *s <= 'f') || (*s >= 'A' && *s <= 'F')))))
+        return 0;
+    for (;; s++) {
+        unsigned d = *s >= '0' && *s <= '9'   ? (unsigned)(*s - '0')
+                     : base == 16 && *s >= 'a' && *s <= 'f' ? (unsigned)(*s - 'a' + 10)
+                     : base == 16 && *s >= 'A' && *s <= 'F' ? (unsigned)(*s - 'A' + 10)
+                                                             : 99u;
+        if (d >= base)
+            break;
+        if (v > 0xFFFFu)
+            return 0;
+        v = v * base + d;
+    }
+    *value = v;
+    *p = s;
+    return 1;
+}
+
+int wl_xbox_vsh_fused_parse(const char *text, WlXboxVshFusedKey *key) {
+    const char *p = text;
+    unsigned live, colors, channels, n, format;
+    char name[8];
+
+    memset(key, 0, sizeof(*key));
+    if (!fused_number(&p, 16, &live) || live > 0xFFFFu || p[0] != ' ' || (p[1] != 'p' && p[1] != 'o'))
+        return 0;
+    key->live = (unsigned short)live;
+    key->perspective = p[1] == 'p';
+    p += 2;
+    if (!fused_number(&p, 10, &colors) || colors > 2 || !fused_number(&p, 10, &channels) || channels > 3 ||
+        *p++ != ' ')
+        return 0;
+    key->colors = (unsigned char)colors;
+    key->channels = (unsigned char)channels;
+    if (*p == '-') {
+        p++;
+    } else {
+        do {
+            const char *kind = *p >= '0' && *p <= '3' && p[1] ? strchr(g_fused_kinds, p[1]) : NULL;
+
+            if (!kind || key->stage_count >= 4)
+                return 0;
+            key->stages[key->stage_count++] = (unsigned char)((unsigned)(*p - '0') | (unsigned)(kind - g_fused_kinds) << 2);
+            p += 2;
+        } while (*p == ',' && *++p);
+    }
+    if (*p++ != ' ')
+        return 0;
+    if (*p == '-')
+        return (int)(p + 1 - text);
+    do {
+        if (!fused_number(&p, 10, &n) || n > 15 || *p++ != ':')
+            return 0;
+        for (format = 1; format < WL_XBOX_VSH_FUSED_FORMATS; format++) {
+            const char *s = fused_format_name(format, name);
+            size_t length = strlen(s);
+
+            if (strncmp(p, s, length) == 0 && (p[length] == ',' || p[length] == 0 || p[length] == ' ' ||
+                                               p[length] == '\n' || p[length] == '\r')) {
+                p += length;
+                break;
+            }
+        }
+        if (format == WL_XBOX_VSH_FUSED_FORMATS)
+            return 0;
+        key->format[n] = (unsigned char)format;
+    } while (*p == ',' && *++p);
+    return (int)(p - text);
 }

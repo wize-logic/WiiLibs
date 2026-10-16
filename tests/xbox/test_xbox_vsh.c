@@ -115,9 +115,9 @@ TEST compile_finds_a_function_by_hash_and_count(void) {
     const uint32_t *words = program_words(0, &count);
     WlXboxVshNative natives[2] = {
         {wl_xbox_vsh_hash(words, count), count + 1, wl_xbox_vsh_check(words, count), native_run,
-         native_colors, NULL, NULL},
+         native_colors, NULL, NULL, NULL, 0},
         {wl_xbox_vsh_hash(words, count), count, wl_xbox_vsh_check(words, count), native_run,
-         native_colors, NULL, NULL},
+         native_colors, NULL, NULL, NULL, 0},
     };
     wl_xbox_vsh_compile(words, count, natives, 1, &g_program); // (the count differs)
     ASSERT(g_program.native == NULL);
@@ -163,7 +163,7 @@ TEST another_program_of_the_same_hash_is_not_taken_for_it(void) {
     ASSERT(wl_xbox_vsh_check(a, count) != wl_xbox_vsh_check(b, count));
     // the compiled functions: a's entry is not b's
     WlXboxVshNative natives[1] = {{wl_xbox_vsh_hash(a, count), count, wl_xbox_vsh_check(a, count),
-                                   native_run, native_colors, NULL, NULL}};
+                                   native_run, native_colors, NULL, NULL, NULL, 0}};
     wl_xbox_vsh_compile(a, count, natives, 1, &g_program);
     ASSERT(g_program.native == native_run);
     wl_xbox_vsh_compile(b, count, natives, 1, &g_program);

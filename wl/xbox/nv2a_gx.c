@@ -173,7 +173,12 @@ struct WlNv2aGx {
         float inputs[WL_XBOX_VSH_BATCH][WL_NV2A_ATTRIBS][4];
         WlXboxVshOutput outputs[WL_XBOX_VSH_BATCH];
         WlXboxVshWork work;
+        // a fused batch's (the vertices' elements, where their words go)
+        uint32_t elements[WL_XBOX_VSH_BATCH];
+        uint32_t *words_made[WL_XBOX_VSH_BATCH];
     } batch;
+    // a fused batch's state (the draw's)
+    WlXboxVshFused fused;
     // the draw's fetch
     WlNv2aFetchPlan fetch;
     // the transform unit's state this backend left (the position matrix set; the coordinates with a
@@ -1306,6 +1311,9 @@ typedef struct DrawPlan {
     unsigned projected_count, projected_list[WL_GX_DIRECT_PROJECTED];
     // the transform unit's draw (NULL: the processor's)
     const struct XfPlan *xf;
+    // the program's fused form for the draw (fused_known: decided; NULL: none)
+    bool fused_known;
+    const WlXboxVshFusedForm *fused;
 } DrawPlan;
 
 // ---- the transform unit's draws ----------------------------------------------------------------------
@@ -1624,6 +1632,148 @@ static inline const PackedVertex *batch_vertex(const WlNv2aGx *gx, unsigned n) {
 // batch (`layout` not NULL) first decides its projected coordinates (projected_plan): true when the
 // plan and the layout changed, which is then to be set again.
 static bool projected_plan(WlNv2aGx *gx, DrawPlan *plan, WlGxDirectLayout *layout, unsigned runs);
+static bool projected_possible(WlNv2aGx *gx, const DrawPlan *plan);
+
+// ---- fused batches -------------------------------------------------------------------------------
+// A program compiled ahead of time for the Wii may have fused forms (WlXboxVshFusedProc): its batch
+// reads the vertex arrays, runs the program and writes the vertices' words in one loop, for one form
+// of the arrays and of the layout (WlXboxVshFusedKey), which vertices_pack's words to the same bits
+// (the colours to a byte as the Gekko's quantized store makes it: below 0 or a NaN 0, else the value
+// cut down, which is what wl_nv2a_color_byte does). The draw's form is found once, at its first batch
+// that may run fused (not the first when a coordinate may be projected: projected_plan reads the
+// program's outputs).
+
+// the draw's form as the key the forms are found by; false when it has none (a way vertices_pack takes
+// that no fused batch writes)
+static bool fused_key(const WlNv2aGx *gx, const DrawPlan *plan, WlXboxVshFusedKey *key) {
+    const WlNv2aFetchPlan *fetch = &gx->fetch;
+    unsigned n;
+
+    memset(key, 0, sizeof *key);
+    if (plan->xf != NULL || plan->landing || plan->projected_count != 0 || plan->to_sx == 0.0f ||
+        plan->to_sy == 0.0f || (plan->texcoords & (1u << WL_XBOX_PSH_FOG_TEXCOORD)) ||
+        fetch->source == WL_NV2A_SOURCE_IMMEDIATE || plan->stage_count > 4u || plan->colors > 2u) {
+        return false;
+    }
+    key->live = (unsigned short)plan->live;
+    key->perspective = gx->projection.perspective;
+    key->colors = (unsigned char)plan->colors;
+    key->channels = (unsigned char)(plan->channels & ((1u << plan->colors) - 1u));
+    key->stage_count = (unsigned char)plan->stage_count;
+    for (n = 0; n < plan->stage_count; n++) {
+        const StagePlan *sp = &plan->stages[plan->stage_list[n]];
+        unsigned kind = sp->sphere       ? WL_XBOX_VSH_FUSED_STAGE_SPHERE
+                        : sp->projective ? (sp->linear ? WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR
+                                                       : WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE)
+                        : sp->linear     ? WL_XBOX_VSH_FUSED_STAGE_LINEAR
+                                         : WL_XBOX_VSH_FUSED_STAGE_PLAIN;
+
+        if (sp->spot || plan->stage_list[n] > 3u) {
+            return false;
+        }
+        key->stages[n] = (unsigned char)(plan->stage_list[n] | kind << 2);
+    }
+    for (n = 0; n < fetch->count; n++) {
+        unsigned format = wl_nv2a_fetch_fused_format(fetch, n);
+
+        if (format == WL_XBOX_VSH_FUSED_FORMATS || fetch->streamed[n].attribute >= 16u) {
+            return false;
+        }
+        key->format[fetch->streamed[n].attribute] = (unsigned char)format;
+    }
+    return true;
+}
+
+// the draw's fused form (NULL: none), and the fused batches' state for it
+static const WlXboxVshFusedForm *fused_form(WlNv2aGx *gx, const DrawPlan *plan) {
+    const WlXboxVshProgram *program = gx->pipeline.program;
+    const WlNv2aFetchPlan *fetch = &gx->fetch;
+    WlXboxVshFused *f = &gx->fused;
+    WlXboxVshFusedKey key;
+    const WlXboxVshFusedForm *form = NULL;
+    unsigned n, c;
+
+    if (gx->cfg.no_fused || program == NULL || (program->native_fused_count == 0 && gx->cfg.fused_seen == NULL) ||
+        !fused_key(gx, plan, &key)) {
+        return NULL;
+    }
+    for (n = 0; n < program->native_fused_count; n++) {
+        if (memcmp(&program->native_fused[n].key, &key, sizeof key) == 0) {
+            form = &program->native_fused[n];
+            break;
+        }
+    }
+    if (form == NULL) {
+        return NULL;
+    }
+    {
+        static const float pack[WL_XBOX_VSH_FUSED_PACK] = {
+            [WL_XBOX_VSH_FUSED_HALF] = 0.5f,          [WL_XBOX_VSH_FUSED_HALF + 1] = 0.5f,
+            [WL_XBOX_VSH_FUSED_255] = 255.0f,         [WL_XBOX_VSH_FUSED_255 + 1] = 255.0f,
+            [WL_XBOX_VSH_FUSED_DEPTH + 1] = 1.0f,     [WL_XBOX_VSH_FUSED_TINY] = 1.0e-12f,
+            [WL_XBOX_VSH_FUSED_SHORT] = 1.0f / 32767.0f, [WL_XBOX_VSH_FUSED_SHORT + 1] = 1.0f / 32767.0f,
+            [WL_XBOX_VSH_FUSED_NEGATIVE] = -1.0f,     [WL_XBOX_VSH_FUSED_NEGATIVE + 1] = -1.0f,
+            [WL_XBOX_VSH_FUSED_BYTE] = 1.0f / 255.0f, [WL_XBOX_VSH_FUSED_BYTE + 1] = 1.0f / 255.0f,
+            [WL_XBOX_VSH_FUSED_EDGE] = 0.5f,          [WL_XBOX_VSH_FUSED_EDGE + 1] = 1.0f,
+            [WL_XBOX_VSH_FUSED_ONES] = 1.0f,          [WL_XBOX_VSH_FUSED_ONES + 1] = 1.0f};
+        static const double sphere[WL_XBOX_VSH_FUSED_SPHERE] = {1.0e-24, 1.0e76, 1.5, 0.5, 2.5e-13, 2.0};
+
+        memcpy(f->pack, pack, sizeof pack);
+        memcpy(f->sphere, sphere, sizeof sphere);
+    }
+    f->pack[WL_XBOX_VSH_FUSED_SCALE] = plan->scale[0];
+    f->pack[WL_XBOX_VSH_FUSED_SCALE + 1] = plan->scale[1];
+    f->pack[WL_XBOX_VSH_FUSED_OFFSET] = plan->offset[0];
+    f->pack[WL_XBOX_VSH_FUSED_OFFSET + 1] = plan->offset[1];
+    f->pack[WL_XBOX_VSH_FUSED_TO_SAMPLES] = plan->to_sx;
+    f->pack[WL_XBOX_VSH_FUSED_TO_SAMPLES + 1] = plan->to_sy;
+    // (as_depth's z / depth_max, or z itself: z / 1)
+    f->pack[WL_XBOX_VSH_FUSED_DEPTH] = plan->depth_max > 0.0f ? plan->depth_max : 1.0f;
+    for (n = 0; n < 4; n++) {
+        const StagePlan *sp = &plan->stages[n];
+
+        f->pack[WL_XBOX_VSH_FUSED_TO_TEXELS + 2 * n] = sp->linear ? sp->to_s : 1.0f;
+        f->pack[WL_XBOX_VSH_FUSED_TO_TEXELS + 2 * n + 1] = sp->linear ? sp->to_t : 1.0f;
+    }
+    // (the inputs' start values: the current values the fetch wrote into every run's, and (0, 0, 0, 1)
+    // under an array's components)
+    for (n = 0; n < 16; n++) {
+        for (c = 0; c < 4; c++) {
+            f->inputs[0][n][c] = f->inputs[1][n][c] = key.format[n] != WL_XBOX_VSH_FUSED_NONE ? (c == 3 ? 1.0f : 0.0f)
+                                                                                              : gx->batch.inputs[0][n][c];
+        }
+        f->data[n] = NULL;
+        f->stride[n] = 0;
+    }
+    for (n = 0; n < fetch->count; n++) {
+        f->data[fetch->streamed[n].attribute] = fetch->streamed[n].data;
+        f->stride[fetch->streamed[n].attribute] = fetch->streamed[n].stride;
+    }
+    wl_nv2a_fetch_tables(&f->byte_float, &f->cmp11, &f->cmp10);
+    return form;
+}
+
+// the draw's fused form, found at its first batch that may run fused (NULL: the general way)
+static const WlXboxVshFusedForm *fused_for(WlNv2aGx *gx, DrawPlan *plan, const WlGxDirectLayout *layout,
+                                           unsigned runs) {
+    if (!plan->fused_known) {
+        if (layout != NULL && projected_possible(gx, plan)) {
+            return NULL;
+        }
+        plan->fused_known = true;
+        plan->fused = fused_form(gx, plan);
+    }
+    if (gx->cfg.fused_seen != NULL && gx->pipeline.program != NULL) {
+        WlXboxVshFusedKey key;
+
+        if (plan->fused != NULL) {
+            gx->cfg.fused_seen(gx->cfg.fused_user, gx->pipeline.program->hash, &plan->fused->key, runs, true);
+        } else if (!gx->cfg.no_fused && fused_key(gx, plan, &key)) {
+            gx->cfg.fused_seen(gx->cfg.fused_user, gx->pipeline.program->hash, &key, runs, false);
+        }
+    }
+    return plan->fused;
+}
 
 static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, uint32_t first,
                           uint32_t count, DrawPlan *plan, WlGxDirectLayout *layout) {
@@ -1658,6 +1808,26 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
         runs++;
     }
     gx->stats.vertices_reused += count - runs;
+    if (plan->xf == NULL && runs != 0) {
+        const WlXboxVshFusedForm *form = fused_for(gx, plan, layout, runs);
+
+        if (form != NULL) {
+            // (each vertex's element as the fetch takes it, and where its words go)
+            for (r = 0; r < runs; r++) {
+                uint32_t v = gx->batch.run_vertex[r];
+
+                gx->batch.elements[r] = gx->fetch.source == WL_NV2A_SOURCE_ARRAYS && gx->fetch.indices != NULL
+                                            ? gx->fetch.indices[v] - gx->fetch.index_base
+                                            : v;
+                gx->batch.words_made[r] = gx->batch.run_vertices[r]->w;
+            }
+            gx->fused.elements = gx->batch.elements;
+            gx->fused.words = gx->batch.words_made;
+            form->run((const float (*)[4])k->constants, &gx->fused, runs, plan->live);
+            gx->stats.vertices_fused += runs;
+            return false;
+        }
+    }
     wl_nv2a_fetch_vertices(&gx->fetch, draw, gx->batch.run_vertex, runs, gx->batch.inputs);
     if (plan->xf != NULL && plan->xf->full) {
         for (r = 0; r < runs; r++) {
@@ -2288,6 +2458,27 @@ static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2
 // pixel, as the NV2A does, out of the stages divided per vertex. A constant q is divided here: per
 // vertex or per pixel, the same (so is a q that varies only after the first batch: divided here, as
 // before). True when the plan changed (the layout to be set again).
+// whether projected_plan may find a coordinate to project (the outputs it reads not looked at)
+static bool projected_possible(WlNv2aGx *gx, const DrawPlan *plan) {
+    unsigned n;
+    bool full;
+
+    if (gx->pipeline.program == NULL || (plan->xf != NULL && plan->xf->full)) {
+        return false;
+    }
+    xf_structure(gx, plan->live, &full);
+    for (n = 0; n < plan->stage_count; n++) {
+        unsigned stage = plan->stage_list[n];
+        const StagePlan *sp = &plan->stages[stage];
+
+        if (sp->spot ||
+            (sp->projective && !sp->sphere && (gx->xf_dependencies.t[stage][3] & 0xFFFFu) != 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool projected_plan(WlNv2aGx *gx, DrawPlan *plan, WlGxDirectLayout *layout, unsigned runs) {
     const WlXboxVshOutput *o = gx->batch.outputs;
     unsigned n, r, kept = 0, count = 0, words, chosen = 0;
@@ -2463,6 +2654,8 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     plan.to_sx = power_of_two(surface.samples_x) ? 1.0f / plan.sx : 0.0f;
     plan.to_sy = power_of_two(surface.samples_y) ? 1.0f / plan.sy : 0.0f;
     plan.landing = count_pixels;
+    plan.fused_known = false;
+    plan.fused = NULL;
     plan.depth_max = surface.depth_max > 0.0f ? surface.depth_max : 16777215.0f;
     plan.scale = k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE];
     plan.offset = k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET];

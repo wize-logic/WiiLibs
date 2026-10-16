@@ -315,6 +315,31 @@ static inline __attribute__((always_inline)) void fetch_ub(const uint8_t *base, 
     }
 }
 
+unsigned wl_nv2a_fetch_fused_format(const WlNv2aFetchPlan *plan, unsigned i) {
+    unsigned size = plan->streamed[i].size;
+
+    switch (plan->streamed[i].format) {
+    case FETCH_F1: return WL_XBOX_VSH_FUSED_F1;
+    case FETCH_F2: return WL_XBOX_VSH_FUSED_F2;
+    case FETCH_F3: return WL_XBOX_VSH_FUSED_F3;
+    case FETCH_F4: return WL_XBOX_VSH_FUSED_F4;
+    case FETCH_D3DCOLOR: return WL_XBOX_VSH_FUSED_D3DCOLOR;
+    case FETCH_CMP: return WL_XBOX_VSH_FUSED_CMP;
+    case FETCH_S1: return size >= 1u && size <= 4u ? WL_XBOX_VSH_FUSED_S1 + size - 1u : WL_XBOX_VSH_FUSED_FORMATS;
+    case FETCH_UB: return size >= 1u && size <= 4u ? WL_XBOX_VSH_FUSED_UB + size - 1u : WL_XBOX_VSH_FUSED_FORMATS;
+    default: return WL_XBOX_VSH_FUSED_FORMATS;
+    }
+}
+
+void wl_nv2a_fetch_tables(const float **byte_float, const float **cmp11, const float **cmp10) {
+    if (!g_fetch_tables) {
+        fetch_tables_make();
+    }
+    *byte_float = g_byte_float;
+    *cmp11 = g_cmp11_float;
+    *cmp10 = g_cmp10_float;
+}
+
 void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, const uint32_t *vertices,
                             uint32_t count, float (*inputs)[WL_NV2A_ATTRIBS][4]) {
     uint32_t elements[WL_NV2A_FETCH_BATCH];

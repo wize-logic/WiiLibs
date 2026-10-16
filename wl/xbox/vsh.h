@@ -61,6 +61,52 @@ point size not set */
 typedef void (*WlXboxVshBatchProc)(const float (*constants)[4], const float (*inputs)[16][4],
                                    WlXboxVshOutput *outputs, unsigned count, unsigned live);
 
+/* ... and fused (the Wii's, tools/xbox_vsh_pairs.c): count vertices read from
+their arrays, run and packed as GX takes them (WlXboxVshFused), for one form of
+the arrays and of GX's vertex (WlXboxVshFusedKey) */
+typedef struct WlXboxVshFused WlXboxVshFused;
+typedef void (*WlXboxVshFusedProc)(const float (*constants)[4], WlXboxVshFused *fused, unsigned count,
+                                   unsigned live);
+
+/* a fused form: each input register's array format (WL_XBOX_VSH_FUSED_...,
+as the fetch reads it; NONE: no array, the register keeps its start value),
+the outputs read, and GX's vertex: its position (perspective: x w, y w, -w
+where the program captured the clip-space position, else the screen-space
+position and depth), its colours (count, and bit n: the program gives dn,
+else 0), its texture coordinates in order (stage | WL_XBOX_VSH_FUSED_STAGE_...
+<< 2). A batch whose draw has another form (or fog, projected coordinates,
+landings) runs the general way. */
+enum {
+    WL_XBOX_VSH_FUSED_NONE,
+    WL_XBOX_VSH_FUSED_F1,
+    WL_XBOX_VSH_FUSED_F2,
+    WL_XBOX_VSH_FUSED_F3,
+    WL_XBOX_VSH_FUSED_F4,
+    WL_XBOX_VSH_FUSED_D3DCOLOR,
+    WL_XBOX_VSH_FUSED_CMP,
+    /* (normalized shorts and bytes: 1 to 4 of them) */
+    WL_XBOX_VSH_FUSED_S1 = 7,
+    WL_XBOX_VSH_FUSED_UB = 11,
+    WL_XBOX_VSH_FUSED_FORMATS = 15
+};
+enum {
+    WL_XBOX_VSH_FUSED_STAGE_PLAIN,
+    WL_XBOX_VSH_FUSED_STAGE_LINEAR,
+    WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE,
+    WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR,
+    WL_XBOX_VSH_FUSED_STAGE_SPHERE
+};
+typedef struct WlXboxVshFusedKey {
+    unsigned short live;
+    unsigned char format[16];
+    unsigned char perspective, colors, channels, stage_count;
+    unsigned char stages[4];
+} WlXboxVshFusedKey;
+typedef struct WlXboxVshFusedForm {
+    WlXboxVshFusedKey key;
+    WlXboxVshFusedProc run;
+} WlXboxVshFusedForm;
+
 /* the outputs a draw reads (wl_xbox_vsh_run_live): the others are left as they
 were, or hold what the instructions computed on the way */
 enum {
@@ -91,6 +137,9 @@ typedef struct WlXboxVshNative {
     WlXboxVshPositionsProc positions;
     /* (for count vertices at once; NULL: run a vertex at a time) */
     WlXboxVshBatchProc batch;
+    /* its fused forms (none off the Wii) */
+    const WlXboxVshFusedForm *fused;
+    unsigned fused_count;
 } WlXboxVshNative;
 
 /* an instruction as the interpreter runs it, its fields resolved once by
@@ -155,6 +204,9 @@ typedef struct WlXboxVshProgram {
     WlXboxVshPositionsProc native_positions;
     /* (for many vertices at once; NULL on the interpreter) */
     WlXboxVshBatchProc native_batch;
+    /* (its fused forms) */
+    const WlXboxVshFusedForm *native_fused;
+    unsigned native_fused_count;
     /* the temporaries read before they are written (bit n: r[n]), which
     the interpreter clears for each vertex */
     unsigned short exposed;
@@ -189,6 +241,50 @@ struct WlXboxVshOutput {
     float t[4][4];
     float fog;
     float point_size;
+};
+
+/* a fused batch's (WlXboxVshFusedProc) state: what it reads, its scratch, where
+it writes. The floats a pair at an even index (8 bytes aligned) */
+enum {
+    /* pack: (each a pair) the viewport's scale, offset, 1 / the samples, 1/2,
+    255, the depth's divisor (the depth's maximum, 1 for none) and 1, 1e-12
+    and 0, each stage's 1 / its texture's size (1 when it is not linear),
+    1 / 32767, 1 / 255, 1/2 and 1, 1 and 1, -1 and -1 */
+    WL_XBOX_VSH_FUSED_SCALE = 0,
+    WL_XBOX_VSH_FUSED_OFFSET = 2,
+    WL_XBOX_VSH_FUSED_TO_SAMPLES = 4,
+    WL_XBOX_VSH_FUSED_HALF = 6,
+    WL_XBOX_VSH_FUSED_255 = 8,
+    WL_XBOX_VSH_FUSED_DEPTH = 10,
+    WL_XBOX_VSH_FUSED_TINY = 12,
+    WL_XBOX_VSH_FUSED_TO_TEXELS = 14,
+    WL_XBOX_VSH_FUSED_SHORT = 22,
+    WL_XBOX_VSH_FUSED_BYTE = 24,
+    WL_XBOX_VSH_FUSED_EDGE = 26,
+    WL_XBOX_VSH_FUSED_ONES = 28,
+    WL_XBOX_VSH_FUSED_NEGATIVE = 30,
+    WL_XBOX_VSH_FUSED_PACK = 32,
+    /* sphere: the sphere map's doubles: 1e-24, 1e76, 1.5, 0.5, 2.5e-13, 2 */
+    WL_XBOX_VSH_FUSED_SPHERE = 6
+};
+struct WlXboxVshFused {
+    double sphere[WL_XBOX_VSH_FUSED_SPHERE];
+    float pack[WL_XBOX_VSH_FUSED_PACK];
+    /* the inputs, the vertex before's and this one's: each register's start
+    value (a register no array gives: the fetch's current value; one an array
+    gives: (0, 0, 0, 1), its components then written over) */
+    float inputs[2][16][4];
+    WlXboxVshOutput output;
+    uint32_t stride[16];
+    uint32_t saved[2];
+    /* each array's element 0 (by input register) */
+    const unsigned char *data[16];
+    /* the fetch's tables (a byte normalized; the packed normal's 11- and
+    10-bit fields) */
+    const float *byte_float, *cmp11, *cmp10;
+    /* the vertices' elements, and where each one's words go */
+    const uint32_t *elements;
+    uint32_t *const *words;
 };
 
 /* what a program's outputs depend on, found from its instructions alone
@@ -229,6 +325,15 @@ unsigned long wl_xbox_vsh_hash(const uint32_t *instructions, unsigned long instr
 /* the words hashed a second way (MurmurHash3's, 32 bits, independent of
 FNV-1a), which a compiled function's table entry carries too */
 unsigned long wl_xbox_vsh_check(const uint32_t *instructions, unsigned long instruction_count);
+
+/* a fused form as text, as tools/xbox_vsh_codegen.c's --fused file lists them
+after the program's hash: "<live, hex> <p or o> <colours> <channels> <stages>
+<formats>", the stages "-" or each "<n><N, L, P, Q or S>" (plain, linear,
+projective, both, sphere), the formats "-" or each "<register>:<F1 ... F4,
+D3D, CMP, S1.n, UB.n>", comma-separated. _text gives the length (snprintf's),
+_parse the characters read (0: not a form; the key's every byte set) */
+int wl_xbox_vsh_fused_text(const WlXboxVshFusedKey *key, char *text, unsigned long size);
+int wl_xbox_vsh_fused_parse(const char *text, WlXboxVshFusedKey *key);
 
 void wl_xbox_vsh_run(const WlXboxVshProgram *program, const float (*constants)[4],
                      const float (*inputs)[4], float point_size, WlXboxVshOutput *output);

@@ -1299,10 +1299,42 @@ static void reuse_code(FILE *out, const WlXboxVshProgram *program, const ReusePr
 
 #include "xbox_vsh_pairs.c"
 
+/* the fused forms asked for (--fused): a program's hash and its form */
+enum { MAXIMUM_FORMS = 256, MAXIMUM_FUSED = 8 };
+static struct {
+    unsigned long hash;
+    WlXboxVshFusedKey key;
+} g_forms[MAXIMUM_FORMS];
+static int g_form_count;
+
+/* a --fused file: a form a line, "<hash> <form> ..." (the replay's --fused-forms), "#" a comment */
+static int read_forms(const char *path) {
+    char line[512];
+    FILE *in = fopen(path, "r");
+
+    if (!in) {
+        perror(path);
+        return 0;
+    }
+    while (fgets(line, sizeof(line), in)) {
+        char *rest;
+        unsigned long hash = strtoul(line, &rest, 16);
+
+        if (line[0] == '#' || rest == line || *rest != ' ')
+            continue;
+        if (g_form_count < MAXIMUM_FORMS && wl_xbox_vsh_fused_parse(rest + 1, &g_forms[g_form_count].key)) {
+            g_forms[g_form_count].hash = hash;
+            g_form_count++;
+        }
+    }
+    fclose(in);
+    return 1;
+}
+
 int main(int argc, char **argv) {
     static uint32_t words[MAXIMUM_WORDS];
     static unsigned long hashes[MAXIMUM_PROGRAMS], counts[MAXIMUM_PROGRAMS], checks[MAXIMUM_PROGRAMS];
-    static int positioned[MAXIMUM_PROGRAMS];
+    static int positioned[MAXIMUM_PROGRAMS], fused[MAXIMUM_PROGRAMS], fused_index[MAXIMUM_PROGRAMS][MAXIMUM_FUSED];
     static WlXboxVshProgram program;
     static unsigned needs[WL_XBOX_VSH_MAX_INSTRUCTIONS];
     ReusePrefix prefix;
@@ -1325,6 +1357,11 @@ int main(int argc, char **argv) {
             accessor = argv[2];
             argc--;
             argv++;
+        } else if (strcmp(argv[1], "--fused") == 0 && argc > 2) {
+            if (!read_forms(argv[2]))
+                return 1;
+            argc--;
+            argv++;
         } else {
             break;
         }
@@ -1334,7 +1371,7 @@ int main(int argc, char **argv) {
     if (argc != 3 && argc != 4) {
         fprintf(stderr,
                 "usage: xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] "
-                "[--no-pairs] microcode.inc output.c [table]\n");
+                "[--no-pairs] [--fused forms.txt] microcode.inc output.c [table]\n");
         return 2;
     }
     if (argc == 4)
@@ -1385,8 +1422,17 @@ int main(int argc, char **argv) {
             "/* the floats the paired-single programs load (tools/xbox_vsh_pairs.c) */\n"
             "static const float wl_xbox_vsh_pairs_k[14] __attribute__((aligned(8), unused)) = {\n"
             "\t0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.001f, 8388608.0f, -8388608.0f, 0.5f, 1.5f,\n"
-            "\t5.42101e-20f, 1.884467e+19f, -5.42101e-20f, -1.884467e+19f};\n#endif\n\n",
-            argv[1]);
+            "\t5.42101e-20f, 1.884467e+19f, -5.42101e-20f, -1.884467e+19f};\n\n"
+            "/* (the fused batches' floats where the tool put them) */\n"
+            "_Static_assert(offsetof(WlXboxVshFused, sphere) == %d && offsetof(WlXboxVshFused, pack) == %d &&\n"
+            "\toffsetof(WlXboxVshFused, stride) == %d && offsetof(WlXboxVshFused, saved) == %d &&\n"
+            "\toffsetof(WlXboxVshOutput, fog) == %d && offsetof(WlXboxVshOutput, clip_captured) == %d &&\n"
+            "\tsizeof(WlXboxVshOutput) == %d,\n"
+            "\t\"WlXboxVshFused's or WlXboxVshOutput's floats moved: tools/xbox_vsh_codegen.c\");\n#endif\n\n",
+            argv[1], (int)offsetof(WlXboxVshFused, sphere), (int)offsetof(WlXboxVshFused, pack),
+            (int)offsetof(WlXboxVshFused, stride), (int)offsetof(WlXboxVshFused, saved),
+            (int)offsetof(WlXboxVshOutput, fog), (int)offsetof(WlXboxVshOutput, clip_captured),
+            (int)sizeof(WlXboxVshOutput));
     /* each program: its header (the instruction count in the high half),
     then four words an instruction */
     for (position = 0; position < word_count;) {
@@ -1444,7 +1490,7 @@ int main(int argc, char **argv) {
         paired = !no_pairs && pr_program(&program, needs, reused, &prefix);
         if (paired) {
             fprintf(out, "#if WL_XBOX_VSH_PS\n");
-            pr_print(out);
+            pr_print(out, reused);
             fprintf(out, "#else\n");
         }
         fprintf(out, "\tunsigned n;\n");
@@ -1499,6 +1545,48 @@ int main(int argc, char **argv) {
                 "WlXboxVshOutput *o,\n\tunsigned live)\n{\n"
                 "\tprogram_%08lx_batch(c, (const float (*)[WL_XBOX_VSH_INPUT_COUNT][4])v, o, 1, live);\n}\n\n",
                 hash, hash);
+        /* (its fused forms asked for, the Wii's) */
+        fused[program_count - 1] = 0;
+        for (index = 0; paired && index < (unsigned long)g_form_count; index++) {
+            int made = fused[program_count - 1];
+
+            if (g_forms[index].hash != hash)
+                continue;
+            pr_fuse = &g_forms[index].key;
+            if (pr_program(&program, needs, reused, &prefix)) {
+                fprintf(out, "#if WL_XBOX_VSH_PS\n");
+                fprintf(out,
+                        "static void program_%08lx_fused_%d(const float (*c)[4], WlXboxVshFused *fused, unsigned count, "
+                        "unsigned live)\n{\n",
+                        hash, made);
+                pr_print(out, reused);
+                fprintf(out, "}\n#endif\n\n");
+                fused_index[program_count - 1][made] = (int)index;
+                fused[program_count - 1] = made + 1;
+            } else {
+                fprintf(stderr, "xbox_vsh_codegen: %08lx's fused form %d not written (registers)\n", hash, (int)index);
+            }
+            pr_fuse = NULL;
+            if (fused[program_count - 1] >= MAXIMUM_FUSED)
+                break;
+        }
+        if (fused[program_count - 1]) {
+            int f;
+
+            fprintf(out, "#if WL_XBOX_VSH_PS\nstatic const WlXboxVshFusedForm program_%08lx_fused[] =\n{\n", hash);
+            for (f = 0; f < fused[program_count - 1]; f++) {
+                const WlXboxVshFusedKey *key = &g_forms[fused_index[program_count - 1][f]].key;
+                int c;
+
+                fprintf(out, "\t{ { 0x%x, {", key->live);
+                for (c = 0; c < 16; c++)
+                    fprintf(out, " %u%s", key->format[c], c < 15 ? "," : "");
+                fprintf(out, " }, %u, %u, %u, %u, { %u, %u, %u, %u } }, program_%08lx_fused_%d },\n", key->perspective,
+                        key->colors, key->channels, key->stage_count, key->stages[0], key->stages[1], key->stages[2],
+                        key->stages[3], hash, f);
+            }
+            fprintf(out, "};\n#endif\n\n");
+        }
         /* (its position for four values of v0: for the skinned programs, those
         whose position reads constants by a0 and is converted to the screen,
         whose every node a device may make a matrix of; the others' matrices
@@ -1521,12 +1609,16 @@ int main(int argc, char **argv) {
             snprintf(colors, sizeof(colors), "program_%08lx_colors", hashes[index]);
         if (positioned[index])
             snprintf(positions, sizeof(positions), "program_%08lx_positions", hashes[index]);
-        fprintf(out, "\t{ 0x%08lxUL, %lu, 0x%08lxUL, program_%08lx, %s, %s, program_%08lx_batch },\n",
+        fprintf(out, "\t{ 0x%08lxUL, %lu, 0x%08lxUL, program_%08lx, %s, %s, program_%08lx_batch, ",
                 hashes[index], counts[index], checks[index], hashes[index], colors, positions, hashes[index]);
+        if (fused[index])
+            fprintf(out, "WL_XBOX_VSH_FUSED_FORMS(program_%08lx_fused, %d) },\n", hashes[index], fused[index]);
+        else
+            fprintf(out, "NULL, 0 },\n");
     }
     /* (C has no empty array: a table of none holds one entry no program matches) */
     if (!program_count)
-        fprintf(out, "\t{ 0UL, 0, 0UL, NULL, NULL, NULL, NULL },\n");
+        fprintf(out, "\t{ 0UL, 0, 0UL, NULL, NULL, NULL, NULL, NULL, 0 },\n");
     fprintf(out, "};\n\nconst unsigned long %s_count = %lu;\n", table, program_count);
     if (accessor)
         fprintf(out,

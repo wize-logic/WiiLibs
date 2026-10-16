@@ -14,6 +14,7 @@
 #include "wl/xbox/nv2a.h"
 #include "wl/xbox/nv2a_regs.h"
 #include "wl/xbox/psh.h"
+#include "wl/xbox/vsh.h"
 
 enum {
     WL_NV2A_ATTRIBS = 16,
@@ -204,6 +205,10 @@ void wl_nv2a_fetch_vertex(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, u
 enum { WL_NV2A_FETCH_BATCH = 32 };
 void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, const uint32_t *vertices,
                             uint32_t count, float (*inputs)[WL_NV2A_ATTRIBS][4]);
+// streamed attribute i's format as a fused batch reads it (WL_XBOX_VSH_FUSED_F1 ...;
+// WL_XBOX_VSH_FUSED_FORMATS: one it cannot), and the tables the fetch converts by
+unsigned wl_nv2a_fetch_fused_format(const WlNv2aFetchPlan *plan, unsigned i);
+void wl_nv2a_fetch_tables(const float **byte_float, const float **cmp11, const float **cmp10);
 // one attribute's value from its data (an array element or inline), as the NV2A widens it: the
 // components the format leaves out are 0, w 1
 void wl_nv2a_attrib_decode(uint8_t type, uint8_t size, const uint8_t *data, float out[4]);

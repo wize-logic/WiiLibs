@@ -10,6 +10,13 @@ the Gekko does, so the host checks the code the Wii runs against the interpreter
 A pair is two floats. A scalar input's ps1 is a NaN, so code that reads it shows; the fused
 multiply-adds are fmaf (one rounding); a product of two floats is exact in a double, so a float
 multiply rounds once as ps_mul does. psq_l reads floats (GQR 0); with W=1 its ps1 is 1.0.
+
+The fused batches' (tools/xbox_vsh_pairs.c's pr_fuse): the GQRs are variables (mtspr, mfspr);
+a quantized load reads u8 or s16 (the s16 in the host's order, as sth wrote it), a quantized
+u8 store cuts the value down and clamps it (a NaN 0) and writes its bytes where the Gekko's
+would land in the word (a little-endian host's word holds them reversed); lwbrx and lhbrx read
+little-endian; an lwz whose displacement names %[ptr] reads a pointer (the host's may be 8
+bytes).
 """
 import re
 import sys
@@ -142,17 +149,48 @@ def emu_line(line, immediates):
         return "(float)%s.%s" % (F(r), lane)
 
     if op == "psq_l":
-        return "f_psq_l(&%s, %s, %s);" % (F(a[0]), emu_memory(a[1], immediates), a[2])
+        return "f_psq_lq(&%s, %s, %s, %s);" % (F(a[0]), emu_memory(a[1], immediates), a[2], a[3])
     if op == "psq_st":
-        return "f_psq_st(&%s, %s, %s);" % (F(a[0]), emu_memory(a[1], immediates), a[2])
+        return "f_psq_stq(&%s, %s, %s, %s);" % (F(a[0]), emu_memory(a[1], immediates), a[2], a[3])
     if op == "lfs":
         return "{ float t; memcpy(&t, %s, 4); f_set(&%s, t); }" % (emu_memory(a[1], immediates), F(a[0]))
     if op == "stfs":
         return "{ float t = (float)%s.a; memcpy(%s, &t, 4); }" % (F(a[0]), emu_memory(a[1], immediates))
     if op == "stfiwx":
         return "memcpy((char *)%s, &%s.i, 4);" % (emu_gpr(a[2]), F(a[0]))
+    if op == "lwz" and "%[ptr]" in a[1]:
+        return "{ void *t; memcpy(&t, %s, sizeof t); %s = (intptr_t)t; }" % (emu_memory(a[1], immediates),
+                                                                           emu_gpr(a[0]))
     if op == "lwz":
         return "{ int32_t t; memcpy(&t, %s, 4); %s = t; }" % (emu_memory(a[1], immediates), emu_gpr(a[0]))
+    if op in ("lwbrx", "lhbrx", "lfsx"):
+        base = "0" if a[1] == "0" else "(char *)" + emu_gpr(a[1])
+        address = "((char *)%s + %s)" % (base, emu_gpr(a[2]))
+        if op == "lwbrx":
+            return "%s = (int32_t)emu_le32(%s);" % (emu_gpr(a[0]), address)
+        if op == "lhbrx":
+            return "%s = (intptr_t)emu_le16(%s);" % (emu_gpr(a[0]), address)
+        return "{ float t; memcpy(&t, %s, 4); f_set(&%s, t); }" % (address, F(a[0]))
+    if op == "sth":
+        return "{ uint16_t t = (uint16_t)%s; memcpy(%s, &t, 2); }" % (emu_gpr(a[0]), emu_memory(a[1], immediates))
+    if op == "lfd":
+        return "{ double t; memcpy(&t, %s, 8); f_double(&%s, t); }" % (emu_memory(a[1], immediates), F(a[0]))
+    if op == "mullw":
+        return "%s = (int32_t)((uint32_t)%s * (uint32_t)%s);" % (emu_gpr(a[0]), emu_gpr(a[1]), emu_gpr(a[2]))
+    if op == "rlwinm":
+        return "%s = cr_insert(0u, (uint32_t)%s, %s, %s, %s);" % (emu_gpr(a[0]), emu_gpr(a[1]), a[2], a[3], a[4])
+    if op == "ori":
+        return "%s = (intptr_t)(int32_t)((uint32_t)%s | %s);" % (emu_gpr(a[0]), emu_gpr(a[1]), a[2])
+    if op == "mr":
+        return "%s = %s;" % (emu_gpr(a[0]), emu_gpr(a[1]))
+    if op == "cmpwi":
+        return "cr_compare((double)(int32_t)%s, (double)%s);" % (emu_gpr(a[0]), a[1])
+    if op == "mfspr":
+        return "%s = (intptr_t)emu_gqr[%d];" % (emu_gpr(a[0]), int(a[1]) - 912)
+    if op == "mtspr":
+        return "emu_gqr[%d] = (uint32_t)%s;" % (int(a[0]) - 912, emu_gpr(a[1]))
+    if op == "isync":
+        return ";"
     if op == "stw":
         return "{ int32_t t = (int32_t)%s; memcpy(%s, &t, 4); }" % (emu_gpr(a[0]),
                                                                    emu_memory(a[1], immediates))
@@ -192,6 +230,11 @@ def emu_line(line, immediates):
     if op == "ps_sel":
         return "f_pair(&%s, %s.a >= 0 ? %s : %s, %s.b >= 0 ? %s : %s);" % (
             F(a[0]), F(a[1]), fa(a[2], "a"), fa(a[3], "a"), F(a[1]), fa(a[2], "b"), fa(a[3], "b"))
+    if op == "ps_div":
+        return "f_pair(&%s, %s / %s, %s / %s);" % (F(a[0]), fa(a[1], "a"), fa(a[2], "a"), fa(a[1], "b"),
+                                                   fa(a[2], "b"))
+    if op in ("fadd", "fsub"):
+        return "f_double(&%s, %s.a %s %s.a);" % (F(a[0]), F(a[1]), "+" if op == "fadd" else "-", F(a[2]))
     if op in ("fadds", "fsubs", "fdivs"):
         sym = {"fadds": "+", "fsubs": "-", "fdivs": "/"}[op]
         return "f_set(&%s, %s %s %s);" % (F(a[0]), fa(a[1], "a"), sym, fa(a[2], "a"))
@@ -292,6 +335,8 @@ def whole(match):
 
 
 EMU_HEADER = r"""
+#include <stdio.h>
+#include <stdlib.h>
 typedef struct { double a, b; int32_t i; } EmuReg;
 static int cr_lt, cr_gt, cr_eq, cr_un;
 static void cr_compare(double x, double y) {
@@ -340,6 +385,59 @@ static void f_psq_st(const EmuReg *r, char *p, int one) {
     if (!one)
         memcpy(p + 4, &y, 4);
 }
+static uint32_t emu_gqr[8];
+static uint32_t emu_le32(const char *p) {
+    const unsigned char *b = (const unsigned char *)p;
+    return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+}
+static uint32_t emu_le16(const char *p) {
+    const unsigned char *b = (const unsigned char *)p;
+    return (uint32_t)b[0] | (uint32_t)b[1] << 8;
+}
+static float emu_dequantize(const char *p, unsigned type) {
+    switch (type) {
+    case 4: return (float)*(const unsigned char *)p;
+    case 6: return (float)*(const signed char *)p;
+    case 5: { uint16_t v; memcpy(&v, p, 2); return (float)v; }
+    case 7: { int16_t v; memcpy(&v, p, 2); return (float)v; }
+    default: { float v; memcpy(&v, p, 4); return v; }
+    }
+}
+static unsigned emu_size(unsigned type) {
+    return type == 4 || type == 6 ? 1 : type == 5 || type == 7 ? 2 : 4;
+}
+static void f_psq_lq(EmuReg *r, const char *p, int one, int gqr) {
+    unsigned type = (emu_gqr[gqr] >> 16) & 7;
+    if (gqr == 0) {
+        f_psq_l(r, p, one);
+        return;
+    }
+    f_pair(r, emu_dequantize(p, type), one ? 1.0f : emu_dequantize(p + emu_size(type), type));
+}
+/* a u8 store's byte at p, where the Gekko's would be in its word */
+static void emu_store_byte(char *p, unsigned char b) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    p = (char *)((uintptr_t)p ^ 3u);
+#endif
+    *(unsigned char *)p = b;
+}
+static unsigned char emu_u8(double x) {
+    return !(x > 0.0) ? 0 : x >= 255.0 ? 255 : (unsigned char)(int)x;
+}
+static void f_psq_stq(const EmuReg *r, char *p, int one, int gqr) {
+    unsigned type = emu_gqr[gqr] & 7;
+    if (gqr == 0) {
+        f_psq_st(r, p, one);
+        return;
+    }
+    if (type != 4) {
+        fprintf(stderr, "vsh_ps_emulate: a quantized store of type %u\n", type);
+        abort();
+    }
+    emu_store_byte(p, emu_u8((float)r->a));
+    if (!one)
+        emu_store_byte(p + 1, emu_u8((float)r->b));
+}
 """
 
 
@@ -348,6 +446,7 @@ def main():
         raise SystemExit("usage: vsh_ps_emulate.py programs.c emulated.c")
     text = open(sys.argv[1]).read()
     text = text.replace("#if WL_XBOX_VSH_PS", "#if 1")
+    text = re.sub(r"WL_XBOX_VSH_FUSED_FORMS\((\w+), (\d+)\)", r"\1, \2", text)
     text = text.replace('#include "wl/xbox/vsh_native.h"',
                         '#include "wl/xbox/vsh_native.h"\n\ntypedef struct { float a, b; } EmuPair;\n' +
                         EMU_HEADER, 1)

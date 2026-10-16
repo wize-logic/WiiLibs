@@ -21,6 +21,13 @@ defined, the plain C, the interpreter's bits. */
 #define WL_XBOX_VSH_PS 0
 #endif
 
+/* a table entry's fused forms: the Wii's alone */
+#if WL_XBOX_VSH_PS
+#define WL_XBOX_VSH_FUSED_FORMS(forms, count) forms, count
+#else
+#define WL_XBOX_VSH_FUSED_FORMS(forms, count) NULL, 0
+#endif
+
 /* the ILU's exponent, logarithm and lighting (from c into out) */
 void wl_xbox_vsh_ilu(int ilu, const float c[4], float out[4]);
 

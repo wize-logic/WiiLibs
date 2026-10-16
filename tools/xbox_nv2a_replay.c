@@ -36,6 +36,11 @@
 //               counted either way
 //   --no-xf-light  a colour affine in one input (a light's dot product) made by the processor, not
 //               lit by GX's transform unit (WlNv2aGxConfig.no_xf_light)
+//   --no-fused  the processor's vertices made the general way, never by a program's fused batch
+//               (WlNv2aGxConfig.no_fused)
+//   --fused-forms  the forms of the draws whose batches could run fused, each with the program's hash
+//               and the vertices made, the most first, as tools/xbox_vsh_codegen.c's --fused file
+//               takes them (a line a form; "fused" after those that ran fused)
 //   --cpu-transform  every vertex through the program on the processor (GX's transform unit not
 //               used for the draws whose outputs are affine), to the bit as before it
 //   --bench N   the capture replayed N times through the GX backend alone (no software GX, no
@@ -114,6 +119,16 @@ static struct {
     uint32_t draws, first;
 } g_features[SURVEY_MAX];
 static unsigned g_feature_count;
+// --fused-forms: each form seen, its vertices
+enum { FUSED_FORMS_MAX = 256 };
+static bool g_fused_forms;
+static struct {
+    unsigned long hash;
+    WlXboxVshFusedKey key;
+    unsigned long vertices;
+    bool fused;
+} g_forms[FUSED_FORMS_MAX];
+static unsigned g_form_count;
 static const char *g_png_dir;
 static unsigned g_png_count;
 static WlNv2aRecorder g_recorder;
@@ -816,6 +831,34 @@ static void texture_cache_line(const char *prefix) {
            (unsigned)ts.restored, (unsigned)(ts.bytes >> 10), (unsigned)(ts.peak_frame_bytes >> 10));
 }
 
+// --fused-forms: the forms seen, the most vertices first
+static void fused_forms_print(void) {
+    unsigned n, m;
+
+    if (!g_fused_forms) {
+        return;
+    }
+    printf("fused forms: %u\n", g_form_count);
+    for (n = 0; n < g_form_count; n++) {
+        unsigned best = n;
+        char text[256];
+
+        for (m = n + 1; m < g_form_count; m++) {
+            if (g_forms[m].vertices > g_forms[best].vertices) {
+                best = m;
+            }
+        }
+        if (best != n) {
+            __typeof__(g_forms[0]) t = g_forms[n];
+
+            g_forms[n] = g_forms[best];
+            g_forms[best] = t;
+        }
+        wl_xbox_vsh_fused_text(&g_forms[n].key, text, sizeof text);
+        printf("%08lx %s %lu%s\n", g_forms[n].hash, text, g_forms[n].vertices, g_forms[n].fused ? " fused" : "");
+    }
+}
+
 static int bench(const uint8_t *data, size_t size, unsigned runs) {
     WlNv2aBackend backend;
     WlNv2aReplayHooks hooks;
@@ -917,14 +960,40 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
     printf("bench: the best run a frame: pusher %.3f ms, draws %.3f, clears and frames %.3f, memory records %.3f\n",
            (best - best_draws - best_others - best_memory) * 1000.0 / frames, best_draws * 1000.0 / frames,
            best_others * 1000.0 / frames, best_memory * 1000.0 / frames);
+    {
+        WlNv2aGxStats fs;
+
+        wl_nv2a_gx_stats(g_gx, &fs);
+        printf("bench: %u vertices made by fused batches in all runs\n", (unsigned)fs.vertices_fused);
+    }
+    fused_forms_print();
     wl_nv2a_gx_destroy(g_gx);
     return 0;
+}
+
+static void fused_seen(void *user, unsigned long hash, const WlXboxVshFusedKey *key, unsigned vertices, bool fused) {
+    unsigned n;
+
+    (void)user;
+    for (n = 0; n < g_form_count; n++) {
+        if (g_forms[n].hash == hash && memcmp(&g_forms[n].key, key, sizeof *key) == 0) {
+            g_forms[n].vertices += vertices;
+            g_forms[n].fused = g_forms[n].fused || fused;
+            return;
+        }
+    }
+    if (g_form_count < FUSED_FORMS_MAX) {
+        g_forms[g_form_count].hash = hash;
+        g_forms[g_form_count].key = *key;
+        g_forms[g_form_count].vertices = vertices;
+        g_forms[g_form_count++].fused = fused;
+    }
 }
 
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
                     "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] [--xf-programs] "
-                    "[--stream] [--cpu-transform] [--no-xf-light] [--overlap] [--png-alpha] [--survey]\n");
+                    "[--stream] [--cpu-transform] [--no-fused] [--fused-forms] [--no-xf-light] [--overlap] [--png-alpha] [--survey]\n");
     return 2;
 }
 
@@ -991,6 +1060,11 @@ int main(int argc, char **argv) {
             watch = true;
         } else if (strcmp(argv[i], "--no-xf-light") == 0) {
             g_gcfg.no_xf_light = true;
+        } else if (strcmp(argv[i], "--no-fused") == 0) {
+            g_gcfg.no_fused = true;
+        } else if (strcmp(argv[i], "--fused-forms") == 0) {
+            g_fused_forms = true;
+            g_gcfg.fused_seen = fused_seen;
         } else if (strcmp(argv[i], "--cpu-transform") == 0) {
             g_gcfg.no_xf = true;
         } else if (strcmp(argv[i], "--stream") == 0) {
@@ -1103,6 +1177,7 @@ int main(int argc, char **argv) {
                "%u with a projective coordinate GX divides at each pixel; %u vertices of indexed draws reused\n",
                (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws,
                (unsigned)gs.projected_draws, (unsigned)gs.vertices_reused);
+        printf("            %u vertices made by fused batches\n", (unsigned)gs.vertices_fused);
         printf("            %u draws counted without drawing (they write nothing), %u skipped; %u kept the raster "
                "state, %u the textures, %u the pixel program\n",
                (unsigned)gs.unwritten_counted, (unsigned)gs.unwritten_skipped, (unsigned)gs.raster_kept,
@@ -1129,6 +1204,7 @@ int main(int argc, char **argv) {
                    g_features[n].name);
         }
     }
+    fused_forms_print();
     if (g_programs != NULL) {
         printf("programs: %u distinct vertex programs written\n", g_program_count);
         fclose(g_programs);

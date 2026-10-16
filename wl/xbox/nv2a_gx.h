@@ -71,6 +71,14 @@ typedef struct WlNv2aGxConfig {
     // with the next one while GX draws this one; the caches keep what GX may still read one frame
     // longer
     bool overlap;
+    // the processor's vertices made the general way (fetched, run and packed one after another), not
+    // fused where the program has the draw's form (the arrays read, the program run and GX's words
+    // written in one loop: WlXboxVshFusedProc, the Wii's)
+    bool no_fused;
+    // called for each batch of a draw that could run fused (the program's hash, the form, the vertices
+    // made, whether its program had the form), to list the forms a title draws (NULL: none)
+    void (*fused_seen)(void *user, unsigned long hash, const WlXboxVshFusedKey *key, unsigned vertices, bool fused);
+    void *fused_user;
 } WlNv2aGxConfig;
 
 // Where a draw's vertices were transformed, and why not further on (WlNv2aGxStats.xf_why_*)
@@ -109,6 +117,7 @@ typedef struct WlNv2aGxStats {
     uint32_t programs_unusable;   // draws whose combiners GX cannot hold (texture 0 times colour)
     uint32_t approximations;      // draws whose combiners or blending were approximated
     uint32_t vertices_reused;     // vertices of indexed draws taken from the ones already run
+    uint32_t vertices_fused;      // vertices made by a fused batch (no_fused)
     uint32_t perspective_draws;   // draws through the perspective projection
     uint32_t fits_made;           // ...whose depth a + b / w was fitted for a transform not seen
     uint32_t fits_shared;         // ...that used the fit kept for their transform

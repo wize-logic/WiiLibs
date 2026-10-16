@@ -235,7 +235,8 @@ static int pr_find_key(const char *key) {
 }
 
 /* a float or pair from memory: kind 0 a pair (psq_l), 1 a float in both
-lanes (lfs), 2 a pair whose second lane is 1.0 (psq_l W=1); base a GPR's
+lanes (lfs), 2 a pair whose second lane is 1.0 (psq_l W=1), 3 a double
+(lfd); base a GPR's
 operand (%[c], %[c2], %[k], %[v], %[ra]); hoistable: the same for the whole
 batch (a constant by a fixed index, or %[k]) */
 static int pr_load(int kind, const char *base, int offset, int hoistable) {
@@ -270,6 +271,8 @@ static int pr_load(int kind, const char *base, int offset, int hoistable) {
     if (kind == 1) {
         pr_op(pre, 1, 1, &value, "lfs @0, %d(%s)", offset, base);
         pr_values[value].splat = 1;
+    } else if (kind == 3) {
+        pr_op(pre, 1, 1, &value, "lfd @0, %d(%s)", offset, base);
     } else {
         pr_op(pre, 1, 1, &value, "psq_l @0, %d(%s), %d, 0", offset, base, kind == 2);
     }
@@ -1282,13 +1285,334 @@ static void pr_defaults(const WlXboxVshProgram *program) {
     }
 }
 
+/* ---- fused batches (WlXboxVshFusedProc) ----
+The same loop for one form of the arrays and of GX's vertex (pr_fuse): each
+vertex's inputs read from its arrays into the inputs' scratch (%[v]; the
+vertex before's at %[pv]), the program run into the output's scratch (%[o]),
+and GX's words written from it where %[w] says, as nv2a_gx.c's vertices_pack
+writes them. Little-endian words and shorts through the byte-reversed loads;
+bytes and shorts made floats by the quantized loads (GQR6: u8, GQR7: s16,
+saved and restored), a colour's bytes by the quantized store (u8: below 0 or a
+NaN 0, above 255 255, else cut down: wl_nv2a_color_byte's of value * 255 + 0.5).
+The state's floats are at the same offsets everywhere (before its pointers);
+its pointers at %[fdata] + %[ptr] * n. */
+static const WlXboxVshFusedKey *pr_fuse;
+
+/* the floats and doubles of WlXboxVshFused */
+static int pr_fused_pack(int kind, int index) {
+    return pr_load(kind, "%[f]", (int)offsetof(WlXboxVshFused, pack) + 4 * index, 1);
+}
+
+static int pr_fused_sphere(int index) {
+    return pr_load(3, "%[f]", (int)offsetof(WlXboxVshFused, sphere) + 8 * index, 1);
+}
+
+/* (before the loop: the GQRs; the outputs no instruction writes, once) */
+static void pr_fused_start(const WlXboxVshProgram *program) {
+    pr_op(1, 0, 0, NULL, "mfspr 0, 918");
+    pr_op(1, 0, 0, NULL, "stw 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, saved));
+    pr_op(1, 0, 0, NULL, "mfspr 0, 919");
+    pr_op(1, 0, 0, NULL, "stw 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, saved) + 4);
+    pr_op(1, 0, 0, NULL, "lis 0, 4");
+    pr_op(1, 0, 0, NULL, "ori 0, 0, 4");
+    pr_op(1, 0, 0, NULL, "mtspr 918, 0");
+    pr_op(1, 0, 0, NULL, "lis 0, 7");
+    pr_op(1, 0, 0, NULL, "ori 0, 0, 7");
+    pr_op(1, 0, 0, NULL, "mtspr 919, 0");
+    pr_op(1, 0, 0, NULL, "isync");
+    pr_defaults(program);
+}
+
+static void pr_fused_end(void) {
+    pr_text("lwz 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, saved));
+    pr_text("mtspr 918, 0");
+    pr_text("lwz 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, saved) + 4);
+    pr_text("mtspr 919, 0");
+    pr_text("isync");
+}
+
+/* a new value written by an op of one value */
+static int pr_fused_new(const char *format, ...) {
+    va_list arguments;
+    char text[96];
+    int value = pr_new();
+
+    va_start(arguments, format);
+    vsnprintf(text, sizeof(text), format, arguments);
+    va_end(arguments);
+    pr_values[value].fresh = 0;
+    pr_op(0, 1, 1, &value, "%s", text);
+    return value;
+}
+
+/* d = op(a, b[, c]) */
+static int pr_fused_op(const char *name, int a, int b, int c) {
+    int values[4] = {pr_new(), a, b, c};
+
+    pr_values[values[0]].fresh = 0;
+    pr_op(0, 1, c >= 0 ? 4 : b >= 0 ? 3 : 2, values, c >= 0 ? "%s @0, @1, @2, @3" : b >= 0 ? "%s @0, @1, @2" : "%s @0, @1",
+          name);
+    return values[0];
+}
+
+static void pr_fused_store(int value, const char *format, ...) {
+    va_list arguments;
+    char text[96];
+
+    va_start(arguments, format);
+    vsnprintf(text, sizeof(text), format, arguments);
+    va_end(arguments);
+    pr_op(0, 0, 1, &value, "%s", text);
+}
+
+/* the vertex's inputs from its arrays (element: %[g]) */
+static void pr_fused_prologue(void) {
+    int n, c;
+
+    pr_text("lwz %%[g], 0(%%[e])");
+    pr_text("addi %%[e], %%[e], 4");
+    for (n = 0; n < 16; n++) {
+        unsigned format = pr_fuse->format[n];
+        int at = 16 * n, size;
+
+        if (format == WL_XBOX_VSH_FUSED_NONE)
+            continue;
+        pr_text("lwz %%[ad], %%[fdata]+%%[ptr]*%d(%%[f])", n);
+        pr_text("lwz 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, stride) + 4 * n);
+        pr_text("mullw 0, 0, %%[g]");
+        pr_text("add %%[ad], %%[ad], 0");
+        if (format >= WL_XBOX_VSH_FUSED_F1 && format <= WL_XBOX_VSH_FUSED_F4) {
+            size = (int)(format - WL_XBOX_VSH_FUSED_F1) + 1;
+            for (c = 0; c < size; c++) {
+                if (c)
+                    pr_text("addi %%[ad], %%[ad], 4");
+                pr_text("lwbrx 0, 0, %%[ad]");
+                pr_text("stw 0, %d(%%[v])", at + 4 * c);
+            }
+        } else if (format == WL_XBOX_VSH_FUSED_CMP) {
+            /* (11, 11 and 10 bits through the fetch's tables) */
+            static const char *const fields[3] = {"2, 19, 29", "23, 19, 29", "12, 20, 29"};
+
+            pr_text("lwbrx %%[x], 0, %%[ad]");
+            for (c = 0; c < 3; c++) {
+                int value;
+
+                if (c != 1)
+                    pr_text("lwz %%[ad], %%[fdata]+%%[ptr]*%d(%%[f])", c == 0 ? 17 : 18);
+                pr_text("rlwinm 0, %%[x], %s", fields[c]);
+                value = pr_fused_new("lfsx @0, %%[ad], 0");
+                pr_fused_store(value, "stfs @0, %d(%%[v])", at + 4 * c);
+            }
+        } else if (format >= WL_XBOX_VSH_FUSED_S1 && format < WL_XBOX_VSH_FUSED_UB) {
+            /* (normalized: s / 32767, at least -1) */
+            int scale = pr_fused_pack(0, WL_XBOX_VSH_FUSED_SHORT), one = pr_fused_pack(0, WL_XBOX_VSH_FUSED_ONES),
+                low = pr_fused_pack(0, WL_XBOX_VSH_FUSED_NEGATIVE);
+
+            size = (int)(format - WL_XBOX_VSH_FUSED_S1) + 1;
+            for (c = 0; c < size; c++) {
+                if (c)
+                    pr_text("addi %%[ad], %%[ad], 2");
+                pr_text("lhbrx 0, 0, %%[ad]");
+                pr_text("sth 0, %d(%%[slot])", 2 * c);
+            }
+            for (c = 0; c < size; c += 2) {
+                int pair = c + 1 < size, value = pr_fused_new("psq_l @0, %d(%%[slot]), %d, 7", 2 * c, !pair);
+                int product = pr_fused_op("ps_mul", value, scale, -1);
+                int above = pr_fused_op("ps_add", product, one, -1);
+                int result = pr_fused_op("ps_sel", above, product, low);
+
+                if (pair)
+                    pr_fused_store(result, "psq_st @0, %d(%%[v]), 0, 0", at + 4 * c);
+                else
+                    pr_fused_store(result, "stfs @0, %d(%%[v])", at + 4 * c);
+            }
+        } else if (format >= WL_XBOX_VSH_FUSED_UB) {
+            int scale = pr_fused_pack(0, WL_XBOX_VSH_FUSED_BYTE);
+
+            size = (int)(format - WL_XBOX_VSH_FUSED_UB) + 1;
+            for (c = 0; c < size; c += 2) {
+                int pair = c + 1 < size, value = pr_fused_new("psq_l @0, %d(%%[ad]), %d, 6", c, !pair);
+                int result = pr_fused_op("ps_mul", value, scale, -1);
+
+                if (pair)
+                    pr_fused_store(result, "psq_st @0, %d(%%[v]), 0, 0", at + 4 * c);
+                else
+                    pr_fused_store(result, "stfs @0, %d(%%[v])", at + 4 * c);
+            }
+        } else {
+            /* a D3DCOLOR: bytes B, G, R, A */
+            int scale = pr_fused_pack(0, WL_XBOX_VSH_FUSED_BYTE);
+            int bg = pr_fused_new("psq_l @0, 0(%%[ad]), 0, 6"), ra = pr_fused_new("psq_l @0, 2(%%[ad]), 0, 6");
+            int rg = pr_fused_op("ps_merge01", ra, bg, -1), ba = pr_fused_op("ps_merge01", bg, ra, -1);
+
+            pr_fused_store(pr_fused_op("ps_mul", rg, scale, -1), "psq_st @0, %d(%%[v]), 0, 0", at);
+            pr_fused_store(pr_fused_op("ps_mul", ba, scale, -1), "psq_st @0, %d(%%[v]), 0, 0", at + 8);
+        }
+    }
+}
+
+/* 1 / sqrt(x) in double: frsqrte's estimate and three of Newton's steps
+(nv2a_texture.c's reciprocal_root) */
+static int pr_fused_root(int x) {
+    int y = pr_fused_op("frsqrte", x, -1, -1), half = pr_fused_sphere(3), three_halves = pr_fused_sphere(2), step;
+
+    for (step = 0; step < 3; step++) {
+        int t = pr_fused_op("fmul", half, x, -1);
+
+        t = pr_fused_op("fmul", t, y, -1);
+        t = pr_fused_op("fmul", t, y, -1);
+        t = pr_fused_op("fsub", three_halves, t, -1);
+        y = pr_fused_op("fmul", y, t, -1);
+    }
+    return y;
+}
+
+/* GX's words from the outputs (vertices_pack's), where %[w] says */
+static void pr_fused_epilogue(void) {
+    const WlXboxVshFusedKey *key = pr_fuse;
+    char other[24], done[24];
+    int word = 3, n;
+
+    pr_text("lwz %%[ad], 0*%%[ptr](%%[w])");
+    pr_text("addi %%[w], %%[w], %%[ptr]");
+    /* the position: (x w, y w, -w) in pixels from the clip-space position
+    the program captured, else the screen-space position and the depth */
+    pr_new_label(other, sizeof(other));
+    pr_new_label(done, sizeof(done));
+    if (key->perspective) {
+        int xy, zw, x, h;
+
+        pr_text("lwz 0, %%[ocaptured](%%[o])");
+        pr_text("cmpwi 0, 0");
+        pr_text("beq %s", other);
+        xy = pr_fused_new("psq_l @0, %%[oclip](%%[o]), 0, 0");
+        zw = pr_fused_new("psq_l @0, %%[oclip]+8(%%[o]), 0, 0");
+        x = pr_fused_op("ps_mul", xy, pr_fused_pack(0, WL_XBOX_VSH_FUSED_SCALE), -1);
+        x = pr_fused_op("ps_add", x, pr_fused_op("ps_muls1", pr_fused_pack(0, WL_XBOX_VSH_FUSED_OFFSET), zw, -1), -1);
+        x = pr_fused_op("ps_mul", x, pr_fused_pack(0, WL_XBOX_VSH_FUSED_TO_SAMPLES), -1);
+        h = pr_fused_op("ps_muls1", pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF), zw, -1);
+        pr_fused_store(pr_fused_op("ps_add", x, h, -1), "psq_st @0, 0(%%[ad]), 0, 0");
+        pr_fused_store(pr_fused_op("ps_neg", pr_fused_op("ps_merge11", zw, zw, -1), -1, -1), "stfs @0, 8(%%[ad])");
+        pr_text("b %s", done);
+    }
+    pr_place_label(other);
+    {
+        int xy = pr_fused_new("psq_l @0, 0(%%[o]), 0, 0"), z = pr_fused_new("lfs @0, 8(%%[o])");
+        int one = pr_fused_pack(1, WL_XBOX_VSH_FUSED_ONES), depth, limited;
+
+        xy = pr_fused_op("ps_mul", xy, pr_fused_pack(0, WL_XBOX_VSH_FUSED_TO_SAMPLES), -1);
+        pr_fused_store(pr_fused_op("ps_add", xy, pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF), -1),
+                       "psq_st @0, 0(%%[ad]), 0, 0");
+        /* (as_depth: z / the maximum, 0 below 0 or for a NaN, 1 above 1; less 1) */
+        depth = pr_fused_op("fdivs", z, pr_fused_pack(1, WL_XBOX_VSH_FUSED_DEPTH), -1);
+        depth = pr_fused_op("fsel", depth, depth, pr_k(1, PRK_ZERO));
+        limited = pr_fused_op("fsubs", depth, one, -1);
+        depth = pr_fused_op("fsel", limited, one, depth);
+        pr_fused_store(pr_fused_op("fsubs", depth, one, -1), "stfs @0, 8(%%[ad])");
+    }
+    pr_place_label(done);
+    /* the colours: each component's byte, value * 255 + 1/2 cut down */
+    for (n = 0; n < key->colors; n++, word++) {
+        const char *field = n == 0 ? "%[od0]" : "%[od1]";
+        int half;
+
+        if (!(key->channels & (1u << n))) {
+            pr_text("li 0, 0");
+            pr_text("stw 0, %d(%%[ad])", 4 * word);
+            continue;
+        }
+        for (half = 0; half < 2; half++) {
+            int value = pr_fused_new("psq_l @0, %s+%d(%%[o]), 0, 0", field, 8 * half);
+
+            value = pr_fused_op("ps_mul", value, pr_fused_pack(0, WL_XBOX_VSH_FUSED_255), -1);
+            value = pr_fused_op("ps_add", value, pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF), -1);
+            pr_fused_store(value, "psq_st @0, %d(%%[ad]), 0, 6", 4 * word + 2 * half);
+        }
+    }
+    /* the texture coordinates (stage_texcoord's) */
+    for (n = 0; n < key->stage_count; n++, word += 2) {
+        unsigned stage = key->stages[n] & 3u, kind = key->stages[n] >> 2;
+        int at = 16 * (int)stage, st = pr_fused_new("psq_l @0, %%[ot]+%d(%%[o]), 0, 0", at);
+        int to = pr_fused_pack(0, WL_XBOX_VSH_FUSED_TO_TEXELS + 2 * (int)stage);
+
+        if (kind == WL_XBOX_VSH_FUSED_STAGE_PLAIN) {
+            pr_fused_store(st, "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
+        } else if (kind == WL_XBOX_VSH_FUSED_STAGE_LINEAR) {
+            pr_fused_store(pr_fused_op("ps_mul", st, to, -1), "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
+        } else if (kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE || kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR) {
+            /* (divided by q unless q is 1 or within 1e-12 of 0, or a NaN) */
+            int linear = kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR;
+            int q = pr_fused_new("lfs @0, %%[ot]+%d(%%[o])", at + 12), values[2], divided;
+
+            pr_new_label(other, sizeof(other));
+            pr_new_label(done, sizeof(done));
+            values[0] = q;
+            values[1] = pr_fused_pack(1, WL_XBOX_VSH_FUSED_ONES);
+            pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
+            pr_text("beq %s", other);
+            values[0] = pr_fused_op("fabs", q, -1, -1);
+            values[1] = pr_fused_pack(1, WL_XBOX_VSH_FUSED_TINY);
+            pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
+            pr_text("bng %s", other);
+            divided = pr_fused_op("ps_div", st, q, -1);
+            if (linear)
+                divided = pr_fused_op("ps_mul", divided, to, -1);
+            pr_fused_store(divided, "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
+            pr_text("b %s", done);
+            pr_place_label(other);
+            pr_fused_store(linear ? pr_fused_op("ps_mul", st, to, -1) : st, "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
+            pr_place_label(done);
+        } else {
+            /* a sphere map (wl_nv2a_sphere_coordinates), in double: x k + 1/2, y k + 1/2 with
+            k = 1 / (2 sqrt(2 L (L + z))), L = |d|; the disc's centre for a direction too short
+            or too long, its edge straight behind */
+            char edge[24];
+            int z = pr_fused_new("lfs @0, %%[ot]+%d(%%[o])", at + 8), y = pr_fused_op("ps_merge11", st, st, -1);
+            int length2, root, length, q, values[2], half = pr_fused_sphere(3);
+
+            pr_new_label(other, sizeof(other));
+            pr_new_label(edge, sizeof(edge));
+            pr_new_label(done, sizeof(done));
+            length2 = pr_fused_op("fadd", pr_fused_op("fmul", st, st, -1), pr_fused_op("fmul", y, y, -1), -1);
+            length2 = pr_fused_op("fadd", length2, pr_fused_op("fmul", z, z, -1), -1);
+            values[0] = length2;
+            values[1] = pr_fused_sphere(0);
+            pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
+            pr_text("bng %s", other);
+            values[1] = pr_fused_sphere(1);
+            pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
+            pr_text("bnl %s", other);
+            root = pr_fused_root(length2);
+            length = pr_fused_op("fmul", length2, root, -1);
+            q = pr_fused_op("fmul", pr_fused_op("fmul", pr_fused_sphere(5), length, -1),
+                            pr_fused_op("fadd", length, z, -1), -1);
+            values[0] = q;
+            values[1] = pr_fused_op("fmul", pr_fused_sphere(4), length2, -1);
+            pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
+            pr_text("bng %s", edge);
+            q = pr_fused_op("fmul", half, pr_fused_root(q), -1);
+            pr_fused_store(pr_fused_op("fadd", pr_fused_op("fmul", st, q, -1), half, -1), "stfs @0, %d(%%[ad])",
+                           4 * word);
+            pr_fused_store(pr_fused_op("fadd", pr_fused_op("fmul", y, q, -1), half, -1), "stfs @0, %d(%%[ad])",
+                           4 * word + 4);
+            pr_text("b %s", done);
+            pr_place_label(other);
+            pr_fused_store(pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF), "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
+            pr_text("b %s", done);
+            pr_place_label(edge);
+            pr_fused_store(pr_fused_pack(0, WL_XBOX_VSH_FUSED_EDGE), "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
+            pr_place_label(done);
+        }
+    }
+}
+
 /* the instructions as ops (pr_pre, pr_body); 0 when one can't be */
 static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, int reused,
                        const ReusePrefix *prefix, int *compare_count) {
     static unsigned after[WL_XBOX_VSH_MAX_INSTRUCTIONS][13];
     unsigned long index, start = reused ? prefix->end : 0;
     unsigned open = ~0u;
-    char skip[24] = "", top[24], made[24];
+    char skip[24] = "", top[24], made[24], again[24] = "";
     int t, h;
 
     pr_value_count = pr_pre_count = pr_body_count = pr_cache_count = 0;
@@ -1314,10 +1638,23 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     *compare_count = 0;
     pr_new_label(top, sizeof(top));
     pr_new_label(made, sizeof(made));
+    if (reused)
+        pr_new_label(again, sizeof(again));
+    /* (fused: the vertex's inputs read from its arrays first; the first
+    vertex's prefix always made) */
+    if (pr_fuse) {
+        pr_fused_start(program);
+        if (reused) {
+            pr_fused_prologue();
+            pr_forget();
+            pr_text("b %s", again);
+        }
+    }
     pr_place_label(top);
+    if (pr_fuse)
+        pr_fused_prologue();
     /* the prefix: made, or kept while the inputs it reads are the vertex before's */
     if (reused) {
-        char again[24];
         int which;
         unsigned words[16] = {0};
 
@@ -1332,14 +1669,16 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
                 if (in->operands[which].mux == _mux_input)
                     words[in->input & 15] |= reads[which];
         }
-        pr_new_label(again, sizeof(again));
-        snprintf(pr_first, sizeof(pr_first), "%s", again);
+        snprintf(pr_first, sizeof(pr_first), "%s", pr_fuse ? "" : again);
         for (index = 0; index < 16; index++)
             for (which = 0; which < 4; which++)
                 if (words[index] & (8u >> which)) {
                     /* (the vertex before's: %[vs] bytes before) */
                     pr_text("lwz 0, %lu(%%[v])", 16 * index + 4 * (unsigned long)which);
-                    pr_text("lwz %%[g], %lu-%%[vs](%%[v])", 16 * index + 4 * (unsigned long)which);
+                    if (pr_fuse)
+                        pr_text("lwz %%[g], %lu(%%[pv])", 16 * index + 4 * (unsigned long)which);
+                    else
+                        pr_text("lwz %%[g], %lu-%%[vs](%%[v])", 16 * index + 4 * (unsigned long)which);
                     pr_text("cmpw 0, %%[g]");
                     pr_text("bne %s", again);
                     (*compare_count)++;
@@ -1430,6 +1769,18 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         values[0] = w1;
         pr_op(0, 0, 1, values, "psq_st @0, 8(%%[o]), 0, 0");
         pr_place_label(done);
+    }
+    if (pr_fuse) {
+        pr_fused_epilogue();
+        /* (the inputs' two sets swapped: this vertex's are the vertex before's) */
+        if (reused) {
+            pr_text("mr %%[ad], %%[v]");
+            pr_text("mr %%[v], %%[pv]");
+            pr_text("mr %%[pv], %%[ad]");
+        }
+        pr_text("bdnz %s", top);
+        pr_fused_end();
+        return !pr_failed;
     }
     pr_defaults(program);
     pr_text("addi %%[v], %%[v], %%[vs]");
@@ -1549,13 +1900,33 @@ static int pr_program(const WlXboxVshProgram *program, const unsigned *needs, in
     return 1;
 }
 
-/* the asm pr_program made */
-static void pr_print(FILE *out) {
+/* an output offset's operand (%[od0] ...) and its value: a fused function
+writes the values (its operands would pass GCC's 30) */
+static const struct {
+    const char *name;
+    int offset;
+} pr_output_offsets[] = {
+    {"%[od0]", (int)offsetof(WlXboxVshOutput, d0)},       {"%[od1]", (int)offsetof(WlXboxVshOutput, d1)},
+    {"%[ob0]", (int)offsetof(WlXboxVshOutput, b0)},       {"%[ob1]", (int)offsetof(WlXboxVshOutput, b1)},
+    {"%[ot]", (int)offsetof(WlXboxVshOutput, t)},         {"%[ofog]", (int)offsetof(WlXboxVshOutput, fog)},
+    {"%[opoint]", (int)offsetof(WlXboxVshOutput, point_size)}, {"%[oclip]", (int)offsetof(WlXboxVshOutput, clip)},
+    {"%[ocaptured]", (int)offsetof(WlXboxVshOutput, clip_captured)},
+};
+
+/* the asm pr_program made (a batch function's, or with pr_fuse a fused
+one's; reused: the prefix kept) */
+static void pr_print(FILE *out, int reused) {
     unsigned used = pr_used;
     int n, k;
 
-    fprintf(out, "\tif (count) {\n\t\tconst char *vp = (const char *)vs;\n\t\tchar *op = (char *)os;\n"
-                 "\t\tint slot[2];\n\t\tlong g, ra, a0;\n\n");
+    if (pr_fuse)
+        fprintf(out, "\tif (count) {\n\t\tconst char *vp = (const char *)fused->inputs[1];\n"
+                     "\t\tconst char *pvp = (const char *)fused->inputs[0];\n\t\tchar *op = (char *)&fused->output;\n"
+                     "\t\tconst uint32_t *ep = fused->elements;\n\t\tuint32_t *const *wp = fused->words;\n"
+                     "\t\tint slot[2];\n\t\tlong g, ra, a0, ad, x;\n\n\t\t(void)pvp;\n");
+    else
+        fprintf(out, "\tif (count) {\n\t\tconst char *vp = (const char *)vs;\n\t\tchar *op = (char *)os;\n"
+                     "\t\tint slot[2];\n\t\tlong g, ra, a0;\n\n");
     fprintf(out, "\t\t__asm__ volatile(\n");
     for (n = 0; n < pr_pre_count + pr_body_count + 2; n++) {
         const PrOp *op;
@@ -1580,6 +1951,19 @@ static void pr_print(FILE *out) {
         op = n < pr_pre_count ? &pr_pre[n] : &pr_body[n - pr_pre_count - 2];
         fprintf(out, "\t\t\t\"");
         for (t = op->text; *t; t++) {
+            size_t o;
+
+            for (o = 0; pr_fuse && *t == '%' && o < sizeof(pr_output_offsets) / sizeof(pr_output_offsets[0]); o++) {
+                size_t length = strlen(pr_output_offsets[o].name);
+
+                if (strncmp(t, pr_output_offsets[o].name, length) == 0) {
+                    fprintf(out, "%d", pr_output_offsets[o].offset);
+                    t += length;
+                    break;
+                }
+            }
+            if (!*t)
+                break;
             if (*t == '@' && t[1] >= '0' && t[1] <= '3') {
                 fprintf(out, "%d", pr_values[pr_root(op->values[t[1] - '0'])].phys);
                 t++;
@@ -1589,10 +1973,22 @@ static void pr_print(FILE *out) {
         }
         fprintf(out, "\\n\\t\"\n");
     }
-    fprintf(out, "\t\t\t: [v] \"+b\"(vp), [o] \"+b\"(op), [g] \"=&r\"(g), [ra] \"=&b\"(ra), [a0] \"=&r\"(a0)\n"
-                 "\t\t\t: [c] \"b\"(c), [c2] \"b\"(c + 128), [k] \"b\"(wl_xbox_vsh_pairs_k), "
-                 "[live] \"r\"(live), [n] \"r\"(count), [slot] \"b\"(slot),\n"
-                 "\t\t\t  [vs] \"i\"(sizeof(vs[0])), [os] \"i\"(sizeof(*os)), "
+    fprintf(out, "\t\t\t: [v] \"+b\"(vp), [o] \"+b\"(op), [g] \"=&r\"(g), [ra] \"=&b\"(ra), [a0] \"=&r\"(a0)");
+    if (pr_fuse)
+        fprintf(out, ",\n\t\t\t  [e] \"+b\"(ep), [w] \"+b\"(wp), [ad] \"=&b\"(ad), [x] \"=&b\"(x)%s",
+                reused ? ", [pv] \"+b\"(pvp)" : "");
+    fprintf(out, "\n\t\t\t: [c] \"b\"(c), [c2] \"b\"(c + 128), [k] \"b\"(wl_xbox_vsh_pairs_k), "
+                 "[live] \"r\"(live), [n] \"r\"(count), [slot] \"b\"(slot),\n");
+    if (pr_fuse)
+        fprintf(out, "\t\t\t  [f] \"b\"(fused), [ptr] \"i\"(sizeof(void *)), "
+                     "[fdata] \"i\"(offsetof(WlXboxVshFused, data))\n");
+    else
+        fprintf(out, "\t\t\t  [vs] \"i\"(sizeof(vs[0])), [os] \"i\"(sizeof(*os)),\n");
+    if (pr_fuse)
+        fprintf(out, "\t\t\t: \"r0\", \"cr0\", \"cr1\", \"cr2\", \"cr3\", \"cr4\", \"cr5\", "
+                     "\"cr6\", \"cr7\", \"ctr\", \"memory\"");
+    else
+        fprintf(out, "\t\t\t  "
                  "[od0] \"i\"(offsetof(WlXboxVshOutput, d0)), [od1] \"i\"(offsetof(WlXboxVshOutput, d1)),\n"
                  "\t\t\t  [ob0] \"i\"(offsetof(WlXboxVshOutput, b0)), [ob1] \"i\"(offsetof(WlXboxVshOutput, b1)), "
                  "[ot] \"i\"(offsetof(WlXboxVshOutput, t)), [ofog] \"i\"(offsetof(WlXboxVshOutput, fog)),\n"
@@ -1604,5 +2000,6 @@ static void pr_print(FILE *out) {
     for (k = 0; k < 32; k++)
         if (used & (1u << k))
             fprintf(out, ", \"fr%d\"", k);
-    fprintf(out, ");\n\t\t(void)g;\n\t\t(void)ra;\n\t\t(void)a0;\n\t}\n");
+    fprintf(out, ");\n\t\t(void)g;\n\t\t(void)ra;\n\t\t(void)a0;\n%s\t}\n",
+            pr_fuse ? "\t\t(void)ad;\n\t\t(void)x;\n" : "");
 }
