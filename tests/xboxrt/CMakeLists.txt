@@ -18,6 +18,13 @@ wl_target_defaults(bench_mmio_fault)
 target_link_libraries(bench_mmio_fault PRIVATE wl_xboxrt)
 add_test(NAME bench_mmio_fault_runs COMMAND bench_mmio_fault 1000)
 set_tests_properties(bench_mmio_fault_runs PROPERTIES LABELS "unit;be")
+# The service poll at a device access when nothing is due (KeTickCount and the level sources):
+# tools/qemu_icount.py counts it on ppc-be.
+add_executable(bench_irq_poll bench_irq_poll.c)
+wl_target_defaults(bench_irq_poll)
+target_link_libraries(bench_irq_poll PRIVATE wl_xboxrt)
+add_test(NAME bench_irq_poll_runs COMMAND bench_irq_poll 1000)
+set_tests_properties(bench_irq_poll_runs PROPERTIES LABELS "unit;be")
 # Demand paging under a frame limit (the Wii's model through SIGSEGV and mprotect): with a swap
 # file, and without one.
 wl_add_test(test_xboxrt_paging SOURCES test_xboxrt_paging.c LIBS wl_xboxrt LABELS unit be)

@@ -95,9 +95,13 @@ void wl_xbox_ac97_destroy(WlXboxAc97 *ac) {
     free(ac);
 }
 
-static bool bm_irq(const BusMaster *b) {
-    return ((b->sr & SR_BCIS) && (b->cr & CR_IOCE)) || ((b->sr & SR_LVBCI) && (b->cr & CR_LVBIE)) ||
-           ((b->sr & SR_FIFOE) && (b->cr & CR_FEIE));
+// The status bits whose interrupt the control register enables, without a branch (the line is
+// asked at every device access): LVBIE is LVBCI's bit, FEIE one below FIFOE's, IOCE one above BCIS's.
+_Static_assert(CR_LVBIE == SR_LVBCI && CR_FEIE << 1 == SR_FIFOE && CR_IOCE >> 1 == SR_BCIS,
+               "the AC'97 enables and their status bits");
+static uint32_t bm_irq(const BusMaster *b) {
+    const uint32_t cr = b->cr;
+    return b->sr & ((cr & CR_LVBIE) | (cr & CR_FEIE) << 1 | (cr & CR_IOCE) >> 1);
 }
 
 static uint32_t glob_sta(const WlXboxAc97 *ac) {
@@ -114,12 +118,11 @@ static uint32_t glob_sta(const WlXboxAc97 *ac) {
 }
 
 bool wl_xbox_ac97_irq(const WlXboxAc97 *ac) {
+    uint32_t any = 0;
     for (uint32_t i = 0; i < BM_COUNT; i++) {
-        if (bm_irq(&ac->bm[i])) {
-            return true;
-        }
+        any |= bm_irq(&ac->bm[i]);
     }
-    return false;
+    return any != 0;
 }
 
 // Takes descriptor civ: its length (samples, 16-bit words) and control bits.
