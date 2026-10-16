@@ -205,6 +205,15 @@ void wl_nv2a_fetch_vertex(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, u
 enum { WL_NV2A_FETCH_BATCH = 32 };
 void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, const uint32_t *vertices,
                             uint32_t count, float (*inputs)[WL_NV2A_ATTRIBS][4]);
+// a vertex's element: an array's index from the least (index_base), an inline or immediate vertex's
+// number
+static inline uint32_t wl_nv2a_fetch_element(const WlNv2aFetchPlan *plan, uint32_t vertex) {
+    return plan->source == WL_NV2A_SOURCE_ARRAYS && plan->indices != NULL ? plan->indices[vertex] - plan->index_base
+                                                                          : vertex;
+}
+// the same from the vertices' elements (wl_nv2a_fetch_element's), for a caller that has them
+void wl_nv2a_fetch_elements(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, const uint32_t *elements,
+                            uint32_t count, float (*inputs)[WL_NV2A_ATTRIBS][4]);
 // streamed attribute i's format as a fused batch reads it (WL_XBOX_VSH_FUSED_F1 ...;
 // WL_XBOX_VSH_FUSED_FORMATS: one it cannot), and the tables the fetch converts by
 unsigned wl_nv2a_fetch_fused_format(const WlNv2aFetchPlan *plan, unsigned i);
