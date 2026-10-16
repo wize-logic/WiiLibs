@@ -556,7 +556,13 @@ the **stall report** (`stall:`, no scheduling for 20 s: who holds the guest lock
 head and every thread's state, once a minute while it lasts) and the **freeze watch** (`freeze:`,
 no new frame for 30 s: each guest thread's return addresses found on its stack and its IRQL, and
 on the Wii a 10 s profile of the frozen title into the log, for `tools/wl_profile.py`; once per
-freeze).
+freeze). A third names a holder that keeps interrupts waiting: **held off** (`interrupts held off
+for N ms`, the service thread kept from the guest lock for a second): the holder's safe points
+meanwhile and how many of them kept the lock at a raised IRQL, its return addresses and IRQL
+(`held off:`), and where its host thread runs (the host: its PC and translated callers; the Wii: a
+0.2 s profile into the log, the first four times). While the service thread waits for the lock,
+the holder's safe points mark the devices' ticks due in its place, so the audio processor's frames
+go on.
 
 The title's build learns from a run: every indirect-call target with no translated function is
 added to the seed file, and every NV2A vertex program drawn that is not compiled in to the program

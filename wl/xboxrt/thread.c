@@ -154,14 +154,21 @@ static void hand_off(void) {
     }
 }
 
-// Waits for the baton (g_m held). The service thread says so when it has waited a second or more:
-// the holder spins without reaching a safe point, and interrupts are held off meanwhile.
+extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
+static void log_guest_stack(const char *what, const WlXbThread *t, const WlXbThread *owner);
+
+// Waits for the baton (g_m held). The service thread says so when it has waited a second or more,
+// and names what the holder does: the safe points it reached meanwhile and how many of them kept
+// the lock at a raised IRQL (none: it ran without a safe point; many: it stays at DISPATCH_LEVEL or
+// above, where its own safe points run the interrupts and nothing else runs), its guest return
+// addresses, and where its host thread is (wl_xb_backend_probe). Nothing of this runs before.
 static void take(WlXbThread *self) {
     if (g_owner == NULL && g_ready == NULL) {
         g_owner = self;
     } else {
         enqueue(self);
         uint64_t since = wl_platform_time_ms(), warned = 0;
+        uint32_t points0 = g_stats.safe_points, raised0 = g_stats.raised_holds;
         while (g_owner != self) {
             if (!self->is_service) {
                 wl_platform_cond_wait(self->cond, g_m);
@@ -170,17 +177,25 @@ static void take(WlXbThread *self) {
             wl_platform_cond_wait_timeout(self->cond, g_m, 500);
             uint64_t waited = wl_platform_time_ms() - since;
             WlXbThread *holder = g_owner;
-            if (holder != self && holder != NULL && waited >= 1000u && (warned == 0 || waited - warned >= 5000u)) {
+            if (holder != self && holder != NULL && waited >= 1000u &&
+                (warned == 0 || waited - warned >= 5000u)) {
                 warned = waited;
                 g_stats.service_starved++;
                 WL_LOG_W(TAG,
-                         "interrupts held off for %u ms: thread %u (%s) keeps the guest lock without a safe point "
-                         "(a kernel call, rdtsc or a device access)",
-                         (unsigned)waited, (unsigned)holder->id, holder->name);
+                         "interrupts held off for %u ms: thread %u (%s) keeps the guest lock: %u safe points, %u of "
+                         "them at a raised IRQL",
+                         (unsigned)waited, (unsigned)holder->id, holder->name, (unsigned)(g_stats.safe_points - points0),
+                         (unsigned)(g_stats.raised_holds - raised0));
+                log_guest_stack("held off", holder, holder);
                 WlXbSymbol sym;
                 (void)wl_xb_symbolize(0, &sym); // builds the table here, not in the probed thread
                 wl_xb_backend_probe(holder->host_handle);
+            } else if (warned != 0) {
+                wl_xb_backend_probe(0); // the Wii: the probe's samples, once taken, into the log
             }
+        }
+        if (warned != 0) {
+            wl_xb_backend_probe(0);
         }
     }
     g_quantum_start = wl_xb_time_us();
@@ -1180,45 +1195,47 @@ void wl_xb_thread_stall_check(void) {
     wl_platform_mutex_unlock(g_m);
 }
 
-extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
+// A guest thread's stack scanned for return addresses (words inside the image's code), the
+// innermost first, and its IRQL, logged as "<what>: ...". The holder's stack pointer is the live
+// one. Only pages with a frame are read (a fault here, on the service thread, must not happen).
+// g_m held.
+static void log_guest_stack(const char *what, const WlXbThread *t, const WlXbThread *owner) {
+    uint32_t esp = t == owner ? g_esp : t->cpu.g_esp;
+    char line[200];
+    size_t used = 0;
+    unsigned found = 0;
+    line[0] = '\0';
+    for (uint32_t i = 0; i < 256u && found < 14u && used + 12u < sizeof line; i++) {
+        uint32_t va = esp + i * 4u;
+        uint8_t b[4];
+        if (!wl_xb_mem_peek(va, b, 4)) { // (no guest lock here: never a fault)
+            break;
+        }
+        uint32_t w = wl_rd_le32(b);
+        if (w >= g_xbox_code_lo && w < g_xbox_code_hi) {
+            used += (size_t)snprintf(line + used, sizeof line - used, " %x", (unsigned)w);
+            found++;
+        }
+    }
+    // its IRQL (a holder at DISPATCH_LEVEL keeps the lock: thread.h, wl_xb_safe_point)
+    uint8_t irql8 = 0;
+    unsigned irql = t->kpcr != 0 && wl_xb_mem_peek(t->kpcr + KPCR_IRQL, &irql8, 1) ? irql8 : 0u;
+    char at[16] = "";
+    if (irql != 0) {
+        snprintf(at, sizeof at, " irql %u", irql);
+    }
+    WL_LOG_W(TAG, "%s: %u %s%s%s esp %08x:%s", what, (unsigned)t->id, t->name, t == owner ? " (holds the lock)" : "",
+             at, (unsigned)esp, found != 0 ? line : " no code addresses");
+}
 
-// Each live guest thread's stack scanned for return addresses (words inside the image's code), the
-// innermost first: where the threads are when the title stops showing frames. The holder's stack
-// pointer is the live one. Only pages with a frame are read (a fault here, on the service thread,
-// must not happen).
+// Each live guest thread's stack: where the threads are when the title stops showing frames.
 void wl_xb_thread_log_guest_stacks(void) {
     wl_platform_mutex_lock(g_m);
     WlXbThread *owner = g_owner;
     for (WlXbThread *t = g_all; t != NULL; t = t->next_all) {
-        if (t->terminated || t->is_service) {
-            continue;
+        if (!t->terminated && !t->is_service) {
+            log_guest_stack("freeze", t, owner);
         }
-        uint32_t esp = t == owner ? g_esp : t->cpu.g_esp;
-        char line[200];
-        size_t used = 0;
-        unsigned found = 0;
-        line[0] = '\0';
-        for (uint32_t i = 0; i < 256u && found < 14u && used + 12u < sizeof line; i++) {
-            uint32_t va = esp + i * 4u;
-            uint8_t b[4];
-            if (!wl_xb_mem_peek(va, b, 4)) { // (no guest lock here: never a fault)
-                break;
-            }
-            uint32_t w = wl_rd_le32(b);
-            if (w >= g_xbox_code_lo && w < g_xbox_code_hi) {
-                used += (size_t)snprintf(line + used, sizeof line - used, " %x", (unsigned)w);
-                found++;
-            }
-        }
-        // its IRQL (a holder at DISPATCH_LEVEL keeps the lock: thread.h, wl_xb_safe_point)
-        uint8_t irql8 = 0;
-        unsigned irql = t->kpcr != 0 && wl_xb_mem_peek(t->kpcr + KPCR_IRQL, &irql8, 1) ? irql8 : 0u;
-        char at[16] = "";
-        if (irql != 0) {
-            snprintf(at, sizeof at, " irql %u", irql);
-        }
-        WL_LOG_W(TAG, "freeze: %u %s%s%s esp %08x:%s", (unsigned)t->id, t->name, t == owner ? " (holds the lock)" : "",
-                 at, (unsigned)esp, found != 0 ? line : " no code addresses");
     }
     wl_platform_mutex_unlock(g_m);
 }

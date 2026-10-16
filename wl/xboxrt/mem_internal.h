@@ -28,10 +28,12 @@ void wl_xb_backend_stats(uint32_t *frames, uint32_t *faults, uint32_t *pte_evict
 // The host memory the backend holds on the heap: its tables, and the frames behind the guest's pages
 // when they come from the heap (the Wii's pools; the host maps its RAM object instead: 0).
 void wl_xb_backend_host_bytes(size_t *tables, size_t *frames);
-// The calling host thread as the fault backend names it (the host: its pthread_t; the Wii: 0).
+// The calling host thread as the fault backend names it (the host: its pthread_t; the Wii: its LWP).
 uintptr_t wl_xb_backend_thread_handle(void);
 // Logs where the host thread `handle` is running: on the host a signal makes it log its PC and the
-// translated function there; nothing on the Wii. A diagnostic for a thread that keeps the guest lock.
+// translated functions there; on the Wii the sampling profiler takes 0.2 s of whatever runs, the holder, the first few times in a run. A diagnostic for
+// a thread that keeps the guest lock: called with 0 afterwards, while the caller still waits and
+// once it is done, to log what was gathered.
 void wl_xb_backend_probe(uintptr_t handle);
 #if !defined(__wii__)
 // The host's fault on guest RAM under a frame limit (fault_posix.c asks first): WL_OK when the page

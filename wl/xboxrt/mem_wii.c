@@ -29,10 +29,12 @@
 #include <malloc.h>
 #include <ogc/cache.h>
 #include <ogc/irq.h>
+#include <ogc/lwp.h>
 #include <stdlib.h>
 #include <string.h>
 #include <tuxedo/ppc/exception.h>
 
+#include "wl/platform/profile.h"
 #include "wl/xboxrt/crash.h"
 #include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/mmio.h"
@@ -617,11 +619,50 @@ void wl_xb_backend_stats(uint32_t *frames, uint32_t *faults, uint32_t *pte_evict
 }
 
 uintptr_t wl_xb_backend_thread_handle(void) {
-    return 0;
+    return (uintptr_t)LWP_GetSelf(); // (never 0)
+}
+
+// The probe: another LWP's context is not reachable, but the holder is the thread that runs while
+// the service thread waits, so the sampling profiler sees it: 0.2 s at 500 Hz, then the samples into
+// the log (tools/wl_profile.py <elf> <log> reads them). The first PROBES of a run only; nothing is
+// allocated before the first.
+enum { PROBES = 4u, PROBE_SAMPLES = 100u, PROBE_DEPTH = 12u };
+static WlProfileRing g_probe_ring;
+static uint32_t *g_probe_store, g_probes;
+static bool g_probe_on;
+
+static void probe_line(void *user, const char *line) {
+    (void)user;
+    WL_LOG_W("xbthread", "%s", line);
 }
 
 void wl_xb_backend_probe(uintptr_t handle) {
-    (void)handle; // another LWP's PC is not looked at here
+    (void)handle;
+    if (g_probe_on) {
+        if (g_probe_ring.count < PROBE_SAMPLES && wl_profile_running()) {
+            return; // still sampling
+        }
+        wl_profile_stop();
+        g_probe_on = false;
+        WlProfileDumpInfo info = {500u, 0u, 0u, "the holder of the guest lock while interrupts are held off"};
+        (void)wl_profile_dump(&g_probe_ring, &info, probe_line, NULL);
+        return;
+    }
+    if (handle == 0 || g_probes >= PROBES) {
+        return;
+    }
+    if (g_probe_store == NULL) {
+        g_probe_store = malloc(PROBE_SAMPLES * (WL_PROFILE_HEADER_WORDS + PROBE_DEPTH) * sizeof(uint32_t));
+        if (g_probe_store == NULL) {
+            return;
+        }
+    }
+    if (wl_profile_ring_init(&g_probe_ring, g_probe_store, PROBE_SAMPLES * (WL_PROFILE_HEADER_WORDS + PROBE_DEPTH),
+                             PROBE_DEPTH, WL_PROFILE_STOP_WHEN_FULL) == WL_OK &&
+        wl_profile_start(&g_probe_ring, 500u) == WL_OK) { // (not while profile.txt's profile runs)
+        g_probe_on = true;
+        g_probes++;
+    }
 }
 
 WlResult wl_xb_fault_install(void) {
