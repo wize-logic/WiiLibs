@@ -398,6 +398,9 @@ or `script stopped at line N (...): why` with what was shown).
   host moves as far, the bot's input at a given tick is the same on every run, and a bot that dies
   and is put back does not play the same death again and again. A bot step whose game time stands
   still ends after four times its length (and a minute) on the script's clock.
+- **Progress**: in a game, a line a game minute says the time played (`played to tick N (the game's
+  tick M)`), so a long cutscene or walk that logs nothing else still shows the game moving on;
+  `tools/host_run.py` counts these ticks, and ends a run whose game stands still for 5 minutes.
 - **Screenshots**: on the host wl/gxsoft draws the next two frames (the first may begin mid-frame)
   and the second becomes `<out>/<name>.png`; on the Wii a one-frame GPU capture (`<name>.cap`, for
   `tools/xbox_nv2a_replay CAP --png-gx DIR`). `capture <frames>` takes a longer capture on both.
@@ -557,7 +560,13 @@ the **stall report** (`stall:`, no scheduling for 20 s: who holds the guest lock
 head and every thread's state, once a minute while it lasts) and the **freeze watch** (`freeze:`,
 no new frame for 30 s: each guest thread's return addresses found on its stack and its IRQL, and
 on the Wii a 10 s profile of the frozen title into the log, for `tools/wl_profile.py`; once per
-freeze).
+freeze). A third names a holder that keeps interrupts waiting: **held off** (`interrupts held off
+for N ms`, the service thread kept from the guest lock for a second): the holder's safe points
+meanwhile and how many of them kept the lock at a raised IRQL, its return addresses and IRQL
+(`held off:`), and where its host thread runs (the host: its PC and translated callers; the Wii: a
+0.2 s profile into the log, the first four times). While the service thread waits for the lock,
+the holder's safe points mark the devices' ticks due in its place, so the audio processor's frames
+go on.
 
 The title's build learns from a run: every indirect-call target with no translated function is
 added to the seed file, and every NV2A vertex program drawn that is not compiled in to the program

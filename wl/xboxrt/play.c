@@ -38,6 +38,7 @@
 #define MAX_REG 96 // a title's texts, numbers, predicates, actions and steps (Halo's plugin has 32)
 #define PLAY_PRIORITY 31
 #define TICK_JUMP 60 // a tick moving on more than this in a frame was a checkpoint loaded, not play
+#define PROGRESS_SECONDS 60 // a line says the time played every game minute (host_run.py's progress)
 #define STILL_FACTOR 4.0 // a bot step whose game time stands still ends after this many times its length
 
 enum {
@@ -130,6 +131,7 @@ static struct {
     // the game's time played: the title's tick, but never back (a revert to a checkpoint puts the
     // tick back; this goes on), so a step's time and the bot's clock move on through deaths
     int64_t played, started_played, last_game_tick;
+    int64_t progress_next;     // the time played at which the next progress line is logged
     uint32_t reverts;
     char map[64];
     bool pressed;
@@ -789,8 +791,10 @@ static void observe(void) {
         map[0] = '\0';
     }
     if (tick >= 0) {
+        int64_t every = (int64_t)(PROGRESS_SECONDS * tick_rate());
         if (P.last_game_tick < 0 || strcmp(map, P.map) != 0 || tick - P.last_game_tick > TICK_JUMP) {
             P.played = tick;
+            P.progress_next = (tick / every + 1) * every;
         } else if (tick > P.last_game_tick) {
             P.played += tick - P.last_game_tick;
         } else if (tick < P.last_game_tick) {
@@ -798,6 +802,12 @@ static void observe(void) {
             wl_xb_play_log("the game went back from tick %lld to %lld (a revert, %u so far): the time played goes on "
                            "from %lld", (long long)P.last_game_tick, (long long)tick, (unsigned)P.reverts,
                            (long long)P.played);
+        }
+        // a cutscene or a long walk logs nothing else for minutes: a line a game minute shows the
+        // game moving on (a run's watcher counts these ticks), and a game that stands still shows none
+        if (P.played >= P.progress_next) {
+            wl_xb_play_log("played to tick %lld (the game's tick %lld)", (long long)P.played, (long long)tick);
+            P.progress_next = (P.played / every + 1) * every;
         }
     }
     P.last_game_tick = tick;

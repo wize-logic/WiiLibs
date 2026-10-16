@@ -714,10 +714,14 @@ TEST a_raised_irql_keeps_the_processor(void) {
     // and marks the flag): not while the holder stays at DISPATCH_LEVEL
     uint32_t hp = gmem(4);
     ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(4, hi_routine)), "%08x");
+    const uint32_t ticks0 = g_tick_runs; // (device_ticks_run_at_safe_points's tick, every 2 ms)
     uint64_t t0 = now_ms();
     while (now_ms() - t0 < 60u) { // the quantum (10 ms) over many times, the thread's sleep too
         (void)wl_xb_rd32(RAISED_DEV_VA + 4u);
     }
+    // the devices' ticks go on, though the service thread waits for the lock all along (the
+    // audio processor's frames stopped while a real Wii held DISPATCH_LEVEL for seconds)
+    ASSERT(g_tick_runs - ticks0 >= 5u); // about 30
     ASSERT_EQ_FMT(1u, g_raised_isr_runs, "%u"); // the interrupt came in at a device access
     ASSERT(!g_raised_irq);
     ASSERT_EQ_FMT(0u, g_dpc_runs, "%u"); // its DPC waits for the IRQL

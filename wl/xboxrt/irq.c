@@ -44,6 +44,9 @@ static WlPlatformCond g_sc;
 static volatile uint32_t g_pending;
 static volatile uint32_t g_lines;
 static volatile uint64_t g_deadline;
+// The service thread waits for the guest lock: its loop, which marks the ticks due, does not run,
+// so the holder's polls mark them (one of the two at a time: ticks_due is not shared).
+static volatile uint32_t g_svc_waiting;
 static struct {
     WlXbIrqLevelFn fn;
     void *user;
@@ -334,6 +337,11 @@ static void poll(bool levels) {
     }
     const uint64_t now = wl_xb_time_us();
     update_tick_at(now);
+    if (__atomic_load_n(&g_svc_waiting, __ATOMIC_ACQUIRE) != 0) {
+        // a holder that keeps the lock for long (at a raised IRQL, where it does not give it up)
+        // still has the devices' ticks: the audio processor's frames go on
+        (void)ticks_due(now, now);
+    }
     uint64_t deadline = g_deadline;
     bool due = g_pending != 0 || (deadline != 0 && now >= deadline);
     if (!due && (levels || g_lines != 0)) {
@@ -596,7 +604,9 @@ static void *service_main(void *arg) {
         bool due = g_pending != 0 || wl_xb_irq_lines() != 0 || (deadline != 0 && now >= deadline);
         if (due && g_handler != NULL) {
             g_stats.service_thread_runs++;
+            __atomic_store_n(&g_svc_waiting, 1u, __ATOMIC_RELEASE);
             wl_xb_lock(g_svc);
+            __atomic_store_n(&g_svc_waiting, 0u, __ATOMIC_RELEASE);
             run_service();
             wl_xb_unlock(g_svc);
         }

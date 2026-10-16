@@ -32,7 +32,7 @@ static struct {
     int focus;
     bool menu;
     int64_t tick, checkpoints;
-    bool step_ran;
+    bool step_ran, fast;
     uint32_t step_frames;
     bool saw_rt, saw_stick, saw_x, port2_b, port2_bot, saw_walk_a;
     WlXboxPad last[4];
@@ -59,6 +59,9 @@ static void sink(void *user, WlLogLevel level, const char *tag, const char *line
     }
     if (strstr(line, "walkto done") != NULL) {
         T.step_done = true;
+    }
+    if (strstr(line, "test_input: twice") != NULL) {
+        T.fast = true; // the game's minutes go by quickly from here
     }
     if (T.log_count < 256) {
         snprintf(T.log[T.log_count++], sizeof T.log[0], "%s", line);
@@ -153,6 +156,7 @@ static const char k_script[] =
     "repeat 2\n"
     "log twice\n"
     "end\n"
+    "ticks 2000\n"
     "log done\n";
 
 static char g_root[256];
@@ -250,7 +254,7 @@ TEST script_runs(void) {
             T.focus++;
         }
         if (!T.menu) {
-            T.tick++;
+            T.tick += T.fast ? 40 : 1; // under the harness's jump that reads as a checkpoint loaded
             if (T.tick == 15) {
                 wl_xb_wr8(MEM_VA, 7);
             }
@@ -290,6 +294,18 @@ TEST script_runs(void) {
         lines += strstr(T.log[i], "test_input: line ") != NULL ? 1 : 0;
     }
     ASSERT_EQ(2, twice);
+    // a line a game minute (1800 ticks at 30 a second) says the time played: a run's watcher
+    // (host_run.py) sees the game move on through a long cutscene that logs nothing else
+    int progress = 0;
+    for (int i = 0; i < T.log_count; i++) {
+        const char *at = strstr(T.log[i], "test_input: played to tick ");
+        long long played = 0, tick = 0;
+        if (at != NULL && sscanf(at, "test_input: played to tick %lld (the game's tick %lld)", &played, &tick) == 2) {
+            ASSERT(played >= 1800 && played < 1800 + 40 && tick == played);
+            progress++;
+        }
+    }
+    ASSERT_EQ(1, progress);
     ASSERT(lines >= 25);
     // the capture step waits for its frames; with no GPU to take them (still armed here) it gives
     // up after 5 s and a second a frame, says so, and the script goes on
