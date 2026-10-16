@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
 // wl/xbox/vsh: a fused batch (tools/xbox_vsh_pairs.c's, the Wii's), emulated on the host by
 // vsh_ps_emulate.py as Broadway runs it (frsqrte's table estimate, stfs cutting a double's
-// mantissa), gives the general path's words to the bit: here a sphere map's stage against
-// wl_nv2a_sphere_coordinates. A sphere stage that stored its doubles without frsp came out one
-// ulp low on the Wii for about half its vertices (Dolphin, 2026-10-16).
+// mantissa), against the general path: here a sphere map's stage and wl_nv2a_sphere_coordinates.
+// The fused stage works in single precision (two roots of two Newton's steps each): its
+// coordinates are within 2^-22 (a four-thousandth of a texel of a 1024-texel map) of the exact
+// ones, which the general path's double gives too except nearly straight behind (where its
+// L + z cancels), and the disc's centre and edge are the general path's to the bit.
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -43,6 +46,15 @@ static void put_le_float(unsigned char *p, float x) {
     p[3] = (unsigned char)(bits >> 24);
 }
 
+// the coordinates in double without the cancellation: 1 + z is r / (L (L - z)) for z < 0
+static void sphere_exact(const float d[3], double st[2]) {
+    double x = d[0], y = d[1], z = d[2], r = x * x + y * y, length = sqrt(r + z * z);
+    double m = sqrt(2.0 * (z >= 0.0 ? 1.0 + z / length : r / (length * (length - z))));
+
+    st[0] = x / length / (2.0 * m) + 0.5;
+    st[1] = y / length / (2.0 * m) + 0.5;
+}
+
 static uint32_t float_bits(float x) {
     uint32_t bits;
 
@@ -61,7 +73,7 @@ static const WlXboxVshFusedForm *sphere_form(void) {
     return NULL;
 }
 
-TEST fused_sphere_stage_matches_the_general_path(void) {
+TEST fused_sphere_stage_is_close_to_the_general_path(void) {
     static float constants[192][4];
     static WlXboxVshFused fused;
     static unsigned char positions[VERTICES * 12], directions[VERTICES * 12];
@@ -71,6 +83,7 @@ TEST fused_sphere_stage_matches_the_general_path(void) {
     const WlXboxVshFusedForm *form = sphere_form();
     unsigned round, v, r, differing = 0, checked = 0;
     char detail[160] = "";
+    double largest = 0.0;
 
     ASSERT(form != NULL);
     ASSERT_EQ(WL_XBOX_VSH_FUSED_STAGE_SPHERE, form->key.stages[0] >> 2);
@@ -111,6 +124,15 @@ TEST fused_sphere_stage_matches_the_general_path(void) {
             } else if (round == 0 && v == 2) {
                 d[0] = d[1] = 0.0f;
                 d[2] = -0.75f;
+            } else if (round == 0 && v == 3) {
+                // (nearly behind, where L + z would cancel)
+                d[0] = 3.0e-6f;
+                d[1] = -1.0e-6f;
+                d[2] = -2.0f;
+            } else if (round == 0 && v == 4) {
+                d[0] = -1.0e-3f;
+                d[1] = 2.0e-3f;
+                d[2] = -0.5f;
             }
             for (r = 0; r < 3; r++) {
                 put_le_float(&directions[12 * v + 4 * r], d[r]);
@@ -122,6 +144,7 @@ TEST fused_sphere_stage_matches_the_general_path(void) {
         form->run((const float (*)[4])constants, &fused, VERTICES, form->key.live);
         for (v = 0; v < VERTICES; v++) {
             float d[3], st[2];
+            double exact[2];
 
             for (r = 0; r < 3; r++) {
                 const unsigned char *p = &directions[12 * v + 4 * r];
@@ -130,8 +153,21 @@ TEST fused_sphere_stage_matches_the_general_path(void) {
                 memcpy(&d[r], &bits, 4);
             }
             wl_nv2a_sphere_coordinates(d, st);
+            sphere_exact(d, exact);
             checked++;
-            if (words[v][3] != float_bits(st[0]) || words[v][4] != float_bits(st[1])) {
+            for (r = 0; r < 2; r++) {
+                float made;
+                uint32_t bits = words[v][3 + r];
+                double apart;
+
+                memcpy(&made, &bits, 4);
+                apart = round == 0 && (v == 1 || v == 2) ? 0.0 : fabs((double)made - exact[r]);
+                if (apart > largest) {
+                    largest = apart;
+                }
+            }
+            if (round == 0 && (v == 1 || v == 2) &&
+                (words[v][3] != float_bits(st[0]) || words[v][4] != float_bits(st[1]))) {
                 if (differing++ == 0) {
                     snprintf(detail, sizeof detail, "round %u vertex %u: fused %08x %08x, general %08x %08x", round, v,
                              (unsigned)words[v][3], (unsigned)words[v][4], (unsigned)float_bits(st[0]),
@@ -141,14 +177,16 @@ TEST fused_sphere_stage_matches_the_general_path(void) {
         }
     }
     if (differing != 0) {
-        printf("  %u of %u vertices differ; the first %s\n", differing, checked, detail);
+        printf("  %u of %u edge vertices differ; the first %s\n", differing, checked, detail);
     }
+    printf("  the coordinates %g apart at most\n", largest);
     ASSERT_EQ(0u, differing);
+    ASSERT(largest <= 1.0 / 4194304.0);
     PASS();
 }
 
 SUITE(xbox_vsh_fused) {
-    RUN_TEST(fused_sphere_stage_matches_the_general_path);
+    RUN_TEST(fused_sphere_stage_is_close_to_the_general_path);
 }
 
 GREATEST_MAIN_DEFS();
