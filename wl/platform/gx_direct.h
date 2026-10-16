@@ -104,7 +104,7 @@ enum {
 // The lit channels' light (WlGxDirectLayout.lit): channel n's value is
 // clamp(ambient + dot(normal_matrix * normal, direction[n]) * color[n], 0, 1) for each component it
 // has (a colour channel r, g, b, an alpha channel a; ambient that of COLOR0A0 or COLOR1A1), the dot
-// product signed (GX_DF_SIGN) and the direction of unit length (a light at infinity).
+// product signed (GX_DF_SIGNED) and the direction of unit length (a light at infinity).
 typedef struct WlGxDirectLighting {
     float normal_matrix[3][3];
     float direction[4][3];

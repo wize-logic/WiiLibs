@@ -175,7 +175,7 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
 
         for (n = 0; n < 4; n++) {
             if (layout->lit & (1u << n)) {
-                GX_SetChanCtrl(channels[n], GX_ENABLE, GX_SRC_REG, GX_SRC_REG, (u8)(GX_LIGHT0 << n), GX_DF_SIGN,
+                GX_SetChanCtrl(channels[n], GX_ENABLE, GX_SRC_REG, GX_SRC_REG, (u8)(GX_LIGHT0 << n), GX_DF_SIGNED,
                                GX_AF_NONE);
             } else {
                 GX_SetChanCtrl(channels[n], GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);

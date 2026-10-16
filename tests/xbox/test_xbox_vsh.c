@@ -332,8 +332,8 @@ TEST the_ilu_operations(void) {
     PASS();
 }
 
-// EXP, LOG and LIT's power by polynomials (not newlib's exp2f, log2f, powf): within an ulp or two of
-// libm's over the range, exact at whole powers of two, the exponent and mantissa exact
+// EXP, LOG and LIT's power by polynomials (not newlib's exp2f, log2f, powf): within an ulp or two
+// of libm's over the range, exact at whole powers of two, the exponent and mantissa exact
 TEST the_ilu_operations_are_near_libms(void) {
     float out[4], x, worst_exp = 0.0f, worst_log = 0.0f, worst_pow = 0.0f;
     int i;
