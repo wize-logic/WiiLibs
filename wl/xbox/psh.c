@@ -4254,5 +4254,6 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
 /* (a device that sets GX itself throughout tells WiiLibs' shadow of it
 when it is done) */
 void wl_xbox_psh_apply(const WlXboxPshProgram *program) {
-    wl_tev_apply_unchecked(&program->tev);
+    /* (what GX holds from the program before is not sent again) */
+    wl_tev_apply_unchecked_ex(&program->tev, WL_TEV_APPLY_CHANGES);
 }

@@ -4,6 +4,8 @@
 #include <string.h>
 
 #include "wl/platform/host/gx_direct_host.h"
+
+#include "wl/platform/gx_shadow.h"
 #include "wl/platform/host/gx_renderer_host.h"
 
 static WlHostGxDirect s;
@@ -313,11 +315,20 @@ void wl_gx_direct_texgen(unsigned n, WlGxDirectTexSource source, const float m[2
 }
 
 void wl_gx_direct_projection(const float m[4][4], bool orthographic) {
+    float value[17];
+
+    memcpy(value, m, 16 * sizeof(float));
+    value[16] = orthographic ? 1.0f : 0.0f;
+
+    (void)wl_gx_shadow_differs(WL_GX_SHADOW_PROJECTION, value, sizeof value); // (counted)
     memcpy(s.projection, m, sizeof s.projection);
     s.orthographic = orthographic;
 }
 
 void wl_gx_direct_viewport(float x, float y, float w, float h) {
+    const float value[4] = {x, y, w, h};
+
+    (void)wl_gx_shadow_differs(WL_GX_SHADOW_VIEWPORT, value, sizeof value); // (counted)
     s.viewport[0] = x;
     s.viewport[1] = y;
     s.viewport[2] = w;
@@ -325,6 +336,9 @@ void wl_gx_direct_viewport(float x, float y, float w, float h) {
 }
 
 void wl_gx_direct_scissor(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    const uint32_t value[4] = {x, y, w, h};
+
+    (void)wl_gx_shadow_differs(WL_GX_SHADOW_SCISSOR, value, sizeof value); // (counted)
     s.scissor[0] = x;
     s.scissor[1] = y;
     s.scissor[2] = w;
@@ -332,32 +346,50 @@ void wl_gx_direct_scissor(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 }
 
 void wl_gx_direct_blend(WlGxBlendMode mode, WlGxBlendFactor source, WlGxBlendFactor destination) {
+    const uint8_t value[3] = {(uint8_t)mode, (uint8_t)source, (uint8_t)destination};
+
+    (void)wl_gx_shadow_differs(WL_GX_SHADOW_BLEND, value, sizeof value); // (counted)
     s.blend_mode = mode;
     s.blend_source = source;
     s.blend_destination = destination;
 }
 
 void wl_gx_direct_zmode(bool test, WlGxCompare func, bool write) {
+    const uint8_t value[3] = {test, (uint8_t)func, write};
+
+    (void)wl_gx_shadow_differs(WL_GX_SHADOW_ZMODE, value, sizeof value); // (counted)
     s.z_test = test;
     s.z_func = func;
     s.z_write = write;
 }
 
 void wl_gx_direct_zcompare_early(bool early) {
+    const uint8_t value = early;
+
+    (void)wl_gx_shadow_differs(WL_GX_SHADOW_ZEARLY, &value, sizeof value); // (counted)
     s.z_early = early;
 }
 
 void wl_gx_direct_alpha_compare(WlGxCompare func, uint8_t ref) {
+    const uint8_t value[2] = {(uint8_t)func, ref};
+
+    (void)wl_gx_shadow_differs(WL_GX_SHADOW_ALPHA_COMPARE, value, sizeof value); // (counted)
     s.alpha_func = func;
     s.alpha_ref = ref;
 }
 
 void wl_gx_direct_color_update(bool color, bool alpha) {
+    const uint8_t value[2] = {color, alpha};
+
+    (void)wl_gx_shadow_differs(WL_GX_SHADOW_COLOR_UPDATE, value, sizeof value); // (counted)
     s.color_update = color;
     s.alpha_update = alpha;
 }
 
 void wl_gx_direct_cull(WlGxCull cull) {
+    const uint8_t value = (uint8_t)cull;
+
+    (void)wl_gx_shadow_differs(WL_GX_SHADOW_CULL, &value, sizeof value); // (counted)
     s.cull = cull;
 }
 
@@ -402,6 +434,7 @@ void wl_gx_direct_texture_invalidate(void) {
 
 void wl_gx_direct_stats(WlGxDirectStats *out) {
     *out = s.stats;
+    wl_gx_shadow_counts(&out->state_calls, &out->state_sent);
 }
 
 // ---- a renderer's own vertex formats ---------------------------------------------------------------

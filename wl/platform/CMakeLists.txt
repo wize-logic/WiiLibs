@@ -5,7 +5,7 @@
 #   host   - dependency-free stubs over POSIX and pthreads, so application code runs in host tests
 #   ppc-be - the host stubs too (big-endian Linux under qemu, for tests)
 add_library(wl_platform STATIC
-    mem_heap.c mem.c mem_census.c heap_overflow.c heap_sites.c ring.c io.c fs.c gx_common.c gx_target.c gx_vertex.c stack.c tev.c backtrace.c net.c
+    mem_heap.c mem.c mem_census.c heap_overflow.c heap_sites.c ring.c io.c fs.c gx_common.c gx_shadow.c gx_target.c gx_vertex.c stack.c tev.c backtrace.c net.c
     posix.c present.c video_mode.c profile.c profile_arm.c hwcount.c hwcount_app.c stop.c input_shape.c input_reports.c input_gesture.c shutdown.c gx_fifo.c audio_gain.c overlay.c file_replace.c dircache.c
     home_menu.c home_menu_draw.c strap_screen.c strap_screen_draw.c home_shell.c)
 wl_target_defaults(wl_platform)

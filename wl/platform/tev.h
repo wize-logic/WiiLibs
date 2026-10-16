@@ -316,6 +316,10 @@ void wl_tev_recipe(WlTevProgram *p, WlGxRecipe recipe);
 // The _ex forms take flags: WL_TEV_APPLY_SKIP_SWAPS leaves the swap tables alone (the caller set
 // them once with GX_SetTevSwapModeTable; the program's own p->swap is not written).
 #define WL_TEV_APPLY_SKIP_SWAPS 0x01u
+// WL_TEV_APPLY_CHANGES sends only what differs from the TEV as the last apply left it (gx_shadow.h:
+// forgotten by wl_gx_invalidate_shadow, which whatever sets the TEV behind it calls): a stage's
+// fields by call, the konsts, preloads, swap tables and stage count by value.
+#define WL_TEV_APPLY_CHANGES 0x02u
 WlResult wl_tev_apply(const WlTevProgram *p);
 WlResult wl_tev_apply_ex(const WlTevProgram *p, uint32_t flags);
 void wl_tev_apply_unchecked(const WlTevProgram *p);

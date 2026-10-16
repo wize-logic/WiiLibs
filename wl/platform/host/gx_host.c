@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "wl/platform/gx_shadow.h"
 #include "wl/platform/gx_target_internal.h"
 #include "wl/platform/host/gx_host.h"
 #include "wl/platform/host/gx_target_host.h"
@@ -332,7 +333,9 @@ bool wl_gx_frame_wait(uint32_t index) {
     return true;
 }
 
-void wl_gx_invalidate_shadow(void) {}
+void wl_gx_invalidate_shadow(void) {
+    wl_gx_shadow_forget();
+}
 
 void wl_gx_reset_state(void) {
     s.viewport[2] = 640;

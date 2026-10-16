@@ -33,6 +33,7 @@ wl_add_test(test_platform_tev SOURCES test_platform_tev.c LIBS wl_platform LABEL
 wl_add_test(test_platform_tev_gx
     SOURCES test_platform_tev_gx.c gx_stub/gx_stub.c
             ${PROJECT_SOURCE_DIR}/wl/platform/tev.c ${PROJECT_SOURCE_DIR}/wl/platform/wii/tev_wii.c
+            ${PROJECT_SOURCE_DIR}/wl/platform/gx_shadow.c
     LIBS wl_base LABELS unit be)
 target_include_directories(test_platform_tev_gx BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub)
 

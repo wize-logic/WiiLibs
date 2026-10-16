@@ -167,6 +167,9 @@ void wl_gx_direct_texture_invalidate(void);
 typedef struct WlGxDirectStats {
     uint32_t draws, vertices, flushes, layouts, textures;
     uint32_t textures_kept; // of the textures, the ones their map held already (the Wii's; not loaded)
+    // GX calls the state setters and wl_tev_apply asked for, and of those the ones sent (the rest
+    // GX held already: gx_shadow.h; counted alike on the host)
+    uint32_t state_calls, state_sent;
 } WlGxDirectStats;
 void wl_gx_direct_stats(WlGxDirectStats *out);
 

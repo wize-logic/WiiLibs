@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "greatest.h"
+#include "wl/platform/gx_shadow.h"
 #include "wl/platform/tev.h"
 
 // ---- the reference: wl_gx_set_recipe as it was before the recipes became programs ----------------
@@ -240,12 +241,53 @@ TEST skip_swaps_leaves_the_tables_to_the_caller(void) {
     PASS();
 }
 
+// WL_TEV_APPLY_CHANGES: a program GX holds sends nothing, one field changed sends its one call, and
+// whatever the order the programs come in, GX ends as a full apply of the last leaves it
+TEST changes_send_only_what_gx_does_not_hold(void) {
+    static const WlGxRecipe recipes[] = {WL_GX_RECIPE_TEX_MODULATE, WL_GX_RECIPE_VERTEX_COLOR,
+                                         WL_GX_RECIPE_TEX_REPLACE, WL_GX_RECIPE_TEX_MODULATE};
+    WlTevProgram p, q;
+    GxStub full;
+    unsigned i;
+
+    wl_tev_recipe(&p, WL_GX_RECIPE_TEX_MODULATE);
+    gx_stub_reset();
+    wl_gx_shadow_forget();
+    wl_tev_apply_unchecked_ex(&p, WL_TEV_APPLY_CHANGES);
+    ASSERT(g_gx_stub.calls > 0u);
+    g_gx_stub.calls = 0;
+    wl_tev_apply_unchecked_ex(&p, WL_TEV_APPLY_CHANGES);
+    ASSERT_EQ(0u, g_gx_stub.calls);
+    q = p;
+    q.stages[0].color.in[0] = WL_TEV_CC_HALF;
+    wl_tev_apply_unchecked_ex(&q, WL_TEV_APPLY_CHANGES);
+    ASSERT_EQ(1u, g_gx_stub.calls);
+    ASSERT_EQ(GX_CC_HALF, g_gx_stub.stage[0].cin[0]);
+    // (forgotten: everything again)
+    g_gx_stub.calls = 0;
+    wl_gx_shadow_forget();
+    wl_tev_apply_unchecked_ex(&q, WL_TEV_APPLY_CHANGES);
+    ASSERT(g_gx_stub.calls > 1u);
+    // a sequence of programs: GX as the last one's full apply left it
+    for (i = 0; i < sizeof recipes / sizeof recipes[0]; i++) {
+        wl_tev_recipe(&p, recipes[i]);
+        p.stages[0].kcsel = (uint8_t)(WL_TEV_KSEL_1 + (i & 1u));
+        wl_tev_apply_unchecked_ex(&p, WL_TEV_APPLY_CHANGES);
+    }
+    memcpy(&full, &g_gx_stub, sizeof full);
+    wl_tev_apply_unchecked(&p);
+    full.calls = g_gx_stub.calls;
+    ASSERT_MEM_EQ(&full, &g_gx_stub, sizeof full);
+    PASS();
+}
+
 SUITE(tev_gx_suite) {
     RUN_TEST(recipes_leave_gx_as_the_hand_written_code_did);
     RUN_TEST(apply_writes_every_field);
     RUN_TEST(apply_refuses_an_invalid_program);
     RUN_TEST(unused_swap_tables_are_left_alone);
     RUN_TEST(skip_swaps_leaves_the_tables_to_the_caller);
+    RUN_TEST(changes_send_only_what_gx_does_not_hold);
 }
 
 GREATEST_MAIN_DEFS();

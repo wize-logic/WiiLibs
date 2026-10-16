@@ -3,6 +3,7 @@
 // so a stage's fields go to the calls as they are. Only this directory may include <ogc/*.h>.
 #include <ogc/gx.h>
 
+#include "wl/platform/gx_shadow.h"
 #include "wl/platform/tev.h"
 
 _Static_assert(WL_TEV_CC_CPREV == GX_CC_CPREV && WL_TEV_CC_APREV == GX_CC_APREV && WL_TEV_CC_C0 == GX_CC_C0 &&
@@ -55,36 +56,57 @@ static GXColor unpack(uint32_t rgba) {
 }
 
 void wl_tev_apply_unchecked_ex(const WlTevProgram *p, uint32_t flags) {
-    uint32_t swaps_used = 0;
-    for (uint32_t i = 0; i < p->stage_count; i++) {
-        swaps_used |= (1u << p->stages[i].ras_swap) | (1u << p->stages[i].tex_swap);
-    }
+    WlTevSend send;
+
+    // (what to send: everything, or with WL_TEV_APPLY_CHANGES what GX does not hold already)
+    wl_tev_shadow_plan(p, flags, &send);
     for (u8 t = 0; t < WL_TEV_SWAP_TABLES; t++) {
-        if ((flags & WL_TEV_APPLY_SKIP_SWAPS) == 0 && (swaps_used & (1u << t)) != 0) {
+        if ((send.swaps & (1u << t)) != 0) {
             GX_SetTevSwapModeTable(t, p->swap[t][0], p->swap[t][1], p->swap[t][2], p->swap[t][3]);
         }
     }
     for (u8 k = 0; k < WL_TEV_KONST_SLOTS; k++) {
-        if ((p->konst_mask & (1u << k)) != 0) {
+        if ((send.konst & (1u << k)) != 0) {
             GX_SetTevKColor((u8)(GX_KCOLOR0 + k), unpack(p->konst[k]));
         }
     }
     for (u8 r = 0; r < WL_TEV_REG_COUNT; r++) {
-        if ((p->preload_mask & (1u << r)) != 0) {
+        if ((send.preload & (1u << r)) != 0) {
             GX_SetTevColor(r, unpack(p->preload[r]));
         }
     }
-    GX_SetNumTevStages(p->stage_count);
+    if (send.stage_count) {
+        GX_SetNumTevStages(p->stage_count);
+    }
     for (u8 i = 0; i < p->stage_count; i++) {
         const WlTevStage *s = &p->stages[i];
-        u8 st = (u8)(GX_TEVSTAGE0 + i);
-        GX_SetTevOrder(st, s->texcoord, s->texmap, s->channel);
-        GX_SetTevSwapMode(st, s->ras_swap, s->tex_swap);
-        GX_SetTevKColorSel(st, s->kcsel);
-        GX_SetTevKAlphaSel(st, s->kasel);
-        GX_SetTevColorIn(st, s->color.in[0], s->color.in[1], s->color.in[2], s->color.in[3]);
-        GX_SetTevColorOp(st, s->color.op, s->color.bias, s->color.scale, s->color.clamp, s->color.dest);
-        GX_SetTevAlphaIn(st, s->alpha.in[0], s->alpha.in[1], s->alpha.in[2], s->alpha.in[3]);
-        GX_SetTevAlphaOp(st, s->alpha.op, s->alpha.bias, s->alpha.scale, s->alpha.clamp, s->alpha.dest);
+        u8 st = (u8)(GX_TEVSTAGE0 + i), calls = send.stages[i];
+        if (calls == 0) {
+            continue;
+        }
+        if (calls & WL_TEV_SEND_ORDER) {
+            GX_SetTevOrder(st, s->texcoord, s->texmap, s->channel);
+        }
+        if (calls & WL_TEV_SEND_SWAP) {
+            GX_SetTevSwapMode(st, s->ras_swap, s->tex_swap);
+        }
+        if (calls & WL_TEV_SEND_KCSEL) {
+            GX_SetTevKColorSel(st, s->kcsel);
+        }
+        if (calls & WL_TEV_SEND_KASEL) {
+            GX_SetTevKAlphaSel(st, s->kasel);
+        }
+        if (calls & WL_TEV_SEND_COLOR_IN) {
+            GX_SetTevColorIn(st, s->color.in[0], s->color.in[1], s->color.in[2], s->color.in[3]);
+        }
+        if (calls & WL_TEV_SEND_COLOR_OP) {
+            GX_SetTevColorOp(st, s->color.op, s->color.bias, s->color.scale, s->color.clamp, s->color.dest);
+        }
+        if (calls & WL_TEV_SEND_ALPHA_IN) {
+            GX_SetTevAlphaIn(st, s->alpha.in[0], s->alpha.in[1], s->alpha.in[2], s->alpha.in[3]);
+        }
+        if (calls & WL_TEV_SEND_ALPHA_OP) {
+            GX_SetTevAlphaOp(st, s->alpha.op, s->alpha.bias, s->alpha.scale, s->alpha.clamp, s->alpha.dest);
+        }
     }
 }

@@ -849,11 +849,16 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
            (unsigned)info.stats.words, (unsigned)info.stats.methods);
     {
         WlGxStats xs;
+        WlGxDirectStats ds;
 
         wl_gx_stats(&xs);
+        wl_gx_direct_stats(&ds);
         printf("bench: GX syncs a frame: %.2f processor waits for GX, %.2f copies out of the EFB (GX's own pixel "
                "sync after each)\n", (double)xs.gpu_waits / ((double)runs * frames),
                (double)xs.efb_copies / ((double)runs * frames));
+        printf("bench: GX state calls a draw (setters and TEV): %.2f asked, %.2f sent (the rest GX held)\n",
+               (double)ds.state_calls / ((double)runs * (info.stats.draws != 0 ? info.stats.draws : 1u)),
+               (double)ds.state_sent / ((double)runs * (info.stats.draws != 0 ? info.stats.draws : 1u)));
     }
     {
         WlNv2aGxStats gs;

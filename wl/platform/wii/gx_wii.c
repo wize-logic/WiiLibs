@@ -19,6 +19,7 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "wl/platform/gx_shadow.h"
 #include "wl/platform/gx_target_internal.h"
 #include "wl/platform/hwcount.h"
 #include "wl/platform/mem.h"
@@ -177,6 +178,7 @@ static bool need(uint32_t bit, bool same) {
     }
     g.known |= bit;
     g.stats.state_writes++;
+    wl_gx_shadow_forget(); // (the direct layer's and the TEV's shadow: GX set behind them)
     return true;
 }
 
@@ -305,6 +307,7 @@ void wl_gx_stats(WlGxStats *out) {
 
 void wl_gx_invalidate_shadow(void) {
     g.known = 0;
+    wl_gx_shadow_forget();
     wl_gx_wii_texmaps_forget(0xFFu);
     g.nrm_valid = false;
     memset(g.tlut, 0, sizeof g.tlut);

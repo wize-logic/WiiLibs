@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "wl/platform/gx_direct.h"
+#include "wl/platform/gx_shadow.h"
 
 // the write-gather pipe's stores (gx_pipe_words.h): the pipe read once for a call
 #define WL_PIPE_T WGPipe *
@@ -365,41 +366,88 @@ void wl_gx_direct_texgen(unsigned n, WlGxDirectTexSource source, const float m[2
 
 void wl_gx_direct_projection(const float m[4][4], bool orthographic) {
     Mtx44 matrix;
+    float value[17];
 
+    memcpy(value, m, 16 * sizeof(float));
+    value[16] = orthographic ? 1.0f : 0.0f;
+
+    if (!wl_gx_shadow_differs(WL_GX_SHADOW_PROJECTION, value, sizeof value)) {
+        return;
+    }
     memcpy(matrix, m, sizeof matrix);
     GX_LoadProjectionMtx(matrix, orthographic ? GX_ORTHOGRAPHIC : GX_PERSPECTIVE);
 }
 
 void wl_gx_direct_viewport(float x, float y, float w, float h) {
+    const float value[4] = {x, y, w, h};
+
+    if (!wl_gx_shadow_differs(WL_GX_SHADOW_VIEWPORT, value, sizeof value)) {
+        return;
+    }
     GX_SetViewport(x, y, w, h, 0.0f, 1.0f);
 }
 
 void wl_gx_direct_scissor(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    const uint32_t value[4] = {x, y, w, h};
+
+    if (!wl_gx_shadow_differs(WL_GX_SHADOW_SCISSOR, value, sizeof value)) {
+        return;
+    }
     GX_SetScissor(x, y, w, h);
 }
 
 void wl_gx_direct_blend(WlGxBlendMode mode, WlGxBlendFactor source, WlGxBlendFactor destination) {
+    const uint8_t value[3] = {(uint8_t)mode, (uint8_t)source, (uint8_t)destination};
+
+    if (!wl_gx_shadow_differs(WL_GX_SHADOW_BLEND, value, sizeof value)) {
+        return;
+    }
     GX_SetBlendMode((u8)mode, (u8)source, (u8)destination, GX_LO_CLEAR);
 }
 
 void wl_gx_direct_zmode(bool test, WlGxCompare func, bool write) {
+    const uint8_t value[3] = {test, (uint8_t)func, write};
+
+    if (!wl_gx_shadow_differs(WL_GX_SHADOW_ZMODE, value, sizeof value)) {
+        return;
+    }
     GX_SetZMode(test ? GX_TRUE : GX_FALSE, (u8)func, write ? GX_TRUE : GX_FALSE);
 }
 
 void wl_gx_direct_zcompare_early(bool early) {
+    const uint8_t value = early;
+
+    if (!wl_gx_shadow_differs(WL_GX_SHADOW_ZEARLY, &value, sizeof value)) {
+        return;
+    }
     GX_SetZCompLoc(early ? GX_TRUE : GX_FALSE);
 }
 
 void wl_gx_direct_alpha_compare(WlGxCompare func, uint8_t ref) {
+    const uint8_t value[2] = {(uint8_t)func, ref};
+
+    if (!wl_gx_shadow_differs(WL_GX_SHADOW_ALPHA_COMPARE, value, sizeof value)) {
+        return;
+    }
     GX_SetAlphaCompare((u8)func, ref, GX_AOP_AND, GX_ALWAYS, 0);
 }
 
 void wl_gx_direct_color_update(bool color, bool alpha) {
+    const uint8_t value[2] = {color, alpha};
+
+    if (!wl_gx_shadow_differs(WL_GX_SHADOW_COLOR_UPDATE, value, sizeof value)) {
+        return;
+    }
     GX_SetColorUpdate(color ? GX_TRUE : GX_FALSE);
     GX_SetAlphaUpdate(alpha ? GX_TRUE : GX_FALSE);
 }
 
 void wl_gx_direct_cull(WlGxCull cull) {
+    const uint8_t value = (uint8_t)cull;
+
+    if (!wl_gx_shadow_differs(WL_GX_SHADOW_CULL, &value, sizeof value)) {
+        return;
+    }
     GX_SetCullMode((u8)cull);
 }
 
@@ -452,4 +500,5 @@ void wl_gx_direct_texture_invalidate(void) {
 void wl_gx_direct_stats(WlGxDirectStats *out) {
     *out = d.stats;
     out->flushes = wl_gx_direct_flushes();
+    wl_gx_shadow_counts(&out->state_calls, &out->state_sent);
 }
