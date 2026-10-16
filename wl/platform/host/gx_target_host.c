@@ -110,7 +110,7 @@ void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, 
     if (r != NULL && r->restore != NULL) {
         r->restore(r->user, colour, depth, w, h);
     }
-    quad_state(back_w, back_h, true, true, true, true);
+    quad_state(back_w, back_h, true, true, depth != NULL, depth != NULL);
 }
 
 void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int x, int y, int rw, int rh,

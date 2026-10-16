@@ -23,7 +23,7 @@ void wl_gx_target_be_copy_end(void);
 void wl_gx_target_be_scissor(uint32_t w, uint32_t h);
 // The parked colour (RGBA8) and depth (Z24X8), `w` by `h` from the EFB's origin, written back over the
 // EFB by a quad of that part of a `back_w` by `back_h` back buffer, depth test always passing and
-// writing. Leaves the viewport and projection over the whole back buffer, as a clear does.
+// writing; `depth` NULL: the colour alone (the EFB's depth left as it is, no depth test or write). Leaves the viewport and projection over the whole back buffer, as a clear does.
 void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, uint32_t h, uint32_t back_w,
                              uint32_t back_h);
 // A clear quad, as wl_gx_target_clear describes (z already clamped); `w`, `h` the back buffer's size.

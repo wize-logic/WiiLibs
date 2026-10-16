@@ -1241,6 +1241,9 @@ static void on_restore(void *user, const void *colour, const void *depth, uint32
             px[1] = c[o + 32u + k * 2u];
             px[2] = c[o + 32u + k * 2u + 1u];
             efb_store(&g.color[i * 4u], px, true, true);
+            if (d == NULL) {
+                continue;
+            }
             g.depth[i] = (uint32_t)d[o + k * 2u + 1u] << 16 | (uint32_t)d[o + 32u + k * 2u] << 8 |
                          (uint32_t)d[o + 32u + k * 2u + 1u];
         }

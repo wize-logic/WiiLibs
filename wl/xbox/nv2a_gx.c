@@ -254,6 +254,9 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     wl_xbox_psh_cache_init(&gx->psh, gx->cfg.recipe != NULL ? &gx->recipe : NULL);
     wl_gx_set_efb_alpha(!gx->cfg.no_efb_alpha);
     wl_gx_target_set_back_buffer_size(gx->cfg.width, gx->cfg.height);
+    // (the back buffer's depth parked only for a target drawn with depth writes: states_apply says
+    // so; Halo's shadows and their blur have no depth buffer, and cost one EFB copy fewer each)
+    wl_gx_target_set_lazy_depth(true);
     wl_gx_set_frame_overlap(gx->cfg.overlap);
     gx->cull_positive = WL_GX_CULL_BACK;
     gx->fit_b = 0.0f;
@@ -634,6 +637,9 @@ static bool states_apply(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aSurfac
     wl_gx_direct_blend(mode, source, destination);
     wl_gx_direct_color_update((mask & 0x00010101u) != 0, (mask & 0x01000000u) != 0);
     // (no depth buffer: no depth test and no writes; no writes without the test, as the NV2A)
+    if (depth_test && wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_MASK) != 0 && gx->owner != NULL) {
+        wl_gx_target_depth_write();
+    }
     wl_gx_direct_zmode(depth_test, wl_nv2a_gx_compare(wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_FUNC)),
                        depth_test && wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_MASK) != 0);
     if (alpha_test) {

@@ -48,6 +48,7 @@ typedef struct {
     uint32_t skipped;   // targets left without a copy (no memory, a format or size that has none)
     uint32_t clears;    // wl_gx_target_clear quads
     uint32_t squeezes;  // wl_gx_target_squeeze: finished pictures narrowed
+    uint32_t depths;    // back buffer depths parked (each park's, or with lazy depth only those a target wrote over)
 } WlGxTargetStats;
 
 // Whether a target can be resolved at all in a back buffer of `back_w` by `back_h` pixels, and the
@@ -96,6 +97,16 @@ const WlGxTarget *wl_gx_target_current(void);
 // back buffer is put back. NULL when nothing is parked. For a caller that reads the picture it
 // was drawing as a texture while drawing into a target.
 const void *wl_gx_target_parked_colour(uint32_t *w, uint32_t *h);
+// Lazy depth (off by default): a park copies the back buffer's colour alone, and its depth only when
+// a target is about to write depth (wl_gx_target_depth_write), so that targets drawn without a depth
+// test (a shadow's picture, a blur) cost one copy out of the EFB fewer and a put-back without a Z
+// texture. A caller that turns it on calls wl_gx_target_depth_write before every draw that writes
+// depth into a target (wl_gx_target_clear does it for its own).
+void wl_gx_target_set_lazy_depth(bool on);
+// With lazy depth: the next draw writes depth into the target that owns the EFB. The back buffer's
+// depth is parked first if it is not yet (it is still in the EFB: no target has written depth since
+// the park). Nothing for the back buffer, without a park, or once it is parked.
+void wl_gx_target_depth_write(void);
 // The caller is drawing into the owner now. Only the back buffer's is recorded: it decides whether
 // a target taking the EFB parks it.
 void wl_gx_target_drawn(void);
