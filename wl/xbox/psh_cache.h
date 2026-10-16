@@ -14,8 +14,12 @@ enum {
     /* the constants a program can read: c0 and c1 of each combiner stage,
     the final combiner's two, and the fog's colour */
     WL_XBOX_PSH_CACHE_SLOTS = 19,
-    WL_XBOX_PSH_CACHE_SETS = 32,
-    WL_XBOX_PSH_CACHE_WAYS = 4,
+    /* 512 programs (about 1 KB each): a scene of Halo's draws with up to 150
+    structures and constant sets, and 32 sets of 4 pushed them out of each
+    other (an evicted structure is translated three times again, its trials
+    with it) */
+    WL_XBOX_PSH_CACHE_SETS = 64,
+    WL_XBOX_PSH_CACHE_WAYS = 8,
     /* the structures pushed out of the cache, remembered by their hash to
     count those translated again */
     WL_XBOX_PSH_CACHE_EVICTED_HASHES = 256

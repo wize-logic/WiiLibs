@@ -49,8 +49,10 @@ enum {
     /* the translations with other constants that make a structure generic */
     GENERIC_TRIALS = 2,
     /* a generic program's changes translated again to check them: the first,
-    then one in this many */
-    AUDIT_INTERVAL = 32,
+    then one in this many (no audit has differed in Halo's captures, and at
+    one in 32 they were most of what was translated once the programs were
+    kept: a model's fog and change colours change for each object) */
+    AUDIT_INTERVAL = 256,
 
     _register_v0 = 4,
     _register_v1 = 5,
