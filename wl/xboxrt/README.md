@@ -372,7 +372,7 @@ The steps (play.h lists them with their arguments): `wait`, `frames`, `vblanks`;
 `down`/`up`/`release`, `stick`, `trigger`; `screen`, `focus`, `select`, `play`, `ticks`,
 `checkpoint`, `until <predicate>`, `memory <address>[:size] [&mask] <op> <value>`, `peek`;
 `do <action>`, `load <map>`; `bot`, `look`; a title's long steps (`objective 3600`); `log`,
-`screenshot`, `capture`; `player <n>`, `<n>: <step>`, `connect`, `disconnect`, `bot <n> <seed>`;
+`screenshot`, `shot` (the Wii: the picture the console drew, a BMP in `shots/`), `capture`; `player <n>`, `<n>: <step>`, `connect`, `disconnect`, `bot <n> <seed>`;
 `repeat`/`end`; `quit`. Durations are seconds, `<n>f` frames or `<n>t` the title's ticks; a wait
 gives up at its timeout (120 s unless given) and stops the script. Every line it logs starts with
 `test_input:` (tag `play`): each step as it begins with the script's clock, what the title reports
@@ -492,7 +492,7 @@ guest RAM's size.
 | `noxf` | GX's transform unit is kept out of the vertices (every vertex through the program on the processor), for an A/B; `WL_XB_NO_XF` on the host |
 | `vcache` | the vertex arrays' cache size in KB, its text (1024 when empty); the default is 1 MB, kept in the end of the textures' arena |
 | `novcache` | turns the vertex arrays' cache off (beats `vcache`) |
-| `gxnotex`, `gxnotlut`, `gxtlutmem1`, `gxmaxdraws`, `gxnoquad`, `gxnozrestore`, `gxnocopy`, `gxtexgap` | the Wii only: work left out of what GX gets, to find what hangs a console's GPU by halving (`wl/platform/gx_direct.h`, `WlGxBisect`): every texture one fixed 4x4 texture; the C4/C8 ones only (no TLUT loads); the TLUTs loaded from copies in MEM1; a frame's first N primitives only (`gxmaxdraws=N`); no quad of the targets; the back buffer put back without its Z texture; no texture copy out of the EFB; the vertex's texture coordinates in the descriptor's slots of their own names, gaps and all (TEX0, TEX2, TEX3: the layout that hung a console's GPU, now sent in the first slots). The boot logs the ones on |
+| `gxnotex`, `gxnotlut`, `gxtlutmem1`, `gxmaxdraws`, `gxnoquad`, `gxnozrestore`, `gxnocopy`, `gxtexgap`, `gxlatez`, `gxvtxinv` | the Wii only: work left out of what GX gets, to find what hangs a console's GPU by halving (`wl/platform/gx_direct.h`, `WlGxBisect`): every texture one fixed 4x4 texture; the C4/C8 ones only (no TLUT loads); the TLUTs loaded from copies in MEM1; a frame's first N primitives only (`gxmaxdraws=N`); no quad of the targets; the back buffer put back without its Z texture; no texture copy out of the EFB; the vertex's texture coordinates in the descriptor's slots of their own names, gaps and all (TEX0, TEX2, TEX3: the layout that hung a console's GPU, now sent in the first slots); the depth test never early (no `GX_SetZCompLoc(GX_TRUE)`); GX's vertex cache invalidated before every primitive. The boot logs the ones on |
 | `overlap` | the processor goes on with the next frame while GX draws (by default each frame's end waits for GX to finish it: the caches' frame-late reuse still shows stale content in some frames); `WL_XB_OVERLAP` on the host |
 | `noaudio` | the idle APU and AC'97 (DirectSound fails, the title runs silent), for an A/B; `WL_XB_AUDIO=0` on the host |
 | `deterministic` | the virtual clock (`thread.h`'s deterministic mode), so a run of a script on the Wii is the same game as the host's with `WL_XB_DETERMINISTIC=1`: guest RAM (the play step `dump`) and captures compare byte for byte; `WL_XB_DETERMINISTIC` on the host |

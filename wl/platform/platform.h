@@ -438,6 +438,14 @@ static inline float wl_gx_ramp_coordinate(float value) {
 // since the last present like wl_platform_video_present.
 void wl_gx_begin_frame(uint32_t clear_rgba);
 uint32_t wl_gx_end_frame(void);
+// The picture the console drew, for a screenshot on it: the wl_gx_end_frame after the request copies
+// the finished EFB (overlay drawn, before the pillarbox narrowing) into `dst` as GX's RGBA8 tiles,
+// WlVideoInfo's fb_width by efb_height (32-byte aligned, wl_gx_tex_bytes(WL_GX_TEX_RGBA8, w, h) bytes),
+// and wl_gx_shot_done turns true once the GPU has written it. Either may be called from any thread;
+// a request while one is pending replaces it. Until requested it costs end_frame one pointer test.
+// The host takes none (its screenshots are wl/gxsoft's): wl_gx_shot_done stays false there.
+void wl_gx_shot_request(void *dst);
+bool wl_gx_shot_done(void);
 // (On a 16:9 console setting with WL_WIDESCREEN_PILLARBOX, wl_gx_end_frame narrows the finished picture,
 // overlay included, into the middle three quarters of the framebuffer, black around it, before the display
 // copy (wl_gx_target_squeeze): one EFB copy of 640x480 and one filtered quad a frame, and 1.2 MiB from the

@@ -174,6 +174,9 @@ typedef struct {
     // the texture coordinates in the vertex descriptor's slots of their own names, gaps and all
     // (TEX0, TEX2, TEX3), as before they were sent in its first slots: the hang of such draws back
     bool texcoord_gaps;
+    // the depth on a console (a10's light beams and characters through walls, the Wii only):
+    bool late_z;    // the depth test always after texturing (GX_SetZCompLoc(GX_FALSE): no early Z)
+    bool vtx_inval; // GX's vertex cache invalidated before every primitive (stale indexed vertices)
 } WlGxBisect;
 void wl_gx_bisect_set(const WlGxBisect *bisect);
 // The switches set (all off before wl_gx_bisect_set).

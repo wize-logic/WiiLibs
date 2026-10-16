@@ -309,7 +309,8 @@ static const char *play_setting(const WlXbTitleConfig *cfg) {
 // loaded from copies in MEM1; "gxmaxdraws" (its text N): only a frame's first N primitives;
 // "gxnoquad": no quad of the targets; "gxnozrestore": the back buffer's restore without its depth;
 // "gxnocopy": no texture copy out of the EFB; "gxtexgap": the vertex's texture coordinates in the
-// descriptor's slots of their own names, gaps and all (the layout that hung).
+// descriptor's slots of their own names, gaps and all (the layout that hung); "gxlatez": no early depth
+// test; "gxvtxinv": GX's vertex cache invalidated before every primitive.
 static bool title_flag(const WlXbTitleConfig *cfg, const char *name, uint32_t *value) {
     char flag[WL_FS_PATH_MAX];
     WlPlatformFile *f = NULL;
@@ -341,12 +342,15 @@ static void gx_bisect_options(const WlXbTitleConfig *cfg) {
     b.no_z_restore = title_flag(cfg, "gxnozrestore", NULL);
     b.no_copies = title_flag(cfg, "gxnocopy", NULL);
     b.texcoord_gaps = title_flag(cfg, "gxtexgap", NULL);
+    b.late_z = title_flag(cfg, "gxlatez", NULL);
+    b.vtx_inval = title_flag(cfg, "gxvtxinv", NULL);
     if (b.no_textures || b.no_tlut || b.tlut_mem1 || b.max_draws != 0 || b.no_quads || b.no_z_restore ||
-        b.no_copies || b.texcoord_gaps) {
-        WL_LOG_W(TAG, "GX bisection:%s%s%s max draws %u%s%s%s%s", b.no_textures ? " gxnotex" : "",
+        b.no_copies || b.texcoord_gaps || b.late_z || b.vtx_inval) {
+        WL_LOG_W(TAG, "GX bisection:%s%s%s max draws %u%s%s%s%s%s%s", b.no_textures ? " gxnotex" : "",
                  b.no_tlut ? " gxnotlut" : "", b.tlut_mem1 ? " gxtlutmem1" : "", (unsigned)b.max_draws,
                  b.no_quads ? " gxnoquad" : "", b.no_z_restore ? " gxnozrestore" : "",
-                 b.no_copies ? " gxnocopy" : "", b.texcoord_gaps ? " gxtexgap" : "");
+                 b.no_copies ? " gxnocopy" : "", b.texcoord_gaps ? " gxtexgap" : "", b.late_z ? " gxlatez" : "",
+                 b.vtx_inval ? " gxvtxinv" : "");
     }
     wl_gx_bisect_set(&b);
 }

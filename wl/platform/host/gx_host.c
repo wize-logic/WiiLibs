@@ -395,6 +395,14 @@ void wl_gx_set_overlay(WlGxOverlayFn fn, void *user) {
     g_overlay = fn;
 }
 
+void wl_gx_shot_request(void *dst) {
+    (void)dst; // (the host's screenshots are wl/gxsoft's)
+}
+
+bool wl_gx_shot_done(void) {
+    return false;
+}
+
 uint32_t wl_gx_end_frame(void) {
     wl_gx_target_frame_ending();
     if (g_overlay != NULL) {

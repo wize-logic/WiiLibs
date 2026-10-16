@@ -443,6 +443,23 @@ void wl_gx_set_overlay(WlGxOverlayFn fn, void *user) {
     g.overlay = fn;
 }
 
+// A screenshot asked for (wl_gx_shot_request): its destination until an end_frame takes it, then that
+// frame's token, which the copy is done behind.
+static void *volatile g_shot_request;
+static volatile bool g_shot_sent;
+static volatile uint32_t g_shot_token;
+
+static void copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat fmt, bool clear, bool invalidate);
+
+void wl_gx_shot_request(void *dst) {
+    g_shot_sent = false;
+    g_shot_request = dst;
+}
+
+bool wl_gx_shot_done(void) {
+    return g_shot_sent && token_passed(g_shot_token);
+}
+
 uint32_t wl_gx_end_frame(void) {
     WL_ASSERT(g.ready);
     VCHECK(g.in_frame, "end_frame outside a frame");
@@ -452,6 +469,12 @@ uint32_t wl_gx_end_frame(void) {
         wl_gx_reset_state();
         g.overlay(g.overlay_user, g.fb_w, g.efb_h);
         wl_gx_reset_state();
+    }
+    void *shot = g_shot_request;
+    if (shot != NULL) {
+        // (the finished picture as the console drew it, before the narrowing: a screenshot)
+        g_shot_request = NULL;
+        copy_efb_texture(0, 0, (int)g.fb_w, (int)g.efb_h, shot, WL_GX_TEX_RGBA8, false, true);
     }
     if (g.pillar_w != 0u) {
         // (a 4:3 picture on a 16:9 screen: narrowed into the middle three quarters, with the bars black; the
@@ -493,6 +516,10 @@ uint32_t wl_gx_end_frame(void) {
     // the next frame's commands queue behind the copy at once.
     uint32_t t = send_token();
     g.frame_token[g.stats.frames % FRAME_FENCES] = t;
+    if (shot != NULL) {
+        g_shot_token = t;
+        g_shot_sent = true;
+    }
     wl_gx_wii_hang_event('E', g.stats.frames, t);
     if (g.overlap) {
         // (the GPU at most this one frame behind: the frame before it retired, as a double-buffered
