@@ -796,9 +796,11 @@ static void psh_cache_line(const char *prefix) {
 
     wl_nv2a_gx_psh_counts(g_gx, &pc);
     printf("%spixel programs: %lu translated (%lu beyond GX), %lu found, %lu patched; %lu trials (%lu differed, "
-           "%lu generic), %lu audits (%lu differed), %lu evicted, %lu translated again after eviction\n",
+           "%lu generic, %lu folded), %lu audits (%lu differed), %lu evicted, %lu translated again after eviction; "
+           "%lu for constants of structures not generic (%lu of them evicted)\n",
            prefix, pc.translated, pc.unusable, pc.found, pc.patched, pc.tests, pc.tests_differ, pc.generic,
-           pc.audited, pc.audits_differ, pc.evicted, pc.again);
+           pc.folded, pc.audited, pc.audits_differ, pc.evicted, pc.again, pc.constant_sets,
+           pc.constant_sets_evicted);
 }
 
 static void texture_cache_line(const char *prefix) {

@@ -155,6 +155,10 @@ typedef struct WlXboxPshProgram {
     or mapping that did not fit */
     bool approximate;
     const char *approximation;
+    /* a value worked out from two constants (a dot product's, or a constant's
+    channels summed) and held as such: the program changes with its constants
+    beyond the konst colours that hold them (psh_cache.h) */
+    bool folded;
 } WlXboxPshProgram;
 
 /* A program made by hand for combiners the caller recognizes, tried before
@@ -174,6 +178,16 @@ when the combiners need more than GX has (the program is then not usable;
 its reason says why). */
 bool wl_xbox_psh_translate(const uint32_t *state, const WlXboxPshTextures *textures,
                            const WlXboxPshRecipe *recipe, WlXboxPshProgram *program);
+/* The same, by the way (*way) a translation of the same combiners and textures took before.
+A translation tries the combiners several ways and takes the first exact program, else the
+first approximated one; which way that is turns on the combiners, the textures and which
+constants are 0, 1 or equal, not on the constants' other values (except a program folded,
+which a caller does not ask this of). *way < 0: the translation tries every way, as
+wl_xbox_psh_translate, and sets *way to the one taken; else that way alone is tried, and every
+way only when it is not usable or not as exact as before (*way is then set again). */
+bool wl_xbox_psh_translate_by_way(const uint32_t *state, const WlXboxPshTextures *textures,
+                                  const WlXboxPshRecipe *recipe, WlXboxPshProgram *program,
+                                  int *way);
 /* the stages to GX (their swap tables, konst colours and preloads too),
 without WiiLibs' shadow of GX's state (wl_tev_apply_unchecked) */
 void wl_xbox_psh_apply(const WlXboxPshProgram *program);

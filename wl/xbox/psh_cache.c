@@ -19,6 +19,15 @@
 // differed: a structure that differs is not generic from then on). A structure that is not
 // generic is kept for each set of its constants, as before.
 //
+// A structure is not generic when its translation folded constants into one (the program says
+// so: a dot product of two constants, worked out); a guess from the combiners alone (a dot
+// product whose inputs might hold constants) took most of Halo's model shaders for such, and
+// each object's colours were translated again. A program beyond the konst registers is not
+// generic either (the nearest constant stands in for the rest, by value); its sets of
+// constants, new for nearly every object, are translated the way the structure's translation
+// took (wl_xbox_psh_translate_by_way), one try instead of every way. In a set, entries for
+// constants are pushed out before structures.
+//
 // Every constant counts, whether or not a combiner names it (a recipe may read some no combiner
 // input does): one a game left from another shader changes the program's constants, not its
 // structure, while its signature holds.
@@ -52,12 +61,7 @@ enum {
     then one in this many (no audit has differed in Halo's captures, and at
     one in 32 they were most of what was translated once the programs were
     kept: a model's fog and change colours change for each object) */
-    AUDIT_INTERVAL = 256,
-
-    _register_v0 = 4,
-    _register_v1 = 5,
-    _register_t0 = 8,
-    _register_t3 = 11,
+    AUDIT_INTERVAL = 256
 };
 
 /* ---------- private code */
@@ -305,53 +309,6 @@ static void constants_patch(const WlXboxPshCacheEntry *entry, WlXboxPshProgram *
     }
 }
 
-/* whether a combiner input may read a constant: anything but a colour or a
-texture of all four channels, until a stage writes it (written: bit n,
-register n) */
-static bool input_constant(unsigned long input, unsigned long written,
-                           const WlXboxPshTextures *textures) {
-    unsigned long reg = input & 0x0f;
-
-    if (written & (1UL << reg))
-        return true;
-    if (reg == _register_v0 || reg == _register_v1)
-        return false;
-    if (reg >= _register_t0 && reg <= _register_t3)
-        return !(textures->present & (1U << (reg - _register_t0))) ||
-               textures->contents[reg - _register_t0] != WL_XBOX_PSH_TEXTURE_ALL;
-    return true;
-}
-
-/* whether the combiners may take a dot product of two constants, which the
-translation works out (gx_psh.c, emit_dot and emit_signed_dot): its value,
-clamped to [0, 1], then decides the stages, where the signatures cannot
-follow it */
-static bool structure_folds(const uint32_t *state, const WlXboxPshTextures *textures) {
-    unsigned long count = state[WL_XBOX_PSH_COMBINER_COUNT] & 0xff, stage, written = 0;
-    int portion, shift;
-
-    if (count > 8)
-        count = 8;
-    for (stage = 0; stage < count; stage++) {
-        uint32_t inputs = state[WL_XBOX_PSH_RGB_INPUTS0 + stage],
-                 outputs = state[WL_XBOX_PSH_RGB_OUTPUTS0 + stage];
-        unsigned flags = (unsigned)(outputs >> 12);
-
-        if (((flags & 0x02) && input_constant(inputs >> 24, written, textures) &&
-             input_constant((inputs >> 16) & 0xff, written, textures)) ||
-            ((flags & 0x01) && input_constant((inputs >> 8) & 0xff, written, textures) &&
-             input_constant(inputs & 0xff, written, textures)))
-            return true;
-        for (portion = 0; portion < 2; portion++) {
-            outputs =
-                state[(portion ? WL_XBOX_PSH_ALPHA_OUTPUTS0 : WL_XBOX_PSH_RGB_OUTPUTS0) + stage];
-            for (shift = 0; shift <= 8; shift += 4)
-                written |= 1UL << ((outputs >> shift) & 0x0f);
-        }
-    }
-    return false;
-}
-
 /* whether the program changes with its constants only where it holds them */
 static bool structure_generic(WlXboxPshCache *cache, const WlXboxPshCacheEntry *entry,
                               unsigned long reads, const uint32_t *state,
@@ -361,15 +318,17 @@ static bool structure_generic(WlXboxPshCache *cache, const WlXboxPshCacheEntry *
     WlXboxPshTextures trial_textures;
     uint32_t perturbed[NUMBER_OF_SLOTS];
     bool usable, free = false;
-    int attempt, slot;
+    int attempt, slot, way;
 
     /* (no constants, or none but 0s and 1s: no others of their signatures) */
     for (slot = 0; slot < NUMBER_OF_SLOTS; slot++)
         free |= (reads & (1UL << slot)) && constant_free(entry->constants[slot]);
     if (!free)
         return true;
-    if (structure_folds(state, textures))
+    if (entry->program.folded) {
+        cache->counts.folded++;
         return false;
+    }
     for (attempt = 0; attempt < GENERIC_TRIALS; attempt++) {
         if (!constants_perturbed(cache, reads, entry->constants, perturbed))
             return false;
@@ -379,7 +338,9 @@ static bool structure_generic(WlXboxPshCache *cache, const WlXboxPshCacheEntry *
             if (reads & (1UL << slot))
                 slot_set(trial_state, &trial_textures, slot, perturbed[slot]);
         }
-        usable = wl_xbox_psh_translate(trial_state, &trial_textures, recipe_of(cache), trial);
+        way = entry->way;
+        usable = wl_xbox_psh_translate_by_way(trial_state, &trial_textures, recipe_of(cache), trial,
+                                              &way);
         cache->counts.tests++;
         memcpy(expected, &entry->program, sizeof(*expected));
         constants_patch(entry, expected, perturbed);
@@ -391,13 +352,20 @@ static bool structure_generic(WlXboxPshCache *cache, const WlXboxPshCacheEntry *
     return true;
 }
 
-/* the set's entry used longest ago */
+/* the set's entry used longest ago: an empty one first, then one for a set
+of constants (of a program whose constants change all the time, each is
+mostly drawn once), then a structure (translated three times again when it
+comes back, its trials with it) */
 static WlXboxPshCacheEntry *set_victim(WlXboxPshCacheEntry *set) {
     WlXboxPshCacheEntry *victim = &set[0];
     int way;
 
     for (way = 1; way < CACHE_WAYS; way++) {
-        if (set[way].stamp < victim->stamp)
+        const WlXboxPshCacheEntry *entry = &set[way];
+        int rank = !entry->stamp ? 0 : entry->structural ? 2 : 1,
+            victim_rank = !victim->stamp ? 0 : victim->structural ? 2 : 1;
+
+        if (rank < victim_rank || (rank == victim_rank && entry->stamp < victim->stamp))
             victim = &set[way];
     }
     return victim;
@@ -488,7 +456,8 @@ const WlXboxPshProgram *wl_xbox_psh_cache_program(WlXboxPshCache *cache,
         if (entry->stamp && entry->structural) {
             counts->evicted++;
             cache->evicted_hashes[cache->evicted_next++ % EVICTED_HASHES] = entry->hash;
-        }
+        } else if (entry->stamp)
+            counts->constant_sets_evicted++;
         if (!structural)
             for (which = 0; which < EVICTED_HASHES; which++)
                 if (cache->evicted_hashes[which] == hash) {
@@ -501,10 +470,14 @@ const WlXboxPshProgram *wl_xbox_psh_cache_program(WlXboxPshCache *cache,
         entry->structural = !structural;
         entry->generic = false;
         entry->changes = 0;
-        entry->usable =
-            wl_xbox_psh_translate(render_state, textures, recipe_of(cache), &entry->program);
+        /* (a structure's other constants: the way the structure's translation
+        took) */
+        entry->way = structural && !structural->program.folded ? structural->way : -1;
+        entry->usable = wl_xbox_psh_translate_by_way(render_state, textures, recipe_of(cache),
+                                                     &entry->program, &entry->way);
         counts->translated++;
         counts->unusable += !entry->usable;
+        counts->constant_sets += structural != NULL;
         *translated = true;
         /* (a structure first seen: whether it is generic) */
         if (!structural) {

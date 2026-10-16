@@ -42,6 +42,10 @@ typedef struct WlXboxPshCacheCounts {
     /* structures pushed out of the cache by others, and structures
     translated that had been (by their hash, of the last 256 pushed out) */
     unsigned long evicted, again;
+    /* programs translated for a set of constants of a structure that is not
+    generic, those of them pushed out by others, and the structures found not
+    generic because their combiners take a dot product of constants */
+    unsigned long constant_sets, constant_sets_evicted, folded;
 } WlXboxPshCacheCounts;
 
 /* (the cache's own: a program's structure, hashed and compared whole) */
@@ -70,6 +74,8 @@ typedef struct WlXboxPshCacheEntry {
     signed char konst_slots[WL_TEV_KONST_SLOTS];
     signed char preload_slots[WL_TEV_REG_COUNT];
     unsigned long changes;
+    /* the way its translation took (wl_xbox_psh_translate_by_way) */
+    int way;
     bool usable;
     WlXboxPshProgram program;
 } WlXboxPshCacheEntry;

@@ -1248,6 +1248,7 @@ static struct operand emit_dot(struct translation *translation, int portion, str
         float dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
         uint32_t level;
 
+        translation->program->folded = true;
         if (dot > 1.0f)
             dot = 1.0f;
         level = (uint32_t)(dot * 255.0f + 0.5f);
@@ -1281,6 +1282,7 @@ static struct operand emit_dot(struct translation *translation, int portion, str
             float sum = a[0] + a[1] + a[2];
             uint32_t level = (uint32_t)((sum > 1.0f ? 1.0f : sum) * 255.0f + 0.5f);
 
+            translation->program->folded = true;
             other = level >= 255 ? one
                                  : operand(_kind_konst,
                                            konst_slot(translation, (level << 24) | (level << 16) |
@@ -1555,6 +1557,7 @@ static bool emit_signed_dot(struct translation *translation, struct operand x, u
         float dot = 0.0f;
         uint32_t level;
 
+        translation->program->folded = true;
         for (channel = 0; channel < 3; channel++)
             dot += mapped_value(a[channel], x_mapping) * mapped_value(b[channel], y_mapping);
         dot = dot < 0.0f ? 0.0f : dot > 1.0f ? 1.0f : dot;
@@ -4177,6 +4180,24 @@ static int blue_to_alpha_rewrite(const uint32_t *state, uint32_t *out) {
 
 bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures *textures,
                            const WlXboxPshRecipe *recipe, WlXboxPshProgram *program) {
+    int way = -1;
+
+    return wl_xbox_psh_translate_by_way(render_state, textures, recipe, program, &way);
+}
+
+/* (a way: (((uniform * 3 + 2 - mux mode) * attempts + attempt) * 2 + 1 - preload) * 2, plus 1
+when its program was approximated; WAY_RECIPE: the recipe's) */
+enum { WAY_RECIPE = 0x7fff };
+
+static int way_of(int uniform, int mux_mode, unsigned attempt, unsigned attempts, int preload,
+                  bool approximate) {
+    return (int)((((unsigned)uniform * 3 + (unsigned)(2 - mux_mode)) * attempts + attempt) * 2 +
+                 (unsigned)(1 - preload)) * 2 + approximate;
+}
+
+bool wl_xbox_psh_translate_by_way(const uint32_t *render_state, const WlXboxPshTextures *textures,
+                                  const WlXboxPshRecipe *recipe, WlXboxPshProgram *program,
+                                  int *way) {
     /* the signed dot products: where the alpha half reads them, then in the
     colour half only (the alpha half's blue of one approximated), then as the
     translation was before it made them, their inputs clamped; economically,
@@ -4194,6 +4215,7 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
     if (recipe && recipe->make && recipe->make(render_state, textures, program, recipe->user)) {
         program->texcoords = (unsigned char)wl_tev_texcoords_mask(&program->tev);
         program->channels = (unsigned char)wl_tev_channels_mask(&program->tev);
+        *way = WAY_RECIPE;
         return true;
     }
     /* each exact, then with constants beyond four approximated (their
@@ -4201,7 +4223,8 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
     first approximated */
     static WlXboxPshProgram approximated;
     static uint32_t rewritten[WL_XBOX_PSH_WORDS];
-    bool have_approximated = false, done = false, has_mux = false;
+    bool have_approximated = false, done = false, has_mux = false, folded = false;
+    int taken = -1, approximated_way = -1;
     int mux_mode, uniform, blues = blue_to_alpha_rewrite(render_state, rewritten);
 
     if (blues)
@@ -4210,6 +4233,24 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
         has_mux = has_mux || ((render_state[WL_XBOX_PSH_RGB_OUTPUTS0 + stage] |
                                render_state[WL_XBOX_PSH_ALPHA_OUTPUTS0 + stage]) &
                               0x4000);
+    /* (the way taken before, alone: as exact as it was, it is the one a
+    translation of every way takes) */
+    if (*way >= 0 && *way != WAY_RECIPE) {
+        unsigned index = (unsigned)*way >> 1, count = sizeof(attempts) / sizeof(attempts[0]);
+
+        preload = 1 - (int)(index & 1);
+        attempt = (index >> 1) % count;
+        mux_mode = 2 - (int)((index >> 1) / count % 3);
+        uniform = (int)((index >> 1) / count / 3);
+        if (uniform < 2 && (mux_mode == 2 || has_mux) &&
+            translate_once(render_state, textures, program, attempts[attempt].economical,
+                           attempts[attempt].folding, preload != 0, attempts[attempt].signed_dots,
+                           mux_mode, uniform != 0) &&
+            !program->folded && program->approximate == (bool)(*way & 1)) {
+            done = true;
+            taken = *way;
+        }
+    }
     /* (and, where none is exact, again with uniform colours in the alpha half) */
     for (uniform = 0; uniform < 2 && !done; uniform++) {
         for (mux_mode = 2; mux_mode >= (has_mux ? 0 : 2) && !done; mux_mode--) {
@@ -4219,22 +4260,39 @@ bool wl_xbox_psh_translate(const uint32_t *render_state, const WlXboxPshTextures
                     if (!translate_once(render_state, textures, program,
                                         attempts[attempt].economical, attempts[attempt].folding,
                                         preload != 0, attempts[attempt].signed_dots, mux_mode,
-                                        uniform != 0))
+                                        uniform != 0)) {
+                        folded |= program->folded;
                         continue;
-                    if (!program->approximate)
+                    }
+                    /* (a fold in any attempt: which attempt is taken may turn
+                    on its value) */
+                    folded |= program->folded;
+                    if (!program->approximate) {
                         done = true;
-                    else if (!have_approximated) {
+                        taken = way_of(uniform, mux_mode, attempt,
+                                       sizeof(attempts) / sizeof(attempts[0]), preload, false);
+                    } else if (!have_approximated) {
                         approximated = *program;
                         have_approximated = true;
+                        approximated_way = way_of(uniform, mux_mode, attempt,
+                                                  sizeof(attempts) / sizeof(attempts[0]), preload,
+                                                  true);
                     }
                 }
             }
         }
     }
-    if (!done && !have_approximated)
+    program->folded = folded;
+    if (!done && !have_approximated) {
+        *way = -1;
         return false;
-    if (!done)
+    }
+    if (!done) {
         *program = approximated;
+        taken = approximated_way;
+    }
+    program->folded = folded;
+    *way = taken;
     if (blues < 0)
         approximate(program, "a blue to alpha without a stage for its copy");
     /* (what the stages read of the vertices; a bumped lookup's offsets

@@ -222,7 +222,40 @@ TEST the_cache_translates_through_its_recipe(void) {
     PASS();
 }
 
+// a translation by the way one of the same structure took is the translation of every way
+// (programs folded aside: the cache does not ask it of them)
+TEST a_translation_by_way_is_the_translation(void) {
+    static uint32_t state[WL_XBOX_PSH_WORDS];
+    static WlXboxPshProgram first, by_way;
+    WlXboxPshTextures textures;
+    unsigned long tried = 0, differ = 0;
+    for (int n = 0; n < 300; n++) {
+        int way = -1, again;
+        program_random(state, &textures);
+        bool usable = wl_xbox_psh_translate_by_way(state, &textures, NULL, &first, &way);
+        bool fresh_usable = wl_xbox_psh_translate(state, &textures, NULL, &g_fresh);
+        ASSERT_EQ(fresh_usable, usable);
+        ASSERT(!usable || !memcmp(&first, &g_fresh, sizeof first));
+        if (!usable || first.folded)
+            continue;
+        ASSERT(way >= 0);
+        for (int change = 0; change < 4; change++) {
+            constants_change(state, &textures, true);
+            again = way;
+            usable = wl_xbox_psh_translate_by_way(state, &textures, NULL, &by_way, &again);
+            fresh_usable = wl_xbox_psh_translate(state, &textures, NULL, &g_fresh);
+            tried++;
+            if (usable != fresh_usable || (usable && memcmp(&by_way, &g_fresh, sizeof g_fresh)))
+                differ++;
+        }
+    }
+    ASSERT(tried > 100);
+    ASSERT_EQ(0ul, differ);
+    PASS();
+}
+
 SUITE(psh_cache_suite) {
+    RUN_TEST(a_translation_by_way_is_the_translation);
     RUN_TEST(cached_programs_are_fresh_translations);
     RUN_TEST(the_last_call_and_the_extra_word);
     RUN_TEST(the_cache_translates_through_its_recipe);

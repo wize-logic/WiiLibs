@@ -244,9 +244,10 @@ static void gpu_status(void) {
     wl_nv2a_gx_psh_counts(g_gx, &pc);
     // (the pixel programs' cache: a translation is long, and a program should be translated about once)
     WL_LOG_I(TAG, "status: pixel programs %lu translated, %lu found, %lu patched; %lu trials (%lu differed, %lu "
-             "generic), %lu audits (%lu differed), %lu evicted, %lu translated again after eviction",
-             pc.translated, pc.found, pc.patched, pc.tests, pc.tests_differ, pc.generic, pc.audited,
-             pc.audits_differ, pc.evicted, pc.again);
+             "generic, %lu folded), %lu audits (%lu differed), %lu evicted, %lu translated again after eviction; "
+             "%lu for constants of structures not generic (%lu of them evicted)",
+             pc.translated, pc.found, pc.patched, pc.tests, pc.tests_differ, pc.generic, pc.folded, pc.audited,
+             pc.audits_differ, pc.evicted, pc.again, pc.constant_sets, pc.constant_sets_evicted);
     WL_LOG_I(TAG, "status: depth fits %u made, %u shared; textures %u KB kept (%u KB drawn in the last frame, "
              "%u KB at most), %u converted, %u made again, %u failed (%u for memory), %u kept smaller (%u made whole "
              "again), %u evicted; %u checks, %u by the write watch, %u hashes (%u KB)",
