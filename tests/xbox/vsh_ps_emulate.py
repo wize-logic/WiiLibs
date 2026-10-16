@@ -110,7 +110,10 @@ def statement(match):
 # Floating-point registers are EmuReg (ps0 a double, ps1, and fctiwz's word); a lane the Gekko
 # leaves undefined, or that the code must not read (ps1 after a double operation), is a NaN. The
 # single-precision operations (lfs, fadds, fmadds, ...) write both lanes, as in paired-single
-# mode. frsqrte is exact here (the Newton steps that follow make either exact).
+# mode. frsqrte gives Broadway's table estimate and stfs / psq_st store a double as Broadway does,
+# its mantissa cut, not rounded (emu_frsqrte, emu_single: Dolphin's ApproximateReciprocalSquareRoot
+# and ConvertToSingle), so code that stores a double result without frsp shows on the host as
+# it would on the Wii.
 
 def emu_expression(text, immediates):
     return re.sub(r"%\[(\w+)\]", lambda m: "(long)(%s)" % immediates[m.group(1)], text)
@@ -155,7 +158,7 @@ def emu_line(line, immediates):
     if op == "lfs":
         return "{ float t; memcpy(&t, %s, 4); f_set(&%s, t); }" % (emu_memory(a[1], immediates), F(a[0]))
     if op == "stfs":
-        return "{ float t = (float)%s.a; memcpy(%s, &t, 4); }" % (F(a[0]), emu_memory(a[1], immediates))
+        return "{ uint32_t t = emu_single(%s.a, 0); memcpy(%s, &t, 4); }" % (F(a[0]), emu_memory(a[1], immediates))
     if op == "stfiwx":
         return "memcpy((char *)%s, &%s.i, 4);" % (emu_gpr(a[2]), F(a[0]))
     if op == "lwz" and "%[ptr]" in a[1]:
@@ -248,7 +251,7 @@ def emu_line(line, immediates):
     if op == "fsel":
         return "f_double(&%s, %s.a >= 0 ? %s.a : %s.a);" % (F(a[0]), F(a[1]), F(a[2]), F(a[3]))
     if op == "frsqrte":
-        return "f_double(&%s, 1.0 / sqrt(%s.a));" % (F(a[0]), F(a[1]))
+        return "f_double(&%s, emu_frsqrte(%s.a));" % (F(a[0]), F(a[1]))
     if op == "fmul":
         return "f_double(&%s, %s.a * %s.a);" % (F(a[0]), F(a[1]), F(a[2]))
     if op == "fnmsub":
@@ -379,8 +382,60 @@ static void f_psq_l(EmuReg *r, const char *p, int one) {
         memcpy(&y, p + 4, 4);
     f_pair(r, x, y);
 }
+/* a double's single as Broadway's stfs (flush 0: psq_st's) writes it: the mantissa cut, not
+rounded (Dolphin's ConvertToSingle, ConvertToSingleFTZ) */
+static uint32_t emu_single(double value, int flush) {
+    uint64_t x;
+    uint32_t e;
+    memcpy(&x, &value, 8);
+    e = (uint32_t)(x >> 52) & 0x7ffu;
+    if (e > 896 || (x & ~(1ull << 63)) == 0 || (!flush && e < 874))
+        return (uint32_t)(((x >> 32) & 0xc0000000u) | ((x >> 29) & 0x3fffffffu));
+    if (flush)
+        return (uint32_t)(x >> 32) & 0x80000000u;
+    {
+        uint32_t t = (uint32_t)(0x80000000u | ((x & 0xfffffffffffffull) >> 21));
+        return (t >> (905 - e)) | ((uint32_t)(x >> 32) & 0x80000000u);
+    }
+}
+/* frsqrte: Broadway's estimate (Dolphin's ApproximateReciprocalSquareRoot) */
+static double emu_frsqrte(double value) {
+    static const int32_t base[32] = {
+        0x1a7e800, 0x17cb800, 0x1552800, 0x130c000, 0x10f2000, 0x0eff000, 0x0d2e000, 0x0b7c000,
+        0x09e5000, 0x0867000, 0x06ff000, 0x05ab800, 0x046a000, 0x0339800, 0x0218800, 0x0105800,
+        0x3ffa000, 0x3c29000, 0x38aa000, 0x3572000, 0x3279000, 0x2fb7000, 0x2d26000, 0x2ac0000,
+        0x2881000, 0x2665000, 0x2468000, 0x2287000, 0x20c1000, 0x1f12000, 0x1d79000, 0x1bf4000};
+    static const int32_t dec[32] = {
+        0x568, 0x4f3, 0x48d, 0x435, 0x3e7, 0x3a2, 0x365, 0x32e, 0x2fc, 0x2d0, 0x2a8, 0x283, 0x261, 0x243, 0x226, 0x20b,
+        0x7a4, 0x700, 0x670, 0x5f2, 0x584, 0x524, 0x4cc, 0x47e, 0x43a, 0x3fa, 0x3c2, 0x38e, 0x35e, 0x332, 0x30a, 0x2e6};
+    int64_t integral, mantissa, exponent, low;
+    int i;
+    memcpy(&integral, &value, 8);
+    mantissa = integral & ((1ll << 52) - 1);
+    exponent = integral & (0x7ffll << 52);
+    if (mantissa == 0 && exponent == 0)
+        return integral < 0 ? -INFINITY : INFINITY;
+    if (exponent == (0x7ffll << 52))
+        return mantissa != 0 ? value + 0.0 : integral < 0 ? NAN : 0.0;
+    if (integral < 0)
+        return NAN;
+    if (exponent == 0) {
+        do {
+            exponent -= 1ll << 52;
+            mantissa <<= 1;
+        } while (!(mantissa & (1ll << 52)));
+        mantissa &= (1ll << 52) - 1;
+        exponent += 1ll << 52;
+    }
+    low = exponent & (1ll << 52);
+    exponent = ((0x3ffll << 52) - ((exponent - (0x3fell << 52)) / 2)) & (0x7ffll << 52);
+    i = (int)((low | mantissa) >> 37);
+    integral = exponent | (int64_t)(base[i / 2048] - dec[i / 2048] * (i % 2048)) << 26;
+    memcpy(&value, &integral, 8);
+    return value;
+}
 static void f_psq_st(const EmuReg *r, char *p, int one) {
-    float x = (float)r->a, y = (float)r->b;
+    uint32_t x = emu_single(r->a, 1), y = emu_single(r->b, 1);
     memcpy(p, &x, 4);
     if (!one)
         memcpy(p + 4, &y, 4);

@@ -1,0 +1,3 @@
+# The fused forms test_xbox_vsh_fused.c runs (xbox_vsh_codegen --fused): vsh_programs.inc's first
+# program (a transform) with its position and its t0 (v9 as given) made a sphere map's coordinates
+9aee98b6 21 o 0 0 0S 0:F3,9:F3

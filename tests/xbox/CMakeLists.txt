@@ -72,4 +72,17 @@ if(Python3_FOUND)
     set_source_files_properties(${vsh_ps_emulated} PROPERTIES COMPILE_OPTIONS "-w")
     wl_add_test(test_xbox_vsh_ps SOURCES test_xbox_vsh_ps.c suite_vsh_ps.c ${vsh_ps_emulated} LIBS wl_xbox LABELS unit be)
     target_include_directories(test_xbox_vsh_ps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    # a fused batch (--fused vsh_fused_forms.txt) emulated as Broadway runs it, against the general
+    # path's words
+    set(vsh_fused_generated ${CMAKE_CURRENT_BINARY_DIR}/vsh_fused_programs.c)
+    set(vsh_fused_emulated ${CMAKE_CURRENT_BINARY_DIR}/vsh_fused_emulated.c)
+    add_custom_command(OUTPUT ${vsh_fused_emulated}
+        COMMAND xbox_vsh_codegen --fused ${CMAKE_CURRENT_SOURCE_DIR}/vsh_fused_forms.txt
+            ${CMAKE_CURRENT_SOURCE_DIR}/vsh_programs.inc ${vsh_fused_generated} test_vsh_fused_natives
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/vsh_ps_emulate.py ${vsh_fused_generated} ${vsh_fused_emulated}
+        DEPENDS xbox_vsh_codegen ${CMAKE_CURRENT_SOURCE_DIR}/vsh_programs.inc ${CMAKE_CURRENT_SOURCE_DIR}/vsh_fused_forms.txt
+            ${CMAKE_CURRENT_SOURCE_DIR}/vsh_ps_emulate.py
+        VERBATIM)
+    set_source_files_properties(${vsh_fused_emulated} PROPERTIES COMPILE_OPTIONS "-w;-ffp-contract=off")
+    wl_add_test(test_xbox_vsh_fused SOURCES test_xbox_vsh_fused.c ${vsh_fused_emulated} LIBS wl_xbox LABELS unit be)
 endif()
