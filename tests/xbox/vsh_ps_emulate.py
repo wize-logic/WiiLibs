@@ -476,8 +476,9 @@ static void emu_store_byte(char *p, unsigned char b) {
 #endif
     *(unsigned char *)p = b;
 }
+/* a NaN quantized to 255, as Dolphin stores it (the fused colours select it away first) */
 static unsigned char emu_u8(double x) {
-    return !(x > 0.0) ? 0 : x >= 255.0 ? 255 : (unsigned char)(int)x;
+    return x != x ? 255 : !(x > 0.0) ? 0 : x >= 255.0 ? 255 : (unsigned char)(int)x;
 }
 static void f_psq_stq(const EmuReg *r, char *p, int one, int gqr) {
     unsigned type = emu_gqr[gqr] & 7;

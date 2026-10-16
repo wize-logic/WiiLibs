@@ -1292,8 +1292,9 @@ vertex before's at %[pv]), the program run into the output's scratch (%[o]),
 and GX's words written from it where %[w] says, as nv2a_gx.c's vertices_pack
 writes them. Little-endian words and shorts through the byte-reversed loads;
 bytes and shorts made floats by the quantized loads (GQR6: u8, GQR7: s16,
-saved and restored), a colour's bytes by the quantized store (u8: below 0 or a
-NaN 0, above 255 255, else cut down: wl_nv2a_color_byte's of value * 255 + 0.5).
+saved and restored), a colour's bytes by the quantized store (u8: below 0 0,
+above 255 255, else cut down: wl_nv2a_color_byte's of value * 255 + 0.5; a NaN made 0 by a
+ps_sel first, the store's own NaN being 255 in Dolphin).
 The state's floats are at the same offsets everywhere (before its pointers);
 its pointers at %[fdata] + %[ptr] * n. */
 static const WlXboxVshFusedKey *pr_fuse;
@@ -1526,6 +1527,9 @@ static void pr_fused_epilogue(void) {
 
             value = pr_fused_op("ps_mul", value, pr_fused_pack(0, WL_XBOX_VSH_FUSED_255), -1);
             value = pr_fused_op("ps_add", value, pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF), -1);
+            /* a NaN made 0 before the store, as wl_nv2a_color_byte's selects make it (Dolphin
+               quantizes a NaN to 255) */
+            value = pr_fused_op("ps_sel", value, value, pr_k(0, PRK_ZERO));
             pr_fused_store(value, "psq_st @0, %d(%%[ad]), 0, 6", 4 * word + 2 * half);
         }
     }
