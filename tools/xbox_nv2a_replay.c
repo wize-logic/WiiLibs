@@ -1221,6 +1221,29 @@ int main(int argc, char **argv) {
                 printf("             %u primitives: %s\n", (unsigned)ss.issue_draws[bit], wl_gxsoft_issue_name(bit));
             }
         }
+        {
+            // (what the console's FIFO would carry: vertices of the size the layout makes GX read,
+            // primitives of the vertices they said)
+            const WlHostGxDirect *st = wl_host_gx_direct();
+            const WlGxDirectLayout *l = &st->wire_first_layout;
+
+            printf("GX wire: %u vertices of the wrong size, %u primitives short", (unsigned)st->wire_mismatches,
+                   (unsigned)st->short_draws);
+            if (st->wire_mismatches != 0) {
+                printf("; the first in draw %u: %u bytes sent, %u read (0: no layout GX can describe); layout "
+                       "indexed %04x colours %u texcoords %02x s %02x generated %02x projected %02x lit %x",
+                       (unsigned)st->wire_first_draw, (unsigned)st->wire_first_sent, (unsigned)st->wire_first_read,
+                       l->indexed, l->colors, l->texcoords, l->texcoord_s, l->texcoords_generated,
+                       l->texcoords_projected, l->lit);
+            }
+            printf("\n");
+            for (bit = 0; bit < WL_GX_CHECKS; bit++) {
+                if (st->check_draws[bit] != 0) {
+                    printf("GX check: %u primitives (the first %u of %u): %s\n", (unsigned)st->check_draws[bit],
+                           (unsigned)st->check_first_draw[bit], (unsigned)st->stats.draws, wl_gx_check_name(bit));
+                }
+            }
+        }
         wl_nv2a_gx_destroy(g_gx);
         wl_gxsoft_detach();
     }

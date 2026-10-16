@@ -812,11 +812,22 @@ would write on round the ring over commands the GPU has not read (a GPU hang), s
 **The GPU hang report** (`wii/gx_hang_wii.c`). A 1 s alarm reads the command processor's FIFO read
 pointer; when it has not moved for 10 s while the FIFO holds commands or a sent token is not
 reached, the alarm snapshots the CP's and PI's FIFO registers, the 64 bytes before and at the read
-pointer (uncached) and the ring of the last 16 GX events (frame, token, layout, array, texture,
+pointer (uncached) and the ring of the last 1024 GX events (frame, token, layout, array, texture,
 TLUT, primitive, flush strip, EFB copy, target quad), and wakes a thread asleep until then. It logs
 them under `[GXHANG]` with what the program said it was at (`wl_gx_hang_where`), syncs the log to
-the SD card, and leaves to the loader 20 s later. Nothing polls; a hung GPU with the GX thread
-suspended at the high-water mark is seen only from an interrupt.
+the SD card, and leaves to the loader 20 s later. The events that send commands keep the FIFO's
+write pointer as they began, so the report also finds the event the GPU stopped after (with a full
+FIFO, a megabyte behind the newest) and logs its layout, its maps' textures and the events around
+it. Nothing polls; a hung GPU with the GX thread suspended at the high-water mark is seen only from
+an interrupt.
+
+**What the console's GPU cannot draw.** Dolphin draws state the console's GPU stops on for good. GX
+is never given no colour channel and no texture coordinate at once (a konst-only draw gets one
+channel from the registers, `wl_gx_direct_layout_outputs`): a primitive with neither, after others
+in flight, hung the Wii's GPU where Dolphin drew it. `wl_gx_check_draw` (gx_direct.h) finds such
+state in a draw: the host's direct layer counts each finding (`tools/xbox_nv2a_replay.c` prints
+them), and a Wii build with `-DWL_GX_CHECK=ON` logs the first draws found under `[GXCHECK]` (off,
+it costs nothing).
 
 **Overlapping frames.** By default `wl_gx_end_frame` still waits for the GPU to finish the frame
 (not for the display), so whatever the caller drew from may be changed as soon as it returns.

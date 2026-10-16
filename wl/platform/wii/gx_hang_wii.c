@@ -8,6 +8,11 @@
 // to the SD card, and leaves to the loader LEAVE_SECONDS later. Until it fires it costs one
 // interrupt a second and a few stores an event: no thread polls.
 //
+// The events that put commands in the FIFO (primitives, quads, copies, flushes, tokens, frames' ends)
+// keep the FIFO's write pointer as they began, so the report finds the event the GPU stopped after:
+// with a full FIFO the commands it stopped in are a megabyte behind the newest, which the ring's
+// last events do not reach. It logs the events around it and the layout and textures it drew with.
+//
 // The interrupt is the only place that sees a hang whose GX thread is suspended for good (libogc
 // suspends it at the FIFO's high-water mark, and a hung GPU never lowers it): nothing else runs
 // then to notice.
@@ -27,7 +32,10 @@
 #define TAG "GXHANG"
 #define HANG_SECONDS 10u
 #define LEAVE_SECONDS 20u
-#define RING 16u
+#define RING 1024u
+#define LAST 16u
+#define AROUND_BEFORE 24u
+#define AROUND_AFTER 6u
 #define PEEK_BYTES 64u
 #define WHERE_SLOTS 4u
 #define STACK_BYTES 16384u
@@ -54,6 +62,8 @@
 typedef struct {
     uint8_t kind;
     uint32_t a, b;
+    // the PI's FIFO write pointer as the event began (its address; 0: an event that sends no commands)
+    uint32_t write;
 } Event;
 
 static struct {
@@ -80,19 +90,25 @@ static struct {
         bool in_frame;
         uint8_t before[PEEK_BYTES], at[PEEK_BYTES];
         bool peeked;
-        Event ring[RING];
-        uint32_t head;
         uint32_t where_value[WHERE_SLOTS];
     } snap;
     uint8_t stack[STACK_BYTES] __attribute__((aligned(32)));
 } h;
 
 void wl_gx_wii_hang_event(char kind, uint32_t a, uint32_t b) {
-    Event *e = &h.ring[h.head % RING];
+    Event *e;
+
+    if (h.fired) {
+        return; // (the ring is the report's now)
+    }
+    e = &h.ring[h.head % RING];
 
     e->kind = (uint8_t)kind;
     e->a = a;
     e->b = b;
+    e->write = kind == 'P' || kind == 'Q' || kind == 'C' || kind == 'X' || kind == 'S' || kind == 'E'
+                   ? PI_REG(PI_WRITE) & 0x03FFFFFFu
+                   : 0u;
     h.head++;
 }
 
@@ -137,8 +153,6 @@ static void snapshot(void) {
     // (the bytes before the read pointer are the commands the GPU took last, those at it the next)
     start = h.snap.read >= h.snap.base + PEEK_BYTES ? h.snap.read - PEEK_BYTES : h.snap.base;
     h.snap.peeked = peek(start, h.snap.before) && peek(h.snap.read & ~31u, h.snap.at);
-    memcpy(h.snap.ring, h.ring, sizeof h.ring);
-    h.snap.head = h.head;
     memcpy(h.snap.where_value, h.where_value, sizeof h.where_value);
 }
 
@@ -195,6 +209,72 @@ static void hex_line(const char *what, uint32_t phys, const uint8_t *bytes) {
     WL_LOG_E(TAG, "%s %08x: %s", what, (unsigned)(phys + PEEK_BYTES / 2u), text);
 }
 
+static void log_event(uint32_t i, const char *mark) {
+    const Event *e = &h.ring[i % RING];
+
+    WL_LOG_E(TAG, "%s%c %08x %08x @%08x  %s", mark, e->kind, (unsigned)e->a, (unsigned)e->b, (unsigned)e->write,
+             event_name(e->kind));
+}
+
+// the event the GPU stopped after: walking back from the newest, the commands each event's write
+// pointer leaves behind it add up to the FIFO's backlog (write pointer to read pointer) at the
+// last event that began before the read pointer
+static void stopped_after(void) {
+    uint32_t size = (h.snap.pi_end & 0x03FFFFFFu) - (h.snap.pi_base & 0x03FFFFFFu);
+    uint32_t write = h.snap.pi_write & 0x03FFFFFFu;
+    uint32_t backlog, behind = 0, prev = write, oldest, i, n, stuck = 0;
+    bool found = false;
+
+    if (size == 0 || h.head == 0) {
+        return;
+    }
+    backlog = (write + size - h.snap.read) % size;
+    oldest = h.head > RING ? h.head - RING : 0;
+    for (i = h.head; i != oldest; i--) {
+        const Event *e = &h.ring[(i - 1u) % RING];
+
+        if (e->write == 0) {
+            continue;
+        }
+        behind += (prev + size - e->write) % size;
+        prev = e->write;
+        if (behind >= backlog) {
+            stuck = i - 1u;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        WL_LOG_E(TAG, "the GPU stopped %u bytes behind the writer, before the oldest of the %u events kept (%u bytes "
+                      "behind)", (unsigned)backlog, (unsigned)(h.head - oldest), (unsigned)behind);
+        return;
+    }
+    WL_LOG_E(TAG, "the GPU stopped %u bytes behind the writer: in the commands after event %u, %u bytes into them",
+             (unsigned)backlog, (unsigned)(h.head - 1u - stuck), (unsigned)(behind - backlog));
+    // (what it drew with: the layout and each map's texture last sent before it)
+    for (i = stuck + 1u; i != oldest; i--) {
+        if (h.ring[(i - 1u) % RING].kind == 'L') {
+            log_event(i - 1u, "  its layout: ");
+            break;
+        }
+    }
+    for (n = 0; n < 8u; n++) {
+        for (i = stuck + 1u; i != oldest; i--) {
+            const Event *e = &h.ring[(i - 1u) % RING];
+
+            if (e->kind == 'T' && (e->b >> 28) == n) {
+                log_event(i - 1u, "  its map: ");
+                break;
+            }
+        }
+    }
+    WL_LOG_E(TAG, "the events around it (the newest event is 0, it is %u):", (unsigned)(h.head - 1u - stuck));
+    for (i = stuck >= oldest + AROUND_BEFORE ? stuck - AROUND_BEFORE : oldest;
+         i != h.head && i <= stuck + AROUND_AFTER; i++) {
+        log_event(i, i == stuck ? "> " : "  ");
+    }
+}
+
 static void *report(void *arg) {
     uint32_t i, count, start;
 
@@ -224,13 +304,12 @@ static void *report(void *arg) {
         hex_line("before the read pointer", start, h.snap.before);
         hex_line("at the read pointer's 32 bytes", h.snap.read & ~31u, h.snap.at);
     }
-    count = h.snap.head < RING ? h.snap.head : RING;
+    count = h.head < LAST ? h.head : LAST;
     WL_LOG_E(TAG, "the last %u GX events, oldest first:", (unsigned)count);
-    for (i = h.snap.head - count; i != h.snap.head; i++) {
-        const Event *e = &h.snap.ring[i % RING];
-
-        WL_LOG_E(TAG, "  %c %08x %08x  %s", e->kind, (unsigned)e->a, (unsigned)e->b, event_name(e->kind));
+    for (i = h.head - count; i != h.head; i++) {
+        log_event(i, "  ");
     }
+    stopped_after();
     wl_platform_log_flush();
     WL_LOG_E(TAG, "leaving to the loader in %u s", LEAVE_SECONDS);
     wl_platform_log_flush();

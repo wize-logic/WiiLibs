@@ -914,8 +914,10 @@ void wl_gx_set_recipe(WlGxRecipe recipe) {
     WlTevProgram prog;
     wl_tev_recipe(&prog, recipe);
     wl_tev_apply_unchecked(&prog);
-    GX_SetNumChans((u8)wl_tev_channels_used(&prog));
     uint32_t texgens = wl_tev_texcoords_used(&prog);
+    // (never no channel and no coordinate at once: gx_direct_wii.c; channel 0's material is the
+    // register's when the vertices carry no colour, apply_chan)
+    GX_SetNumChans((u8)(wl_tev_channels_used(&prog) != 0 || texgens != 0 ? wl_tev_channels_used(&prog) : 1u));
     GX_SetNumTexGens((u8)texgens);
     if (texgens != 0) {
         texgen0();

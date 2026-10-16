@@ -44,6 +44,15 @@ typedef struct WlHostGxDirect {
     uint32_t begins, invalidates;
     // primitives that got fewer vertices than they said
     uint32_t short_draws;
+    // vertices whose bytes differ from what the layout's vertex descriptor makes GX read (on the
+    // console the command processor then reads vertex data as commands, or commands as vertex data:
+    // a hung GPU), and the first such vertex's draw (s.stats.draws then), layout, bytes sent and read
+    uint32_t wire_mismatches, wire_first_draw, wire_first_sent, wire_first_read;
+    // primitives with each finding of wl_gx_check_draw (by its bit's number), in the state the Wii's
+    // layer would give GX (wl_gx_direct_layout_outputs, the last TEV program, the maps loaded), and
+    // the first such primitive (s.stats.draws then)
+    uint32_t check_draws[WL_GX_CHECKS], check_first_draw[WL_GX_CHECKS];
+    WlGxDirectLayout wire_first_layout;
     // the last draw's primitive, and its first vertices (up to WL_HOST_GX_DIRECT_KEPT)
     WlGxDirectPrim prim;
     uint32_t count;

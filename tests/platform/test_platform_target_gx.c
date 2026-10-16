@@ -297,8 +297,8 @@ TEST clear_quad_colour_and_depth(void) {
     EXPECT(from, "GX_SetColorUpdate 1", "GX_SetAlphaUpdate 1", "GX_SetZMode 1 7 1", "GX_SetZCompLoc 1",
            "GX_LoadProjectionMtx ortho 0.003125 -1 -0.00416667 1 1 0 1", "GX_SetViewport 0 0 640 480 0 1",
            "GX_SetBlendMode 0 1 0 0", "GX_SetAlphaCompare 7 0 0 7 0", "GX_SetCullMode 0",
-           "GX_SetNumIndStages 0", "GX_SetTevDirect 0", "GX_SetTevDirect 1", "GX_SetNumChans 0",
-           "GX_SetNumTevStages 1", "GX_SetNumTexGens 0",
+           "GX_SetNumIndStages 0", "GX_SetTevDirect 0", "GX_SetTevDirect 1", "GX_SetNumChans 1",
+           "GX_SetChanCtrl 4 0 0 0 0 0 2", "GX_SetNumTevStages 1", "GX_SetNumTexGens 0",
            // the colour in register 0 (red, green, blue, alpha), passed through as the stage's output
            "GX_SetTevColor 1 255 128 64 32",
            "GX_SetTevOrder 0 255 255 255", "GX_SetTevSwapMode 0 0 0",

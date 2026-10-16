@@ -50,8 +50,48 @@ static struct {
     // n's is known; wl_gx_wii_texmaps_forget clears it)
     GXTexObj maps[GX_MAX_TEXMAP];
     uint8_t maps_known;
+    // the colour channels and texture coordinates GX makes for the layout
+    uint32_t chans, texgens;
     WlGxDirectStats stats;
+#ifdef WL_GX_CHECK
+    uint32_t check_findings;
+#endif
 } d;
+
+#ifdef WL_GX_CHECK
+// the draw's state checked (wl_gx_check_draw): the first findings logged with the state, then a count
+static void check_draw(void) {
+    const WlTevProgram *tev = wl_gx_wii_tev_last();
+    uint32_t found = wl_gx_check_draw(d.chans, d.texgens, d.maps_known, tev), bit, i;
+
+    if (found == 0) {
+        return;
+    }
+    d.check_findings++;
+    if (d.check_findings > 8u && (d.check_findings & 1023u) != 0) {
+        return;
+    }
+    for (bit = 0; bit < WL_GX_CHECKS; bit++) {
+        if (found & (1u << bit)) {
+            WL_LOG_E("GXCHECK", "draw %u (finding %u): %s", (unsigned)d.stats.draws, (unsigned)d.check_findings,
+                     wl_gx_check_name(bit));
+        }
+    }
+    WL_LOG_E("GXCHECK", "  layout indexed %04x colours %u texcoords %02x s %02x generated %02x projected %02x lit %x; "
+                        "channels %u, coordinates %u, maps loaded %02x",
+             d.layout.indexed, d.layout.colors, d.layout.texcoords, d.layout.texcoord_s,
+             d.layout.texcoords_generated, d.layout.texcoords_projected, d.layout.lit, (unsigned)d.chans,
+             (unsigned)d.texgens, d.maps_known);
+    for (i = 0; tev != NULL && i < tev->stage_count && i < WL_TEV_MAX_STAGES; i++) {
+        const WlTevStage *s = &tev->stages[i];
+
+        WL_LOG_E("GXCHECK", "  stage %u: coordinate %d map %d channel %d, colour %u %u %u %u, alpha %u %u %u %u",
+                 (unsigned)i, s->texcoord == WL_TEV_NONE ? -1 : s->texcoord, s->texmap == WL_TEV_NONE ? -1 : s->texmap,
+                 s->channel == WL_TEV_NONE ? -1 : s->channel, s->color.in[0], s->color.in[1], s->color.in[2],
+                 s->color.in[3], s->alpha.in[0], s->alpha.in[1], s->alpha.in[2], s->alpha.in[3]);
+    }
+}
+#endif
 
 void wl_gx_wii_texmaps_forget(uint32_t maps) {
     d.maps_known &= (uint8_t)~maps;
@@ -164,15 +204,22 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
                          0);
         GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4, GX_TG_TEX0 + n, GX_IDENTITY);
     }
-    GX_SetNumTexGens(texgens);
-    GX_SetNumChans(layout->colors);
+    // (never no channel and no coordinate at once: the console's GPU stops for good on a primitive
+    // with neither that follows others in the pipeline, where Dolphin draws it. One channel then,
+    // from the registers, which no stage of such a draw reads; wl_gx_direct_layout_outputs)
+    wl_gx_direct_layout_outputs(layout, &d.chans, &d.texgens);
+    GX_SetNumTexGens((u8)d.texgens);
+    GX_SetNumChans((u8)d.chans);
     wl_gx_wii_hang_event('L', layout->indexed | (uint32_t)layout->colors << 16 | (uint32_t)layout->lit << 20 |
                                   (uint32_t)layout->texcoords_projected << 24,
                          layout->texcoords | (uint32_t)layout->texcoords_generated << 8 |
                              (uint32_t)layout->texcoord_s << 16);
     if (!layout->lit) {
-        GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
-        GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+        // (a channel the vertex has no colour for: its material the register's)
+        GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, layout->colors >= 1 ? GX_SRC_VTX : GX_SRC_REG,
+                       GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+        GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, layout->colors >= 2 ? GX_SRC_VTX : GX_SRC_REG,
+                       GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
     } else {
         // (a lit channel: its material and ambient the registers', its light n, the signed dot
         // product, no attenuation; the others the vertex's colour)
@@ -287,6 +334,11 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     if (count == 0 || count > 65535u || (unsigned)prim >= sizeof prims || !d.layout_known) {
         return;
     }
+    // (noted before its commands: the flush, the state GX_Begin sends, the primitive)
+    wl_gx_wii_hang_event('P', (uint32_t)prim << 16 | count, d.stats.draws);
+#ifdef WL_GX_CHECK
+    check_draw();
+#endif
     if (wl_gx_flush_wii_take()) {
         static const WlGxDirectVertex zero;
 
@@ -299,7 +351,6 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
         wl_gx_wii_hang_event('X', 0, 0);
     }
     GX_Begin(prims[prim], DIRECT_FORMAT, (u16)count);
-    wl_gx_wii_hang_event('P', (uint32_t)prim << 16 | count, d.stats.draws);
     d.in_primitive = true;
     d.stats.draws++;
     d.stats.vertices += count;

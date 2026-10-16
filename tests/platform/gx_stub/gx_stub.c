@@ -62,6 +62,10 @@ const char *gx_stub_name(const void *address) {
 
 void GX_SetNumTevStages(u8 num) { g_gx_stub.num_stages = num; g_gx_stub.calls++; gx_stub_logf("GX_SetNumTevStages %u", num); }
 void GX_SetNumChans(u8 num) { g_gx_stub.num_chans = num; g_gx_stub.calls++; gx_stub_logf("GX_SetNumChans %u", num); }
+void GX_SetChanCtrl(s32 channel, u8 enable, u8 ambsrc, u8 matsrc, u8 litmask, u8 diff_fn, u8 attn_fn) {
+    g_gx_stub.calls++;
+    gx_stub_logf("GX_SetChanCtrl %d %u %u %u %u %u %u", (int)channel, enable, ambsrc, matsrc, litmask, diff_fn, attn_fn);
+}
 void GX_SetNumTexGens(u32 num) { g_gx_stub.num_texgens = (u8)num; g_gx_stub.calls++; gx_stub_logf("GX_SetNumTexGens %u", (unsigned)num); }
 void GX_SetTevOrder(u8 stage, u8 texcoord, u32 texmap, u8 color) {
     GxStubStage *s = &g_gx_stub.stage[stage];

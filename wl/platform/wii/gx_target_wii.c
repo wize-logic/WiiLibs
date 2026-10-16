@@ -71,7 +71,12 @@ static void quad(float x0, float y0, float x1, float y1, const GXColor *colour, 
     GX_SetNumIndStages(0);
     GX_SetTevDirect(GX_TEVSTAGE0);
     GX_SetTevDirect(GX_TEVSTAGE1);
-    GX_SetNumChans(0);
+    // (no stage reads a channel; an untextured quad still has one, from the registers: GX never has
+    // no channel and no coordinate at once, gx_direct_wii.c)
+    GX_SetNumChans(textured ? 0 : 1);
+    if (!textured) {
+        GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+    }
     GX_SetNumTevStages(textured && z_texture ? 2 : 1);
     if (textured) {
         GX_SetNumTexGens(1);

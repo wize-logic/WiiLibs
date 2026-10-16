@@ -23,6 +23,11 @@ uint32_t wl_gx_wii_mark_token(void);
 // the frame (safe in an interrupt: plain reads).
 void wl_gx_wii_hang_init(void);
 void wl_gx_wii_hang_event(char kind, uint32_t a, uint32_t b);
+#ifdef WL_GX_CHECK
+#include "wl/platform/tev.h"
+// the TEV program last applied (wl_tev_apply), NULL before the first: WL_GX_CHECK builds only
+const WlTevProgram *wl_gx_wii_tev_last(void);
+#endif
 void wl_gx_wii_hang_state(uint32_t *token_sent, uint32_t *frames_ended, bool *in_frame);
 // The calling thread made libogc's GX thread (the one it suspends at the FIFO's high-water mark)
 // when it is not already.

@@ -7,6 +7,7 @@
 
 #include "wl/platform/gx_shadow.h"
 #include "wl/platform/host/gx_renderer_host.h"
+#include "wl/platform/host/tev_host.h"
 
 static WlHostGxDirect s;
 static bool g_flush_due, g_flush_off, g_layout_known;
@@ -107,6 +108,20 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     s.count = count;
     s.stats.draws++;
     s.stats.vertices += count;
+    {
+        uint32_t chans, texgens, maps = 0, found, bit;
+
+        wl_gx_direct_layout_outputs(&s.layout, &chans, &texgens);
+        for (bit = 0; bit < 8; bit++) {
+            maps |= s.map_kind[bit] != WL_HOST_GX_MAP_NONE ? 1u << bit : 0u;
+        }
+        found = wl_gx_check_draw(chans, texgens, maps, wl_host_tev_last());
+        for (bit = 0; found != 0 && bit < WL_GX_CHECKS; bit++) {
+            if ((found & (1u << bit)) && s.check_draws[bit]++ == 0) {
+                s.check_first_draw[bit] = s.stats.draws;
+            }
+        }
+    }
 }
 
 // a lit channel's component as GX's lighting makes it: the ambient plus the signed dot product of the
@@ -155,12 +170,68 @@ void wl_gx_direct_vertex(const WlGxDirectVertex *vertex) {
     }
 }
 
+// the bytes of a vertex GX reads in a layout, as the Wii's direct layer describes it
+// (wii/gx_direct_wii.c: a 16-bit index for an indexed attribute; floats; colours RGBA8), and
+// whether the layout is one that layer can describe at all
+static uint32_t wire_bytes(const WlGxDirectLayout *layout, bool *describable, uint32_t *indexes) {
+    uint32_t bytes = 0;
+    unsigned n, projected = 0;
+
+#define WL_WIRE_INDEXED(attribute) ((layout->indexed & (1u << (attribute))) ? ((*indexes)++, true) : false)
+    *indexes = 0;
+    bytes += WL_WIRE_INDEXED(WL_GX_DIRECT_ARRAY_POSITION) ? 2u : 12u;
+
+    for (n = 0; n < 8; n++) {
+        projected += (layout->texcoords_projected >> n) & 1u;
+    }
+    // (one normal attribute: a lit layout's normal and projected coordinates cannot both be sent,
+    // nor more projected coordinates than the normal, binormal and tangent hold)
+    *describable = !(layout->lit && projected != 0) && projected <= WL_GX_DIRECT_PROJECTED;
+    if (projected == 1u) {
+        bytes += 12u;
+    } else if (projected > 1u) {
+        bytes += 36u;
+    } else if (layout->lit) {
+        bytes += WL_WIRE_INDEXED(WL_GX_DIRECT_ARRAY_NORMAL) ? 2u : 12u;
+    }
+    for (n = 0; n < layout->colors && n < 2u; n++) {
+        bytes += WL_WIRE_INDEXED(WL_GX_DIRECT_ARRAY_COLOR0 + n) ? 2u : 4u;
+    }
+    for (n = 0; n < 8; n++) {
+        if (layout->texcoords & (1u << n)) {
+            bytes += WL_WIRE_INDEXED(WL_GX_DIRECT_ARRAY_TEXCOORD0 + n) ? 2u
+                     : (layout->texcoord_s & (1u << n))                             ? 4u
+                                                                                    : 8u;
+        }
+    }
+#undef WL_WIRE_INDEXED
+    return bytes;
+}
+
+static void wire_check(uint32_t sent) {
+    bool describable;
+    uint32_t indexes, read = wire_bytes(&s.layout, &describable, &indexes);
+
+    if (sent == read && describable) {
+        return;
+    }
+    if (s.wire_mismatches++ == 0) {
+        s.wire_first_draw = s.stats.draws;
+        s.wire_first_sent = sent;
+        s.wire_first_read = describable ? read : 0;
+        s.wire_first_layout = s.layout;
+    }
+}
+
 void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
     WlGxDirectVertex v;
     uint32_t i = 3, n;
 
     // (the words back into a vertex, by the layout, as the FIFO would read them)
     memset(&v, 0, sizeof v);
+    if (g_in_primitive) {
+        wire_check(count * 4u);
+    }
     if (count < 3) {
         return;
     }
@@ -252,6 +323,14 @@ void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t c
 
     // (the vertex as GX would read it: an indexed attribute from its array, the others' words)
     memset(&v, 0, sizeof v);
+    if (g_in_primitive) {
+        // (sent: an index for each indexed attribute, then the words while they last)
+        bool describable;
+        uint32_t indexes, read = wire_bytes(&s.layout, &describable, &indexes), direct;
+
+        direct = read > indexes * 2u ? (read - indexes * 2u) / 4u : 0;
+        wire_check(indexes * 2u + 4u * (count < direct ? count : direct));
+    }
     if (s.layout.indexed & (1u << WL_GX_DIRECT_ARRAY_POSITION)) {
         if ((e = element(WL_GX_DIRECT_ARRAY_POSITION, index)) != NULL) {
             v.position[0] = be_float(e);
