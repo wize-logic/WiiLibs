@@ -491,6 +491,7 @@ guest RAM's size.
 | `novcache` | turns the vertex arrays' cache off (beats `vcache`) |
 | `overlap` | the processor goes on with the next frame while GX draws (by default each frame's end waits for GX to finish it: the caches' frame-late reuse still shows stale content in some frames); `WL_XB_OVERLAP` on the host |
 | `noaudio` | the idle APU and AC'97 (DirectSound fails, the title runs silent), for an A/B; `WL_XB_AUDIO=0` on the host |
+| `noreadahead` | no host thread reads ahead of a file the title reads from start to end (a map being inflated into a Z: cache slot: 512 KB read while the title inflates the last 128 KB), for an A/B of a level's first load; `WL_XB_NO_READAHEAD` on the host |
 | `deterministic` | the virtual clock (`thread.h`'s deterministic mode), so a run of a script on the Wii is the same game as the host's with `WL_XB_DETERMINISTIC=1`: guest RAM (the play step `dump`) and captures compare byte for byte; `WL_XB_DETERMINISTIC` on the host |
 | `netrun.txt` | options in the command line's form, one a line (`#` comments), for a run started without arguments (Dolphin): `net=127.0.0.1:7777`, `switch=...`, `play=...`; the command line wins (below) |
 | `play/` | where screenshots and captures go (`WL_XB_PLAY_OUT` on the host); scripts and `replay:` captures are looked for relative to the title folder |

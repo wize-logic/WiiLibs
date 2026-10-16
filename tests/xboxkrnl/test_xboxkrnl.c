@@ -1231,6 +1231,70 @@ TEST files_io_counts(void) {
     PASS();
 }
 
+// A map read from start to end is read ahead by a host thread: every byte as the file's, through a
+// jump back and on to the end, with most of them from the read-ahead's window.
+static uint8_t ahead_byte(uint32_t at) {
+    return (uint8_t)((at >> 8) * 7u + at);
+}
+
+static bool ahead_check(uint32_t buf, uint32_t at, uint32_t n) {
+    uint8_t got[4096];
+    wl_xb_copy_out(got, buf, n);
+    for (uint32_t i = 0; i < n; i++) {
+        if (got[i] != ahead_byte(at + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TEST files_read_ahead(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    const uint32_t size = (3u << 19) + 1000u; // 1.5 MB and a piece of a slot
+    char path[512];
+    snprintf(path, sizeof path, "%s/title/stream", g_root); // (a folder of its own: no listing sees it)
+    mkdir(path, 0777);
+    snprintf(path, sizeof path, "%s/title/stream/big.map", g_root);
+    FILE *fp = fopen(path, "wb");
+    ASSERT(fp != NULL);
+    for (uint32_t i = 0; i < size; i++) {
+        fputc(ahead_byte(i), fp);
+    }
+    fclose(fp);
+    uint32_t st = 0, iosb = gmem(8), off = gmem(8), buf = gmem(4096);
+    uint32_t h = open_path("D:\\stream\\big.map", 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    uint32_t at = 0, n = 3000u; // requests across the slots' edges
+    for (; at < 700000u; at += n) {
+        wl_xb_wr64(off, at);
+        ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, 0, 0, 0, iosb, buf, n, off), "%08x");
+        ASSERT(ahead_check(buf, at, n));
+    }
+    WlXkFileIo io;
+    ASSERT(wl_xk_file_io(h, &io));
+    ASSERT(io.ahead_bytes > 600000u);
+    wl_xb_wr64(off, 1234u); // a jump back: the card's, then a window again
+    ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, 0, 0, 0, iosb, buf, n, off), "%08x");
+    ASSERT(ahead_check(buf, 1234u, n));
+    for (at = 1234u + n; at < size; at += n) {
+        uint32_t want = size - at < n ? size - at : n;
+        wl_xb_wr64(off, at);
+        ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, 0, 0, 0, iosb, buf, n, off), "%08x");
+        ASSERT_EQ_FMT(want, wl_xb_rd32(iosb + 4), "%u");
+        ASSERT(ahead_check(buf, at, want));
+    }
+    wl_xb_wr64(off, size);
+    ASSERT_EQ_FMT(0xC0000011u, KN(S_NT_READ, h, 0, 0, 0, iosb, buf, n, off), "%08x"); // STATUS_END_OF_FILE
+    WlXkFileIo io2;
+    ASSERT(wl_xk_file_io(h, &io2));
+    ASSERT(io2.ahead_bytes > io.ahead_bytes + 1000000u);
+    KN(S_NT_CLOSE, h);
+    remove(path);
+    PASS();
+}
+
 // ---- Memory -------------------------------------------------------------------------------------
 
 TEST virtual_and_contiguous_memory(void) {
@@ -2035,6 +2099,7 @@ SUITE(kernel_suite) {
     RUN_TEST(files_dvd_and_overlapped);
     RUN_TEST(files_sparse_cache_drive);
     RUN_TEST(files_io_counts);
+    RUN_TEST(files_read_ahead);
     RUN_TEST(virtual_and_contiguous_memory);
     RUN_TEST(rtl_crypto_settings);
     RUN_TEST(files_flushed_open);

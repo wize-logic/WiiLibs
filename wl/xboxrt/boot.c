@@ -525,6 +525,19 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     kc.inline_first_thread = cfg->inline_first_thread;
     kc.async_io_pending = cfg->async_io_pending;
     kc.trace_calls = cfg->trace_kernel_calls;
+    {
+        // a file "noreadahead" in the title's folder (WL_XB_NO_READAHEAD on the host): no host thread
+        // reads a map ahead of the title's sequential reads, for an A/B of a level's first load
+        char flag[WL_FS_PATH_MAX];
+        snprintf(flag, sizeof flag, "%s/noreadahead", cfg->title_dir);
+        kc.no_read_ahead = wl_platform_fs_exists(flag);
+#if !defined(__wii__)
+        kc.no_read_ahead = kc.no_read_ahead || getenv("WL_XB_NO_READAHEAD") != NULL;
+#endif
+        if (kc.no_read_ahead) {
+            WL_LOG_I(TAG, "read-ahead: off");
+        }
+    }
     if (cfg->kernel_config != NULL) {
         cfg->kernel_config(&kc, cfg->user);
     }

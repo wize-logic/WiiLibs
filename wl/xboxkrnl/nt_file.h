@@ -74,7 +74,18 @@ struct XkFile {
     uint64_t io_end;         // where the last request ended
     uint64_t io_logged;      // the bytes at the last log line
     uint64_t unflushed;      // bytes written since the file was last flushed (XK_FLUSH_BYTES)
+    uint64_t io_ahead_bytes; // read bytes the read-ahead had ready (read_ahead.c)
 };
+
+// Read-ahead (read_ahead.c): one window at a time, for the handle `owner`, read by a host thread
+// through its own handle on `host` from `from` to `size`. xk_ahead_peek gives the window's bytes at
+// `off` (waiting for a read in flight; *avail of them, to the end of a slot) or NULL when `off` is
+// outside it: they stay valid until the owner's next peek or close. Closing waits for the thread's
+// read in flight; `owner` NULL closes any window.
+bool xk_ahead_open(const void *owner, const char *host, uint64_t from, uint64_t size);
+bool xk_ahead_owned(const void *owner);
+const uint8_t *xk_ahead_peek(const void *owner, uint64_t off, uint32_t *avail);
+void xk_ahead_close(const void *owner);
 
 // Raw partition sectors (the partition table on Partition0; what the title wrote to a partition's
 // first 64 KB, kept in data_dir).

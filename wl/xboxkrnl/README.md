@@ -107,6 +107,15 @@ partition table in sector 0 (the homebrew `****PARTINFO****`), and sector 4 is X
 utility drive's cache database, which it reads back at every boot). Device controls answer the
 geometry, partition information and the DVD media check.
 
+Read-ahead (`read_ahead.c`): a handle that reads a file of 1 MB or more from where its last read
+ended, on a file no handle may write, gets a window of four 128 KB slots that a host thread (above
+the guest's threads) fills through a handle of its own, so the card reads the next piece while the
+title works on the last (Halo inflating a map into a Z: cache slot). One window at a time; a read
+outside it, a write or resize of the file, `wl_xk_file_changed` and the handle's close end it. The
+bytes are the file's either way, so deterministic runs are unchanged. `no_read_ahead` in the
+config turns it off (the title folder's `noreadahead`). The log's "file I/O" lines count the KB
+the window had ready.
+
 ## Halo's imports
 
 Every one of the 134 imports in Halo's XBE resolves to a body or a data export (`yes`: implemented;
