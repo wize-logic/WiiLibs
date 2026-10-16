@@ -1508,6 +1508,16 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
         if (batch_open(dev, WL_NV2A_SOURCE_ARRAYS)) {
             uint32_t first = param & 0x00FFFFFFu, count = (param >> 24) + 1u, i;
 
+            if (count <= WL_NV2A_BATCH_INDICES - dev->batch_index_count) {
+                // (room for them all: no flush to test for)
+                uint32_t *to = dev->batch_indices + dev->batch_index_count;
+
+                for (i = 0; i < count; i++) {
+                    to[i] = first + i;
+                }
+                dev->batch_index_count += count;
+                break;
+            }
             for (i = 0; i < count; i++) {
                 batch_index(dev, first + i);
             }
@@ -1547,9 +1557,74 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     }
 }
 
+// an increasing run inside one of the windows (wl_nv2a_kelvin_push: `method` and the run's last word
+// in the same window): what window_word makes of each word, the slot and its bound kept here
+static __attribute__((noinline)) void window_run(WlNv2aKelvin *k, uint32_t method, const uint8_t *words,
+                                                 uint32_t count) {
+    unsigned word = (method >> 2) & 3u, last = word;
+    uint32_t n, changes = 0;
+
+    if (method < WL_NV2A_K_SET_TRANSFORM_CONSTANT) {
+        uint32_t load = k->program_load;
+
+        for (n = 0; n < count; n++) {
+            uint32_t param = wl_rd_le32(words + 4u * n);
+
+            if (load < WL_NV2A_PROGRAM_SLOTS && k->program[load][word] != param) {
+                k->program[load][word] = param;
+                changes++;
+            }
+            last = word;
+            if (word == 3) {
+                load++;
+                word = 0;
+            } else {
+                word++;
+            }
+        }
+        if (changes != 0) {
+            k->program_generation += changes;
+            k->dirty |= WL_NV2A_DIRTY_PROGRAM;
+        }
+        k->program_load = load;
+        k->program_word = last;
+        return;
+    }
+    {
+        uint32_t load = k->constant_load;
+
+        for (n = 0; n < count; n++) {
+            uint32_t param = wl_rd_le32(words + 4u * n), old;
+
+            if (load < WL_NV2A_CONSTANTS) {
+                // (the bits compared, as window_word's memcmp)
+                memcpy(&old, &k->constants[load][word], sizeof old);
+                if (old != param) {
+                    memcpy(&k->constants[load][word], &param, sizeof param);
+                    changes++;
+                }
+            }
+            last = word;
+            if (word == 3) {
+                load++;
+                word = 0;
+            } else {
+                word++;
+            }
+        }
+        if (changes != 0) {
+            k->constants_generation += changes;
+            k->dirty |= WL_NV2A_DIRTY_CONSTANTS;
+        }
+        k->constant_load = load;
+        k->constant_word = last;
+    }
+}
+
 // wl_nv2a_kelvin_methods' work, for it and wl_nv2a_kelvin_push (`ch`: the channel running, or NULL)
-static inline uint32_t methods_run(WlNv2a *dev, const WlNv2aChannel *ch, uint32_t method, bool increasing,
-                                   const uint8_t *words, uint32_t count) {
+static inline __attribute__((always_inline)) uint32_t methods_run(WlNv2a *dev, const WlNv2aChannel *ch,
+                                                                  uint32_t method, bool increasing,
+                                                                  const uint8_t *words, uint32_t count) {
     WlNv2aKelvin *k = &dev->kelvin;
     uint32_t n;
 
@@ -1562,6 +1637,27 @@ static inline uint32_t methods_run(WlNv2a *dev, const WlNv2aChannel *ch, uint32_
         uint32_t *indices = dev->batch_indices, at = dev->batch_index_count;
         unsigned halves = method == WL_NV2A_K_ARRAY_ELEMENT16 ? 2u : 1u, h;
 
+        if (count != 0 && count <= (WL_NV2A_BATCH_INDICES - at) / halves) {
+            // (room for the whole run: no flush to test for, and the method's value the last word's)
+            const uint8_t *w = words;
+
+            if (halves == 2u) {
+                for (n = 0; n < count; n++, w += 4) {
+                    uint32_t param = wl_rd_le32(w);
+
+                    indices[at] = param & 0xFFFFu;
+                    indices[at + 1u] = param >> 16;
+                    at += 2u;
+                }
+            } else {
+                for (n = 0; n < count; n++, w += 4) {
+                    indices[at++] = wl_rd_le32(w);
+                }
+            }
+            k->raw[method >> 2] = wl_rd_le32(words + 4u * (count - 1u));
+            dev->batch_index_count = at;
+            return count;
+        }
         for (n = 0; n < count; n++) {
             uint32_t param = wl_rd_le32(words + 4u * n);
 
@@ -1577,6 +1673,12 @@ static inline uint32_t methods_run(WlNv2a *dev, const WlNv2aChannel *ch, uint32_
             }
         }
         dev->batch_index_count = at;
+        return count;
+    }
+    if (increasing && method - WL_NV2A_K_SET_TRANSFORM_PROGRAM < WINDOWS_SIZE && count != 0 &&
+        ((method + 4u * (count - 1u)) ^ method) < 0x80u) {
+        // (a run inside one window: its words stored without each one's dispatch)
+        window_run(k, method, words, count);
         return count;
     }
     for (n = 0; n < count; n++) {
@@ -1614,6 +1716,11 @@ uint32_t wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, c
                        increasing, words, count);
 }
 
+// (GCC saved and restored the registers the runs take around each header, inside the loop: once, at
+// the entry, they cost a tenth of the pusher's instructions less)
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-shrink-wrap-separate")))
+#endif
 uint32_t wl_nv2a_kelvin_push(WlNv2a *dev, WlNv2aChannel *ch, const uint8_t *words, uint32_t avail) {
     uint32_t taken = 0, last_method = 0;
     unsigned last_subchannel = 0;
