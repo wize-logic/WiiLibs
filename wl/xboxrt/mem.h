@@ -157,6 +157,17 @@ void wl_xb_fill(uint32_t va, uint8_t byte, uint32_t n);
 // platform's write status (WL_OK when every byte went).
 struct WlPlatformFile;
 WlResult wl_xb_file_write(struct WlPlatformFile *file, const void *data, uint32_t bytes);
+// File-backed pages. A file read put the bytes of `file` from `offset` on at [va, va + n) (with
+// wl_xb_copy_in, just before): each whole page among them remembers its file and offset, so that
+// while it stays unchanged its frame goes back with nothing written, and a touch reads it from the
+// file again. The caller keeps the file open and its bytes as they are while pages remember them:
+// before a write to it, a change of its size or its close (by any handle), wl_xb_file_forget. Only
+// with paging and a swap file; bytes past 4 GB are not remembered.
+void wl_xb_file_pages(uint32_t va, uint32_t n, struct WlPlatformFile *file, uint64_t offset);
+// The pages remembering bytes of `file` in [offset, offset + bytes) forget them (UINT64_MAX: to its
+// end): those without a frame are read back from the file first. WL_OK, or the read's failure (the
+// page's bytes are lost: logged).
+WlResult wl_xb_file_forget(struct WlPlatformFile *file, uint64_t offset, uint64_t bytes);
 // A guest NUL-terminated string into `dst` (at most cap - 1 bytes, always terminated); the length
 // copied. Stops at the first byte of an address that is not valid guest memory.
 uint32_t wl_xb_read_cstr(uint32_t va, char *dst, uint32_t cap);
@@ -319,6 +330,10 @@ typedef struct {
     uint32_t swap_ins, swap_outs, swap_writes; // pages read back, pages written, write calls (batches)
     uint32_t zero_outs;                        // evictions of changed pages found zero: nothing written
     uint32_t swap_ins_spared;                  // swapped pages a file read overwrote whole: not read back
+    uint32_t file_copies;                      // pages a file read filled whole, kept as the file's copy
+    uint32_t file_evictions;                   // of the clean evictions, file copies: nothing written
+    uint32_t file_ins;                         // file copies read back from their file
+    uint32_t file_forgets, file_forget_ins;    // copies forgotten (the file changed or closed); read back first
     uint64_t swap_read_bytes, swap_write_bytes;
     uint64_t swap_us;                          // time spent in swap file I/O
     uint32_t swap_slots, swap_slots_used;      // the swap file's pages

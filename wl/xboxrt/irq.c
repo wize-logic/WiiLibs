@@ -480,6 +480,9 @@ static void status_report(void) {
                  (unsigned)m.swap_ins, (unsigned)(m.swap_read_bytes >> 10), (unsigned)m.swap_ins_spared,
                  (unsigned)m.swap_outs, (unsigned)(m.swap_write_bytes >> 10), (unsigned)m.swap_writes,
                  (unsigned)(m.swap_us / 1000u));
+        WL_LOG_I(TAG, "status: file pages %u kept, %u evicted, %u read back; %u forgotten (%u read back first)",
+                 (unsigned)m.file_copies, (unsigned)m.file_evictions, (unsigned)m.file_ins, (unsigned)m.file_forgets,
+                 (unsigned)m.file_forget_ins);
     }
 }
 

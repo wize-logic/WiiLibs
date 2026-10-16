@@ -8,6 +8,9 @@
 // a thread switch delivered to a loop that only polls a device register, user APCs
 // from overlapped reads, the file layer (D: read-only, Z: sparse, listings, renames), virtual and
 // contiguous memory, Rtl's strings, time and printf, the crypto exports, the EEPROM settings.
+// Built three times: as it is, in the deterministic mode (WL_XK_TEST_DETERMINISTIC) and with guest
+// memory paged over a few frames and a swap file (WL_XK_TEST_PAGING), where pages a file read filled
+// come back from the file until it changes.
 #define _DEFAULT_SOURCE
 #include <signal.h>
 #include <stdio.h>
@@ -35,6 +38,7 @@
 #define DATA_VA 0x00012000u
 #define THUNK_VA DATA_VA
 #define SCRATCH_VA 0x00013000u // a page of the image for strings and structures
+#define PAGED_FRAMES 256u      // WL_XK_TEST_PAGING: guest memory over 1 MB of frames
 #define IMAGE_SIZE 0x00008000u
 
 // the imports, in thunk-slot order
@@ -239,6 +243,10 @@ static void boot(void) {
 
     WlXbMemConfig mc;
     wl_xb_mem_config_default(&mc);
+#if defined(WL_XK_TEST_PAGING)
+    mc.frame_limit_bytes = PAGED_FRAMES * WL_XB_PAGE;
+    mc.swap_path = "sd:/pagefile.sys";
+#endif
     if (wl_xb_mem_init(&mc) != WL_OK || wl_xb_fault_install() != WL_OK) {
         return;
     }
@@ -1566,6 +1574,95 @@ static uint32_t rename_to(uint32_t h, const char *to, bool replace) {
     return KN(S_NT_SET_INFO, h, iosb, info, 16, 10);
 }
 
+// The words that tell page `i` of a file's version `v` apart (at +0 and +2048).
+static uint32_t page_word(uint32_t v, uint32_t i, uint32_t k) {
+    return (v << 24) ^ (i * 0x9E3779B1u) ^ (k != 0 ? 0x5A5A5A5Au : 0u);
+}
+
+static void fill_pages(uint32_t va, uint32_t pages, uint32_t v) {
+    for (uint32_t i = 0; i < pages; i++) {
+        wl_xb_wr32(va + i * WL_XB_PAGE, page_word(v, i, 0));
+        wl_xb_wr32(va + i * WL_XB_PAGE + 2048u, page_word(v, i, 1));
+    }
+}
+
+// Whether pages [0, n) of `va` hold version `v` (the first `first` of them version `v0`).
+static bool pages_hold(uint32_t va, uint32_t n, uint32_t first, uint32_t v0, uint32_t v) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t w = i < first ? v0 : v;
+        if (wl_xb_rd32(va + i * WL_XB_PAGE) != page_word(w, i, 0) ||
+            wl_xb_rd32(va + i * WL_XB_PAGE + 2048u) != page_word(w, i, 1)) {
+            fprintf(stderr, "page %u: 0x%08x, not version %u\n", (unsigned)i, (unsigned)wl_xb_rd32(va + i * WL_XB_PAGE),
+                    (unsigned)w);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Guest pages a read filled from a file remember it (wl_xb_file_pages) until the file changes: a
+// write through another handle, a smaller end of file, a rename, the reading handle's close and a
+// truncating open each leave the guest's bytes as they were read. Paged (WL_XK_TEST_PAGING), the
+// buffer is twice the frames: its pages go and come back from the file or the swap file meanwhile.
+TEST files_pages_keep_what_was_read(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    const uint32_t pages = 2u * PAGED_FRAMES, quarter = pages / 4u;
+    uint32_t src = 0, buf = 0, st = 0, iosb = gmem(8), off = gmem(8);
+    ASSERT_EQ(WL_OK, wl_xb_va_alloc(&src, pages * WL_XB_PAGE, 0x00400000u, WL_XB_PROT_READWRITE));
+    ASSERT_EQ(WL_OK, wl_xb_va_alloc(&buf, pages * WL_XB_PAGE, 0x00400000u, WL_XB_PROT_READWRITE));
+    uint32_t h = open_path("z:\\pages.bin", 0xC0000000u, 3, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    fill_pages(src, pages, 1);
+    wl_xb_wr64(off, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h, 0, 0, 0, iosb, src, pages * WL_XB_PAGE, off), "%08x");
+    WlXbMemStats m0;
+    wl_xb_mem_stats(&m0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, 0, 0, 0, iosb, buf, pages * WL_XB_PAGE, off), "%08x");
+    WlXbMemStats m1;
+    wl_xb_mem_stats(&m1);
+#if defined(WL_XK_TEST_PAGING)
+    ASSERT_EQ(pages, m1.file_copies - m0.file_copies);
+#endif
+    ASSERT(pages_hold(buf, pages, 0, 1, 1));
+    // another handle writes version 2 over the first quarter
+    uint32_t h2 = open_path("z:\\pages.bin", 0xC0000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    fill_pages(src, pages, 2);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h2, 0, 0, 0, iosb, src, quarter * WL_XB_PAGE, off), "%08x");
+    ASSERT(pages_hold(buf, pages, 0, 1, 1));
+    // cut to half through it, then renamed (every handle opens the file again)
+    ASSERT_EQ_FMT(0u, set_eof(h2, (uint64_t)(pages / 2u) * WL_XB_PAGE), "%08x");
+    ASSERT(pages_hold(buf, pages, 0, 1, 1));
+    ASSERT_EQ_FMT(0u, rename_to(h, "z:\\pages2.bin", true), "%08x");
+    ASSERT(pages_hold(buf, pages, 0, 1, 1));
+    // read again through the other handle (version 2, then 1), and the first one closed
+    ASSERT_EQ_FMT(0u, KN(S_NT_READ, h2, 0, 0, 0, iosb, buf, (pages / 2u) * WL_XB_PAGE, off), "%08x");
+    KN(S_NT_CLOSE, h);
+    ASSERT(pages_hold(buf, pages, quarter, 2, 1));
+    // a truncating open (FILE_OVERWRITE_IF) while that handle is open, then a write of version 3
+    uint32_t h3 = open_path("z:\\pages2.bin", 0xC0000000u, 5, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    fill_pages(src, pages, 3);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h3, 0, 0, 0, iosb, src, pages * WL_XB_PAGE, off), "%08x");
+    ASSERT(pages_hold(buf, pages, quarter, 2, 1));
+    ASSERT(pages_hold(buf, pages, quarter, 2, 1));
+#if defined(WL_XK_TEST_PAGING)
+    WlXbMemStats m2;
+    wl_xb_mem_stats(&m2);
+    ASSERT(m2.file_ins > m1.file_ins);
+    ASSERT(m2.file_forgets > m1.file_forgets);
+#endif
+    KN(S_NT_CLOSE, h2);
+    KN(S_NT_CLOSE, h3);
+    ASSERT(pages_hold(buf, pages, quarter, 2, 1));
+    ASSERT_EQ_FMT(0u, KN(S_NT_DELETE_FILE, gattr("z:\\pages2.bin")), "%08x");
+    ASSERT_EQ(WL_OK, wl_xb_va_release(src, NULL));
+    ASSERT_EQ(WL_OK, wl_xb_va_release(buf, NULL));
+    PASS();
+}
+
 TEST files_rename_moves_every_handle(void) {
     boot();
     ASSERT(g_ready);
@@ -1817,6 +1914,7 @@ SUITE(kernel_suite) {
     RUN_TEST(files_deleted_at_the_last_close);
     RUN_TEST(files_delete_pending_refuses_opens);
     RUN_TEST(files_rename_moves_every_handle);
+    RUN_TEST(files_pages_keep_what_was_read);
     RUN_TEST(objects_live_while_referenced);
     RUN_TEST(a_wait_keeps_its_object);
     RUN_TEST(virtual_memory_corners);

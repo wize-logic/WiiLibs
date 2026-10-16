@@ -55,7 +55,7 @@ WlResult wl_xb_backend_page_fault(uint32_t ea);
 
 extern uint8_t *g_xb_pg_flags;  // [ram pages]
 extern uint16_t *g_xb_pg_frame; // [ram pages] 1..frames, 0: none
-extern uint16_t *g_xb_pg_slot;  // [ram pages] swap slot + 1, 0: none
+extern uint16_t *g_xb_pg_slot;  // [ram pages] swap slot + 1 (below 0x8000), a file copy (0x8000 set), 0: none
 extern uint32_t g_xb_pg_frames; // frames in the pool; 0: paging is off (the OS backs every page)
 // The write watch: each page's write epoch, the epoch a store to it (a C bit harvested, the host's
 // write fault: watched pages only) or a change of its contents (freed, moved) was last seen at; the
@@ -102,6 +102,16 @@ void wl_xb_pg_release(uint32_t p, uint32_t pages);
 // its copy in the swap file, so that the touch that follows zero-fills it instead of reading it back.
 // Resident pages are left as they are.
 void wl_xb_pg_discard(uint32_t p, uint32_t pages);
+// File copies (mem.h, wl_xb_file_pages): the source number of an open file (1..; 0: none to spare, or
+// no swap file to read its pages back into when they are forgotten).
+uint32_t wl_xb_pg_source(struct WlPlatformFile *file);
+// Page `p` holds the bytes of `source` from `offset` on, just copied there whole: while it stays
+// clean its frame goes back with nothing written and a touch reads it from the file. Normal context,
+// lock held.
+void wl_xb_pg_filed(uint32_t p, uint32_t source, uint32_t offset);
+// The pages holding bytes of `file` in [offset, offset + bytes) forget it: those without a frame are
+// read back first (I/O), all of them are dirty. The whole file (0, UINT64_MAX): its source is free.
+WlResult wl_xb_pg_forget(struct WlPlatformFile *file, uint64_t offset, uint64_t bytes);
 // The user page in physical page `from` moves to physical page `to` (free): its frame, slot and
 // flags go with it. Both are unmapped.
 void wl_xb_pg_move(uint32_t from, uint32_t to);

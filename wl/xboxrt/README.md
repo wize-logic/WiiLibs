@@ -81,6 +81,16 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
   gathered becomes a zero page (no write, and its next touch zero-fills it). A file read into guest
   memory (`wl_xb_copy_in`) overwrites whole pages: a swapped one among them forgets its slot first
   (`wl_xb_pg_discard`), so the read does not fetch from the swap file bytes it is about to replace.
+- **File-backed pages.** The kernel's file reads (NtReadFile) tell the core which whole pages they
+  filled from a file's bytes (`wl_xb_file_pages`): such a page is made clean and remembers its file
+  and offset in place of a slot, so while unchanged it gives its frame back with nothing written and
+  a touch reads it from the file again (the airlock's swap-outs: 12955 -> 1387). The file is read
+  through the title's own handle (no second handle on a file the title writes: a FAT driver's two
+  handles disagree about its clusters), so before its bytes change or the handle goes the pages
+  forget it (`wl_xb_file_forget`: one without a frame is read back first, all are marked changed):
+  a write through any handle on the file, a smaller size, a truncating open, a rename (every handle
+  reopens) and a close. A program that writes a file the kernel has open behind its back says so
+  first (`wl_xk_file_changed`: the play harness's checkpoint snapshots over z:\savegame.bin).
 - **The swap file**: `<the title's hard disk folder>/pagefile.sys` (`WlXbTitleConfig.swap_path`, ""
   for none), the guest RAM's size by default, grown once (the card allocates its clusters then, not
   during play) and kept; its contents mean nothing across runs. Slots are pages; a bit map says

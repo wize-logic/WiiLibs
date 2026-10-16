@@ -702,6 +702,31 @@ void wl_xb_copy_in(uint32_t va, const void *src, uint32_t n) {
     memcpy(wl_xb_ptr(va), src, n);
 }
 
+void wl_xb_file_pages(uint32_t va, uint32_t n, struct WlPlatformFile *file, uint64_t offset) {
+    if (!g_ready || g_xb_pg_frames == 0 || n < WL_XB_PAGE) {
+        return;
+    }
+    uint32_t source = wl_xb_pg_source(file);
+    if (source == 0) {
+        return;
+    }
+    uint64_t end = ((uint64_t)va + n) & ~(uint64_t)(WL_XB_PAGE - 1u);
+    for (uint64_t a = ((uint64_t)va + WL_XB_PAGE - 1u) & ~(uint64_t)(WL_XB_PAGE - 1u); a < end; a += WL_XB_PAGE) {
+        uint64_t at = offset + (a - va);
+        uint32_t p1 = phys_page_of((uint32_t)a);
+        if (at + WL_XB_PAGE > 0x100000000ull) {
+            break;
+        }
+        if (p1 != 0) {
+            wl_xb_pg_filed(p1 - 1u, source, (uint32_t)at);
+        }
+    }
+}
+
+WlResult wl_xb_file_forget(struct WlPlatformFile *file, uint64_t offset, uint64_t bytes) {
+    return wl_xb_pg_forget(file, offset, bytes);
+}
+
 void wl_xb_copy_out(void *dst, uint32_t va, uint32_t n) {
     if (n != 0) {
         memcpy(dst, wl_xb_ptr(va), n);
