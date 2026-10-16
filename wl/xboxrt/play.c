@@ -1087,14 +1087,19 @@ static void shot_begin(const char *name) {
         wl_xb_play_log("shot: no memory for %ux%u", (unsigned)vi.fb_width, (unsigned)vi.efb_height);
         return;
     }
-    snprintf(dir, sizeof dir, "%s/shots", P.base_dir);
-    (void)wl_platform_fs_mkdir(dir);
-    if (name[0] != '\0') {
-        snprintf(P.shot_bmp, sizeof P.shot_bmp, "%s/%s.bmp", dir, name);
-    } else {
-        snprintf(P.shot_bmp, sizeof P.shot_bmp, "%s/shot_%04u.bmp", dir, (unsigned)P.shots);
+    int n = snprintf(dir, sizeof dir, "%s/shots", P.base_dir);
+    if (n > 0 && (size_t)n < sizeof dir) {
+        (void)wl_platform_fs_mkdir(dir);
+        n = name[0] != '\0' ? snprintf(P.shot_bmp, sizeof P.shot_bmp, "%s/%s.bmp", dir, name)
+                            : snprintf(P.shot_bmp, sizeof P.shot_bmp, "%s/shot_%04u.bmp", dir, (unsigned)P.shots);
     }
     P.shots++;
+    if (n <= 0 || (size_t)n >= sizeof P.shot_bmp) {
+        wl_xb_play_log("shot: the path is too long");
+        free(P.shot_tiles);
+        P.shot_tiles = NULL;
+        return;
+    }
     wl_gx_shot_request(P.shot_tiles);
 }
 
