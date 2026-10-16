@@ -317,6 +317,37 @@ TEST cube_maps_become_sphere_maps(void) {
         ASSERT(fabsf(st[0] - 0.3f) < 1e-4f);
         ASSERT(fabsf(st[1] - 0.6f) < 1e-4f);
     }
+    // the mapping without divisions against its definition (d normalized, m = 2 |d + (0, 0, 1)|) over
+    // directions of every length and side; zero, and straight behind
+    {
+        float d[3], st[2];
+        int n;
+
+        for (n = 0; n < 4000; n++) {
+            double scale = pow(10.0, (double)(n % 13) - 6.0), x, y, z, l, m;
+
+            d[0] = (float)(sin(n * 0.37) * scale);
+            d[1] = (float)(cos(n * 0.91) * scale);
+            d[2] = (float)(sin(n * 1.73 + 0.5) * scale);
+            x = d[0];
+            y = d[1];
+            z = d[2];
+            l = sqrt(x * x + y * y + z * z);
+            m = 2.0 * sqrt(x * x / (l * l) + y * y / (l * l) + (z / l + 1.0) * (z / l + 1.0));
+            if (m < 1.0e-3) {
+                continue;
+            }
+            wl_nv2a_sphere_coordinates(d, st);
+            ASSERT(fabs(st[0] - (x / l / m + 0.5)) < 1.0e-6);
+            ASSERT(fabs(st[1] - (y / l / m + 0.5)) < 1.0e-6);
+        }
+        d[0] = d[1] = d[2] = 0.0f;
+        wl_nv2a_sphere_coordinates(d, st);
+        ASSERT(st[0] == 0.5f && st[1] == 0.5f);
+        d[2] = -3.0f;
+        wl_nv2a_sphere_coordinates(d, st);
+        ASSERT(st[0] == 0.5f && st[1] == 1.0f);
+    }
     PASS();
 }
 

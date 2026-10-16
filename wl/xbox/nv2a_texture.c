@@ -390,27 +390,39 @@ void wl_nv2a_texel_rgba(uint8_t color, const uint8_t *row, uint32_t x, const uin
 
 // ---- the sphere map ---------------------------------------------------------------------------
 
-void wl_nv2a_sphere_coordinates(const float direction[3], float st[2]) {
-    float x = direction[0], y = direction[1], z = direction[2];
-    // (wl_sqrtf_exact: sqrtf's bits, inline, a vertex at a time)
-    float length = wl_sqrtf_exact(x * x + y * y + z * z), m;
+// 1 / sqrt(x) for x > 0, finite: the estimate (frsqrte's 5 bits on the Wii) and three steps of
+// Newton's method in double (36 bits or more: a float's worth, no division)
+static inline double reciprocal_root(double x) {
+    double y = wl_rsqrt_estimate(x);
 
-    if (!(length > 1.0e-12f)) {
+    y = y * (1.5 - 0.5 * x * y * y);
+    y = y * (1.5 - 0.5 * x * y * y);
+    y = y * (1.5 - 0.5 * x * y * y);
+    return y;
+}
+
+// (x / m + 1/2 with d normalized and m = 2 |d + (0, 0, 1)| is x k + 1/2 with k = 1 / (2 sqrt(2 L (L +
+// z))), L = |d|: two reciprocal roots, no division, for the 2-3% of a frame the five divisions and two
+// exact roots cost on the Wii)
+void wl_nv2a_sphere_coordinates(const float direction[3], float st[2]) {
+    double x = direction[0], y = direction[1], z = direction[2];
+    double length2 = x * x + y * y + z * z, length, q;
+
+    if (!(length2 > 1.0e-24 && length2 < 1.0e76)) {
         st[0] = st[1] = 0.5f;
         return;
     }
-    x /= length;
-    y /= length;
-    z /= length;
-    m = 2.0f * wl_sqrtf_exact(x * x + y * y + (z + 1.0f) * (z + 1.0f));
-    if (!(m > 1.0e-6f)) {
-        // straight behind: the disc's edge
+    length = length2 * reciprocal_root(length2);
+    q = 2.0 * length * (length + z);
+    if (!(q > 2.5e-13 * length2)) {
+        // straight behind (m below 1e-6): the disc's edge
         st[0] = 0.5f;
         st[1] = 1.0f;
         return;
     }
-    st[0] = x / m + 0.5f;
-    st[1] = y / m + 0.5f;
+    q = 0.5 * reciprocal_root(q);
+    st[0] = (float)(x * q + 0.5);
+    st[1] = (float)(y * q + 0.5);
 }
 
 void wl_nv2a_sphere_direction(float s, float t, float direction[3]) {
