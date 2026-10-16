@@ -42,6 +42,11 @@ static uint32_t g_low_pages; // the reserved low pages (the retail kernel's), le
 // committed page fail, and it empties them (and they are empty until guest memory is ready).
 #define OK_PAGES 16u
 static uint32_t g_ok_pages[OK_PAGES];
+// The RAM window's bytes (0x80000000 up) once guest memory is ready, 0 before: wl_xb_range_ok's
+// second common case. Halo keeps its objects and tags in contiguous memory, read through the window,
+// and its level runner's reads of them were 3.5% of a d40 run on the Wii, nearly all in
+// wl_xb_range_ok_slow.
+static uint32_t g_window_bytes;
 
 void wl_xb_mem_config_default(WlXbMemConfig *cfg) {
     memset(cfg, 0, sizeof *cfg);
@@ -132,6 +137,7 @@ WlResult wl_xb_mem_init(const WlXbMemConfig *cfg) {
     g_xbox_mem_offset = (ptrdiff_t)base;
 #endif
     g_ready = true;
+    g_window_bytes = pages << WL_XB_PAGE_SHIFT;
     (void)wl_mem_census_add("guest tables", census_tables, NULL);
     (void)wl_mem_census_add("frames", census_frames, NULL);
     WL_LOG_I(TAG, "guest RAM %u MB (%u pages), host base %p, reserved low 0x%x, GPU instance 0x%x", cfg->ram_bytes >> 20,
@@ -642,15 +648,23 @@ static bool page_ok(uint32_t va) {
     return false;
 }
 
-// The common case first: a range inside one user page the memo holds (only pages page_ok found
-// committed are there). The kernel checks every argument this way and a title's own code every
-// field it reads (2.4% of Halo's airlock fight on the Wii before this); without a frame of its own,
-// the rest is a tail call to the whole check.
+// The common cases first: a range inside one user page the memo holds (only pages page_ok found
+// committed are there), and a range inside the RAM window. The kernel checks every argument this
+// way and a title's own code every field it reads (2.4% of Halo's airlock fight on the Wii before
+// the first, 3.5% of d40 before the second); without a frame of its own, the rest is a tail call to
+// the whole check.
 bool wl_xb_range_ok(uint32_t va, uint32_t n) {
     uint32_t vp = va >> WL_XB_PAGE_SHIFT;
     // n - 1 below the bytes left in va's page: n is not 0, and the range neither wraps nor crosses a page
     if (va < WL_XB_USER_LIMIT && n - 1u < WL_XB_PAGE - (va & (WL_XB_PAGE - 1u)) &&
         g_ok_pages[vp & (OK_PAGES - 1u)] == vp + 1u) {
+        return true;
+    }
+    // va's offset in the window below its RAM's bytes (so va is 0x80000000 up, and guest memory is
+    // ready), and n - 1 below the bytes left (n is not 0, and the range ends in that RAM): what
+    // page_ok answers for each of its pages
+    uint32_t off = va - 0x80000000u;
+    if (off < g_window_bytes && n - 1u < g_window_bytes - off) {
         return true;
     }
     return wl_xb_range_ok_slow(va, n);
