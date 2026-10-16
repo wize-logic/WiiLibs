@@ -613,6 +613,9 @@ typedef struct {
     uint32_t tex_loads;       // texture objects loaded into the GPU (after the shadow)
     uint32_t tlut_loads;      // TLUTs loaded
     uint32_t tex_mtx_loads;   // texture matrices loaded into the GPU (after the shadow)
+    uint32_t gpu_waits;       // times the processor waited for the GPU (end_frame, wl_gx_sync, wl_gx_frame_wait)
+    uint32_t efb_copies;      // texture copies out of the EFB (render targets, parks, the squeeze); the GPU's
+                              // pixel pipe syncs after each, the processor does not wait
 } WlGxStats;
 void wl_gx_stats(WlGxStats *out);
 

@@ -46,6 +46,12 @@ void wl_gx_wii_note_commands(void) {
     g_commands++;
 }
 
+void wl_gx_wii_note_efb_copy(void) {}
+
+bool wl_gx_sync(void) {
+    return true; // (the stub GPU is never behind)
+}
+
 // ---- the test ---------------------------------------------------------------------------------------
 
 static uint8_t g_parked_colour[640 * 480 * 4] __attribute__((aligned(32)));

@@ -40,6 +40,9 @@ static void default_free(void *memory) {
 
 static void free_parked(void) {
     WlGxTargetFree release = t.release != NULL ? t.release : default_free;
+    if (t.colour != NULL || t.depth != NULL) {
+        (void)wl_gx_sync(); // (the GPU may still copy into them or read them: frame overlap)
+    }
     if (t.colour != NULL) {
         release(t.colour);
     }
@@ -61,6 +64,7 @@ static bool block_at_least(void **block, size_t *size, size_t *clean, size_t byt
         return true;
     }
     if (*block != NULL) {
+        (void)wl_gx_sync(); // (the GPU may still copy into it or read it: frame overlap)
         release(*block);
     }
     *block = alloc(bytes);

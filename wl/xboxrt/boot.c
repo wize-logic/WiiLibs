@@ -301,13 +301,14 @@ static const char *play_setting(const WlXbTitleConfig *cfg) {
 }
 
 // The GPU's options from the title's folder: a file "noxf" (or WL_XB_NO_XF on the host) keeps GX's
-// transform unit out of the vertices, for an A/B on the console. The static geometry's vertex
+// transform unit out of the vertices, for an A/B on the console; a file "nooverlap" (or
+// WL_XB_NO_OVERLAP) has each frame's end wait for GX to finish it. The static geometry's vertex
 // arrays are kept for GX to read by index, 1 MB of them in the end of the textures' arena (a10 kept
 // at most 843 KB on the Wii); a file "vcache" sets the KB (its text, 1024 when empty), a file
 // "novcache" turns them off (WL_XB_VCACHE_KB on the host, 0 for off).
 static void gpu_options(const WlXbTitleConfig *cfg) {
     char flag[WL_FS_PATH_MAX];
-    bool no_xf;
+    bool no_xf, no_overlap;
     uint32_t vcache_kb = 1024u;
     WlPlatformFile *vf = NULL;
 
@@ -317,6 +318,12 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
     no_xf = no_xf || getenv("WL_XB_NO_XF") != NULL;
 #endif
     wl_xb_gpu_set_transform_unit(!no_xf);
+    snprintf(flag, sizeof flag, "%s/nooverlap", cfg->title_dir);
+    no_overlap = wl_platform_fs_exists(flag);
+#if !defined(__wii__)
+    no_overlap = no_overlap || getenv("WL_XB_NO_OVERLAP") != NULL;
+#endif
+    wl_xb_gpu_set_frame_overlap(!no_overlap);
     snprintf(flag, sizeof flag, "%s/vcache", cfg->title_dir);
     if (wl_platform_fs_open(flag, WL_FILE_READ, &vf) == WL_OK) {
         char text[16];

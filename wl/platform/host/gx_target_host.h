@@ -32,3 +32,5 @@ typedef struct {
 #define WL_HOST_TARGET_OPS_MAX 64u
 const WlHostTargetOp *wl_host_target_ops(uint32_t *count);
 void wl_host_target_clear_ops(void);
+// The copies out of the EFB (COPY and SQUEEZE) since the start, for WlGxStats.efb_copies.
+uint32_t wl_host_gx_target_copies(void);

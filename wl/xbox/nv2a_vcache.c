@@ -82,7 +82,14 @@ static void array_free(WlNv2aVCache *cache, void *array) {
     }
 }
 
-// an array the GPU may still read this frame: given back at its end (false: no room to remember it)
+// whether the GPU may still read an array drawn in frame `used`: this frame's, or one of the
+// gpu_lag frames before it that the GPU may not have finished
+static bool gpu_reads(const WlNv2aVCache *cache, uint32_t used) {
+    return used != 0 && used + cache->cfg.gpu_lag >= cache->frame;
+}
+
+// an array the GPU may still read: given back at the end of the frame the GPU is then past (false:
+// no room to remember it)
 static bool release_array(WlNv2aVCache *cache, void *array, bool used_now) {
     if (!used_now) {
         array_free(cache, array);
@@ -91,6 +98,7 @@ static bool release_array(WlNv2aVCache *cache, void *array, bool used_now) {
     if (cache->pending_count == WL_NV2A_VCACHE_PENDING) {
         return false;
     }
+    cache->pending_frame[cache->pending_count] = cache->frame;
     cache->pending[cache->pending_count++] = array;
     return true;
 }
@@ -126,7 +134,7 @@ static bool drop_array(WlNv2aVCache *cache, WlNv2aVCacheEntry *e) {
     if (e->array == NULL) {
         return true;
     }
-    if (!release_array(cache, e->array, e->used_frame == cache->frame)) {
+    if (!release_array(cache, e->array, gpu_reads(cache, e->used_frame))) {
         return false;
     }
     cache->stats.bytes -= e->bytes;
@@ -156,7 +164,7 @@ static WlNv2aVCacheEntry *eviction_candidate(WlNv2aVCache *cache, const WlNv2aVC
     for (i = 0; i < WL_NV2A_VCACHE_ENTRIES; i++) {
         WlNv2aVCacheEntry *e = &cache->entries[i];
 
-        if (e->kind == 0xFFu || e == spare || e->array == NULL || e->used_frame == cache->frame) {
+        if (e->kind == 0xFFu || e == spare || e->array == NULL || gpu_reads(cache, e->used_frame)) {
             continue;
         }
         if (best == NULL || e->used_frame < best->used_frame) {
@@ -210,6 +218,10 @@ void wl_nv2a_vcache_clear(WlNv2aVCache *cache) {
     unsigned i;
 
     wl_nv2a_vcache_frame_done(cache);
+    // (the GPU is done with every frame: those kept for a lagging GPU too)
+    while (cache->pending_count != 0) {
+        array_free(cache, cache->pending[--cache->pending_count]);
+    }
     for (i = 0; i < WL_NV2A_VCACHE_ENTRIES; i++) {
         if (cache->entries[i].array != NULL) {
             array_free(cache, cache->entries[i].array);
@@ -223,11 +235,18 @@ void wl_nv2a_vcache_clear(WlNv2aVCache *cache) {
 
 void wl_nv2a_vcache_frame_done(WlNv2aVCache *cache) {
     size_t drawn = 0;
-    unsigned i;
+    unsigned i, kept = 0;
 
-    while (cache->pending_count != 0) {
-        array_free(cache, cache->pending[--cache->pending_count]);
+    // (the GPU is past the frames gpu_lag before this one)
+    for (i = 0; i < cache->pending_count; i++) {
+        if (cache->pending_frame[i] + cache->cfg.gpu_lag <= cache->frame) {
+            array_free(cache, cache->pending[i]);
+        } else {
+            cache->pending_frame[kept] = cache->pending_frame[i];
+            cache->pending[kept++] = cache->pending[i];
+        }
     }
+    cache->pending_count = kept;
     for (i = 0; i < WL_NV2A_VCACHE_ENTRIES; i++) {
         const WlNv2aVCacheEntry *e = &cache->entries[i];
 
@@ -434,8 +453,8 @@ const void *wl_nv2a_vcache_get(WlNv2aVCache *cache, WlNv2a *dev, const WlNv2aAtt
         uint32_t hi = near->first + near->count - 1u > last ? near->first + near->count - 1u : last;
 
         if (hi - lo < WL_NV2A_VCACHE_SPAN) {
-            if (near->used_frame != cache->frame) {
-                // (not drawn this frame: its memory free for the one over both)
+            if (!gpu_reads(cache, near->used_frame)) {
+                // (not read by the GPU now: its memory free for the one over both)
                 evict(cache, near);
                 e = make(cache, dev, &key, lo, hi - lo + 1u, NULL);
             } else {
@@ -465,8 +484,8 @@ const void *wl_nv2a_vcache_get(WlNv2aVCache *cache, WlNv2a *dev, const WlNv2aAtt
                 cache->stats.refused++;
                 return NULL;
             }
-            if (e->used_frame == cache->frame) {
-                // (the GPU may still read the old one this frame: the new one elsewhere)
+            if (gpu_reads(cache, e->used_frame)) {
+                // (the GPU may still read the old one: the new one elsewhere)
                 void *array = room(cache, padded(e->bytes), e);
 
                 if (array == NULL || !release_array(cache, e->array, true)) {

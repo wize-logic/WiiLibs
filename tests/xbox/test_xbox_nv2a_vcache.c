@@ -155,6 +155,40 @@ TEST found_again_checked_once_a_frame_rewritten_twice_not_kept(void) {
     PASS();
 }
 
+// gpu_lag 1 (frames overlapped): an array drawn in the frame before may still be read by the GPU,
+// so its rewrite goes elsewhere, and the old one is given back only a frame later
+TEST overlapped_frames_keep_the_frame_befores_arrays(void) {
+    WlNv2aVCache *cache = calloc(1, sizeof *cache);
+    WlNv2aVCacheConfig cfg;
+    WlNv2aAttrib position;
+    const uint8_t *p, *moved;
+
+    ASSERT(cache != NULL && guest() != NULL);
+    memset(&cfg, 0, sizeof cfg);
+    cfg.budget = 1u << 20;
+    cfg.gpu_lag = 1;
+    wl_nv2a_vcache_init(cache, &cfg);
+    position = attrib(0, 0, WL_NV2A_VTX_F, 3);
+    p = wl_nv2a_vcache_get(cache, g_guest.dev, &position, 0, 31, WL_NV2A_VCACHE_POSITION);
+    ASSERT(p != NULL);
+    wl_nv2a_vcache_frame_done(cache);
+    // rewritten: the GPU may still be drawing the frame before from it
+    t_w32(&g_guest, ARRAY + STRIDE * 3, t_f(99.0f));
+    moved = wl_nv2a_vcache_get(cache, g_guest.dev, &position, 0, 31, WL_NV2A_VCACHE_POSITION);
+    ASSERT(moved != NULL && moved != p);
+    ASSERT_EQ(bits(99.0f), be(moved + 12 * 3));
+    ASSERT_EQ(bits(-7.0f + 1.25f * 3.0f), be(p + 12 * 3));
+    ASSERT_EQ(1u, cache->pending_count);
+    wl_nv2a_vcache_frame_done(cache);
+    ASSERT_EQ(1u, cache->pending_count); // (the GPU may be drawing the frame that read it)
+    wl_nv2a_vcache_frame_done(cache);
+    ASSERT_EQ(0u, cache->pending_count);
+    wl_nv2a_vcache_clear(cache);
+    t_destroy(&g_guest);
+    free(cache);
+    PASS();
+}
+
 // a write watch whose pages are written when the test says
 static uint32_t g_epoch = 1, g_written_epoch;
 
@@ -253,6 +287,7 @@ TEST two_ranges_met_as_one_and_the_least_recent_evicted(void) {
 SUITE(vcache_suite) {
     RUN_TEST(each_kind_converted_as_the_fetch_widens_it);
     RUN_TEST(found_again_checked_once_a_frame_rewritten_twice_not_kept);
+    RUN_TEST(overlapped_frames_keep_the_frame_befores_arrays);
     RUN_TEST(the_watch_answers_for_an_array_not_written);
     RUN_TEST(two_ranges_met_as_one_and_the_least_recent_evicted);
 }

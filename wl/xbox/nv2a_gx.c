@@ -237,11 +237,13 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     textures = gx->cfg.textures;
     // (a light's falloff cube as its lit face, wl_nv2a_spot_coordinates, not a sphere map)
     textures.spots = true;
+    textures.gpu_lag = gx->cfg.overlap ? 1u : 0u;
     if (textures.flush == NULL) {
         textures.flush = commit;
     }
     wl_nv2a_texcache_init(&gx->textures, &textures);
     vertices = gx->cfg.vertices;
+    vertices.gpu_lag = textures.gpu_lag;
     if (vertices.flush == NULL) {
         vertices.flush = commit;
     }
@@ -252,6 +254,7 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     wl_xbox_psh_cache_init(&gx->psh, gx->cfg.recipe != NULL ? &gx->recipe : NULL);
     wl_gx_set_efb_alpha(!gx->cfg.no_efb_alpha);
     wl_gx_target_set_back_buffer_size(gx->cfg.width, gx->cfg.height);
+    wl_gx_set_frame_overlap(gx->cfg.overlap);
     gx->cull_positive = WL_GX_CULL_BACK;
     gx->fit_b = 0.0f;
     return gx;
@@ -266,6 +269,9 @@ void wl_nv2a_gx_destroy(WlNv2aGx *gx) {
     if (gx->frame_open) {
         wl_nv2a_gx_present(gx);
     }
+    // (GX done with what it reads before it is given back)
+    (void)wl_gx_sync();
+    wl_gx_set_frame_overlap(false);
     wl_nv2a_texcache_clear(&gx->textures);
     wl_nv2a_vcache_clear(&gx->vertices);
     for (i = 0; i < TARGETS; i++) {
@@ -476,6 +482,11 @@ static RenderTarget *slot_for(WlNv2aGx *gx, uint32_t phys, uint32_t w, uint32_t 
         return NULL;
     }
     if (slot->memory != NULL) {
+        if (slot->used_frame + gx->textures.cfg.gpu_lag >= gx->frame) {
+            // (GX may still copy into it or read it: done first, for the memory may be another
+            // image's at once)
+            (void)wl_gx_sync();
+        }
         gx->textures.cfg.release(gx->textures.cfg.user, slot->memory);
     }
     memset(slot, 0, sizeof *slot);

@@ -5,6 +5,7 @@
 
 #include "wl/platform/gx_target_internal.h"
 #include "wl/platform/host/gx_host.h"
+#include "wl/platform/host/gx_target_host.h"
 #include "wl/platform/host/gx_renderer_host.h"
 
 static WlHostGxState s;
@@ -197,6 +198,8 @@ static uint32_t g_frames;
 static uint32_t g_interval = 1;
 static uint32_t g_frames_ended; // wl_gx_frame_index (not reset with the counters)
 static bool g_overlap;
+// the frames ended without overlap: the console's processor waits for the GPU at each
+static uint32_t g_frame_waits;
 
 WlResult wl_platform_video_init(void) {
     return WL_OK;
@@ -301,6 +304,8 @@ void wl_gx_stats(WlGxStats *out) {
     out->tex_loads = s.tex_binds;
     out->tlut_loads = s.tlut_loads;
     out->tex_mtx_loads = s.texmtx_loads;
+    out->gpu_waits = s.sync_calls + g_frame_waits;
+    out->efb_copies = s.efb_copies + wl_host_gx_target_copies();
 }
 
 bool wl_gx_sync(void) {
@@ -401,7 +406,8 @@ uint32_t wl_gx_end_frame(void) {
     s.in_frame = false;
     s.end_frames++;
     g_frames_ended++;
-    (void)g_overlap; // (the stub GPU has finished every frame: overlap changes nothing)
+    // (the stub GPU has finished every frame: overlap changes nothing but the waits counted)
+    g_frame_waits += g_overlap ? 0u : 1u;
     return wl_platform_video_present();
 }
 

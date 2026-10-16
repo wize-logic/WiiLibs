@@ -8,7 +8,11 @@
 #include "wl/platform/host/gx_renderer_host.h"
 
 static WlHostTargetOp ops[WL_HOST_TARGET_OPS_MAX];
-static uint32_t op_count;
+static uint32_t op_count, copies;
+
+uint32_t wl_host_gx_target_copies(void) {
+    return copies;
+}
 
 const WlHostTargetOp *wl_host_target_ops(uint32_t *count) {
     *count = op_count;
@@ -42,6 +46,7 @@ void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what
     (void)invalidate; // (no processor cache to keep in step)
     const WlHostGxRenderer *r = wl_host_gx_renderer();
     WlHostTargetOp *op = next_op(WL_HOST_TARGET_COPY);
+    copies++;
     op->what = (uint8_t)what;
     op->w = w;
     op->h = h;
@@ -133,6 +138,7 @@ void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uin
     (void)invalidate;
     const WlHostGxRenderer *r = wl_host_gx_renderer();
     WlHostTargetOp *op = next_op(WL_HOST_TARGET_SQUEEZE);
+    copies++;
     op->dst = colour;
     op->back_w = back_w;
     op->back_h = back_h;

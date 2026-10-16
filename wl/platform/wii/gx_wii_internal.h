@@ -10,6 +10,8 @@
 void wl_gx_wii_copy_filter(bool display);
 // GX commands were submitted behind the shadow's back (wl_gx_peek_rgba then syncs first).
 void wl_gx_wii_note_commands(void);
+// a texture copy out of the EFB made (WlGxStats.efb_copies)
+void wl_gx_wii_note_efb_copy(void);
 // Texture maps loaded behind gx_direct_wii.c's back (bit n: GX_TEXMAPn): what they hold is unknown
 // to it, so its next wl_gx_direct_texture on them loads.
 void wl_gx_wii_texmaps_forget(uint32_t maps);

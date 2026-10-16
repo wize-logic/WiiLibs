@@ -295,10 +295,14 @@ WlNv2aGx *wl_xb_gpu_nv2a_gx(void) {
     return g_gx;
 }
 
-static bool g_no_xf;
+static bool g_no_xf, g_no_overlap;
 
 void wl_xb_gpu_set_transform_unit(bool on) {
     g_no_xf = !on;
+}
+
+void wl_xb_gpu_set_frame_overlap(bool on) {
+    g_no_overlap = !on;
 }
 
 static void *g_vcache_arena;
@@ -399,6 +403,10 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
         }
         gcfg.program_decoded = program_decoded;
         gcfg.no_xf = g_no_xf;
+        gcfg.overlap = !g_no_overlap;
+        if (g_no_overlap) {
+            WL_LOG_I(TAG, "frames not overlapped: each frame's end waits for GX to finish it");
+        }
         if (g_no_xf) {
             WL_LOG_I(TAG, "GX's transform unit not used: every vertex through the program on the processor");
         }

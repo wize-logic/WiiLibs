@@ -63,6 +63,10 @@ typedef struct WlNv2aGxConfig {
     // every vertex through the program on the processor, never GX's transform unit (the draws whose
     // live outputs are affine in their inputs otherwise go to the transform unit: not to the bit)
     bool no_xf;
+    // the processor does not wait for GX at the end of a frame (wl_gx_set_frame_overlap): it goes on
+    // with the next one while GX draws this one; the caches keep what GX may still read one frame
+    // longer
+    bool overlap;
 } WlNv2aGxConfig;
 
 // Where a draw's vertices were transformed, and why not further on (WlNv2aGxStats.xf_why_*)

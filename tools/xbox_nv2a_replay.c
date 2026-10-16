@@ -31,6 +31,9 @@
 //               runtime's MMU gives it on the Wii: a page counts as stored to when one of the
 //               capture's memory blocks lands in it (the blocks are what the title wrote, as the
 //               capture read it); with --bench too
+//   --overlap   the GX backend's frames overlapped (WlNv2aGxConfig.overlap, as the runtime has them):
+//               the processor does not wait for GX at a frame's end; with --bench, the waits a frame
+//               counted either way
 //   --cpu-transform  every vertex through the program on the processor (GX's transform unit not
 //               used for the draws whose outputs are affine), to the bit as before it
 //   --bench N   the capture replayed N times through the GX backend alone (no software GX, no
@@ -845,6 +848,14 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
     printf("bench: a run's model: %u kicks, %u words, %u methods\n", (unsigned)info.stats.kicks,
            (unsigned)info.stats.words, (unsigned)info.stats.methods);
     {
+        WlGxStats xs;
+
+        wl_gx_stats(&xs);
+        printf("bench: GX syncs a frame: %.2f processor waits for GX, %.2f copies out of the EFB (GX's own pixel "
+               "sync after each)\n", (double)xs.gpu_waits / ((double)runs * frames),
+               (double)xs.efb_copies / ((double)runs * frames));
+    }
+    {
         WlNv2aGxStats gs;
 
         wl_nv2a_gx_stats(g_gx, &gs);
@@ -890,7 +901,7 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
                     "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] [--xf-programs] "
-                    "[--stream] [--cpu-transform] [--png-alpha] [--survey]\n");
+                    "[--stream] [--cpu-transform] [--overlap] [--png-alpha] [--survey]\n");
     return 2;
 }
 
@@ -935,6 +946,8 @@ int main(int argc, char **argv) {
             gx = true;
         } else if (strcmp(argv[i], "--xf-programs") == 0) {
             g_xf_programs = true;
+        } else if (strcmp(argv[i], "--overlap") == 0) {
+            g_gcfg.overlap = true;
         } else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
             g_bench = (unsigned)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--programs") == 0 && i + 1 < argc) {

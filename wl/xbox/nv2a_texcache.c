@@ -92,7 +92,13 @@ static void link_entry(WlNv2aTexCache *cache, WlNv2aTexEntry *e) {
     *bucket = (uint16_t)(e - cache->entries + 1);
 }
 
-// an image the GPU may still read this frame: given back at its end
+// whether the GPU may still read an image drawn in frame `used`: this frame's, or one of the
+// gpu_lag frames before it that the GPU may not have finished
+static bool gpu_reads(const WlNv2aTexCache *cache, uint32_t used) {
+    return used != 0 && used + cache->cfg.gpu_lag >= cache->frame;
+}
+
+// an image the GPU may still read: given back at the end of the frame the GPU is then past
 static bool release_image(WlNv2aTexCache *cache, void *image, bool used_now) {
     if (!used_now) {
         image_free(cache, image);
@@ -101,13 +107,14 @@ static bool release_image(WlNv2aTexCache *cache, void *image, bool used_now) {
     if (cache->pending_count == WL_NV2A_TEXCACHE_PENDING) {
         return false;
     }
+    cache->pending_frame[cache->pending_count] = cache->frame;
     cache->pending[cache->pending_count++] = image;
     return true;
 }
 
 static bool evict(WlNv2aTexCache *cache, WlNv2aTexEntry *e) {
     if (e->image != NULL) {
-        if (!release_image(cache, e->image, e->used_frame == cache->frame)) {
+        if (!release_image(cache, e->image, gpu_reads(cache, e->used_frame))) {
             return false;
         }
         cache->stats.bytes -= e->layout.total_bytes;
@@ -122,6 +129,10 @@ void wl_nv2a_texcache_clear(WlNv2aTexCache *cache) {
     unsigned i;
 
     wl_nv2a_texcache_frame_done(cache);
+    // (the GPU is done with every frame: those kept for a lagging GPU too)
+    while (cache->pending_count != 0) {
+        image_free(cache, cache->pending[--cache->pending_count]);
+    }
     for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
         if (cache->entries[i].image != NULL) {
             image_free(cache, cache->entries[i].image);
@@ -137,11 +148,18 @@ void wl_nv2a_texcache_clear(WlNv2aTexCache *cache) {
 
 void wl_nv2a_texcache_frame_done(WlNv2aTexCache *cache) {
     size_t drawn = 0;
-    unsigned i;
+    unsigned i, kept = 0;
 
-    while (cache->pending_count != 0) {
-        image_free(cache, cache->pending[--cache->pending_count]);
+    // (the GPU is past the frames gpu_lag before this one)
+    for (i = 0; i < cache->pending_count; i++) {
+        if (cache->pending_frame[i] + cache->cfg.gpu_lag <= cache->frame) {
+            image_free(cache, cache->pending[i]);
+        } else {
+            cache->pending_frame[kept] = cache->pending_frame[i];
+            cache->pending[kept++] = cache->pending[i];
+        }
     }
+    cache->pending_count = kept;
     for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
         if (cache->entries[i].image != NULL && cache->entries[i].used_frame == cache->frame) {
             drawn += cache->entries[i].layout.total_bytes;
@@ -327,7 +345,7 @@ static WlNv2aTexEntry *oldest(WlNv2aTexCache *cache, const WlNv2aTexEntry *keep,
     for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
         WlNv2aTexEntry *e = &cache->entries[i];
 
-        if (e->image != NULL && e != keep && (!idle || e->used_frame != cache->frame) &&
+        if (e->image != NULL && e != keep && (!idle || !gpu_reads(cache, e->used_frame)) &&
             (found == NULL || e->used_frame < found->used_frame)) {
             found = e;
         }
@@ -414,7 +432,7 @@ static bool arena_block(void *user, const WlHeapLive *live) {
     if (w->next < w->images && cache->entries[w->by_image[w->next]].image == live->ptr) {
         const WlNv2aTexEntry *e = &cache->entries[w->by_image[w->next]];
 
-        if (e != w->keep && e->used_frame != cache->frame) {
+        if (e != w->keep && !gpu_reads(cache, e->used_frame)) {
             b->entry = (uint16_t)(w->by_image[w->next] + 1u);
             b->used_frame = e->used_frame;
         }
@@ -739,7 +757,7 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     cache->stats.checks++;
     if (e != NULL && e->stamp != 0 && watching(cache, dev) && !watch_written(cache, e, t)) {
         // no store to its pages since it was checked: as it was
-        if (!restore(cache, dev, e, t, e->used_frame == cache->frame, NULL, NULL, made)) {
+        if (!restore(cache, dev, e, t, gpu_reads(cache, e->used_frame), NULL, NULL, made)) {
             cache->stats.failed++;
             return NULL;
         }
@@ -765,7 +783,7 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
         }
     }
     if (e != NULL) {
-        bool drawn_now = e->used_frame == cache->frame;
+        bool drawn_now = gpu_reads(cache, e->used_frame);
 
         // (the watch armed before the texels are read: a store from here on is seen at the next
         // check; a large texture under the watch is not hashed, its samples would not see every

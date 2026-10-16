@@ -52,6 +52,10 @@ typedef struct WlNv2aVCacheConfig {
     uint32_t (*watch)(void *user, uint32_t phys, uint32_t bytes);
     bool (*written)(void *user, uint32_t phys, uint32_t bytes, uint32_t stamp);
     void *user;
+    // the frames the GPU may still be drawing behind the one finished (1 under
+    // wl_gx_set_frame_overlap; 0: each frame drawn by its end): an array drawn in one of them is
+    // neither given back nor rewritten in place until the GPU is past it
+    uint8_t gpu_lag;
 } WlNv2aVCacheConfig;
 
 typedef struct WlNv2aVCacheEntry {
@@ -85,6 +89,7 @@ typedef struct WlNv2aVCache {
     WlNv2aVCacheEntry entries[WL_NV2A_VCACHE_ENTRIES];
     uint16_t buckets[WL_NV2A_VCACHE_BUCKETS];
     void *pending[WL_NV2A_VCACHE_PENDING];
+    uint32_t pending_frame[WL_NV2A_VCACHE_PENDING]; // the frame each was given back in
     unsigned pending_count;
     WlHeap heap; // over the arena, when there is one
     uint32_t frame;
@@ -94,7 +99,7 @@ typedef struct WlNv2aVCache {
 } WlNv2aVCache;
 
 void wl_nv2a_vcache_init(WlNv2aVCache *cache, const WlNv2aVCacheConfig *cfg);
-// every array given back
+// every array given back (the GPU must be done with them)
 void wl_nv2a_vcache_clear(WlNv2aVCache *cache);
 // whether arrays are kept at all (a budget)
 bool wl_nv2a_vcache_on(const WlNv2aVCache *cache);

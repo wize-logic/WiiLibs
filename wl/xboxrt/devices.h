@@ -128,6 +128,11 @@ void wl_xb_gpu_set_program_list(const char *path);
 // The boot code turns it off for a file "noxf" in the title's folder (and WL_XB_NO_XF on the host).
 // Call it before wl_xb_gpu_attach_nv2a.
 void wl_xb_gpu_set_transform_unit(bool on);
+// Whether the processor goes on with the next frame while GX draws this one (wl/xbox/nv2a_gx.h's
+// overlap; on by default): off, each frame's end waits for GX to finish it. The boot code turns it
+// off for a file "nooverlap" in the title's folder (and WL_XB_NO_OVERLAP on the host). Call it
+// before wl_xb_gpu_attach_nv2a.
+void wl_xb_gpu_set_frame_overlap(bool on);
 // The GX backend's vertex arrays kept for GX to read by index (wl/xbox/nv2a_vcache.h: a level's
 // static geometry converted once, its draws through the transform unit sending indices alone), in
 // `arena` (`bytes`, 32-byte aligned; NULL: the end of the textures' arena when that leaves them 8 MB,

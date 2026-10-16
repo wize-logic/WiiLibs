@@ -31,6 +31,7 @@ void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what
     GX_SetTexCopyDst((u16)w, (u16)h, format[what], GX_FALSE);
     GX_CopyTex(dst, GX_FALSE);
     GX_PixModeSync();
+    wl_gx_wii_note_efb_copy();
 }
 
 void wl_gx_target_be_copy_end(void) {
@@ -174,6 +175,7 @@ void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uin
     GX_SetTexCopyDst((u16)back_w, (u16)back_h, GX_TF_RGBA8, GX_FALSE);
     GX_CopyTex(colour, GX_TRUE);
     GX_PixModeSync();
+    wl_gx_wii_note_efb_copy();
     wl_gx_wii_copy_filter(true);
     GX_InvalidateTexAll();
     // ...and drawn back narrower, filtered, over the bars

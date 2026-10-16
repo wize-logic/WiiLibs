@@ -68,6 +68,10 @@ typedef struct WlNv2aTexCacheConfig {
     uint32_t (*watch)(void *user, uint32_t phys, uint32_t bytes);
     bool (*written)(void *user, uint32_t phys, uint32_t bytes, uint32_t stamp);
     void *user;
+    // the frames the GPU may still be drawing behind the one finished (1 under
+    // wl_gx_set_frame_overlap; 0: each frame drawn by its end): an image drawn in one of them is
+    // neither given back nor rewritten in place until the GPU is past it
+    uint8_t gpu_lag;
 } WlNv2aTexCacheConfig;
 
 typedef struct WlNv2aTexEntry {
@@ -109,6 +113,7 @@ typedef struct WlNv2aTexCache {
     WlNv2aTexEntry entries[WL_NV2A_TEXCACHE_ENTRIES];
     uint16_t buckets[WL_NV2A_TEXCACHE_BUCKETS];
     void *pending[WL_NV2A_TEXCACHE_PENDING];
+    uint32_t pending_frame[WL_NV2A_TEXCACHE_PENDING]; // the frame each was given back in
     unsigned pending_count;
     WlHeap heap; // over the arena, when there is one
     struct {

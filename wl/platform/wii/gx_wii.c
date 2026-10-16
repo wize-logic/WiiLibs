@@ -336,6 +336,7 @@ static uint32_t send_token(void) {
 static bool wait_token(uint32_t t) {
     uint64_t t0 = now_us();
     bool ok = true;
+    g.stats.gpu_waits++;
     wl_hwcount_wait_begin(WL_HWWAIT_GPU); // (the processor's counters leave the wait out)
     // (the first token after init is waited for exactly: the register held anything before it)
     while (g.token == 1u ? GX_GetDrawSync() != 1u : !token_passed(t)) {
@@ -522,6 +523,7 @@ static void copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexForma
     GX_PixModeSync();
     wl_gx_wii_copy_filter(true);
     GX_InvalidateTexAll();
+    g.stats.efb_copies++;
     g.dirty = true;
 }
 
@@ -546,6 +548,10 @@ void wl_gx_wii_copy_filter(bool display) {
 
 void wl_gx_wii_note_commands(void) {
     g.dirty = true;
+}
+
+void wl_gx_wii_note_efb_copy(void) {
+    g.stats.efb_copies++;
 }
 
 // ---- shadowed state ---------------------------------------------------------------------------
