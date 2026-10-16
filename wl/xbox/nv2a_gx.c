@@ -3030,6 +3030,7 @@ static void backend_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
             wl_gx_target_clear(false, true, rgba, z, (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
         }
         clear_channels(gx, flags, rgba, x0, y0, x1, y1);
+        return;
     } else {
         wl_gx_target_clear(colour, depth, rgba, z, (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
     }
