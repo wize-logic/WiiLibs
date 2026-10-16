@@ -136,6 +136,15 @@ void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, 
     GX_InitTexObj(&colour_map, (void *)colour, (u16)w, (u16)h, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
     GX_InitTexObjFilterMode(&colour_map, GX_NEAR, GX_NEAR);
     GX_LoadTexObj(&colour_map, GX_TEXMAP0);
+    if (depth == NULL) {
+        // (the colour alone: the depth there is the back buffer's still)
+        GX_SetColorUpdate(GX_TRUE);
+        GX_SetAlphaUpdate(GX_TRUE);
+        GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+        GX_SetZCompLoc(GX_TRUE);
+        quad(0.0f, 0.0f, (float)w, (float)h, NULL, 0.0f, true, false, back_w, back_h);
+        return;
+    }
     GX_InitTexObj(&depth_map, (void *)depth, (u16)w, (u16)h, GX_TF_Z24X8, GX_CLAMP, GX_CLAMP, GX_FALSE);
     GX_InitTexObjFilterMode(&depth_map, GX_NEAR, GX_NEAR);
     GX_LoadTexObj(&depth_map, GX_TEXMAP1);

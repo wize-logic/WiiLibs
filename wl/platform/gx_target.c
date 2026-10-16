@@ -20,6 +20,8 @@ static struct {
     WlGxTarget resolved; // the last one wl_gx_target_use returned
     bool drawn;          // the back buffer has had something drawn or cleared this frame
     bool parked;         // its colour and depth are in `colour` and `depth`, (0, 0) to (parked_w, parked_h)
+    bool depth_parked;   // ...its depth too (always, unless lazy_depth: then from wl_gx_target_depth_write)
+    bool lazy_depth;     // wl_gx_target_set_lazy_depth
     bool squeeze_warned; // the lack of memory for wl_gx_target_squeeze has been told
     uint32_t parked_w, parked_h;
     void *colour, *depth;
@@ -121,6 +123,7 @@ void wl_gx_target_frame_begun(void) {
     t.owner_is_target = false;
     t.drawn = false;
     t.parked = false;
+    t.depth_parked = false;
 }
 
 void wl_gx_target_shutdown(void) {
@@ -156,11 +159,15 @@ static void park(uint32_t w, uint32_t h) {
     }
     wl_gx_target_be_copy_begin();
     wl_gx_target_be_copy(t.colour, w, h, WL_GX_TARGET_COPY_RGBA8, t.colour_clean < bytes);
-    wl_gx_target_be_copy(t.depth, w, h, WL_GX_TARGET_COPY_Z24X8, t.depth_clean < bytes);
+    if (!t.lazy_depth) {
+        wl_gx_target_be_copy(t.depth, w, h, WL_GX_TARGET_COPY_Z24X8, t.depth_clean < bytes);
+        t.depth_clean = t.depth_clean > bytes ? t.depth_clean : bytes;
+        t.stats.depths++;
+    }
     t.colour_clean = t.colour_clean > bytes ? t.colour_clean : bytes;
-    t.depth_clean = t.depth_clean > bytes ? t.depth_clean : bytes;
     wl_gx_target_be_copy_end();
     t.parked = true;
+    t.depth_parked = !t.lazy_depth;
     t.parked_w = w;
     t.parked_h = h;
     t.stats.parks++;
@@ -174,8 +181,10 @@ static void restore(void) {
     if (!t.parked) {
         return;
     }
-    wl_gx_target_be_restore(t.colour, t.depth, t.parked_w, t.parked_h, w, h);
+    // (a depth not parked is the back buffer's still: no target wrote it)
+    wl_gx_target_be_restore(t.colour, t.depth_parked ? t.depth : NULL, t.parked_w, t.parked_h, w, h);
     t.parked = false;
+    t.depth_parked = false;
     t.stats.restores++;
 }
 
@@ -255,6 +264,26 @@ const void *wl_gx_target_parked_colour(uint32_t *w, uint32_t *h) {
     return t.colour;
 }
 
+void wl_gx_target_set_lazy_depth(bool on) {
+    t.lazy_depth = on;
+}
+
+void wl_gx_target_depth_write(void) {
+    size_t bytes;
+    if (!t.owner_is_target || !t.parked || t.depth_parked || t.depth == NULL) {
+        return;
+    }
+    // (the block was asked for with the colour's, at the park: the EFB's depth there is still the
+    // back buffer's, copied before the draw that is to write it)
+    bytes = wl_gx_tex_bytes(WL_GX_TEX_RGBA8, t.parked_w, t.parked_h);
+    wl_gx_target_be_copy_begin();
+    wl_gx_target_be_copy(t.depth, t.parked_w, t.parked_h, WL_GX_TARGET_COPY_Z24X8, t.depth_clean < bytes);
+    wl_gx_target_be_copy_end();
+    t.depth_clean = t.depth_clean > bytes ? t.depth_clean : bytes;
+    t.depth_parked = true;
+    t.stats.depths++;
+}
+
 void wl_gx_target_drawn(void) {
     if (!t.owner_is_target) {
         t.drawn = true;
@@ -271,6 +300,9 @@ void wl_gx_target_clear(bool colour, bool depth, uint32_t rgba, float z, int x, 
     uint32_t bw, bh;
     back_size(&bw, &bh);
     z = z < 0.0f ? 0.0f : z > 1.0f ? 1.0f : z;
+    if (depth) {
+        wl_gx_target_depth_write();
+    }
     wl_gx_target_be_clear(colour, depth, rgba, z, x, y, w, h, bw, bh);
     t.stats.clears++;
 }
@@ -293,6 +325,7 @@ bool wl_gx_target_squeeze(uint32_t x, uint32_t w) {
         return false;
     }
     t.parked = false;
+    t.depth_parked = false;
     wl_gx_target_be_squeeze(t.colour, bw, bh, x, w, t.colour_clean < squeeze_bytes);
     t.colour_clean = t.colour_clean > squeeze_bytes ? t.colour_clean : squeeze_bytes;
     t.stats.squeezes++;

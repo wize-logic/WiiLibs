@@ -82,7 +82,17 @@ static void start(void) {
     g_commands = g_shadow = 0;
     wl_gx_target_set_allocator(park_alloc, park_free);
     wl_gx_target_set_back_buffer_size(640, 480);
+    wl_gx_target_set_lazy_depth(false);
     wl_gx_target_frame_begun();
+}
+
+// The lines of the log since `from` that start with `prefix`.
+static unsigned log_count(unsigned from, const char *prefix) {
+    unsigned n = 0;
+    for (unsigned i = from; i < g_gx_stub_log_count; i++) {
+        n += strncmp(g_gx_stub_log[i], prefix, strlen(prefix)) == 0;
+    }
+    return n;
 }
 
 // The log since `from` is exactly `n` lines, `lines`.
@@ -195,6 +205,50 @@ TEST put_the_back_buffer_back_through_a_z_texture(void) {
            "GX_Position3f32 0 64 -1", "GX_TexCoord2f32 0 1",
            "GX_End", "GX_SetZTexture 0 0x11 0", "GX_SetZCompLoc 1", "wl_gx_invalidate_shadow");
     ASSERT(g_shadow > shadows);
+    PASS();
+}
+
+TEST lazy_depth_parks_the_depth_only_before_a_target_writes_it(void) {
+    start();
+    wl_gx_target_set_lazy_depth(true);
+    WlGxTarget a = target_a();
+    WlGxTarget b = target_b();
+    WlGxTargetStats stats;
+    wl_gx_target_stats(&stats, true);
+    // a target drawn without depth: the colour parked alone, put back alone (no Z texture, no depth
+    // test or write)
+    wl_gx_target_drawn();
+    unsigned from = g_gx_stub_log_count;
+    (void)wl_gx_target_use(&a);
+    ASSERT_EQ(1u, log_count(from, "GX_CopyTex"));
+    ASSERT_EQ(1u, log_count(from, "GX_CopyTex PC"));
+    from = g_gx_stub_log_count;
+    ASSERT(wl_gx_target_use(NULL) != NULL);
+    ASSERT_EQ(1u, log_count(from, "GX_CopyTex A"));
+    ASSERT_EQ(0u, log_count(from, "GX_LoadTexObj PD"));
+    ASSERT_EQ(0u, log_count(from, "GX_SetZTexture"));
+    ASSERT_EQ(1u, log_count(from, "GX_SetZMode 0 7 0"));
+    ASSERT_EQ(1u, log_count(from, "GX_SetNumTevStages 1"));
+    // one that writes depth: the depth parked before it, once, and put back through the Z texture
+    wl_gx_target_drawn();
+    (void)wl_gx_target_use(&b);
+    from = g_gx_stub_log_count;
+    wl_gx_target_depth_write();
+    wl_gx_target_clear(false, true, 0, 1.0f, 0, 0, 32, 32);
+    ASSERT_EQ(1u, log_count(from, "GX_CopyTex"));
+    ASSERT_EQ(1u, log_count(from, "GX_CopyTex PD"));
+    from = g_gx_stub_log_count;
+    (void)wl_gx_target_use(NULL);
+    ASSERT_EQ(1u, log_count(from, "GX_LoadTexObj PD 1"));
+    ASSERT_EQ(1u, log_count(from, "GX_SetZTexture 2"));
+    // (the back buffer: nothing to park)
+    from = g_gx_stub_log_count;
+    wl_gx_target_depth_write();
+    ASSERT_EQ(from, g_gx_stub_log_count);
+    wl_gx_target_stats(&stats, true);
+    ASSERT_EQ(2u, stats.parks);
+    ASSERT_EQ(1u, stats.depths);
+    wl_gx_target_set_lazy_depth(false);
     PASS();
 }
 
@@ -332,6 +386,7 @@ SUITE(target_gx_suite) {
     RUN_TEST(park_the_back_buffer_and_take_the_efb);
     RUN_TEST(resolve_a_target_into_its_memory);
     RUN_TEST(put_the_back_buffer_back_through_a_z_texture);
+    RUN_TEST(lazy_depth_parks_the_depth_only_before_a_target_writes_it);
     RUN_TEST(squeeze_the_finished_picture_into_the_middle);
     RUN_TEST(clear_quad_colour_and_depth);
     RUN_TEST(clear_quad_depth_only_and_colour_only);
