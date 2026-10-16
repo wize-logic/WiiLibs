@@ -304,6 +304,10 @@ void wl_nv2a_gx_stats(const WlNv2aGx *gx, WlNv2aGxStats *out) {
     *out = gx->stats;
 }
 
+void wl_nv2a_gx_psh_counts(const WlNv2aGx *gx, WlXboxPshCacheCounts *out) {
+    wl_xbox_psh_cache_counts(&gx->psh, out);
+}
+
 const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx) {
     return &gx->textures;
 }

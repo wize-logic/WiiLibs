@@ -788,6 +788,17 @@ static void vertex_cache_line(const char *prefix) {
 }
 
 // the texture cache's work and memory
+// the pixel programs' cache (psh_cache.h): translations, and why
+static void psh_cache_line(const char *prefix) {
+    WlXboxPshCacheCounts pc;
+
+    wl_nv2a_gx_psh_counts(g_gx, &pc);
+    printf("%spixel programs: %lu translated (%lu beyond GX), %lu found, %lu patched; %lu trials (%lu differed, "
+           "%lu generic), %lu audits (%lu differed), %lu evicted, %lu translated again after eviction\n",
+           prefix, pc.translated, pc.unusable, pc.found, pc.patched, pc.tests, pc.tests_differ, pc.generic,
+           pc.audited, pc.audits_differ, pc.evicted, pc.again);
+}
+
 static void texture_cache_line(const char *prefix) {
     WlNv2aTexCacheStats ts;
 
@@ -868,6 +879,7 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
                "alone\n", (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws);
         vertex_cache_line("bench: ");
         texture_cache_line("bench: ");
+        psh_cache_line("bench: ");
         printf("bench: texture binds: %u draws kept the draw before's textures; %u textures bound to stages, %u GX "
                "objects (alphas apart included) kept as made before\n",
                (unsigned)gs.textures_kept, (unsigned)gs.texture_stages, (unsigned)gs.texture_objects_kept);
@@ -1068,6 +1080,7 @@ int main(int argc, char **argv) {
         wl_nv2a_gx_stats(g_gx, &gs);
         vertex_cache_line("");
         texture_cache_line("");
+        psh_cache_line("");
         wl_gxsoft_stats(&ss);
         printf("gx backend: %u draws, %u perspective (%u fits made, %u shared), %u into targets (%u without one), "
                "%u stencil skipped, %u programs beyond GX, %u approximated, %u clears (%u quads), %u frames\n",

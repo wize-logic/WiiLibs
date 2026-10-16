@@ -34,6 +34,7 @@
 #include "wl/xbox/nv2a_texcache.h"
 #include "wl/xbox/nv2a_vcache.h"
 #include "wl/xbox/psh.h"
+#include "wl/xbox/psh_cache.h"
 #include "wl/xbox/vsh.h"
 
 typedef struct WlNv2aGx WlNv2aGx;
@@ -136,6 +137,8 @@ void wl_nv2a_gx_backend(WlNv2aGx *gx, WlNv2aBackend *out);
 // never says one finished).
 void wl_nv2a_gx_present(WlNv2aGx *gx);
 void wl_nv2a_gx_stats(const WlNv2aGx *gx, WlNv2aGxStats *out);
+// The pixel programs' cache's counts (psh_cache.h: translations, and why).
+void wl_nv2a_gx_psh_counts(const WlNv2aGx *gx, WlXboxPshCacheCounts *out);
 const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx);
 const WlNv2aVCache *wl_nv2a_gx_vertex_cache(const WlNv2aGx *gx);
 // The host memory the backend holds besides its textures' (wl_nv2a_texcache_memory): its record

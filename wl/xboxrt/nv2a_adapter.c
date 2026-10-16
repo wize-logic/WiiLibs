@@ -240,6 +240,13 @@ static void gpu_status(void) {
              (unsigned)gs.perspective_draws, (unsigned)gs.target_draws, (unsigned)gs.target_skipped,
              (unsigned)gs.stencil_skipped, (unsigned)gs.stencil_ignored, (unsigned)gs.programs_unusable,
              (unsigned)gs.approximations);
+    WlXboxPshCacheCounts pc;
+    wl_nv2a_gx_psh_counts(g_gx, &pc);
+    // (the pixel programs' cache: a translation is long, and a program should be translated about once)
+    WL_LOG_I(TAG, "status: pixel programs %lu translated, %lu found, %lu patched; %lu trials (%lu differed, %lu "
+             "generic), %lu audits (%lu differed), %lu evicted, %lu translated again after eviction",
+             pc.translated, pc.found, pc.patched, pc.tests, pc.tests_differ, pc.generic, pc.audited,
+             pc.audits_differ, pc.evicted, pc.again);
     WL_LOG_I(TAG, "status: depth fits %u made, %u shared; textures %u KB kept (%u KB drawn in the last frame, "
              "%u KB at most), %u converted, %u made again, %u failed (%u for memory), %u kept smaller (%u made whole "
              "again), %u evicted; %u checks, %u by the write watch, %u hashes (%u KB)",
