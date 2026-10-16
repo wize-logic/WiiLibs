@@ -59,6 +59,10 @@ static int pr_label;            /* labels written */
 static char pr_ra_key[24];      /* what %[ra] holds (a relative row's address) */
 static int pr_a0_version, pr_uses_a0, pr_uses_ra, pr_uses_c2, pr_uses_slot;
 static char pr_first[24];       /* where the first vertex starts (the prefix made) */
+/* a fused function's form (NULL: a batch function's); its live is the form's,
+so each block runs or is left out, with no test */
+static const WlXboxVshFusedKey *pr_fuse;
+static int pr_fused_captured;   /* (fused) the clip-space position captured, always */
 
 /* the constants that may be loaded once a batch, and how often each is loaded in a vertex */
 static char pr_keys[PR_KEYS][80];
@@ -329,6 +333,17 @@ static void pr_forget(void) {
             pr_cache[kept++] = pr_cache[n];
     pr_cache_count = kept;
     pr_ra_key[0] = 0;
+}
+
+/* the cache as it was at mark (a branch's first): what was loaded on one way
+alone is not there on the other */
+static void pr_cache_trim(int mark) {
+    int n, kept = mark;
+
+    for (n = mark; n < pr_cache_count; n++)
+        if (pr_cache[n].hoisted)
+            pr_cache[kept++] = pr_cache[n];
+    pr_cache_count = kept;
 }
 
 /* ---- operands ---- */
@@ -1041,8 +1056,12 @@ static void pr_instruction(const WlXboxVshInstruction *in, int mode) {
             p[k].lane = k & 1;
         }
         pr_store(p, 0xf, "%[oclip]");
-        pr_text("li 0, 1");
-        pr_text("stw 0, %%[ocaptured](%%[o])");
+        if (pr_fuse) {
+            pr_fused_captured = 1;
+        } else {
+            pr_text("li 0, 1");
+            pr_text("stw 0, %%[ocaptured](%%[o])");
+        }
     }
     /* (a dot product's lanes: written in place when one ln of a
     temporary is all it writes there) */
@@ -1297,7 +1316,22 @@ above 255 255, else cut down: wl_nv2a_color_byte's of value * 255 + 0.5; a NaN m
 ps_sel first, the store's own NaN being 255 in Dolphin).
 The state's floats are at the same offsets everywhere (before its pointers);
 its pointers at %[fdata] + %[ptr] * n. */
-static const WlXboxVshFusedKey *pr_fuse;
+
+/* the components an array of the format gives (the others keep their start
+values, the same in every vertex) */
+static int pr_fused_components(unsigned format) {
+    if (format >= WL_XBOX_VSH_FUSED_F1 && format <= WL_XBOX_VSH_FUSED_F4)
+        return (int)(format - WL_XBOX_VSH_FUSED_F1) + 1;
+    if (format == WL_XBOX_VSH_FUSED_D3DCOLOR)
+        return 4;
+    if (format == WL_XBOX_VSH_FUSED_CMP)
+        return 3;
+    if (format >= WL_XBOX_VSH_FUSED_S1 && format < WL_XBOX_VSH_FUSED_UB)
+        return (int)(format - WL_XBOX_VSH_FUSED_S1) + 1;
+    if (format >= WL_XBOX_VSH_FUSED_UB && format < WL_XBOX_VSH_FUSED_FORMATS)
+        return (int)(format - WL_XBOX_VSH_FUSED_UB) + 1;
+    return 0;
+}
 
 /* the floats and doubles of WlXboxVshFused */
 static int pr_fused_pack(int kind, int index) {
@@ -1455,12 +1489,13 @@ static void pr_fused_prologue(void) {
 /* 1 / sqrt(x) in double: frsqrte's estimate and three of Newton's steps
 (nv2a_texture.c's reciprocal_root) */
 static int pr_fused_root(int x) {
-    int y = pr_fused_op("frsqrte", x, -1, -1), half = pr_fused_sphere(3), three_halves = pr_fused_sphere(2), step;
+    int y = pr_fused_op("frsqrte", x, -1, -1), three_halves = pr_fused_sphere(2), step;
+    /* (0.5 x made once: the same double at each step) */
+    int half_x = pr_fused_op("fmul", pr_fused_sphere(3), x, -1);
 
     for (step = 0; step < 3; step++) {
-        int t = pr_fused_op("fmul", half, x, -1);
+        int t = pr_fused_op("fmul", half_x, y, -1);
 
-        t = pr_fused_op("fmul", t, y, -1);
         t = pr_fused_op("fmul", t, y, -1);
         t = pr_fused_op("fsub", three_halves, t, -1);
         y = pr_fused_op("fmul", y, t, -1);
@@ -1480,38 +1515,54 @@ static void pr_fused_epilogue(void) {
     the program captured, else the screen-space position and the depth */
     pr_new_label(other, sizeof(other));
     pr_new_label(done, sizeof(done));
-    if (key->perspective) {
-        int xy, zw, x, h;
-
-        pr_text("lwz 0, %%[ocaptured](%%[o])");
-        pr_text("cmpwi 0, 0");
-        pr_text("beq %s", other);
-        xy = pr_fused_new("psq_l @0, %%[oclip](%%[o]), 0, 0");
-        zw = pr_fused_new("psq_l @0, %%[oclip]+8(%%[o]), 0, 0");
-        x = pr_fused_op("ps_mul", xy, pr_fused_pack(0, WL_XBOX_VSH_FUSED_SCALE), -1);
-        x = pr_fused_op("ps_add", x, pr_fused_op("ps_muls1", pr_fused_pack(0, WL_XBOX_VSH_FUSED_OFFSET), zw, -1), -1);
-        x = pr_fused_op("ps_mul", x, pr_fused_pack(0, WL_XBOX_VSH_FUSED_TO_SAMPLES), -1);
-        h = pr_fused_op("ps_muls1", pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF), zw, -1);
-        pr_fused_store(pr_fused_op("ps_add", x, h, -1), "psq_st @0, 0(%%[ad]), 0, 0");
-        pr_fused_store(pr_fused_op("ps_neg", pr_fused_op("ps_merge11", zw, zw, -1), -1, -1), "stfs @0, 8(%%[ad])");
-        pr_text("b %s", done);
-    }
-    pr_place_label(other);
     {
-        int xy = pr_fused_new("psq_l @0, 0(%%[o]), 0, 0"), z = pr_fused_new("lfs @0, 8(%%[o])");
-        int one = pr_fused_pack(1, WL_XBOX_VSH_FUSED_ONES), depth, limited;
+        /* (the captured way alone when the program always captures, the other alone without
+        perspective; else the program's flag tested) */
+        int clip = key->perspective && pr_fused_captured, screen = !key->perspective || !pr_fused_captured;
+        int to_samples = pr_fused_pack(0, WL_XBOX_VSH_FUSED_TO_SAMPLES), half = pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF);
+        int mark = pr_cache_count;
 
-        xy = pr_fused_op("ps_mul", xy, pr_fused_pack(0, WL_XBOX_VSH_FUSED_TO_SAMPLES), -1);
-        pr_fused_store(pr_fused_op("ps_add", xy, pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF), -1),
-                       "psq_st @0, 0(%%[ad]), 0, 0");
-        /* (as_depth: z / the maximum, 0 below 0 or for a NaN, 1 above 1; less 1) */
-        depth = pr_fused_op("fdivs", z, pr_fused_pack(1, WL_XBOX_VSH_FUSED_DEPTH), -1);
-        depth = pr_fused_op("fsel", depth, depth, pr_k(1, PRK_ZERO));
-        limited = pr_fused_op("fsubs", depth, one, -1);
-        depth = pr_fused_op("fsel", limited, one, depth);
-        pr_fused_store(pr_fused_op("fsubs", depth, one, -1), "stfs @0, 8(%%[ad])");
+        if (key->perspective) {
+            int xy, zw, x, h;
+
+            if (!clip) {
+                pr_text("lwz 0, %%[ocaptured](%%[o])");
+                pr_text("cmpwi 0, 0");
+                pr_text("beq %s", other);
+            }
+            xy = pr_fused_new("psq_l @0, %%[oclip](%%[o]), 0, 0");
+            zw = pr_fused_new("psq_l @0, %%[oclip]+8(%%[o]), 0, 0");
+            x = pr_fused_op("ps_mul", xy, pr_fused_pack(0, WL_XBOX_VSH_FUSED_SCALE), -1);
+            x = pr_fused_op("ps_add", x, pr_fused_op("ps_muls1", pr_fused_pack(0, WL_XBOX_VSH_FUSED_OFFSET), zw, -1),
+                            -1);
+            x = pr_fused_op("ps_mul", x, to_samples, -1);
+            h = pr_fused_op("ps_muls1", half, zw, -1);
+            pr_fused_store(pr_fused_op("ps_add", x, h, -1), "psq_st @0, 0(%%[ad]), 0, 0");
+            pr_fused_store(pr_fused_op("ps_neg", pr_fused_op("ps_merge11", zw, zw, -1), -1, -1), "stfs @0, 8(%%[ad])");
+            if (screen)
+                pr_text("b %s", done);
+        }
+        if (screen) {
+            int xy, z, one, depth, limited;
+
+            pr_place_label(other);
+            pr_cache_trim(mark);
+            xy = pr_fused_new("psq_l @0, 0(%%[o]), 0, 0");
+            z = pr_fused_new("lfs @0, 8(%%[o])");
+            one = pr_fused_pack(1, WL_XBOX_VSH_FUSED_ONES);
+            xy = pr_fused_op("ps_mul", xy, to_samples, -1);
+            pr_fused_store(pr_fused_op("ps_add", xy, half, -1), "psq_st @0, 0(%%[ad]), 0, 0");
+            /* (as_depth: z / the maximum, 0 below 0 or for a NaN, 1 above 1; less 1) */
+            depth = pr_fused_op("fdivs", z, pr_fused_pack(1, WL_XBOX_VSH_FUSED_DEPTH), -1);
+            depth = pr_fused_op("fsel", depth, depth, pr_k(1, PRK_ZERO));
+            limited = pr_fused_op("fsubs", depth, one, -1);
+            depth = pr_fused_op("fsel", limited, one, depth);
+            pr_fused_store(pr_fused_op("fsubs", depth, one, -1), "stfs @0, 8(%%[ad])");
+            pr_place_label(done);
+        }
+        if (key->perspective && screen)
+            pr_cache_trim(mark);
     }
-    pr_place_label(done);
     /* the colours: each component's byte, value * 255 + 1/2 cut down */
     for (n = 0; n < key->colors; n++, word++) {
         const char *field = n == 0 ? "%[od0]" : "%[od1]";
@@ -1537,7 +1588,9 @@ static void pr_fused_epilogue(void) {
     for (n = 0; n < key->stage_count; n++, word += 2) {
         unsigned stage = key->stages[n] & 3u, kind = key->stages[n] >> 2;
         int at = 16 * (int)stage, st = pr_fused_new("psq_l @0, %%[ot]+%d(%%[o]), 0, 0", at);
-        int to = pr_fused_pack(0, WL_XBOX_VSH_FUSED_TO_TEXELS + 2 * (int)stage);
+        int linear = kind == WL_XBOX_VSH_FUSED_STAGE_LINEAR || kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR;
+        int to = linear ? pr_fused_pack(0, WL_XBOX_VSH_FUSED_TO_TEXELS + 2 * (int)stage) : -1;
+        int mark = pr_cache_count;
 
         if (kind == WL_XBOX_VSH_FUSED_STAGE_PLAIN) {
             pr_fused_store(st, "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
@@ -1545,17 +1598,18 @@ static void pr_fused_epilogue(void) {
             pr_fused_store(pr_fused_op("ps_mul", st, to, -1), "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
         } else if (kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE || kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR) {
             /* (divided by q unless q is 1 or within 1e-12 of 0, or a NaN) */
-            int linear = kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR;
             int q = pr_fused_new("lfs @0, %%[ot]+%d(%%[o])", at + 12), values[2], divided;
+            int one = pr_fused_pack(1, WL_XBOX_VSH_FUSED_ONES), tiny = pr_fused_pack(1, WL_XBOX_VSH_FUSED_TINY);
 
+            mark = pr_cache_count;
             pr_new_label(other, sizeof(other));
             pr_new_label(done, sizeof(done));
             values[0] = q;
-            values[1] = pr_fused_pack(1, WL_XBOX_VSH_FUSED_ONES);
+            values[1] = one;
             pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
             pr_text("beq %s", other);
             values[0] = pr_fused_op("fabs", q, -1, -1);
-            values[1] = pr_fused_pack(1, WL_XBOX_VSH_FUSED_TINY);
+            values[1] = tiny;
             pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
             pr_text("bng %s", other);
             divided = pr_fused_op("ps_div", st, q, -1);
@@ -1566,6 +1620,7 @@ static void pr_fused_epilogue(void) {
             pr_place_label(other);
             pr_fused_store(linear ? pr_fused_op("ps_mul", st, to, -1) : st, "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
             pr_place_label(done);
+            pr_cache_trim(mark);
         } else {
             /* a sphere map (wl_nv2a_sphere_coordinates), in double: x k + 1/2, y k + 1/2 with
             k = 1 / (2 sqrt(2 L (L + z))), L = |d|; the disc's centre for a direction too short
@@ -1582,6 +1637,7 @@ static void pr_fused_epilogue(void) {
             values[0] = length2;
             values[1] = pr_fused_sphere(0);
             pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
+            mark = pr_cache_count;
             pr_text("bng %s", other);
             values[1] = pr_fused_sphere(1);
             pr_op(0, 0, 2, values, "fcmpu 0, @0, @1");
@@ -1608,6 +1664,7 @@ static void pr_fused_epilogue(void) {
             pr_place_label(edge);
             pr_fused_store(pr_fused_pack(0, WL_XBOX_VSH_FUSED_EDGE), "psq_st @0, %d(%%[ad]), 0, 0", 4 * word);
             pr_place_label(done);
+            pr_cache_trim(mark);
         }
     }
 }
@@ -1631,16 +1688,26 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     /* (value 0: a placeholder no op names) */
     pr_new();
     pr_needs = ~0u;
+    pr_fused_captured = 0;
+    /* (fused: live is the form's, each instruction always written or left out) */
+    if (pr_fuse) {
+        static unsigned fused_needs[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+
+        for (index = 0; index < program->count; index++)
+            fused_needs[index] = needs[index] & pr_fuse->live ? ~0u : 0u;
+        needs = fused_needs;
+    }
     for (index = 0; index < program->count; index++)
         if (needs[index] && !pr_supported(&program->instructions[index]))
             return 0;
     pr_liveness(program, needs, 0, after);
     /* (each block's test: a condition register bit set once a batch) */
     pr_need_count = 0;
-    for (index = 0; index < program->count; index++)
+    for (index = 0; index < program->count && !pr_fuse; index++)
         if (needs[index])
             pr_need_bit(needs[index]);
-    pr_need_bit(WL_XBOX_VSH_LIVE_POSITION);
+    if (!pr_fuse)
+        pr_need_bit(WL_XBOX_VSH_LIVE_POSITION);
     *compare_count = 0;
     pr_new_label(top, sizeof(top));
     pr_new_label(made, sizeof(made));
@@ -1678,7 +1745,8 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         snprintf(pr_first, sizeof(pr_first), "%s", pr_fuse ? "" : again);
         for (index = 0; index < 16; index++)
             for (which = 0; which < 4; which++)
-                if (words[index] & (8u >> which)) {
+                if ((words[index] & (8u >> which)) &&
+                    (!pr_fuse || which < pr_fused_components(pr_fuse->format[index]))) {
                     /* (the vertex before's: %[vs] bytes before) */
                     pr_text("lwz 0, %lu(%%[v])", 16 * index + 4 * (unsigned long)which);
                     if (pr_fuse)
@@ -1755,8 +1823,18 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     if (open != ~0u)
         pr_place_label(skip);
     pr_needs = ~0u;
-    /* the position (as the program left p when it is live; else (0, 0, 0, 1)) */
-    {
+    /* the position (as the program left p when it is live; else (0, 0, 0, 1));
+    fused: none when GX's takes the clip-space one, else the one way live gives */
+    if (pr_fuse) {
+        int values[1], live = (pr_fuse->live & WL_XBOX_VSH_LIVE_POSITION) != 0;
+
+        if (!(pr_fuse->perspective && pr_fused_captured)) {
+            values[0] = live ? pr_half(12, 0) : pr_k(0, PRK_ZERO);
+            pr_op(0, 0, 1, values, "psq_st @0, 0(%%[o]), 0, 0");
+            values[0] = live ? pr_half(12, 1) : pr_k(0, PRK_W1);
+            pr_op(0, 0, 1, values, "psq_st @0, 8(%%[o]), 0, 0");
+        }
+    } else {
         char other[24], done[24];
         int values[1], p0 = pr_half(12, 0), p1 = pr_half(12, 1), zero = pr_k(0, PRK_ZERO),
                        w1 = pr_k(0, PRK_W1);
@@ -1939,14 +2017,16 @@ static void pr_print(FILE *out, int reused) {
         const char *t;
 
         if (n == pr_pre_count) {
-            /* (the blocks' bits: live & needs != 0 into bit 4 + k) */
-            fprintf(out, "\t\t\t\"li %%[g], 0\\n\\t\"\n");
-            for (k = 0; k < pr_need_count && k < PR_NEED_BITS; k++)
-                fprintf(out,
-                        "\t\t\t\"andi. 0, %%[live], %u\\n\\t\"\n\t\t\t\"neg 0, 0\\n\\t\"\n"
-                        "\t\t\t\"srwi 0, 0, 31\\n\\t\"\n\t\t\t\"rlwimi %%[g], 0, %d, %d, %d\\n\\t\"\n",
-                        pr_need_values[k], 27 - k, 4 + k, 4 + k);
-            fprintf(out, "\t\t\t\"mtcrf 127, %%[g]\\n\\t\"\n");
+            /* (the blocks' bits: live & needs != 0 into bit 4 + k; none in a fused function) */
+            if (!pr_fuse) {
+                fprintf(out, "\t\t\t\"li %%[g], 0\\n\\t\"\n");
+                for (k = 0; k < pr_need_count && k < PR_NEED_BITS; k++)
+                    fprintf(out,
+                            "\t\t\t\"andi. 0, %%[live], %u\\n\\t\"\n\t\t\t\"neg 0, 0\\n\\t\"\n"
+                            "\t\t\t\"srwi 0, 0, 31\\n\\t\"\n\t\t\t\"rlwimi %%[g], 0, %d, %d, %d\\n\\t\"\n",
+                            pr_need_values[k], 27 - k, 4 + k, 4 + k);
+                fprintf(out, "\t\t\t\"mtcrf 127, %%[g]\\n\\t\"\n");
+            }
             fprintf(out, "\t\t\t\"mtctr %%[n]\\n\\t\"\n");
             if (pr_first[0])
                 fprintf(out, "\t\t\t\"b %s\\n\\t\"\n", pr_first);
