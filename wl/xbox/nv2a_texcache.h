@@ -72,6 +72,11 @@ typedef struct WlNv2aTexCacheConfig {
     // wl_gx_set_frame_overlap; 0: each frame drawn by its end): an image drawn in one of them is
     // neither given back nor rewritten in place until the GPU is past it
     uint8_t gpu_lag;
+    // optional, with gpu_lag: waits for the GPU to finish what it was given (wl_gx_sync). Called
+    // at most once a frame, when an image finds no room while frames the GPU may still be drawing
+    // hold the memory (a level's first frames): the images only those frames drew go back then,
+    // instead of the new texture being kept smaller.
+    void (*gpu_wait)(void);
 } WlNv2aTexCacheConfig;
 
 typedef struct WlNv2aTexEntry {
@@ -102,6 +107,7 @@ typedef struct WlNv2aTexCacheStats {
     uint32_t no_memory;   // of the failures, for want of memory
     uint32_t reduced;     // textures kept smaller for want of memory (converted or made again so)
     uint32_t restored;    // of those, made whole again later
+    uint32_t gpu_waits;   // frames whose images waited for the GPU (cfg.gpu_wait) to find room
     uint64_t hashed_bytes;
     size_t bytes;         // images kept now
     size_t frame_bytes;   // of those, drawn in the last frame finished
@@ -122,6 +128,7 @@ typedef struct WlNv2aTexCache {
     unsigned refused_next;
     uint32_t refused_logged;
     uint32_t frame, serial;
+    uint32_t waited_frame; // the frame cfg.gpu_wait was last called in (the GPU past every frame before it)
     bool capturing; // a capture ran at the last lookup
     WlNv2aTexCacheStats stats;
     // the decoders' scratch (grown as needed)

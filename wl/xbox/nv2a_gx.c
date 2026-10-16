@@ -216,6 +216,10 @@ static void commit(void *user, void *memory, size_t bytes) {
     wl_gpu_buffer_commit(memory, bytes);
 }
 
+static void gpu_wait(void) {
+    (void)wl_gx_sync();
+}
+
 WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     WlNv2aGx *gx = calloc(1, sizeof *gx);
     WlNv2aTexCacheConfig textures;
@@ -240,6 +244,9 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     textures.gpu_lag = gx->cfg.overlap ? 1u : 0u;
     if (textures.flush == NULL) {
         textures.flush = commit;
+    }
+    if (textures.gpu_wait == NULL) {
+        textures.gpu_wait = gpu_wait;
     }
     wl_nv2a_texcache_init(&gx->textures, &textures);
     vertices = gx->cfg.vertices;

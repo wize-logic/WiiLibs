@@ -822,6 +822,88 @@ TEST cache_keeps_smaller_for_want_of_memory(void) {
     PASS();
 }
 
+static unsigned g_gpu_waits;
+
+static void count_gpu_wait(void) {
+    g_gpu_waits++;
+}
+
+// Frames overlapped (gpu_lag 1): a texture drawn in every frame is still made whole again (beside its
+// smaller image, which goes back once the GPU is past it); and an image finding no room while only
+// the frame before's images hold the memory waits for the GPU once, rather than being kept smaller.
+TEST cache_overlapped_restores_and_waits(void) {
+    static WlNv2aTexCache cache;
+    // (four 16x16 images and the 32x32's smaller one, and 2 KiB: no room for the 32x32 beside the four,
+    // and its whole image fits only where they were)
+    static uint8_t arena[5 * (1024 + 32) + 2048 + 32];
+    TGuest g;
+    WlNv2aTexCacheConfig cfg;
+    WlNv2aTexture t, big, other[4];
+    const WlNv2aTexEntry *e;
+    bool made;
+    unsigned i, f;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    set_texture(&g, 0, 0x100000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 4, 4, 1, false));
+    set_texture(&g, 1, 0x200000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 5, 5, 3, false));
+    t_kick(&g);
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 0, &t));
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 1, &big));
+    for (i = 0; i < 4; i++) {
+        other[i] = t;
+        other[i].phys = 0x100000 + 0x1000 * i;
+        other[i].format_word ^= i << 28;
+    }
+
+    // drawn in every frame: whole again after WL_NV2A_TEXCACHE_RESTORE_FRAMES frames all the same
+    memset(&cfg, 0, sizeof cfg);
+    cfg.arena = arena;
+    cfg.arena_bytes = sizeof arena;
+    cfg.gpu_lag = 1;
+    wl_nv2a_texcache_init(&cache, &cfg);
+    for (i = 0; i < 4; i++) {
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made) != NULL);
+    }
+    e = wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made);
+    ASSERT(e != NULL && e->reduced == 1);
+    for (f = 1; f < WL_NV2A_TEXCACHE_RESTORE_FRAMES; f++) {
+        wl_nv2a_texcache_frame_done(&cache);
+        e = wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made);
+        ASSERT(e != NULL && e->reduced == 1);
+    }
+    wl_nv2a_texcache_frame_done(&cache);
+    e = wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made);
+    ASSERT(e != NULL);
+    ASSERT(made);
+    ASSERT_EQ(0u, (unsigned)e->reduced);
+    ASSERT_EQ(32u, e->layout.width);
+    ASSERT_EQ(1u, cache.pending_count); // (the smaller image: the GPU may be drawing the frame before from it)
+    wl_nv2a_texcache_frame_done(&cache);
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT_EQ(0u, cache.pending_count);
+    ASSERT(wl_heap_check(&cache.heap));
+    wl_nv2a_texcache_clear(&cache);
+    ASSERT_EQ(0u, cache.heap.live);
+
+    // the others drawn in the frame before alone: the GPU waited for, and the texture whole at once
+    cfg.gpu_wait = count_gpu_wait;
+    wl_nv2a_texcache_init(&cache, &cfg);
+    g_gpu_waits = 0;
+    for (i = 0; i < 4; i++) {
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made) != NULL);
+    }
+    wl_nv2a_texcache_frame_done(&cache);
+    e = wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made);
+    ASSERT(e != NULL);
+    ASSERT_EQ(0u, (unsigned)e->reduced);
+    ASSERT_EQ(1u, g_gpu_waits);
+    ASSERT(wl_heap_check(&cache.heap));
+    wl_nv2a_texcache_clear(&cache);
+    ASSERT_EQ(0u, cache.heap.live);
+    t_destroy(&g);
+    PASS();
+}
+
 static WlResult sink_count(void *user, const void *data, uint32_t bytes) {
     (void)data;
     *(uint32_t *)user += bytes;
@@ -876,6 +958,7 @@ SUITE(texture_suite) {
     RUN_TEST(cache_watched_and_in_an_arena);
     RUN_TEST(cache_arena_window);
     RUN_TEST(cache_keeps_smaller_for_want_of_memory);
+    RUN_TEST(cache_overlapped_restores_and_waits);
     RUN_TEST(cache_reads_again_when_a_capture_begins);
 }
 
