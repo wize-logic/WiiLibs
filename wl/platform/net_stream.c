@@ -24,6 +24,7 @@
 #define STACK_BYTES (24u * 1024u)
 #define CONNECT_MS 3000u
 #define RETRY_MS 1000u
+#define DIAG_MS 5000u
 #define SHUTDOWN_FLUSH_MS 3000u
 
 typedef struct {
@@ -273,6 +274,28 @@ static void nap(uint32_t ms) {
     }
 }
 
+// One line about a failed step of getting connected, at most one every DIAG_MS (the thread retries
+// every second: a log line for each would drown the run's own). It says which step and the code,
+// and how many attempts failed since the last line. The line goes to the console log, and to the
+// PC once there is a connection.
+static void diag(const char *step, WlResult code) {
+    static uint64_t last;
+    static uint32_t skipped;
+    uint64_t now = wl_platform_time_ms();
+
+    if (last != 0u && now - last < DIAG_MS) {
+        skipped++;
+        return;
+    }
+    WL_LOG_W(TAG, "%s failed: %s (%d); %u more attempts failed since the last note", step, wl_net_result_name(code),
+             (int)code, (unsigned)skipped);
+    skipped = 0;
+    last = wl_platform_time_ms();
+    if (last == 0u) {
+        last = 1u;
+    }
+}
+
 static void disconnect(void) {
     if (g.sock != WL_SOCKET_INVALID) {
         (void)wl_net_close(g.sock);
@@ -302,7 +325,10 @@ static bool send_all(const void *data, uint32_t size) {
             return false;
         }
         WlNetPoll item = {.socket = g.sock, .events = WL_NET_POLL_WRITE, .revents = 0};
-        if (wl_net_poll(&item, 1u, 50) < 0 || (item.revents & (WL_NET_POLL_ERROR | WL_NET_POLL_HUP)) != 0u) {
+        // (a poll that fails is not a dead connection, the send says that: pace it, do not spin)
+        if (wl_net_poll(&item, 1u, 50) < 0) {
+            wl_platform_thread_sleep_ms(20);
+        } else if ((item.revents & (WL_NET_POLL_ERROR | WL_NET_POLL_HUP)) != 0u) {
             return false;
         }
     }
@@ -458,23 +484,42 @@ static bool acquire_listen(void) {
     if (g.listener == WL_SOCKET_INVALID) {
         WlNetAddr any = {.address = WL_NET_ADDR_ANY, .port = g.port};
         WlSocket s;
-        if (wl_net_socket(WL_NET_TCP, &s) != WL_OK) {
+        WlResult made = wl_net_socket(WL_NET_TCP, &s);
+        if (made != WL_OK) {
+            diag("listen: socket", made);
+            nap(RETRY_MS);
             return false;
         }
         (void)wl_net_set_option(s, WL_NET_OPT_REUSEADDR, 1);
-        if (wl_net_bind(s, &any) != WL_OK || wl_net_listen(s, 1) != WL_OK || wl_net_set_nonblocking(s, true) != WL_OK) {
+        WlResult r = wl_net_bind(s, &any);
+        const char *step = "listen: bind";
+        if (r == WL_OK) {
+            step = "listen";
+            r = wl_net_listen(s, 1);
+        }
+        if (r == WL_OK) {
+            step = "listen: non-blocking";
+            r = wl_net_set_nonblocking(s, true);
+        }
+        if (r != WL_OK) {
+            diag(step, r);
             (void)wl_net_close(s);
+            nap(RETRY_MS);
             return false;
         }
         g.listener = s;
         WL_LOG_I(TAG, "listening on port %u", (unsigned)g.port);
     }
-    if (!wait_socket(g.listener, WL_NET_POLL_READ, 100u)) {
-        return false;
-    }
+    // (the poll only paces the loop: the listener is non-blocking, so asking to accept is cheap and
+    // does not rest on a poll that reports a connection to accept)
+    (void)wait_socket(g.listener, WL_NET_POLL_READ, 100u);
     WlSocket c;
     WlNetAddr peer;
-    if (wl_net_accept(g.listener, &c, &peer) != WL_OK) {
+    WlResult accepted = wl_net_accept(g.listener, &c, &peer);
+    if (accepted != WL_OK) {
+        if (accepted != WL_ERR_AGAIN) {
+            diag("accept", accepted);
+        }
         return false;
     }
     if (wl_net_set_nonblocking(c, true) != WL_OK) {
@@ -485,28 +530,87 @@ static bool acquire_listen(void) {
     return connected_now();
 }
 
+static bool connect_pending(WlResult r) {
+    return r == WL_ERR_NET_INPROGRESS || r == WL_ERR_NET_ALREADY || r == WL_ERR_AGAIN;
+}
+
+// Waits for a non-blocking connect to finish, for CONNECT_MS. Sockets say how it went in two ways,
+// and the thread takes whichever answers: the socket polls writable and wl_net_connect_result says
+// how it ended (a host's SO_ERROR), or connecting again says it (the BSD idiom, and the one IOS
+// gives for certain: EALREADY or EINPROGRESS while it goes on, EISCONN when it is done, the error
+// when it failed; Dolphin follows IOS). So, besides the poll, a second connect is tried every
+// PROBE_MS. Returns WL_OK when connected, else why not.
+static WlResult finish_connect(WlSocket s, const WlNetAddr *to) {
+    enum { PROBE_MS = 200 };
+    uint32_t since_probe = PROBE_MS; // (the first probe comes with the first round)
+    WlResult poll_failed = WL_OK;
+
+    for (uint32_t waited = 0; waited < CONNECT_MS && !stopping(); waited += 50u) {
+        WlNetPoll item = {.socket = s, .events = WL_NET_POLL_WRITE, .revents = 0};
+        int32_t ready = wl_net_poll(&item, 1u, 50);
+
+        if (ready < 0) {
+            poll_failed = (WlResult)ready;
+            wl_platform_thread_sleep_ms(50); // (a poll that fails answers at once: do not spin)
+        } else if (ready > 0) {
+            WlResult outcome;
+            if (wl_net_connect_result(s, &outcome) != WL_OK) {
+                outcome = WL_ERR_NET_REFUSED;
+            }
+            if (!connect_pending(outcome)) {
+                return outcome;
+            }
+        }
+        since_probe += 50u;
+        if (since_probe >= PROBE_MS) {
+            since_probe = 0;
+            WlResult again = wl_net_connect(s, to);
+            if (again == WL_OK || again == WL_ERR_NET_ISCONN) {
+                return WL_OK;
+            }
+            if (!connect_pending(again)) {
+                return again;
+            }
+        }
+    }
+    if (poll_failed != WL_OK) {
+        diag("connect: poll", poll_failed);
+    }
+    return WL_ERR_NET_TIMEDOUT;
+}
+
 static bool acquire_connect(void) {
     uint32_t address;
     WlSocket s;
+    WlResult r;
 
-    if (wl_net_resolve(g.host, &address) != WL_OK) {
+    if ((r = wl_net_resolve(g.host, &address)) != WL_OK) {
+        diag("connect: resolve", r);
         nap(RETRY_MS);
         return false;
     }
-    if (wl_net_socket(WL_NET_TCP, &s) != WL_OK || wl_net_set_nonblocking(s, true) != WL_OK) {
+    if ((r = wl_net_socket(WL_NET_TCP, &s)) != WL_OK) {
+        diag("connect: socket", r);
+        nap(RETRY_MS);
+        return false;
+    }
+    if ((r = wl_net_set_nonblocking(s, true)) != WL_OK) {
+        diag("connect: non-blocking", r);
+        (void)wl_net_close(s);
         nap(RETRY_MS);
         return false;
     }
     WlNetAddr to = {.address = address, .port = g.port};
-    WlResult r = wl_net_connect(s, &to);
-    if (r == WL_ERR_NET_INPROGRESS || r == WL_ERR_AGAIN) {
-        WlResult outcome = WL_ERR_NET_TIMEDOUT;
-        if (wait_socket(s, WL_NET_POLL_WRITE, CONNECT_MS)) {
-            if (wl_net_connect_result(s, &outcome) != WL_OK) {
-                outcome = WL_ERR_NET_REFUSED;
-            }
+    r = wl_net_connect(s, &to);
+    if (r == WL_ERR_NET_ISCONN) {
+        r = WL_OK;
+    } else if (connect_pending(r)) {
+        r = finish_connect(s, &to);
+        if (r != WL_OK) {
+            diag("connect: waiting", r);
         }
-        r = outcome;
+    } else if (r != WL_OK) {
+        diag("connect", r);
     }
     if (r != WL_OK) {
         (void)wl_net_close(s);
@@ -520,15 +624,27 @@ static bool acquire_connect(void) {
 // The thread. The network first (DHCP takes seconds on a console), then connect, send, repeat.
 static void *sender_main(void *arg) {
     (void)arg;
-    (void)wl_net_start();
+    uint64_t began = wl_platform_time_ms();
+    uint64_t noted = began;
+    WlResult started = wl_net_start();
+    if (started != WL_OK) {
+        diag("network start", started);
+    }
     while (!stopping()) {
         WlResult up = wl_net_wait(200u);
         if (up == WL_OK) {
+            uint32_t ip = wl_net_local_address();
+            WL_LOG_I(TAG, "network up after %u ms, this console is %u.%u.%u.%u", (unsigned)(wl_platform_time_ms() - began),
+                     (unsigned)(ip >> 24), (unsigned)((ip >> 16) & 255u), (unsigned)((ip >> 8) & 255u), (unsigned)(ip & 255u));
             break;
         }
         if (up == WL_ERR_NET_DOWN) {
+            diag("network", up);
             nap(3000u); // (no cable, no access point, no DHCP answer: try again)
             (void)wl_net_start();
+        } else if (wl_platform_time_ms() - noted >= DIAG_MS) {
+            noted = wl_platform_time_ms();
+            WL_LOG_I(TAG, "waiting for the network: %u ms so far", (unsigned)(noted - began));
         }
     }
     while (!stopping()) {

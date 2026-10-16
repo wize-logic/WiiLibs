@@ -474,7 +474,13 @@ loopback (`tests/platform/test_platform_net.c`, also on the big-endian build) an
   10000 + errno) maps from the results.
 - **Select.** `wl_net_poll` over up to 64 sockets, on `net_poll` (libogc's `net_select` has a
   16-socket fd_set). `WL_NET_POLL_ERROR` and `_HUP` are reported whether asked for or not; a
-  non-blocking connect that finishes shows as writable, and `wl_net_connect_result` says how.
+  non-blocking connect that finishes shows as writable, and `wl_net_connect_result` says how. On the
+  console IOS says how a connect ended only by connecting again (libogc's idiom: `EALREADY` or
+  `EINPROGRESS` while it goes on, `EISCONN` when it is done, the error when it failed), and Dolphin's
+  `SO_ERROR` is the last error of any socket: so the backend keeps the address of a pending connect
+  and `wl_net_connect_result` connects again (its `out` can be `WL_ERR_NET_INPROGRESS`: ask again).
+  `net_stream` does not rest on the poll either: it also connects again every 200 ms, and tries to
+  accept whether or not the poll said so.
 - **What IOS lacks.** `getpeername` (keep the address `wl_net_accept` and `wl_net_connect` gave),
   `FIONREAD` (libogc's `net_ioctl` handles `FIONBIO` only: `wl_net_bytes_available` returns
   `WL_ERR_UNSUPPORTED` on the console) and `SO_TYPE` (`wl_net_socket_proto` answers from a table this layer keeps);
@@ -483,8 +489,8 @@ loopback (`tests/platform/test_platform_net.c`, also on the big-endian build) an
   TCP connect/accept/stream/shutdown, a non-blocking connect and a refusal, poll with timeouts,
   the errno mapping and the address text. The Wii backend is compiled (with `-Werror`) and the
   console runner checks it when the network comes up (UDP and TCP to the console's own address),
-  which needs a Dolphin with a network or a console. `wl_net_connect_result` reads `SO_ERROR`, whose
-  numbering through IOS has not been checked against hardware.
+  which needs a Dolphin with a network or a console. The connect-again path has not been checked
+  against hardware.
 
 ## The remote log (`net_stream.h`)
 

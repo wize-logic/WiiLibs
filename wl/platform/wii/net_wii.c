@@ -92,6 +92,19 @@ static void from_system(const struct sockaddr_in *in, WlNetAddr *out) {
     out->port = ntohs(in->sin_port);
 }
 
+// The address of each socket whose non-blocking connect is going on. IOS says how a connect ended
+// only by connecting again (EISCONN when it is done, the error when it failed, EALREADY while it
+// goes on: the libogc idiom), so wl_net_connect_result needs it. Indexed by the socket number.
+#define CONNECT_MEMO 64u
+static struct {
+    WlNetAddr to;
+    bool pending;
+} g_connecting[CONNECT_MEMO];
+
+static bool connect_is_pending(WlResult r) {
+    return r == WL_ERR_NET_INPROGRESS || r == WL_ERR_NET_ALREADY || r == WL_ERR_AGAIN;
+}
+
 WlResult wl_net_resolve(const char *host, uint32_t *out) {
     const struct hostent *found;
 
@@ -139,6 +152,9 @@ WlResult wl_net_close(WlSocket socket) {
     s32 value;
 
     wl_net_proto_clear(socket);
+    if (socket >= 0 && (uint32_t)socket < CONNECT_MEMO) {
+        g_connecting[socket].pending = false;
+    }
     value = net_close(socket);
 
     return value < 0 ? failed(value) : WL_OK;
@@ -174,6 +190,7 @@ WlResult wl_net_local_addr(WlSocket socket, WlNetAddr *out) {
 
 WlResult wl_net_connect(WlSocket socket, const WlNetAddr *address) {
     struct sockaddr_in system;
+    WlResult result;
     s32 value;
 
     if (address == NULL) {
@@ -181,7 +198,14 @@ WlResult wl_net_connect(WlSocket socket, const WlNetAddr *address) {
     }
     to_system(address, &system);
     value = net_connect(socket, (struct sockaddr *)&system, sizeof system);
-    return value < 0 ? failed(value) : WL_OK;
+    result = value < 0 ? failed(value) : WL_OK;
+    if (socket >= 0 && (uint32_t)socket < CONNECT_MEMO) {
+        g_connecting[socket].pending = connect_is_pending(result);
+        if (g_connecting[socket].pending) {
+            g_connecting[socket].to = *address;
+        }
+    }
+    return result;
 }
 
 WlResult wl_net_listen(WlSocket socket, int32_t backlog) {
@@ -316,6 +340,16 @@ WlResult wl_net_connect_result(WlSocket socket, WlResult *out) {
 
     if (out == NULL) {
         return WL_ERR_ARG;
+    }
+    if (socket >= 0 && (uint32_t)socket < CONNECT_MEMO && g_connecting[socket].pending) {
+        // (connecting again answers as IOS does; Dolphin's SO_ERROR is the last error of any socket)
+        WlResult again = wl_net_connect(socket, &g_connecting[socket].to);
+
+        if (again == WL_ERR_NET_ISCONN) {
+            again = WL_OK;
+        }
+        *out = connect_is_pending(again) ? WL_ERR_NET_INPROGRESS : again;
+        return WL_OK;
     }
     value = net_getsockopt(socket, SOL_SOCKET, SO_ERROR, &error, &length);
     if (value < 0) {

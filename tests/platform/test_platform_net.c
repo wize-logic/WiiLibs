@@ -334,6 +334,44 @@ TEST tcp_nonblocking_connect_completes_and_refusal_is_reported(void) {
     PASS();
 }
 
+// The way IOS answers (libogc's idiom, which the Wii backend's connect result rests on): connecting
+// again says how a non-blocking connect went, pending, connected or failed.
+TEST tcp_connecting_again_says_how_a_nonblocking_connect_went(void) {
+    WlSocket listener, client;
+    uint16_t port;
+    WlNetAddr to;
+
+    ASSERT_EQ(WL_OK, bound(WL_NET_TCP, &listener, &port));
+    ASSERT_EQ(WL_OK, wl_net_listen(listener, 1));
+    ASSERT_EQ(WL_OK, wl_net_socket(WL_NET_TCP, &client));
+    ASSERT_EQ(WL_OK, wl_net_set_nonblocking(client, true));
+    to = loopback(port);
+    WlResult r = wl_net_connect(client, &to);
+    ASSERT(r == WL_OK || r == WL_ERR_NET_INPROGRESS);
+    for (int i = 0; i < 100 && r != WL_OK && r != WL_ERR_NET_ISCONN; i++) {
+        ASSERT(r == WL_ERR_NET_INPROGRESS || r == WL_ERR_NET_ALREADY || r == WL_ERR_AGAIN);
+        WlNetPoll writable = {client, WL_NET_POLL_WRITE, 0};
+        (void)wl_net_poll(&writable, 1, 20);
+        r = wl_net_connect(client, &to);
+    }
+    ASSERT(r == WL_OK || r == WL_ERR_NET_ISCONN);
+    ASSERT_EQ(WL_OK, wl_net_close(client));
+    ASSERT_EQ(WL_OK, wl_net_close(listener));
+
+    // nobody listening: the repeat says refused (or the first connect did)
+    ASSERT_EQ(WL_OK, wl_net_socket(WL_NET_TCP, &client));
+    ASSERT_EQ(WL_OK, wl_net_set_nonblocking(client, true));
+    r = wl_net_connect(client, &to);
+    for (int i = 0; i < 100 && (r == WL_ERR_NET_INPROGRESS || r == WL_ERR_NET_ALREADY); i++) {
+        WlNetPoll writable = {client, WL_NET_POLL_WRITE, 0};
+        (void)wl_net_poll(&writable, 1, 20);
+        r = wl_net_connect(client, &to);
+    }
+    ASSERT_EQ(WL_ERR_NET_REFUSED, r);
+    ASSERT_EQ(WL_OK, wl_net_close(client));
+    PASS();
+}
+
 TEST tcp_on_an_unconnected_socket_says_so(void) {
     WlSocket s;
     uint8_t byte = 0;
@@ -404,6 +442,7 @@ SUITE(net_suite) {
     RUN_TEST(broadcast_needs_its_option);
     RUN_TEST(tcp_connect_accept_and_stream);
     RUN_TEST(tcp_nonblocking_connect_completes_and_refusal_is_reported);
+    RUN_TEST(tcp_connecting_again_says_how_a_nonblocking_connect_went);
     RUN_TEST(tcp_on_an_unconnected_socket_says_so);
     RUN_TEST(poll_reports_only_the_ready_sockets_and_times_out);
 }
