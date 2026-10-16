@@ -130,6 +130,7 @@ struct WlNv2aGx {
     // the title samples a picture it showed (a display surface as a texture): each finished back
     // buffer is copied into a target at its address
     bool keep_frames;
+    bool park_whole; // wl_gx_target_set_park_whole: the picture being drawn read from a target
     uint32_t view_w, view_h;
     // the draw's
     const WlNv2aTexEntry *entries[WL_NV2A_TEXTURES];
@@ -269,6 +270,7 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     // (the back buffer's depth parked only for a target drawn with depth writes: states_apply says
     // so; Halo's shadows and their blur have no depth buffer, and cost one EFB copy fewer each)
     wl_gx_target_set_lazy_depth(true);
+    wl_gx_target_set_park_whole(false);
     wl_gx_set_frame_overlap(gx->cfg.overlap);
     gx->cull_positive = WL_GX_CULL_BACK;
     gx->fit_b = 0.0f;
@@ -893,6 +895,15 @@ static const WlNv2aTexEntry *target_texture(WlNv2aGx *gx, unsigned stage, const 
             // last park)
             gx->texture_memory_changed = true;
             return e;
+        }
+        if (!gx->park_whole) {
+            // (only the part a smaller target draws over was parked: from the next park on, all of
+            // it, else the texture is the guest's memory, which holds no picture, and a megabyte)
+            gx->park_whole = true;
+            wl_gx_target_set_park_whole(true);
+            WL_LOG_I(TAG, "the picture being drawn (%08x) is read while a target has the EFB (%ux%u of it "
+                          "parked): the back buffer parked whole from now on",
+                     (unsigned)t->phys, (unsigned)w, (unsigned)h);
         }
     }
     for (i = 0; i < TARGETS; i++) {
@@ -2974,6 +2985,9 @@ static void backend_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
     uint32_t h = wl_nv2a_k(k, WL_NV2A_K_SET_CLEAR_RECT_HORIZONTAL);
     uint32_t v = wl_nv2a_k(k, WL_NV2A_K_SET_CLEAR_RECT_VERTICAL);
     bool colour = (flags & WL_NV2A_CLEAR_COLOR) != 0, depth = (flags & WL_NV2A_CLEAR_Z) != 0;
+    // (only some of the colour's channels: red, green and blue together, or alpha alone, on GX)
+    bool rgb = (flags & (WL_NV2A_CLEAR_R | WL_NV2A_CLEAR_G | WL_NV2A_CLEAR_B)) != 0;
+    bool part = colour && rgb != ((flags & WL_NV2A_CLEAR_A) != 0);
     uint32_t x0, x1, y0, y1, rgba;
     float z;
 
@@ -2990,7 +3004,7 @@ static void backend_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
     y1 = ((v >> 16) + 1u) / s.samples_y;
     rgba = wl_nv2a_clear_rgba(k, &s);
     z = wl_nv2a_clear_depth(k, &s);
-    if (surface_is_screen(gx, &s) && !gx->frame_open && colour && depth && z >= 1.0f && x0 == 0 && y0 == 0 &&
+    if (surface_is_screen(gx, &s) && !gx->frame_open && colour && !part && depth && z >= 1.0f && x0 == 0 && y0 == 0 &&
         x1 >= gx->cfg.width && y1 >= gx->cfg.height) {
         // the frame's first clear, of all of it: GX's own (the copy that ends a frame clears the EFB)
         frame_begin(gx, rgba);
@@ -3011,14 +3025,14 @@ static void backend_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
     if (x0 >= x1 || y0 >= y1) {
         return;
     }
-    if (colour && (flags & WL_NV2A_CLEAR_COLOR) != WL_NV2A_CLEAR_COLOR) {
-        clear_channels(gx, flags, rgba, x0, y0, x1, y1);
-        if (!depth) {
-            return;
+    if (part) {
+        if (depth) {
+            wl_gx_target_clear(false, true, rgba, z, (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
         }
-        colour = false;
+        clear_channels(gx, flags, rgba, x0, y0, x1, y1);
+    } else {
+        wl_gx_target_clear(colour, depth, rgba, z, (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
     }
-    wl_gx_target_clear(colour, depth, rgba, z, (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
     gx->stats.quad_clears++;
     device_state(gx);
 }

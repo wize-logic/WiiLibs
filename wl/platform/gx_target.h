@@ -97,6 +97,10 @@ const WlGxTarget *wl_gx_target_current(void);
 // back buffer is put back. NULL when nothing is parked. For a caller that reads the picture it
 // was drawing as a texture while drawing into a target.
 const void *wl_gx_target_parked_colour(uint32_t *w, uint32_t *h);
+// Whole parks (off by default): a park keeps all of the back buffer, not only the part the target
+// coming can draw over, so that wl_gx_target_parked_colour has the whole picture so far, for a
+// caller that reads it as a texture while drawing into a smaller target. Taken at the next park.
+void wl_gx_target_set_park_whole(bool on);
 // Lazy depth (off by default): a park copies the back buffer's colour alone, and its depth only when
 // a target is about to write depth (wl_gx_target_depth_write), so that targets drawn without a depth
 // test (a shadow's picture, a blur) cost one copy out of the EFB fewer and a put-back without a Z

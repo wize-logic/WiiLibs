@@ -22,6 +22,7 @@ static struct {
     bool parked;         // its colour and depth are in `colour` and `depth`, (0, 0) to (parked_w, parked_h)
     bool depth_parked;   // ...its depth too (always, unless lazy_depth: then from wl_gx_target_depth_write)
     bool lazy_depth;     // wl_gx_target_set_lazy_depth
+    bool park_whole;     // wl_gx_target_set_park_whole
     bool squeeze_warned; // the lack of memory for wl_gx_target_squeeze has been told
     uint32_t parked_w, parked_h;
     void *colour, *depth;
@@ -138,6 +139,10 @@ void wl_gx_target_shutdown(void) {
 static void park_size(uint32_t w, uint32_t h, uint32_t *pw, uint32_t *ph) {
     uint32_t bw, bh;
     back_size(&bw, &bh);
+    if (t.park_whole) {
+        w = bw;
+        h = bh;
+    }
     w = (w + 3u) & ~3u;
     h = (h + 3u) & ~3u;
     *pw = w < bw ? w : bw;
@@ -146,12 +151,12 @@ static void park_size(uint32_t w, uint32_t h, uint32_t *pw, uint32_t *ph) {
 
 // The back buffer's colour and depth, `w` by `h` from the EFB's origin (what the targets coming can
 // draw over: park_size), out of the EFB, into blocks asked for at the first park and again, larger,
-// when a park needs more.
+// when a park needs more (with lazy depth, the depth's at its first copy).
 static void park(uint32_t w, uint32_t h) {
     size_t bytes = wl_gx_tex_bytes(WL_GX_TEX_RGBA8, w, h);
     // (the colour's block may be there already, and larger: wl_gx_target_squeeze's)
     if (!block_at_least(&t.colour, &t.colour_bytes, &t.colour_clean, bytes) ||
-        !block_at_least(&t.depth, &t.depth_bytes, &t.depth_clean, bytes)) {
+        (!t.lazy_depth && !block_at_least(&t.depth, &t.depth_bytes, &t.depth_clean, bytes))) {
         free_parked();
         WL_LOG_W(TAG, "no memory to park the back buffer (%u bytes twice): a target's draws go over it",
                  (unsigned)bytes);
@@ -268,14 +273,23 @@ void wl_gx_target_set_lazy_depth(bool on) {
     t.lazy_depth = on;
 }
 
+void wl_gx_target_set_park_whole(bool on) {
+    t.park_whole = on;
+}
+
 void wl_gx_target_depth_write(void) {
     size_t bytes;
-    if (!t.owner_is_target || !t.parked || t.depth_parked || t.depth == NULL) {
+    if (!t.owner_is_target || !t.parked || t.depth_parked) {
         return;
     }
-    // (the block was asked for with the colour's, at the park: the EFB's depth there is still the
-    // back buffer's, copied before the draw that is to write it)
+    // (the EFB's depth there is still the back buffer's, copied before the draw that is to write it,
+    // into a block asked for now)
     bytes = wl_gx_tex_bytes(WL_GX_TEX_RGBA8, t.parked_w, t.parked_h);
+    if (!block_at_least(&t.depth, &t.depth_bytes, &t.depth_clean, bytes)) {
+        WL_LOG_W(TAG, "no memory to park the back buffer's depth (%u bytes): a target's draws go over it",
+                 (unsigned)bytes);
+        return;
+    }
     wl_gx_target_be_copy_begin();
     wl_gx_target_be_copy(t.depth, t.parked_w, t.parked_h, WL_GX_TARGET_COPY_Z24X8, t.depth_clean < bytes);
     wl_gx_target_be_copy_end();

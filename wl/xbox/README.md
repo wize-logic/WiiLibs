@@ -270,8 +270,11 @@ even, so its winding holds).
   EFB is the back buffer; another surface (a multisampled one among them, or one at the back
   buffer's depth buffer, whose memory Halo's screen blur borrows) takes it through
   `wl/platform/gx_target.h`, and a texture at its address then samples its image (the back buffer's
-  own address, while a target of its size has the EFB, samples its parked colour: the picture
-  being drawn). A texture takes a target's image only with its texel size (4 bytes for the RGBA8
+  own address, while a target has the EFB, samples its parked colour: the picture being drawn;
+  the first such read under a target smaller than the screen turns on whole parks,
+  `wl_gx_target_set_park_whole`: Halo reads it from a 64 by 64 target). A clear of
+  some of the colour's channels (Halo under water clears the alpha alone) is a quad with GX's
+  colour or alpha update alone (red, green and blue go together on GX). A texture takes a target's image only with its texel size (4 bytes for the RGBA8
   image, 2 for the RGB565) and within its size; with the runtime's write watch, a store to the
   target's memory after its image was made (the memory used again for a texture the processor
   fills) makes the guest's texels the texture's until the target is drawn again (counted as
