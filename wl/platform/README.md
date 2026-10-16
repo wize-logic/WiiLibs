@@ -510,7 +510,7 @@ wl_net_stream_close(3000);                              // END, after at most 3 
 - **It never stalls the program.** One thread (priority of the system watcher, 24 KB stack) does all the
   network work: brings the network up (`wl_net_start`), connects with retries a second apart (or listens),
   and empties the ring. A ring that is full drops the new line and counts it; the next line that fits is
-  preceded by `[W][wlnet] N lines dropped`. A peer that takes nothing for `WL_NET_STREAM_STALL_MS` (3 s)
+  preceded by `[W][wlnet] N lines dropped` (or, if the log goes quiet first, the note is queued when the thread frees room). A peer that takes nothing for `WL_NET_STREAM_STALL_MS` (3 s)
   is let go: the lines in flight are counted as lost, the thread connects again and says so. The lines
   logged before the first connection wait in the ring.
 - **Which end connects.** `host:port` (the program connects to a listener) or `listen:port` (it accepts the
