@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Shaping of the raw input words (platform.h) into the ranges an application wants. It holds no
 // libogc call and no byte-order assumption, so every backend uses it and host tests and the
-// big-endian build run it. Mapping to actions stays with the layer above.
+// big-endian build run it. Mapping to actions stays with the layer above. The sticks and triggers
+// are shaped in integers: the Wii shapes the GameCube pads' in its retrace interrupt, where a
+// float would overwrite the floating-point registers of the code it interrupted.
 #pragma once
 
 #include "wl/platform/platform.h"

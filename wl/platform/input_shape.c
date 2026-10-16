@@ -6,12 +6,37 @@
 #define IR_HALF_W 320.0f
 #define IR_HALF_H 240.0f
 
+// The sticks are shaped in integers: the Wii reads the GameCube pads in the retrace interrupt, and
+// libogc saves no floating-point registers for an interrupt, so a float there overwrote the ones
+// the interrupted code was using (Halo's matrices on the Wii, sixty times a second).
+
+// n / d rounded to the nearest, a half away from zero (lroundf's way); d > 0
+static long round_div(long n, long d) {
+    return n >= 0 ? (2 * n + d) / (2 * d) : -((-2 * n + d) / (2 * d));
+}
+
 int8_t wl_input_stick(int value, int full) {
     if (full <= 0) {
         return 0;
     }
-    long scaled = lroundf((float)value * 127.0f / (float)full);
+    long scaled = round_div((long)value * 127, full);
     return (int8_t)(scaled < -127 ? -127 : scaled > 127 ? 127 : scaled);
+}
+
+// 127 * v / sqrt(squares) rounded as round_div does, with no square root: the largest q with
+// (2q - 1)^2 * squares <= (254 * |v|)^2, that is q - 1/2 <= 127 |v| / sqrt(squares)
+static int8_t on_circle(int v, int64_t squares) {
+    int64_t a = v < 0 ? -(int64_t)v : v;
+    int64_t limit = (254 * a) * (254 * a);
+    int q = 0;
+    for (int bit = 64; bit != 0; bit >>= 1) {
+        int64_t odd = 2 * (int64_t)(q + bit) - 1;
+        if (odd * odd * squares <= limit) {
+            q += bit;
+        }
+    }
+    q = q > 127 ? 127 : q;
+    return (int8_t)(v < 0 ? -q : q);
 }
 
 void wl_input_stick_pair(int x, int y, int full, int8_t out[2]) {
@@ -20,15 +45,14 @@ void wl_input_stick_pair(int x, int y, int full, int8_t out[2]) {
     if (full <= 0) {
         return;
     }
-    float fx = (float)x / (float)full;
-    float fy = (float)y / (float)full;
-    float length = sqrtf(fx * fx + fy * fy);
-    if (length > 1.0f) {
-        fx /= length;
-        fy /= length;
+    int64_t squares = (int64_t)x * x + (int64_t)y * y;
+    if (squares <= (int64_t)full * full) {
+        out[0] = (int8_t)round_div((long)x * 127, full);
+        out[1] = (int8_t)round_div((long)y * 127, full);
+        return;
     }
-    out[0] = (int8_t)lroundf(fx * 127.0f);
-    out[1] = (int8_t)lroundf(fy * 127.0f);
+    out[0] = on_circle(x, squares);
+    out[1] = on_circle(y, squares);
 }
 
 uint8_t wl_input_trigger(unsigned value, unsigned first, unsigned full) {

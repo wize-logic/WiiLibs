@@ -66,7 +66,9 @@ static void on_pre_retrace(u32 retrace_count) {
 static WlRetraceHook volatile g_hook;
 static void *volatile g_hook_user;
 
-// After: what the interface scans now (a committed frame has reached the screen).
+// After: what the interface scans now (a committed frame has reached the screen). Interrupt context:
+// no floating point here or in what it calls (libogc saves no FP registers for an interrupt, so a
+// float overwrites the interrupted code's), the hook's included.
 static void on_retrace(u32 retrace_count) {
     (void)retrace_count;
     g_retraces++;
