@@ -60,6 +60,36 @@ static void ps_floats(const WlXboxVshOutput *o, float *out, unsigned *count) {
     *count = n;
 }
 
+// the outputs live leaves out, cleared (what a draw does not read is not compared)
+static void ps_dead(WlXboxVshOutput *o, unsigned live) {
+    if (!(live & WL_XBOX_VSH_LIVE_POSITION)) {
+        memset(o->position, 0, sizeof o->position);
+        memset(o->clip, 0, sizeof o->clip);
+        o->clip_captured = 0;
+    }
+    if (!(live & WL_XBOX_VSH_LIVE_D0)) {
+        memset(o->d0, 0, sizeof o->d0);
+    }
+    if (!(live & WL_XBOX_VSH_LIVE_D1)) {
+        memset(o->d1, 0, sizeof o->d1);
+    }
+    if (!(live & WL_XBOX_VSH_LIVE_BACK)) {
+        memset(o->b0, 0, sizeof o->b0);
+        memset(o->b1, 0, sizeof o->b1);
+    }
+    for (int n = 0; n < 4; n++) {
+        if (!(live & (WL_XBOX_VSH_LIVE_T0 << n))) {
+            memset(o->t[n], 0, sizeof o->t[n]);
+        }
+    }
+    if (!(live & WL_XBOX_VSH_LIVE_FOG)) {
+        o->fog = 0.0f;
+    }
+    if (!(live & WL_XBOX_VSH_LIVE_POINT_SIZE)) {
+        o->point_size = 0.0f;
+    }
+}
+
 void wlt_suite_vsh_ps(void) {
     unsigned long floats = 0, differ = 0, beyond = 0, programs = 0;
     size_t position = 0, words = sizeof ps_microcode / sizeof ps_microcode[0];
@@ -106,13 +136,18 @@ void wlt_suite_vsh_ps(void) {
                 wl_xbox_vsh_run(&g_ps_interpreted, (const float (*)[4])g_ps_constants,
                                 (const float (*)[4])g_ps_inputs[m], 2.5f, &want[m]);
             }
+            // (a third of the trials with some outputs alone live: the code for the others is skipped)
+            unsigned live = trial % 3 == 2 ? ps_rnd() & WL_XBOX_VSH_LIVE_ALL
+                                           : WL_XBOX_VSH_LIVE_ALL;
             wl_xbox_vsh_run_batch(&g_ps_native, (const float (*)[4])g_ps_constants,
                                   (const float (*)[WL_XBOX_VSH_INPUT_COUNT][4])g_ps_inputs, PS_VERTICES, 2.5f,
-                                  got, WL_XBOX_VSH_LIVE_ALL, &g_ps_work);
+                                  got, live, &g_ps_work);
             for (int m = 0; m < PS_VERTICES; m++) {
                 float a[48], b[48];
                 unsigned n;
 
+                ps_dead(&want[m], live);
+                ps_dead(&got[m], live);
                 clips = clips && want[m].clip_captured == got[m].clip_captured;
                 ps_floats(&want[m], a, &n);
                 ps_floats(&got[m], b, &n);

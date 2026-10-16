@@ -98,13 +98,260 @@ def statement(match):
     return "\n\t\t".join(code)
 
 
+# ---- whole programs (tools/xbox_vsh_pairs.c): an asm volatile statement with its own loop ----
+#
+# Floating-point registers are EmuReg (ps0 a double, ps1, and fctiwz's word); a lane the Gekko
+# leaves undefined, or that the code must not read (ps1 after a double operation), is a NaN. The
+# single-precision operations (lfs, fadds, fmadds, ...) write both lanes, as in paired-single
+# mode. frsqrte is exact here (the Newton steps that follow make either exact).
+
+def emu_expression(text, immediates):
+    return re.sub(r"%\[(\w+)\]", lambda m: "(long)(%s)" % immediates[m.group(1)], text)
+
+
+def emu_gpr(text):
+    text = text.strip()
+    if text == "0":
+        return "r0"
+    return "e_" + re.match(r"%\[(\w+)\]$", text).group(1)
+
+
+def emu_memory(text, immediates):
+    m = re.match(r"(.*)\((%\[\w+\]|0)\)$", text.strip())
+    offset = emu_expression(m.group(1), immediates) if m.group(1).strip() else "0"
+    return "((char *)(%s) + (%s))" % (emu_gpr(m.group(2)), offset)
+
+
+def emu_label(text):
+    return "L_" + re.sub(r"\W", "_", text.strip().replace("%=", ""))
+
+
+def emu_f(text):
+    return "f[%d]" % int(text)
+
+
+def emu_line(line, immediates):
+    line = line.strip()
+    if line.endswith(":"):
+        return emu_label(line[:-1]) + ":;"
+    op, _, rest = line.partition(" ")
+    a = [x.strip() for x in rest.split(",")] if rest else []
+    F = emu_f
+
+    def fa(r, lane):
+        return "(float)%s.%s" % (F(r), lane)
+
+    if op == "psq_l":
+        return "f_psq_l(&%s, %s, %s);" % (F(a[0]), emu_memory(a[1], immediates), a[2])
+    if op == "psq_st":
+        return "f_psq_st(&%s, %s, %s);" % (F(a[0]), emu_memory(a[1], immediates), a[2])
+    if op == "lfs":
+        return "{ float t; memcpy(&t, %s, 4); f_set(&%s, t); }" % (emu_memory(a[1], immediates), F(a[0]))
+    if op == "stfs":
+        return "{ float t = (float)%s.a; memcpy(%s, &t, 4); }" % (F(a[0]), emu_memory(a[1], immediates))
+    if op == "stfiwx":
+        return "memcpy((char *)%s, &%s.i, 4);" % (emu_gpr(a[2]), F(a[0]))
+    if op == "lwz":
+        return "{ int32_t t; memcpy(&t, %s, 4); %s = t; }" % (emu_memory(a[1], immediates), emu_gpr(a[0]))
+    if op == "stw":
+        return "{ int32_t t = (int32_t)%s; memcpy(%s, &t, 4); }" % (emu_gpr(a[0]),
+                                                                   emu_memory(a[1], immediates))
+    if op in ("ps_mr", "ps_neg"):
+        sign = "-" if op == "ps_neg" else ""
+        return "{ EmuReg t = %s; t.a = %st.a; t.b = %st.b; %s = t; }" % (F(a[1]), sign, sign, F(a[0]))
+    m = re.match(r"ps_merge([01])([01])$", op)
+    if m:
+        return "f_pair(&%s, %s, %s);" % (F(a[0]), fa(a[1], "ab"[int(m.group(1))]),
+                                         fa(a[2], "ab"[int(m.group(2))]))
+    if op in ("ps_mul", "ps_add", "ps_sub"):
+        sym = {"ps_mul": "*", "ps_add": "+", "ps_sub": "-"}[op]
+        return "f_pair(&%s, %s %s %s, %s %s %s);" % (F(a[0]), fa(a[1], "a"), sym, fa(a[2], "a"),
+                                                     fa(a[1], "b"), sym, fa(a[2], "b"))
+    m = re.match(r"ps_muls([01])$", op)
+    if m:
+        lane = "ab"[int(m.group(1))]
+        return "f_pair(&%s, %s * %s, %s * %s);" % (F(a[0]), fa(a[1], "a"), fa(a[2], lane),
+                                                   fa(a[1], "b"), fa(a[2], lane))
+    # (frD, frA, frC, frB: A * C + B)
+    fused = {"ps_madd": ("", ""), "ps_msub": ("", "-"), "ps_nmadd": ("-", ""), "ps_nmsub": ("-", "-")}
+    if op in fused:
+        n, nb = fused[op]
+        return "f_pair(&%s, %sfmaf(%s, %s, %s%s), %sfmaf(%s, %s, %s%s));" % (
+            F(a[0]), n, fa(a[1], "a"), fa(a[2], "a"), nb, fa(a[3], "a"),
+            n, fa(a[1], "b"), fa(a[2], "b"), nb, fa(a[3], "b"))
+    m = re.match(r"ps_madds([01])$", op)
+    if m:
+        lane = "ab"[int(m.group(1))]
+        return "f_pair(&%s, fmaf(%s, %s, %s), fmaf(%s, %s, %s));" % (
+            F(a[0]), fa(a[1], "a"), fa(a[2], lane), fa(a[3], "a"), fa(a[1], "b"), fa(a[2], lane),
+            fa(a[3], "b"))
+    if op == "ps_sum0":
+        return "f_pair(&%s, %s + %s, %s);" % (F(a[0]), fa(a[1], "a"), fa(a[3], "b"), fa(a[2], "b"))
+    if op == "ps_sum1":
+        return "f_pair(&%s, %s, %s + %s);" % (F(a[0]), fa(a[2], "a"), fa(a[1], "a"), fa(a[3], "b"))
+    if op == "ps_sel":
+        return "f_pair(&%s, %s.a >= 0 ? %s : %s, %s.b >= 0 ? %s : %s);" % (
+            F(a[0]), F(a[1]), fa(a[2], "a"), fa(a[3], "a"), F(a[1]), fa(a[2], "b"), fa(a[3], "b"))
+    if op in ("fadds", "fsubs", "fdivs"):
+        sym = {"fadds": "+", "fsubs": "-", "fdivs": "/"}[op]
+        return "f_set(&%s, %s %s %s);" % (F(a[0]), fa(a[1], "a"), sym, fa(a[2], "a"))
+    if op in ("fmadds", "fnmadds"):
+        return "f_set(&%s, %sfmaf(%s, %s, %s));" % (F(a[0]), "-" if op == "fnmadds" else "", fa(a[1], "a"),
+                                                     fa(a[2], "a"), fa(a[3], "a"))
+    if op == "fabs":
+        return "f_double(&%s, fabs(%s.a));" % (F(a[0]), F(a[1]))
+    if op == "fmr":
+        return "f_double(&%s, %s.a);" % (F(a[0]), F(a[1]))
+    if op == "fsel":
+        return "f_double(&%s, %s.a >= 0 ? %s.a : %s.a);" % (F(a[0]), F(a[1]), F(a[2]), F(a[3]))
+    if op == "frsqrte":
+        return "f_double(&%s, 1.0 / sqrt(%s.a));" % (F(a[0]), F(a[1]))
+    if op == "fmul":
+        return "f_double(&%s, %s.a * %s.a);" % (F(a[0]), F(a[1]), F(a[2]))
+    if op == "fnmsub":
+        return "f_double(&%s, -fma(%s.a, %s.a, -%s.a));" % (F(a[0]), F(a[1]), F(a[2]), F(a[3]))
+    if op == "frsp":
+        return "f_double(&%s, (float)%s.a);" % (F(a[0]), F(a[1]))
+    if op == "fctiwz":
+        return "f_word(&%s, %s.a);" % (F(a[0]), F(a[1]))
+    if op == "fcmpu":
+        return "cr_compare(%s.a, %s.a);" % (F(a[1]), F(a[2]))
+    if op == "li":
+        return "%s = %s;" % (emu_gpr(a[0]), a[1])
+    if op == "lis":
+        return "%s = (intptr_t)(int32_t)((uint32_t)%s << 16);" % (emu_gpr(a[0]), a[1])
+    if op == "addi":
+        return "%s = %s + (%s);" % (emu_gpr(a[0]), emu_gpr(a[1]), emu_expression(a[2], immediates))
+    if op == "add":
+        return "%s = %s + %s;" % (emu_gpr(a[0]), emu_gpr(a[1]), emu_gpr(a[2]))
+    if op == "andc":
+        return "%s = %s & ~%s;" % (emu_gpr(a[0]), emu_gpr(a[1]), emu_gpr(a[2]))
+    if op == "slwi":
+        return "%s = (intptr_t)(int32_t)((uint32_t)%s << %s);" % (emu_gpr(a[0]), emu_gpr(a[1]), a[2])
+    if op == "srawi":
+        return "%s = (int32_t)%s >> %s;" % (emu_gpr(a[0]), emu_gpr(a[1]), a[2])
+    if op == "andi.":
+        return "%s = %s & %s; cr_compare((double)%s, 0.0);" % (emu_gpr(a[0]), emu_gpr(a[1]), a[2],
+                                                               emu_gpr(a[0]))
+    if op == "cmpw":
+        return "cr_compare((double)(int32_t)%s, (double)(int32_t)%s);" % (emu_gpr(a[0]), emu_gpr(a[1]))
+    if op == "cmplwi":
+        return "cr_compare((double)(uint32_t)%s, (double)(uint32_t)%s);" % (emu_gpr(a[0]), a[1])
+    if op == "neg":
+        return "%s = (intptr_t)(int32_t)(0u - (uint32_t)%s);" % (emu_gpr(a[0]), emu_gpr(a[1]))
+    if op == "srwi":
+        return "%s = (intptr_t)((uint32_t)%s >> %s);" % (emu_gpr(a[0]), emu_gpr(a[1]), a[2])
+    if op == "rlwimi":
+        return "%s = cr_insert((uint32_t)%s, (uint32_t)%s, %s, %s, %s);" % (
+            emu_gpr(a[0]), emu_gpr(a[0]), emu_gpr(a[1]), a[2], a[3], a[4])
+    if op == "mtcrf":
+        return "cr_fields(%s, (uint32_t)%s);" % (a[0], emu_gpr(a[1]))
+    if op in ("bf", "bt"):
+        return "if (%scr_bit(%s)) goto %s;" % ("!" if op == "bf" else "", a[0], emu_label(a[1]))
+    if op == "mtctr":
+        return "ctr = (uint32_t)%s;" % emu_gpr(a[0])
+    if op == "bdnz":
+        return "if (--ctr) goto %s;" % emu_label(a[0])
+    branches = {"b": "1", "beq": "cr_eq", "bne": "!cr_eq", "bgt": "cr_gt", "bng": "!cr_gt",
+                "blt": "cr_lt", "bnl": "!cr_lt", "ble": "(cr_lt || cr_eq)", "bun": "cr_un",
+                "bnu": "!cr_un"}
+    if op in branches:
+        return "if (%s) goto %s;" % (branches[op], emu_label(a[0]))
+    raise SystemExit("vsh_ps_emulate: no emulation of " + op)
+
+
+def whole(match):
+    lines = match.group(1).split("\n")
+    template = [re.match(r'\s*"(.*)\\n\\t"', x).group(1) for x in lines if re.match(r'\s*"', x)]
+    sections, current = [], None
+    for x in lines:
+        if x.strip().startswith(":"):
+            current = [x.strip()[1:].strip()]
+            sections.append(current)
+        elif current is not None and x.strip():
+            current.append(x.strip())
+    outputs = operands(" ".join(sections[0]))
+    inputs = operands(" ".join(sections[1]))
+    immediates = {}
+    code = ["{", "EmuReg f[32]; intptr_t r0 = 0; uint32_t ctr = 0; int k;",
+            "for (k = 0; k < 32; k++) { f[k].a = f[k].b = NAN; f[k].i = 0; }"]
+    for name, constraint, value in outputs:
+        code.append("intptr_t e_%s = (intptr_t)(%s);" % (name, value if "+" in constraint else "0"))
+    for name, constraint, value in inputs:
+        if constraint == "i":
+            immediates[name] = value
+        else:
+            code.append("intptr_t e_%s = (intptr_t)(%s);" % (name, value))
+    for line in template:
+        code.append(emu_line(line, immediates))
+    for name, constraint, value in outputs:
+        code.append("%s = (__typeof__(%s))e_%s;" % (value, value, name))
+    code.append("(void)r0;")
+    code.append("}")
+    return "\n\t\t".join(code)
+
+
+EMU_HEADER = r"""
+typedef struct { double a, b; int32_t i; } EmuReg;
+static int cr_lt, cr_gt, cr_eq, cr_un;
+static void cr_compare(double x, double y) {
+    cr_un = isnan(x) || isnan(y);
+    cr_lt = !cr_un && x < y;
+    cr_gt = !cr_un && x > y;
+    cr_eq = !cr_un && x == y;
+}
+static uint32_t cr_rest; /* cr1 to cr7: bit 4 + k at 1 << (27 - k) */
+static void cr_fields(unsigned mask, uint32_t value) {
+    for (int field = 1; field < 8; field++) {
+        if (mask & (0x80u >> field)) {
+            uint32_t bits = 0xf0000000u >> (4 * field);
+            cr_rest = (cr_rest & ~bits) | (value & bits);
+        }
+    }
+}
+static int cr_bit(int bit) {
+    if (bit < 4)
+        return bit == 0 ? cr_lt : bit == 1 ? cr_gt : bit == 2 ? cr_eq : cr_un;
+    return (int)((cr_rest >> (31 - bit)) & 1);
+}
+static uint32_t cr_insert(uint32_t a, uint32_t s, int shift, int first, int last) {
+    uint32_t rotated = shift ? (s << shift) | (s >> (32 - shift)) : s, mask = 0;
+    for (int bit = first; bit <= last; bit++)
+        mask |= 0x80000000u >> bit;
+    return (a & ~mask) | (rotated & mask);
+}
+static void f_set(EmuReg *r, float x) { r->a = r->b = x; }
+static void f_pair(EmuReg *r, float x, float y) { r->a = x; r->b = y; }
+static void f_double(EmuReg *r, double x) { r->a = x; r->b = NAN; }
+static void f_word(EmuReg *r, double x) {
+    r->a = r->b = NAN;
+    r->i = isnan(x) ? INT32_MIN : x >= 2147483647.0 ? INT32_MAX : x <= -2147483648.0 ? INT32_MIN : (int32_t)x;
+}
+static void f_psq_l(EmuReg *r, const char *p, int one) {
+    float x, y = 1.0f;
+    memcpy(&x, p, 4);
+    if (!one)
+        memcpy(&y, p + 4, 4);
+    f_pair(r, x, y);
+}
+static void f_psq_st(const EmuReg *r, char *p, int one) {
+    float x = (float)r->a, y = (float)r->b;
+    memcpy(p, &x, 4);
+    if (!one)
+        memcpy(p + 4, &y, 4);
+}
+"""
+
+
 def main():
     if len(sys.argv) != 3:
         raise SystemExit("usage: vsh_ps_emulate.py programs.c emulated.c")
     text = open(sys.argv[1]).read()
     text = text.replace("#if WL_XBOX_VSH_PS", "#if 1")
     text = text.replace('#include "wl/xbox/vsh_native.h"',
-                        '#include "wl/xbox/vsh_native.h"\n\ntypedef struct { float a, b; } EmuPair;', 1)
+                        '#include "wl/xbox/vsh_native.h"\n\ntypedef struct { float a, b; } EmuPair;\n' +
+                        EMU_HEADER, 1)
+    text = re.sub(r"__asm__ volatile\(\n(.*?)\);", whole, text, flags=re.S)
     text, count = re.subn(r"__asm__\(\n(.*?)\);", statement, text, flags=re.S)
     if "__asm__" in text:
         raise SystemExit("vsh_ps_emulate: an asm statement left")
