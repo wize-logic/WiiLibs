@@ -25,6 +25,7 @@
 #include <stdint.h>
 
 #include "wl/platform/platform.h"
+#include "wl/platform/tev.h"
 
 // blend modes and factors, in GX's numbering (GX_BM_*, GX_BL_*: the colour factors are the other
 // side's, a source's factor of the destination colour and a destination's of the source colour)
@@ -159,6 +160,25 @@ void wl_gx_direct_flush_after(void);
 // Whether the flush is sent (on by default).
 void wl_gx_direct_set_xf_flush(bool on);
 
+// Work left out of what GX gets, to find on a console what hangs its GPU by halving (each a switch
+// of the title's folder; all off by default, and off they cost a branch). The host takes and
+// ignores them.
+typedef struct {
+    bool no_textures;  // every map's texture one fixed 4x4 RGBA8 texture in MEM1 (no TLUT loads)
+    bool no_tlut;      // C4 and C8 textures that fixed texture (no TLUT loads); the others as they are
+    bool tlut_mem1;    // each TLUT copied into MEM1 before it is loaded (the entries are in MEM2)
+    uint32_t max_draws; // only the first max_draws primitives of a frame reach GX (0: all)
+    bool no_quads;     // no quad of the targets (the back buffer's restore, the clears, the squeeze)
+    bool no_z_restore; // the back buffer's restore puts back the colour only (no Z texture)
+    bool no_copies;    // no texture copy out of the EFB (the display's copy stays)
+    // the texture coordinates in the vertex descriptor's slots of their own names, gaps and all
+    // (TEX0, TEX2, TEX3), as before they were sent in its first slots: the hang of such draws back
+    bool texcoord_gaps;
+} WlGxBisect;
+void wl_gx_bisect_set(const WlGxBisect *bisect);
+// The switches set (all off before wl_gx_bisect_set).
+const WlGxBisect *wl_gx_bisect(void);
+
 // The transform unit's position matrix for the draws that follow (row-major 3x4: (x', y', z') =
 // m (x, y, z, 1), before the projection), NULL the identity (as wl_gx_direct_begin leaves it).
 void wl_gx_direct_position_matrix(const float m[3][4]);
@@ -261,3 +281,30 @@ WlGxFlushResult wl_gx_direct_flush_pending(uint8_t format);
 void wl_gx_direct_begin_format(uint8_t gx_primitive, uint8_t format, uint16_t count);
 // the flushes sent, by wl_gx_direct_draw and wl_gx_direct_flush_pending
 uint32_t wl_gx_direct_flushes(void);
+
+// ---- the draw's state checked ------------------------------------------------------------------
+// What the console's GPU cannot draw where Dolphin draws it, found in a draw's state: the colour
+// channels and texture coordinates the transform unit makes for it (GX_SetNumChans,
+// GX_SetNumTexGens), the texture maps loaded and the TEV program. A hung GPU on the Wii (its
+// command processor stopped mid-primitive, Dolphin drawing the same frames) is looked for with it:
+// the host's direct layer counts the draws with each finding (host/gx_direct_host.h), and the Wii's
+// logs the first ones under [GXCHECK] when WiiLibs is built with WL_GX_CHECK (off: no cost).
+enum {
+    WL_GX_CHECK_NO_OUTPUT = 1u << 0, // neither a colour channel nor a texture coordinate
+    WL_GX_CHECK_CHANNEL = 1u << 1,   // a stage's colour channel beyond the channels made
+    WL_GX_CHECK_RAS_NULL = 1u << 2,  // a stage reads the rasterised colour with no channel ordered
+    WL_GX_CHECK_TEXCOORD = 1u << 3,  // a stage's texture coordinate beyond the coordinates made
+    WL_GX_CHECK_TEX_NULL = 1u << 4,  // a stage reads the texel with no texture map ordered
+    WL_GX_CHECK_TEXMAP = 1u << 5,    // a stage's texture map holds no texture (maps_loaded)
+    WL_GX_CHECK_STAGES = 1u << 6,    // no TEV stage, or more than GX has
+    WL_GX_CHECKS = 7
+};
+// The findings (WL_GX_CHECK_*) for a draw with `chans` colour channels and `texgens` texture
+// coordinates made, the texture maps holding a texture (bit n: map n) and the TEV program.
+uint32_t wl_gx_check_draw(uint32_t chans, uint32_t texgens, uint32_t maps_loaded, const WlTevProgram *tev);
+// A finding's short name (its bit's number), for logs.
+const char *wl_gx_check_name(unsigned bit);
+// The colour channels and texture coordinates the Wii's direct layer has GX make for a layout
+// (wii/gx_direct_wii.c): its colours, one when it has neither colours nor coordinates (GX never
+// makes neither), and coordinates up to the highest one it sends, makes or projects.
+void wl_gx_direct_layout_outputs(const WlGxDirectLayout *layout, uint32_t *chans, uint32_t *texgens);

@@ -268,6 +268,75 @@ TEST gx_direct_stub_takes_batches_of_vertices(void) {
     PASS();
 }
 
+// what the console's GPU would be handed: vertices of the size the layout makes it read, and the
+// state's findings (wl_gx_check_draw) in the channels and coordinates the Wii's layer gives GX
+TEST gx_direct_stub_checks_what_the_console_reads(void) {
+    WlGxDirectLayout layout;
+    WlTevProgram tev;
+    const WlHostGxDirect *d;
+    uint32_t words[8] = {0}, chans, texgens;
+    const uint32_t *batch[1] = {words};
+
+    // a colour and a coordinate (s, t): six words; four are a vertex of the wrong size
+    memset(&layout, 0, sizeof layout);
+    layout.colors = 1;
+    layout.texcoords = 1;
+    wl_host_gx_direct_reset();
+    wl_gx_direct_layout(&layout);
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 2);
+    wl_gx_direct_vertices_words(batch, 1, 6);
+    wl_gx_direct_vertices_words(batch, 1, 4);
+    wl_gx_direct_primitive_end();
+    d = wl_host_gx_direct();
+    ASSERT_EQ(1u, d->wire_mismatches);
+    ASSERT_EQ(16u, d->wire_first_sent);
+    ASSERT_EQ(24u, d->wire_first_read);
+    // indexed: the position's index and the colour's word
+    layout.indexed = 1u << WL_GX_DIRECT_ARRAY_POSITION;
+    layout.texcoords = 0;
+    wl_host_gx_direct_reset();
+    wl_gx_direct_layout(&layout);
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 2);
+    wl_gx_direct_vertices_index(NULL, 0, 1, words, 1);
+    wl_gx_direct_vertices_index(NULL, 0, 1, words, 0);
+    wl_gx_direct_primitive_end();
+    ASSERT_EQ(1u, wl_host_gx_direct()->wire_mismatches);
+    ASSERT_EQ(2u, wl_host_gx_direct()->wire_first_sent);
+
+    // neither colours nor coordinates: GX is given one channel
+    memset(&layout, 0, sizeof layout);
+    wl_gx_direct_layout_outputs(&layout, &chans, &texgens);
+    ASSERT_EQ(1u, chans);
+    ASSERT_EQ(0u, texgens);
+    layout.texcoords_generated = 1u << 2;
+    wl_gx_direct_layout_outputs(&layout, &chans, &texgens);
+    ASSERT_EQ(0u, chans);
+    ASSERT_EQ(3u, texgens);
+
+    // a stage of konst alone: only "neither"; one reading channel 1 and coordinate 1, the texel
+    // and the rasterised colour of maps and channels not ordered or not loaded
+    wl_tev_program_init(&tev);
+    wl_tev_add_stage(&tev);
+    ASSERT_EQ(WL_GX_CHECK_NO_OUTPUT, wl_gx_check_draw(0, 0, 0, &tev));
+    ASSERT_EQ(0u, wl_gx_check_draw(1, 0, 0, &tev));
+    tev.stages[0].channel = WL_TEV_CH_COLOR1A1;
+    tev.stages[0].texcoord = 1;
+    tev.stages[0].texmap = 3;
+    ASSERT_EQ(WL_GX_CHECK_CHANNEL | WL_GX_CHECK_TEXCOORD | WL_GX_CHECK_TEXMAP, wl_gx_check_draw(1, 1, 0, &tev));
+    ASSERT_EQ(0u, wl_gx_check_draw(2, 2, 1u << 3, &tev));
+    tev.stages[0].channel = WL_TEV_NONE;
+    tev.stages[0].texcoord = WL_TEV_NONE;
+    tev.stages[0].texmap = WL_TEV_NONE;
+    tev.stages[0].color.in[0] = WL_TEV_CC_RASC;
+    tev.stages[0].alpha.in[0] = WL_TEV_CA_TEXA;
+    ASSERT_EQ(WL_GX_CHECK_RAS_NULL | WL_GX_CHECK_TEX_NULL, wl_gx_check_draw(1, 0, 0, &tev));
+    tev.stage_count = 0;
+    ASSERT_EQ(WL_GX_CHECK_STAGES, wl_gx_check_draw(1, 0, 0, &tev));
+    ASSERT_STR_EQ("no colour channel and no texture coordinate", wl_gx_check_name(0));
+    wl_host_gx_direct_reset();
+    PASS();
+}
+
 TEST audio_stub_renders_through_the_fill_callback(void) {
     uint32_t next = 0;
     ASSERT_EQ(WL_ERR_ARG, wl_platform_audio_start(32000, 256, NULL, NULL));
@@ -301,6 +370,7 @@ SUITE(host_suite) {
     RUN_TEST(gx_direct_stub_flushes_a_renderers_own_format);
     RUN_TEST(gx_direct_stub_takes_projected_coordinates_after_the_position);
     RUN_TEST(gx_direct_stub_takes_batches_of_vertices);
+    RUN_TEST(gx_direct_stub_checks_what_the_console_reads);
     RUN_TEST(audio_stub_renders_through_the_fill_callback);
 }
 

@@ -11,6 +11,7 @@
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
+typedef int32_t s32;
 typedef struct {
     u8 r, g, b, a;
 } GXColor;
@@ -22,6 +23,13 @@ typedef struct {
 #define GX_COLOR1A1 5
 #define GX_COLORZERO 6
 #define GX_COLORNULL 0xff
+#define GX_DISABLE 0
+#define GX_ENABLE 1
+#define GX_SRC_REG 0
+#define GX_SRC_VTX 1
+#define GX_LIGHTNULL 0
+#define GX_DF_NONE 0
+#define GX_AF_NONE 2
 #define GX_TEXCOORD0 0
 #define GX_TEXCOORDNULL 0xff
 #define GX_TEXMAP0 0
@@ -222,6 +230,7 @@ void gx_stub_reset(void);
 
 void GX_SetNumTevStages(u8 num);
 void GX_SetNumChans(u8 num);
+void GX_SetChanCtrl(s32 channel, u8 enable, u8 ambsrc, u8 matsrc, u8 litmask, u8 diff_fn, u8 attn_fn);
 void GX_SetNumTexGens(u32 num);
 void GX_SetTevOrder(u8 stage, u8 texcoord, u32 texmap, u8 color);
 void GX_SetTevSwapMode(u8 stage, u8 ras_sel, u8 tex_sel);
