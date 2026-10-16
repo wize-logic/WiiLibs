@@ -654,6 +654,9 @@ def main() -> int:
                         help="a GFX.ini entry, added or overriding the defaults: NAME=VALUE in [Hacks] (EFBAccessEnable, "
                              "EFBToTextureEnable and DeferEFBCopies by default), SECTION.NAME=VALUE in another "
                              "section, e.g. Settings.CPUCull=False; repeatable")
+    parser.add_argument("--config", action="append", default=[], metavar="SYSTEM.SECTION.KEY=VALUE",
+                        help="a Dolphin setting for this run (Dolphin's -C), e.g. Dolphin.Core.RAMOverrideEnable=True; "
+                             "repeatable")
     parser.add_argument("--name", default="wl-dolphin", help="the work folder's name under %%TEMP%%")
     parser.add_argument("--break", dest="break_at", action="append", default=[], metavar="SYMBOL",
                         help="with --backtrace: stop there (exit, abort, a function); the backtrace is then "
@@ -712,6 +715,7 @@ def main() -> int:
                  "-C", f"SYSCONF.IPL.AR={1 if args.wii_aspect == '16:9' else 0}",
                  *(["-C", "SYSCONF.IPL.PGS=1"] if args.wii_progressive else []),
                  *(["-C", f"SYSCONF.IPL.E60={1 if args.wii_eurgb60 == 'on' else 0}"] if args.wii_eurgb60 else []),
+                 *(item for setting in args.config for item in ("-C", setting)),
                  "-e", to_windows(program)]
     try:
         if NATIVE:
