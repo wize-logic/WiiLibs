@@ -14,6 +14,7 @@
 #include <ogc/cache.h>
 #include <ogc/gu.h>
 #include <ogc/gx.h>
+#include <ogc/lwp.h>
 #include <ogc/lwp_watchdog.h>
 #include <ogc/video.h>
 #include <stddef.h>
@@ -272,6 +273,7 @@ WlResult wl_gx_init(void) {
     GX_CopyDisp(wl_platform_video_back_buffer(), GX_TRUE);
     g.dirty = true;
     (void)wl_gx_sync();
+    wl_gx_wii_hang_init();
     WL_LOG_I(TAG, "up: FIFO %u bytes at %p, EFB %ux%u", (unsigned)fifo_bytes, fifo,
              (unsigned)g.fb_w, (unsigned)g.efb_h);
     return WL_OK;
@@ -333,7 +335,25 @@ static uint32_t send_token(void) {
     g.token++;
     GX_SetDrawSync((u16)g.token);
     GX_Flush();
+    wl_gx_wii_hang_event('S', g.token, 0);
     return g.token;
+}
+
+void wl_gx_wii_hang_state(uint32_t *token_sent, uint32_t *frames_ended, bool *in_frame) {
+    *token_sent = g.token;
+    *frames_ended = g.stats.frames;
+    *in_frame = g.in_frame;
+}
+
+// libogc suspends the thread GX_Init ran on at the FIFO's high-water mark, not the one writing: a
+// title whose frames another thread draws (a recompiled title's guest thread) would otherwise
+// write on past the GPU's read pointer, over commands it has not read (a GPU hang), while the
+// thread that started GX is the one stopped.
+void wl_gx_wii_own_thread(void) {
+    lwp_t self = LWP_GetSelf();
+    if (GX_GetCurrentGXThread() != self) {
+        (void)GX_SetCurrentGXThread();
+    }
 }
 
 static bool wait_token(uint32_t t) {
@@ -406,6 +426,8 @@ void wl_gx_begin_frame(uint32_t clear_rgba) {
     WL_ASSERT(g.ready);
     VCHECK(!g.in_frame, "begin_frame inside a frame");
     wl_hwcount_frame_begin(); // (closes the last frame's window, opens this one's: the counters' selections queue here)
+    wl_gx_wii_own_thread();
+    wl_gx_wii_hang_event('F', g.stats.frames, 0);
     wl_gx_reset_state();
     if (clear_rgba != g.clear_next) {
         clear_efb(clear_rgba);
@@ -470,6 +492,7 @@ uint32_t wl_gx_end_frame(void) {
     // the next frame's commands queue behind the copy at once.
     uint32_t t = send_token();
     g.frame_token[g.stats.frames % FRAME_FENCES] = t;
+    wl_gx_wii_hang_event('E', g.stats.frames, t);
     if (g.overlap) {
         // (the GPU at most this one frame behind: the frame before it retired, as a double-buffered
         // frame arena needs, whatever the number of XFBs)
@@ -524,6 +547,7 @@ static void copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexForma
     GX_SetTexCopyDst((u16)w, (u16)h, tf[fmt], GX_FALSE);
     GX_CopyTex(dst, clear ? GX_TRUE : GX_FALSE);
     GX_PixModeSync();
+    wl_gx_wii_hang_event('C', (uint32_t)(uintptr_t)dst, (uint32_t)w << 16 | (uint32_t)h);
     wl_gx_wii_copy_filter(true);
     GX_InvalidateTexAll();
     g.stats.efb_copies++;

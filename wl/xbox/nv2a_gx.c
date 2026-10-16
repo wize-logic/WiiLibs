@@ -2662,6 +2662,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     }
     gx->stats.draws++;
     gx->stats.vertices += draw->count;
+    wl_gx_hang_where(0, "nv2a draws", gx->stats.draws);
     if ((wl_nv2a_k(k, WL_NV2A_K_SET_COLOR_MASK) & 0x01010101u) == 0 && wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_MASK) == 0) {
         // (nothing written: its pixel count alone, or nothing)
         display_textures_note(gx, k);

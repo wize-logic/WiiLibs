@@ -61,6 +61,7 @@ void wl_gx_direct_begin(void) {
     Mtx identity;
     unsigned stage;
 
+    wl_gx_wii_own_thread();
     wl_gx_invalidate_shadow();
     wl_gx_tlut_invalidate();
     d.layout_known = false;
@@ -165,6 +166,10 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
     }
     GX_SetNumTexGens(texgens);
     GX_SetNumChans(layout->colors);
+    wl_gx_wii_hang_event('L', layout->indexed | (uint32_t)layout->colors << 16 | (uint32_t)layout->lit << 20 |
+                                  (uint32_t)layout->texcoords_projected << 24,
+                         layout->texcoords | (uint32_t)layout->texcoords_generated << 8 |
+                             (uint32_t)layout->texcoord_s << 16);
     if (!layout->lit) {
         GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
         GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
@@ -291,8 +296,10 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
         }
         GX_End();
         wl_gx_flush_wii_count();
+        wl_gx_wii_hang_event('X', 0, 0);
     }
     GX_Begin(prims[prim], DIRECT_FORMAT, (u16)count);
+    wl_gx_wii_hang_event('P', (uint32_t)prim << 16 | count, d.stats.draws);
     d.in_primitive = true;
     d.stats.draws++;
     d.stats.vertices += count;
@@ -327,6 +334,7 @@ void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride) {
         return;
     }
     GX_SetArray(gx_attribute, (void *)data, (u8)stride);
+    wl_gx_wii_hang_event('A', (uint32_t)(uintptr_t)data, gx_attribute << 8 | stride);
     wl_gx_wii_note_commands();
 }
 
@@ -534,6 +542,7 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
 
         memcpy(&table, tlut->opaque, sizeof table);
         GX_LoadTlut(&table, tex->tlut);
+        wl_gx_wii_hang_event('U', (uint32_t)(uintptr_t)tlut->entries, (uint32_t)tex->tlut << 16 | tlut->count);
         wl_gx_tlut_invalidate();
     }
     if (!pow2) {
@@ -556,6 +565,9 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
         return;
     }
     GX_LoadTexObj(&obj, (u8)(GX_TEXMAP0 + map));
+    wl_gx_wii_hang_event('T', (uint32_t)(uintptr_t)GX_GetTexObjData(&obj),
+                         map << 28 | (uint32_t)(tex->format & 63u) << 22 | (tex->width & 2047u) << 11 |
+                             (tex->height & 2047u));
     d.maps[map] = obj;
     d.maps_known |= (uint8_t)(1u << map);
     wl_gx_wii_note_commands();
