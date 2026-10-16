@@ -4,6 +4,9 @@
 
 #include <string.h>
 
+// (stages compared as bytes: no padding in them)
+_Static_assert(sizeof(WlTevHalf) == 9u && sizeof(WlTevStage) == 7u + 2u * sizeof(WlTevHalf), "WlTevStage has padding");
+
 // the GX calls each key's setter makes
 static const uint8_t k_calls[WL_GX_SHADOW_KEYS] = {1, 1, 1, 1, 1, 1, 1, 2, 1};
 
@@ -47,6 +50,10 @@ static uint8_t stage_calls(const WlTevStage *now, const WlTevStage *was, bool kn
     if (!known) {
         return WL_TEV_SEND_STAGE;
     }
+    // (the common case first: the stage as it was, its bytes compared at once)
+    if (memcmp(now, was, sizeof *now) == 0) {
+        return 0;
+    }
     if (now->texcoord != was->texcoord || now->texmap != was->texmap || now->channel != was->channel) {
         send |= WL_TEV_SEND_ORDER;
     }
@@ -75,12 +82,7 @@ static uint8_t stage_calls(const WlTevStage *now, const WlTevStage *was, bool kn
 }
 
 static unsigned bits(uint32_t v) {
-    unsigned n = 0;
-
-    for (; v != 0; v &= v - 1u) {
-        n++;
-    }
-    return n;
+    return (unsigned)__builtin_popcount(v);
 }
 
 void wl_tev_shadow_plan(const WlTevProgram *p, uint32_t flags, WlTevSend *out) {
