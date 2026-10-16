@@ -156,27 +156,29 @@ struct WlNv2aGx {
     } signatures[FIT_SETS][FIT_WAYS];
     uint32_t signature_use;
     bool last_shared;
-    // (stamp: the draw; batch: the batch that last used the slot, which no other index may then
-    // take until it is sent)
+    // (stamp: the draw; memo_batch: the batch that last used the slot, which no other index may then
+    // take until it is sent; memo_vertices: the slot's vertex. Apart, the tags a lookup reads are four
+    // to a 32-byte cache line, a strip's neighbouring indices in one, and each vertex starts a line:
+    // on the Wii a vertex beside its tags missed the cache on most lookups, 1.8% of a30's time)
     struct WlNv2aGxMemo {
-        uint32_t index, stamp, batch;
-        PackedVertex vertex;
+        uint32_t index, stamp;
     } memo[MEMO];
+    uint32_t memo_batch[MEMO];
+    PackedVertex *memo_vertices; // (memo_space's first 32-byte boundary)
+    PackedVertex memo_space[MEMO + 1];
     uint32_t memo_stamp, batch_stamp;
     // a batch of a draw's vertices (WL_XBOX_VSH_BATCH): each one's vertex (in the memo, or made
-    // here), the program run for those not kept (their vertex numbers and where their vertex goes),
-    // the runs' inputs and outputs
+    // here), the program run for those not kept (their elements as the fetch takes them, where their
+    // vertex goes, and its words, a fused batch's way), the runs' inputs and outputs
     struct {
         const uint32_t *words[WL_XBOX_VSH_BATCH]; // (their words: batch_vertex's vertex)
-        uint32_t run_vertex[WL_XBOX_VSH_BATCH];
+        uint32_t elements[WL_XBOX_VSH_BATCH];
         PackedVertex *run_vertices[WL_XBOX_VSH_BATCH];
+        uint32_t *words_made[WL_XBOX_VSH_BATCH];
         PackedVertex made[WL_XBOX_VSH_BATCH];
         float inputs[WL_XBOX_VSH_BATCH][WL_NV2A_ATTRIBS][4];
         WlXboxVshOutput outputs[WL_XBOX_VSH_BATCH];
         WlXboxVshWork work;
-        // a fused batch's (the vertices' elements, where their words go)
-        uint32_t elements[WL_XBOX_VSH_BATCH];
-        uint32_t *words_made[WL_XBOX_VSH_BATCH];
     } batch;
     // a fused batch's state (the draw's)
     WlXboxVshFused fused;
@@ -245,6 +247,7 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     if (gx->cfg.recipe != NULL) {
         gx->recipe = *gx->cfg.recipe;
     }
+    gx->memo_vertices = (PackedVertex *)(void *)(((uintptr_t)gx->memo_space + 31u) & ~(uintptr_t)31u);
     textures = gx->cfg.textures;
     // (a light's falloff cube as its lit face, wl_nv2a_spot_coordinates, not a sphere map)
     textures.spots = true;
@@ -1175,10 +1178,13 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
         p.perspective = false;
         return p;
     }
-    // the transform's signature, and the canonical points' w and depth
+    // the transform's signature, and the canonical points' w and depth (each point in the input
+    // registers the position reads, as the draw's fetch fills only those)
     for (i = 0; i < CANONICAL_POINTS; i++) {
         for (v = 0; v < WL_NV2A_ATTRIBS; v++) {
-            memcpy(gx->batch.inputs[i][v], canonical_points[i], sizeof gx->batch.inputs[i][v]);
+            if (attributes & (1u << v)) {
+                memcpy(gx->batch.inputs[i][v], canonical_points[i], sizeof gx->batch.inputs[i][v]);
+            }
         }
     }
     wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs,
@@ -1440,6 +1446,51 @@ static inline void put_bits(uint32_t *word, const float *f) {
     *word = bits;
 }
 
+// vertices_pack's positions: (x w, y w, -w) in pixels for a perspective vertex, else (x, y, depth);
+// made inline for constant choices (mul_x, mul_y: the samples' sizes powers of two, to_sx and to_sy
+// multiplied by; landing: where the vertices land kept)
+static inline __attribute__((always_inline)) void positions_pack(const WlNv2aGx *gx, const DrawPlan *plan,
+                                                                 unsigned runs, bool mul_x, bool mul_y,
+                                                                 bool landing) {
+    PackedVertex *const *made = gx->batch.run_vertices;
+    const WlXboxVshOutput *o = gx->batch.outputs;
+    const bool perspective = gx->projection.perspective;
+    const float scale_x = plan->scale[0], scale_y = plan->scale[1], offset_x = plan->offset[0],
+                offset_y = plan->offset[1], sx = plan->sx, sy = plan->sy, to_sx = plan->to_sx, to_sy = plan->to_sy,
+                depth_max = plan->depth_max;
+    unsigned r;
+
+    for (r = 0; r < runs; r++) {
+        PackedVertex *out = made[r];
+        const WlXboxVshOutput *v = &o[r];
+
+        if (perspective && v->clip_captured) {
+            // (x w, y w, -w) in pixels, the pixel centres on integers as Direct3D puts them
+            float cw = v->clip[3];
+            float x = v->clip[0] * scale_x + offset_x * cw, y = v->clip[1] * scale_y + offset_y * cw;
+            float px = (mul_x ? x * to_sx : x / sx) + 0.5f * cw;
+            float py = (mul_y ? y * to_sy : y / sy) + 0.5f * cw;
+
+            put_float(&out->w[0], px);
+            put_float(&out->w[1], py);
+            put_float(&out->w[2], -cw);
+            if (landing) {
+                out->x = cw != 0.0f ? px / cw : 0.0f;
+                out->y = cw != 0.0f ? py / cw : 0.0f;
+            }
+        } else {
+            float px = (mul_x ? v->position[0] * to_sx : v->position[0] / sx) + 0.5f;
+            float py = (mul_y ? v->position[1] * to_sy : v->position[1] / sy) + 0.5f;
+
+            put_float(&out->w[0], px);
+            put_float(&out->w[1], py);
+            put_float(&out->w[2], as_depth(v->position[2], depth_max) - 1.0f);
+            out->x = px;
+            out->y = py;
+        }
+    }
+}
+
 // the batch's vertices the program made (gx->batch.outputs[r] into gx->batch.run_vertices[r]) as GX
 // takes them (OpenCE-Wii's vertex_store), in the draw's layout, and where they land in EFB pixels.
 // A word at a time for all of them (as the fetch takes an attribute): a word's place and the
@@ -1464,40 +1515,16 @@ static void vertices_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawP
             put_bits(&w[2], &in[2]);
         }
     } else {
-        const bool perspective = gx->projection.perspective, landing = plan->landing;
-        const float scale_x = plan->scale[0], scale_y = plan->scale[1], offset_x = plan->offset[0],
-                    offset_y = plan->offset[1], sx = plan->sx, sy = plan->sy, to_sx = plan->to_sx,
-                    to_sy = plan->to_sy, depth_max = plan->depth_max;
-        const bool mul_x = to_sx != 0.0f, mul_y = to_sy != 0.0f;
-
-        for (r = 0; r < runs; r++) {
-            PackedVertex *out = made[r];
-            const WlXboxVshOutput *v = &o[r];
-
-            if (perspective && v->clip_captured) {
-                // (x w, y w, -w) in pixels, the pixel centres on integers as Direct3D puts them
-                float cw = v->clip[3];
-                float x = v->clip[0] * scale_x + offset_x * cw, y = v->clip[1] * scale_y + offset_y * cw;
-                float px = (mul_x ? x * to_sx : x / sx) + 0.5f * cw;
-                float py = (mul_y ? y * to_sy : y / sy) + 0.5f * cw;
-
-                put_float(&out->w[0], px);
-                put_float(&out->w[1], py);
-                put_float(&out->w[2], -cw);
-                if (landing) {
-                    out->x = cw != 0.0f ? px / cw : 0.0f;
-                    out->y = cw != 0.0f ? py / cw : 0.0f;
-                }
+        // (a loop made for the samples' usual power of two, each way of landing, so the choices are
+        // not tested again at each vertex)
+        if (plan->to_sx != 0.0f && plan->to_sy != 0.0f) {
+            if (plan->landing) {
+                positions_pack(gx, plan, runs, true, true, true);
             } else {
-                float px = (mul_x ? v->position[0] * to_sx : v->position[0] / sx) + 0.5f;
-                float py = (mul_y ? v->position[1] * to_sy : v->position[1] / sy) + 0.5f;
-
-                put_float(&out->w[0], px);
-                put_float(&out->w[1], py);
-                put_float(&out->w[2], as_depth(v->position[2], depth_max) - 1.0f);
-                out->x = px;
-                out->y = py;
+                positions_pack(gx, plan, runs, true, true, false);
             }
+        } else {
+            positions_pack(gx, plan, runs, plan->to_sx != 0.0f, plan->to_sy != 0.0f, plan->landing);
         }
     }
     if (projected_count != 0) {
@@ -1804,7 +1831,7 @@ static void fused_check(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *d
     for (r = 0; r < runs; r++) {
         fused[r] = *gx->batch.run_vertices[r];
     }
-    wl_nv2a_fetch_vertices(&gx->fetch, draw, gx->batch.run_vertex, runs, gx->batch.inputs);
+    wl_nv2a_fetch_elements(&gx->fetch, draw, gx->batch.elements, runs, gx->batch.inputs);
     wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, runs,
                               plan->live, gx->batch.outputs, &gx->batch.work);
     vertices_pack(gx, k, plan, runs);
@@ -1834,10 +1861,10 @@ static void fused_check(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *d
                 }
             }
             WL_LOG_W(TAG,
-                     "fused check: program %08lx form %u live %03x vertex %u element %u (%u of %u vertices differ so "
+                     "fused check: program %08lx form %u live %03x element %u (%u of %u vertices differ so "
                      "far); words fused/general:%s",
                      program->hash, (unsigned)(form - program->native_fused), plan->live,
-                     (unsigned)gx->batch.run_vertex[r], (unsigned)gx->batch.elements[r], differing, checked, text);
+                     (unsigned)gx->batch.elements[r], differing, checked, text);
             at = 0;
             for (n = 0; n < fetch->count && at < sizeof text - 48u; n++) {
                 unsigned bytes = fused_check_bytes(wl_nv2a_fetch_fused_format(fetch, n)), b;
@@ -1871,45 +1898,57 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
     unsigned runs = 0, n, r;
     bool changed;
 
-    for (n = 0; n < count; n++) {
-        uint32_t v = first + n;
-        PackedVertex *made = &gx->batch.made[runs];
+    // (each vertex made: its element as the fetch takes it, wl_nv2a_fetch_element's, and where its
+    // words go; the draw's and the tables' addresses in locals, which the stores would otherwise
+    // have the compiler load again for each vertex)
+    if (indexed) {
+        const uint32_t *indices = draw->indices + first;
+        const uint32_t stamp = gx->memo_stamp, index_base = draw->index_base;
+        struct WlNv2aGxMemo *const memo = gx->memo;
+        uint32_t *const memo_batch = gx->memo_batch;
+        PackedVertex *const memo_vertices = gx->memo_vertices, *const batch_made = gx->batch.made;
+        const uint32_t **const words = gx->batch.words;
 
-        if (indexed) {
-            uint32_t index = draw->indices[v];
-            struct WlNv2aGxMemo *m = &gx->memo[index & (MEMO - 1u)];
+        for (n = 0; n < count; n++) {
+            uint32_t index = indices[n], slot = index & (MEMO - 1u);
+            struct WlNv2aGxMemo *m = &memo[slot];
+            PackedVertex *made;
 
-            if (m->stamp == gx->memo_stamp && m->index == index) {
-                m->batch = batch;
-                gx->batch.words[n] = m->vertex.w;
+            if (m->stamp == stamp && m->index == index) {
+                memo_batch[slot] = batch;
+                words[n] = memo_vertices[slot].w;
                 continue;
             }
-            if (m->stamp != gx->memo_stamp || m->batch != batch) {
-                m->stamp = gx->memo_stamp;
+            if (m->stamp != stamp || memo_batch[slot] != batch) {
+                m->stamp = stamp;
                 m->index = index;
-                m->batch = batch;
-                made = &m->vertex;
+                memo_batch[slot] = batch;
+                made = &memo_vertices[slot];
+            } else {
+                made = &batch_made[runs];
             }
+            words[n] = made->w;
+            gx->batch.elements[runs] = index - index_base;
+            gx->batch.words_made[runs] = made->w;
+            gx->batch.run_vertices[runs] = made;
+            runs++;
         }
-        gx->batch.words[n] = made->w;
-        gx->batch.run_vertex[runs] = v;
-        gx->batch.run_vertices[runs] = made;
-        runs++;
+    } else {
+        for (n = 0; n < count; n++) {
+            PackedVertex *made = &gx->batch.made[n];
+
+            gx->batch.words[n] = made->w;
+            gx->batch.elements[n] = first + n;
+            gx->batch.words_made[n] = made->w;
+            gx->batch.run_vertices[n] = made;
+        }
+        runs = count;
     }
     gx->stats.vertices_reused += count - runs;
     if (plan->xf == NULL && runs != 0) {
         const WlXboxVshFusedForm *form = fused_for(gx, plan, layout, runs);
 
         if (form != NULL) {
-            // (each vertex's element as the fetch takes it, and where its words go)
-            for (r = 0; r < runs; r++) {
-                uint32_t v = gx->batch.run_vertex[r];
-
-                gx->batch.elements[r] = gx->fetch.source == WL_NV2A_SOURCE_ARRAYS && gx->fetch.indices != NULL
-                                            ? gx->fetch.indices[v] - gx->fetch.index_base
-                                            : v;
-                gx->batch.words_made[r] = gx->batch.run_vertices[r]->w;
-            }
             gx->fused.elements = gx->batch.elements;
             gx->fused.words = gx->batch.words_made;
             form->run((const float (*)[4])k->constants, &gx->fused, runs, plan->live);
@@ -1920,7 +1959,7 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
             return false;
         }
     }
-    wl_nv2a_fetch_vertices(&gx->fetch, draw, gx->batch.run_vertex, runs, gx->batch.inputs);
+    wl_nv2a_fetch_elements(&gx->fetch, draw, gx->batch.elements, runs, gx->batch.inputs);
     if (plan->xf != NULL && plan->xf->full) {
         for (r = 0; r < runs; r++) {
             vertex_pack_xf(plan, (const float (*)[4])gx->batch.inputs[r], gx->batch.run_vertices[r]);
@@ -2155,6 +2194,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
     const WlXboxVshDependencies *d = &gx->xf_dependencies;
     const WlXboxVshOutput *o = gx->batch.outputs;
     unsigned n, a, stage, c, row;
+    uint32_t reads;
     float rows[4][4], lit_scale[4][4] = {{0.0f}};
     bool full;
 
@@ -2177,9 +2217,13 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         gx->xf_why = WL_NV2A_GX_XF_POSITION;
         return false;
     }
+    // (each probe in the input registers the draw's outputs read, as the draw's fetch fills only those)
+    reads = wl_nv2a_pipeline_inputs(&gx->pipeline, plan->live);
     for (n = 0; n < XF_PROBES; n++) {
         for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
-            memcpy(gx->batch.inputs[n][a], probe[n], sizeof probe[n]);
+            if (reads & (1u << a)) {
+                memcpy(gx->batch.inputs[n][a], probe[n], sizeof probe[n]);
+            }
         }
     }
     wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, XF_PROBES,

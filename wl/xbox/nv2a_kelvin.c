@@ -340,30 +340,22 @@ void wl_nv2a_fetch_tables(const float **byte_float, const float **cmp11, const f
     *cmp10 = g_cmp10_float;
 }
 
-void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, const uint32_t *vertices,
+void wl_nv2a_fetch_elements(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, const uint32_t *all_elements,
                             uint32_t count, float (*inputs)[WL_NV2A_ATTRIBS][4]) {
-    uint32_t elements[WL_NV2A_FETCH_BATCH];
     uint32_t n, done, run;
     unsigned i;
 
     if (plan->source == WL_NV2A_SOURCE_IMMEDIATE) {
         for (n = 0; n < count; n++) {
-            memcpy(inputs[n], draw->immediate[vertices[n]], sizeof(float) * WL_NV2A_ATTRIBS * 4);
+            memcpy(inputs[n], draw->immediate[all_elements[n]], sizeof(float) * WL_NV2A_ATTRIBS * 4);
         }
         return;
     }
     for (done = 0; done < count; done += run) {
         float (*in)[WL_NV2A_ATTRIBS][4] = inputs + done;
+        const uint32_t *elements = all_elements + done;
 
         run = count - done < WL_NV2A_FETCH_BATCH ? count - done : WL_NV2A_FETCH_BATCH;
-        // (each vertex's element: an array's index from the least, an inline vertex's number)
-        for (n = 0; n < run; n++) {
-            uint32_t v = vertices[done + n];
-
-            elements[n] = plan->source == WL_NV2A_SOURCE_ARRAYS && plan->indices != NULL
-                              ? plan->indices[v] - plan->index_base
-                              : v;
-        }
         // an attribute at a time for all of them (its format decided once)
         for (i = 0; i < plan->count; i++) {
             const uint8_t *base = plan->streamed[i].data;
@@ -461,6 +453,20 @@ void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw,
                 break;
             }
         }
+    }
+}
+
+void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, const uint32_t *vertices,
+                            uint32_t count, float (*inputs)[WL_NV2A_ATTRIBS][4]) {
+    uint32_t elements[WL_NV2A_FETCH_BATCH];
+    uint32_t n, done, run;
+
+    for (done = 0; done < count; done += run) {
+        run = count - done < WL_NV2A_FETCH_BATCH ? count - done : WL_NV2A_FETCH_BATCH;
+        for (n = 0; n < run; n++) {
+            elements[n] = wl_nv2a_fetch_element(plan, vertices[done + n]);
+        }
+        wl_nv2a_fetch_elements(plan, draw, elements, run, inputs + done);
     }
 }
 
