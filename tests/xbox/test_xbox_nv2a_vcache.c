@@ -102,6 +102,35 @@ TEST each_kind_converted_as_the_fetch_widens_it(void) {
     PASS();
 }
 
+// wl_nv2a_color_word (its bytes put together in a double) gives wl_nv2a_color_byte's bytes: the
+// edges, and a spread of every sign, exponent and mantissa (all 2^32 floats checked once by hand)
+TEST a_colour_word_is_its_components_bytes(void) {
+    static const float edges[] = { 0.0f, -0.0f, 1.0f, -1.0f, 0.5f / 255.0f, 1.5f / 255.0f, 254.5f / 255.0f,
+                                   1.0e-30f, 1.0e30f, 255.0f, 256.0f, 2147483648.0f, 1.0f / 3.0f };
+    uint64_t i;
+    unsigned e;
+
+    for (e = 0; e < sizeof edges / sizeof edges[0]; e++) {
+        float c[4] = { edges[e], 0.25f, edges[e], -edges[e] };
+
+        ASSERT_EQ(wl_nv2a_color_byte(c[0]) << 24 | wl_nv2a_color_byte(c[1]) << 16 | wl_nv2a_color_byte(c[2]) << 8 |
+                      wl_nv2a_color_byte(c[3]),
+                  wl_nv2a_color_word(c));
+    }
+    for (i = 0; i < 0x100000000ull; i += 4093) {
+        uint32_t u = (uint32_t)i, v = u ^ 0x5A5A5A5Au;
+        float f, g, c[4];
+
+        memcpy(&f, &u, sizeof f);
+        memcpy(&g, &v, sizeof g);
+        c[0] = f, c[1] = g, c[2] = -f, c[3] = f * 0.5f;
+        ASSERT_EQ(wl_nv2a_color_byte(c[0]) << 24 | wl_nv2a_color_byte(c[1]) << 16 | wl_nv2a_color_byte(c[2]) << 8 |
+                      wl_nv2a_color_byte(c[3]),
+                  wl_nv2a_color_word(c));
+    }
+    PASS();
+}
+
 TEST found_again_checked_once_a_frame_rewritten_twice_not_kept(void) {
     WlNv2aVCache *cache = calloc(1, sizeof *cache);
     WlNv2aVCacheConfig cfg;
@@ -324,6 +353,7 @@ TEST a_rewrite_without_room_is_not_answered_stale(void) {
 
 SUITE(vcache_suite) {
     RUN_TEST(each_kind_converted_as_the_fetch_widens_it);
+    RUN_TEST(a_colour_word_is_its_components_bytes);
     RUN_TEST(found_again_checked_once_a_frame_rewritten_twice_not_kept);
     RUN_TEST(overlapped_frames_keep_the_frame_befores_arrays);
     RUN_TEST(the_watch_answers_for_an_array_not_written);

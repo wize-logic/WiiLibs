@@ -10,6 +10,7 @@
 #include "wl/xbox/nv2a_gx.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -89,7 +90,8 @@ typedef struct Projection {
 
 // a vertex as GX takes it from the FIFO in the draw's layout (wl_gx_direct_vertex_words: the
 // position's three floats, the colours as 0xRRGGBBAA, the texture coordinates' floats; at most
-// 3 + 2 + 4 * 2 + 1 words, the fog's coordinate last), and where it lands in EFB pixels
+// 3 + 2 + 4 * 2 + 1 words, the fog's coordinate last), and where it lands in EFB pixels. (The words
+// first: a pointer to them is one to the vertex.)
 enum { PACKED_WORDS = 14 };
 typedef struct PackedVertex {
     uint32_t w[PACKED_WORDS];
@@ -164,8 +166,7 @@ struct WlNv2aGx {
     // here), the program run for those not kept (their vertex numbers and where their vertex goes),
     // the runs' inputs and outputs
     struct {
-        const PackedVertex *vertices[WL_XBOX_VSH_BATCH];
-        const uint32_t *words[WL_XBOX_VSH_BATCH]; // (their words)
+        const uint32_t *words[WL_XBOX_VSH_BATCH]; // (their words: batch_vertex's vertex)
         uint32_t run_vertex[WL_XBOX_VSH_BATCH];
         PackedVertex *run_vertices[WL_XBOX_VSH_BATCH];
         PackedVertex made[WL_XBOX_VSH_BATCH];
@@ -1310,7 +1311,7 @@ typedef struct DrawPlan {
 // ---- the transform unit's draws ----------------------------------------------------------------------
 // A program whose outputs the draw reads are, for the draw's constants, affine functions of their
 // inputs leaves its work to GX's transform unit: the position through a matrix (with the viewport and
-// the samples folded in, so the eye vector is what vertex_pack makes, for the same projection), each
+// the samples folded in, so the eye vector is what vertices_pack makes, for the same projection), each
 // texture coordinate through a generator from its one input (the vertex's coordinate sent as fetched,
 // or its position), the colours a vertex input passed as it is, or a constant. The matrices come from
 // the program run for five probe vertices (every input register (0, 0, 0, 0), (0, 0, 0, 1), (1, 0, 0,
@@ -1412,79 +1413,174 @@ static inline void stage_texcoord(const StagePlan *s, const float t[4], float st
     }
 }
 
-// a float into a word's place, its bits (a float store, not a trip through an integer register)
+// a float into a word's place, its bits: a float store (may_alias: the word is read as an integer
+// after), not a trip through an integer register, which GCC makes of a memcpy (a store, a load and a
+// store on PowerPC)
+typedef float WordFloat __attribute__((may_alias));
+
 static inline void put_float(uint32_t *word, float f) {
-    memcpy(word, &f, sizeof f);
+    *(WordFloat *)word = f;
 }
 
-// a vertex as GX takes it (OpenCE-Wii's vertex_store) from what the program left, in the draw's
-// layout, and where it lands in EFB pixels
-static void vertex_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPlan *plan, const WlXboxVshOutput *o,
-                        const float (*inputs)[4], PackedVertex *out) {
-    float position[3];
-    unsigned stage, i = 3;
+// a texture coordinate's word sent as the program left it (stage_texcoord's st for a stage that
+// is not a sphere map, projective or linear), its bits copied
+static inline void put_bits(uint32_t *word, const float *f) {
+    uint32_t bits;
+
+    memcpy(&bits, f, sizeof bits);
+    *word = bits;
+}
+
+// the batch's vertices the program made (gx->batch.outputs[r] into gx->batch.run_vertices[r]) as GX
+// takes them (OpenCE-Wii's vertex_store), in the draw's layout, and where they land in EFB pixels.
+// A word at a time for all of them (as the fetch takes an attribute): a word's place and the
+// draw's choices for it are the same for every vertex, so each loop is made for its choices and
+// keeps them in registers (a float store may alias the plan, which would otherwise be read again
+// after each).
+static void vertices_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPlan *plan, unsigned runs) {
+    PackedVertex *const *made = gx->batch.run_vertices;
+    const WlXboxVshOutput *o = gx->batch.outputs;
+    const unsigned colors = plan->colors, channels = plan->channels, stage_count = plan->stage_count,
+                   projected_count = plan->projected_count;
+    unsigned i = 3, stage, r;
 
     if (plan->xf != NULL) {
         // (the transform unit's: the position as the vertex has it)
-        position[0] = inputs[0][0];
-        position[1] = inputs[0][1];
-        position[2] = inputs[0][2];
-    } else if (gx->projection.perspective && o->clip_captured) {
-        // (x w, y w, -w) in pixels, the pixel centres on integers as Direct3D puts them
-        float w = o->clip[3];
+        for (r = 0; r < runs; r++) {
+            uint32_t *w = made[r]->w;
+            const float *in = gx->batch.inputs[r][0];
 
-        float x = o->clip[0] * plan->scale[0] + plan->offset[0] * w, y = o->clip[1] * plan->scale[1] + plan->offset[1] * w;
-
-        position[0] = (plan->to_sx != 0.0f ? x * plan->to_sx : x / plan->sx) + 0.5f * w;
-        position[1] = (plan->to_sy != 0.0f ? y * plan->to_sy : y / plan->sy) + 0.5f * w;
-        position[2] = -w;
-        if (plan->landing) {
-            out->x = w != 0.0f ? position[0] / w : 0.0f;
-            out->y = w != 0.0f ? position[1] / w : 0.0f;
+            put_bits(&w[0], &in[0]);
+            put_bits(&w[1], &in[1]);
+            put_bits(&w[2], &in[2]);
         }
     } else {
-        position[0] = (plan->to_sx != 0.0f ? o->position[0] * plan->to_sx : o->position[0] / plan->sx) + 0.5f;
-        position[1] = (plan->to_sy != 0.0f ? o->position[1] * plan->to_sy : o->position[1] / plan->sy) + 0.5f;
-        position[2] = as_depth(o->position[2], plan->depth_max) - 1.0f;
-        out->x = position[0];
-        out->y = position[1];
+        const bool perspective = gx->projection.perspective, landing = plan->landing;
+        const float scale_x = plan->scale[0], scale_y = plan->scale[1], offset_x = plan->offset[0],
+                    offset_y = plan->offset[1], sx = plan->sx, sy = plan->sy, to_sx = plan->to_sx,
+                    to_sy = plan->to_sy, depth_max = plan->depth_max;
+        const bool mul_x = to_sx != 0.0f, mul_y = to_sy != 0.0f;
+
+        for (r = 0; r < runs; r++) {
+            PackedVertex *out = made[r];
+            const WlXboxVshOutput *v = &o[r];
+
+            if (perspective && v->clip_captured) {
+                // (x w, y w, -w) in pixels, the pixel centres on integers as Direct3D puts them
+                float cw = v->clip[3];
+                float x = v->clip[0] * scale_x + offset_x * cw, y = v->clip[1] * scale_y + offset_y * cw;
+                float px = (mul_x ? x * to_sx : x / sx) + 0.5f * cw;
+                float py = (mul_y ? y * to_sy : y / sy) + 0.5f * cw;
+
+                put_float(&out->w[0], px);
+                put_float(&out->w[1], py);
+                put_float(&out->w[2], -cw);
+                if (landing) {
+                    out->x = cw != 0.0f ? px / cw : 0.0f;
+                    out->y = cw != 0.0f ? py / cw : 0.0f;
+                }
+            } else {
+                float px = (mul_x ? v->position[0] * to_sx : v->position[0] / sx) + 0.5f;
+                float py = (mul_y ? v->position[1] * to_sy : v->position[1] / sy) + 0.5f;
+
+                put_float(&out->w[0], px);
+                put_float(&out->w[1], py);
+                put_float(&out->w[2], as_depth(v->position[2], depth_max) - 1.0f);
+                out->x = px;
+                out->y = py;
+            }
+        }
     }
-    put_float(&out->w[0], position[0]);
-    put_float(&out->w[1], position[1]);
-    put_float(&out->w[2], position[2]);
-    if (plan->projected_count != 0) {
+    if (projected_count != 0) {
         // (the projected coordinates first, as GX's normal, binormal and tangent)
-        for (stage = 0; stage < plan->projected_count; stage++) {
+        for (stage = 0; stage < projected_count; stage++, i += 3) {
             unsigned n = plan->projected_list[stage];
-            float stq[3];
+            const StagePlan *sp = &plan->stages[n];
 
-            stage_texcoord_projected(&plan->stages[n], o->t[n], stq);
-            put_float(&out->w[i++], stq[0]);
-            put_float(&out->w[i++], stq[1]);
-            put_float(&out->w[i++], stq[2]);
+            for (r = 0; r < runs; r++) {
+                float stq[3];
+
+                stage_texcoord_projected(sp, o[r].t[n], stq);
+                put_float(&made[r]->w[i], stq[0]);
+                put_float(&made[r]->w[i + 1], stq[1]);
+                put_float(&made[r]->w[i + 2], stq[2]);
+            }
         }
-        for (; plan->projected_count > 1u && stage < WL_GX_DIRECT_PROJECTED; stage++) {
-            out->w[i++] = 0;
-            out->w[i++] = 0;
-            out->w[i++] = 0;
+        for (; projected_count > 1u && stage < WL_GX_DIRECT_PROJECTED; stage++, i += 3) {
+            for (r = 0; r < runs; r++) {
+                made[r]->w[i] = made[r]->w[i + 1] = made[r]->w[i + 2] = 0;
+            }
         }
     }
-    if (plan->colors >= 1) {
-        out->w[i++] = (plan->channels & 1u) ? wl_nv2a_color_word(o->d0) : 0u;
+    if (colors != 0) {
+        const WlNv2aColorConstants color_k = wl_nv2a_color_constants();
+        unsigned c;
+
+        for (c = 0; c < colors; c++, i++) {
+            if (channels & (1u << c)) {
+                size_t from = c == 0 ? offsetof(WlXboxVshOutput, d0) : offsetof(WlXboxVshOutput, d1);
+
+                for (r = 0; r < runs; r++) {
+                    made[r]->w[i] = wl_nv2a_color_word_with((const float *)((const char *)&o[r] + from), &color_k);
+                }
+            } else {
+                for (r = 0; r < runs; r++) {
+                    made[r]->w[i] = 0u;
+                }
+            }
+        }
     }
-    if (plan->colors >= 2) {
-        out->w[i++] = (plan->channels & 2u) ? wl_nv2a_color_word(o->d1) : 0u;
-    }
-    for (stage = 0; stage < plan->stage_count; stage++) {
+    for (stage = 0; stage < stage_count; stage++, i += 2) {
         unsigned n = plan->stage_list[stage];
-        float st[2];
+        const StagePlan *sp = &plan->stages[n];
 
-        stage_texcoord(&plan->stages[n], o->t[n], st);
-        put_float(&out->w[i++], st[0]);
-        put_float(&out->w[i++], st[1]);
+        if (sp->sphere) {
+            for (r = 0; r < runs; r++) {
+                float st[2];
+
+                stage_texcoord(sp, o[r].t[n], st);
+                put_float(&made[r]->w[i], st[0]);
+                put_float(&made[r]->w[i + 1], st[1]);
+            }
+        } else if (sp->projective) {
+            // (stage_texcoord's, its choices read once)
+            const bool linear = sp->linear;
+            const float to_s = sp->to_s, to_t = sp->to_t;
+
+            for (r = 0; r < runs; r++) {
+                const float *t = o[r].t[n];
+                float s0 = t[0], s1 = t[1], q = t[3];
+
+                if (q != 1.0f && fabsf(q) > 1.0e-12f) {
+                    s0 /= q;
+                    s1 /= q;
+                }
+                if (linear) {
+                    s0 *= to_s;
+                    s1 *= to_t;
+                }
+                put_float(&made[r]->w[i], s0);
+                put_float(&made[r]->w[i + 1], s1);
+            }
+        } else if (sp->linear) {
+            const float to_s = sp->to_s, to_t = sp->to_t;
+
+            for (r = 0; r < runs; r++) {
+                put_float(&made[r]->w[i], o[r].t[n][0] * to_s);
+                put_float(&made[r]->w[i + 1], o[r].t[n][1] * to_t);
+            }
+        } else {
+            // (as the program left them)
+            for (r = 0; r < runs; r++) {
+                put_bits(&made[r]->w[i], &o[r].t[n][0]);
+                put_bits(&made[r]->w[i + 1], &o[r].t[n][1]);
+            }
+        }
     }
     if (plan->texcoords & (1u << WL_XBOX_PSH_FOG_TEXCOORD)) {
-        put_float(&out->w[i], wl_gx_ramp_coordinate(wl_nv2a_fog_factor(k, o->fog)));
+        for (r = 0; r < runs; r++) {
+            put_float(&made[r]->w[i], wl_gx_ramp_coordinate(wl_nv2a_fog_factor(k, o[r].fog)));
+        }
     }
 }
 
@@ -1515,8 +1611,13 @@ static void vertex_pack_xf(const DrawPlan *plan, const float (*inputs)[4], Packe
     out->x = out->y = 0.0f;
 }
 
+// the batch's vertex n (its words' first member)
+static inline const PackedVertex *batch_vertex(const WlNv2aGx *gx, unsigned n) {
+    return (const PackedVertex *)(const void *)gx->batch.words[n];
+}
+
 // vertices first .. first + count - 1 of a draw (count at most WL_XBOX_VSH_BATCH) as GX takes them:
-// gx->batch.vertices[n]. An indexed draw's vertex kept by its index (the memo) is not made again; the
+// gx->batch.words[n] (batch_vertex). An indexed draw's vertex kept by its index (the memo) is not made again; the
 // others are fetched (the inputs the program reads alone) and run through the program together, and
 // their vertices made into the memo (or, where another index of the batch holds the slot, here).
 // A vertex is a function of its index, so each is the same whatever the memo held. The draw's first
@@ -1541,9 +1642,7 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
 
             if (m->stamp == gx->memo_stamp && m->index == index) {
                 m->batch = batch;
-                gx->batch.vertices[n] = &m->vertex;
                 gx->batch.words[n] = m->vertex.w;
-                gx->stats.vertices_reused++;
                 continue;
             }
             if (m->stamp != gx->memo_stamp || m->batch != batch) {
@@ -1553,12 +1652,12 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
                 made = &m->vertex;
             }
         }
-        gx->batch.vertices[n] = made;
         gx->batch.words[n] = made->w;
         gx->batch.run_vertex[runs] = v;
         gx->batch.run_vertices[runs] = made;
         runs++;
     }
+    gx->stats.vertices_reused += count - runs;
     wl_nv2a_fetch_vertices(&gx->fetch, draw, gx->batch.run_vertex, runs, gx->batch.inputs);
     if (plan->xf != NULL && plan->xf->full) {
         for (r = 0; r < runs; r++) {
@@ -1571,10 +1670,7 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
                               plan->xf != NULL ? plan->live & ~(unsigned)WL_XBOX_VSH_LIVE_POSITION : plan->live,
                               gx->batch.outputs, &gx->batch.work);
     changed = layout != NULL && projected_plan(gx, plan, layout, runs);
-    for (r = 0; r < runs; r++) {
-        vertex_pack(gx, k, plan, &gx->batch.outputs[r], (const float (*)[4])gx->batch.inputs[r],
-                    gx->batch.run_vertices[r]);
-    }
+    vertices_pack(gx, k, plan, runs);
     return changed;
 }
 
@@ -1829,7 +1925,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
     memset(xf, 0, sizeof *xf);
     xf->attributes = 1u;
     if (gx->projection.perspective) {
-        // (x w, y w, -w) in pixels, as vertex_pack makes them from the clip-space position
+        // (x w, y w, -w) in pixels, as vertices_pack makes them from the clip-space position
         float to_x = plan->to_sx != 0.0f ? plan->scale[0] * plan->to_sx : plan->scale[0] / plan->sx;
         float to_y = plan->to_sy != 0.0f ? plan->scale[1] * plan->to_sy : plan->scale[1] / plan->sy;
         float w_x = (plan->to_sx != 0.0f ? plan->offset[0] * plan->to_sx : plan->offset[0] / plan->sx) + 0.5f;
@@ -2083,7 +2179,7 @@ static float area2(const float a[2], const float b[2], const float c[2]) {
     return (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
 }
 
-// a vertex's landing (vertex_pack's x, y) into the draw's triangles' areas: what a pixel count without
+// a vertex's landing (vertices_pack's x, y) into the draw's triangles' areas: what a pixel count without
 // a depth test would say
 static void landing_area(uint32_t primitive, const PackedVertex *vertex, uint32_t *seen_count, float corners[3][2],
                          float *area) {
@@ -2176,7 +2272,7 @@ static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2
             vertices_make(gx, k, draw, v, draw->count - v < WL_XBOX_VSH_BATCH ? draw->count - v : WL_XBOX_VSH_BATCH,
                           &plan, NULL);
         }
-        landing_area(draw->primitive, gx->batch.vertices[n], &seen, corners, &area);
+        landing_area(draw->primitive, batch_vertex(gx, n), &seen, corners, &area);
     }
     gx->stats.unwritten_counted++;
     {
@@ -2500,7 +2596,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
         // (the batch's vertices into the FIFO in one call)
         wl_gx_direct_vertices_words(gx->batch.words, run, plan.words);
         for (v = 0; count_pixels && v < run; v++) {
-            landing_area(draw->primitive, gx->batch.vertices[v], &seen, corners, &area);
+            landing_area(draw->primitive, batch_vertex(gx, v), &seen, corners, &area);
         }
     }
     wl_gx_direct_primitive_end();
