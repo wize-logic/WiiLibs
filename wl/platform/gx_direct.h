@@ -63,6 +63,8 @@ typedef struct WlGxDirectVertex {
     float texcoord[8][2];
     // a projected coordinate's q (WlGxDirectLayout.texcoords_projected), which GX divides s and t by
     float texcoord_q[8];
+    // the normal (WlGxDirectLayout.lit), which the lit channels read
+    float normal[3];
 } WlGxDirectVertex;
 
 typedef struct WlGxDirectLayout {
@@ -80,14 +82,37 @@ typedef struct WlGxDirectLayout {
     // (one) or its normal, binormal and tangent (two or three: nine numbers, the unused zero), sent
     // after the position, and makes each through a 3x4 generator
     uint8_t texcoords_projected;
+    // bit n: channel n lit by the transform unit from the vertex's normal (0 COLOR0, 1 ALPHA0,
+    // 2 COLOR1, 3 ALPHA1; wl_gx_direct_lighting), its vertex colour unread. The normal (three
+    // floats) is then sent after the position; not with projected coordinates.
+    uint8_t lit;
 } WlGxDirectLayout;
 
 // projected coordinates a layout may have
 enum { WL_GX_DIRECT_PROJECTED = 3 };
 
 // an indexed attribute (WlGxDirectLayout.indexed's bit, wl_gx_direct_array's attribute): the
-// position, colour c (WL_GX_DIRECT_ARRAY_COLOR0 + c), texture coordinate n (..._TEXCOORD0 + n)
-enum { WL_GX_DIRECT_ARRAY_POSITION = 0, WL_GX_DIRECT_ARRAY_COLOR0 = 1, WL_GX_DIRECT_ARRAY_TEXCOORD0 = 3 };
+// position, colour c (WL_GX_DIRECT_ARRAY_COLOR0 + c), texture coordinate n (..._TEXCOORD0 + n), the
+// normal of a lit layout (three big-endian floats)
+enum {
+    WL_GX_DIRECT_ARRAY_POSITION = 0,
+    WL_GX_DIRECT_ARRAY_COLOR0 = 1,
+    WL_GX_DIRECT_ARRAY_TEXCOORD0 = 3,
+    WL_GX_DIRECT_ARRAY_NORMAL = 11
+};
+
+// The lit channels' light (WlGxDirectLayout.lit): channel n's value is
+// clamp(ambient + dot(normal_matrix * normal, direction[n]) * color[n], 0, 1) for each component it
+// has (a colour channel r, g, b, an alpha channel a; ambient that of COLOR0A0 or COLOR1A1), the dot
+// product signed (GX_DF_SIGN) and the direction of unit length (a light at infinity).
+typedef struct WlGxDirectLighting {
+    float normal_matrix[3][3];
+    float direction[4][3];
+    uint8_t color[4][4];
+    uint8_t ambient[2][4];
+} WlGxDirectLighting;
+// The light of the lit channels, for the draws that follow (set after the layout).
+void wl_gx_direct_lighting(const WlGxDirectLighting *lighting);
 
 // what a texture coordinate is generated from (wl_gx_direct_texgen)
 typedef enum {
@@ -106,7 +131,7 @@ void wl_gx_direct_draw(WlGxDirectPrim prim, const WlGxDirectVertex *vertices, ui
 void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count);
 void wl_gx_direct_vertex(const WlGxDirectVertex *vertex);
 // The same vertex as the FIFO takes it in the layout set: `count` words, the position's three floats,
-// the projected coordinates' (s, t, q) in order (three words for one, nine for two or three, the
+// a lit layout's normal (three floats), the projected coordinates' (s, t, q) in order (three words for one, nine for two or three, the
 // unused zero), each colour as 0xRRGGBBAA, each texture coordinate's one or two floats (a float as its
 // bits), in that order. On the Wii the words go into the FIFO as they are, without the layout's tests.
 void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count);

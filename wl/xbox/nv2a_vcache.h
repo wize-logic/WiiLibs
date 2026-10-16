@@ -34,7 +34,12 @@ enum {
 // what an attribute is converted as: the position (an F3 array: three big-endian floats), a texture
 // coordinate (any format of at most two components, as the fetch widens it: s and t, big-endian
 // floats), a colour (any format, as the fetch widens it, as GX's bytes r, g, b, a: nv2a_color.h)
-typedef enum { WL_NV2A_VCACHE_POSITION = 0, WL_NV2A_VCACHE_TEXCOORD, WL_NV2A_VCACHE_COLOR } WlNv2aVCacheKind;
+typedef enum {
+    WL_NV2A_VCACHE_POSITION = 0,
+    WL_NV2A_VCACHE_TEXCOORD,
+    WL_NV2A_VCACHE_COLOR,
+    WL_NV2A_VCACHE_NORMAL // x, y, z as three big-endian floats (any type, decoded)
+} WlNv2aVCacheKind;
 
 typedef struct WlNv2aVCacheConfig {
     // bytes of arrays kept (0: off, nothing kept; with an arena, at most its size)

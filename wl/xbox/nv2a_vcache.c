@@ -57,7 +57,9 @@ bool wl_nv2a_vcache_on(const WlNv2aVCache *cache) {
 }
 
 uint32_t wl_nv2a_vcache_element_bytes(WlNv2aVCacheKind kind) {
-    return kind == WL_NV2A_VCACHE_POSITION ? 12u : kind == WL_NV2A_VCACHE_TEXCOORD ? 8u : 4u;
+    return kind == WL_NV2A_VCACHE_POSITION || kind == WL_NV2A_VCACHE_NORMAL ? 12u
+           : kind == WL_NV2A_VCACHE_TEXCOORD                                ? 8u
+                                                                            : 4u;
 }
 
 // ---- memory -------------------------------------------------------------------------------------
@@ -305,6 +307,17 @@ static void convert(WlNv2aVCache *cache, const WlNv2aVCacheEntry *e, const uint8
 
             wl_nv2a_attrib_decode(e->type, e->size, src, value);
             wl_wr_be32(out, wl_nv2a_color_word(value));
+        }
+    } else if (e->kind == WL_NV2A_VCACHE_NORMAL) {
+        for (i = 0; i < e->count; i++, src += e->stride, out += 12) {
+            float value[4];
+            uint32_t bits[3];
+
+            wl_nv2a_attrib_decode(e->type, e->size, src, value);
+            memcpy(bits, value, sizeof bits);
+            wl_wr_be32(out, bits[0]);
+            wl_wr_be32(out + 4, bits[1]);
+            wl_wr_be32(out + 8, bits[2]);
         }
     } else {
         for (i = 0; i < e->count; i++, src += e->stride, out += 8) {

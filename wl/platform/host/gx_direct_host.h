@@ -20,6 +20,8 @@ typedef struct WlHostGxDirect {
         uint8_t source; // WlGxDirectTexSource
         float m[2][4];
     } texgen[8];
+    // the lit channels' light (wl_gx_direct_lighting), applied to the vertices as they arrive
+    WlGxDirectLighting lighting;
     float projection[4][4];
     bool orthographic;
     float viewport[4];
@@ -49,8 +51,8 @@ typedef struct WlHostGxDirect {
     WlGxDirectStats stats;
     // the indexed attributes' arrays (wl_gx_direct_array: WL_GX_DIRECT_ARRAY_*), the vertices sent
     // through indices, and how often the arrays were said to have changed
-    const void *arrays[11];
-    uint32_t array_strides[11];
+    const void *arrays[12];
+    uint32_t array_strides[12];
     uint32_t indexed_vertices, arrays_changed;
     // a renderer's own vertex formats: its primitives begun (wl_gx_direct_begin_format), the last's
     // GX primitive, format and count, and the bytes of the last flush sent before one

@@ -245,8 +245,11 @@ even, so its winding holds).
   columns exactly, so two programs over the same geometry get the same matrix and their passes the
   same depths. A screen-space draw goes to the transform unit only with a depth the same at every
   vertex (clamped to the range, as the processor clamps each vertex's: GX would clip one beyond).
-  When every other output the draw reads is affine too (a colour passed from an input
-  or constant, a texture coordinate from one input of two components or from the position, no fog,
+  When every other output the draw reads is affine too (a colour passed from an input,
+  constant, or a directional light's dot product with one input of up to three numbers, which GX
+  lights from that input as its normal: each of the colour's parts, r g b and a, the ambient plus
+  the signed dot product times a scale, a light of its own, `no_xf_light` in `WlNv2aGxConfig` or the
+  replay's `--no-xf-light` leaves it to the processor; counted as `xf_lit_draws`), a texture coordinate from one input of two components or from the position, no fog,
   no sphere map, a projected stage's q 1), the program is not run at all: the coordinates come from
   the transform unit's generators. Not to the bit (`no_xf` in `WlNv2aGxConfig` keeps every vertex on
   the processor; the runtime's `noxf` file). A projective stage's coordinate is divided by its q at

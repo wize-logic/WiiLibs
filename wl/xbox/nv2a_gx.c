@@ -654,7 +654,7 @@ static bool states_apply(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aSurfac
 // cull_measure: GX's names for its windings are not the screen's).
 static void cull_measure(WlNv2aGx *gx, uint32_t clear_rgba) {
     static const float corners[3][2] = {{0.0f, 0.0f}, {16.0f, 0.0f}, {0.0f, 16.0f}};
-    WlGxDirectLayout layout = {1, 0, 0, 0, 0, 0};
+    WlGxDirectLayout layout = {1, 0, 0, 0, 0, 0, 0};
     WlTevProgram tev;
     float m[4][4];
     unsigned pass, v;
@@ -1319,6 +1319,11 @@ typedef struct XfPlan {
     unsigned stage_source[WL_NV2A_TEXTURES];
     float stage_matrix[WL_NV2A_TEXTURES][2][4];
     unsigned words;
+    // the channels lit by GX from a normal (WlGxDirectLayout.lit: a colour affine in one input but
+    // not passed as it is), the input register the normal is, and the light
+    unsigned lit;
+    unsigned normal_source;
+    WlGxDirectLighting lighting;
 } XfPlan;
 
 static void stage_plan(StagePlan *s, const WlNv2aTexEntry *entry, unsigned stage_program) {
@@ -1478,6 +1483,11 @@ static void vertex_pack_xf(const DrawPlan *plan, const float (*inputs)[4], Packe
     put_float(&out->w[0], inputs[0][0]);
     put_float(&out->w[1], inputs[0][1]);
     put_float(&out->w[2], inputs[0][2]);
+    if (xf->lit != 0) {
+        put_float(&out->w[i++], inputs[xf->normal_source][0]);
+        put_float(&out->w[i++], inputs[xf->normal_source][1]);
+        put_float(&out->w[i++], inputs[xf->normal_source][2]);
+    }
     for (c = 0; c < plan->colors; c++) {
         out->w[i++] = xf->color_source[c] < 0 ? xf->color_word[c] : wl_nv2a_color_word(inputs[xf->color_source[c]]);
     }
@@ -1649,6 +1659,114 @@ static bool same4(const float *a, float x, float y, float z, float w) {
     return a[0] == x && a[1] == y && a[2] == z && a[3] == w;
 }
 
+// A colour affine in one input register, value = k + M v (from the probes: k at the zero vector, M's
+// columns at the basis), as GX's lighting makes it (wl_gx_direct_lighting): each of its parts (r, g, b
+// and a) either the same at every vertex or the ambient plus the signed dot product of the input as a
+// normal and one direction, times a colour, the r, g, b scales of one sign. Into xf's lit channels
+// (c's two: 2c the colour, 2c + 1 the alpha), their directions and colours (the scale of each kept in
+// lit_scale for lit_finish), and k into the constant word; false when it is not of that form, or its
+// input not a normal GX can take (more than three numbers: the w of four, or of a two floats and w).
+static bool lit_plan(XfPlan *xf, const WlNv2aDraw *draw, unsigned c, unsigned source, const float *zero,
+                     const float *const basis[4], float lit_scale[4][4]) {
+    unsigned r = bit_index(source), part, i, j;
+    const WlNv2aAttrib *attrib = &draw->attribs[r];
+    bool w_one = !(attrib->size >= 4u || (attrib->type == WL_NV2A_VTX_F && attrib->size == 7u));
+    float k[4], rows[4][3], color[4];
+
+    if (!(draw->streamed & source) || (xf->lit != 0 && xf->normal_source != r)) {
+        return false;
+    }
+    for (i = 0; i < 4; i++) {
+        float w = basis[3][i] - zero[i];
+
+        // (a w of 1 at every vertex adds its column to k; one read from the vertex is beyond a normal)
+        if (w != 0.0f && !w_one) {
+            return false;
+        }
+        k[i] = zero[i] + (w_one ? w : 0.0f);
+        for (j = 0; j < 3; j++) {
+            rows[i][j] = basis[j][i] - zero[i];
+        }
+    }
+    for (part = 0; part < 2; part++) {
+        unsigned first = part == 0 ? 0u : 3u, last = part == 0 ? 3u : 4u, best = first;
+        float best_length = 0.0f, length;
+
+        for (i = first; i < last; i++) {
+            length = rows[i][0] * rows[i][0] + rows[i][1] * rows[i][1] + rows[i][2] * rows[i][2];
+            if (length > best_length) {
+                best_length = length;
+                best = i;
+            }
+        }
+        if (best_length == 0.0f) {
+            // (the same at every vertex: the constant word's)
+            continue;
+        }
+        length = sqrtf(best_length);
+        for (i = first; i < last; i++) {
+            // (row i a multiple t of the longest, t >= 0)
+            float t = (rows[i][0] * rows[best][0] + rows[i][1] * rows[best][1] + rows[i][2] * rows[best][2]) /
+                      best_length;
+
+            if (t < 0.0f) {
+                return false;
+            }
+            for (j = 0; j < 3; j++) {
+                if (fabsf(rows[i][j] - t * rows[best][j]) > 1.0e-5f * length) {
+                    return false;
+                }
+            }
+            color[i] = t * length;
+        }
+        for (i = first; i < last; i++) {
+            // (the ambient a byte: none below 0)
+            if (k[i] < -1.0e-6f) {
+                return false;
+            }
+        }
+        xf->lit |= 1u << (2u * c + part);
+        for (j = 0; j < 3; j++) {
+            xf->lighting.direction[2u * c + part][j] = rows[best][j] / length;
+        }
+        for (i = first; i < last; i++) {
+            lit_scale[2u * c + part][i] = color[i];
+        }
+    }
+    xf->normal_source = r;
+    xf->color_word[c] = wl_nv2a_color_word(k);
+    for (i = 0; i < 4; i++) {
+        xf->lighting.ambient[c][i] = (uint8_t)(wl_nv2a_color_word((const float[4]){k[i], 0.0f, 0.0f, 0.0f}) >> 24);
+    }
+    return true;
+}
+
+// The lit channels' normal matrix (the largest scale, the normal taken as it is times it) and colours
+// (each scale over the largest)
+static void lit_finish(XfPlan *xf, const float lit_scale[4][4]) {
+    float most = 0.0f;
+    unsigned n, i;
+
+    for (n = 0; n < 4; n++) {
+        for (i = 0; i < 4; i++) {
+            if ((xf->lit & (1u << n)) && lit_scale[n][i] > most) {
+                most = lit_scale[n][i];
+            }
+        }
+    }
+    memset(xf->lighting.normal_matrix, 0, sizeof xf->lighting.normal_matrix);
+    for (i = 0; i < 3; i++) {
+        xf->lighting.normal_matrix[i][i] = most;
+    }
+    for (n = 0; n < 4; n++) {
+        for (i = 0; i < 4; i++) {
+            float v = (xf->lit & (1u << n)) && most > 0.0f ? lit_scale[n][i] / most * 255.0f + 0.5f : 0.0f;
+
+            xf->lighting.color[n][i] = (uint8_t)(v > 255.0f ? 255.0f : v);
+        }
+    }
+}
+
 // The draw's transform unit plan, or false for the processor's: the structure, then the probes (the
 // position's w 1 where the draw is in screen space; each colour passed as it is or constant; no
 // sphere map; a projected stage's q 1; a stage's input the position or a coordinate of two
@@ -1666,7 +1784,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
     const WlXboxVshDependencies *d = &gx->xf_dependencies;
     const WlXboxVshOutput *o = gx->batch.outputs;
     unsigned n, a, stage, c, row;
-    float rows[4][4];
+    float rows[4][4], lit_scale[4][4] = {{0.0f}};
     bool full;
 
     if (gx->cfg.no_xf || gx->pipeline.program == NULL || count_pixels || draw->count < XF_MIN_VERTICES ||
@@ -1780,16 +1898,32 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
             const float *value = c == 0 ? o[n].d0 : o[n].d1;
 
             if (!same4(value, probe[n][0], probe[n][1], probe[n][2], probe[n][3])) {
+                break;
+            }
+        }
+        if (n < XF_PROBES) {
+            // (not passed as it is: lit by GX from the input as a normal, or the processor's)
+            const float *basis[4] = {c == 0 ? o[P_X].d0 : o[P_X].d1, c == 0 ? o[P_Y].d0 : o[P_Y].d1,
+                                     c == 0 ? o[P_Z].d0 : o[P_Z].d1, c == 0 ? o[P_W].d0 : o[P_W].d1};
+
+            if (gx->cfg.no_xf_light || !lit_plan(xf, draw, c, source, c == 0 ? o[P_ZERO].d0 : o[P_ZERO].d1, basis,
+                                                 lit_scale)) {
                 xf->full = false;
                 gx->xf_why = WL_NV2A_GX_XF_POS_COLOR_MIX;
                 return true;
             }
+            xf->color_source[c] = -1;
+            xf->attributes |= source;
+            continue;
         }
         xf->color_source[c] = (int)bit_index(source);
         xf->attributes |= source;
     }
+    if (xf->lit != 0) {
+        lit_finish(xf, (const float (*)[4])lit_scale);
+    }
     // the stages
-    xf->words = 3u + plan->colors;
+    xf->words = 3u + (xf->lit != 0 ? 3u : 0u) + plan->colors;
     for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
         const StagePlan *sp = &plan->stages[stage];
         unsigned source, r;
@@ -1838,9 +1972,15 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
             xf->stage_matrix[stage][row][3] = o[P_W].t[stage][row] * scale;
         }
     }
+    if (xf->full && xf->words > PACKED_WORDS) {
+        // (a lit draw's normal beyond a sent vertex's words)
+        xf->full = false;
+        gx->xf_why = WL_NV2A_GX_XF_POS_COLOR_MIX;
+    }
     if (!xf->full) {
         xf->words = plan->words;
         xf->attributes = 1u;
+        xf->lit = 0;
     }
     return true;
 }
@@ -1852,7 +1992,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
 // the cache is off, the draw is not from arrays or its indices are beyond 16 bits of its least, or an
 // array cannot be kept.
 static bool xf_arrays(WlNv2aGx *gx, const WlNv2aDraw *draw, const DrawPlan *plan, const XfPlan *xf,
-                      WlGxDirectLayout *layout, const void *arrays[WL_GX_DIRECT_ARRAY_TEXCOORD0 + WL_NV2A_TEXTURES]) {
+                      WlGxDirectLayout *layout, const void *arrays[WL_GX_DIRECT_ARRAY_NORMAL + 1]) {
     unsigned c, stage;
     uint16_t indexed = 1u << WL_GX_DIRECT_ARRAY_POSITION;
 
@@ -1874,6 +2014,14 @@ static bool xf_arrays(WlNv2aGx *gx, const WlNv2aDraw *draw, const DrawPlan *plan
             return false;
         }
         indexed |= (uint16_t)(1u << (WL_GX_DIRECT_ARRAY_COLOR0 + c));
+    }
+    if (xf->lit != 0) {
+        arrays[WL_GX_DIRECT_ARRAY_NORMAL] = wl_nv2a_vcache_get(&gx->vertices, gx->dev, &draw->attribs[xf->normal_source],
+                                                               draw->index_base, draw->index_last, WL_NV2A_VCACHE_NORMAL);
+        if (arrays[WL_GX_DIRECT_ARRAY_NORMAL] == NULL) {
+            return false;
+        }
+        indexed |= (uint16_t)(1u << WL_GX_DIRECT_ARRAY_NORMAL);
     }
     arrays[WL_GX_DIRECT_ARRAY_POSITION] = wl_nv2a_vcache_get(&gx->vertices, gx->dev, &draw->attribs[0],
                                                              draw->index_base, draw->index_last, WL_NV2A_VCACHE_POSITION);
@@ -2093,7 +2241,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     DrawPlan plan;
     XfPlan xf;
     bool exact, xf_ok, indexed = false, count_pixels = wl_nv2a_k(k, WL_NV2A_K_SET_ZPASS_PIXEL_COUNT_ENABLE) != 0;
-    const void *arrays[WL_GX_DIRECT_ARRAY_TEXCOORD0 + WL_NV2A_TEXTURES] = {NULL};
+    const void *arrays[WL_GX_DIRECT_ARRAY_NORMAL + 1] = {NULL};
     float corners[3][2], area = 0.0f;
     uint32_t v, seen = 0, first = 0, run, attributes;
     unsigned stage;
@@ -2244,11 +2392,20 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
                 }
             }
         }
+        layout.lit = (uint8_t)xf.lit;
         indexed = xf_arrays(gx, draw, &plan, &xf, &layout, arrays);
         if (indexed) {
             gx->xf_why = WL_NV2A_GX_XF_INDEXED;
         }
         wl_gx_direct_layout(&layout);
+        if (xf.lit != 0) {
+            wl_gx_direct_lighting(&xf.lighting);
+            gx->stats.xf_lit_draws++;
+            if (indexed) {
+                wl_gx_direct_array(WL_GX_DIRECT_ARRAY_NORMAL, arrays[WL_GX_DIRECT_ARRAY_NORMAL],
+                                   wl_nv2a_vcache_element_bytes(WL_NV2A_VCACHE_NORMAL));
+            }
+        }
         for (stage = 0; indexed && stage < WL_GX_DIRECT_ARRAY_TEXCOORD0 + WL_NV2A_TEXTURES; stage++) {
             if (layout.indexed & (1u << stage)) {
                 wl_gx_direct_array(stage, arrays[stage],

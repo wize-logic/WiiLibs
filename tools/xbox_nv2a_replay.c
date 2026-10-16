@@ -34,6 +34,8 @@
 //   --overlap   the GX backend's frames overlapped (WlNv2aGxConfig.overlap, as the runtime has them):
 //               the processor does not wait for GX at a frame's end; with --bench, the waits a frame
 //               counted either way
+//   --no-xf-light  a colour affine in one input (a light's dot product) made by the processor, not
+//               lit by GX's transform unit (WlNv2aGxConfig.no_xf_light)
 //   --cpu-transform  every vertex through the program on the processor (GX's transform unit not
 //               used for the draws whose outputs are affine), to the bit as before it
 //   --bench N   the capture replayed N times through the GX backend alone (no software GX, no
@@ -875,8 +877,10 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
         WlNv2aGxStats gs;
 
         wl_nv2a_gx_stats(g_gx, &gs);
-        printf("bench: %u draws (%u vertices) through GX's transform unit in all runs, %u more for their position "
-               "alone\n", (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws);
+        printf("bench: %u draws (%u vertices) through GX's transform unit in all runs (%u lit by it), %u more for "
+               "their position alone\n",
+               (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_lit_draws,
+               (unsigned)gs.xf_position_draws);
         vertex_cache_line("bench: ");
         texture_cache_line("bench: ");
         psh_cache_line("bench: ");
@@ -918,7 +922,7 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] "
                     "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] [--xf-programs] "
-                    "[--stream] [--cpu-transform] [--overlap] [--png-alpha] [--survey]\n");
+                    "[--stream] [--cpu-transform] [--no-xf-light] [--overlap] [--png-alpha] [--survey]\n");
     return 2;
 }
 
@@ -983,6 +987,8 @@ int main(int argc, char **argv) {
             g_gcfg.vertices.arena = g_gcfg.vertices.arena_bytes != 0 ? malloc(g_gcfg.vertices.arena_bytes) : NULL;
         } else if (strcmp(argv[i], "--watch") == 0) {
             watch = true;
+        } else if (strcmp(argv[i], "--no-xf-light") == 0) {
+            g_gcfg.no_xf_light = true;
         } else if (strcmp(argv[i], "--cpu-transform") == 0) {
             g_gcfg.no_xf = true;
         } else if (strcmp(argv[i], "--stream") == 0) {

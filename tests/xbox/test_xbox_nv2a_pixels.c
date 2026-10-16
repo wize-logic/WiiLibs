@@ -73,7 +73,7 @@ static void on_draw(void *user, const WlGxSoftDraw *d) {
 }
 
 // (the next pixel_device's GX backend never uses the transform unit)
-static bool g_no_xf;
+static bool g_no_xf, g_no_xf_light;
 static size_t g_vertex_cache;
 
 static WlNv2a *pixel_device(TGuest *g) {
@@ -92,6 +92,7 @@ static WlNv2a *pixel_device(TGuest *g) {
 
         memset(&gcfg, 0, sizeof gcfg);
         gcfg.no_xf = g_no_xf;
+        gcfg.no_xf_light = g_no_xf_light;
         gcfg.vertices.budget = g_vertex_cache;
         g_gx = wl_nv2a_gx_create(&gcfg);
     }
@@ -764,6 +765,79 @@ TEST arrays_through_the_transform_unit_land_as_on_the_processor(void) {
     PASS();
 }
 
+// the clip program with its colour a directional light's: r, g, b = dot(v9, c[12]), a = dot(v9, -c[10])
+// (v9's z 0 and w 1, as a coordinate of two floats is fetched)
+static const uint32_t f_clip_program_lit[][4] = {
+    {0x00000000, 0x00EC001B, 0x0836186C, 0x08C00000}, // dp4 r12.x, v0, c[0]
+    {0x00000000, 0x00EC201B, 0x0836186C, 0x04C00000}, // dp4 r12.y, v0, c[1]
+    {0x00000000, 0x00EC401B, 0x0836186C, 0x02C00000}, // dp4 r12.z, v0, c[2]
+    {0x00000000, 0x00EC601B, 0x0836186C, 0x01C00000}, // dp4 r12.w, v0, c[3]
+    {0x00000000, 0x0600001B, 0x003603FF, 0x10180000}, // ircc r1.x, r12.w
+    {0x00000000, 0x0040001B, 0xC400286C, 0x0EC00000}, // mul r12.xyz, r12, r1.x
+    {0x00000000, 0x0027601B, 0x0C36006C, 0x0F200000}, // mov r2, c[-37]
+    {0x00000000, 0x0087401B, 0xC436186C, 0x9000E800}, // mad oPos.xyz, r12, c[-38], r2
+    {0x00000000, 0x00AD921B, 0x0836186C, 0x0000E818}, // dp3 oD0.xyz, v9, c[12]
+    {0x00000000, 0x00AD521B, 0x0A36186C, 0x00001818}, // dp3 oD0.w, v9, -c[10]
+    {0x00000000, 0x0020121B, 0x0836006C, 0x0000F849}, // mov oT0, v9
+};
+
+// the EFB after the arrays' draw by the lit program, with or without the transform unit (or its
+// lighting)
+static int xf_lit_frame(uint32_t *efb, bool no_xf, bool no_light, WlNv2aGxStats *stats) {
+    TGuest g;
+    int x, y;
+
+    g_no_xf = no_xf;
+    g_no_xf_light = no_light;
+    if (pixel_device(&g) == NULL) {
+        g_no_xf = g_no_xf_light = false;
+        return 0;
+    }
+    g_no_xf = g_no_xf_light = false;
+    f_perspective(&g);
+    f_program(&g, 8, f_clip_program_lit, 11);
+    f_constant(&g, 106, -0.6f, -0.3f, 0.5f, 0.0f);
+    f_constant(&g, 108, 0.5f, 0.25f, 0.0f, 0.0f);
+    f_clear(&g, 0x00000000u);
+    xf_arrays(&g);
+    t_kick(&g);
+    for (y = 0; y < 480; y++) {
+        for (x = 0; x < 640; x++) {
+            efb[y * 640 + x] = pixel(x, y);
+        }
+    }
+    wl_nv2a_gx_stats(g_gx, stats);
+    pixel_done(&g);
+    return 1;
+}
+
+// a colour that is a directional light's dot product with an input lit by GX from it as a normal
+// (each part its own light, the colour's scale below the alpha's): the processor's colours
+TEST a_light_dot_product_is_lit_by_the_transform_unit_as_on_the_processor(void) {
+    static uint32_t cpu[640 * 480], xf[640 * 480];
+    WlNv2aGxStats cpu_stats, xf_stats;
+    unsigned i, covered = 0, beyond = 0;
+
+    ASSERT(xf_lit_frame(cpu, false, true, &cpu_stats));
+    ASSERT(xf_lit_frame(xf, false, false, &xf_stats));
+    ASSERT_EQ(0u, cpu_stats.xf_draws);
+    ASSERT_EQ(1u, cpu_stats.xf_position_draws);
+    ASSERT_EQ(1u, xf_stats.xf_draws);
+    ASSERT_EQ(1u, xf_stats.xf_lit_draws);
+    for (i = 0; i < 640u * 480u; i++) {
+        if ((cpu[i] & 0xFFFFFF00u) != 0) {
+            covered++;
+        }
+        // (the alpha too: within the EFB's six bits)
+        if (!near_rgb(cpu[i], xf[i], 8) || abs((int)(cpu[i] & 0xFFu) - (int)(xf[i] & 0xFFu)) > 8) {
+            beyond++;
+        }
+    }
+    ASSERT(covered > 20000u);
+    ASSERTm("pixels beyond the tolerance", beyond * 200u < covered);
+    PASS();
+}
+
 // mov oPos.xyw, v0; mov oPos.z, c[0]: screen space at one depth for every vertex
 static const uint32_t f_screen_program_flat[][4] = {
     {0x00000000, 0x0020001B, 0x0836006C, 0x0000D800}, // mov oPos.xyw, v0
@@ -1019,6 +1093,7 @@ SUITE(pixels_suite) {
     RUN_TEST(a_picture_shown_is_sampled_the_next_frame);
     RUN_TEST(capture_replays_to_the_same_pixels);
     RUN_TEST(arrays_through_the_transform_unit_land_as_on_the_processor);
+    RUN_TEST(a_light_dot_product_is_lit_by_the_transform_unit_as_on_the_processor);
     RUN_TEST(screen_space_depths_beyond_the_range_are_clamped_on_the_transform_unit_too);
     RUN_TEST(a_second_pass_by_the_processor_passes_over_the_transform_units_depths);
     RUN_TEST(arrays_kept_for_gx_to_index_draw_to_the_bit);

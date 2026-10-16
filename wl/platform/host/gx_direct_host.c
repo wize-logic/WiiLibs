@@ -109,9 +109,45 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     s.stats.vertices += count;
 }
 
+// a lit channel's component as GX's lighting makes it: the ambient plus the signed dot product of the
+// normal (through the normal matrix) and the light's direction, times the light's colour, clamped
+static uint8_t lit_component(const float normal[3], unsigned channel, unsigned component) {
+    const WlGxDirectLighting *l = &s.lighting;
+    float dot = 0.0f, value;
+    unsigned r;
+
+    for (r = 0; r < 3; r++) {
+        dot += (l->normal_matrix[r][0] * normal[0] + l->normal_matrix[r][1] * normal[1] +
+                l->normal_matrix[r][2] * normal[2]) *
+               l->direction[channel][r];
+    }
+    value = (float)l->ambient[channel / 2u][component] / 255.0f +
+            dot * ((float)l->color[channel][component] / 255.0f);
+    value = value > 1.0f ? 1.0f : value > 0.0f ? value : 0.0f;
+    return (uint8_t)(value * 255.0f + 0.5f);
+}
+
 void wl_gx_direct_vertex(const WlGxDirectVertex *vertex) {
     if (g_in_primitive && g_received < g_expected) {
         g_vertices[g_received] = *vertex;
+        if (s.layout.lit) {
+            WlGxDirectVertex *v = &g_vertices[g_received];
+            unsigned channel, c;
+
+            for (channel = 0; channel < 4u; channel++) {
+                if (!(s.layout.lit & (1u << channel))) {
+                    continue;
+                }
+                if (channel & 1u) {
+                    v->color[channel / 2u][3] = lit_component(v->normal, channel, 3);
+                } else {
+                    for (c = 0; c < 3u; c++) {
+                        v->color[channel / 2u][c] = lit_component(v->normal, channel, c);
+                    }
+                }
+            }
+            vertex = v;
+        }
         if (g_received < WL_HOST_GX_DIRECT_KEPT) {
             s.vertices[g_received] = *vertex;
         }
@@ -129,6 +165,10 @@ void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
         return;
     }
     memcpy(v.position, words, sizeof v.position);
+    if (s.layout.lit && i + 3u <= count) {
+        memcpy(v.normal, &words[i], sizeof v.normal);
+        i += 3u;
+    }
     if (s.layout.texcoords_projected) {
         unsigned projected = 0, k;
 
@@ -184,7 +224,7 @@ void wl_gx_direct_vertices_index(const uint32_t *indices, uint32_t base, uint32_
 }
 
 void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride) {
-    if (attribute < 11u) {
+    if (attribute < 12u) {
         s.arrays[attribute] = data;
         s.array_strides[attribute] = stride;
     }
@@ -221,6 +261,17 @@ void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t c
     } else {
         for (n = 0; n < 3 && i < count; n++) {
             memcpy(&v.position[n], &words[i++], sizeof(float));
+        }
+    }
+    if (s.layout.lit && (s.layout.indexed & (1u << WL_GX_DIRECT_ARRAY_NORMAL))) {
+        if ((e = element(WL_GX_DIRECT_ARRAY_NORMAL, index)) != NULL) {
+            v.normal[0] = be_float(e);
+            v.normal[1] = be_float(e + 4);
+            v.normal[2] = be_float(e + 8);
+        }
+    } else if (s.layout.lit) {
+        for (n = 0; n < 3 && i < count; n++) {
+            memcpy(&v.normal[n], &words[i++], sizeof(float));
         }
     }
     for (n = 0; n < s.layout.colors && n < 2; n++) {
@@ -294,6 +345,10 @@ void wl_gx_direct_draw(WlGxDirectPrim prim, const WlGxDirectVertex *vertices, ui
         wl_gx_direct_vertex(&vertices[i]);
     }
     wl_gx_direct_primitive_end();
+}
+
+void wl_gx_direct_lighting(const WlGxDirectLighting *lighting) {
+    s.lighting = *lighting;
 }
 
 void wl_gx_direct_position_matrix(const float m[3][4]) {

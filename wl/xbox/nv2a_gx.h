@@ -64,6 +64,9 @@ typedef struct WlNv2aGxConfig {
     // every vertex through the program on the processor, never GX's transform unit (the draws whose
     // live outputs are affine in their inputs otherwise go to the transform unit: not to the bit)
     bool no_xf;
+    // a colour affine in one input but not passed as it is (a directional light's dot product) left
+    // to the processor, not lit by GX from the input as a normal
+    bool no_xf_light;
     // the processor does not wait for GX at the end of a frame (wl_gx_set_frame_overlap): it goes on
     // with the next one while GX draws this one; the caches keep what GX may still read one frame
     // longer
@@ -112,6 +115,7 @@ typedef struct WlNv2aGxStats {
     uint32_t xf_draws;            // draws whose vertices GX's transform unit transformed
     uint32_t xf_vertices;         // ...and their vertices
     uint32_t xf_position_draws;   // draws whose positions alone it transformed (the rest the program's)
+    uint32_t xf_lit_draws;        // of the xf draws, those whose colours GX lit from a normal
     uint32_t projected_draws;     // draws with a projective coordinate whose q varies: divided by GX per pixel
     uint32_t unwritten_counted;   // draws that write nothing (no colour, no depth) counting pixels: counted, not drawn
     uint32_t unwritten_skipped;   // ...and not counting: skipped

@@ -42,6 +42,9 @@ static struct {
     uint8_t order[12], order_count;
     // the layout's projected coordinates
     unsigned projected;
+    // the lit channels' light as loaded (wl_gx_direct_lighting)
+    WlGxDirectLighting lighting;
+    bool lighting_known;
     bool in_primitive;
     // the texture object each map holds as wl_gx_direct_texture loaded it (bit n of maps_known: map
     // n's is known; wl_gx_wii_texmaps_forget clears it)
@@ -61,6 +64,7 @@ void wl_gx_direct_begin(void) {
     wl_gx_invalidate_shadow();
     wl_gx_tlut_invalidate();
     d.layout_known = false;
+    d.lighting_known = false;
     d.position_identity = true;
     d.texgen_set = 0;
     wl_gx_direct_flush_after();
@@ -105,6 +109,10 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
     GX_ClearVtxDesc();
     GX_SetVtxDesc(GX_VA_POS, input_of(layout, WL_GX_DIRECT_ARRAY_POSITION, 3));
     GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+    if (layout->lit) {
+        GX_SetVtxDesc(GX_VA_NRM, input_of(layout, WL_GX_DIRECT_ARRAY_NORMAL, 3));
+        GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+    }
     // (projected coordinates: the normal's three numbers, or the normal, binormal and tangent's nine)
     d.projected = 0;
     for (n = 0; n < 8; n++) {
@@ -157,8 +165,62 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
     }
     GX_SetNumTexGens(texgens);
     GX_SetNumChans(layout->colors);
-    GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
-    GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+    if (!layout->lit) {
+        GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+        GX_SetChanCtrl(GX_COLOR1A1, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+    } else {
+        // (a lit channel: its material and ambient the registers', its light n, the signed dot
+        // product, no attenuation; the others the vertex's colour)
+        static const s32 channels[4] = {GX_COLOR0, GX_ALPHA0, GX_COLOR1, GX_ALPHA1};
+
+        for (n = 0; n < 4; n++) {
+            if (layout->lit & (1u << n)) {
+                GX_SetChanCtrl(channels[n], GX_ENABLE, GX_SRC_REG, GX_SRC_REG, (u8)(GX_LIGHT0 << n), GX_DF_SIGN,
+                               GX_AF_NONE);
+            } else {
+                GX_SetChanCtrl(channels[n], GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+            }
+        }
+    }
+    wl_gx_wii_note_commands();
+}
+
+void wl_gx_direct_lighting(const WlGxDirectLighting *lighting) {
+    static const GXColor white = {255, 255, 255, 255};
+    Mtx normal;
+    unsigned n, r;
+
+    if (d.lighting_known && memcmp(&d.lighting, lighting, sizeof d.lighting) == 0) {
+        return;
+    }
+    d.lighting = *lighting;
+    d.lighting_known = true;
+    for (r = 0; r < 3; r++) {
+        normal[r][0] = lighting->normal_matrix[r][0];
+        normal[r][1] = lighting->normal_matrix[r][1];
+        normal[r][2] = lighting->normal_matrix[r][2];
+        normal[r][3] = 0.0f;
+    }
+    GX_LoadNrmMtxImm(normal, GX_PNMTX0);
+    for (n = 0; n < 4; n++) {
+        GXLightObj light;
+        const float *dir = lighting->direction[n];
+        GXColor color = {lighting->color[n][0], lighting->color[n][1], lighting->color[n][2], lighting->color[n][3]};
+
+        // (a light at infinity: its position far along the direction, as libogc's specular one)
+        GX_InitLightPos(&light, dir[0] * 1.0e18f, dir[1] * 1.0e18f, dir[2] * 1.0e18f);
+        GX_InitLightDir(&light, 0.0f, 0.0f, 0.0f);
+        GX_InitLightAttn(&light, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        GX_InitLightColor(&light, color);
+        GX_LoadLightObj(&light, (u8)(GX_LIGHT0 << n));
+    }
+    for (n = 0; n < 2; n++) {
+        GXColor ambient = {lighting->ambient[n][0], lighting->ambient[n][1], lighting->ambient[n][2],
+                           lighting->ambient[n][3]};
+
+        GX_SetChanAmbColor(n == 0 ? GX_COLOR0A0 : GX_COLOR1A1, ambient);
+        GX_SetChanMatColor(n == 0 ? GX_COLOR0A0 : GX_COLOR1A1, white);
+    }
     wl_gx_wii_note_commands();
 }
 
@@ -170,6 +232,11 @@ static inline void emit(const WlGxDirectVertex *v) {
         GX_Position1x16(0);
     } else {
         GX_Position3f32(v->position[0], v->position[1], v->position[2]);
+    }
+    if (d.layout.lit && (d.layout.indexed & (1u << WL_GX_DIRECT_ARRAY_NORMAL))) {
+        GX_Normal1x16(0);
+    } else if (d.layout.lit) {
+        GX_Normal3f32(v->normal[0], v->normal[1], v->normal[2]);
     }
     if (d.layout.texcoords_projected) {
         unsigned sent = 0;
@@ -251,11 +318,12 @@ void wl_gx_direct_vertices_words(const uint32_t *const *vertices, uint32_t n, ui
 
 void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride) {
     u32 gx_attribute = attribute == WL_GX_DIRECT_ARRAY_POSITION ? (u32)GX_VA_POS
+                       : attribute == WL_GX_DIRECT_ARRAY_NORMAL ? (u32)GX_VA_NRM
                        : attribute < WL_GX_DIRECT_ARRAY_TEXCOORD0
                            ? (u32)(GX_VA_CLR0 + attribute - WL_GX_DIRECT_ARRAY_COLOR0)
                            : (u32)(GX_VA_TEX0 + attribute - WL_GX_DIRECT_ARRAY_TEXCOORD0);
 
-    if (attribute >= WL_GX_DIRECT_ARRAY_TEXCOORD0 + 8u) {
+    if (attribute > WL_GX_DIRECT_ARRAY_NORMAL) {
         return;
     }
     GX_SetArray(gx_attribute, (void *)data, (u8)stride);
