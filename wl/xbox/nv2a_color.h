@@ -47,25 +47,44 @@ static inline WlNv2aColorConstants wl_nv2a_color_constants(void) {
     return k;
 }
 
-// wl_nv2a_color_byte's byte as a double, without a conversion to an integer: y clamped to 255 (a
-// NaN kept) then to 0 (a NaN 0: below 1 the byte is 0 either way), so z is 0 or in [0, 255]; z - 0.5
-// + 2^-30 is exact in a double and never half way between integers, so rounding it to the nearest
-// (adding and taking away 1.5 * 2^52) is (int)z
-static inline double wl_nv2a_color_byte_double(float value, const WlNv2aColorConstants *k) {
+// wl_nv2a_color_byte's byte plus 1.5 * 2^52 as a double, without a conversion to an integer: y
+// clamped to 255 (a NaN kept) then to 0 (a NaN 0: below 1 the byte is 0 either way), so z is 0 or in
+// [0, 255]; z - 0.5 + 2^-30 is exact in a double and never half way between integers, so adding 1.5 *
+// 2^52 rounds it to the nearest, (int)z
+static inline double wl_nv2a_color_byte_magic(float value, const WlNv2aColorConstants *k) {
     float y = value * k->c255 + k->half;
     float a = wl_nv2a_select_ge0(y - k->c255, k->c255, y);
     double t = (double)wl_nv2a_select_ge0(a, a, k->zero) + k->below;
 
-    return (t + k->magic) - k->magic;
+    return t + k->magic;
+}
+
+// the byte itself as a double
+static inline double wl_nv2a_color_byte_double(float value, const WlNv2aColorConstants *k) {
+    return wl_nv2a_color_byte_magic(value, k) - k->magic;
+}
+
+// b * 256 + c for whole numbers below 2^53, exact: on PowerPC one fmadd (its one rounding, of an
+// exact result, the same bits as the product's and the sum's)
+static inline double wl_nv2a_color_shift_add(double b, double c, const WlNv2aColorConstants *k) {
+#if defined(__PPC__) || defined(__powerpc__)
+    return __builtin_fma(b, k->c256, c);
+#else
+    return b * k->c256 + c;
+#endif
 }
 
 // a colour as the word GX takes, 0xRRGGBBAA: wl_nv2a_color_byte's bytes put together in a double
-// (exact below 2^32), its low word read by its bits after adding 1.5 * 2^52. (A float to an
-// integer is a store and a load on PowerPC, one for the colour instead of one for each byte;
-// every float gives wl_nv2a_color_byte's byte, checked over all of them.)
+// (exact below 2^32), its low word read by its bits after adding 1.5 * 2^52 (the last byte's own,
+// all of them whole numbers and exact). (A float to an integer is a store and a load on PowerPC, one
+// for the colour instead of one for each byte; every float gives wl_nv2a_color_byte's byte, checked
+// over all of them.)
 static inline uint32_t wl_nv2a_color_word_with(const float c[4], const WlNv2aColorConstants *k) {
-    double word = ((wl_nv2a_color_byte_double(c[0], k) * k->c256 + wl_nv2a_color_byte_double(c[1], k)) * k->c256 +
-                   wl_nv2a_color_byte_double(c[2], k)) * k->c256 + wl_nv2a_color_byte_double(c[3], k) + k->magic;
+    double word = wl_nv2a_color_shift_add(
+        wl_nv2a_color_shift_add(wl_nv2a_color_shift_add(wl_nv2a_color_byte_double(c[0], k),
+                                                        wl_nv2a_color_byte_double(c[1], k), k),
+                                wl_nv2a_color_byte_double(c[2], k), k),
+        wl_nv2a_color_byte_magic(c[3], k), k);
     uint64_t bits;
 
     memcpy(&bits, &word, sizeof bits);
