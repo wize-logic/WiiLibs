@@ -65,6 +65,10 @@ static char pr_first[24];       /* where the first vertex starts (the prefix mad
 so each block runs or is left out, with no test */
 static const WlXboxVshFusedKey *pr_fuse;
 static int pr_fused_captured;   /* (fused) the clip-space position captured, always */
+/* (fused, GX taking the clip-space position: the instructions whose writes nothing reads, the
+screen-space position's divide and viewport among them; pr_dead_now: the one being written's) */
+static unsigned char pr_dead[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+static int pr_dead_now;
 
 /* the constants that may be loaded once a batch, and how often each is loaded in a vertex */
 static char pr_keys[PR_KEYS][80];
@@ -1395,9 +1399,11 @@ static const char *pr_output_field(unsigned address, char *text, size_t size) {
 
 /* one instruction (mode: WRITE_TEMPORARIES, WRITE_OUTPUTS or both) */
 static void pr_instruction(const WlXboxVshInstruction *in, int mode) {
-    int mac_t = in->mac != _mac_nop && (in->mac == _mac_arl || in->mac_mask) && (mode & WRITE_TEMPORARIES);
-    int ilu_t = in->ilu != _ilu_nop && in->ilu_mask && (mode & WRITE_TEMPORARIES);
-    int out = in->output_mask && in->output_is_register &&
+    /* (an instruction pr_liveness found dead writes nothing: its clip-space capture alone) */
+    int mac_t = !pr_dead_now && in->mac != _mac_nop && (in->mac == _mac_arl || in->mac_mask) &&
+                (mode & WRITE_TEMPORARIES);
+    int ilu_t = !pr_dead_now && in->ilu != _ilu_nop && in->ilu_mask && (mode & WRITE_TEMPORARIES);
+    int out = !pr_dead_now && in->output_mask && in->output_is_register &&
               (in->output_from_ilu ? in->ilu : in->mac) != 0 && (mode & WRITE_OUTPUTS);
     unsigned mac_lanes = (mac_t ? in->mac_mask : 0) | (out && !in->output_from_ilu ? in->output_mask : 0);
     unsigned ilu_lanes = (ilu_t ? in->ilu_mask : 0) | (out && in->output_from_ilu ? in->output_mask : 0);
@@ -1578,22 +1584,42 @@ static void pr_instruction(const WlXboxVshInstruction *in, int mode) {
 }
 
 /* the temporaries' lanes read after each instruction (bit 3 x), the
-position's all read at the end; instructions no output needs left out */
+position's all read at the end; instructions no output needs left out.
+drop_position (fused, GX taking the clip-space position the program captures):
+the position read by none at the end, and an instruction whose writes are then
+all unread is dead (pr_dead), reading nothing but for its capture */
 static void pr_liveness(const WlXboxVshProgram *program, const unsigned *needs, unsigned long from,
-                        unsigned (*after)[13]) {
+                        unsigned (*after)[13], int drop_position) {
     unsigned live[13];
     long index;
     int t, which;
 
     memset(live, 0, sizeof(live));
-    live[12] = 0xf;
+    live[12] = drop_position ? 0 : 0xf;
     for (index = (long)program->count - 1; index >= (long)from; index--) {
         const WlXboxVshInstruction *in = &program->instructions[index];
         unsigned reads[3];
 
         memcpy(after[index], live, sizeof(live));
+        pr_dead[index] = 0;
         if (!needs[index])
             continue;
+        if (drop_position && in->mac != _mac_arl && !(in->output_mask && !in->output_is_register)) {
+            int out = in->output_mask && in->output_is_register && (in->output_from_ilu ? in->ilu : in->mac) != 0;
+            unsigned mac_live = in->mac != _mac_nop && in->mac_mask
+                                    ? live[pr_temporary_index(in->temporary)] & in->mac_mask : 0;
+            unsigned ilu_live = in->ilu != _ilu_nop && in->ilu_mask
+                                    ? live[pr_temporary_index(in->mac != _mac_nop ? 1 : in->temporary)] & in->ilu_mask
+                                    : 0;
+            unsigned out_live = out ? (in->output_address == _output_position ? live[12] & in->output_mask : 1u) : 0;
+
+            if (!mac_live && !ilu_live && !out_live) {
+                pr_dead[index] = 1;
+                if (in->captures_clip)
+                    live[12] = 0xf;
+                continue;
+            }
+        }
         if (in->mac != _mac_nop && in->mac != _mac_arl && in->mac_mask)
             live[pr_temporary_index(in->temporary)] &= ~in->mac_mask;
         if (in->ilu != _ilu_nop && in->ilu_mask)
@@ -2179,7 +2205,14 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     for (index = 0; index < program->count; index++)
         if (needs[index] && !pr_supported(&program->instructions[index]))
             return 0;
-    pr_liveness(program, needs, 0, after);
+    {
+        int drop = 0;
+
+        if (pr_fuse && pr_fuse->perspective)
+            for (index = 0; index < program->count; index++)
+                drop |= needs[index] && program->instructions[index].captures_clip;
+        pr_liveness(program, needs, 0, after, drop);
+    }
     /* (each block's test: a condition register bit set once a batch) */
     pr_need_count = 0;
     for (index = 0; index < program->count && !pr_fuse; index++)
@@ -2251,6 +2284,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
                 open = pr_needs = needs[index];
             }
             memcpy(pr_live_after, after[index], sizeof(pr_live_after));
+            pr_dead_now = pr_dead[index];
             pr_instruction(in, WRITE_TEMPORARIES);
         }
         if (open != ~0u)
@@ -2281,6 +2315,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
                 open = pr_needs = needs[index];
             }
             memcpy(pr_live_after, after[index], sizeof(pr_live_after));
+            pr_dead_now = pr_dead[index];
             pr_instruction(in, WRITE_OUTPUTS);
         }
     } else {
@@ -2299,8 +2334,10 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
             open = pr_needs = needs[index];
         }
         memcpy(pr_live_after, after[index], sizeof(pr_live_after));
+        pr_dead_now = pr_dead[index];
         pr_instruction(&program->instructions[index], WRITE_ALL);
     }
+    pr_dead_now = 0;
     if (open != ~0u)
         pr_place_label(skip);
     pr_needs = ~0u;
