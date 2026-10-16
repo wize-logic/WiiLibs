@@ -55,6 +55,7 @@ void wlt_suite_posix(const char *path);
 void wlt_suite_sseq(void);
 void wlt_suite_sqrt(void);
 void wlt_suite_nv2a(void);
+void wlt_suite_recomp_header(void);
 void wlt_suite_vsh_ps(void);
 
 // Close enough for an EFB colour: the EFB keeps 6 or 8 bits a channel depending on the mode.
@@ -942,6 +943,9 @@ int main(void) {
     check_tev_program();
     // the NV2A backend on GX: synthetic push buffers, the EFB read back (tests/xbox/suite_nv2a.c)
     wlt_suite_nv2a();
+    // the recompiled code's header under this compiler (tests/xbox_recomp/suite_recomp_header.c)
+    wlt_report("WLT SUITE recomp_header");
+    wlt_suite_recomp_header();
     check_backtrace();
     check_profile();
     check_atomics64();

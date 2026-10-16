@@ -26,6 +26,8 @@ static void guest_reset(void) {
     g_xbox_mem_offset = (ptrdiff_t)(uintptr_t)g_guest;
 }
 
+#include "recomp_simd_case.h"
+
 TEST ea_transform(void) {
     // user space keeps its address; the contiguous window and its tiled alias land at 0x1xxxxxxx
     ASSERT_EQ_FMT(0x00010000u, WL_XB_EA(0x00010000u), "%08x");
@@ -147,6 +149,13 @@ TEST simd_lanes_overlay_as_on_x86(void) {
     PASS();
 }
 
+TEST shufps_then_movhps(void) {
+    // the case devkitPPC's GCC 16 got wrong (recomp_simd_case.h; the console runs it too)
+    guest_reset();
+    ASSERT_EQ(0, recomp_case_shufps_movhps());
+    PASS();
+}
+
 TEST cvt_si32(void) {
     ASSERT_EQ(2, recomp_cvt_si32(1.5, 0));
     ASSERT_EQ(2, recomp_cvt_si32(2.5, 0));
@@ -216,6 +225,7 @@ SUITE(recomp_header) {
     RUN_TEST(float_memory);
     RUN_TEST(atomics);
     RUN_TEST(simd_lanes_overlay_as_on_x86);
+    RUN_TEST(shufps_then_movhps);
     RUN_TEST(cvt_si32);
     RUN_TEST(extended_80bit);
     RUN_TEST(fp_pc24_matches_the_slow_path);

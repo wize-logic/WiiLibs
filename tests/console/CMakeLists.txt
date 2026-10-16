@@ -11,8 +11,13 @@ add_executable(wl_console_tests
     ${PROJECT_SOURCE_DIR}/tests/audio/suite_sseq.c
     ${PROJECT_SOURCE_DIR}/tests/audio/synth_fixture.c
     ${PROJECT_SOURCE_DIR}/tests/gfx/suite_sqrt.c
-    ${PROJECT_SOURCE_DIR}/tests/xbox/suite_nv2a.c)
+    ${PROJECT_SOURCE_DIR}/tests/xbox/suite_nv2a.c
+    ${PROJECT_SOURCE_DIR}/tests/xbox_recomp/suite_recomp_header.c)
 wl_target_defaults(wl_console_tests)
+# the recompiled code's header, as generated code includes it (a system header, as in
+# tests/xbox_recomp/CMakeLists.txt)
+set_source_files_properties(${PROJECT_SOURCE_DIR}/tests/xbox_recomp/suite_recomp_header.c PROPERTIES
+    COMPILE_OPTIONS "-isystem;${PROJECT_SOURCE_DIR}/wl/xboxrt/recomp;-fno-strict-aliasing")
 target_link_libraries(wl_console_tests PRIVATE wl_audio wl_platform wl_gfx wl_xbox_gx)
 # the synthetic vertex programs compiled ahead of time with their paired-single code against the
 # interpreter (tests/xbox/suite_vsh_ps.c): tools/xbox_vsh_codegen.c built for the build machine, as

@@ -390,13 +390,13 @@ SHUFFLE_OLD = """static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, u
 }
 """
 SHUFFLE_NEW = """static inline __attribute__((always_inline)) RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
-    /* WiiLibs: lanes moved as bytes (both sides are little-endian), not read with lwbrx and
-     * written back with stwbrx */
+    /* WiiLibs: lane by lane, as upstream. Lanes moved as bytes (memcpy into the little-endian
+     * union) were miscompiled by GCC 16's scalar replacement of aggregates (devkitPPC 16.1, -Os and
+     * -O2): a lane read back after the copy kept its bytes reversed, so a movhps after a shufps
+     * stored the floats big-endian. This form is also the smaller one there. */
     RecompXmm r;
-    memcpy((char *)&r + 0,  (const char *)&a + 4u * ((imm >> 0) & 3u), 4);
-    memcpy((char *)&r + 4,  (const char *)&a + 4u * ((imm >> 2) & 3u), 4);
-    memcpy((char *)&r + 8,  (const char *)&b + 4u * ((imm >> 4) & 3u), 4);
-    memcpy((char *)&r + 12, (const char *)&b + 4u * ((imm >> 6) & 3u), 4);
+    r.u[0] = a.u[(imm >> 0) & 3u]; r.u[1] = a.u[(imm >> 2) & 3u];
+    r.u[2] = b.u[(imm >> 4) & 3u]; r.u[3] = b.u[(imm >> 6) & 3u];
     return r;
 }
 """
