@@ -82,7 +82,10 @@ resolves through the mount table:
 | `\Device\Harddisk0\Partition3`..`5` | `data_dir/X`, `Y`, `Z` | the cache partitions, sparse |
 
 `WlXkConfig.mounts` add or replace devices. Lookups are case-blind (FATX is case-insensitive; a
-host's file system need not be), and `..` above a mount is refused. Covered: `NtCreateFile`,
+host's file system need not be), and `..` above a mount is refused. Each look costs a walk from the
+volume's root on libfat, so a name that is not there (a file about to be created) is looked for in
+another case only in its folder's listing when the folder is there as written, and not at all on a
+volume that folds the case itself (FAT: probed once per mount at start, "folds case" in its log line). Covered: `NtCreateFile`,
 `NtOpenFile` and `IoCreateFile` with the six dispositions and delete-on-close; reads and writes at
 offsets or at the file position, overlapped ones completing at once (their event, the file object,
 the APC; `STATUS_PENDING` first with `async_io_pending`; both events are cleared before the request,
@@ -97,7 +100,8 @@ close, and meanwhile every open or create of the name fails with `STATUS_DELETE_
 moves every handle on the file to the new name; one that would replace an open file is
 `STATUS_ACCESS_DENIED`. On a sparse partition a file keeps a logical size beyond what was written, in a
 `<name>.wlsz` sidecar that listings hide; its handles share the size, and only one that changed it
-writes the sidecar. A partition opened as a device (`Partition0`, the cache partitions for
+writes the sidecar (none is removed while the kernel knows there is none: its open found none, and
+`wl_xk_file_changed` has not been called since). A partition opened as a device (`Partition0`, the cache partitions for
 `XMountUtilityDrive`) keeps its first 64 KB in `data_dir/raw<N>.bin`; `Partition0` shows a
 partition table in sector 0 (the homebrew `****PARTINFO****`), and sector 4 is XAPI's own (its
 utility drive's cache database, which it reads back at every boot). Device controls answer the

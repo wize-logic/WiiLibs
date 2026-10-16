@@ -9,6 +9,7 @@ typedef struct {
     char host[192];   // "sd:/xbox/halo/hdd/E"
     bool writable;
     bool sparse;
+    bool folds_case;  // the volume finds a name in another case itself (FAT): no listing for a miss
 } XkMount;
 
 typedef enum {
@@ -28,7 +29,9 @@ typedef struct {
 
 void xk_paths_init(const WlXkConfig *cfg);
 bool xk_resolve(const char *name, XkResolved *out);
-void xk_resolve_case(char *host, uint32_t root_len);
+bool xk_resolve_case(XkResolved *r, WlPlatformStat *st);
+// For tests: every mount as on a volume that folds the case (`folds`) or tells the cases apart.
+void xk_paths_set_folds_case(bool folds);
 bool xk_link_delete(const char *link);
 
 int xk_stricmp(const char *a, const char *b);

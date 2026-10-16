@@ -124,10 +124,21 @@ struct XkFcb {
     uint32_t opens;   // the XkFiles on it ...
     XkFile *files;    // ... linked by fcb_next
     bool delete_pending;
+    bool no_sidecar;  // known to have none on disk (a removal would only cost a path walk on libfat)
     XkFcb *next;
 };
 
 static XkFcb *g_fcbs;
+
+// An open file's sidecar after its size changed: written when the size passes its bytes, else removed
+// unless the file is known to have none.
+static void fcb_sidecar_write(XkFcb *c, uint64_t physical) {
+    bool none = c->logical <= physical;
+    if (!(none && c->no_sidecar)) {
+        sidecar_write(c->host, c->logical, physical);
+    }
+    c->no_sidecar = none;
+}
 
 static XkFcb *fcb_find(const char *host) {
     for (XkFcb *c = g_fcbs; c != NULL; c = c->next) {
@@ -296,7 +307,10 @@ static void pages_forget(const XkFile *f, uint64_t off, uint64_t len) {
 }
 
 void wl_xk_file_changed(const char *host) {
-    const XkFcb *c = fcb_find(host);
+    XkFcb *c = fcb_find(host);
+    if (c != NULL) {
+        c->no_sidecar = false; // (its sidecar may have been written too)
+    }
     WL_LOG_I(XK_TAG, "changed outside the kernel: %s (%s)", host, c != NULL ? "open" : "not open");
     fcb_pages_forget(c, 0, UINT64_MAX);
 }
@@ -308,7 +322,7 @@ void xk_file_close(XkFile *f) {
     if (f->pf != NULL) {
         wl_xb_file_forget(f->pf, 0, UINT64_MAX); // its pages' bytes are read back while it is open
         if (f->sparse && f->resized && f->fcb != NULL) {
-            sidecar_write(f->host, f->fcb->logical, physical_size(f));
+            fcb_sidecar_write(f->fcb, physical_size(f));
         }
         wl_platform_fs_close(f->pf);
         g_files_open--;
@@ -329,9 +343,11 @@ void xk_file_close(XkFile *f) {
                     wl_platform_fs_rmdir(c->host);
                 } else {
                     wl_platform_fs_remove(c->host);
-                    char side[340];
-                    sidecar_path(c->host, side, sizeof side);
-                    wl_platform_fs_remove(side);
+                    if (!c->no_sidecar) {
+                        char side[340];
+                        sidecar_path(c->host, side, sizeof side);
+                        wl_platform_fs_remove(side);
+                    }
                 }
             }
             fcb_unlink(c);
@@ -399,13 +415,12 @@ static uint32_t open_file(uint32_t handle_out, uint32_t access, uint32_t oa, uin
         f->writable = true;
         f->can_write = (access & DATA_WRITE_ACCESS) != 0;
     } else {
+        WlPlatformStat st;
+        bool exists = xk_resolve_case(&r, &st);
         snprintf(f->host, sizeof f->host, "%s", r.host);
-        xk_resolve_case(f->host, r.root_len);
         f->writable = r.mount.writable;
         f->can_write = f->writable && (access & DATA_WRITE_ACCESS) != 0;
         f->sparse = r.mount.sparse;
-        WlPlatformStat st;
-        bool exists = wl_platform_fs_stat(f->host, &st) == WL_OK;
         bool is_dir = exists && st.is_dir;
         uint32_t fail = 0;
         const XkFcb *open_fcb = exists ? fcb_find(f->host) : NULL;
@@ -464,8 +479,10 @@ static uint32_t open_file(uint32_t handle_out, uint32_t access, uint32_t oa, uin
             // a sparse file's size: its other handles', else its sidecar's; a sidecar that cannot
             // be read (every slot in use) fails the open rather than lose the size
             uint64_t logical = 0;
+            bool no_sidecar = false;
             if (f->sparse && exists && !truncate && fcb_find(f->host) == NULL) {
                 WlResult sr = sidecar_read(f->host, &logical);
+                no_sidecar = sr == WL_ERR_NOT_FOUND;
                 if (sr != WL_OK && sr != WL_ERR_NOT_FOUND) {
                     WL_LOG_W(XK_TAG, "open \"%s\": its size cannot be read: %s", name, wl_result_name(sr));
                     free(f);
@@ -501,9 +518,12 @@ static uint32_t open_file(uint32_t handle_out, uint32_t access, uint32_t oa, uin
                 xk_iosb(iosb, STATUS_NO_MEMORY, 0);
                 return STATUS_NO_MEMORY;
             }
+            if (no_sidecar) {
+                f->fcb->no_sidecar = true;
+            }
             if (f->sparse && (truncate || !exists)) {
                 f->fcb->logical = 0;
-                sidecar_write(f->host, 0, 0); // gone with the old contents (or left by a lost file)
+                fcb_sidecar_write(f->fcb, 0); // gone with the old contents (or left by a lost file)
             }
             info = !exists ? 2u : truncate ? (disposition == FILE_SUPERSEDE ? 0u : 3u) : 1u;
         }
@@ -744,7 +764,7 @@ void k_NtFlushBuffersFile(void) {
     if (f->pf != NULL) {
         wl_platform_fs_flush(f->pf);
         if (f->sparse && f->resized && f->fcb != NULL) {
-            sidecar_write(f->host, f->fcb->logical, physical_size(f));
+            fcb_sidecar_write(f->fcb, physical_size(f));
         }
     }
     xk_iosb(ARG(1), STATUS_SUCCESS, 0);
@@ -918,11 +938,13 @@ static uint32_t set_size(XkFile *f, uint64_t size) {
         if (size < phys && wl_platform_fs_truncate(f->pf, size) != WL_OK) {
             return STATUS_DISK_FULL;
         }
+        f->resized = true;
         if (f->fcb != NULL) {
             f->fcb->logical = size;
+            fcb_sidecar_write(f->fcb, physical_size(f));
+        } else {
+            sidecar_write(f->host, size, physical_size(f));
         }
-        f->resized = true;
-        sidecar_write(f->host, size, physical_size(f));
         return STATUS_SUCCESS;
     }
     return wl_platform_fs_truncate(f->pf, size) == WL_OK ? STATUS_SUCCESS : STATUS_DISK_FULL;
@@ -956,9 +978,9 @@ void k_NtSetInformationFile(void) {
             status = STATUS_ACCESS_DENIED;
             break;
         }
-        xk_resolve_case(r.host, r.root_len);
+        bool there = xk_resolve_case(&r, NULL);
         bool replace = wl_xb_rd8(in) != 0;
-        if (!replace && wl_platform_fs_exists(r.host)) {
+        if (!replace && there) {
             status = STATUS_OBJECT_NAME_COLLISION;
             break;
         }
@@ -1053,9 +1075,8 @@ void k_NtQueryFullAttributesFile(void) {
         RET(STATUS_OBJECT_PATH_NOT_FOUND);
         return;
     }
-    xk_resolve_case(r.host, r.root_len);
     WlPlatformStat st;
-    if (wl_platform_fs_stat(r.host, &st) != WL_OK) {
+    if (!xk_resolve_case(&r, &st)) {
         RET(STATUS_OBJECT_NAME_NOT_FOUND);
         return;
     }
@@ -1306,9 +1327,8 @@ void k_NtDeleteFile(void) {
         RET(STATUS_ACCESS_DENIED);
         return;
     }
-    xk_resolve_case(r.host, r.root_len);
     WlPlatformStat st;
-    if (wl_platform_fs_stat(r.host, &st) != WL_OK) {
+    if (!xk_resolve_case(&r, &st)) {
         RET(STATUS_OBJECT_NAME_NOT_FOUND);
         return;
     }

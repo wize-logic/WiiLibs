@@ -70,6 +70,54 @@ static void mkdir_p(const char *path) {
     wl_platform_fs_mkdir(tmp);
 }
 
+// Whether the volume under `root` (a folder that exists) finds a name written in another case by itself,
+// as FAT does: the root's last component with its letters' case swapped names a folder, and the parent
+// lists no entry spelled so. Such a volume has no other spelling to look for when a name is not there.
+static bool probe_folds_case(const char *root) {
+    const char *slash = strrchr(root, '/');
+    if (slash == NULL || slash[1] == '\0' || strlen(root) >= 192u) {
+        return false;
+    }
+    char other[192], parent[192], swapped[192];
+    snprintf(other, sizeof other, "%s", root);
+    char *comp = other + (slash + 1 - root);
+    bool any = false;
+    for (char *p = comp; *p != '\0'; p++) {
+        if (isalpha((unsigned char)*p)) {
+            *p = (char)(isupper((unsigned char)*p) ? tolower((unsigned char)*p) : toupper((unsigned char)*p));
+            any = true;
+        }
+    }
+    WlPlatformStat st;
+    if (!any || wl_platform_fs_stat(other, &st) != WL_OK || !st.is_dir) {
+        return false;
+    }
+    snprintf(swapped, sizeof swapped, "%s", comp);
+    // the parent: "sd:/" for a folder at the volume's root
+    size_t plen = (size_t)(slash - root);
+    if (plen > 0u && root[plen - 1u] == ':') {
+        plen++;
+    }
+    snprintf(parent, sizeof parent, "%.*s", (int)plen, root);
+    WlPlatformDir *d = NULL;
+    if (wl_platform_fs_dir_open(parent, &d) != WL_OK) {
+        return false;
+    }
+    bool second = false; // a folder of its own spelled so: a volume that tells the cases apart
+    char name[256];
+    while (!second && wl_platform_fs_dir_next(d, name, sizeof name, NULL) == WL_OK) {
+        second = strcmp(name, swapped) == 0;
+    }
+    wl_platform_fs_dir_close(d);
+    return !second;
+}
+
+void xk_paths_set_folds_case(bool folds) {
+    for (uint32_t i = 0; i < g_mount_count; i++) {
+        g_mounts[i].folds_case = folds;
+    }
+}
+
 void xk_paths_init(const WlXkConfig *cfg) {
     char host[192];
     g_mount_count = 0;
@@ -97,8 +145,10 @@ void xk_paths_init(const WlXkConfig *cfg) {
         }
     }
     for (uint32_t i = 0; i < g_mount_count; i++) {
-        WL_LOG_I(XK_TAG, "mount %s -> %s%s%s", g_mounts[i].device, g_mounts[i].host, g_mounts[i].writable ? " (rw" : " (ro",
-                 g_mounts[i].sparse ? ", sparse)" : ")");
+        g_mounts[i].folds_case = probe_folds_case(g_mounts[i].host);
+        WL_LOG_I(XK_TAG, "mount %s -> %s%s%s%s", g_mounts[i].device, g_mounts[i].host,
+                 g_mounts[i].writable ? " (rw" : " (ro", g_mounts[i].sparse ? ", sparse" : "",
+                 g_mounts[i].folds_case ? ", folds case)" : ")");
     }
 }
 
@@ -280,13 +330,56 @@ bool xk_resolve(const char *name, XkResolved *out) {
     return true;
 }
 
-// Finds `host`'s components in another case when the name as given does not exist (from the
-// mount's root, which exists). Leaves the path as given for components that are not there.
-void xk_resolve_case(char *host, uint32_t root_len) {
-    if (wl_platform_fs_exists(host)) {
-        return;
+// Lists `dir` for an entry that differs from `comp` (`len` bytes) in case only, and writes its spelling
+// over `comp`.
+static bool find_spelling(const char *dir, char *comp, size_t len) {
+    WlPlatformDir *d = NULL;
+    bool found = false;
+    if (wl_platform_fs_dir_open(dir, &d) == WL_OK) {
+        char name[256];
+        while (wl_platform_fs_dir_next(d, name, sizeof name, NULL) == WL_OK) {
+            if (strlen(name) == len && strncasecmp(name, comp, len) == 0) {
+                memcpy(comp, name, len);
+                found = true;
+                break;
+            }
+        }
+        wl_platform_fs_dir_close(d);
     }
-    size_t at = root_len;
+    return found;
+}
+
+// Finds `r->host`'s components in another case when the name as given does not exist (from the
+// mount's root, which exists). Leaves the path as given for components that are not there. Returns
+// whether the path is there, with what it is in `st` (when not NULL).
+//
+// On libfat every look walks the path from the volume's root, so a miss (a file about to be created)
+// is answered with as few looks as it can: none more on a volume that finds other cases itself (FAT),
+// else the parent (there as written, only the last component can be spelled otherwise) and a listing
+// of it, and only when the parent is not there a walk from the mount's root.
+bool xk_resolve_case(XkResolved *r, WlPlatformStat *st) {
+    WlPlatformStat local;
+    if (st == NULL) {
+        st = &local;
+    }
+    char *host = r->host;
+    if (wl_platform_fs_stat(host, st) == WL_OK) {
+        return true;
+    }
+    if (r->mount.folds_case) {
+        return false;
+    }
+    size_t at = r->root_len;
+    char *last = strrchr(host, '/');
+    if (last != NULL && (size_t)(last - host) > at) {
+        *last = '\0';
+        bool parent = wl_platform_fs_exists(host);
+        bool found = parent && find_spelling(host, last + 1, strlen(last + 1));
+        *last = '/';
+        if (parent) {
+            return found && wl_platform_fs_stat(host, st) == WL_OK;
+        }
+    }
     while (host[at] == '/') {
         char *comp = host + at + 1;
         char *end = strchr(comp, '/');
@@ -297,24 +390,14 @@ void xk_resolve_case(char *host, uint32_t root_len) {
         if (!there) {
             // list the parent and take a match that differs in case only
             host[at] = '\0';
-            WlPlatformDir *d = NULL;
-            if (wl_platform_fs_dir_open(at == 0 ? "/" : host, &d) == WL_OK) {
-                char name[256];
-                while (wl_platform_fs_dir_next(d, name, sizeof name, NULL) == WL_OK) {
-                    if (strlen(name) == len && strncasecmp(name, comp, len) == 0) {
-                        memcpy(comp, name, len);
-                        there = true;
-                        break;
-                    }
-                }
-                wl_platform_fs_dir_close(d);
-            }
+            there = find_spelling(at == 0 ? "/" : host, comp, len);
             host[at] = '/';
         }
         comp[len] = saved;
         if (!there) {
-            return; // the rest cannot exist either
+            return false; // the rest cannot exist either
         }
         at += 1u + len;
     }
+    return wl_platform_fs_stat(host, st) == WL_OK;
 }
