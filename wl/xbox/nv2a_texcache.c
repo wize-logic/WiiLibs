@@ -601,8 +601,10 @@ static void refuse(WlNv2aTexCache *cache, const WlNv2aTexture *t, size_t bytes) 
     // (logged now and then: a texture refused once is refused in every frame it is drawn)
     if (cache->refused_logged == 0 || cache->frame - cache->refused_logged >= 600u) {
         cache->refused_logged = cache->frame;
-        WL_LOG_W(TAG, "no memory for a texture of %u bytes (%u kept; %u refused so far)", (unsigned)bytes,
-                 (unsigned)cache->stats.bytes, (unsigned)cache->stats.no_memory);
+        WL_LOG_W(TAG, "no memory for a texture of %u bytes (%08x, %ux%u%s, format %08x; %u kept; %u refused so far)",
+                 (unsigned)bytes, (unsigned)t->phys, (unsigned)t->width, (unsigned)t->height,
+                 t->linear ? " linear" : "", (unsigned)t->format_word, (unsigned)cache->stats.bytes,
+                 (unsigned)cache->stats.no_memory);
     }
 }
 

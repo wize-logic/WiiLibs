@@ -857,7 +857,9 @@ test always passing), the parked depth. `wl_gx_target_clear` is a clear of a rec
 frame has begun, also a quad. `wl_gx_begin_frame` gives the EFB to the back buffer, and
 `wl_gx_end_frame` puts it back if a target holds it. While a target holds it,
 `wl_gx_target_parked_colour` gives the back buffer's parked colour as an RGBA8 texture's image (the
-part parked), for a caller that reads the picture it is drawing while it draws into a target.
+part parked), for a caller that reads the picture it is drawing while it draws into a target;
+`wl_gx_target_set_park_whole(true)` makes every park keep the whole back buffer for such a caller,
+however small the target coming. With lazy depth the depth's block is asked for at its first copy.
 The target functions that draw use raw GX and
 call `wl_gx_invalidate_shadow` after; what they leave set is listed with `wl_gx_target_clear`.
 The part of the EFB that is the back buffer defaults to the video mode's width and EFB height and
