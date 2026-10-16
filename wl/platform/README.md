@@ -804,6 +804,20 @@ draw-done (an application calling `GX_DrawDone` itself) could be woken by the fr
 before its own work was done. Tokens are compared in order (the register holds the last one
 passed), so other tokens sent later do not hide the frame's.
 
+**The GX thread.** libogc suspends one thread at the FIFO's high-water mark: the one that called
+`GX_Init`, unless `GX_SetCurrentGXThread` names another. A program that draws from another thread
+would write on round the ring over commands the GPU has not read (a GPU hang), so
+`wl_gx_begin_frame` and `wl_gx_direct_begin` make the calling thread the GX thread.
+
+**The GPU hang report** (`wii/gx_hang_wii.c`). A 1 s alarm reads the command processor's FIFO read
+pointer; when it has not moved for 10 s while the FIFO holds commands or a sent token is not
+reached, the alarm snapshots the CP's and PI's FIFO registers, the 64 bytes before and at the read
+pointer (uncached) and the ring of the last 16 GX events (frame, token, layout, array, texture,
+TLUT, primitive, flush strip, EFB copy, target quad), and wakes a thread asleep until then. It logs
+them under `[GXHANG]` with what the program said it was at (`wl_gx_hang_where`), syncs the log to
+the SD card, and leaves to the loader 20 s later. Nothing polls; a hung GPU with the GX thread
+suspended at the high-water mark is seen only from an interrupt.
+
 **Overlapping frames.** By default `wl_gx_end_frame` still waits for the GPU to finish the frame
 (not for the display), so whatever the caller drew from may be changed as soon as it returns.
 `wl_gx_set_frame_overlap(true)` drops that wait: the CPU builds the next frame while the GPU
