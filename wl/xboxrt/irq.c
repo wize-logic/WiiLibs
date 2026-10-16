@@ -481,7 +481,7 @@ static void status_report(void) {
     // its top), once a minute who holds it, the threads' host stacks and wl_mem's own heaps
     static uint32_t reports;
     (void)wl_xb_thread_reap();
-    wl_xb_thread_stall_check();
+    wl_xb_thread_stall_check(m.faults_resolved + m.swap_ins + m.file_ins); // paging I/O moves on too
     freeze_check();
     wl_mem_census_log(TAG, reports++ % 6u != 0u);
     if (reports % 6u == 1u) {
