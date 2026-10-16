@@ -246,6 +246,23 @@ typedef struct RECOMP_GUEST_LE { volatile double   v; } recomp_le_f64;
 #define MEMF(addr)   (((recomp_le_f32 *)XBOX_PTR(addr))->v)
 #define MEMD(addr)   (((recomp_le_f64 *)XBOX_PTR(addr))->v)
 
+/** The same accesses at base + disp, disp a constant in [-0x8000, 0x8000) (the lifter's --mem-disp
+ * writes them for MEMxx(base + disp), patch 0021): base is mapped and disp added on the host side, so
+ * accesses through one base share its EA (two instructions each before, and an addi) and the
+ * displacement lands in the access. For every address the guest may touch it is the same access: a
+ * small displacement from a valid base stays in its 256 MB region, where the EA map is a plain
+ * addition; only a wild access that leaves the region (one the Xbox faults on too) lands elsewhere. */
+#define RECOMP_MEM_D(T, b, d) (((T *)(XBOX_PTR(b) + (uintptr_t)(intptr_t)(int32_t)(d)))->v)
+#define MEM8_D(b, d)   RECOMP_MEM_D(recomp_le_u8, b, d)
+#define MEM16_D(b, d)  RECOMP_MEM_D(recomp_le_u16, b, d)
+#define MEM32_D(b, d)  RECOMP_MEM_D(recomp_le_u32, b, d)
+#define SMEM8_D(b, d)  RECOMP_MEM_D(recomp_le_s8, b, d)
+#define SMEM16_D(b, d) RECOMP_MEM_D(recomp_le_s16, b, d)
+#define SMEM32_D(b, d) RECOMP_MEM_D(recomp_le_s32, b, d)
+#define SMEM64_D(b, d) RECOMP_MEM_D(recomp_le_s64, b, d)
+#define MEMF_D(b, d)   RECOMP_MEM_D(recomp_le_f32, b, d)
+#define MEMD_D(b, d)   RECOMP_MEM_D(recomp_le_f64, b, d)
+
 /** Float/double stores, through the value's integer bits: a byte-reversed float store would be
  * a float store, an integer reload and a three-instruction swap; this is the float store, the
  * reload and one stwbrx (two for a double). Always inline, like WL_XB_EA: at -Os GCC calls an

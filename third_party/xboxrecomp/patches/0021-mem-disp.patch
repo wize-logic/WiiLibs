@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Fri, 16 Oct 2026 15:40:00 -0400
+Subject: [PATCH] recomp: --mem-disp writes a small displacement as its own
+ operand of a guest access
+
+The lifter writes a memory operand as one address expression with the
+displacement last: MEM32(esp + 0x10), MEMF(esi + eax * 4 - 0x8). A
+runtime whose guest-to-host address map is not a plain addition (a
+PowerPC host that keeps the Xbox's 0x80000000 window beside user space)
+has to map each of those addresses whole, so [esi + 4] and [esi + 8] pay
+for the map twice and the compiler cannot share it between them.
+
+--mem-disp (mem_disp.py) rewrites each function's MEMxx(base + disp),
+disp a constant in [-0x8000, 0x8000) and base a plain sum of terms, into
+MEMxx_D(base, disp). The template header defines MEMxx_D(b, d) as
+MEMxx((b) + (d)), the same access, so the generated code means what it
+did; a runtime can define it to map base once and add disp on the host.
+A larger displacement (a table indexed by a register, where the
+displacement is the pointer) keeps the old form. Off by default.
+---
+
+diff --git a/tools/recomp/mem_disp.py b/tools/recomp/mem_disp.py
+new file mode 100644
+--- /dev/null
++++ b/tools/recomp/mem_disp.py
+@@ -0,0 +1,79 @@
++"""--mem-disp: a guest access's small constant displacement as its own operand.
++
++The lifter writes a memory operand as one address expression, the
++displacement last (`MEM32(esp + 0x10)`, `MEMF(esi + eax * 4 - 0x8)`). A
++runtime whose guest-to-host address map is not a plain addition (a
++PowerPC host that folds the Xbox's 0x80000000 window next to user space,
++say) has to map every such address on its own, so `[esi + 4]` and
++`[esi + 8]` cost the whole map twice and the compiler cannot share it.
++
++This pass rewrites `MEMxx(base + disp)` into `MEMxx_D(base, disp)` when
++disp is a constant in [-0x8000, 0x8000): the runtime header maps base once
++and adds disp on the host side (recomp_types.h defines MEMxx_D as
++MEMxx(base + disp), the same access, for a runtime that does not care). A
++small displacement from a base the guest dereferences stays in the base's
++region for every valid address, so the two are the same access wherever
++the guest's own access would be valid. A larger displacement (a global
++table indexed by a register, `[eax * 4 + 0x80123456]`) keeps the old form.
++"""
++
++import re
++
++_NAMES = ("MEM8", "MEM16", "MEM32", "SMEM8", "SMEM16", "SMEM32", "SMEM64", "MEMF", "MEMD")
++_CALL = re.compile(r"\b(" + "|".join(_NAMES) + r")\(")
++_TAIL = re.compile(r"^(?P<base>.*\S)\s*(?P<op>[+-])\s*(?P<disp>0x[0-9A-Fa-f]+|\d+)u?$", re.S)
++LIMIT = 0x8000
++
++
++def _split(arg):
++    """(base, signed disp) for `base + disp` / `base - disp` at the top level, or None."""
++    m = _TAIL.match(arg)
++    if not m:
++        return None
++    base = m.group("base")
++    if base.endswith("+") and m.group("op") == "-":  # _fmt_mem's `ebp + - 0x4`
++        base = base[:-1].rstrip()
++    if base.endswith(("+", "-", "~", "!")):
++        return None
++    depth = 0
++    for c in base:  # the base must be a sum of terms: balanced, and at its top level no operator
++        depth += (c == "(") - (c == ")")  # that binds less tightly than + (a << 2 + 4 is a << 6)
++        if depth < 0 or (depth == 0 and c in ",?:<>&|^=!"):
++            return None
++    if depth != 0 or base.rstrip().endswith(("*", "/", "<<", ">>", "&", "|", "^", "(")):
++        return None
++    disp = int(m.group("disp"), 0)
++    disp = -disp if m.group("op") == "-" else disp
++    if not -LIMIT <= disp < LIMIT or disp == 0:
++        return None
++    return base, disp
++
++
++def rewrite(text):
++    """The function's text with every eligible access split; (text, accesses split)."""
++    out, i, hits = [], 0, 0
++    while True:
++        m = _CALL.search(text, i)
++        if not m:
++            out.append(text[i:])
++            break
++        out.append(text[i:m.start()])
++        j, depth = m.end(), 1
++        while depth and j < len(text):
++            depth += (text[j] == "(") - (text[j] == ")")
++            j += 1
++        if depth:
++            out.append(text[m.start():])
++            break
++        inner, n = rewrite(text[m.end():j - 1])  # accesses inside the address
++        hits += n
++        parts = _split(inner)
++        if parts:
++            base, disp = parts
++            sign = "-" if disp < 0 else ""
++            out.append(f"{m.group(1)}_D({base}, {sign}0x{abs(disp):X})")
++            hits += 1
++        else:
++            out.append(f"{m.group(1)}({inner})")
++        i = j
++    return "".join(out), hits
+diff --git a/tools/recomp/test_mem_disp.py b/tools/recomp/test_mem_disp.py
+new file mode 100644
+--- /dev/null
++++ b/tools/recomp/test_mem_disp.py
+@@ -0,0 +1,49 @@
++"""
++--mem-disp: MEMxx(base + disp) written as MEMxx_D(base, disp).
++
++A runtime whose guest-to-host address map is not a plain addition maps
++base once for all the accesses through it; disp must be a small constant
++and base a whole sum of terms, or the access keeps its old form.
++"""
++
++from tools.recomp.mem_disp import rewrite
++
++
++def check(src, want, hits):
++    got, n = rewrite(src)
++    assert got == want, (src, got)
++    assert n == hits, (src, n)
++
++
++def test_register_bases():
++    check("MEM32(_r_esp + 0x108) = MEM32(_r_esi + _r_eax * 4 + 0x14);",
++          "MEM32_D(_r_esp, 0x108) = MEM32_D(_r_esi + _r_eax * 4, 0x14);", 2)
++    check("MEMF(ebp - 0x10)", "MEMF_D(ebp, -0x10)", 1)
++    check("SMEM32(ebp + - 0x4)", "SMEM32_D(ebp, -0x4)", 1)  # _fmt_mem's negative displacement
++    check("MEM32(a - - 4)", "MEM32(a - - 4)", 0)
++    check("x = SMEM16(ecx + 2);", "x = SMEM16_D(ecx, 0x2);", 1)
++
++
++def test_nested_and_parenthesised():
++    check("MEM16(MEM32(a + 8) + 2)", "MEM16_D(MEM32_D(a, 0x8), 0x2)", 2)
++    check("MEMD((a + 0x10) + 4)", "MEMD_D((a + 0x10), 0x4)", 1)
++
++
++def test_left_alone():
++    for src in ("MEM32(0x1234)",                 # a constant address folds anyway
++                "MEM32(eax * 4 + 0x80123456)",   # a table: the displacement is the pointer
++                "MEM32(eax + 0x8000)",           # past the small range
++                "MEM8(a + 0)",
++                "MEM32(x << 2 + 4)",             # + binds tighter than <<
++                "MEM32(a ? b : c + 4)",
++                "MEM32(eax)",
++                "XMEM32(a + 4)"):
++        check(src, src, 0)
++    check("MEM32(eax - 0x8000)", "MEM32_D(eax, -0x8000)", 1)
++
++
++if __name__ == "__main__":
++    for name, fn in sorted(globals().items()):
++        if name.startswith("test_"):
++            fn()
++    print("ok")
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -23,6 +23,7 @@
+ from .config import va_to_file_offset, is_code_address
+ from . import config as _config
+ from .disasm import Disassembler
++from .mem_disp import rewrite as mem_disp_rewrite
+ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
+                      detect_setjmp_helpers, _func_ident, _operand_width)
+@@ -501,6 +502,9 @@
+         self.x87_locals = False
+         self.reg_locals = False
+         self.x87_stats = {}
++        # mem_disp.py: MEMxx(base + small disp) as MEMxx_D(base, disp) (--mem-disp)
++        self.mem_disp = False
++        self.mem_disp_count = 0
+ 
+     def discover_static_indirect_targets(self, *, coalescing=False):
+         """Recover function entries from bounded static callback tables."""
+@@ -3085,6 +3089,10 @@
+             key = why or "in locals"
+             self.x87_stats[key] = self.x87_stats.get(key, 0) + 1
+ 
++        if self.mem_disp:
++            text, n = mem_disp_rewrite("\n".join(lines))
++            self.mem_disp_count += n
++            return text
+         return "\n".join(lines)
+ 
+     def _find_used_registers(self, instructions):
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -285,6 +285,9 @@
+                              "g_fp_* globals only where control leaves the "
+                              "function (x87_locals.py); needs a runtime header "
+                              "with RECOMP_FP_PC_CW")
++    parser.add_argument("--mem-disp", action="store_true",
++                        help="Write a guest access with a small constant displacement as "
++                             "MEMxx_D(base, disp), so a runtime can map base once (mem_disp.py)")
+     parser.add_argument("--reg-locals", action="store_true",
+                         help="Keep each function's integer registers (eax..edi, esp) "
+                              "in C locals too, written back to the g_* globals only "
+@@ -369,6 +372,7 @@
+     )
+     translator.translator.x87_locals = args.x87_locals
+     translator.translator.reg_locals = args.reg_locals
++    translator.translator.mem_disp = args.mem_disp
+ 
+     t_load = time.time() - t0
+     print(f"Loaded {len(translator.func_db)} functions, "
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -487,6 +487,20 @@
+ /** Float/double memory access. */
+ #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
+ #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
++
++/** The same accesses at base + disp, a small constant (recomp --mem-disp
++ * writes them for MEMxx(base + disp)). Here exactly MEMxx(base + disp); a
++ * runtime whose address map is not a plain addition can map base once and
++ * add disp on the host side. */
++#define MEM8_D(b, d)   MEM8((b) + (d))
++#define MEM16_D(b, d)  MEM16((b) + (d))
++#define MEM32_D(b, d)  MEM32((b) + (d))
++#define SMEM8_D(b, d)  SMEM8((b) + (d))
++#define SMEM16_D(b, d) SMEM16((b) + (d))
++#define SMEM32_D(b, d) SMEM32((b) + (d))
++#define SMEM64_D(b, d) SMEM64((b) + (d))
++#define MEMF_D(b, d)   MEMF((b) + (d))
++#define MEMD_D(b, d)   MEMD((b) + (d))
+ 
+ /** Float/double stores. The lifter emits MEMF_SET(addr, v) rather than
+  * "MEMF(addr) = v" so a runtime can store a float some other way without
+-- 
+2.43.0
+

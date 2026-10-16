@@ -36,7 +36,9 @@ written back to the g_fp_* globals only where control leaves the function (--x87
 0013: the memory model's loads and stores were most of the time of x87 code on PowerPC; results are
 identical), and its integer registers too (--reg-locals, patch 0014: every guest store made the
 compiler reload them). A title's config can turn either off ("x87_locals": false,
-"reg_locals": false).
+"reg_locals": false). It writes a guest access's small constant displacement apart from its base
+(--mem-disp, patch 0021: MEM32_D(esi, 0x8)), so the PowerPC header maps the base once for the
+accesses through it ("mem_disp": false turns it off).
 
 A title's own knowledge is data, passed with --config (JSON; relative paths are relative to it):
 
@@ -63,6 +65,8 @@ A title's own knowledge is data, passed with --config (JSON; relative paths are 
       "x87_locals": false,                   the x87 state in memory at every operation (the default
                                              true keeps it in locals inside a function)
       "reg_locals": false,                   the same for the integer registers (default true)
+      "mem_disp": false,                     every access's address whole (the default true writes a
+                                             small displacement apart: MEM32_D(esi, 0x8), patch 0021)
       "hot_functions": "hot.txt" or ["sub_00052520", "0x00088B80"],   the functions compiled at
                                              -O2 (tu/recomp_tu_hot.c); a file is read for its
                                              sub_XXXXXXXX names and 0x addresses (a profile report
@@ -328,6 +332,8 @@ class Run:
             rcmd.append("--x87-locals")
         if c.get("reg_locals", True):
             rcmd.append("--reg-locals")
+        if c.get("mem_disp", True):
+            rcmd.append("--mem-disp")
         rin = [self.xbe, functions, disasm / "labels.json", func_id / "identified_functions.json", abi]
         if c.get("icall_sites"):
             rcmd += ["--icall-sites", str(self.cfg_path(c["icall_sites"]))]
@@ -556,7 +562,7 @@ def load_config(path):
     known = {"name", "seed_functions", "extra_sections", "text_only", "manual_functions",
              "coalesce_functions", "trace_functions", "split", "disasm_args", "func_id_args",
              "abi_args", "recomp_args", "icall_sites", "patches", "comment", "vertex_programs", "x87_locals",
-             "reg_locals", "hot_functions"}
+             "reg_locals", "mem_disp", "hot_functions"}
     unknown = sorted(set(cfg) - known)
     if unknown:
         raise Failure(f"{path}: unknown keys {unknown} (known: {sorted(known)})")

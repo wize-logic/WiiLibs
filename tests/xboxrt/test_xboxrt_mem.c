@@ -230,8 +230,8 @@ static int range_grid_agrees(uint32_t base) {
     static const uint32_t offs[] = {0, 1, 2, 0x7F0u, 0xFF0u, 0xFFCu, 0xFFDu, 0xFFEu, 0xFFFu};
     static const uint32_t ns[] = {0, 1, 2, 3, 4, 8, 16, 0xFFFu, 0x1000u, 0x1001u, 0x2000u, 0x3000u, 0x10000u,
                                   0x80000000u, 0xFFFFF000u, 0xFFFFF001u, 0xFFFFFFFEu, 0xFFFFFFFFu};
-    static const uint32_t extra[] = {0, 0x0FFFF000u, 0x10000000u, 0x80000000u, 0x83FFF000u, 0x84000000u,
-                                     0xF0000000u, 0xFD000000u, 0xFFFFF000u};
+    static const uint32_t extra[] = {0, 0x0FFFF000u, 0x10000000u, 0x7FFFF000u, 0x80000000u, 0x81234000u,
+                                     0x83FFF000u, 0x84000000u, 0x8FFFF000u, 0xF0000000u, 0xFD000000u, 0xFFFFF000u};
     for (uint32_t k = 0; k < 8u + sizeof extra / sizeof extra[0]; k++) {
         uint32_t page = k < 8u ? base + (k << WL_XB_PAGE_SHIFT) : extra[k - 8u];
         for (unsigned o = 0; o < sizeof offs / sizeof offs[0]; o++) {
@@ -262,6 +262,13 @@ TEST range_ok_inline_agrees(void) {
     ASSERT(!wl_xb_range_ok(va + 0x1FFFu, 0xFFFFFFFFu)); // wraps back into its own page
     ASSERT(wl_xb_range_ok(va + 0x1000u, 0));
     ASSERT(!wl_xb_range_ok(va + 0x3000u, 4));
+    // the RAM's window (64 MB here): inside, up to its last byte, and not past it
+    ASSERT(wl_xb_range_ok(0x80000000u, 4));
+    ASSERT(wl_xb_range_ok(0x83FFFFFCu, 4));
+    ASSERT(wl_xb_range_ok(0x80000000u, 0x04000000u));
+    ASSERT(!wl_xb_range_ok(0x83FFFFFDu, 4));
+    ASSERT(!wl_xb_range_ok(0x84000000u, 1));
+    ASSERT(!wl_xb_range_ok(0x7FFFFFFEu, 4));
     ASSERT_EQ(WL_OK, wl_xb_va_decommit(va + 0x2000u, 0x1000u)); // empties the memo
     ASSERT(!wl_xb_range_ok(va + 0x2000u, 4));
     ASSERT(!wl_xb_range_ok(va + 0x1FFEu, 4));
