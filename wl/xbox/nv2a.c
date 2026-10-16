@@ -355,17 +355,6 @@ static void pusher_stop(WlNv2a *dev, unsigned chid, uint32_t at, uint32_t word, 
     dev->channels[chid].get = dev->channels[chid].put;
 }
 
-// whether a run of words to this method may go to the 3D object at once: the 3D class's own methods
-// (not the puller's, an object handle the puller looks up, or the trap's NO_OPERATION), a run that
-// stays among them
-static bool bulk_method(const WlNv2aChannel *ch, unsigned subchannel, uint32_t method) {
-    return ch->subchannel_class[subchannel] == WL_NV2A_CLASS_KELVIN && method >= 0x100u &&
-           method != WL_NV2A_K_NO_OPERATION &&
-           !(method >= WL_NV2A_PULLER_HANDLE_FIRST && method <= WL_NV2A_PULLER_HANDLE_LAST) &&
-           (ch->non_increasing || method + 4u * ch->count <= WL_NV2A_PULLER_HANDLE_FIRST ||
-            method > WL_NV2A_PULLER_HANDLE_LAST);
-}
-
 static void run_channel(WlNv2a *dev, unsigned chid) {
     WlNv2aChannel *ch = &dev->channels[chid];
     uint32_t words = 0;
@@ -400,7 +389,7 @@ static void run_channel(WlNv2a *dev, unsigned chid) {
             }
         }
         for (i = 0; i < span && ch->get != ch->put && !ch->suspended && !redirected; i += 4) {
-            uint32_t word = wl_rd_le32(p + i), at = ch->get;
+            uint32_t word = wl_rd_le32(p + i), at = ch->get, avail;
 
             ch->get += 4;
             dev->stats.words++;
@@ -409,21 +398,34 @@ static void run_channel(WlNv2a *dev, unsigned chid) {
                 ch->get = ch->put;
                 break;
             }
+            // (the words that may go at once: as far as this span, PUT and the word limit allow)
+            avail = (span - i) / 4u;
+            if (ch->put >= at && (ch->put - at) / 4u < avail) {
+                avail = (ch->put - at) / 4u;
+            }
+            if (avail > WL_NV2A_KICK_WORD_LIMIT - (words - 1u)) {
+                avail = WL_NV2A_KICK_WORD_LIMIT - (words - 1u);
+            }
+            if (ch->count == 0 && avail >= 2u) {
+                // (method headers to the 3D object and their runs, from this one on, in one loop:
+                // each word what the pusher and the puller make of it, without their tests for each)
+                uint32_t taken = wl_nv2a_kelvin_push(dev, ch, p + i, avail);
+
+                if (taken != 0) {
+                    ch->get = at + 4u * taken;
+                    dev->stats.words += taken - 1u;
+                    words += taken - 1u;
+                    i += 4u * (taken - 1u);
+                    continue;
+                }
+            }
             if (ch->count != 0) {
                 uint32_t method = ch->method, run;
 
-                // (the rest of a header's run to the 3D object at once, as far as this span, PUT and
-                // the word limit allow: each word what the puller makes of it, without the pusher's and
-                // the puller's tests for each)
-                run = (span - i) / 4u;
-                if (ch->put >= at && (ch->put - at) / 4u < run) {
-                    run = (ch->put - at) / 4u;
-                }
-                run = run < ch->count ? run : ch->count;
-                if (run > WL_NV2A_KICK_WORD_LIMIT - (words - 1u)) {
-                    run = WL_NV2A_KICK_WORD_LIMIT - (words - 1u);
-                }
-                if (run >= 2 && bulk_method(ch, ch->subchannel, method)) {
+                // (the rest of a header's run to the 3D object at once: each word what the puller
+                // makes of it, without the pusher's and the puller's tests for each)
+                run = avail < ch->count ? avail : ch->count;
+                if (wl_nv2a_bulk_method(ch->subchannel_class[ch->subchannel], method, ch->non_increasing, ch->count)) {
                     // (a method that stops the channel leaves the run's rest for later)
                     run = wl_nv2a_kelvin_methods(dev, method, !ch->non_increasing, p + i, run);
                     ch->get = at + 4u * run;

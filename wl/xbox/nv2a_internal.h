@@ -44,6 +44,15 @@ typedef struct WlNv2aChannel {
     uint32_t semaphore_base, semaphore_limit, semaphore_offset;
 } WlNv2aChannel;
 
+// whether a run of `count` words to this method may go to the 3D object at once: the 3D class's own
+// methods (not the puller's, an object handle the puller looks up, or the trap's NO_OPERATION), a run
+// that stays among them
+static inline bool wl_nv2a_bulk_method(uint32_t class_id, uint32_t method, bool non_increasing, uint32_t count) {
+    return class_id == WL_NV2A_CLASS_KELVIN && method >= 0x100u && method != WL_NV2A_K_NO_OPERATION &&
+           !(method >= WL_NV2A_PULLER_HANDLE_FIRST && method <= WL_NV2A_PULLER_HANDLE_LAST) &&
+           (non_increasing || method + 4u * count <= WL_NV2A_PULLER_HANDLE_FIRST || method > WL_NV2A_PULLER_HANDLE_LAST);
+}
+
 typedef struct WlNv2aCapture WlNv2aCapture;
 
 struct WlNv2a {
@@ -119,6 +128,13 @@ void wl_nv2a_kelvin_init(WlNv2a *dev);
 // (the words taken: fewer than `count` when a method stopped the channel, the rest left for later)
 uint32_t wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const uint8_t *words, uint32_t count);
 void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param);
+// method headers and their runs to the 3D object, from `words` (at most `avail` of them, little-endian)
+// on, in one loop: what the pusher and the puller make of them a word at a time. It stops before a
+// word that is not a method header or a header wl_nv2a_bulk_method refuses, and after a method that
+// stops the channel; a run cut short (by `avail` or a stop) is left in the channel's header state, as
+// the pusher leaves it. The words taken (0: the first is not such a header); `ch` is the channel
+// running, with no header in progress
+uint32_t wl_nv2a_kelvin_push(WlNv2a *dev, WlNv2aChannel *ch, const uint8_t *words, uint32_t avail);
 // a trap the title's ISR must see (NO_OPERATION with a parameter; `method` with its subchannel in
 // bits 18:16, as TRAPPED_ADDR has it): true when the pusher stops
 bool wl_nv2a_trap(WlNv2a *dev, uint32_t method, uint32_t param);
