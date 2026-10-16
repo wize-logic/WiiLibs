@@ -1405,6 +1405,28 @@ static uint32_t set_delete(uint32_t h, bool on) {
     return KN(S_NT_SET_INFO, h, iosb, disp, 1, 13);
 }
 
+// A file the title keeps open: its size reaches the card when the title leaves (wl_xk_files_flush),
+// without a close.
+TEST files_flushed_open(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t st = 0;
+    uint32_t h = open_path("z:\\slot.map", 0xC0000000u, 3, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    ASSERT_EQ_FMT(0u, set_eof(h, 0x01000000u), "%08x");
+    ASSERT_EQ(0x01000000ull, host_sidecar("hdd/Z/slot.map"));
+    uint32_t iosb = gmem(8), data = gstr("tail"), off = gmem(8);
+    wl_xb_wr64(off, 0x01000000u); // past the end: the file grows to its bytes
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h, 0, 0, 0, iosb, data, 4, off), "%08x");
+    ASSERT_EQ(0x01000000ull, host_sidecar("hdd/Z/slot.map")); // not yet
+    wl_xk_files_flush();
+    ASSERT_EQ(0ull, host_sidecar("hdd/Z/slot.map")); // its bytes hold its size: no sidecar
+    ASSERT_EQ(0x01000004ull, query_eof(h));
+    KN(S_NT_CLOSE, h);
+    PASS();
+}
+
 TEST files_share_one_size(void) {
     boot();
     ASSERT(g_ready);
@@ -2015,6 +2037,7 @@ SUITE(kernel_suite) {
     RUN_TEST(files_io_counts);
     RUN_TEST(virtual_and_contiguous_memory);
     RUN_TEST(rtl_crypto_settings);
+    RUN_TEST(files_flushed_open);
     RUN_TEST(files_share_one_size);
     RUN_TEST(files_failures_leave_the_request_alone);
     RUN_TEST(files_deleted_at_the_last_close);

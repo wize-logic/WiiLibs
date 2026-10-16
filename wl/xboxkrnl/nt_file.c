@@ -28,6 +28,18 @@
 #define SIDECAR ".wlsz"
 #define RAW_KEEP 0x10000u
 #define XK_IO_LOG_BYTES (64ull << 20)
+// A file written this much since its last flush is flushed. The card's FAT keeps a file's size and
+// time in its directory entry, written only by a flush or a close, and a title keeps some files open
+// for good (Halo's Z: cache slots): without it a slot inflated in one session would be found at the
+// next with its old time (Halo replaces the slot with the oldest time) or its old size. The Wii's
+// writes are on the card already, so a flush only writes the entry; the host's file system keeps
+// both current by itself, and its flush would wait for every byte to reach the disk.
+#define XK_FLUSH_BYTES (32ull << 20)
+#if defined(__wii__)
+#define XK_FLUSH_CARD 1
+#else
+#define XK_FLUSH_CARD 0
+#endif
 
 #define FILE_SUPERSEDE 0u
 #define FILE_OPEN 1u
@@ -690,6 +702,8 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
     return STATUS_SUCCESS;
 }
 
+static void file_flush(XkFile *f, bool card);
+
 static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uint32_t *done) {
     *done = 0;
     if (f->kind == XK_FILE_DIRECTORY || f->kind == XK_FILE_CDROM) {
@@ -716,6 +730,12 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
     if (f->sparse && f->fcb != NULL && off + *done > f->fcb->logical) {
         f->fcb->logical = off + *done;
         f->resized = true;
+    }
+    if (f->kind == XK_FILE_REGULAR) {
+        f->unflushed += *done;
+        if (f->unflushed >= XK_FLUSH_BYTES) {
+            file_flush(f, false);
+        }
     }
     return status;
 }
@@ -811,18 +831,37 @@ void k_NtWriteFile(void) {
 }
 
 // NTSTATUS NtFlushBuffersFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock)
+// A file's writes to the card, with its size and time (`card`, else only where the platform needs it:
+// XK_FLUSH_CARD), and a sparse file's sidecar.
+static void file_flush(XkFile *f, bool card) {
+    if (f->pf != NULL) {
+        if (card || XK_FLUSH_CARD) {
+            wl_platform_fs_flush(f->pf);
+        }
+        if (f->sparse && f->resized && f->fcb != NULL) {
+            fcb_sidecar_write(f->fcb, physical_size(f));
+        }
+    }
+    f->unflushed = 0;
+}
+
+void wl_xk_files_flush(void) {
+    for (XkFcb *c = g_fcbs; c != NULL; c = c->next) {
+        for (XkFile *f = c->files; f != NULL; f = f->fcb_next) {
+            if (f->unflushed != 0) {
+                file_flush(f, false);
+            }
+        }
+    }
+}
+
 void k_NtFlushBuffersFile(void) {
     XkFile *f = file_of(ARG(0));
     if (f == NULL) {
         RET(STATUS_INVALID_HANDLE);
         return;
     }
-    if (f->pf != NULL) {
-        wl_platform_fs_flush(f->pf);
-        if (f->sparse && f->resized && f->fcb != NULL) {
-            fcb_sidecar_write(f->fcb, physical_size(f));
-        }
-    }
+    file_flush(f, true);
     xk_iosb(ARG(1), STATUS_SUCCESS, 0);
     RET(STATUS_SUCCESS);
 }

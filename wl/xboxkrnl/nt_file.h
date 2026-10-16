@@ -73,6 +73,7 @@ struct XkFile {
     uint64_t io_us;          // the time spent in the card's reads and writes
     uint64_t io_end;         // where the last request ended
     uint64_t io_logged;      // the bytes at the last log line
+    uint64_t unflushed;      // bytes written since the file was last flushed (XK_FLUSH_BYTES)
 };
 
 // Raw partition sectors (the partition table on Partition0; what the title wrote to a partition's

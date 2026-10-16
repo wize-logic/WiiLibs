@@ -622,6 +622,7 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     // waiting for the lock), then the lock is the boot thread's for good: no guest code runs again.
     wl_xb_service_stop();
     wl_xb_lock(boot);
+    wl_xk_files_flush(); // the files the title left open (its Z: cache slots) whole on the card
 #if defined(__wii__)
     wl_platform_log_flush();
 #endif
