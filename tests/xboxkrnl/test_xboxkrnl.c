@@ -1201,6 +1201,36 @@ TEST files_sparse_cache_drive(void) {
     PASS();
 }
 
+// A handle's I/O counts (the log's "file I/O" lines): requests, bytes and the jumps between them.
+TEST files_io_counts(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t st = 0, iosb = gmem(8);
+    uint32_t h = open_path("z:\\cache003.map", 0xC0000000u, 3, 0x20, &st); // OPEN_IF
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    uint32_t n = 3000u;
+    uint32_t buf = gmem(n), off = gmem(8);
+    wl_xb_fill(buf, 0x5A, n);
+    wl_xb_wr64(off, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h, 0, 0, 0, iosb, buf, n, off), "%08x");
+    wl_xb_wr64(off, n);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h, 0, 0, 0, iosb, buf, 100, off), "%08x"); // where the last ended
+    wl_xb_wr64(off, 1024);
+    ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, 0, 0, 0, iosb, buf, 512, off), "%08x"); // a jump back
+    ASSERT_EQ(0x5A, wl_xb_rd8(buf + 511));
+    WlXkFileIo io;
+    ASSERT(wl_xk_file_io(h, &io));
+    ASSERT_EQ_FMT(2u, io.writes, "%u");
+    ASSERT_EQ_FMT(n + 100u, (uint32_t)io.write_bytes, "%u");
+    ASSERT_EQ_FMT(1u, io.reads, "%u");
+    ASSERT_EQ_FMT(512u, (uint32_t)io.read_bytes, "%u");
+    ASSERT_EQ_FMT(1u, io.jumps, "%u");
+    ASSERT(!wl_xk_file_io(0x12345678u, &io));
+    KN(S_NT_CLOSE, h);
+    PASS();
+}
+
 // ---- Memory -------------------------------------------------------------------------------------
 
 TEST virtual_and_contiguous_memory(void) {
@@ -2071,6 +2101,7 @@ SUITE(kernel_suite) {
     RUN_TEST(a_priority_change_resorts_the_queue);
     RUN_TEST(files_dvd_and_overlapped);
     RUN_TEST(files_sparse_cache_drive);
+    RUN_TEST(files_io_counts);
     RUN_TEST(virtual_and_contiguous_memory);
     RUN_TEST(rtl_crypto_settings);
     RUN_TEST(files_share_one_size);

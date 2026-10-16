@@ -27,6 +27,7 @@
 #define BOUNCE 65536u
 #define SIDECAR ".wlsz"
 #define RAW_KEEP 0x10000u
+#define XK_IO_LOG_BYTES (64ull << 20)
 
 #define FILE_SUPERSEDE 0u
 #define FILE_OPEN 1u
@@ -70,7 +71,9 @@ int xk_strnicmp(const char *a, const char *b, size_t n) {
 }
 
 void xk_files_init(const WlXkConfig *cfg) {
-    g_bounce = malloc(BOUNCE);
+    // aligned for the card: libdvm's cache moves a whole page of an aligned buffer straight to the
+    // card, and copies a misaligned one through its four pages (the FAT's sectors pushed out with it)
+    g_bounce = aligned_alloc(64, BOUNCE);
     snprintf(g_data_dir, sizeof g_data_dir, "%s", cfg->data_dir);
     xk_paths_init(cfg);
 }
@@ -315,9 +318,58 @@ void wl_xk_file_changed(const char *host) {
     fcb_pages_forget(c, 0, UINT64_MAX);
 }
 
+// A handle's I/O so far, in the log: how a load reads and writes (sizes, jumps, the card's time).
+static void io_log(const XkFile *f, const char *why) {
+    uint32_t ops = f->io_reads + f->io_writes;
+    WL_LOG_I(XK_TAG, "file I/O %s: %s: %u reads (%u KB, %u KB each), %u writes (%u KB, %u KB each), %u jumps, %u ms",
+             why, f->name, (unsigned)f->io_reads, (unsigned)(f->io_read_bytes >> 10),
+             f->io_reads != 0 ? (unsigned)(f->io_read_bytes / f->io_reads >> 10) : 0u, (unsigned)f->io_writes,
+             (unsigned)(f->io_write_bytes >> 10),
+             f->io_writes != 0 ? (unsigned)(f->io_write_bytes / f->io_writes >> 10) : 0u, (unsigned)f->io_jumps,
+             ops != 0 ? (unsigned)(f->io_us / 1000u) : 0u);
+}
+
+// One request's count: a line every XK_IO_LOG_BYTES of a handle's traffic.
+static void io_note(XkFile *f, bool write, uint64_t off, uint32_t len, uint64_t us) {
+    if (write) {
+        f->io_writes++;
+        f->io_write_bytes += len;
+    } else {
+        f->io_reads++;
+        f->io_read_bytes += len;
+    }
+    if (off != f->io_end && f->io_reads + f->io_writes > 1u) {
+        f->io_jumps++;
+    }
+    f->io_end = off + len;
+    f->io_us += us;
+    uint64_t total = f->io_read_bytes + f->io_write_bytes;
+    if (total - f->io_logged >= XK_IO_LOG_BYTES) {
+        f->io_logged = total;
+        io_log(f, "so far");
+    }
+}
+
+bool wl_xk_file_io(uint32_t handle, WlXkFileIo *out) {
+    XkObject *o = xk_handle_get_type(handle, XK_OBJ_FILE);
+    if (o == NULL || o->file == NULL || out == NULL) {
+        return false;
+    }
+    const XkFile *f = o->file;
+    *out = (WlXkFileIo){.reads = f->io_reads,
+                        .writes = f->io_writes,
+                        .jumps = f->io_jumps,
+                        .read_bytes = f->io_read_bytes,
+                        .write_bytes = f->io_write_bytes};
+    return true;
+}
+
 void xk_file_close(XkFile *f) {
     if (f == NULL) {
         return;
+    }
+    if (f->io_read_bytes + f->io_write_bytes >= XK_IO_LOG_BYTES) {
+        io_log(f, "at close");
     }
     if (f->pf != NULL) {
         wl_xb_file_forget(f->pf, 0, UINT64_MAX); // its pages' bytes are read back while it is open
@@ -723,9 +775,11 @@ void k_NtReadFile(void) {
     begin_io(handle, ARG(1));
     uint64_t off = io_offset(f, ARG(7));
     uint32_t done = 0;
+    uint64_t t0 = wl_platform_time_us();
     uint32_t status = do_read(f, off, ARG(5), ARG(6), &done);
     if (NT_SUCCESS(status)) {
         f->pos = off + done;
+        io_note(f, false, off, done, wl_platform_time_us() - t0);
     }
     RET(complete_io(f, handle, ARG(1), ARG(2), ARG(3), ARG(4), status, done));
 }
@@ -747,9 +801,11 @@ void k_NtWriteFile(void) {
     begin_io(handle, ARG(1));
     uint64_t off = io_offset(f, ARG(7));
     uint32_t done = 0;
+    uint64_t t0 = wl_platform_time_us();
     uint32_t status = do_write(f, off, ARG(5), ARG(6), &done);
     if (NT_SUCCESS(status)) {
         f->pos = off + done;
+        io_note(f, true, off, done, wl_platform_time_us() - t0);
     }
     RET(complete_io(f, handle, ARG(1), ARG(2), ARG(3), ARG(4), status, done));
 }

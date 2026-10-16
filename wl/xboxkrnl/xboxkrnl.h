@@ -88,6 +88,15 @@ void wl_xk_stats(WlXkStats *out);
 // snapshots): guest pages filled from its bytes forget them (mem.h, wl_xb_file_pages). Before the
 // change; `host` as the kernel names it (the data folder's path, then the file's).
 void wl_xk_file_changed(const char *host);
+// What a file handle's reads and writes moved (NtReadFile/NtWriteFile that succeeded): the log shows
+// it every 64 MB and at close ("file I/O"), with the time the card took. False for a handle that is
+// not a file.
+typedef struct {
+    uint32_t reads, writes;
+    uint32_t jumps; // requests that did not start where the one before ended
+    uint64_t read_bytes, write_bytes;
+} WlXkFileIo;
+bool wl_xk_file_io(uint32_t handle, WlXkFileIo *out);
 
 #ifdef __cplusplus
 }

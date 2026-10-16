@@ -66,6 +66,13 @@ struct XkFile {
     bool held;              // an entry found that did not fit the caller's buffer: returned next
     char held_name[256];
     WlPlatformStat held_st;
+    // what this handle moved (a map's load is mostly this): logged every XK_IO_LOG_BYTES and at close
+    uint32_t io_reads, io_writes;
+    uint32_t io_jumps;       // requests that did not start where the last one ended
+    uint64_t io_read_bytes, io_write_bytes;
+    uint64_t io_us;          // the time spent in the card's reads and writes
+    uint64_t io_end;         // where the last request ended
+    uint64_t io_logged;      // the bytes at the last log line
 };
 
 // Raw partition sectors (the partition table on Partition0; what the title wrote to a partition's
