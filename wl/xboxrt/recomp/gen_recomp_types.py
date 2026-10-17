@@ -42,6 +42,9 @@ WiiLibs' copy (wl/xboxrt/recomp/recomp_types.h) is that template, with WiiLibs' 
  15. PUSH32 onto the guest's own esp (g_esp, how every direct call pushes its return address) is a
      call of one small function per unit in code built for size (-Os: the units the profile does
      not name hot), not eight inline instructions
+ 16. MEMxx_SP(esp, disp) and MEMF/MEMD_SET_SP (--stack-disp), PUSH32 and POP32 address the guest
+     stack as esp + disp without WL_XB_EA: every guest stack is below WL_XB_USER_LIMIT, where the
+     transform is the identity; the PC=24 fast path tests the exponent with one add and one mask
 
 On a little-endian host the storage-order attribute does nothing and the byte swaps are
 identities, so the same header serves host tests.
@@ -276,6 +279,28 @@ typedef struct RECOMP_GUEST_LE { double v; } recomp_le_f64;
 #define MEMF_D(b, d)   RECOMP_MEM_D(recomp_le_f32, b, d)
 #define MEMD_D(b, d)   RECOMP_MEM_D(recomp_le_f64, b, d)
 
+/* The same accesses at esp + disp (--stack-disp writes them for an access whose base is esp, disp 0
+ * included), without WL_XB_EA: wl/xboxrt keeps every guest stack below WL_XB_USER_LIMIT
+ * (0x10000000, checked when a thread is created), where the transform is the identity, so the
+ * address is esp + disp itself (plus g_xbox_mem_offset on a host). GCC folds disp into the load and
+ * keeps one register for esp, not one per esp the pushes and calls make (7% of the instructions
+ * of Halo's hot units). */
+#ifdef WL_XB_EA_BASE_ZERO
+#define RECOMP_STACK_PTR(a) ((uintptr_t)(uint32_t)(a))
+#else
+#define RECOMP_STACK_PTR(a) ((uintptr_t)(uint32_t)(a) + (uintptr_t)g_xbox_mem_offset)
+#endif
+#define RECOMP_MEM_SP(T, b, d) (((T *)RECOMP_STACK_PTR((uint32_t)(b) + (uint32_t)(int32_t)(d)))->v)
+#define MEM8_SP(b, d)   RECOMP_MEM_SP(recomp_le_u8, b, d)
+#define MEM16_SP(b, d)  RECOMP_MEM_SP(recomp_le_u16, b, d)
+#define MEM32_SP(b, d)  RECOMP_MEM_SP(recomp_le_u32, b, d)
+#define SMEM8_SP(b, d)  RECOMP_MEM_SP(recomp_le_s8, b, d)
+#define SMEM16_SP(b, d) RECOMP_MEM_SP(recomp_le_s16, b, d)
+#define SMEM32_SP(b, d) RECOMP_MEM_SP(recomp_le_s32, b, d)
+#define SMEM64_SP(b, d) RECOMP_MEM_SP(recomp_le_s64, b, d)
+#define MEMF_SP(b, d)   RECOMP_MEM_SP(recomp_le_f32, b, d)
+#define MEMD_SP(b, d)   RECOMP_MEM_SP(recomp_le_f64, b, d)
+
 /** Float/double stores, through the value's integer bits: a byte-reversed float store would be
  * a float store, an integer reload and a three-instruction swap; this is the float store, the
  * reload and one stwbrx (two for a double). Always inline, like WL_XB_EA: at -Os GCC calls an
@@ -296,10 +321,23 @@ RECOMP_MEM_SET_INLINE void recomp_memd_set(uint32_t addr, double v) {
     union { double d; uint64_t u; } c;
     c.d = v;
     MEM32(addr) = (uint32_t)c.u;
-    MEM32(addr + 4u) = (uint32_t)(c.u >> 32);
+    MEM32_D(addr, 4) = (uint32_t)(c.u >> 32);
 }
 #define MEMF_SET(addr, v) recomp_memf_set((uint32_t)(addr), (float)(v))
 #define MEMD_SET(addr, v) recomp_memd_set((uint32_t)(addr), (double)(v))
+RECOMP_MEM_SET_INLINE void recomp_memf_set_sp(uint32_t addr, float v) {
+    union { float f; uint32_t u; } c;
+    c.f = v;
+    MEM32_SP(addr, 0) = c.u;
+}
+RECOMP_MEM_SET_INLINE void recomp_memd_set_sp(uint32_t addr, double v) {
+    union { double d; uint64_t u; } c;
+    c.d = v;
+    MEM32_SP(addr, 0) = (uint32_t)c.u;
+    MEM32_SP(addr, 4) = (uint32_t)(c.u >> 32);
+}
+#define MEMF_SET_SP(b, d, v) recomp_memf_set_sp((uint32_t)(b) + (uint32_t)(int32_t)(d), (float)(v))
+#define MEMD_SET_SP(b, d, v) recomp_memd_set_sp((uint32_t)(b) + (uint32_t)(int32_t)(d), (double)(v))
 """
 
 FPPC_OLD = """/* RECOMP_FP_PC_CW takes the control word as an argument: a function whose x87
@@ -314,7 +352,8 @@ static inline double recomp_fp_pc24(double x) {
     float f = (float)x;
     uint32_t bits;
     memcpy(&bits, &f, sizeof bits);
-    if (__builtin_expect(((bits >> 23) & 0xFFu) - 1u < 0xFEu, 1))
+    /* exponent 1..254: +1 then its top seven bits not all zero (addis, andis., one branch) */
+    if (__builtin_expect(((bits + 0x00800000u) & 0x7F000000u) != 0, 1))
         return (double)f;
     return recomp_fp_round24(x);
 }
@@ -511,7 +550,7 @@ PUSH_OLD = """#define PUSH32(sp, val) do { \\
 PUSH_NEW = """#define RECOMP_PUSH32_INLINE(sp, val) do { \\
     uint32_t _pv = (uint32_t)(val); \\
     (sp) -= 4; \\
-    MEM32(sp) = _pv; \\
+    MEM32_SP(sp, 0) = _pv; \\
 } while(0)
 /* WiiLibs: in code built for size (-Os, the units the profile does not name hot) a push onto the
  * guest's own esp, g_esp, is a call of recomp_push32_esp: load, decrement, store, the address
@@ -532,6 +571,10 @@ static __attribute__((noinline, unused)) void recomp_push32_esp(uint32_t v) {
 #endif
 """
 
+
+POP_OLD = """#define POP32(sp, dst) do { \\
+    (dst) = MEM32(sp); \\"""
+POP_NEW = POP_OLD.replace("MEM32(sp)", "MEM32_SP(sp, 0)")
 
 PORT_OLD = """#ifndef RECOMP_PORT_IN
 #define RECOMP_PORT_IN(port, size) ((void)(port), (void)(size), 0u)
@@ -583,6 +626,7 @@ def transform(src: str, commit: str, release: str, patches: list[str]) -> str:
     src = replace_once(src, BACKEDGE_OLD, BACKEDGE_NEW, "RECOMP_BACKEDGE safe point")
     src = replace_once(src, PORT_OLD, PORT_NEW, "RECOMP_PORT_IN/OUT")
     src = replace_once(src, PUSH_OLD, PUSH_NEW, "PUSH32 onto g_esp out of line")
+    src = replace_once(src, POP_OLD, POP_NEW, "POP32 at esp without the address map")
     for needle in ("__thread", "_InterlockedExchangeAdd", "(*(volatile uint32_t *)XBOX_PTR"):
         if needle in src:
             raise AnchorError(f"after the edits the header still has {needle!r}: an edit missed a new copy")

@@ -766,6 +766,12 @@ WlResult wl_xb_thread_setup_guest(WlXbThread *t, uint32_t stack_bytes, uint32_t 
         return r;
     }
     uint32_t bottom = va + WL_XB_PAGE; // the page below stays reserved, not committed: a guard
+    // recompiled code addresses the stack as esp + disp without the address map (MEMxx_SP, PUSH32
+    // and POP32 in recomp/recomp_types.h): it must lie where WL_XB_EA is the identity
+    if ((uint64_t)va + stack_bytes + extra + WL_XB_PAGE > WL_XB_USER_LIMIT) {
+        wl_xb_va_release(va, NULL);
+        return WL_ERR_STATE;
+    }
     r = wl_xb_va_commit(bottom, stack_bytes + extra, WL_XB_PROT_READWRITE);
     if (r != WL_OK) {
         wl_xb_va_release(va, NULL);

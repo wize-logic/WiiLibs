@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Sat, 17 Oct 2026 18:00:00 -0400
+Subject: [PATCH] recomp: --stack-disp writes an access at esp + disp as
+ MEMxx_SP(esp, disp)
+
+About half of a lifted function's guest accesses are to its own stack:
+[esp + disp] operands, and the pushes and pops. A runtime whose guest
+address map is not a plain addition maps every one of those addresses,
+and esp changes at every push, pop and call, so --mem-disp's sharing of
+one mapped base helps little there.
+
+--stack-disp writes an access whose base is esp itself (the global's
+name, or --reg-locals' local copy), its displacement a constant in
+[-0x8000, 0x8000) or none, as MEMxx_SP(esp, disp), and a float or double
+store there as MEMF_SET_SP/MEMD_SET_SP(esp, disp, v). The template
+header defines them as MEMxx_D(esp, disp) and MEMF_SET((esp) + (disp), v):
+the same accesses. A runtime that keeps every guest stack where its
+address map is the identity can address the stack as esp + disp with no
+map at all.
+---
+
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -288,6 +288,10 @@
+     parser.add_argument("--mem-disp", action="store_true",
+                         help="Write a guest access with a small constant displacement as "
+                              "MEMxx_D(base, disp), so a runtime can map base once (mem_disp.py)")
++    parser.add_argument("--stack-disp", action="store_true",
++                        help="Write a guest access at esp + a small constant as MEMxx_SP(esp, disp) "
++                             "(and a float store there as MEMF_SET_SP), for a runtime that "
++                             "addresses its stacks without the address map (mem_disp.py)")
+     parser.add_argument("--reg-locals", action="store_true",
+                         help="Keep each function's registers (eax..edi, esp, xmm0..7, mm0..7) "
+                              "in C locals too, written back to the g_* globals only "
+@@ -373,6 +377,7 @@
+     translator.translator.x87_locals = args.x87_locals
+     translator.translator.reg_locals = args.reg_locals
+     translator.translator.mem_disp = args.mem_disp
++    translator.translator.stack_disp = args.stack_disp
+ 
+     t_load = time.time() - t0
+     print(f"Loaded {len(translator.func_db)} functions, "
+diff --git a/tools/recomp/mem_disp.py b/tools/recomp/mem_disp.py
+--- a/tools/recomp/mem_disp.py
++++ b/tools/recomp/mem_disp.py
+@@ -15,6 +15,16 @@
+ region for every valid address, so the two are the same access wherever
+ the guest's own access would be valid. A larger displacement (a global
+ table indexed by a register, `[eax * 4 + 0x80123456]`) keeps the old form.
++
++--stack-disp (stack=True) goes one step further for the stack pointer: an
++access whose base is esp itself (`esp`, or its local copy `_r_esp`) is
++written MEMxx_SP(esp, disp), its displacement 0 included, and a float or
++double store to one MEMF_SET_SP(esp, disp, v). A runtime that keeps every
++guest stack where its address map is the identity (or a plain offset) can
++then address the stack as esp + disp with no map at all; about half of a
++lifted function's accesses are to its stack, and esp changes at every
++push, pop and call, so each new esp cost the whole map again. The template
++header defines MEMxx_SP(b, d) as MEMxx_D(b, d): the same access.
+ """
+ 
+ import re
+@@ -23,6 +33,9 @@
+ _CALL = re.compile(r"\b(" + "|".join(_NAMES) + r")\(")
+ _TAIL = re.compile(r"^(?P<base>.*\S)\s*(?P<op>[+-])\s*(?P<disp>0x[0-9A-Fa-f]+|\d+)u?$", re.S)
+ LIMIT = 0x8000
++# --stack-disp: the stack pointer's names in a body (the global's macro, and --reg-locals' local copy)
++_STACK = ("esp", "_r_esp")
++_SET = re.compile(r"\b(MEMF_SET|MEMD_SET)\(")
+ 
+ 
+ def _split(arg):
+@@ -49,29 +62,91 @@
+     return base, disp
+ 
+ 
+-def rewrite(text):
+-    """The function's text with every eligible access split; (text, accesses split)."""
++def _stack_split(arg):
++    """(esp's name, signed disp) for `esp`, `esp + disp` or `esp - disp` (disp small), or None."""
++    arg = arg.strip()
++    if arg in _STACK:
++        return arg, 0
++    m = _TAIL.match(arg)
++    if not m:
++        return None
++    base = m.group("base").strip()
++    if base.endswith("+") and m.group("op") == "-":  # _fmt_mem's `esp + - 0x4`
++        base = base[:-1].rstrip()
++    if base not in _STACK:
++        return None
++    disp = int(m.group("disp"), 0)
++    disp = -disp if m.group("op") == "-" else disp
++    if not -LIMIT <= disp < LIMIT:
++        return None
++    return base, disp
++
++
++def _fmt_disp(disp):
++    return f"{'-' if disp < 0 else ''}0x{abs(disp):X}"
++
++
++def _close(text, j):
++    """The index just past the parenthesis that closes the one before j, or None."""
++    depth = 1
++    while depth and j < len(text):
++        depth += (text[j] == "(") - (text[j] == ")")
++        j += 1
++    return None if depth else j
++
++
++def _top_comma(s):
++    """The index of s's first comma outside parentheses, or -1."""
++    depth = 0
++    for k, c in enumerate(s):
++        depth += (c == "(") - (c == ")")
++        if c == "," and depth == 0:
++            return k
++    return -1
++
++
++def rewrite(text, stack=False):
++    """The function's text with every eligible access split; (text, accesses split).
++    stack: esp-based accesses become MEMxx_SP / MEMF_SET_SP (--stack-disp)."""
+     out, i, hits = [], 0, 0
+     while True:
+         m = _CALL.search(text, i)
++        s = _SET.search(text, i) if stack else None
++        if s and (not m or s.start() < m.start()):
++            j = _close(text, s.end())
++            if j is None:
++                out.append(text[i:])
++                break
++            out.append(text[i:s.start()])
++            args, n = rewrite(text[s.end():j - 1], stack)
++            hits += n
++            k = _top_comma(args)
++            parts = _stack_split(args[:k]) if k > 0 else None
++            if parts:
++                out.append(f"{s.group(1)}_SP({parts[0]}, {_fmt_disp(parts[1])},{args[k + 1:]})")
++                hits += 1
++            else:
++                out.append(f"{s.group(1)}({args})")
++            i = j
++            continue
+         if not m:
+             out.append(text[i:])
+             break
+         out.append(text[i:m.start()])
+-        j, depth = m.end(), 1
+-        while depth and j < len(text):
+-            depth += (text[j] == "(") - (text[j] == ")")
+-            j += 1
+-        if depth:
++        j = _close(text, m.end())
++        if j is None:
+             out.append(text[m.start():])
+             break
+-        inner, n = rewrite(text[m.end():j - 1])  # accesses inside the address
++        inner, n = rewrite(text[m.end():j - 1], stack)  # accesses inside the address
+         hits += n
+-        parts = _split(inner)
+-        if parts:
++        sp = _stack_split(inner) if stack else None
++        parts = None if sp else _split(inner)
++        if sp:
++            out.append(f"{m.group(1)}_SP({sp[0]}, {_fmt_disp(sp[1])})")
++            hits += 1
++        elif parts:
+             base, disp = parts
+-            sign = "-" if disp < 0 else ""
+-            out.append(f"{m.group(1)}_D({base}, {sign}0x{abs(disp):X})")
++            out.append(f"{m.group(1)}_D({base}, {_fmt_disp(disp)})")
+             hits += 1
+         else:
+             out.append(f"{m.group(1)}({inner})")
+diff --git a/tools/recomp/test_mem_disp.py b/tools/recomp/test_mem_disp.py
+--- a/tools/recomp/test_mem_disp.py
++++ b/tools/recomp/test_mem_disp.py
+@@ -9,8 +9,8 @@
+ from tools.recomp.mem_disp import rewrite
+ 
+ 
+-def check(src, want, hits):
+-    got, n = rewrite(src)
++def check(src, want, hits, stack=False):
++    got, n = rewrite(src, stack)
+     assert got == want, (src, got)
+     assert n == hits, (src, n)
+ 
+@@ -42,6 +42,26 @@
+     check("MEM32(eax - 0x8000)", "MEM32_D(eax, -0x8000)", 1)
+ 
+ 
++
++def test_stack():
++    """--stack-disp: esp (or its local) plus a small constant, 0 included, and the float stores there."""
++    check("MEM32(_r_esp + 0x108) = MEM32(_r_esi + _r_eax * 4 + 0x14);",
++          "MEM32_SP(_r_esp, 0x108) = MEM32_D(_r_esi + _r_eax * 4, 0x14);", 2, True)
++    check("MEM32(esp) = MEM32(esp + - 0x4);", "MEM32_SP(esp, 0x0) = MEM32_SP(esp, -0x4);", 2, True)
++    check("MEMF_SET(_r_esp + 0x14, (float)_x87sm1);", "MEMF_SET_SP(_r_esp, 0x14, (float)_x87sm1);", 1, True)
++    check("MEMD_SET(esp, f(a, b));", "MEMD_SET_SP(esp, 0x0, f(a, b));", 1, True)
++    check("MEMF_SET(eax + 4, MEMF(esp + 8));", "MEMF_SET(eax + 4, MEMF_SP(esp, 0x8));", 1, True)
++    check("MEM32(MEM32(_r_esp + 4) + 8)", "MEM32_D(MEM32_SP(_r_esp, 0x4), 0x8)", 2, True)
++    for src in ("MEM32(_r_esp + _r_eax * 4 + 0x10)",  # indexed: an ordinary base
++                "MEM32(esp + 0x8000)",                 # past the small range
++                "MEM32(xesp + 4)", "MEM32(_r_esp2)",
++                "MEMF_SET(ebp - 4, v);"):
++        want, n = rewrite(src)
++        check(src, want, n, True)
++    # without the option the stack is an ordinary base
++    check("MEMF_SET(esp + 4, v); MEM32(esp)", "MEMF_SET(esp + 4, v); MEM32(esp)", 0)
++
++
+ if __name__ == "__main__":
+     for name, fn in sorted(globals().items()):
+         if name.startswith("test_"):
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -505,6 +505,8 @@
+         # mem_disp.py: MEMxx(base + small disp) as MEMxx_D(base, disp) (--mem-disp)
+         self.mem_disp = False
+         self.mem_disp_count = 0
++        # and esp-based accesses as MEMxx_SP(esp, disp) (--stack-disp)
++        self.stack_disp = False
+ 
+     def discover_static_indirect_targets(self, *, coalescing=False):
+         """Recover function entries from bounded static callback tables."""
+@@ -3089,8 +3091,8 @@
+             key = why or "in locals"
+             self.x87_stats[key] = self.x87_stats.get(key, 0) + 1
+ 
+-        if self.mem_disp:
+-            text, n = mem_disp_rewrite("\n".join(lines))
++        if self.mem_disp or self.stack_disp:
++            text, n = mem_disp_rewrite("\n".join(lines), stack=self.stack_disp)
+             self.mem_disp_count += n
+             return text
+         return "\n".join(lines)
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -502,6 +502,21 @@
+ #define MEMF_D(b, d)   MEMF((b) + (d))
+ #define MEMD_D(b, d)   MEMD((b) + (d))
+ 
++/** The same accesses at esp + disp (recomp --stack-disp writes them for an
++ * access whose base is esp itself, disp 0 included). Here exactly
++ * MEMxx_D(esp, disp); a runtime that keeps every guest stack where its
++ * address map is the identity can address the stack as esp + disp without
++ * the map. */
++#define MEM8_SP(b, d)   MEM8_D(b, d)
++#define MEM16_SP(b, d)  MEM16_D(b, d)
++#define MEM32_SP(b, d)  MEM32_D(b, d)
++#define SMEM8_SP(b, d)  SMEM8_D(b, d)
++#define SMEM16_SP(b, d) SMEM16_D(b, d)
++#define SMEM32_SP(b, d) SMEM32_D(b, d)
++#define SMEM64_SP(b, d) SMEM64_D(b, d)
++#define MEMF_SP(b, d)   MEMF_D(b, d)
++#define MEMD_SP(b, d)   MEMD_D(b, d)
++
+ /** Float/double stores. The lifter emits MEMF_SET(addr, v) rather than
+  * "MEMF(addr) = v" so a runtime can store a float some other way without
+  * the generated code changing. A host that keeps guest memory little-endian
+@@ -514,6 +529,13 @@
+ #endif
+ #ifndef MEMD_SET
+ #define MEMD_SET(addr, v) ((void)(MEMD(addr) = (double)(v)))
++#endif
++/* The stores at esp + disp (--stack-disp). */
++#ifndef MEMF_SET_SP
++#define MEMF_SET_SP(b, d, v) MEMF_SET((b) + (d), v)
++#endif
++#ifndef MEMD_SET_SP
++#define MEMD_SET_SP(b, d, v) MEMD_SET((b) + (d), v)
+ #endif
+ 
+ /** x87 80-bit extended memory operands: fld m80 and fstp m80.
+-- 
+2.43.0
+
