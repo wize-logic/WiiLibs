@@ -25,11 +25,22 @@ wl_target_defaults(bench_irq_poll)
 target_link_libraries(bench_irq_poll PRIVATE wl_xboxrt)
 add_test(NAME bench_irq_poll_runs COMMAND bench_irq_poll 1000)
 set_tests_properties(bench_irq_poll_runs PROPERTIES LABELS "unit;be")
+# The page packer (the compressed page cache's): pages back byte for byte, bad bytes refused; its
+# cost per page for tools/qemu_icount.py on ppc-be.
+wl_add_test(test_xboxrt_page_pack SOURCES test_xboxrt_page_pack.c LIBS wl_xboxrt LABELS unit be)
+add_executable(bench_page_pack bench_page_pack.c)
+wl_target_defaults(bench_page_pack)
+target_link_libraries(bench_page_pack PRIVATE wl_xboxrt)
+add_test(NAME bench_page_pack_runs COMMAND bench_page_pack 64 unpack)
+set_tests_properties(bench_page_pack_runs PROPERTIES LABELS "unit;be")
 # Demand paging under a frame limit (the Wii's model through SIGSEGV and mprotect): with a swap
 # file, and without one.
 wl_add_test(test_xboxrt_paging SOURCES test_xboxrt_paging.c LIBS wl_xboxrt LABELS unit be)
 wl_add_test(test_xboxrt_paging_no_swap SOURCES test_xboxrt_paging.c LIBS wl_xboxrt LABELS unit be)
 target_compile_definitions(test_xboxrt_paging_no_swap PRIVATE WL_XBRT_PAGING_NO_SWAP=1)
+# and with a compressed page cache beside the same pool
+wl_add_test(test_xboxrt_paging_cache SOURCES test_xboxrt_paging.c LIBS wl_xboxrt LABELS unit be)
+target_compile_definitions(test_xboxrt_paging_cache PRIVATE WL_XBRT_PAGING_CACHE=1)
 # The page census, a diagnostic of what guest pages are and the working set each second.
 wl_add_test(test_xboxrt_page_census SOURCES test_xboxrt_page_census.c LIBS wl_xboxrt LABELS unit be)
 # The gamepad state, its reports, the Wii controllers' mappings and the ports (portable).

@@ -208,7 +208,14 @@ typedef struct {
     // frames back, and when none is left a touch that needs a frame is a guest crash, as before.
     const char *swap_path;
     uint32_t swap_bytes;
+    // The compressed page cache's share of the frames, in bytes (paging only): pages that give their
+    // frames back with a copy elsewhere (their file, the swap file) are kept packed in it too, so that
+    // a touch soon after unpacks them instead of reading the card. At most a quarter of the frames;
+    // 0: none; WL_XB_PAGE_CACHE_AUTO (wl_xb_mem_config_default): a twelfth of a pool of 16 MB or more,
+    // none for a smaller one. The host's WL_XB_PAGE_CACHE_KB, when set, overrides it.
+    uint32_t page_cache_bytes;
 } WlXbMemConfig;
+#define WL_XB_PAGE_CACHE_AUTO 0xFFFFFFFFu
 
 // The defaults above (no frame pools: the Wii's caller adds them).
 void wl_xb_mem_config_default(WlXbMemConfig *cfg);
@@ -350,6 +357,11 @@ typedef struct {
     uint32_t refaults_swap, refaults_file, refaults_zero;
     uint32_t ahead_unused;                     // pages read ahead that went again without being used
     uint32_t resident_dirty, resident_file;    // pages with frames now: changed; clean file copies
+    // The compressed page cache (0 frames: none): its frames, the pages packed into it, those that
+    // did not pack small enough (not tried again until they change), the touches it served (no read),
+    // and its packed pages now and their bytes
+    uint32_t zcache_frames, zcache_puts, zcache_raw, zcache_hits, zcache_pages;
+    uint64_t zcache_bytes;
 } WlXbMemStats;
 void wl_xb_mem_stats(WlXbMemStats *out);
 

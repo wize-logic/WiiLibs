@@ -101,6 +101,14 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
   which are taken, and a dirty page gets a new slot each time it is written (its old one freed).
   Without a swap file only zero and clean pages give frames back, and a touch that needs a frame
   when none can be had is a guest crash ("no frame left"), as before paging.
+- **The page cache.** A share of the frames (`WlXbMemConfig.page_cache_bytes`: by default a twelfth
+  of a pool of 16 MB or more; `WL_XB_PAGE_CACHE_KB` on the host) holds pages packed small
+  (`page_pack.c`, an LZ77 of the LZ4 kind written for a 4 KB page): a page that gives its frame
+  back clean with a copy (its file, a swap slot) is packed into a ring there too, and its next
+  touch unpacks it instead of reading the card (`zcache_hits`). A page that does not pack into
+  3 KB is marked and not tried again until it changes; an entry goes with its page's copy. Most
+  of a level's paging is pages coming back soon after they went, so a share of the frames packed
+  holds more of them than as frames.
 - **Fault paths (the Wii).** The DSI handler's exception context keeps the fast cases: a first
   touch with a free frame, a first touch that takes a clean page's frame (a look of at most 256
   frames, no I/O), a resident page whose PTE was evicted from the table. A touch that needs I/O (a
