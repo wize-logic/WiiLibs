@@ -264,12 +264,13 @@ static void gpu_status(void) {
              pc.audits_differ, pc.evicted, pc.again, pc.constant_sets, pc.constant_sets_evicted);
     WL_LOG_I(TAG, "status: depth fits %u made, %u shared; textures %u KB kept (%u KB drawn in the last frame, "
              "%u KB at most), %u converted, %u made again, %u failed (%u for memory), %u kept smaller (%u made whole "
-             "again), %u evicted; %u checks, %u by the write watch, %u hashes (%u KB)",
+             "again), %u evicted; %u checks, %u by the write watch, %u hashes (%u KB); %u drawn smaller in the last frame",
              (unsigned)gs.fits_made, (unsigned)gs.fits_shared, (unsigned)(ts.bytes / 1024u),
              (unsigned)(ts.frame_bytes / 1024u), (unsigned)(ts.peak_frame_bytes / 1024u), (unsigned)ts.converted,
              (unsigned)ts.reconverted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.reduced,
              (unsigned)ts.restored, (unsigned)ts.evicted,
-             (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed, (unsigned)(ts.hashed_bytes >> 10));
+             (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed, (unsigned)(ts.hashed_bytes >> 10),
+             (unsigned)ts.frame_reduced);
     WlNv2aTexCacheKinds tk;
     wl_nv2a_texcache_kinds(wl_nv2a_gx_textures(g_gx), &tk);
     // (what fills the arena: KB by GX format, count in brackets)

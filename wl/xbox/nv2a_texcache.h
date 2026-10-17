@@ -111,6 +111,7 @@ typedef struct WlNv2aTexCacheStats {
     uint64_t hashed_bytes;
     size_t bytes;         // images kept now
     size_t frame_bytes;   // of those, drawn in the last frame finished
+    uint32_t frame_reduced; // textures drawn in the last frame finished kept smaller (detail missing now)
     size_t peak_frame_bytes;
 } WlNv2aTexCacheStats;
 
