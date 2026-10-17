@@ -285,6 +285,12 @@ static void gpu_status(void) {
              (unsigned)(tk.by_format[WL_GXC_I8] >> 10), (unsigned)tk.count_by_format[WL_GXC_I8],
              (unsigned)(tk.linear >> 10), (unsigned)(tk.source >> 10),
              (unsigned)(tk.largest >> 10));
+    WL_LOG_I(TAG, "status: textures failed: %u refused again, %u formats GX cannot take, %u unreadable, %u bad; %u "
+             "stood in, %u draws hidden; not looked up: %u unread, %u disabled, %u unsampled; %u mip-map shares (%u given back)",
+             (unsigned)ts.refused_again, (unsigned)ts.unknown, (unsigned)ts.unreadable, (unsigned)ts.bad_texels,
+             (unsigned)gs.textures_stood_in, (unsigned)gs.standin_hidden, (unsigned)gs.textures_unread,
+             (unsigned)gs.textures_disabled,
+             (unsigned)gs.textures_unsampled, (unsigned)ts.mip_shared, (unsigned)ts.mip_replaced);
     if (wl_nv2a_vcache_on(wl_nv2a_gx_vertex_cache(g_gx))) {
         WlNv2aVCacheStats vs;
         wl_nv2a_vcache_stats(wl_nv2a_gx_vertex_cache(g_gx), &vs);

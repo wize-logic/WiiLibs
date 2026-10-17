@@ -200,6 +200,62 @@ TEST swizzled_levels_and_luminance(void) {
     PASS();
 }
 
+// A4R4G4B4 is written to RGBA8 tile by tile (levels of whole tiles), the rest texel by texel: both
+// what the NV2A samples
+TEST swizzled_a4r4g4b4_tile_by_tile(void) {
+    static uint8_t src[(16 * 8 + 8 * 4 + 4 * 2 + 2 * 1) * 2];
+    static uint8_t dst[4096] __attribute__((aligned(32)));
+    static uint8_t scratch[4096];
+    static uint8_t linear[16 * 8 * 2];
+    WlNv2aTexture t;
+    WlNv2aGxLayout layout;
+    unsigned b;
+
+    for (b = 0; b < sizeof src; b++) {
+        src[b] = (uint8_t)(b * 29u + 5u);
+    }
+    memset(&t, 0, sizeof t);
+    t.color = WL_NV2A_TEX_SZ_A4R4G4B4;
+    t.known = 1;
+    t.swizzled = 1;
+    t.width = 16;
+    t.height = 8;
+    t.depth = 1;
+    t.levels = 4;
+    t.texel_bytes = 2;
+    t.total_bytes = t.face_bytes = sizeof src;
+    ASSERT(wl_nv2a_texture_layout(&t, true, &layout));
+    ASSERT_EQ(WL_GXC_RGBA8, layout.format);
+    ASSERT_EQ(4u, layout.levels);
+    ASSERT(wl_nv2a_texture_scratch_bytes(&t, &layout) <= sizeof scratch);
+    ASSERT(wl_nv2a_texture_convert(&t, &layout, src, NULL, dst, scratch));
+    ASSERT(wl_xbox_unswizzle(src, sizeof linear, 16, 8, 2, linear, sizeof linear) == sizeof linear);
+    ASSERT(image_matches(&t, &layout, dst, linear, 32, 0));
+    // level 1 (8 x 4, whole tiles) and level 2 (4 x 2, texel by texel) as their texels say
+    {
+        size_t at = wl_gxc_tex_bytes(WL_GXC_RGBA8, 16, 8);
+        unsigned level, x, y;
+
+        for (level = 1; level <= 2; level++) {
+            uint32_t w = 16u >> level, h = 8u >> level;
+            const uint8_t *level_src = src + (level == 1 ? 16 * 8 * 2 : (16 * 8 + 8 * 4) * 2);
+
+            ASSERT(wl_xbox_unswizzle(level_src, w * h * 2u, w, h, 2, linear, sizeof linear) == w * h * 2u);
+            for (y = 0; y < h; y++) {
+                for (x = 0; x < w; x++) {
+                    uint8_t want[4], got[4];
+
+                    wl_nv2a_texel_rgba(t.color, linear + y * w * 2u, x, NULL, want);
+                    ASSERT(wl_gxc_texel_read(WL_GXC_RGBA8, dst + at, wl_gxc_tex_bytes(WL_GXC_RGBA8, w, h), w, h, x, y, got));
+                    ASSERT_MEM_EQ(want, got, 4);
+                }
+            }
+            at += wl_gxc_tex_bytes(WL_GXC_RGBA8, w, h);
+        }
+    }
+    PASS();
+}
+
 TEST dxt_and_palettes(void) {
     static uint8_t src[16 * 16];
     static uint8_t palette[64 * 4];
@@ -1034,6 +1090,7 @@ SUITE(texture_suite) {
     RUN_TEST(stage_registers_decoded);
     RUN_TEST(conversions_sample_as_the_nv2a_would);
     RUN_TEST(swizzled_levels_and_luminance);
+    RUN_TEST(swizzled_a4r4g4b4_tile_by_tile);
     RUN_TEST(dxt_and_palettes);
     RUN_TEST(cube_maps_become_sphere_maps);
     RUN_TEST(a_falloff_cube_becomes_its_lit_face);

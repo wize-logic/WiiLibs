@@ -1023,6 +1023,18 @@ static void texture_cache_line(const char *prefix) {
            (unsigned long long)ts.hashed_bytes, (unsigned)ts.converted, (unsigned)ts.reconverted,
            (unsigned)ts.evicted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.reduced,
            (unsigned)ts.restored, (unsigned)(ts.bytes >> 10), (unsigned)(ts.peak_frame_bytes >> 10));
+    {
+        WlNv2aGxStats gs;
+
+        wl_nv2a_gx_stats(g_gx, &gs);
+        printf("%s          failed: %u refused again, %u formats or sizes GX cannot take, %u unreadable, %u bad texels; "
+               "%u stood in, %u draws hidden; not looked up: %u unread, %u disabled, %u unsampled; %u without mip-maps answered by "
+               "the texture with them (%u given back)\n",
+               prefix, (unsigned)ts.refused_again, (unsigned)ts.unknown, (unsigned)ts.unreadable,
+               (unsigned)ts.bad_texels, (unsigned)gs.textures_stood_in, (unsigned)gs.standin_hidden,
+               (unsigned)gs.textures_unread, (unsigned)gs.textures_disabled, (unsigned)gs.textures_unsampled, (unsigned)ts.mip_shared,
+               (unsigned)ts.mip_replaced);
+    }
 }
 
 // --fused-forms: the forms seen, the most vertices first

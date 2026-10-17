@@ -84,7 +84,8 @@ typedef struct WlNv2aTexEntry {
     uint32_t phys, format_word, rect_word, palette_phys;
     uint32_t source_bytes;
     uint64_t hash, palette_hash;
-    uint8_t mipmaps;
+    uint8_t mipmaps; // (a request without mip-maps takes it with them, never converting it twice)
+    uint8_t signs;   // WlNv2aTexture.signs
     // what it became
     WlNv2aGxLayout layout;
     void *image; // layout.total_bytes: the image, then its alpha (DXT3/5), then its TLUT (P8)
@@ -105,6 +106,12 @@ typedef struct WlNv2aTexCacheStats {
     uint32_t checks;      // lookups that looked at the texture (not its frame's first check again)
     uint32_t watched;     // of those, answered by the write watch (unchanged, nothing read)
     uint32_t no_memory;   // of the failures, for want of memory
+    uint32_t refused_again; // ...lookups of a texture refused so in their frame
+    uint32_t unknown;     // ...a format or size GX cannot take
+    uint32_t unreadable;  // ...texels outside guest memory
+    uint32_t bad_texels;  // ...a conversion that failed
+    uint32_t mip_shared;  // lookups without mip-maps answered by the texture with them
+    uint32_t mip_replaced; // textures without mip-maps given back when made with them
     uint32_t reduced;     // textures kept smaller for want of memory (converted or made again so)
     uint32_t restored;    // of those, made whole again later
     uint32_t gpu_waits;   // frames whose images waited for the GPU (cfg.gpu_wait) to find room
@@ -128,6 +135,7 @@ typedef struct WlNv2aTexCache {
     } refused[WL_NV2A_TEXCACHE_REFUSED];
     unsigned refused_next;
     uint32_t refused_logged;
+    uint32_t unknown_logged[8]; // the format codes logged as unknown (a bit each)
     uint32_t frame, serial;
     uint32_t waited_frame; // the frame cfg.gpu_wait was last called in (the GPU past every frame before it)
     bool capturing; // a capture ran at the last lookup

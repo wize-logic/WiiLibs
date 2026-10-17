@@ -42,6 +42,9 @@ typedef struct WlNv2aTexture {
     uint8_t wrap_u, wrap_v; // WL_NV2A_WRAP_*
     uint32_t border_color;  // SET_TEXTURE_BORDER_COLOR (ARGB), read outside by WL_NV2A_WRAP_BORDER
     uint8_t min_filter, mag_filter; // WL_NV2A_FILTER_*
+    // the channels the filter register reads as signed (its bits 31:28: A, R, G, B), kept for a
+    // format whose texels change with it (V16U16), else 0
+    uint8_t signs;
     // what the texels hold, as wl/xbox/psh takes it (WL_XBOX_PSH_TEXTURE_*)
     uint8_t contents;
 } WlNv2aTexture;
@@ -100,6 +103,11 @@ size_t wl_nv2a_texture_scratch_bytes(const WlNv2aTexture *t, const WlNv2aGxLayou
 // One texel of a linear (unswizzled) level as RGBA8: the decoder of the formats without an exact GX
 // equivalent, and the reference for the others. `row` is the level's row y.
 void wl_nv2a_texel_rgba(uint8_t color, const uint8_t *row, uint32_t x, const uint8_t *palette, uint8_t rgba[4]);
+
+// The texture's average colour, from up to 64 of its texels (a level of 8 x 8 or less, else a grid
+// over level 0; a cube map's first face): what is bound in its place while it cannot be (no memory,
+// a format not known). false when its texels cannot be read so (an unknown format).
+bool wl_nv2a_texture_average(const WlNv2aTexture *t, const uint8_t *src, const uint8_t *palette, uint8_t rgba[4]);
 
 // Whether a cube map is a light's falloff (a spot: one face carries the light, the other faces and
 // that face's edge texels are dark), from its texels (`scratch`: wl_nv2a_texture_scratch_bytes of its
