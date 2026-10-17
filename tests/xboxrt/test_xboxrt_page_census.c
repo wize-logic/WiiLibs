@@ -39,6 +39,7 @@ TEST pages_and_seconds(void) {
     snprintf(g_path, sizeof g_path, "%s/wl_xbrt_census_%d.txt", tmp != NULL && tmp[0] != '\0' ? tmp : "/tmp",
              (int)getpid());
     setenv("WL_XB_PAGE_CENSUS", g_path, 1);
+    setenv("WL_XB_PAGE_CENSUS_STACKS", "1", 1);
     WlXbMemConfig cfg;
     wl_xb_mem_config_default(&cfg);
     cfg.ram_bytes = 16u << 20;
@@ -112,6 +113,36 @@ TEST pages_and_seconds(void) {
     ASSERT(alloc);
     ASSERT(page);
     unlink(pages);
+#if defined(__GLIBC__) && defined(__x86_64__)
+    // who touched (WL_XB_PAGE_CENSUS_STACKS): each touch's second, page and host stack id
+    char stacks[320], touch[320];
+    snprintf(stacks, sizeof stacks, "%s.stacks", g_path);
+    snprintf(touch, sizeof touch, "%s.touch", g_path);
+    f = fopen(stacks, "r");
+    ASSERT(f != NULL);
+    bool anchor = false, stack = false;
+    while (fgets(line, sizeof line, f) != NULL) {
+        anchor = anchor || strncmp(line, "anchor ", 7) == 0;
+        stack = stack || strncmp(line, "stack ", 6) == 0;
+    }
+    fclose(f);
+    ASSERT(anchor);
+    ASSERT(stack);
+    f = fopen(touch, "rb");
+    ASSERT(f != NULL);
+    uint32_t rec[3];
+    bool p0_1 = false, p1_1 = false, p1_2 = false;
+    while (fread(rec, sizeof rec, 1, f) == 1) {
+        ASSERT(rec[2] != 0u);
+        p0_1 = p0_1 || (rec[0] == 1u && rec[1] == p0);
+        p1_1 = p1_1 || (rec[0] == 1u && rec[1] == p1);
+        p1_2 = p1_2 || (rec[0] == 2u && rec[1] == p1);
+    }
+    fclose(f);
+    ASSERT(p0_1 && p1_1 && p1_2);
+    unlink(stacks);
+    unlink(touch);
+#endif
     unlink(g_path);
     PASS();
 }

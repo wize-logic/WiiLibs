@@ -822,6 +822,85 @@ TEST cache_keeps_smaller_for_want_of_memory(void) {
     PASS();
 }
 
+// A texture kept smaller while every other image is drawn in each frame (none gives way) and no gap
+// could take it whole: its tries at being made whole leave it as it is without reading its texels
+// (they would touch the guest's pages once a second, and the smaller image would only be made again).
+// Its bytes are changed behind the write watch's back: the image must not see it.
+TEST cache_smaller_kept_without_reading(void) {
+    static WlNv2aTexCache cache;
+    // room for four 16x16 RGBA8 images (1 KiB each, with its heap header) and a little more
+    static uint8_t arena[4 * (1024 + 32) + 32 + 256];
+    TGuest g;
+    WlNv2aTexCacheConfig cfg;
+    WlNv2aTexture t, big, other[3];
+    WlNv2aTexCacheStats s;
+    const WlNv2aTexEntry *e;
+    uint8_t rgba[4];
+    bool made;
+    unsigned i, f;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    memset(&g_w, 0, sizeof g_w);
+    g_w.epoch = 1;
+    // a swizzled A8R8G8B8 32x32 of three levels: level 0 red, level 1 green, level 2 blue
+    for (i = 0; i < 32 * 32; i++) {
+        wl_wr_le32(&g.ram[0x200000 + 4 * i], 0xFFFF0000u);
+    }
+    for (i = 0; i < 16 * 16; i++) {
+        wl_wr_le32(&g.ram[0x200000 + 4096 + 4 * i], 0xFF00FF00u);
+    }
+    for (i = 0; i < 8 * 8; i++) {
+        wl_wr_le32(&g.ram[0x200000 + 4096 + 1024 + 4 * i], 0xFF0000FFu);
+    }
+    set_texture(&g, 0, 0x100000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 4, 4, 1, false));
+    set_texture(&g, 1, 0x200000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 5, 5, 3, false));
+    t_kick(&g);
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 0, &t));
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 1, &big));
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.arena = arena;
+    cfg.arena_bytes = sizeof arena;
+    cfg.watch = w_watch;
+    cfg.written = w_written;
+    wl_nv2a_texcache_init(&cache, &cfg);
+    for (i = 0; i < 3; i++) {
+        other[i] = t;
+        other[i].phys = 0x100000 + 0x1000 * i;
+        other[i].format_word ^= i << 28; // (another key)
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made) != NULL);
+    }
+    e = wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made);
+    ASSERT(e != NULL && e->reduced == 1);
+    // level 1 made red behind the watch's back (no store it sees)
+    for (i = 0; i < 16 * 16; i++) {
+        wl_wr_le32(&g.ram[0x200000 + 4096 + 4 * i], 0xFFFF0000u);
+    }
+    // the others drawn in every frame: three tries at making the 32x32 whole, none with room
+    for (f = 1; f <= 3u * WL_NV2A_TEXCACHE_RESTORE_FRAMES; f++) {
+        wl_nv2a_texcache_frame_done(&cache);
+        for (i = 0; i < 3; i++) {
+            ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made) != NULL);
+            ASSERT_FALSE(made);
+        }
+        e = wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made);
+        ASSERT(e != NULL);
+        ASSERT_FALSE(made);
+        ASSERT_EQ(1u, (unsigned)e->reduced);
+    }
+    // still the green it was made from: its texels were not read again
+    ASSERT(wl_gxc_texel_read(WL_GXC_RGBA8, e->image, e->layout.image_bytes, 16, 16, 3, 5, rgba));
+    ASSERT_EQ(0, rgba[0]);
+    ASSERT_EQ(255, rgba[1]);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(0u, s.restored);
+    ASSERT_EQ(0u, s.evicted);
+    ASSERT(wl_heap_check(&cache.heap));
+    wl_nv2a_texcache_clear(&cache);
+    t_destroy(&g);
+    PASS();
+}
+
 static unsigned g_gpu_waits;
 
 static void count_gpu_wait(void) {
@@ -958,6 +1037,7 @@ SUITE(texture_suite) {
     RUN_TEST(cache_watched_and_in_an_arena);
     RUN_TEST(cache_arena_window);
     RUN_TEST(cache_keeps_smaller_for_want_of_memory);
+    RUN_TEST(cache_smaller_kept_without_reading);
     RUN_TEST(cache_overlapped_restores_and_waits);
     RUN_TEST(cache_reads_again_when_a_capture_begins);
 }

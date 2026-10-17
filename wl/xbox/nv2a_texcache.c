@@ -719,9 +719,17 @@ static void *image_stale(WlNv2aTexCache *cache, size_t bytes, const WlNv2aTexEnt
     return image;
 }
 
+// Whether image_stale has an image to give back for room (one not drawn for
+// WL_NV2A_TEXCACHE_RESTORE_FRAMES).
+static bool stale_image(WlNv2aTexCache *cache, const WlNv2aTexEntry *keep) {
+    const WlNv2aTexEntry *e = oldest(cache, keep, true);
+
+    return e != NULL && cache->frame - e->used_frame >= WL_NV2A_TEXCACHE_RESTORE_FRAMES;
+}
+
 // A texture kept smaller for want of memory, as it was: made whole again when there is room for it
-// (image_stale; with its smaller image given back first when only that makes the room, the smaller
-// one made again where it fails), tried at its first use in a frame (the GPU has finished with the
+// (image_stale; with its smaller image given back first when only that may make the room, and put
+// back as it was where it does not: copied, its texels not read again), tried at its first use in a frame (the GPU has finished with the
 // smaller image) once in WL_NV2A_TEXCACHE_RESTORE_FRAMES. `src` and `palette` its guest bytes when
 // they were read (NULL: read now). *made true when its image was made anew; false when the entry
 // is gone (no memory even for the smaller image again, or bad texels). One the GPU may still read
@@ -738,6 +746,15 @@ static bool restore(WlNv2aTexCache *cache, WlNv2a *dev, WlNv2aTexEntry *e, const
     e->restore_frame = cache->frame;
     if (!wl_nv2a_texture_layout(t, e->mipmaps != 0, &whole)) {
         return true;
+    }
+    if (cache->cfg.arena != NULL && !drawn_now) {
+        // (no room even with the smaller image given back: the whole image's block would take the
+        // smaller one's and both its neighbours', at most the largest free block each. Kept as it is,
+        // without the texels read again only to make the smaller image anew where it was)
+        size_t room = wl_heap_usable_size(&cache->heap, e->image) + 2u * wl_heap_largest_free(&cache->heap);
+        if (whole.total_bytes > room && !stale_image(cache, e)) {
+            return true;
+        }
     }
     if (src == NULL) {
         src = wl_nv2a_phys(dev, t->phys, t->total_bytes);
@@ -767,13 +784,24 @@ static bool restore(WlNv2aTexCache *cache, WlNv2a *dev, WlNv2aTexEntry *e, const
     } else if (image != NULL) {
         image_free(cache, e->image);
     } else {
-        // (the smaller image beside the room: given back, and made again if the whole one still
-        // finds none)
+        // (the smaller image beside the room: given back, and put back if the whole one still
+        // finds none: from a copy kept in the scratch when it fits there, else made again)
+        bool aside = small.total_bytes <= WL_NV2A_TEXCACHE_SCRATCH_KEPT && scratch_for(cache, small.total_bytes);
+        if (aside) {
+            memcpy(cache->scratch, e->image, small.total_bytes);
+        }
         image_free(cache, e->image);
         image = image_alloc(cache, whole.total_bytes);
         if (image == NULL) {
             image = image_alloc(cache, small.total_bytes);
             e->image = image;
+            if (image != NULL && aside) {
+                memcpy(image, cache->scratch, small.total_bytes);
+                if (cache->cfg.flush != NULL) {
+                    cache->cfg.flush(cache->cfg.user, image, small.total_bytes);
+                }
+                return true;
+            }
             if (image == NULL || !convert(cache, e, t, src, palette)) {
                 if (image != NULL) {
                     image_free(cache, image);
