@@ -28,6 +28,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/thread.h"
 
@@ -184,6 +185,13 @@ void wl_xb_mmu_frame_move(uint32_t from, uint32_t to, uint32_t f) {
     punch(from, 1);
 }
 
+void wl_xb_mmu_census_close(uint32_t p) {
+    if ((g_xb_pg_flags[p] & WL_XB_PG_PINNED) == 0) {
+        set_prot(p, 0, PROT_NONE, false);
+        set_prot(p, 1, PROT_NONE, false);
+    }
+}
+
 void wl_xb_mmu_pinned(uint32_t p) {
     set_prot(p, 0, PROT_READ | PROT_WRITE, false); // never closed again: the service thread writes
     set_prot(p, 1, PROT_READ | PROT_WRITE, false); // KeTickCount without the guest lock
@@ -245,6 +253,7 @@ WlResult wl_xb_backend_page_fault(uint32_t ea) {
     // armed is seen)
     bool rw = (fl & WL_XB_PG_PINNED) != 0 || write || ((fl & WL_XB_PG_DIRTY) != 0 && (fl & WL_XB_PG_WATCH) == 0);
     g_xb_pg_flags[p] = (uint8_t)(fl | WL_XB_PG_REF);
+    wl_xb_census_seen(p, write);
     // (already open as wanted: the mapping was replaced behind the table's back; set it again)
     set_prot(p, a, rw ? PROT_READ | PROT_WRITE : PROT_READ, cur == (rw ? (PROT_READ | PROT_WRITE) : PROT_READ));
     g_faults++;

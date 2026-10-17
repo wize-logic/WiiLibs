@@ -324,6 +324,10 @@ void wl_xb_mmu_pinned(uint32_t p) {
     (void)p; // a resident page's PTE is put back by the fast path, without I/O
 }
 
+void wl_xb_mmu_census_close(uint32_t p) {
+    (void)p; // (the census sees the host's faults only)
+}
+
 uint32_t wl_xb_mmu_lock(void) {
     return IRQ_Disable();
 }

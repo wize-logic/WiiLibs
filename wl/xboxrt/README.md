@@ -579,6 +579,7 @@ small files). With `netrun.txt` and no PC command line, a Dolphin run sends its 
 | `WL_XB_NO_XF`, `WL_XB_VCACHE_KB` | as the files `noxf` and `vcache` (`0` turns the cache off) |
 | `WL_XB_CAPTURE` | `path[,frames[,after]]`: a GPU capture of `frames` frames (2) starting `after` vertical blanks in (600) |
 | `WL_XB_AUDIO`, `_WAV`, `_TRACE`, `_HASH` | see "The GPU and the MCPX" |
+| `WL_XB_PAGE_CENSUS` | `path` (with a frame limit): the page census (`page_census.h`): each guest page's allocation, what used it (the GPU's textures and vertex arrays, the APU, a map file) and the working set each second; `tools/xb_page_census.py path` makes the tables |
 
 The imitation of the Wii's memory on the host is `WL_XB_FRAME_MB=24 WL_XB_HEAP_MB=14` (the Wii's before MEM1's rest joined the frame pools; about 32 and 13 since, to be set from a real-Wii log's "guest frames" lines).
 

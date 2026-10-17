@@ -159,6 +159,9 @@ bool wl_xb_mmu_watch(uint32_t p);
 // Page `p` was pinned and has its frame: map it wherever a fault must not be needed (the host maps
 // both EAs read-write; the Wii's fast path maps a resident page without I/O, so nothing).
 void wl_xb_mmu_pinned(uint32_t p);
+// The page census (page_census.h): `p`'s EAs closed so that its next touch faults again, its flags left
+// alone (a backend that cannot: nothing).
+void wl_xb_mmu_census_close(uint32_t p);
 // Keeps the fault path of another thread out of the core's tables for a few lines (the Wii:
 // interrupts off; the host: nothing, only the guest lock's holder faults on pages that are not
 // pinned, and pinned pages stay mapped).

@@ -12,6 +12,7 @@
 
 #include "wl/base/endian.h"
 #include "wl/platform/mem_census.h"
+#include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/crash.h"
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
@@ -719,6 +720,7 @@ WlResult wl_xb_thread_setup_guest(WlXbThread *t, uint32_t stack_bytes, uint32_t 
         wl_xb_va_release(va, NULL);
         return r;
     }
+    wl_xb_census_alloc(WL_XB_CA_STACK, bottom, stack_bytes + extra, 0);
     uint32_t top = bottom + stack_bytes + extra;
     uint32_t block_start = top - block;
     uint32_t area_start = block_start - area;

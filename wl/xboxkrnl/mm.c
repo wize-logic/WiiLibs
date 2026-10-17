@@ -3,6 +3,7 @@
 // 0x80000000|P), user virtual memory (reservations and commits), queries, protection (recorded;
 // the mapping is read-write), the GPU's instance memory, and the pools (Ex).
 #include "wl/xboxkrnl/kernel_internal.h"
+#include "wl/xboxrt/page_census.h"
 
 #define MEM_COMMIT 0x1000u
 #define MEM_RESERVE 0x2000u
@@ -15,25 +16,26 @@ static uint32_t window_va(uint32_t phys) {
     return WL_XB_WINDOW | phys;
 }
 
-static uint32_t contiguous(uint32_t bytes, uint32_t lowest, uint32_t highest, uint32_t align) {
+static uint32_t contiguous(uint32_t bytes, uint32_t lowest, uint32_t highest, uint32_t align, WlXbCensusAlloc kind) {
     uint32_t phys = 0;
     if (bytes == 0 || wl_xb_phys_alloc(bytes, lowest, highest, align < WL_XB_PAGE ? WL_XB_PAGE : align, &phys) != WL_OK) {
         WL_LOG_W(XK_TAG, "contiguous 0x%x in [0x%08x, 0x%08x] align 0x%x: no memory (from 0x%08x)", (unsigned)bytes,
                  (unsigned)lowest, (unsigned)highest, (unsigned)align, (unsigned)wl_xb_kernel_caller());
         return 0;
     }
+    wl_xb_census_alloc(kind, window_va(phys), bytes, wl_xb_kernel_caller());
     return window_va(phys);
 }
 
 // PVOID MmAllocateContiguousMemory(SIZE_T NumberOfBytes)
 void k_MmAllocateContiguousMemory(void) {
-    RET(contiguous(ARG(0), 0, 0xFFFFFFFFu, WL_XB_PAGE));
+    RET(contiguous(ARG(0), 0, 0xFFFFFFFFu, WL_XB_PAGE, WL_XB_CA_CONTIG));
 }
 
 // PVOID MmAllocateContiguousMemoryEx(SIZE_T NumberOfBytes, ULONG_PTR Lowest, ULONG_PTR Highest,
 //                                    ULONG_PTR Alignment, ULONG Protect)
 void k_MmAllocateContiguousMemoryEx(void) {
-    uint32_t va = contiguous(ARG(0), ARG(1), ARG(2), ARG(3));
+    uint32_t va = contiguous(ARG(0), ARG(1), ARG(2), ARG(3), WL_XB_CA_CONTIG);
     if (va != 0 && ARG(1) != 0 && ARG(2) - ARG(1) + 1u <= ARG(0) + WL_XB_PAGE) {
         WL_LOG_I(XK_TAG, "pinned contiguous 0x%x at physical 0x%08x -> 0x%08x", (unsigned)ARG(0), (unsigned)ARG(1),
                  (unsigned)va);
@@ -56,7 +58,7 @@ void k_MmFreeContiguousMemory(void) {
 
 // PVOID MmAllocateSystemMemory(SIZE_T NumberOfBytes, ULONG Protect)
 void k_MmAllocateSystemMemory(void) {
-    RET(contiguous(ARG(0), 0, 0xFFFFFFFFu, WL_XB_PAGE));
+    RET(contiguous(ARG(0), 0, 0xFFFFFFFFu, WL_XB_PAGE, WL_XB_CA_SYSTEM));
 }
 
 // ULONG MmFreeSystemMemory(PVOID BaseAddress, SIZE_T NumberOfBytes)
@@ -228,6 +230,9 @@ void k_NtAllocateVirtualMemory(void) {
     }
     wl_xb_wr32(base_p, base);
     wl_xb_wr32(size_p, size);
+    if (type & MEM_COMMIT) {
+        wl_xb_census_alloc(WL_XB_CA_VIRTUAL, base, size, wl_xb_kernel_caller());
+    }
     RET(STATUS_SUCCESS);
 }
 

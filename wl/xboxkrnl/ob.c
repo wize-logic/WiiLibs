@@ -10,6 +10,7 @@
 #include <stdlib.h>
 
 #include "wl/xboxkrnl/kernel_internal.h"
+#include "wl/xboxrt/page_census.h"
 
 #define POOL_MAGIC 0x4C504C57u // "WLPL"
 #define POOL_HDR 16u
@@ -65,6 +66,7 @@ uint32_t xk_pool_alloc(uint32_t bytes) {
                 }
                 g_chunk_va = WL_XB_WINDOW | phys;
                 g_chunk_left = CHUNK_BYTES;
+                wl_xb_census_alloc(WL_XB_CA_POOL, g_chunk_va, CHUNK_BYTES, 0);
             }
             block = g_chunk_va;
             g_chunk_va += size;
@@ -77,6 +79,7 @@ uint32_t xk_pool_alloc(uint32_t bytes) {
             return 0;
         }
         block = WL_XB_WINDOW | phys;
+        wl_xb_census_alloc(WL_XB_CA_POOL, block, size, wl_xb_kernel_caller());
     }
     wl_xb_fill(block, 0, size);
     wl_xb_wr32(block + 0u, POOL_MAGIC);
