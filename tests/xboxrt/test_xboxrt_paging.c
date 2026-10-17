@@ -5,7 +5,8 @@
 // clean pages read back cost no write when they go again, changed pages cleared to zero go as zero
 // pages, a file read over swapped pages does not read them back first, pages a file read filled
 // whole go for nothing and come back from the file until they change or the file does, both EAs of
-// a page see one page whatever happened to its frame, pinned pages keep theirs, relocations and
+// a page see one page whatever happened to its frame, discarded pages give back their frames and
+// slots and read zero, pinned pages keep theirs, relocations and
 // frees carry the paging state, accesses across two pages and copies between two buffers larger
 // than the pool work, a read back gives the guest lock up while the card works (another thread that
 // touches the page waits for it), devices still fault, and the write watch sees the stores to a
@@ -450,6 +451,37 @@ TEST freed_pages_come_back_zero(void) {
     PASS();
 }
 
+TEST discarded_pages_cost_nothing(void) {
+    up();
+    const uint32_t n = 3u * FRAMES;
+    uint32_t phys = 0;
+    ASSERT_EQ(WL_OK, wl_xb_phys_alloc(n * PAGE, 0, 0xFFFFFFFFu, 0, &phys));
+    uint32_t va = WL_XB_WINDOW | phys;
+    fill(va, n, 11); // changed pages, most of them in the swap file now
+    WlXbMemStats a = stats();
+    uint32_t held = 0;
+    ASSERT_EQ(WL_OK, wl_xb_va_discard(va + PAGE / 2u, (n - 1u) * PAGE + PAGE / 2u, &held)); // not the first page
+    ASSERT_EQ(n - 1u, held);
+    WlXbMemStats b = stats();
+    ASSERT(b.swap_slots_used + (n - FRAMES) <= a.swap_slots_used + 8u); // the slots came back
+    ASSERT(b.frames_free > a.frames_free);
+    ASSERT(check(va, 1, 11));
+    for (uint32_t i = 1; i < n; i++) {
+        ASSERT_EQ(0u, wl_xb_rd32(va + i * PAGE + 4u * i));
+    }
+    WlXbMemStats c = stats();
+    ASSERT(c.swap_ins <= b.swap_ins + 1u); // nothing read back (the first page at most)
+    uint32_t other = alloc(2u * FRAMES); // the discarded pages go again: nothing to write for them
+    ASSERT(other != 0);
+    fill(other, 2u * FRAMES, 12);
+    WlXbMemStats d = stats();
+    ASSERT(d.swap_outs - c.swap_outs <= 2u * FRAMES); // only the new pages' own
+    ASSERT_EQ(WL_ERR_RANGE, wl_xb_va_discard(0xFFFFF000u, 0x2000u, NULL));
+    ASSERT_EQ(WL_OK, wl_xb_va_release(other, NULL));
+    ASSERT_EQ(WL_OK, wl_xb_phys_free(phys));
+    PASS();
+}
+
 TEST cleared_pages_go_out_as_zero(void) {
     up();
     const uint32_t n = 3u * FRAMES;
@@ -838,6 +870,7 @@ SUITE(paging) {
     RUN_TEST(pinned_pages_keep_their_frames);
     RUN_TEST(relocation_carries_swapped_pages);
     RUN_TEST(freed_pages_come_back_zero);
+    RUN_TEST(discarded_pages_cost_nothing);
     RUN_TEST(cleared_pages_go_out_as_zero);
     RUN_TEST(cold_cleared_pages_give_their_frames_back);
     RUN_TEST(file_reads_spare_swap_ins);

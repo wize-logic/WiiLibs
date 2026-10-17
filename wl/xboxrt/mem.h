@@ -285,6 +285,14 @@ WlResult wl_xb_va_protect(uint32_t va, uint32_t bytes, uint32_t protect, uint32_
 // committed user VA through its page. false (and 0) when it has none.
 bool wl_xb_va_to_phys(uint32_t va, uint32_t *phys);
 
+// The title says the bytes of [va, va + bytes) are dead (a buffer it will write again before it reads
+// it, or never read): each whole page in it gives back its frame and its swap slot or file copy and
+// reads zero from now on (a page that only zero is in costs nothing until it is written), so an
+// eviction never writes it to the swap file. Window and user VAs; pinned and locked pages are left
+// alone. `*held` (may be NULL) gets the pages that had a frame or a copy. WL_ERR_RANGE when the
+// range wraps.
+WlResult wl_xb_va_discard(uint32_t va, uint32_t bytes, uint32_t *held);
+
 // ---- Pinned pages ------------------------------------------------------------------------------
 // A pinned page gets its frame now and keeps it: the clock passes it by. For guest memory touched
 // where a fault could not wait for the swap file: by a host thread without the guest lock (the
