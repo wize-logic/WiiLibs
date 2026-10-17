@@ -169,6 +169,7 @@ XkObject *xk_thread_object(WlXbThread *t);
 #define XK_MAX_APCS 2048u
 typedef struct {
     uint32_t routine, context, arg1, arg2; // a user APC: routine(context, arg1, arg2)
+    uint32_t read_issued; // a read's completion: when the read was issued (ms + 1; 0: not a read)
 } XkApc;
 // Mutants a thread owns at once (abandoned when it ends; more are owned but not tracked, logged).
 #define XK_MAX_OWNED 64u
@@ -212,7 +213,12 @@ int32_t xk_event_pulse(uint32_t ev);
 uint32_t xk_semaphore_release(uint32_t sem, int32_t adjustment, int32_t *previous);
 uint32_t xk_mutant_release(uint32_t mut, bool abandon, int32_t *previous);
 // Queues a user APC for `t` (delivered at its next alertable user-mode wait).
-void xk_apc_queue(WlXbThread *t, uint32_t routine, uint32_t context, uint32_t arg1, uint32_t arg2);
+// `read_issued`: xk_read_issued() at the read's start for a read's completion, else 0.
+void xk_apc_queue(WlXbThread *t, uint32_t routine, uint32_t context, uint32_t arg1, uint32_t arg2,
+                  uint32_t read_issued);
+uint32_t xk_read_issued(void);
+// The kernel's lines in the status report every 10 s.
+void xk_status_report(void);
 bool xk_apc_deliver(WlXbThread *t);
 // The current system time (100 ns since 1601) and the conversions of a timeout.
 uint64_t xk_system_time(void);

@@ -135,6 +135,7 @@ WlResult wl_xk_init(const WlXkConfig *cfg) {
     xk_files_init(cfg);
     xk_irq_init();
     wl_xb_thread_set_exit_hook(thread_ended);
+    wl_xb_service_set_status_hook(xk_status_report);
     wl_xb_service_set_tick_va(xk_kdata_tick_va());
     wl_xb_thunk_trace(cfg->trace_calls, false);
     uint32_t implemented = 0;

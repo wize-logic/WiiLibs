@@ -47,6 +47,7 @@ static int g_exit_code;
 static uint32_t g_live; // guest threads started and not ended
 static uint32_t g_tls_data, g_tls_bytes, g_tls_zero;
 static WlXbThreadStats g_stats;
+static WlXbLatency g_ready_waits; // g_m held
 volatile uint32_t g_xb_attention;
 volatile uint32_t g_xb_det_work;
 
@@ -120,9 +121,17 @@ static void enqueue(WlXbThread *t) {
     g_xb_attention = 1; // the holder gives the lock up at its next safe point when this one outranks it
 }
 
+// `t` leaves the ready queue for the lock: how long it waited (g_m held).
+static void note_ready_wait(const WlXbThread *t) {
+    if (!t->is_service) {
+        wl_xb_latency_add(&g_ready_waits, wl_xb_time_us() - t->ready_since_us);
+    }
+}
+
 static WlXbThread *dequeue(void) {
     WlXbThread *t = g_ready;
     if (t != NULL) {
+        note_ready_wait(t);
         g_ready = t->next_ready;
         t->next_ready = NULL;
         t->ready = false;
@@ -146,6 +155,9 @@ static void unqueue(WlXbThread *t) {
 // Gives the baton away (g_m held; the caller is the holder): to the head of the queue, or to no
 // one. In the deterministic mode no one is the idle thread, which moves the clock on.
 static void hand_off(void) {
+    if (g_boosted == g_owner) {
+        g_boosted = NULL; // a boost lasts the turn it was given for
+    }
     WlXbThread *next = dequeue();
     if (next == NULL && g_det && g_idle != NULL && g_owner != g_idle) {
         next = g_idle;
@@ -360,6 +372,27 @@ static bool irql_raised(const WlXbThread *t) {
     return t->kpcr != 0 && wl_xb_rd8(t->kpcr + KPCR_IRQL) >= DISPATCH_LEVEL;
 }
 
+// The holder gives the lock to `to`, already out of the ready queue, for one quantum (g_boosted:
+// queued by priority, the holder would otherwise take it back at the next safe point), and waits
+// in the queue for its turn (g_m held; released on return).
+static void give_to(WlXbThread *self, WlXbThread *to) {
+    note_ready_wait(to);
+    g_boosted = to;
+    wl_xb_cpu_save(&self->cpu);
+    g_cur = NULL;
+    enqueue(self);
+    g_owner = to;
+    g_stats.handoffs++;
+    wl_platform_cond_signal(to->cond);
+    while (g_owner != self) {
+        wl_platform_cond_wait(self->cond, g_m);
+    }
+    g_quantum_start = wl_xb_time_us();
+    wl_platform_mutex_unlock(g_m);
+    g_cur = self;
+    wl_xb_cpu_load(&self->cpu);
+}
+
 // Gives the lock to the head of the ready queue when it outranks the caller, or ties with it and
 // the caller's quantum is over. true when it did.
 static bool yield_if_due(WlXbThread *self) {
@@ -410,20 +443,7 @@ static bool yield_if_due(WlXbThread *self) {
         starved->next_ready = NULL;
         starved->ready = false;
         g_stats.starved_handoffs++;
-        g_boosted = starved;
-        wl_xb_cpu_save(&self->cpu);
-        g_cur = NULL;
-        enqueue(self);
-        g_owner = starved;
-        g_stats.handoffs++;
-        wl_platform_cond_signal(starved->cond);
-        while (g_owner != self) {
-            wl_platform_cond_wait(self->cond, g_m);
-        }
-        g_quantum_start = wl_xb_time_us();
-        wl_platform_mutex_unlock(g_m);
-        g_cur = self;
-        wl_xb_cpu_load(&self->cpu);
+        give_to(self, starved);
         return true;
     }
     return false;
@@ -616,6 +636,37 @@ bool wl_xb_card_busy(void) {
     }
     wl_platform_mutex_unlock(g_card);
     return false;
+}
+
+bool wl_xb_yield_any(void) {
+    WlXbThread *self = g_cur;
+    g_stats.yields++;
+    if (self == NULL || g_ready == NULL || wl_xb_in_service()) {
+        return false;
+    }
+    if (irql_raised(self)) {
+        g_stats.raised_holds++; // the processor stays its (yield_if_due)
+        return false;
+    }
+    wl_platform_mutex_lock(g_m);
+    WlXbThread *head = g_ready;
+    if (head == NULL) {
+        wl_platform_mutex_unlock(g_m);
+        return false;
+    }
+    if (head->priority >= self->priority || head->is_service) {
+        wl_platform_mutex_unlock(g_m);
+        requeue(self);
+        return true;
+    }
+    // below the caller: the console runs it for the rest of a quantum (the caller, ready above it,
+    // comes back at the quantum's end or when it waits), as the starvation hand-off does
+    g_ready = head->next_ready;
+    head->next_ready = NULL;
+    head->ready = false;
+    g_stats.yields_lower++;
+    give_to(self, head);
+    return true;
 }
 
 // ---- Threads -----------------------------------------------------------------------------------
@@ -1171,6 +1222,48 @@ int wl_xb_process_wait(void) {
 
 void wl_xb_thread_stats(WlXbThreadStats *out) {
     *out = g_stats;
+}
+
+void wl_xb_latency_add(WlXbLatency *h, uint64_t us) {
+    static const uint32_t bound_ms[WL_XB_LAT_BUCKETS - 1u] = {1, 2, 5, 10, 20, 30, 40, 60, 100};
+    uint32_t ms = us >= 0xFFFFFFFFull * 1000u ? 0xFFFFFFFFu : (uint32_t)(us / 1000u);
+    uint32_t b = 0;
+    while (b < WL_XB_LAT_BUCKETS - 1u && ms >= bound_ms[b]) {
+        b++;
+    }
+    h->n[b]++;
+    h->count++;
+    if (ms > h->max_ms) {
+        h->max_ms = ms;
+    }
+}
+
+void wl_xb_latency_log(const char *tag, const char *what, WlXbLatency *h) {
+    WlXbLatency c = *h;
+    memset(h, 0, sizeof *h);
+    if (c.count == 0) {
+        return;
+    }
+    WL_LOG_I(tag, "%s: %u, ms <1:%u <2:%u <5:%u <10:%u <20:%u <30:%u <40:%u <60:%u <100:%u more:%u max %u", what,
+             (unsigned)c.count, (unsigned)c.n[0], (unsigned)c.n[1], (unsigned)c.n[2], (unsigned)c.n[3],
+             (unsigned)c.n[4], (unsigned)c.n[5], (unsigned)c.n[6], (unsigned)c.n[7], (unsigned)c.n[8],
+             (unsigned)c.n[9], (unsigned)c.max_ms);
+}
+
+void wl_xb_thread_log_ready_waits(void) {
+    wl_platform_mutex_lock(g_m);
+    WlXbLatency c = g_ready_waits;
+    memset(&g_ready_waits, 0, sizeof g_ready_waits);
+    WlXbThreadStats st = g_stats;
+    wl_platform_mutex_unlock(g_m);
+    static uint32_t last_starved, last_lower;
+    if (c.count != 0) {
+        WL_LOG_I(TAG, "ready waits: %u starved hand-offs, %u yields to a lower priority since the last line",
+                 (unsigned)(st.starved_handoffs - last_starved), (unsigned)(st.yields_lower - last_lower));
+    }
+    last_starved = st.starved_handoffs;
+    last_lower = st.yields_lower;
+    wl_xb_latency_log(TAG, "ready waits", &c);
 }
 
 void wl_xb_thread_host_memory(size_t *bytes, uint32_t *stacks, size_t *deepest, size_t *deepest_of) {

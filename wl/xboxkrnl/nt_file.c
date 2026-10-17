@@ -951,7 +951,7 @@ static XkObject *begin_io(XkObject *file, uint32_t event) {
 // (an NT_ERROR status, STATUS_END_OF_FILE among them) is returned alone: NT sets none of them for a
 // request that fails before it is pending (begin_io cleared the events).
 static uint32_t complete_io(XkFile *f, XkObject *file, XkObject *event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb,
-                            uint32_t status, uint32_t done) {
+                            uint32_t status, uint32_t done, uint32_t read_issued) {
     if (NT_ERROR(status)) {
         return status;
     }
@@ -963,7 +963,7 @@ static uint32_t complete_io(XkFile *f, XkObject *file, XkObject *event, uint32_t
         xk_event_set(event->body);
     }
     if (apc != 0 && !f->synchronous) {
-        xk_apc_queue(wl_xb_current(), apc, apc_ctx, iosb, 0);
+        xk_apc_queue(wl_xb_current(), apc, apc_ctx, iosb, 0, read_issued);
     }
     if (!f->synchronous && g_xk_cfg.async_io_pending && NT_SUCCESS(status)) {
         return STATUS_PENDING;
@@ -1005,6 +1005,7 @@ static void file_io(bool write) {
         return;
     }
     // the file and the event stay while the card's part runs outside the guest lock (do_read)
+    uint32_t read_issued = write ? 0u : xk_read_issued();
     xk_object_reference(o);
     XkObject *ev = begin_io(o, ARG(1));
     io_turn_take(f);
@@ -1017,7 +1018,7 @@ static void file_io(bool write) {
         io_note(f, write, off, done, wl_platform_time_us() - t0);
     }
     f->io_busy = false;
-    RET(complete_io(f, o, ev, ARG(2), ARG(3), ARG(4), status, done));
+    RET(complete_io(f, o, ev, ARG(2), ARG(3), ARG(4), status, done, read_issued));
     if (ev != NULL) {
         xk_object_release(ev);
     }

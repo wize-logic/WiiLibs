@@ -119,6 +119,16 @@ void k_KeDelayExecutionThread(void) {
     WlXbThread *self = wl_xb_current();
     XkThread *k = self != NULL ? xk_thread_state(self) : NULL;
     if (t == 0 || k == NULL) {
+        g_xk_stats.zero_delays++;
+        // The console looks at the user APCs before the interval: SleepEx(0, TRUE) runs the
+        // completion routines queued so far (Halo's reader calls it before each ReadFileEx)
+        if (k != NULL && alertable && user && k->apc_count > 0) {
+            g_xk_stats.zero_delays_with_apc++;
+            xk_apc_deliver(self);
+            RET(STATUS_USER_APC);
+            return;
+        }
+        // then a zero interval gives way to a ready thread of equal or higher priority
         wl_xb_yield();
         RET(STATUS_SUCCESS);
         return;

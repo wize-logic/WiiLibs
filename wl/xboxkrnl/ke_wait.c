@@ -144,6 +144,26 @@ static bool try_satisfy(WlXbThread *t, uint32_t count, const uint32_t *objects, 
     return false;
 }
 
+// A read's issue to its completion routine (the APCs of reads, delivered since the last report).
+static WlXbLatency g_read_apc_lat;
+
+uint32_t xk_read_issued(void) {
+    return (uint32_t)(wl_xb_time_us() / 1000u) + 1u;
+}
+
+void xk_status_report(void) {
+    static WlXkStats last;
+    WlXkStats s = g_xk_stats;
+    if (s.apcs_queued != last.apcs_queued || s.zero_delays != last.zero_delays) {
+        WL_LOG_I(XK_TAG, "APCs: %u queued, %u delivered; %u zero delays, %u of them with an APC queued (10 s)",
+                 (unsigned)(s.apcs_queued - last.apcs_queued), (unsigned)(s.apcs_delivered - last.apcs_delivered),
+                 (unsigned)(s.zero_delays - last.zero_delays),
+                 (unsigned)(s.zero_delays_with_apc - last.zero_delays_with_apc));
+    }
+    last = s;
+    wl_xb_latency_log(XK_TAG, "reads issued to completion routine", &g_read_apc_lat);
+}
+
 bool xk_apc_deliver(WlXbThread *t) {
     XkThread *k = xk_thread_state(t);
     bool any = false;
@@ -151,6 +171,10 @@ bool xk_apc_deliver(WlXbThread *t) {
         XkApc apc = k->apcs[k->apc_head];
         k->apc_head = (k->apc_head + 1u) % XK_MAX_APCS;
         k->apc_count--;
+        if (apc.read_issued != 0) {
+            uint32_t now = xk_read_issued();
+            wl_xb_latency_add(&g_read_apc_lat, (uint64_t)(now - apc.read_issued) * 1000u);
+        }
         uint32_t args[3] = {apc.context, apc.arg1, apc.arg2};
         wl_xb_call_guest_preserving(apc.routine, 3, args);
         g_xk_stats.apcs_delivered++;
@@ -159,7 +183,8 @@ bool xk_apc_deliver(WlXbThread *t) {
     return any;
 }
 
-void xk_apc_queue(WlXbThread *t, uint32_t routine, uint32_t context, uint32_t arg1, uint32_t arg2) {
+void xk_apc_queue(WlXbThread *t, uint32_t routine, uint32_t context, uint32_t arg1, uint32_t arg2,
+                  uint32_t read_issued) {
     XkThread *k = xk_thread_state(t);
     if (k == NULL || routine == 0) {
         return;
@@ -168,8 +193,9 @@ void xk_apc_queue(WlXbThread *t, uint32_t routine, uint32_t context, uint32_t ar
         WL_LOG_E(XK_TAG, "thread %u: APC queue full, APC to 0x%08x dropped", (unsigned)t->id, (unsigned)routine);
         return;
     }
-    k->apcs[(k->apc_head + k->apc_count) % XK_MAX_APCS] = (XkApc){routine, context, arg1, arg2};
+    k->apcs[(k->apc_head + k->apc_count) % XK_MAX_APCS] = (XkApc){routine, context, arg1, arg2, read_issued};
     k->apc_count++;
+    g_xk_stats.apcs_queued++;
     if (k->waiting) {
         wl_xb_wake(t);
     }

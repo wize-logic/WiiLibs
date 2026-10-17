@@ -361,7 +361,7 @@ void k_NtQueueApcThread(void) {
         RET(STATUS_INVALID_HANDLE);
         return;
     }
-    xk_apc_queue(o->thread, ARG(1), ARG(2), ARG(3), ARG(4));
+    xk_apc_queue(o->thread, ARG(1), ARG(2), ARG(3), ARG(4), 0);
     RET(STATUS_SUCCESS);
 }
 

@@ -943,6 +943,66 @@ TEST no_yield_at_dispatch_level(void) {
     PASS();
 }
 
+// ---- NtYieldExecution gives way to any ready thread ------------------------------------------------
+// The console's NtYieldExecution hands the processor to the best ready thread whatever its
+// priority (a spin on SwitchToThread lets a lower-priority loader run), and says when there was
+// none (STATUS_NO_YIELD_PERFORMED). A delay of 0 gives way only to equal or higher priority.
+
+TEST yield_gives_way_to_a_lower_priority(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    g_ran = 0;
+    WlXbThread *self = wl_xb_current();
+    int prio = self->priority;
+    wl_xb_thread_set_priority(self, prio + 2); // the spinner above the worker, as Halo's main thread
+    uint32_t hp = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 1, 0, 0, 0, guest_fn(8, mark_routine)), "%08x");
+    if (!wl_xb_deterministic()) {
+        wl_platform_thread_sleep_ms(20); // (its host thread queued for the lock)
+    }
+    uint64_t start = now_ms();
+    uint32_t yields = 0, status = 0;
+    while (g_ran == 0 && yields < 1000u) {
+        status = K0(S_NT_YIELD);
+        yields++;
+    }
+    ASSERT_EQ_FMT(1u, g_ran, "%u");
+    ASSERT_EQ_FMT(0u, status, "%08x");
+    if (!wl_xb_deterministic()) {
+        ASSERT(now_ms() - start < 20u); // at once, not after the starvation hand-off (30 ms)
+    }
+    delay_ms(5); // the worker ends
+    ASSERT_EQ_FMT(0x40000024u, K0(S_NT_YIELD), "%08x"); // no one ready: STATUS_NO_YIELD_PERFORMED
+    wl_xb_thread_set_priority(self, prio);
+    KN(S_NT_CLOSE, wl_xb_rd32(hp));
+    PASS();
+}
+
+// ---- Vertical blanks are counted, not merged -----------------------------------------------------
+// Halo's game clock counts its vblank callback's calls: two vertical blanks raised before the
+// service runs are two interrupts, not one.
+
+TEST vblanks_raised_together_all_run(void) {
+    boot();
+    ASSERT(g_ready);
+    uint32_t before = wl_xb_vblank_count();
+    WlXbServiceStats s0;
+    wl_xb_service_stats(&s0);
+    wl_xb_service_raise(WL_XB_SVC_VBLANK);
+    wl_xb_service_raise(WL_XB_SVC_VBLANK);
+    wl_xb_service_raise(WL_XB_SVC_VBLANK);
+    wl_xb_service_poll();
+    for (int i = 0; i < 50 && wl_xb_vblank_count() - before < 3u; i++) {
+        delay_ms(1); // (the service thread may have run some)
+    }
+    ASSERT_EQ_FMT(3u, wl_xb_vblank_count() - before, "%u");
+    WlXbServiceStats s1;
+    wl_xb_service_stats(&s1);
+    ASSERT_EQ_FMT(3u, s1.vblanks_raised - s0.vblanks_raised, "%u");
+    PASS();
+}
+
 // ---- A thread that ends abandons its mutants ------------------------------------------------------
 
 static uint32_t g_mut_h, g_mut_tp;
@@ -1187,6 +1247,17 @@ TEST files_dvd_and_overlapped(void) {
     ASSERT_EQ_FMT(1u, g_apc_runs, "%u");
     ASSERT_EQ_FMT(0xA9C0u, g_apc_ctx, "%08x");
     ASSERT_EQ_FMT(8u, g_apc_info, "%u");
+    // SleepEx(0, TRUE): an alertable delay of 0 delivers a queued APC first (STATUS_USER_APC), as
+    // the console does before its zero-interval yield; not from kernel mode, nor when not alertable
+    ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, ev, guest_fn(3, apc_routine), 0xA9C1u, iosb, buf, 8, off), "%08x");
+    uint32_t zero = gmem(8);
+    ASSERT_EQ_FMT(0u, KN(S_KE_DELAY, 1, 0, zero), "%08x");
+    ASSERT_EQ_FMT(0u, KN(S_KE_DELAY, 0, 1, zero), "%08x");
+    ASSERT_EQ_FMT(1u, g_apc_runs, "%u");
+    ASSERT_EQ_FMT(0xC0u, KN(S_KE_DELAY, 1, 1, zero), "%08x");
+    ASSERT_EQ_FMT(2u, g_apc_runs, "%u");
+    ASSERT_EQ_FMT(0xA9C1u, g_apc_ctx, "%08x");
+    ASSERT_EQ_FMT(0u, KN(S_KE_DELAY, 1, 1, zero), "%08x"); // none left: a yield
     KN(S_NT_CLOSE, ev);
     KN(S_NT_CLOSE, h);
     PASS();
@@ -2762,6 +2833,8 @@ SUITE(kernel_suite) {
     RUN_TEST(card_io_gives_the_lock_up);
     RUN_TEST(a_signal_satisfies_the_waiter_at_once);
     RUN_TEST(no_yield_at_dispatch_level);
+    RUN_TEST(yield_gives_way_to_a_lower_priority);
+    RUN_TEST(vblanks_raised_together_all_run);
     RUN_TEST(an_ended_owner_abandons_its_mutants);
     RUN_TEST(a_masked_line_waits_quietly);
     RUN_TEST(timers_wait_for_the_irql);
