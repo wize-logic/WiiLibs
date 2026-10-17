@@ -141,6 +141,10 @@ void wl_xb_gpu_set_frame_overlap(bool on);
 // boot code sets it for a file "vcache" in the title's folder (its text the KB, 1024 when empty;
 // WL_XB_VCACHE_KB on the host). Call it before wl_xb_gpu_attach_nv2a.
 void wl_xb_gpu_set_vertex_cache(void *arena, uint32_t bytes);
+// The vertex path's dcbt ahead of the guest's vertex data and push buffer (wl/xbox/nv2a_kelvin.h's
+// wl_nv2a_set_prefetch; on by default, PowerPC only). The boot code turns it off for a file
+// "noprefetch" in the title's folder, for an A/B on the console.
+void wl_xb_gpu_set_prefetch(bool on);
 
 #ifdef __cplusplus
 }

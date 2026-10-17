@@ -402,6 +402,9 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
     }
 #endif
     wl_xb_gpu_set_vertex_cache(NULL, vcache_kb << 10);
+    // (a file "noprefetch": no dcbt ahead of the vertex data and push buffer, for an A/B on the console)
+    snprintf(flag, sizeof flag, "%s/noprefetch", cfg->title_dir);
+    wl_xb_gpu_set_prefetch(!wl_platform_fs_exists(flag));
     gx_bisect_options(cfg);
 }
 

@@ -198,6 +198,42 @@ static inline float small_int_float(int value) {
     return f - 12582912.0f;
 }
 
+bool wl_nv2a_prefetch_on = true;
+
+void wl_nv2a_set_prefetch(bool on) {
+    wl_nv2a_prefetch_on = on;
+}
+
+// an array attribute's bytes joined to the plan's prefetch areas: to one of its stride whose bytes
+// and these lie within one stride, else a new one (none when they are all taken)
+static void prefetch_area_add(WlNv2aFetchPlan *plan, const uint8_t *data, uint32_t stride, uint32_t bytes) {
+    unsigned a;
+
+    if (bytes == 0) {
+        return;
+    }
+    for (a = 0; a < plan->prefetch_count; a++) {
+        const uint8_t *lo = plan->prefetch[a].data, *hi = lo + plan->prefetch[a].last + 1u;
+
+        if (plan->prefetch[a].stride != stride) {
+            continue;
+        }
+        lo = data < lo ? data : lo;
+        hi = data + bytes > hi ? data + bytes : hi;
+        if ((size_t)(hi - lo) <= (stride > WL_NV2A_CACHE_LINE ? stride : WL_NV2A_CACHE_LINE)) {
+            plan->prefetch[a].data = lo;
+            plan->prefetch[a].last = (uint32_t)(hi - lo) - 1u;
+            return;
+        }
+    }
+    if (plan->prefetch_count < WL_NV2A_PREFETCH_AREAS) {
+        plan->prefetch[plan->prefetch_count].data = data;
+        plan->prefetch[plan->prefetch_count].stride = stride;
+        plan->prefetch[plan->prefetch_count].last = bytes - 1u;
+        plan->prefetch_count++;
+    }
+}
+
 void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetchPlan *plan) {
     unsigned a;
 
@@ -210,6 +246,7 @@ void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetch
     plan->constants = 0;
     plan->indices = draw->indices;
     plan->index_base = draw->index_base;
+    plan->prefetch_count = 0;
     if (draw->source == WL_NV2A_SOURCE_IMMEDIATE) {
         return;
     }
@@ -229,6 +266,9 @@ void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetch
         if (draw->source == WL_NV2A_SOURCE_ARRAYS) {
             plan->streamed[plan->count].data = attrib->data;
             plan->streamed[plan->count].stride = attrib->stride;
+            if (WL_NV2A_PREFETCHES) {
+                prefetch_area_add(plan, attrib->data, attrib->stride, wl_nv2a_attrib_bytes(attrib->type, attrib->size));
+            }
         } else {
             plan->streamed[plan->count].data = draw->inline_data + attrib->inline_offset;
             plan->streamed[plan->count].stride = draw->inline_stride;
@@ -1627,6 +1667,20 @@ static __attribute__((noinline)) void window_run(WlNv2aKelvin *k, uint32_t metho
     }
 }
 
+// how many of a run's `left` words at `w` to read before asking for the next line: to the end of
+// w's line, with the line WL_NV2A_PUSH_AHEAD on asked for (Broadway reads the push buffer a miss a
+// line otherwise); all of them without the prefetch
+static inline __attribute__((always_inline)) uint32_t push_part(const uint8_t *w, uint32_t left) {
+    uint32_t part;
+
+    if (!wl_nv2a_prefetching()) {
+        return left;
+    }
+    WL_NV2A_PREFETCH(w + WL_NV2A_PUSH_AHEAD);
+    part = (WL_NV2A_CACHE_LINE - ((uint32_t)(uintptr_t)w & (WL_NV2A_CACHE_LINE - 1u))) >> 2;
+    return part != 0 && part < left ? part : left;
+}
+
 // wl_nv2a_kelvin_methods' work, for it and wl_nv2a_kelvin_push (`ch`: the channel running, or NULL)
 static inline __attribute__((always_inline)) uint32_t methods_run(WlNv2a *dev, const WlNv2aChannel *ch,
                                                                   uint32_t method, bool increasing,
@@ -1646,18 +1700,24 @@ static inline __attribute__((always_inline)) uint32_t methods_run(WlNv2a *dev, c
         if (count != 0 && count <= (WL_NV2A_BATCH_INDICES - at) / halves) {
             // (room for the whole run: no flush to test for, and the method's value the last word's)
             const uint8_t *w = words;
+            uint32_t left = count, part;
 
-            if (halves == 2u) {
-                for (n = 0; n < count; n++, w += 4) {
-                    uint32_t param = wl_rd_le32(w);
+            // (a line of words at a time, the line WL_NV2A_PUSH_AHEAD on asked for first; without the
+            // prefetch, the whole run in one)
+            for (; left != 0; left -= part) {
+                part = push_part(w, left);
+                if (halves == 2u) {
+                    for (n = 0; n < part; n++, w += 4) {
+                        uint32_t param = wl_rd_le32(w);
 
-                    indices[at] = param & 0xFFFFu;
-                    indices[at + 1u] = param >> 16;
-                    at += 2u;
-                }
-            } else {
-                for (n = 0; n < count; n++, w += 4) {
-                    indices[at++] = wl_rd_le32(w);
+                        indices[at] = param & 0xFFFFu;
+                        indices[at + 1u] = param >> 16;
+                        at += 2u;
+                    }
+                } else {
+                    for (n = 0; n < part; n++, w += 4) {
+                        indices[at++] = wl_rd_le32(w);
+                    }
                 }
             }
             k->raw[method >> 2] = wl_rd_le32(words + 4u * (count - 1u));
@@ -1740,6 +1800,11 @@ uint32_t wl_nv2a_kelvin_push(WlNv2a *dev, WlNv2aChannel *ch, const uint8_t *word
         uint32_t method, count, run, done;
         unsigned subchannel;
         bool non_increasing;
+
+        if (wl_nv2a_prefetching()) {
+            // (the headers and short runs that follow: the line WL_NV2A_PUSH_AHEAD on asked for)
+            WL_NV2A_PREFETCH(words + 4u * taken + WL_NV2A_PUSH_AHEAD);
+        }
 
         // (a header: what the pusher takes it for when it is not a jump, a call or a return, which
         // never match these bits)

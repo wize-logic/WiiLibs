@@ -198,4 +198,8 @@ void wl_xb_gpu_set_vertex_cache(void *arena, uint32_t bytes) {
     (void)arena;
     (void)bytes;
 }
+
+void wl_xb_gpu_set_prefetch(bool on) {
+    (void)on;
+}
 #endif

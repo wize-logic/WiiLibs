@@ -23,6 +23,7 @@
 
 #include "wl/xbox/nv2a.h"
 #include "wl/xbox/nv2a_capture.h"
+#include "wl/xbox/nv2a_kelvin.h"
 #include "wl/xbox/nv2a_gx.h"
 
 #define TAG "xbgpu"
@@ -319,6 +320,10 @@ static uint32_t g_vcache_bytes;
 void wl_xb_gpu_set_vertex_cache(void *arena, uint32_t bytes) {
     g_vcache_arena = arena;
     g_vcache_bytes = bytes;
+}
+
+void wl_xb_gpu_set_prefetch(bool on) {
+    wl_nv2a_set_prefetch(on);
 }
 
 // What the GPU holds of the host's heap (mem_census.h): the device and the backend's records, the
