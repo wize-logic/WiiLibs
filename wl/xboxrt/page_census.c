@@ -61,7 +61,7 @@ typedef struct {
 } IoCount;
 static IoCount g_io[WL_XB_CIO_COUNT];
 static uint32_t g_card_ops[WL_XB_CCARD_COUNT][2];   // [kind][map]
-static uint64_t g_card_bytes[WL_XB_CCARD_COUNT][2];
+static uint32_t g_card_bytes[WL_XB_CCARD_COUNT][2]; // (32 bits: no 64-bit atomics on 32-bit PowerPC; a second's)
 static const char *const k_io[WL_XB_CIO_COUNT] = {"swap_in", "swap_out", "file_in", "ahead", "zhit",
                                                   "evict", "ahead_unused", "forget"};
 static const char *const k_card[WL_XB_CCARD_COUNT] = {"read", "read_held", "ahead", "write"};
@@ -314,7 +314,7 @@ void wl_xb_census_card_slow(WlXbCensusCard kind, bool map, uint32_t bytes) {
     }
     // (the read-ahead's thread counts without the guest lock)
     __atomic_fetch_add(&g_card_ops[kind][map], 1u, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&g_card_bytes[kind][map], (uint64_t)bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_card_bytes[kind][map], bytes, __ATOMIC_RELAXED);
 }
 
 void wl_xb_census_io_now(WlXbCensusIo kind, uint32_t *ops, uint32_t *pages, uint32_t *fresh) {
@@ -329,7 +329,7 @@ void wl_xb_census_card_now(WlXbCensusCard kind, uint32_t *ops, uint64_t *bytes) 
     *ops = ok ? __atomic_load_n(&g_card_ops[kind][0], __ATOMIC_RELAXED) +
                     __atomic_load_n(&g_card_ops[kind][1], __ATOMIC_RELAXED)
               : 0u;
-    *bytes = ok ? __atomic_load_n(&g_card_bytes[kind][0], __ATOMIC_RELAXED) +
+    *bytes = ok ? (uint64_t)__atomic_load_n(&g_card_bytes[kind][0], __ATOMIC_RELAXED) +
                       __atomic_load_n(&g_card_bytes[kind][1], __ATOMIC_RELAXED)
                 : 0u;
 }
@@ -359,7 +359,7 @@ static void io_lines(void) {
         memset(c, 0, sizeof *c);
     }
     uint32_t ops[WL_XB_CCARD_COUNT][2];
-    uint64_t bytes[WL_XB_CCARD_COUNT][2];
+    uint32_t bytes[WL_XB_CCARD_COUNT][2];
     uint32_t any = 0;
     for (int k = 0; k < WL_XB_CCARD_COUNT; k++) {
         for (int m = 0; m < 2; m++) {
