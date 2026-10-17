@@ -57,6 +57,9 @@ enum {
 // how far (in the depth's 0..1) a fit made with the canonical points may be from a draw's own
 // depths: a few of the depth buffer's 24-bit steps, the rounding of a program's depth
 #define FIT_TOLERANCE (8.0f / 16777216.0f)
+// how far the camera's slope with a draw's own offset may be from its vertices' depths for a draw
+// whose vertices alone make its fit (projection_fit): beyond it, the draw has a projection of its own
+#define NARROW_TOLERANCE (512.0f / 16777216.0f)
 // how far a fit kept for a transform may be from a draw of the same signature: only a sanity check.
 // The draws of one transform must share its fit exactly whatever its rounding (a fit is exact only
 // near the vertices it was made from, and a second pass may reach nearer the eye, where the depth
@@ -148,6 +151,10 @@ struct WlNv2aGx {
     float loaded_bias;
     uint32_t loaded_w, loaded_h;
     float fit_a, fit_b;
+    // the last fit made through the canonical points as well as the vertices (spread through the
+    // depth: the camera's projection), for a draw whose vertices alone span too little
+    float wide_a, wide_b;
+    bool wide;
     // the fits kept by their transform's signature: the clip-space positions the program gives the
     // canonical inputs, bit for bit
     struct FitSignature {
@@ -1154,6 +1161,21 @@ static float fit_error(float a, float b, const float *inverse_w, const float *de
     return worst;
 }
 
+// the depth a + b / w with the slope b given, its a halfway between the vertices' least and greatest
+// depth - b / w; returns the fit's worst error over them
+static float offset_fit(float b, const float *inverse_w, const float *depth, unsigned n, float *a) {
+    float low = 0.0f, high = 0.0f, r;
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        r = depth[i] - b * inverse_w[i];
+        low = i == 0 || r < low ? r : low;
+        high = i == 0 || r > high ? r : high;
+    }
+    *a = 0.5f * (low + high);
+    return 0.5f * (high - low);
+}
+
 // the guest's bytes of the draw's vertices first .. first + count - 1 (those in the draw) asked for
 // ahead of their fetch (wl_nv2a_fetch_prefetch): a batch ahead, a miss each line otherwise
 static void draw_prefetch(const WlNv2aFetchPlan *fetch, const WlNv2aDraw *draw, uint32_t first, uint32_t count) {
@@ -1303,9 +1325,19 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
     }
     // a fit for a transform not seen: through the vertices and the canonical points, unless they
     // stray from the vertices; else through the vertices alone (with none in front of the eye, the
-    // canonical points alone; with neither, the last fit)
-    if (!(fit_two(inverse_w, depth, c, &a, &b) && fit_error(a, b, inverse_w, depth, n) <= FIT_TOLERANCE) &&
-        !fit_two(inverse_w, depth, n, &a, &b)) {
+    // canonical points alone; with neither, the last fit). Through the vertices alone, the slope of
+    // the last wide fit (the camera's) first when it holds for them, with an offset of their own: a
+    // small or distant model (Halo's skinned characters, whose canonical points stray) spans too
+    // little depth to set a slope (a10's captain: 1 / w over 0.0916..0.0916), and one of its own,
+    // kept for its transform, put him in front of the bridge's console in one frame and behind it
+    // in the next (its error over his body 4e-5, 700 of the depth's steps)
+    if (fit_two(inverse_w, depth, c, &a, &b) && fit_error(a, b, inverse_w, depth, n) <= FIT_TOLERANCE) {
+        gx->wide_a = a;
+        gx->wide_b = b;
+        gx->wide = true;
+    } else if (n > 0 && gx->wide && offset_fit(gx->wide_b, inverse_w, depth, n, &a) <= NARROW_TOLERANCE) {
+        b = gx->wide_b;
+    } else if (!fit_two(inverse_w, depth, n, &a, &b)) {
         return p;
     }
     gx->stats.fits_made++;
