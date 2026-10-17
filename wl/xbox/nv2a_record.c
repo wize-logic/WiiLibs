@@ -137,6 +137,18 @@ size_t wl_nv2a_describe_state(const WlNv2aKelvin *k, char *buf, size_t cap) {
                  (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_COLOR_MASK), (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_FOG_ENABLE),
                  (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_FOG_MODE),
                  wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_TEST_ENABLE) ? "STENCIL" : "no stencil");
+    if (n >= 0 && (size_t)n < cap && wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_TEST_ENABLE)) {
+        // (the test and what it writes: func ref&mask, write mask, ops fail/zfail/zpass)
+        int more = snprintf(buf + n, cap - (size_t)n, " %s %u&%02x write %02x ops %04x/%04x/%04x",
+                            func_name(wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_FUNC)),
+                            (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_FUNC_REF),
+                            (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_FUNC_MASK),
+                            (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_MASK),
+                            (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_OP_FAIL),
+                            (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_OP_ZFAIL),
+                            (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_STENCIL_OP_ZPASS));
+        n = more < 0 ? n : n + more;
+    }
     return n < 0 ? 0 : (size_t)n;
 }
 
