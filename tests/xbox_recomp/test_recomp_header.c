@@ -218,6 +218,37 @@ TEST fp_pc24_matches_the_slow_path(void) {
     PASS();
 }
 
+// Values live across the slow path survive it. On PowerPC it is a call that GCC is told clobbers
+// only LR, so the accumulators below sit in volatile registers across it; a plain call of
+// recomp_fp_round24 is the reference.
+static __attribute__((noinline)) void pc24_accumulate(int keep, const double *din, const uint32_t *iin,
+                                                      double *dout, uint32_t *iout) {
+    double a0 = din[0], a1 = din[1], a2 = din[2], a3 = din[3], a4 = din[4], a5 = din[5];
+    uint32_t b0 = iin[0], b1 = iin[1], b2 = iin[2], b3 = iin[3], b4 = iin[4], b5 = iin[5];
+    for (int k = 1; k <= 64; k++) {
+        double x = (k % 3 == 0 ? 0.0 : k & 1 ? 1e-40 : -3e39) * k;   // zero, denormal as a float, past its range
+        double v = keep ? RECOMP_FP_PC(x) : recomp_fp_round24(x);
+        a0 = a0 * 1.25 + v * 1e30; a1 -= a0 * 0.5; a2 = a2 * a1 + 1.0; a3 += v; a4 = a4 * 0.75 - a3;
+        a5 += (double)k;
+        b0 = b0 * 3u + (uint32_t)k; b1 ^= b0; b2 += b1 >> 3; b3 = b3 * 7u ^ b2; b4 -= b3; b5 += b4 | 1u;
+    }
+    dout[0] = a0; dout[1] = a1; dout[2] = a2; dout[3] = a3; dout[4] = a4; dout[5] = a5;
+    iout[0] = b0; iout[1] = b1; iout[2] = b2; iout[3] = b3; iout[4] = b4; iout[5] = b5;
+}
+
+TEST fp_pc24_slow_path_keeps_registers(void) {
+    static const double din[6] = {0.5, -1.5, 0.25, 2.0, 3.0, -4.0};
+    static const uint32_t iin[6] = {1u, 2u, 3u, 4u, 5u, 6u};
+    double dk[6], dr[6];
+    uint32_t ik[6], ir[6];
+    g_fp_control_word = 0x007F;   // PC = 24
+    pc24_accumulate(1, din, iin, dk, ik);
+    pc24_accumulate(0, din, iin, dr, ir);
+    ASSERT_MEM_EQ(dr, dk, sizeof dk);
+    ASSERT_MEM_EQ(ir, ik, sizeof ik);
+    PASS();
+}
+
 SUITE(recomp_header) {
     RUN_TEST(ea_transform);
     RUN_TEST(mem_reads_little_endian);
@@ -229,6 +260,7 @@ SUITE(recomp_header) {
     RUN_TEST(cvt_si32);
     RUN_TEST(extended_80bit);
     RUN_TEST(fp_pc24_matches_the_slow_path);
+    RUN_TEST(fp_pc24_slow_path_keeps_registers);
 }
 
 GREATEST_MAIN_DEFS();

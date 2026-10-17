@@ -9,7 +9,8 @@ if(NOT WL_PLATFORM STREQUAL "wii")
     # the helpers, on the host and big-endian (ppc-be)
     wl_add_test(test_xbox_recomp_header SOURCES test_recomp_header.c LABELS unit be)
     target_include_directories(test_xbox_recomp_header SYSTEM PRIVATE ${recomp_include})
-    target_compile_options(test_xbox_recomp_header PRIVATE -ffp-contract=off -fno-strict-aliasing)
+    # -O2 even in a debug build: fp_pc24_slow_path_keeps_registers needs the PC=24 path inlined
+    target_compile_options(test_xbox_recomp_header PRIVATE -ffp-contract=off -fno-strict-aliasing -O2)
     target_link_libraries(test_xbox_recomp_header PRIVATE m)
 endif()
 
