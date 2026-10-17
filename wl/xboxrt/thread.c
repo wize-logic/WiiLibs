@@ -63,7 +63,7 @@ static void census_threads(void *user, WlMemCensusReport *out);
 void wl_xb_thread_config_default(WlXbThreadConfig *cfg) {
     cfg->quantum_ms = 10;
     cfg->starve_ms = 30;
-    cfg->host_stack_bytes = 1u << 20;
+    cfg->host_stack_bytes = 256u << 10;
     cfg->default_stack_bytes = 64u << 10;
     cfg->deterministic = false;
     cfg->det_backedge_ns = 40;
@@ -858,12 +858,15 @@ WlResult wl_xb_thread_create(uint32_t routine, uint32_t ctx1, uint32_t ctx2, uin
         return r;
     }
     // the host stack follows what the title asked for its guest stack (a recompiled guest frame is
-    // a C frame, of about twice the guest's bytes), within [192 KB, host_stack_bytes]: Halo's
+    // a C frame, of about twice the guest's bytes), within [64 KB, host_stack_bytes]: Halo's
     // workers ask 16 KB and its main thread 512 KB, and seven 1 MB stacks were a quarter of what
-    // the Wii's host side has
+    // the Wii's host side has. Real-Wii and Dolphin runs of Halo's levels (2026-10, ~5400 census
+    // reports of each size) used at most 14 KB of the main thread's 1 MB and 4 KB of a worker's
+    // 192 KB: the main thread's 256 KB and a worker's 64 KB are still 16 times that, and give
+    // 1.25 MB back to the host side's heap (the census warns past three quarters of a stack)
     size_t host = (size_t)(stack_bytes != 0 ? stack_bytes : g_cfg.default_stack_bytes) * 2u;
-    if (host < (192u << 10)) {
-        host = 192u << 10;
+    if (host < (64u << 10)) {
+        host = 64u << 10;
     }
     if (host > g_cfg.host_stack_bytes) {
         host = g_cfg.host_stack_bytes;
@@ -1328,6 +1331,13 @@ static void census_threads(void *user, WlMemCensusReport *out) {
     uint32_t stacks;
     size_t deepest, of;
     wl_xb_thread_host_memory(&out->bytes, &stacks, &deepest, &of);
+    // (a host stack's overflow runs into the heap below it, silently: said while there is room)
+    static bool warned;
+    if (of != 0 && deepest > of / 4u * 3u && !warned) {
+        warned = true;
+        WL_LOG_W(TAG, "a host stack has been %u KB deep of its %u KB: raise WlXbThreadConfig.host_stack_bytes "
+                 "or the 64 KB floor (thread.c)", (unsigned)(deepest >> 10), (unsigned)(of >> 10));
+    }
     if (of != 0) {
         snprintf(out->note, sizeof out->note, "%u stacks, deepest %u of %u", (unsigned)stacks, (unsigned)(deepest >> 10),
                  (unsigned)(of >> 10));

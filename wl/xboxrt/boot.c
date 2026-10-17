@@ -492,12 +492,14 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
         // heaps are the GX FIFO, three thread stacks (the IO thread's 32 KB, the shutdown watch's
         // 16 KB, the audio thread's 24 KB) and the audio's DMA blocks (five of 4 KB at most): the
         // budgets are those with room to spare (the built-in ones, 4 MB of MEM1 and 4 MB of MEM2,
-        // held 6.8 MB that nothing used, out of malloc's reach; the census logs each heap's peak).
+        // held 6.8 MB that nothing used, out of malloc's reach; the census logs each heap's peak:
+        // over ~800 reports of Halo's levels at most stack 25 KB, audio 5 KB, hot, frame and scene
+        // 0, so their 512 KB of 2026-10 is now 144, and MEM1's rest, the frames', 496 KB more).
         static WlMemTagDef tags[WL_TAG_BUILTIN_COUNT];
         memcpy(tags, wl_mem_builtin_tags(), sizeof tags);
-        tags[WL_TAG_STACK].budget = 256u << 10;
-        tags[WL_TAG_HOT].budget = 64u << 10;
-        tags[WL_TAG_AUDIO].budget = 128u << 10;
+        tags[WL_TAG_STACK].budget = 96u << 10;
+        tags[WL_TAG_HOT].budget = 0;
+        tags[WL_TAG_AUDIO].budget = 48u << 10;
         tags[WL_TAG_NET].budget = 0;
         tags[WL_TAG_ASSET].budget = 0;
         tags[WL_TAG_AUDIO_BANK].budget = 0;
@@ -507,9 +509,9 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
         mcfg.tags = tags;
         mcfg.tag_count = WL_TAG_BUILTIN_COUNT;
         // (the per-frame arenas and the scene stack are a game engine's; the runtime does not use
-        // them, and MEM1 beside a recompiled title's ~12 MB of code has ~7 MB to give)
-        mcfg.frame_arena_size = 64u * 1024u;
-        mcfg.scene_stack_size = 64u * 1024u;
+        // them: none)
+        mcfg.frame_arena_size = 0;
+        mcfg.scene_stack_size = 0;
         mcfg.claim[WL_MEM1] = WL_MEM_CLAIM_NEEDED;
         mcfg.claim[WL_MEM2] = WL_MEM_CLAIM_NEEDED;
         mem_result = wl_mem_init(&mcfg);
