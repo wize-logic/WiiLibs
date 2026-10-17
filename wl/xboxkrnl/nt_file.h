@@ -71,6 +71,8 @@ struct XkFile {
     uint32_t io_jumps;       // requests that did not start where the last one ended
     uint64_t io_read_bytes, io_write_bytes;
     uint64_t io_us;          // the time spent in the card's reads and writes
+    uint64_t io_held_us;     // the card's time (reads, writes, flushes) with the guest lock kept
+    uint64_t io_held_max_us; // its longest piece: every other thread and the interrupts waited
     uint64_t io_end;         // where the last request ended
     uint64_t io_logged;      // the bytes at the last log line
     uint64_t unflushed;      // bytes written since the file was last flushed (XK_FLUSH_BYTES)

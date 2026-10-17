@@ -97,13 +97,16 @@ void wl_xk_alloc_census_report(void);
 // change; `host` as the kernel names it (the data folder's path, then the file's).
 void wl_xk_file_changed(const char *host);
 // What a file handle's reads and writes moved (NtReadFile/NtWriteFile that succeeded): the log shows
-// it every 64 MB and at close ("file I/O"), with the time the card took. False for a handle that is
+// it every 64 MB and at close ("file I/O"), with the time the card took and how much of it kept the
+// guest lock (every other thread and the interrupts waited). False for a handle that is
 // not a file.
 typedef struct {
     uint32_t reads, writes;
     uint32_t jumps; // requests that did not start where the one before ended
     uint64_t read_bytes, write_bytes;
     uint64_t ahead_bytes; // of the read bytes, those the read-ahead had ready
+    uint64_t held_us;     // the card's time (reads, writes, flushes) with the guest lock kept
+    uint64_t held_max_us; // its longest piece
 } WlXkFileIo;
 bool wl_xk_file_io(uint32_t handle, WlXkFileIo *out);
 // Flushes every open file written since its last flush (its size and time reach the card's

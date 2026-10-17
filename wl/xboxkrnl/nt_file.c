@@ -376,12 +376,24 @@ void wl_xk_file_changed(const char *host) {
 static void io_log(const XkFile *f, const char *why) {
     uint32_t ops = f->io_reads + f->io_writes;
     WL_LOG_I(XK_TAG,
-             "file I/O %s: %s: %u reads (%u KB, %u KB each, %u KB read ahead), %u writes (%u KB, %u KB each), %u jumps, %u ms",
+             "file I/O %s: %s: %u reads (%u KB, %u KB each, %u KB read ahead), %u writes (%u KB, %u KB each), %u jumps, %u ms; "
+             "the guest lock kept %u ms of the card's time (longest %u ms)",
              why, f->name, (unsigned)f->io_reads, (unsigned)(f->io_read_bytes >> 10),
              f->io_reads != 0 ? (unsigned)(f->io_read_bytes / f->io_reads >> 10) : 0u,
              (unsigned)(f->io_ahead_bytes >> 10), (unsigned)f->io_writes, (unsigned)(f->io_write_bytes >> 10),
              f->io_writes != 0 ? (unsigned)(f->io_write_bytes / f->io_writes >> 10) : 0u, (unsigned)f->io_jumps,
-             ops != 0 ? (unsigned)(f->io_us / 1000u) : 0u);
+             ops != 0 ? (unsigned)(f->io_us / 1000u) : 0u, (unsigned)(f->io_held_us / 1000u),
+             (unsigned)(f->io_held_max_us / 1000u));
+}
+
+// The card's part of a request, begun at `t0` (wl_platform_time_us), when it kept the guest lock
+// (`self` NULL: no wl_xb_block_begin): what every other thread and the interrupts waited for.
+static void io_held(XkFile *f, const WlXbThread *self, uint64_t t0) {
+    if (self == NULL) {
+        uint64_t us = wl_platform_time_us() - t0;
+        f->io_held_us += us;
+        f->io_held_max_us = us > f->io_held_max_us ? us : f->io_held_max_us;
+    }
 }
 
 // One request's count: a line every XK_IO_LOG_BYTES of a handle's traffic.
@@ -416,7 +428,9 @@ bool wl_xk_file_io(uint32_t handle, WlXkFileIo *out) {
                         .jumps = f->io_jumps,
                         .read_bytes = f->io_read_bytes,
                         .write_bytes = f->io_write_bytes,
-                        .ahead_bytes = f->io_ahead_bytes};
+                        .ahead_bytes = f->io_ahead_bytes,
+                        .held_us = f->io_held_us,
+                        .held_max_us = f->io_held_max_us};
     return true;
 }
 
@@ -840,9 +854,11 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
             memset(io, 0, chunk);
         } else {
             WlXbThread *self = card_begin(span, n);
+            uint64_t t0 = wl_platform_time_us();
             // (held: as card_begin decides on the Wii, whatever the deterministic mode does here)
             got = card_read(f, at, io, chunk, phys, n < XK_BLOCK_MIN && !wl_xb_card_busy());
             wl_xb_block_end(self);
+            io_held(f, self, t0);
         }
         wl_xb_copy_in(buf + *done, io, got);
         *done += got;
@@ -872,7 +888,7 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
     return STATUS_SUCCESS;
 }
 
-static void file_flush(XkFile *f, bool card);
+static void file_flush(XkFile *f, bool card, bool unlocked);
 
 static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uint32_t *done) {
     *done = 0;
@@ -889,7 +905,7 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
     // whole, never a valid header over a body the card's FAT lost.
     bool barrier = f->kind == XK_FILE_REGULAR && off == 0 && f->unflushed != 0;
     if (barrier) {
-        file_flush(f, false);
+        file_flush(f, false, true);
     }
     if (f->kind != XK_FILE_PARTITION) {
         pages_forget(f, off, len);
@@ -904,8 +920,10 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
             xk_raw_write(f->partition, off + *done, io, chunk);
         } else {
             WlXbThread *self = card_begin(span, len);
+            uint64_t t0 = wl_platform_time_us();
             bool ok = card_write(f, off + *done, io, chunk);
             wl_xb_block_end(self);
+            io_held(f, self, t0);
             if (!ok) {
                 status = STATUS_DISK_FULL; // the card is full: what was written stays, and counts
                 break;
@@ -923,7 +941,7 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
     if (f->kind == XK_FILE_REGULAR) {
         f->unflushed += *done;
         if (barrier || f->unflushed >= XK_FLUSH_BYTES) {
-            file_flush(f, false);
+            file_flush(f, false, true);
         }
     }
     return status;
@@ -1037,22 +1055,47 @@ void k_NtWriteFile(void) {
 
 // NTSTATUS NtFlushBuffersFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock)
 // A file's writes to the card, with its size and time (`card`, else only where the platform needs it:
-// XK_FLUSH_CARD), and a sparse file's sidecar.
-static void file_flush(XkFile *f, bool card) {
+// XK_FLUSH_CARD), and a sparse file's sidecar. `unlocked`: a regular file's flush gives the guest lock
+// up while the card works, as its writes do (the caller holds a reference on its object, and keeps
+// no pointer into a list another thread may change). A flush waits for every byte written before it
+// (the host's fsync) or writes the FAT's entry and sectors (the Wii's, every XK_FLUSH_BYTES of a Z:
+// cache slot's copy and before its header's last write), and a sidecar is a file written whole:
+// they held the other threads and the interrupts off for as long. The sidecar's sizes are those at
+// the call; its path is read under the card's lock, which a rename holds while it changes it.
+static void file_flush(XkFile *f, bool card, bool unlocked) {
+    uint64_t before = f->unflushed; // (another thread's writes while the lock is given up stay counted)
     if (f->pf != NULL) {
-        if (card || XK_FLUSH_CARD) {
-            WlResult r = wl_platform_fs_flush(f->pf);
+        bool flush = card || XK_FLUSH_CARD;
+        XkFcb *c = f->sparse && f->resized ? f->fcb : NULL;
+        uint64_t logical = c != NULL ? c->logical : 0, physical = c != NULL ? physical_size(f) : 0;
+        bool side = c != NULL && !(logical <= physical && c->no_sidecar); // (as fcb_sidecar_write)
+        if (flush || side) {
+            WlXbThread *self = unlocked && f->kind == XK_FILE_REGULAR ? wl_xb_block_begin() : NULL;
+            uint64_t t0 = wl_platform_time_us();
+            WlResult r = WL_OK;
+            wl_xb_card_lock();
+            bool stopped = self != NULL && g_card_stopped; // (the title left meanwhile: the card is going)
+            if (flush) {
+                r = stopped ? WL_ERR_STATE : f->pf != NULL ? wl_platform_fs_flush(f->pf)
+                                                           : WL_ERR_STATE; // (its reopen after a rename failed)
+            }
+            if (side && !stopped) {
+                sidecar_write(c->host, logical, physical);
+            }
+            wl_xb_card_unlock();
+            wl_xb_block_end(self);
+            io_held(f, self, t0);
             if (r != WL_OK && !f->flush_failed) {
                 // its size and time may stay as they were on the card
                 f->flush_failed = true;
                 WL_LOG_W(XK_TAG, "flush of %s failed: %s", f->name, wl_result_name(r));
             }
         }
-        if (f->sparse && f->resized && f->fcb != NULL) {
-            fcb_sidecar_write(f->fcb, physical_size(f));
+        if (c != NULL) {
+            c->no_sidecar = logical <= physical;
         }
     }
-    f->unflushed = 0;
+    f->unflushed -= before < f->unflushed ? before : f->unflushed;
 }
 
 void wl_xk_files_stop(bool stop) {
@@ -1069,21 +1112,24 @@ void wl_xk_files_flush(void) {
     for (XkFcb *c = g_fcbs; c != NULL; c = c->next) {
         for (XkFile *f = c->files; f != NULL; f = f->fcb_next) {
             if (f->unflushed != 0) {
-                file_flush(f, false);
+                file_flush(f, false, false);
             }
         }
     }
 }
 
 void k_NtFlushBuffersFile(void) {
-    XkFile *f = file_of(ARG(0));
+    XkObject *o = xk_handle_get_type(ARG(0), XK_OBJ_FILE);
+    XkFile *f = o != NULL ? o->file : NULL;
     if (f == NULL) {
         RET(STATUS_INVALID_HANDLE);
         return;
     }
-    file_flush(f, true);
+    xk_object_reference(o); // (the file stays while the card's part runs outside the guest lock)
+    file_flush(f, true, true);
     xk_iosb(ARG(1), STATUS_SUCCESS, 0);
     RET(STATUS_SUCCESS);
+    xk_object_release(o);
 }
 
 // ---- Information -------------------------------------------------------------------------------------

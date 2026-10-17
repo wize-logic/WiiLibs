@@ -46,7 +46,7 @@ static const uint16_t k_ordinals[] = {
     127, 126, 268, 53, 51, 8, 189, 225, 186, 233, 234, 235, 187, 192, 221, 255, 258, 291, 277, 294, 108, 145, 159, 158,
     113, 107, 149, 119, 109, 98, 44, 190, 202, 219, 236, 211, 226, 207, 210, 218, 184, 199, 217, 166, 171, 173, 168, 305,
     304, 289, 279, 362, 335, 336, 337, 340, 338, 339, 24, 99, 232, 238, 112, 132, 128, 156, 322, 224, 129, 161,
-    195, 246, 250, 251, 364, 123, 138, 205, 160, 175, 176, 151,
+    195, 246, 250, 251, 364, 123, 138, 205, 160, 175, 176, 151, 198,
 };
 enum {
     S_PERF_FREQ, S_PERF_COUNTER, S_COMPARE_MEMORY, S_INTERLOCKED_INC, S_INTERLOCKED_CMPXCHG, S_DBGPRINT,
@@ -62,7 +62,7 @@ enum {
     S_KE_TICK_COUNT, S_HW_INFO, S_NT_RESUME, S_KE_RAISE_TO_DPC, S_KF_LOWER_IRQL, S_NT_DELETE_FILE, S_OB_REF_BY_HANDLE,
     S_OBF_DEREF, S_OBF_REF, S_RTL_VSPRINTF,
     S_KE_PULSE_EVENT, S_KE_RESET_EVENT, S_NT_PULSE_EVENT, S_KF_RAISE_IRQL,
-    S_MM_LOCK_BUFFER, S_MM_LOCK_PHYS, S_KE_STALL,
+    S_MM_LOCK_BUFFER, S_MM_LOCK_PHYS, S_KE_STALL, S_NT_FLUSH,
 };
 
 static uint8_t *g_image; // the XBE's bytes
@@ -807,6 +807,51 @@ TEST card_io_gives_the_lock_up(void) {
             FAILm("the bytes read differ");
         }
     }
+    ASSERT_EQ(WL_OK, wl_platform_thread_join(holder, NULL));
+    KN(S_NT_CLOSE, h);
+    PASS();
+}
+
+// A flush gives the lock up too: it waits for every byte written before it (the host's fsync) or
+// writes the card's FAT (the Wii's, every 32 MB of a Z: cache slot's copy). Here the card is held for
+// 150 ms while the guest flushes: the devices' ticks go on, and the file's count of the card's time
+// with the lock kept stays short.
+TEST card_flush_gives_the_lock_up(void) {
+    boot();
+    ASSERT(g_ready);
+    if (wl_xb_deterministic()) {
+        SKIPm("the virtual clock: the card's I/O keeps the lock");
+    }
+    reset_scratch();
+    const uint32_t n = 64u * 1024u;
+    uint32_t st = 0, iosb = gmem(8), off = gmem(8), base_p = gmem(4), size_p = gmem(4);
+    wl_xb_wr32(base_p, 0);
+    wl_xb_wr32(size_p, n);
+    ASSERT_EQ_FMT(0u, KN(S_NT_ALLOC_VM, base_p, 0, size_p, 0x3000, 4), "%08x"); // MEM_RESERVE | MEM_COMMIT
+    uint32_t buf = wl_xb_rd32(base_p);
+    uint32_t h = open_path("z:\\cardflush.bin", 0xC0000000u, 5, 0x20, &st); // OVERWRITE_IF
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    wl_xb_wr64(off, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h, 0, 0, 0, iosb, buf, n, off), "%08x");
+    g_card_state = 0;
+    WlPlatformThread holder;
+    ASSERT_EQ(WL_OK, wl_platform_thread_create(&holder, card_holder, NULL, g_card_stack, sizeof g_card_stack,
+                                               WL_THREAD_PRIO_MAIN));
+    while (g_card_state == 0) {
+        wl_platform_thread_sleep_ms(1);
+    }
+    WlXbThreadStats ts0, ts1;
+    wl_xb_thread_stats(&ts0);
+    const uint32_t ticks0 = g_tick_runs;
+    ASSERT_EQ_FMT(0u, KN(S_NT_FLUSH, h, iosb), "%08x");
+    ASSERT_EQ_FMT(2u, g_card_state, "%u"); // the flush waited for the card
+    ASSERT(g_tick_runs - ticks0 >= 10u);   // the service thread had the lock meanwhile
+    wl_xb_thread_stats(&ts1);
+    ASSERT(ts1.io_blocks > ts0.io_blocks);
+    WlXkFileIo io;
+    ASSERT(wl_xk_file_io(h, &io));
+    ASSERT_EQ_FMT(1u, io.writes, "%u");
+    ASSERT(io.held_max_us < 100000u); // (the 150 ms wait was not with the lock kept)
     ASSERT_EQ(WL_OK, wl_platform_thread_join(holder, NULL));
     KN(S_NT_CLOSE, h);
     PASS();
@@ -2760,6 +2805,7 @@ SUITE(kernel_suite) {
     RUN_TEST(device_ticks_run_at_safe_points);
     RUN_TEST(a_raised_irql_keeps_the_processor);
     RUN_TEST(card_io_gives_the_lock_up);
+    RUN_TEST(card_flush_gives_the_lock_up);
     RUN_TEST(a_signal_satisfies_the_waiter_at_once);
     RUN_TEST(no_yield_at_dispatch_level);
     RUN_TEST(an_ended_owner_abandons_its_mutants);
