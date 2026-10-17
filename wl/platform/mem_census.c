@@ -85,13 +85,18 @@ void wl_mem_census_heap_text(const WlPlatformHeapInfo *h, char *buf, size_t size
             n += snprintf(buf + n, size - (size_t)n, h->elsewhere != 0 ? ", %u in MEM2)" : ")", kb(h->elsewhere));
         }
     }
+    if (h->stranded != 0 && n > 0 && (size_t)n < size) {
+        n += snprintf(buf + n, size - (size_t)n, "; %u KB of MEM1 out of malloc's reach", kb(h->stranded));
+    }
     if (h->cap != 0 && n > 0 && (size_t)n < size) {
         snprintf(buf + n, size - (size_t)n, "; cap %u KB: %u used, %u at most, %u refused (largest %u B)", kb(h->cap),
                  kb(h->cap_used), kb(h->cap_peak), (unsigned)h->cap_refused, (unsigned)h->cap_largest_refused);
     }
 }
 
-#define LINE 200u
+// (a row's line is cut before the Wii's log does it: log_wii.c keeps 160 characters of a line,
+// the level and tag included)
+#define LINE 128u
 
 void wl_mem_census_log(const char *tag, bool heap_only) {
     static WlMemCensus c; // (large for a stack; one thread at a time takes the census)

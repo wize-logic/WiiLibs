@@ -2,6 +2,7 @@
 // Who holds the host's heap (wl/platform/mem_census.c): the reporters, the rows' order, "other",
 // and on a glibc host (host/heap_host.c) the heap's figures, the cap and the exempt blocks.
 // Byte-order independent: also runs on the big-endian build.
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -95,6 +96,47 @@ TEST heap_text(void) {
     // (a short buffer is cut, not overrun)
     wl_mem_census_heap_text(&h, buf, 16);
     ASSERT_EQ(15u, strlen(buf));
+    // the Wii once sbrk has moved on to MEM2: MEM1's rest out of malloc's reach, said beside
+    memset(&h, 0, sizeof h);
+    h.known = true;
+    h.in_use = 3u << 20;
+    h.top = 2u << 20;
+    h.free_total = h.top;
+    h.stranded = 7u << 20;
+    wl_mem_census_heap_text(&h, buf, sizeof buf);
+    ASSERT_STR_EQ("heap: 3072 KB in use, 2048 KB free (0 inside, 2048 above the top); 7168 KB of MEM1 out of "
+                  "malloc's reach",
+                  buf);
+    PASS();
+}
+
+// The census's rows wrap before the Wii's log cuts a line (log_wii.c: 160 characters, the level and
+// tag included: "[I][xbirq] " before the text).
+static unsigned g_lines, g_longest;
+static void sink_lengths(void *user, WlLogLevel level, const char *tag, const char *line) {
+    (void)user;
+    (void)level;
+    size_t n = 6u + strlen(tag) + strlen(line);
+    g_lines++;
+    g_longest = n > g_longest ? (unsigned)n : g_longest;
+}
+
+TEST rows_fit_the_wii_log(void) {
+    static size_t bytes = 12345678u;
+    static char names[WL_MEM_CENSUS_MAX][16];
+    unsigned i;
+    for (i = 0; i < WL_MEM_CENSUS_MAX; i++) {
+        snprintf(names[i], sizeof names[i], "row number %u", i);
+        ASSERT_EQ(WL_OK, wl_mem_census_add(names[i], report_noted, &bytes));
+    }
+    wl_log_set_sink(sink_lengths, NULL);
+    wl_mem_census_log("xbirq", false);
+    wl_log_set_sink(NULL, NULL);
+    for (i = 0; i < WL_MEM_CENSUS_MAX; i++) {
+        wl_mem_census_remove(names[i]);
+    }
+    ASSERT(g_lines > 3u);
+    ASSERT(g_longest <= 160u);
     PASS();
 }
 
@@ -158,6 +200,7 @@ int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(reporters_rows_and_other);
     RUN_TEST(heap_text);
+    RUN_TEST(rows_fit_the_wii_log);
     RUN_TEST(cap_and_exempt);
     GREATEST_MAIN_END();
 }

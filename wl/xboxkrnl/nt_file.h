@@ -91,6 +91,9 @@ bool xk_ahead_owned(const void *owner);
 const uint8_t *xk_ahead_peek(const void *owner, uint64_t off, uint32_t *avail);
 void xk_ahead_close(const void *owner);
 void xk_ahead_settle(void);
+// What the read-ahead holds of the host's heap now (its thread's stack, a window's buffer), for the
+// census (read without the lock: a figure, not a promise).
+size_t xk_ahead_host_bytes(void);
 // The host files open for the title, counted in its stats (the read-ahead's own handle too).
 void xk_files_open_add(int delta);
 

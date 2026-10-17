@@ -22,6 +22,7 @@
 #include <stdlib.h>
 
 #include "wl/base/endian.h"
+#include "wl/platform/mem_census.h"
 #include "wl/xboxkrnl/nt_file.h"
 
 #define BOUNCE 65536u
@@ -100,10 +101,17 @@ int xk_strnicmp(const char *a, const char *b, size_t n) {
     return 0;
 }
 
+// What the files hold of the host's heap (mem_census.h): the bounce buffer and the read-ahead's.
+static void census_files(void *user, WlMemCensusReport *out) {
+    (void)user;
+    out->bytes = (g_bounce != NULL ? BOUNCE : 0u) + xk_ahead_host_bytes();
+}
+
 void xk_files_init(const WlXkConfig *cfg) {
     // aligned for the card: libdvm's cache moves a whole page of an aligned buffer straight to the
     // card, and copies a misaligned one through its four pages (the FAT's sectors pushed out with it)
     g_bounce = aligned_alloc(64, BOUNCE);
+    (void)wl_mem_census_add("kernel files", census_files, NULL);
     snprintf(g_data_dir, sizeof g_data_dir, "%s", cfg->data_dir);
     g_ahead_on = !cfg->no_read_ahead;
     xk_ahead_close(NULL);

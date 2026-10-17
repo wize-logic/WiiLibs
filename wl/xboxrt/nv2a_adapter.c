@@ -316,6 +316,7 @@ void wl_xb_gpu_set_frame_overlap(bool on) {
 
 static void *g_vcache_arena;
 static uint32_t g_vcache_bytes;
+static bool g_vcache_carved; // the vertex arrays' arena is the end of the boot's textures' arena (of the heap)
 
 void wl_xb_gpu_set_vertex_cache(void *arena, uint32_t bytes) {
     g_vcache_arena = arena;
@@ -362,6 +363,12 @@ static void census_textures(void *user, WlMemCensusReport *out) {
     }
 }
 
+// the vertex arrays' arena when it is the end of the textures' (the boot's heap block)
+static void census_vertices(void *user, WlMemCensusReport *out) {
+    (void)user;
+    out->bytes = g_vcache_carved ? g_vcache_bytes : 0u;
+}
+
 static void census_scratch(void *user, WlMemCensusReport *out) {
     (void)user;
     WlNv2aTexCacheMemory m;
@@ -389,6 +396,7 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
             bytes -= vbytes;
             g_vcache_arena = (uint8_t *)texture_arena + bytes;
             g_vcache_bytes = vbytes;
+            g_vcache_carved = true;
         }
         if (texture_arena != NULL) {
             gcfg.textures.arena = texture_arena;
@@ -445,6 +453,7 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
         (void)wl_mem_census_add("targets", census_targets, NULL);
         (void)wl_mem_census_add("textures", census_textures, NULL);
         (void)wl_mem_census_add("tex scratch", census_scratch, NULL);
+        (void)wl_mem_census_add("vertex arena", census_vertices, NULL);
     }
     (void)wl_mem_census_add("gpu", census_gpu, NULL);
 #if !defined(__wii__)
