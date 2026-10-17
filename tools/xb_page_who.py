@@ -20,6 +20,7 @@ import subprocess
 import sys
 
 PAGE = 4096
+FILL = 0xFFFFFFFF  # a touch record of a page a file read filled (no stack)
 # the fault's own frames: everything up to and including the handler is dropped
 HANDLER = ("on_fault",)
 
@@ -113,7 +114,7 @@ def main():
     data = open(a.census + ".touch", "rb").read()
     n = len(data) // 12
     for sec, page, sid in struct.iter_unpack("<3I" if sys.byteorder == "little" else ">3I", data[: n * 12]):
-        if sec < a.lo or sec > a.hi or (keep is not None and page not in keep):
+        if sid == FILL or sec < a.lo or sec > a.hi or (keep is not None and page not in keep):
             continue
         cls, d = who(sid)
         touches[cls] += 1

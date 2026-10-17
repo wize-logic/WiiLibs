@@ -50,6 +50,19 @@ static uint32_t g_pages, g_second, g_vblanks;
 static FILE *g_out;
 static char g_path[512];
 
+// The card's traffic in the current second (page_census.h): by kind, its ops, pages, pages a map read
+// filled, pages still fresh from a file read (no device use since), and pages by class
+static uint8_t *g_fresh; // [ram pages] filled by a file read, no GPU/APU use since
+typedef struct {
+    uint32_t ops, pages, map, fresh, by[C_COUNT];
+} IoCount;
+static IoCount g_io[WL_XB_CIO_COUNT];
+static uint32_t g_card_ops[WL_XB_CCARD_COUNT][2];   // [kind][map]
+static uint64_t g_card_bytes[WL_XB_CCARD_COUNT][2];
+static const char *const k_io[WL_XB_CIO_COUNT] = {"swap_in", "swap_out", "file_in", "ahead", "zhit",
+                                                  "evict", "ahead_unused", "forget"};
+static const char *const k_card[WL_XB_CCARD_COUNT] = {"read", "ahead", "write"};
+
 // ---- Who touched (WL_XB_PAGE_CENSUS_STACKS=1, x86-64 glibc hosts) ----------------------------------
 // (not under qemu-ppc: a backtrace from its fault handler crashes)
 // Each touch the census sees (a page's first in a second: a fault) has its host call stack taken;
@@ -112,13 +125,15 @@ static uint32_t st_intern(void *const *pc, uint32_t n) {
     return 0;
 }
 
-static void st_record(uint32_t p) {
+// (`fill`: no stack; the page was filled by a file read, written as the id ST_FILL)
+#define ST_FILL 0xFFFFFFFFu
+static void st_record(uint32_t p, bool fill) {
     void *pc[ST_DEPTH];
-    int n = backtrace(pc, (int)ST_DEPTH);
+    int n = fill ? 0 : backtrace(pc, (int)ST_DEPTH);
     // (the census's own frames and the fault handler's are left in: the tool knows their names)
     while (__atomic_exchange_n(&g_st_lock, 1u, __ATOMIC_ACQUIRE) != 0) {
     }
-    uint32_t id = n > 0 ? st_intern(pc, (uint32_t)n) : 0u;
+    uint32_t id = fill ? ST_FILL : n > 0 ? st_intern(pc, (uint32_t)n) : 0u;
     if (g_touch_n + 3u > sizeof g_touch_buf / sizeof g_touch_buf[0]) {
         st_flush();
     }
@@ -165,7 +180,7 @@ void wl_xb_census_seen_slow(uint32_t p, bool write) {
     }
 #if CENSUS_STACKS
     if (g_stacks != NULL && g_now[p] == 0) {
-        st_record(p);
+        st_record(p, false);
     }
 #endif
     g_now[p] = 1;
@@ -181,6 +196,16 @@ void wl_xb_census_phys_slow(uint32_t phys, uint32_t bytes, uint8_t use) {
     uint64_t end = ((uint64_t)phys + bytes + WL_XB_PAGE - 1u) >> WL_XB_PAGE_SHIFT;
     for (uint64_t p = phys >> WL_XB_PAGE_SHIFT; p < end && p < g_pages; p++) {
         g_xb_census_use[p] |= use;
+        if (use & (WL_XB_CU_MAP | WL_XB_CU_FILE)) {
+            g_fresh[p] = 1;
+#if CENSUS_STACKS
+            if (g_stacks != NULL) {
+                st_record((uint32_t)p, true);
+            }
+#endif
+        } else if (use & (WL_XB_CU_GPU | WL_XB_CU_TEX | WL_XB_CU_VTX | WL_XB_CU_APU)) {
+            g_fresh[p] = 0;
+        }
     }
 }
 
@@ -257,6 +282,81 @@ static int class_of(uint32_t p) {
     }
 }
 
+void wl_xb_census_io_slow(WlXbCensusIo kind, uint32_t p, bool op) {
+    if ((unsigned)kind >= WL_XB_CIO_COUNT || p >= g_pages) {
+        return;
+    }
+    IoCount *c = &g_io[kind];
+    c->ops += op;
+    c->pages++;
+    c->map += (g_xb_census_use[p] & WL_XB_CU_MAP) != 0;
+    c->fresh += g_fresh[p];
+    c->by[class_of(p)]++;
+}
+
+void wl_xb_census_card_slow(WlXbCensusCard kind, bool map, uint32_t bytes) {
+    if ((unsigned)kind >= WL_XB_CCARD_COUNT) {
+        return;
+    }
+    // (the read-ahead's thread counts without the guest lock)
+    __atomic_fetch_add(&g_card_ops[kind][map], 1u, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_card_bytes[kind][map], (uint64_t)bytes, __ATOMIC_RELAXED);
+}
+
+void wl_xb_census_io_now(WlXbCensusIo kind, uint32_t *ops, uint32_t *pages, uint32_t *fresh) {
+    bool ok = g_xb_census_use != NULL && (unsigned)kind < WL_XB_CIO_COUNT;
+    *ops = ok ? g_io[kind].ops : 0u;
+    *pages = ok ? g_io[kind].pages : 0u;
+    *fresh = ok ? g_io[kind].fresh : 0u;
+}
+
+void wl_xb_census_card_now(WlXbCensusCard kind, uint32_t *ops, uint64_t *bytes) {
+    bool ok = g_xb_census_use != NULL && (unsigned)kind < WL_XB_CCARD_COUNT;
+    *ops = ok ? __atomic_load_n(&g_card_ops[kind][0], __ATOMIC_RELAXED) +
+                    __atomic_load_n(&g_card_ops[kind][1], __ATOMIC_RELAXED)
+              : 0u;
+    *bytes = ok ? __atomic_load_n(&g_card_bytes[kind][0], __ATOMIC_RELAXED) +
+                      __atomic_load_n(&g_card_bytes[kind][1], __ATOMIC_RELAXED)
+                : 0u;
+}
+
+// The second's traffic lines (written when there was any), the counts started again.
+static void io_lines(void) {
+    for (int k = 0; k < WL_XB_CIO_COUNT; k++) {
+        IoCount *c = &g_io[k];
+        if (c->pages != 0 && g_out != NULL) {
+            fprintf(g_out, "io %u %s ops %u pages %u map %u fresh %u", (unsigned)g_second, k_io[k], (unsigned)c->ops,
+                    (unsigned)c->pages, (unsigned)c->map, (unsigned)c->fresh);
+            for (int i = 0; i < C_COUNT; i++) {
+                if (c->by[i] != 0) {
+                    fprintf(g_out, " %s %u", k_class[i], (unsigned)c->by[i]);
+                }
+            }
+            fputc('\n', g_out);
+        }
+        memset(c, 0, sizeof *c);
+    }
+    uint32_t ops[WL_XB_CCARD_COUNT][2];
+    uint64_t bytes[WL_XB_CCARD_COUNT][2];
+    uint32_t any = 0;
+    for (int k = 0; k < WL_XB_CCARD_COUNT; k++) {
+        for (int m = 0; m < 2; m++) {
+            ops[k][m] = __atomic_exchange_n(&g_card_ops[k][m], 0u, __ATOMIC_RELAXED);
+            bytes[k][m] = __atomic_exchange_n(&g_card_bytes[k][m], 0u, __ATOMIC_RELAXED);
+            any |= ops[k][m];
+        }
+    }
+    if (any != 0 && g_out != NULL) {
+        // per kind: ops and KB of maps, then of other files
+        fprintf(g_out, "card %u", (unsigned)g_second);
+        for (int k = 0; k < WL_XB_CCARD_COUNT; k++) {
+            fprintf(g_out, " %s %u %u %u %u", k_card[k], (unsigned)ops[k][1], (unsigned)(bytes[k][1] >> 10),
+                    (unsigned)ops[k][0], (unsigned)(bytes[k][0] >> 10));
+        }
+        fputc('\n', g_out);
+    }
+}
+
 uint32_t wl_xb_census_interval(void) {
     if (g_xb_census_use == NULL) {
         return 0;
@@ -301,6 +401,9 @@ uint32_t wl_xb_census_interval(void) {
             fprintf(g_out, " %s %u", k_class[c], (unsigned)by[c]);
         }
         fputc('\n', g_out);
+    }
+    io_lines();
+    if (g_out != NULL) {
         fflush(g_out);
     }
     if (g_second % DUMP_EVERY == 0) {
@@ -380,7 +483,8 @@ WlResult wl_xb_census_start(const char *path) {
     g_seconds = calloc(pages, sizeof *g_seconds);
     g_alloc_of = calloc(pages, sizeof *g_alloc_of);
     uint8_t *use = calloc(pages, 1);
-    if (g_now == NULL || g_first == NULL || g_last == NULL || g_seconds == NULL || g_alloc_of == NULL || use == NULL) {
+    g_fresh = calloc(pages, 1);
+    if (g_fresh == NULL || g_now == NULL || g_first == NULL || g_last == NULL || g_seconds == NULL || g_alloc_of == NULL || use == NULL) {
         return WL_ERR_NOMEM;
     }
     g_pages = pages;

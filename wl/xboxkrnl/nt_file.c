@@ -734,6 +734,7 @@ static uint32_t card_read(XkFile *f, uint64_t at, uint8_t *dst, uint32_t len, ui
                          : f->pf != NULL ? wl_platform_fs_read_some_at(f->pf, at + done, dst + done, want, &got)
                                          : WL_ERR_STATE; // (its reopen after a rename failed)
             wl_xb_card_unlock();
+            wl_xb_census_card(WL_XB_CCARD_READ, strstr(f->name, ".map") != NULL, got); // (a diagnostic)
             if (r != WL_OK) {
                 return done;
             }
@@ -753,6 +754,7 @@ static bool card_write(XkFile *f, uint64_t at, const uint8_t *src, uint32_t len)
                      : f->pf != NULL ? wl_platform_fs_write_at(f->pf, at + done, src + done, chunk)
                                      : WL_ERR_STATE;
         wl_xb_card_unlock();
+        wl_xb_census_card(WL_XB_CCARD_WRITE, strstr(f->name, ".map") != NULL, chunk); // (a diagnostic)
         if (r != WL_OK) {
             return false;
         }

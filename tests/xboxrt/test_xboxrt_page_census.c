@@ -143,6 +143,58 @@ TEST pages_and_seconds(void) {
     unlink(stacks);
     unlink(touch);
 #endif
+    PASS();
+}
+
+// The card's traffic (the census's io and card lines): counted by kind, with the pages a file read
+// filled and no device used since ("fresh"), started again each second.
+TEST card_traffic(void) {
+    ASSERT(wl_xb_census_on());
+    uint32_t va = 0;
+    ASSERT_EQ(WL_OK, wl_xb_va_alloc(&va, 2u * PAGE, 0x00800000u, WL_XB_PROT_READWRITE));
+    uint32_t p0 = phys_page(va), p1 = phys_page(va + PAGE);
+    ASSERT(p0 != 0xFFFFFFFFu && p1 != 0xFFFFFFFFu);
+    (void)wl_xb_census_interval(); // (a second of its own)
+
+    uint32_t ops, pages, fresh;
+
+    // two pages filled by a map read; p1 then read by the GPU: only p0 stays fresh
+    wl_xb_census_va(va, 2u * PAGE, WL_XB_CU_MAP);
+    wl_xb_census_phys(p1 << WL_XB_PAGE_SHIFT, 16, WL_XB_CU_TEX);
+    wl_xb_census_io(WL_XB_CIO_FILE_IN, p0, true);
+    wl_xb_census_io(WL_XB_CIO_AHEAD, p1, false);
+    wl_xb_census_io_now(WL_XB_CIO_FILE_IN, &ops, &pages, &fresh);
+    ASSERT_EQ(1u, ops);
+    ASSERT_EQ(1u, pages);
+    ASSERT_EQ(1u, fresh);
+    wl_xb_census_io_now(WL_XB_CIO_AHEAD, &ops, &pages, &fresh);
+    ASSERT_EQ(0u, ops);
+    ASSERT_EQ(1u, pages);
+    ASSERT_EQ(0u, fresh);
+    wl_xb_census_card(WL_XB_CCARD_READ, true, 8192);
+    wl_xb_census_card(WL_XB_CCARD_AHEAD, false, 4096);
+    uint64_t bytes;
+    wl_xb_census_card_now(WL_XB_CCARD_READ, &ops, &bytes);
+    ASSERT_EQ(1u, ops);
+    ASSERT_EQ(8192u, (unsigned)bytes);
+
+    // the second's end writes its lines and starts the counts again
+    (void)wl_xb_census_interval();
+    wl_xb_census_io_now(WL_XB_CIO_FILE_IN, &ops, &pages, &fresh);
+    ASSERT_EQ(0u, pages);
+    wl_xb_census_card_now(WL_XB_CCARD_READ, &ops, &bytes);
+    ASSERT_EQ(0u, ops);
+    FILE *f = fopen(g_path, "r");
+    ASSERT(f != NULL);
+    char line[512];
+    bool io = false, card = false;
+    while (fgets(line, sizeof line, f) != NULL) {
+        io = io || strstr(line, " file_in ops 1 pages 1 map 1 fresh 1 ") != NULL;
+        card = card || strstr(line, " read 1 8 0 0 ahead 0 0 1 4 write 0 0 0 0") != NULL;
+    }
+    fclose(f);
+    ASSERT(io);
+    ASSERT(card);
     unlink(g_path);
     PASS();
 }
@@ -150,6 +202,7 @@ TEST pages_and_seconds(void) {
 SUITE(census) {
     RUN_TEST(off_until_asked);
     RUN_TEST(pages_and_seconds);
+    RUN_TEST(card_traffic);
 }
 
 GREATEST_MAIN_DEFS();
