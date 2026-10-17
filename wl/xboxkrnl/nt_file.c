@@ -23,6 +23,7 @@
 
 #include "wl/base/endian.h"
 #include "wl/xboxkrnl/nt_file.h"
+#include "wl/xboxrt/page_census.h"
 
 #define BOUNCE 65536u
 // A regular file's read or write of XK_BLOCK_MIN bytes or more (or any, while another thread has the
@@ -843,6 +844,9 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
     }
     if (*done < n) {
         return status;
+    }
+    if (wl_xb_census_on()) {
+        wl_xb_census_va(buf, n, strstr(f->name, ".map") != NULL ? WL_XB_CU_MAP : WL_XB_CU_FILE);
     }
     if (off < phys && f->pf != NULL && (f->fcb == NULL || f->fcb->changes == changes)) {
         // the whole pages filled from the file's bytes remember them: unchanged, they are read

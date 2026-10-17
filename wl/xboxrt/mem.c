@@ -7,6 +7,7 @@
 
 #include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
+#include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/mem_internal.h"
 
 #define TAG "xbmem"
@@ -142,6 +143,10 @@ WlResult wl_xb_mem_init(const WlXbMemConfig *cfg) {
     (void)wl_mem_census_add("frames", census_frames, NULL);
     WL_LOG_I(TAG, "guest RAM %u MB (%u pages), host base %p, reserved low 0x%x, GPU instance 0x%x", cfg->ram_bytes >> 20,
              (unsigned)pages, (void *)base, (unsigned)cfg->reserved_low_bytes, (unsigned)cfg->gpu_instance_bytes);
+    const char *census = getenv("WL_XB_PAGE_CENSUS"); // the page census (page_census.h): a diagnostic
+    if (census != NULL && census[0] != '\0') {
+        (void)wl_xb_census_start(census);
+    }
     return WL_OK;
 }
 

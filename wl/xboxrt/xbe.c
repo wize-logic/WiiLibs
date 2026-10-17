@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "wl/base/endian.h"
+#include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/thread.h"
 #include "wl/xboxrt/thunk.h"
@@ -160,6 +161,19 @@ WlResult wl_xbe_load(const WlXbe *x, WlXbeRead read, void *user) {
     if (r != WL_OK) {
         WL_LOG_E(TAG, "reading the image failed: %s", wl_result_name(r));
         return r;
+    }
+    if (wl_xb_census_on()) {
+        // the page census's allocations: the code first, so that a page code shares with data is data
+        for (uint32_t pass = 0; pass < 2u; pass++) {
+            for (uint32_t i = 0; i < x->section_count; i++) {
+                const WlXbeSection *s = &x->sections[i];
+                bool code = (s->flags & WL_XBE_SEC_EXECUTABLE) != 0;
+                if (code == (pass == 0) && wl_xb_range_ok(s->va, s->vsize)) {
+                    wl_xb_census_alloc(code ? WL_XB_CA_XBE_CODE : WL_XB_CA_XBE_DATA, s->va, s->vsize, i);
+                }
+            }
+        }
+        wl_xb_census_alloc(WL_XB_CA_XBE_DATA, x->base, x->headers_size, 0xFFFFFFFFu);
     }
     if (code_hi > code_lo) {
         wl_xb_set_code_bounds(code_lo, code_hi);

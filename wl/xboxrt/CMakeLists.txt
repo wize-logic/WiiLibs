@@ -5,7 +5,7 @@
 # the vertical blank, the kernel thunk dispatcher, crash reports. The kernel itself is wl_xboxkrnl;
 # the boot code that joins them is wl_xboxrt_boot (and wl_xboxrt_main, a default main).
 add_library(wl_xboxrt STATIC
-    mem.c paging.c mmio.c ppc_decode.c x86_decode.c regs.c thread.c irq.c thunk.c crash.c xbe.c devices.c gpu_stub.c
+    mem.c paging.c page_census.c mmio.c ppc_decode.c x86_decode.c regs.c thread.c irq.c thunk.c crash.c xbe.c devices.c gpu_stub.c
     pad.c input.c usb_ohci.c usb_xid.c play.c bench.c runopts.c)
 wl_target_defaults(wl_xboxrt)
 target_link_libraries(wl_xboxrt PUBLIC wl_platform wl_base)

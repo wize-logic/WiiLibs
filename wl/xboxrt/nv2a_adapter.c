@@ -17,6 +17,7 @@
 
 #include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
+#include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/thread.h"
@@ -189,12 +190,21 @@ static void *phys_ptr(void *user, uint32_t phys, uint32_t bytes) {
     if ((uint64_t)phys + bytes > wl_xb_ram_bytes()) {
         return NULL;
     }
+    wl_xb_census_phys(phys, bytes, WL_XB_CU_GPU);
     return wl_xb_phys_ptr(phys);
 }
 
 // the write watch (mem.h): a converted texture is only read again once its pages were stored to
 static uint32_t tex_watch(void *user, uint32_t phys, uint32_t bytes) {
     (void)user;
+    wl_xb_census_phys(phys, bytes, WL_XB_CU_TEX);
+    return wl_xb_phys_watch(phys, bytes);
+}
+
+// (the same for a vertex array the cache converted)
+static uint32_t vtx_watch(void *user, uint32_t phys, uint32_t bytes) {
+    (void)user;
+    wl_xb_census_phys(phys, bytes, WL_XB_CU_VTX);
     return wl_xb_phys_watch(phys, bytes);
 }
 
@@ -405,7 +415,7 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
             } else {
                 gcfg.vertices.budget = g_vcache_bytes;
             }
-            gcfg.vertices.watch = tex_watch;
+            gcfg.vertices.watch = vtx_watch;
             gcfg.vertices.written = tex_written;
             WL_LOG_I(TAG, "vertex arrays: %u KB %s for GX to read by index", (unsigned)(g_vcache_bytes >> 10),
                      g_vcache_arena != NULL ? "in an arena of their own" : "of the heap");

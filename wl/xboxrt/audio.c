@@ -21,6 +21,7 @@
 #include "wl/base/endian.h"
 #include "wl/xboxapu/ac97.h"
 #include "wl/xboxapu/apu.h"
+#include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/crash.h"
 #include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/irq.h"
@@ -65,6 +66,7 @@ static uint8_t *phys_ptr(void *user, uint32_t phys, uint32_t bytes) {
     if (phys >= ram || bytes > ram - phys) {
         return NULL;
     }
+    wl_xb_census_phys(phys, bytes, WL_XB_CU_APU);
     return wl_xb_phys_ptr(phys);
 }
 
