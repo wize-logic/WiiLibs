@@ -53,15 +53,18 @@ static char g_path[512];
 // The card's traffic in the current second (page_census.h): by kind, its ops, pages, pages a map read
 // filled, pages still fresh from a file read (no device use since), and pages by class
 static uint8_t *g_fresh; // [ram pages] filled by a file read, no GPU/APU use since
+#define IO_ALLOCS 8u
 typedef struct {
     uint32_t ops, pages, map, fresh, by[C_COUNT];
+    uint32_t al_id[IO_ALLOCS], al_pages[IO_ALLOCS], al_fresh[IO_ALLOCS]; // by allocation (+1; 0: free)
+    uint32_t al_rest;                                                    // pages of the allocations past those
 } IoCount;
 static IoCount g_io[WL_XB_CIO_COUNT];
 static uint32_t g_card_ops[WL_XB_CCARD_COUNT][2];   // [kind][map]
 static uint64_t g_card_bytes[WL_XB_CCARD_COUNT][2];
 static const char *const k_io[WL_XB_CIO_COUNT] = {"swap_in", "swap_out", "file_in", "ahead", "zhit",
                                                   "evict", "ahead_unused", "forget"};
-static const char *const k_card[WL_XB_CCARD_COUNT] = {"read", "ahead", "write"};
+static const char *const k_card[WL_XB_CCARD_COUNT] = {"read", "read_held", "ahead", "write"};
 
 // ---- Who touched (WL_XB_PAGE_CENSUS_STACKS=1, x86-64 glibc hosts) ----------------------------------
 // (not under qemu-ppc: a backtrace from its fault handler crashes)
@@ -292,6 +295,17 @@ void wl_xb_census_io_slow(WlXbCensusIo kind, uint32_t p, bool op) {
     c->map += (g_xb_census_use[p] & WL_XB_CU_MAP) != 0;
     c->fresh += g_fresh[p];
     c->by[class_of(p)]++;
+    uint32_t id = g_alloc_of[p] + 1u, i = 0; // (1: no allocation)
+    while (i < IO_ALLOCS && c->al_id[i] != 0 && c->al_id[i] != id) {
+        i++;
+    }
+    if (i == IO_ALLOCS) {
+        c->al_rest++;
+        return;
+    }
+    c->al_id[i] = id;
+    c->al_pages[i]++;
+    c->al_fresh[i] += g_fresh[p];
 }
 
 void wl_xb_census_card_slow(WlXbCensusCard kind, bool map, uint32_t bytes) {
@@ -331,6 +345,14 @@ static void io_lines(void) {
                 if (c->by[i] != 0) {
                     fprintf(g_out, " %s %u", k_class[i], (unsigned)c->by[i]);
                 }
+            }
+            // by allocation (its number in <file>.pages; 0: none): pages/fresh
+            for (uint32_t i = 0; i < IO_ALLOCS && c->al_id[i] != 0; i++) {
+                fprintf(g_out, " @%u %u/%u", (unsigned)(c->al_id[i] - 1u), (unsigned)c->al_pages[i],
+                        (unsigned)c->al_fresh[i]);
+            }
+            if (c->al_rest != 0) {
+                fprintf(g_out, " @rest %u", (unsigned)c->al_rest);
             }
             fputc('\n', g_out);
         }

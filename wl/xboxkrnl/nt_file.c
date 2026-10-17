@@ -720,8 +720,8 @@ static bool ahead_wanted(const XkFile *f, uint64_t off) {
 
 // A regular file's bytes [at, at + len) from the card into `dst`, BOUNCE bytes at a time under the
 // card's lock (with or without the guest lock), zeros past its written bytes `phys`. The bytes read
-// before a failure, or `len`.
-static uint32_t card_read(XkFile *f, uint64_t at, uint8_t *dst, uint32_t len, uint64_t phys) {
+// before a failure, or `len`. (`held`: the guest lock kept through it, for the page census's counts)
+static uint32_t card_read(XkFile *f, uint64_t at, uint8_t *dst, uint32_t len, uint64_t phys, bool held) {
     uint32_t done = 0;
     while (done < len) {
         uint32_t chunk = len - done < BOUNCE ? len - done : BOUNCE;
@@ -734,7 +734,8 @@ static uint32_t card_read(XkFile *f, uint64_t at, uint8_t *dst, uint32_t len, ui
                          : f->pf != NULL ? wl_platform_fs_read_some_at(f->pf, at + done, dst + done, want, &got)
                                          : WL_ERR_STATE; // (its reopen after a rename failed)
             wl_xb_card_unlock();
-            wl_xb_census_card(WL_XB_CCARD_READ, strstr(f->name, ".map") != NULL, got); // (a diagnostic)
+            wl_xb_census_card(held ? WL_XB_CCARD_READ_HELD : WL_XB_CCARD_READ, strstr(f->name, ".map") != NULL,
+                              got); // (a diagnostic)
             if (r != WL_OK) {
                 return done;
             }
@@ -839,7 +840,8 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
             memset(io, 0, chunk);
         } else {
             WlXbThread *self = card_begin(span, n);
-            got = card_read(f, at, io, chunk, phys);
+            // (held: as card_begin decides on the Wii, whatever the deterministic mode does here)
+            got = card_read(f, at, io, chunk, phys, n < XK_BLOCK_MIN && !wl_xb_card_busy());
             wl_xb_block_end(self);
         }
         wl_xb_copy_in(buf + *done, io, got);

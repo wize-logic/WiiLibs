@@ -93,8 +93,9 @@ static inline void wl_xb_census_alloc(WlXbCensusAlloc kind, uint32_t va, uint32_
 }
 
 // ---- The card's traffic (where SD reads and writes come from), counted by second ------------------
-// Each second with traffic gets `io <second> <kind> ops <n> pages <n> map <n> fresh <n> <class> <n>...`
-// lines (a page's class as in the second's line; `map`: pages a map read filled; `fresh`: pages a file
+// Each second with traffic gets `io <second> <kind> ops <n> pages <n> map <n> fresh <n> <class> <n>...
+// @<allocation> <pages>/<fresh>...` lines (a page's class as in the second's line, its allocation's number
+// in `<file>.pages`; `map`: pages a map read filled; `fresh`: pages a file
 // read filled and no device (GPU, APU) used since: a texture evicted or read back before its conversion)
 // and a `card <second> ...` line for the kernel's own file I/O. tools/xb_paging_io.py makes the tables.
 typedef enum {
@@ -109,9 +110,16 @@ typedef enum {
     WL_XB_CIO_COUNT
 } WlXbCensusIo;
 
-// The kernel's own card I/O: a read (`ahead`: by the file read-ahead's thread) or a write of `bytes`,
-// of a map file (`map`) or another, as one op.
-typedef enum { WL_XB_CCARD_READ, WL_XB_CCARD_AHEAD, WL_XB_CCARD_WRITE, WL_XB_CCARD_COUNT } WlXbCensusCard;
+// The kernel's own card I/O: a read with the guest lock given up, one with it kept (a read under
+// XK_BLOCK_MIN: the other threads wait, as for the pager's), a read by the file read-ahead's thread, or
+// a write, of `bytes` of a map file (`map`) or another, as one op.
+typedef enum {
+    WL_XB_CCARD_READ,
+    WL_XB_CCARD_READ_HELD,
+    WL_XB_CCARD_AHEAD,
+    WL_XB_CCARD_WRITE,
+    WL_XB_CCARD_COUNT
+} WlXbCensusCard;
 
 void wl_xb_census_io_slow(WlXbCensusIo kind, uint32_t p, bool op);
 void wl_xb_census_card_slow(WlXbCensusCard kind, bool map, uint32_t bytes);

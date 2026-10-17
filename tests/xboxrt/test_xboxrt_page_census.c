@@ -189,8 +189,8 @@ TEST card_traffic(void) {
     char line[512];
     bool io = false, card = false;
     while (fgets(line, sizeof line, f) != NULL) {
-        io = io || strstr(line, " file_in ops 1 pages 1 map 1 fresh 1 ") != NULL;
-        card = card || strstr(line, " read 1 8 0 0 ahead 0 0 1 4 write 0 0 0 0") != NULL;
+        io = io || (strstr(line, " file_in ops 1 pages 1 map 1 fresh 1 ") != NULL && strstr(line, " @0 1/1") != NULL);
+        card = card || strstr(line, " read 1 8 0 0 read_held 0 0 0 0 ahead 0 0 1 4 write 0 0 0 0") != NULL;
     }
     fclose(f);
     ASSERT(io);
