@@ -171,6 +171,9 @@ Stubs and approximations among them:
   lock from its closes to its reopens, so the transfer goes on in the renamed file; requests on one
   synchronous handle take turns (its position). At the title's exit `wl_xk_files_stop` ends every
   transfer at its next 64 KB piece (it fails) before the files are flushed and the card unmounted.
+  A flush gives the lock up the same way (`NtFlushBuffersFile`, and the Wii's flush every 32 MB of
+  a Z: cache slot's copy and before its header's last write). The "file I/O" log line gives the
+  card's time a handle's requests spent with the lock kept, and its longest piece.
 - `ETHREAD.UniqueThread` is at KTHREAD + 0x134. The `XC_MAX_OS` user section's layout comes from
   public headers as remembered and is not checked against a console.
 - `KeQueryPerformanceFrequency` is 3 375 000 Hz, `KeTimeIncrement` 1 ms in 100 ns units.
