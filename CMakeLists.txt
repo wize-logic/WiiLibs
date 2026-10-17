@@ -41,6 +41,14 @@ option(WL_BUILD_TESTS "Build the WiiLibs tests" ${WL_TOP_LEVEL})
 
 include(cmake/WiiLibs.cmake)
 
+# No unwind tables on the Wii: C there never unwinds (backtraces follow the stack's back chain,
+# wl/platform/backtrace.h), and devkitPPC's GCC otherwise puts .eh_frame in every program's DOL
+# (about 100 KB of a recompiled title's MEM1 for WiiLibs' own code). Directory-scoped: WiiLibs'
+# targets only, not a consumer's.
+if(WL_PLATFORM STREQUAL "wii")
+    add_compile_options(-fno-asynchronous-unwind-tables -fno-unwind-tables)
+endif()
+
 add_subdirectory(third_party)
 
 # Every module is wl/<name>/ with its own CMakeLists.txt; it decides which platforms it builds

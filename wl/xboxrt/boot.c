@@ -37,13 +37,14 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     memset(cfg, 0, sizeof *cfg);
     cfg->xbe_name = "default.xbe";
     cfg->ram_mb = 64;
-    // the host side: caches, buffers, render targets (12 MB: real-Wii runs of a10, a30 and d40 used
-    // at most 9.9 MB of 14, the kept frames' 2.4 MB among it, now gone; 4.5 MB stay for what a 10 s
-    // census misses, a shot's 1.2 MB and the freeze profile's 320 KB among them), and the GX
+    // the host side: caches, buffers, render targets (9 MB: the census's exact high-water mark, "peak
+    // +N KB", was 6.7 MB in a real-Wii run of a10's opening, shots included, and 6.7-6.8 MB on the
+    // host in a10, b30 and four level loads; 2 MB stay over it for levels not measured, more render
+    // targets, fragmentation and the freeze profile's 320 KB; the rest goes to the guest's frames), and the GX
     // textures converted from the guest's in an arena of their own (15 MB, the vertex arrays' 1 MB in its end: a10's opening
     // draws up to 14.2 MB of them in a frame; an arena too small for a frame's textures keeps them
     // smaller, or refuses them and the draws lose them)
-    cfg->keep_free_bytes = 12u << 20;
+    cfg->keep_free_bytes = 9u << 20;
     cfg->texture_bytes = 15u << 20;
     cfg->htab_bytes = 256u << 10;
 }
