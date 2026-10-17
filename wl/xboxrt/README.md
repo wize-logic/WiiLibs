@@ -568,6 +568,7 @@ small files). With `netrun.txt` and no PC command line, a Dolphin run sends its 
 | Variable | Effect |
 |---|---|
 | `WL_XB_TRACE` | any value: log every kernel call |
+| `WL_XB_ALLOCS` | `<KB>`: the kernel's allocation census: every contiguous, system or virtual allocation of at least that size logged with its guest callers ("alloc ..."), and `wl_xk_alloc_census_report` (a title's play step) logs each one kept: KB asked, with a frame, not all zero, and a map of where |
 | `WL_XB_PLAY` | the play setting: `script:<host path>`, `bot:<seed>`, `look:<seed>` or `replay:<capture> [runs]` |
 | `WL_XB_PLAY_OUT` | the folder for screenshots and captures (default `<title folder>/play`) |
 | `WL_XB_DETERMINISTIC` | anything but empty or `0`: the deterministic mode |

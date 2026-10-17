@@ -24,6 +24,8 @@ typedef struct {
 
 // Logs the report (WL_LOG_E lines, tag "xbcrash").
 void wl_xb_crash_report(const WlXbCrash *c);
+// A guest return address: inside the code, and the bytes before it are a call (stack scans).
+bool wl_xb_guest_return_address(uint32_t ra);
 // Reports and stops.
 WL_NORETURN void wl_xb_crash(const WlXbCrash *c);
 // What stopping means (the default: wl_platform_stop_screen on the Wii, abort elsewhere). Tests

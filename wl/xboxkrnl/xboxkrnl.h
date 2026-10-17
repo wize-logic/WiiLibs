@@ -86,6 +86,12 @@ typedef struct {
     uint32_t pool_bytes;
 } WlXkStats;
 void wl_xk_stats(WlXkStats *out);
+// The allocation census (diagnostics; WL_XB_ALLOCS=<KB> arms it on the host at the kernel's start):
+// every contiguous, system or virtual allocation of at least `min_bytes` (0: off) is logged
+// ("alloc ...") with its guest callers and kept until freed. The report logs each one kept ("allocs:
+// ..."): KB asked, with a frame now, and of those not all zero, and a map of where. Lock held.
+void wl_xk_alloc_census(uint32_t min_bytes);
+void wl_xk_alloc_census_report(void);
 // A host file the kernel may have open was changed by someone else (the play harness's checkpoint
 // snapshots): guest pages filled from its bytes forget them (mem.h, wl_xb_file_pages). Before the
 // change; `host` as the kernel names it (the data folder's path, then the file's).
