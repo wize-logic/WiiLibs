@@ -278,6 +278,9 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
         }
     }
 #endif
+    // the heap's high-water marks from here on (mem_census.h): the host side's own use, which
+    // keep_free_bytes holds on the Wii, exact (the census and the exit print them)
+    wl_platform_heap_mark();
     WlResult r = wl_xb_mem_init(&mc);
     if (r == WL_OK) {
         r = wl_xb_fault_install();
@@ -719,6 +722,7 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     wl_xb_unlock(boot);
     int code = wl_xb_process_wait();
     WL_LOG_I(TAG, "the title left with %d", code);
+    wl_mem_census_log(TAG, false); // (the heap's peak over the whole run, and who holds it now)
     // the guest stopped before the platform winds down: its other threads (and the service
     // thread's interrupts and vertical blanks) would go on running the title's code while the
     // card is unmounted and the audio and video are stopped. The service thread first (it may be

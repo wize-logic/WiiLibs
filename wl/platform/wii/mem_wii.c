@@ -162,12 +162,21 @@ void wl_gpu_buffer_invalidate(void *ptr, size_t size) {
 void *_sbrk_r(struct _reent *reent, ptrdiff_t incr);
 void __malloc_lock(struct _reent *reent);
 void __malloc_unlock(struct _reent *reent);
+// newlib's own high-water mark of its arena (mallocr.c's max_sbrked_mem, a global of libc.a's
+// mallocr.o): _malloc_r raises it each time it takes more from sbrk, and mallinfo's arena is
+// the arena now (sbrked_mem). The marks below are read from it: no cost on malloc's path.
+extern unsigned long __malloc_max_sbrked_mem;
+
+static size_t g_mark_arena;   // the arena at wl_platform_heap_mark (0: the program's start)
+static size_t g_mark_top;     // `top` then
+static bool g_marked;
 
 void wl_platform_heap_info(WlPlatformHeapInfo *out) {
     memset(out, 0, sizeof *out);
     __malloc_lock(_REENT);
     struct mallinfo mi = mallinfo();
     uintptr_t top = (uintptr_t)_sbrk_r(_REENT, 0); // (where the next sbrk would start)
+    size_t max_arena = (size_t)__malloc_max_sbrked_mem;
     __malloc_unlock(_REENT);
     uintptr_t mem2_lo = (uintptr_t)SYS_GetArena2Lo(), mem2_hi = (uintptr_t)SYS_GetArena2Hi();
     if (top == (uintptr_t)-1) {
@@ -193,6 +202,24 @@ void wl_platform_heap_info(WlPlatformHeapInfo *out) {
         out->elsewhere = mem2_hi > mem2_lo ? mem2_hi - mem2_lo : 0;
     }
     out->free_total = out->free_inside + out->top + out->elsewhere;
+    // the arena grows only at its top, so what it grew past the mark's is what it took of the
+    // mark's `top` (sbrk moving on to MEM2 after the mark would count MEM1's hole too: boot marks
+    // after its probe has moved it)
+    out->peak_known = true;
+    out->peak = max_arena > g_mark_arena ? max_arena - g_mark_arena : 0;
+    out->low_top = !g_marked ? SIZE_MAX : g_mark_top > out->peak ? g_mark_top - out->peak : 0;
+}
+
+void wl_platform_heap_mark(void) {
+    WlPlatformHeapInfo h;
+    wl_platform_heap_info(&h);
+    __malloc_lock(_REENT);
+    struct mallinfo mi = mallinfo();
+    __malloc_max_sbrked_mem = (unsigned long)mi.arena;
+    g_mark_arena = (size_t)mi.arena;
+    __malloc_unlock(_REENT);
+    g_mark_top = h.top;
+    g_marked = true;
 }
 
 WlResult wl_platform_heap_cap(size_t bytes) {

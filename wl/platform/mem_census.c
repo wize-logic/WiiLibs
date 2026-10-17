@@ -89,8 +89,19 @@ void wl_mem_census_heap_text(const WlPlatformHeapInfo *h, char *buf, size_t size
         n += snprintf(buf + n, size - (size_t)n, "; %u KB of MEM1 out of malloc's reach", kb(h->stranded));
     }
     if (h->cap != 0 && n > 0 && (size_t)n < size) {
-        snprintf(buf + n, size - (size_t)n, "; cap %u KB: %u used, %u at most, %u refused (largest %u B)", kb(h->cap),
-                 kb(h->cap_used), kb(h->cap_peak), (unsigned)h->cap_refused, (unsigned)h->cap_largest_refused);
+        n += snprintf(buf + n, size - (size_t)n, "; cap %u KB: %u used, %u at most, %u refused (largest %u B)",
+                      kb(h->cap), kb(h->cap_used), kb(h->cap_peak), (unsigned)h->cap_refused,
+                      (unsigned)h->cap_largest_refused);
+    }
+    // the high-water marks: grown past the mark at most, and the least `top` (kept short: the Wii
+    // cuts a log line at 160 characters)
+    if (h->peak_known && n > 0 && (size_t)n < size) {
+        if (h->low_top == SIZE_MAX) {
+            snprintf(buf + n, size - (size_t)n, "; peak +%u KB", kb(h->peak));
+        } else {
+            snprintf(buf + n, size - (size_t)n, "; peak +%u KB, least top %u KB", kb(h->peak),
+                     kb(h->low_top));
+        }
     }
 }
 

@@ -38,6 +38,8 @@ static long g_cap;         // 0: none
 static long g_cap_peak;    // the most g_live - g_base reached under the cap
 static uint32_t g_refused;    // requests the cap refused
 static size_t g_largest_refused;
+static long g_mark;           // g_live at wl_platform_heap_mark (0: the process's start)
+static long g_peak;           // the most g_live reached since the mark
 
 static long live_add(long delta) {
     return __atomic_add_fetch(&g_live, delta, __ATOMIC_RELAXED);
@@ -144,6 +146,10 @@ static void *counted(void *p) {
     }
     if (p != NULL) {
         long now = live_add((long)malloc_usable_size(p));
+        long high = __atomic_load_n(&g_peak, __ATOMIC_RELAXED);
+        while (now > high &&
+               !__atomic_compare_exchange_n(&g_peak, &high, now, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        }
         if (__atomic_load_n(&g_cap, __ATOMIC_RELAXED) != 0) {
             long used = now - __atomic_load_n(&g_base, __ATOMIC_RELAXED);
             long peak = __atomic_load_n(&g_cap_peak, __ATOMIC_RELAXED);
@@ -248,6 +254,10 @@ void wl_platform_heap_info(WlPlatformHeapInfo *out) {
     out->free_inside = mi.fordblks;
     out->top = SIZE_MAX;
     out->free_total = SIZE_MAX;
+    long peak = __atomic_load_n(&g_peak, __ATOMIC_RELAXED) - __atomic_load_n(&g_mark, __ATOMIC_RELAXED);
+    out->peak_known = true;
+    out->peak = peak > 0 ? (size_t)peak : 0;
+    out->low_top = SIZE_MAX;
     long cap = __atomic_load_n(&g_cap, __ATOMIC_RELAXED);
     if (cap != 0) {
         long used = __atomic_load_n(&g_live, __ATOMIC_RELAXED) - __atomic_load_n(&g_base, __ATOMIC_RELAXED);
@@ -258,7 +268,14 @@ void wl_platform_heap_info(WlPlatformHeapInfo *out) {
         out->cap_largest_refused = (size_t)__atomic_load_n(&g_largest_refused, __ATOMIC_RELAXED);
         out->top = out->cap > out->cap_used ? out->cap - out->cap_used : 0;
         out->free_total = out->free_inside + out->top;
+        out->low_top = out->cap > out->cap_peak ? out->cap - out->cap_peak : 0;
     }
+}
+
+void wl_platform_heap_mark(void) {
+    long now = __atomic_load_n(&g_live, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_mark, now, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_peak, now, __ATOMIC_RELAXED);
 }
 
 WlResult wl_platform_heap_cap(size_t bytes) {
@@ -278,6 +295,9 @@ WlResult wl_platform_heap_cap(size_t bytes) {
 
 void wl_platform_heap_exempt(bool on) {
     (void)on;
+}
+
+void wl_platform_heap_mark(void) {
 }
 
 #if defined(__GLIBC__)

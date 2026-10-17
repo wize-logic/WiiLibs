@@ -43,9 +43,25 @@ typedef struct {
     size_t cap, cap_used, cap_peak;
     uint32_t cap_refused;
     size_t cap_largest_refused;
+    // The high-water marks since wl_platform_heap_mark (else the program's start), kept as they
+    // happen rather than sampled: what a census taken every few seconds misses is in them. No
+    // cost but a compare where the allocator already counts: the host's malloc (here) on each
+    // allocation, newlib's own sbrk high-water on the Wii (it keeps one; the mark resets it).
+    bool peak_known;
+    // The most the heap grew past what it held at the mark. The host: the live blocks' bytes (the
+    // cap's exempt blocks left out). The Wii: newlib's arena (sbrk's reach), free blocks inside
+    // it included: the most of the memory above the mark's top the heap ever took, which is what
+    // a piece kept free for it (boot.c's keep_free_bytes) must hold.
+    size_t peak;
+    // The least `top` since the mark: peak's other side (SIZE_MAX where top is; the Wii before a mark)
+    size_t low_top;
 } WlPlatformHeapInfo;
 
 void wl_platform_heap_info(WlPlatformHeapInfo *out);
+// Starts the high-water marks (peak, low_top) again from the heap as it is now: after a program
+// has taken its large blocks for good (xboxrt's boot: the guest's frames, the textures' arena), so
+// that the marks measure what comes after. One thread, with no other allocating meanwhile.
+void wl_platform_heap_mark(void);
 
 // Host only (a no-op returning WL_ERR_UNSUPPORTED elsewhere): from now on, malloc and its relatives
 // refuse a request (NULL, errno ENOMEM) that would take the bytes allocated since this call (less
