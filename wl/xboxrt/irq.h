@@ -49,6 +49,12 @@ void wl_xb_service_set_vblank(WlXbVblankFn fn, void *user);
 WlResult wl_xb_service_add_vblank_hook(WlXbVblankFn fn, void *user);
 // Vertical blanks so far (the guest's frame clock: the play harness counts them).
 uint32_t wl_xb_vblank_count(void);
+// The calling guest thread sleeps until the next vertical blank's round has run (its hooks, and so
+// the title's own vblank callback, included) or `timeout_ms` passes; the others run meanwhile. For a
+// title's loop that spins on a counter its vblank callback moves (the caller checks it again). true
+// when a vertical blank came; false at once from the service thread or inside the handler, or when 4
+// threads wait already. Lock held.
+bool wl_xb_vblank_wait(uint32_t timeout_ms);
 // A device's periodic work (the audio processor's frames): `fn` runs about every `period_us`
 // microseconds, lock held, before the handler in the same round (an interrupt it raises is
 // delivered at once). Up to WL_XB_MAX_TICKS; before or after wl_xb_service_start.

@@ -169,7 +169,7 @@ static uint32_t gattr(const char *path) {
 
 // ---- Guest functions written in C -----------------------------------------------------------------
 
-#define MAX_GUEST_FNS 16u
+#define MAX_GUEST_FNS 20u
 static recomp_func_t g_guest_fns[MAX_GUEST_FNS];
 
 static uint32_t guest_fn(uint32_t index, recomp_func_t fn) {
@@ -1000,6 +1000,155 @@ TEST vblanks_raised_together_all_run(void) {
     WlXbServiceStats s1;
     wl_xb_service_stats(&s1);
     ASSERT_EQ_FMT(3u, s1.vblanks_raised - s0.vblanks_raised, "%u");
+    PASS();
+}
+
+// ---- A thread sleeps until the next vertical blank ------------------------------------------------
+// A title's frame loop that spins on a counter its vblank callback moves sleeps in wl_xb_vblank_wait
+// instead: woken by the next vertical blank's round, not before, every waiter at once, and a vertical
+// blank raised before the wait is not lost (its round runs only once the waiter gives the lock up).
+
+static volatile uint32_t g_vw_in, g_vw_done, g_vw_ok;
+
+static void vblank_raise_routine(void) {
+    // stdcall SystemRoutine(ctx1 = ms before the vertical blank, ctx2)
+    delay_ms(guest_arg(0));
+    wl_xb_service_raise(WL_XB_SVC_VBLANK);
+    guest_ret(8);
+}
+
+static void vblank_wait_routine(void) {
+    // stdcall SystemRoutine(ctx1, ctx2)
+    g_vw_in++;
+    if (wl_xb_vblank_wait(5000)) {
+        g_vw_ok++;
+    }
+    g_vw_done++;
+    guest_ret(8);
+}
+
+TEST vblank_wait_wakes_at_the_next_vblank(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t before = wl_xb_vblank_count();
+    uint64_t start = now_ms();
+    ASSERT_FALSE(wl_xb_vblank_wait(30)); // none comes: the timeout
+    ASSERT(now_ms() - start >= 25u);
+    ASSERT_EQ_FMT(before, wl_xb_vblank_count(), "%u");
+    uint32_t hp = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 40, 0, 0, 0, guest_fn(14, vblank_raise_routine)), "%08x");
+    start = now_ms();
+    ASSERT(wl_xb_vblank_wait(5000));
+    ASSERT(now_ms() - start >= 35u); // not before the vertical blank 40 ms on
+    ASSERT_EQ_FMT(before + 1u, wl_xb_vblank_count(), "%u");
+    delay_ms(5); // the raiser ends
+    KN(S_NT_CLOSE, wl_xb_rd32(hp));
+    PASS();
+}
+
+TEST vblank_wait_wakes_every_waiter(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    g_vw_in = g_vw_done = g_vw_ok = 0;
+    uint32_t hp = gmem(16);
+    for (uint32_t i = 0; i < 4u; i++) {
+        ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp + 4u * i, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(15, vblank_wait_routine)),
+                      "%08x");
+    }
+    for (int i = 0; i < 300 && g_vw_in < 4u; i++) {
+        delay_ms(5); // (each registers and sleeps without giving the lock up between)
+    }
+    ASSERT_EQ_FMT(4u, g_vw_in, "%u");
+    ASSERT_EQ_FMT(0u, g_vw_done, "%u");
+    uint32_t before = wl_xb_vblank_count();
+    uint64_t start = now_ms();
+    ASSERT_FALSE(wl_xb_vblank_wait(1000)); // a fifth: no room, false at once
+    ASSERT(now_ms() - start < 500u);
+    wl_xb_service_raise(WL_XB_SVC_VBLANK);
+    for (int i = 0; i < 300 && g_vw_done < 4u; i++) {
+        delay_ms(5);
+    }
+    ASSERT_EQ_FMT(4u, g_vw_done, "%u");
+    ASSERT_EQ_FMT(4u, g_vw_ok, "%u"); // one vertical blank woke all four
+    ASSERT_EQ_FMT(before + 1u, wl_xb_vblank_count(), "%u");
+    delay_ms(5);
+    for (uint32_t i = 0; i < 4u; i++) {
+        KN(S_NT_CLOSE, wl_xb_rd32(hp + 4u * i));
+    }
+    PASS();
+}
+
+TEST vblank_raised_before_the_wait_is_not_lost(void) {
+    boot();
+    ASSERT(g_ready);
+    // the title read its counter, then the vertical blank came before it slept: its round runs once
+    // the waiter gives the lock up, and wakes it
+    uint32_t before = wl_xb_vblank_count();
+    uint64_t start = now_ms();
+    wl_xb_service_raise(WL_XB_SVC_VBLANK);
+    ASSERT(wl_xb_vblank_wait(5000));
+    ASSERT(now_ms() - start < 2000u);
+    ASSERT_EQ_FMT(before + 1u, wl_xb_vblank_count(), "%u");
+    PASS();
+}
+
+// ---- A thread's time off the lock ---------------------------------------------------------------
+// wl_xb_thread_times: queued for its turn, in guest waits, in the card's I/O.
+
+static volatile uint32_t g_tt_done;
+static WlXbThreadTimes g_tt_worker;
+
+static void times_routine(void) {
+    // stdcall SystemRoutine(ctx1, ctx2): its times as it first runs
+    wl_xb_thread_times(wl_xb_current(), &g_tt_worker);
+    g_tt_done = 1;
+    guest_ret(8);
+}
+
+TEST thread_times_count_queued_waits_and_io(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    WlXbThread *self = wl_xb_current();
+    WlXbThreadTimes t0, t1;
+    wl_xb_thread_times(self, &t0);
+    delay_ms(20); // a guest wait
+    wl_xb_thread_times(self, &t1);
+    ASSERT(t1.waited_us - t0.waited_us >= 15000u);
+    ASSERT(t1.waited_us - t0.waited_us < 2000000u);
+    ASSERT_EQ_FMT((unsigned long long)t0.io_us, (unsigned long long)t1.io_us, "%llu");
+    // the card's I/O: outside the lock (none in the deterministic mode, whose clock does not see it)
+    WlXbThread *b = wl_xb_block_begin();
+    wl_platform_thread_sleep_ms(15);
+    wl_xb_block_end(b);
+    wl_xb_thread_times(self, &t0);
+    if (b != NULL) {
+        ASSERT(t0.io_us - t1.io_us >= 10000u);
+    } else {
+        ASSERT_EQ_FMT((unsigned long long)t1.io_us, (unsigned long long)t0.io_us, "%llu");
+    }
+    ASSERT_EQ_FMT((unsigned long long)t1.waited_us, (unsigned long long)t0.waited_us, "%llu");
+    // queued: a worker made while this thread keeps the lock waits its turn
+    g_tt_done = 0;
+    memset(&g_tt_worker, 0, sizeof g_tt_worker);
+    uint32_t hp = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(16, times_routine)), "%08x");
+    if (!wl_xb_deterministic()) {
+        wl_platform_thread_sleep_ms(10); // (its host thread queued for the lock)
+    }
+    pause_ms(30); // the lock kept
+    for (int i = 0; i < 300 && g_tt_done == 0; i++) {
+        delay_ms(5);
+    }
+    ASSERT_EQ_FMT(1u, g_tt_done, "%u");
+    ASSERT(g_tt_worker.ready_us >= 20000u);
+    ASSERT_EQ_FMT(0ull, (unsigned long long)g_tt_worker.io_us, "%llu");
+    delay_ms(5);
+    KN(S_NT_CLOSE, wl_xb_rd32(hp));
+    wl_xb_thread_times(NULL, &t1); // no thread: zeros
+    ASSERT_EQ_FMT(0ull, (unsigned long long)(t1.ready_us + t1.waited_us + t1.io_us), "%llu");
     PASS();
 }
 
@@ -2835,6 +2984,10 @@ SUITE(kernel_suite) {
     RUN_TEST(no_yield_at_dispatch_level);
     RUN_TEST(yield_gives_way_to_a_lower_priority);
     RUN_TEST(vblanks_raised_together_all_run);
+    RUN_TEST(vblank_wait_wakes_at_the_next_vblank);
+    RUN_TEST(vblank_wait_wakes_every_waiter);
+    RUN_TEST(vblank_raised_before_the_wait_is_not_lost);
+    RUN_TEST(thread_times_count_queued_waits_and_io);
     RUN_TEST(an_ended_owner_abandons_its_mutants);
     RUN_TEST(a_masked_line_waits_quietly);
     RUN_TEST(timers_wait_for_the_irql);

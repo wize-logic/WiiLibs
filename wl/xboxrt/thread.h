@@ -56,6 +56,12 @@ struct WlXbThread {
     uint32_t host_done_ms;     // when its host thread ran its last statement (ms, odd; 0: not yet)
     bool ready;                // in the ready queue
     uint64_t ready_since_us;   // when it was queued
+    // where its time off the lock went (wl_xb_time_us, g_m held): wl_xb_thread_times
+    uint64_t ready_us;         // in the ready queue (its turn not come: another thread had the lock)
+    uint64_t waited_us;        // in wl_xb_wait (a guest wait: an event, a sleep, a semaphore)
+    uint64_t io_us;            // outside the lock in a kernel call's card I/O (wl_xb_block_begin)
+    uint64_t off_since_us;     // when the wait or the I/O began (0: neither)
+    bool off_io;               // ...which of the two
     bool woken;                // a wake arrived while it slept (wl_xb_wake)
     bool det_created;          // its host thread exists (wl_xb_thread_create): a resume queues it
     bool det_waiting;          // the deterministic mode: in wl_xb_wait, not queued
@@ -282,6 +288,13 @@ typedef struct {
     uint32_t yields, yields_lower; // NtYieldExecution calls; those that gave way to a lower priority
 } WlXbThreadStats;
 void wl_xb_thread_stats(WlXbThreadStats *out);
+// A thread's time off the guest lock since it was made, in microseconds of wl_xb_time_us: queued
+// for its turn, in guest waits, in the card's I/O (a span still going on counts up to now). A title's
+// frame loop measures its own frame with it: what it waited for, and on what. Any thread.
+typedef struct {
+    uint64_t ready_us, waited_us, io_us;
+} WlXbThreadTimes;
+void wl_xb_thread_times(const WlXbThread *t, WlXbThreadTimes *out);
 // What the stall watch counts as the guest moving on: hand-offs, safe points, waits, wakes,
 // timeouts and kernel calls.
 uint32_t wl_xb_thread_progress(void);
