@@ -375,7 +375,13 @@ static inline uint16_t recomp_fxam(double value) {
  * The unordered case is not a curiosity: `fucompp` of a value with itself
  * followed by `test ah, 0x44; jp` is how this era's CRT asks "is this a NaN",
  * and collapsing it to "equal" answers no every time. */
-#define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
+/* WiiLibs: each operand evaluated once (it is often a guest memory load), and the ordered tests
+ * first, so the compiler answers all four outcomes from one fcmpu; the two NaN tests first made it
+ * three or four compares, and a test of the status word after it could not fold to one branch. */
+static inline __attribute__((always_inline)) int recomp_fcmp(double a, double b) {
+    return a < b ? -1 : a > b ? 1 : a == b ? 0 : 2;
+}
+#define RECOMP_FCMP(a, b)     recomp_fcmp((a), (b))
 /* x87 rounding to an integral value under the guest RC bits (control word
  * bits 10-11: 0 nearest-even, 1 down, 2 up, 3 toward zero). FRNDINT rounds
  * this way, and so does FIST before its store; neither may follow the HOST's
@@ -606,8 +612,15 @@ typedef struct RECOMP_GUEST_LE { volatile int8_t   v; } recomp_le_s8;
 typedef struct RECOMP_GUEST_LE { volatile int16_t  v; } recomp_le_s16;
 typedef struct RECOMP_GUEST_LE { volatile int32_t  v; } recomp_le_s32;
 typedef struct RECOMP_GUEST_LE { volatile int64_t  v; } recomp_le_s64;
-typedef struct RECOMP_GUEST_LE { volatile float    v; } recomp_le_f32;
-typedef struct RECOMP_GUEST_LE { volatile double   v; } recomp_le_f64;
+/* The float and double loads alone are not volatile (x87 and SSE scalar operands: MEMF, MEMD;
+ * their stores are MEMF_SET/MEMD_SET, integer and volatile). No guest spins on a float or reads
+ * one from a device, and a byte-reversed float load is three instructions through the stack
+ * (lwbrx, stw, lfs): volatile made each `fcomp [mem]` load its operand up to four times and every
+ * `fmul [esp+x]` reload a value the block had just read. GCC still orders them after every
+ * store that may alias and every call; only a device read (a safe point, so another guest thread
+ * may run in it) no longer forces a float read before it to be read again after it. */
+typedef struct RECOMP_GUEST_LE { float  v; } recomp_le_f32;
+typedef struct RECOMP_GUEST_LE { double v; } recomp_le_f64;
 
 /** Read/write N bytes at a flat Xbox memory address. */
 #define MEM8(addr)   (((recomp_le_u8  *)XBOX_PTR(addr))->v)

@@ -330,6 +330,22 @@
    "notes": "patch 0003 updates the expected store text"
   },
   {
+   "upstream": "tools/recomp/test_lifter_fpu_reverse.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/"
+   ],
+   "notes": "patches 0015 (the status word's condition bits) and 0016 (the transcendentals' static stack depth) update the expected text"
+  },
+  {
+   "upstream": "tools/recomp/test_lifter_lahf.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/"
+   ],
+   "notes": "patch 0015 (sahf reads AH) updates the expected text"
+  },
+  {
    "upstream": "tools/recomp/**",
    "kind": "vendored",
    "wl": [

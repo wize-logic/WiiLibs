@@ -16,7 +16,8 @@ WiiLibs' copy (wl/xboxrt/recomp/recomp_types.h) is that template, with WiiLibs' 
   4. XBOX_PTR is the guest-to-host transform: WL_XB_EA(a) = (a & 0x0FFFFFFF) | ((a >> 3) &
      0x10000000), plus g_xbox_mem_offset, or nothing with WL_XB_EA_BASE_ZERO (the Wii, where the
      effective address is the address); MEM8..MEMD read and write little-endian through
-     scalar_storage_order("little-endian") structs, volatile and may_alias
+     scalar_storage_order("little-endian") structs, may_alias, volatile but for the float and
+     double loads
   5. MEMF_SET/MEMD_SET store a float's integer bits (one byte-reversed store, not a float
      store, reload and swap), always inline
   6. RecompXmm and RecompMmx get little-endian storage, so their lane views agree as on x86; the
@@ -37,6 +38,7 @@ WiiLibs' copy (wl/xboxrt/recomp/recomp_types.h) is that template, with WiiLibs' 
      forever)
  13. the indirect-call macros resolve their target with one call, RECOMP_RESOLVE (wl/xboxrt's
      wl_xb_lookup: manual, generated, kernel behind a direct-mapped cache), not three
+ 14. RECOMP_FCMP is an inline function: one evaluation of each operand, ordered tests first
 
 On a little-endian host the storage-order attribute does nothing and the byte swaps are
 identities, so the same header serves host tests.
@@ -228,8 +230,15 @@ typedef struct RECOMP_GUEST_LE { volatile int8_t   v; } recomp_le_s8;
 typedef struct RECOMP_GUEST_LE { volatile int16_t  v; } recomp_le_s16;
 typedef struct RECOMP_GUEST_LE { volatile int32_t  v; } recomp_le_s32;
 typedef struct RECOMP_GUEST_LE { volatile int64_t  v; } recomp_le_s64;
-typedef struct RECOMP_GUEST_LE { volatile float    v; } recomp_le_f32;
-typedef struct RECOMP_GUEST_LE { volatile double   v; } recomp_le_f64;
+/* The float and double loads alone are not volatile (x87 and SSE scalar operands: MEMF, MEMD;
+ * their stores are MEMF_SET/MEMD_SET, integer and volatile). No guest spins on a float or reads
+ * one from a device, and a byte-reversed float load is three instructions through the stack
+ * (lwbrx, stw, lfs): volatile made each `fcomp [mem]` load its operand up to four times and every
+ * `fmul [esp+x]` reload a value the block had just read. GCC still orders them after every
+ * store that may alias and every call; only a device read (a safe point, so another guest thread
+ * may run in it) no longer forces a float read before it to be read again after it. */
+typedef struct RECOMP_GUEST_LE { float  v; } recomp_le_f32;
+typedef struct RECOMP_GUEST_LE { double v; } recomp_le_f64;
 
 /** Read/write N bytes at a flat Xbox memory address. */
 #define MEM8(addr)   (((recomp_le_u8  *)XBOX_PTR(addr))->v)
@@ -309,6 +318,15 @@ static inline double recomp_fp_pc24(double x) {
  * state the lifter keeps in locals (--x87-locals) passes its local copy. */
 #define RECOMP_FP_PC_CW(cw, x) (((cw) & 0x300u) ? (double)(x) : recomp_fp_pc24(x))
 #define RECOMP_FP_PC(x) RECOMP_FP_PC_CW(g_fp_control_word, x)"""
+
+FCMP_OLD = "#define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)"
+FCMP_NEW = """/* WiiLibs: each operand evaluated once (it is often a guest memory load), and the ordered tests
+ * first, so the compiler answers all four outcomes from one fcmpu; the two NaN tests first made it
+ * three or four compares, and a test of the status word after it could not fold to one branch. */
+static inline __attribute__((always_inline)) int recomp_fcmp(double a, double b) {
+    return a < b ? -1 : a > b ? 1 : a == b ? 0 : 2;
+}
+#define RECOMP_FCMP(a, b)     recomp_fcmp((a), (b))"""
 
 ROUND24_OLD = "static inline double recomp_fp_round24(double x) {"
 ROUND24_NEW = "static __attribute__((noinline, cold, unused)) double recomp_fp_round24(double x) {"
@@ -507,6 +525,7 @@ def transform(src: str, commit: str, release: str, patches: list[str]) -> str:
     src = replace_between(src, SET_DEFAULTS_START, SET_DEFAULTS_END, "", "MEMF_SET defaults")
     src = replace_once(src, ROUND24_OLD, ROUND24_NEW, "recomp_fp_round24 out of line")
     src = replace_once(src, FPPC_OLD, FPPC_NEW, "RECOMP_FP_PC fast path")
+    src = replace_once(src, FCMP_OLD, FCMP_NEW, "RECOMP_FCMP")
     n = src.count(TRACE_SEQ)
     if n < 5:
         raise AnchorError(f"edit 'icall trace': expected the trace sequence in at least 5 macros, found {n}")
