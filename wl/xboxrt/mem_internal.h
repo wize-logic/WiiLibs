@@ -94,10 +94,17 @@ WlResult wl_xb_pg_init(const WlXbMemConfig *cfg, uint32_t frames);
 // clock). Its bytes are not set. `keep` (a page + 1, or 0) is not taken. 0 when neither is at hand.
 uint32_t wl_xb_pg_frame_fast(uint32_t p, uint32_t keep);
 // Normal context, the guest lock held: page `p` gets a frame with its contents (zero, or read back
-// from the swap file), writing changed pages out first when it must; not mapped. WL_OK, WL_ERR_NOMEM
-// (every frame is pinned, or changed with no swap file to write it to), WL_ERR_IO (the swap file
-// failed), WL_ERR_STATE (the page is in I/O already: a fault inside the paging code).
+// from the swap file or its file), writing changed pages out first when it must; not mapped. WL_OK,
+// WL_ERR_NOMEM (every frame is pinned, or changed with no swap file to write it to), WL_ERR_IO (the
+// swap file or the file failed), WL_ERR_STATE (the page is in a batch's write: a fault inside the
+// paging code). A page another thread reads back (wl_xb_pg_touch) is waited for. The guest lock is
+// kept throughout (the kernel's callers: a pin, a forget).
 WlResult wl_xb_pg_fault(uint32_t p, uint32_t keep);
+// The same for a thread's own touch of the page (the Wii's DSI, the host's fault): a read back
+// gives the guest lock up while the card works (wl_xb_block_begin), as a thread waits in its I/O, so
+// the tables may have changed when it returns (the caller looks at its EA again). The page is in
+// transit meanwhile: IO, its frame its own, and a thread that meets it waits for the read.
+WlResult wl_xb_pg_touch(uint32_t p, uint32_t keep);
 // The pages' contents are no longer wanted: unmapped, frames and slots back, flags cleared.
 void wl_xb_pg_release(uint32_t p, uint32_t pages);
 // The pages' bytes are about to be overwritten whole (a file read into them): a swapped page forgets

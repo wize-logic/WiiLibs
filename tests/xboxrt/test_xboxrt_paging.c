@@ -4,13 +4,14 @@
 // for nothing, changed pages go to the swap file in batches and come back on their next touch,
 // clean pages read back cost no write when they go again, changed pages cleared to zero go as zero
 // pages, a file read over swapped pages does not read them back first, pages a file read filled
-// whole go for nothing and come back from the file until they change or the file does, both EAs of a page see one page
-// whatever happened to its frame, pinned pages keep theirs, relocations and frees carry the
-// paging state, accesses across two pages and copies between two buffers larger than the pool
-// work, devices still fault, and the write watch sees the stores to a range (and only those: not
-// reads, not a swap-out and read back) through either EA. Built twice: with a swap file, and without one
-// (WL_XBRT_PAGING_NO_SWAP), where only zero and clean pages give frames back and a changed page
-// that needs a frame is a guest crash.
+// whole go for nothing and come back from the file until they change or the file does, both EAs of
+// a page see one page whatever happened to its frame, pinned pages keep theirs, relocations and
+// frees carry the paging state, accesses across two pages and copies between two buffers larger
+// than the pool work, a read back gives the guest lock up while the card works (another thread that
+// touches the page waits for it), devices still fault, and the write watch sees the stores to a
+// range (and only those: not reads, not a swap-out and read back) through either EA. Built twice:
+// with a swap file, and without one (WL_XBRT_PAGING_NO_SWAP), where only zero and clean pages give
+// frames back and a changed page that needs a frame is a guest crash.
 #define _GNU_SOURCE
 #include <setjmp.h>
 #include <signal.h>
@@ -27,6 +28,7 @@
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/mmio.h"
+#include "wl/xboxrt/thread.h"
 
 #define FRAMES 64u
 #define PAGE WL_XB_PAGE
@@ -549,12 +551,14 @@ TEST file_pages_need_no_swap_out(void) {
     WlXbMemStats c = stats();
     ASSERT_EQ(0u, c.swap_outs - b.swap_outs);
     ASSERT_EQ(0u, c.swap_ins - b.swap_ins);
-    ASSERT(c.file_ins - b.file_ins >= n);
+    ASSERT((c.file_ins + c.file_ahead) - (b.file_ins + b.file_ahead) >= n);
+    ASSERT(c.file_ahead > b.file_ahead); // read in order: the pages after each come in its read
     ASSERT(c.file_evictions - b.file_evictions >= n);
     // a read over pages that went: not read back from the file to be overwritten
     file_read(va, f, 0, n);
     WlXbMemStats d = stats();
     ASSERT_EQ(c.file_ins, d.file_ins);
+    ASSERT_EQ(c.file_ahead, d.file_ahead);
     ASSERT(check(va, n, 21));
     // freed: the file's pages are gone with the memory, nothing is left to forget
     ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
@@ -677,6 +681,86 @@ TEST files_written_from_paged_out_memory(void) {
     PASS();
 }
 
+// A thread's read back of a page gives the guest lock up while the card works (a real Wii's card
+// held every thread, the vertical blank and the audio off for seconds while a10's opening cutscene
+// paged its map in): here another host thread holds the card for 150 ms while the boot thread
+// touches a page that went back to its file. A second guest thread runs meanwhile and touches the
+// same page: it waits for that read rather than reading it again or taking its frame.
+static volatile uint32_t g_card_state, g_go, g_seen_card, g_toucher_ok, g_toucher_done;
+static uint32_t g_touch_va, g_touch_want;
+static _Alignas(32) uint8_t g_card_stack[64 * 1024];
+
+static void *card_holder(void *arg) {
+    (void)arg;
+    wl_xb_card_lock();
+    g_card_state = 1;
+    wl_platform_thread_sleep_ms(150);
+    g_card_state = 2;
+    wl_xb_card_unlock();
+    return NULL;
+}
+
+static void toucher(WlXbThread *self, void *user) {
+    (void)user;
+    while (g_go == 0) {
+        (void)wl_xb_wait(self, 1);
+    }
+    g_seen_card = g_card_state; // 1: it ran while the boot thread waited for the card
+    g_toucher_ok = wl_xb_rd32(g_touch_va) == g_touch_want ? 1u : 0u;
+    g_toucher_done = 1;
+}
+
+TEST read_back_gives_the_lock_up(void) {
+    up();
+    WlXbThread *boot = NULL;
+    WlXbThreadConfig tc;
+    wl_xb_thread_config_default(&tc);
+    ASSERT_EQ(WL_OK, wl_xb_threads_init(&tc, &boot));
+    ASSERT_EQ(WL_OK, wl_xb_thread_setup_guest(boot, 0x10000u, 0, 0, 0));
+    const uint32_t n = 2u * FRAMES;
+    WlPlatformFile *f = pattern_file("sd:/transit.bin", n, 33);
+    ASSERT(f != NULL);
+    uint32_t va = alloc(n);
+    ASSERT(va != 0);
+    file_read(va, f, 0, n);
+    ASSERT(check(va, n, 33)); // the first pages went back to the file for the last ones
+    ASSERT(!wl_xb_mem_resident(va));
+    WlXbThread *t = NULL;
+    ASSERT_EQ(WL_OK, wl_xb_thread_create_host("toucher", toucher, NULL, 0x4000u,
+                                              WL_XB_PRIORITY_NORMAL, &t));
+    g_touch_va = va;
+    g_touch_want = word(33, 0, 0);
+    WlPlatformThread holder;
+    ASSERT_EQ(WL_OK, wl_platform_thread_create(&holder, card_holder, NULL, g_card_stack,
+                                               sizeof g_card_stack, WL_THREAD_PRIO_MAIN));
+    while (g_card_state == 0) {
+        wl_platform_thread_sleep_ms(1);
+    }
+    WlXbMemStats a = stats();
+    g_go = 1;
+    uint32_t got =
+        wl_xb_rd32(va); // read back from the file: the lock given up while the card is held
+    WlXbMemStats b = stats();
+    ASSERT_EQ_FMT(g_touch_want, got, "%08x");
+    ASSERT_EQ_FMT(2u, g_card_state, "%u"); // the read waited for the card
+    uint64_t t0 = wl_platform_time_us();
+    while (g_toucher_done == 0 && wl_platform_time_us() - t0 < 3000000u) {
+        (void)wl_xb_wait(boot, 1);
+    }
+    ASSERT_EQ_FMT(1u, (unsigned)g_toucher_done, "%u");
+    ASSERT_EQ_FMT(1u, (unsigned)g_seen_card, "%u"); // the other thread ran meanwhile
+    ASSERT_EQ_FMT(1u, (unsigned)g_toucher_ok, "%u");
+    ASSERT_EQ_FMT(1u, b.file_ins - a.file_ins, "%u");           // read once
+    ASSERT_EQ_FMT(1u, b.transit_waits - a.transit_waits, "%u"); // the other thread waited for it
+    ASSERT(b.io_unlocked > a.io_unlocked);
+    ASSERT_EQ(b.io_held_us, a.io_held_us);
+    ASSERT(check(va, n, 33));
+    (void)wl_platform_thread_join(holder, NULL);
+    wl_platform_fs_close(f);
+    wl_platform_fs_remove("sd:/transit.bin");
+    PASS();
+}
+
 #else // no swap file
 
 static sigjmp_buf g_crash_jmp;
@@ -729,6 +813,7 @@ SUITE(paging) {
     RUN_TEST(file_pages_forget_their_file);
     RUN_TEST(across_pages_and_big_copies);
     RUN_TEST(files_written_from_paged_out_memory);
+    RUN_TEST(read_back_gives_the_lock_up); // (last: the boot thread becomes a guest thread)
 #else
     RUN_TEST(changed_pages_need_a_swap_file);
 #endif

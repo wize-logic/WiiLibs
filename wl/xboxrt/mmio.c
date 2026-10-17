@@ -8,6 +8,7 @@
 static WlXbDevice g_devices[WL_XB_MAX_DEVICES];
 static uint32_t g_count;
 static WlXbMmioStats g_stats;
+uint32_t g_xb_mmio_depth;
 
 WlResult wl_xb_mmio_register(const WlXbDevice *dev) {
     if (dev == NULL || dev->base < WL_XB_MMIO_BASE || dev->size == 0 ||
@@ -45,6 +46,7 @@ bool wl_xb_mmio_read(uint32_t va, unsigned size, uint64_t *value) {
         return false;
     }
     g_stats.reads++;
+    g_xb_mmio_depth++;
     if (size == 8) {
         uint64_t lo = d->read(d->user, va - d->base, 4);
         uint64_t hi = d->read(d->user, va + 4u - d->base, 4);
@@ -53,6 +55,7 @@ bool wl_xb_mmio_read(uint32_t va, unsigned size, uint64_t *value) {
         uint32_t v = d->read(d->user, va - d->base, size);
         *value = size == 4 ? v : size == 2 ? (v & 0xFFFFu) : (v & 0xFFu);
     }
+    g_xb_mmio_depth--;
     return true;
 }
 
@@ -63,6 +66,7 @@ bool wl_xb_mmio_write(uint32_t va, uint64_t value, unsigned size) {
         return false;
     }
     g_stats.writes++;
+    g_xb_mmio_depth++;
     if (size == 8) {
         d->write(d->user, va - d->base, (uint32_t)value, 4);
         d->write(d->user, va + 4u - d->base, (uint32_t)(value >> 32), 4);
@@ -70,6 +74,7 @@ bool wl_xb_mmio_write(uint32_t va, uint64_t value, unsigned size) {
         uint32_t mask = size == 4 ? 0xFFFFFFFFu : size == 2 ? 0xFFFFu : 0xFFu;
         d->write(d->user, va - d->base, (uint32_t)value & mask, size);
     }
+    g_xb_mmio_depth--;
     return true;
 }
 

@@ -43,6 +43,9 @@ const WlXbDevice *wl_xb_mmio_find(uint32_t va);
 // 8-byte accesses (an x86 movq or a pair of words) are split in two 4-byte ones, low first.
 bool wl_xb_mmio_read(uint32_t va, unsigned size, uint64_t *value);
 bool wl_xb_mmio_write(uint32_t va, uint64_t value, unsigned size);
+// > 0 while a device's register access is emulated (the guest lock's holder): a fault on guest RAM
+// in there is the device's own access, which must not give the guest lock up halfway (paging.c).
+extern uint32_t g_xb_mmio_depth;
 
 // The host PC of the guest access being emulated, as the fault handler saw it (0 when it does not
 // say: the Wii's handler, or a call from C): a device's trace names the translated function with

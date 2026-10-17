@@ -75,8 +75,12 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
 - **Writes are batched; clean victims first.** The SD card is slow at small writes: the slow path
   gathers the unused dirty pages the clock passes, and only when a whole look finds no clean page
   writes up to 32 of them (128 KB) in one write to consecutive free slots, then takes their frames,
-  which leaves free frames for the next touches. A page read back is read alone (4 KB): only what
-  is touched.
+  which leaves free frames for the next touches. A page read back by a thread's own touch is read
+  alone (4 KB): only what is touched. One read back with the guest lock kept (a device's or the
+  kernel's own access: the NV2A walks a vertex or texture buffer page after page) takes the file
+  copies after it at the following offsets in the same read, up to 8 pages (32 KB) with frames had
+  without I/O, clean and not marked used: the card's time is mostly its seek. a10's opening
+  cutscene on the host at the Wii's memory: 486 such reads became 130.
 - **Nothing written or read that need not be.** A changed page found zero again when its batch is
   gathered becomes a zero page (no write, and its next touch zero-fills it). A file read into guest
   memory (`wl_xb_copy_in`) overwrites whole pages: a swapped one among them forgets its slot first
@@ -103,7 +107,16 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
   page to read back, or no clean page at hand so a batch must be written) returns to the
   trampoline the device faults use, and `wl_xb_dsi_slow` runs the paging core in the faulting
   thread's own context, which holds the guest lock: it waits for the card there and the access
-  runs again. Its table changes run with interrupts off a step at a time, so the fast path on
+  runs again. A read back gives the guest lock up while the card works (`wl_xb_pg_touch`,
+  `wl_xb_block_begin`), as an Xbox thread waits in its I/O, unless the touch is inside a kernel
+  call or a device's emulation (their C code expects the lock throughout), at DISPATCH_LEVEL, or in
+  the deterministic mode. The page is in transit meanwhile: marked IO, its frame its own; a thread
+  that meets it (a touch, a free, a move, a pin, a file's forget) waits for that read (with the
+  guest lock kept: the reader needs only the card's lock) instead of reading it again or taking its
+  frame. Every transfer on the swap file and the files is made under the card's lock. On a real
+  Wii, a10's opening cutscene froze 2-3 s with ~1 s a window of paging I/O under the guest lock
+  (the reads also waited for the kernel's streamed reads on the card); on the host 571 of its reads
+  now run without the lock. Its table changes run with interrupts off a step at a time, so the fast path on
   another thread (a PTE reload of a pinned page) sees them whole; pages being written or read are
   marked and neither mapped nor taken meanwhile. A slow-path touch from a thread without the guest
   lock, or with interrupts off, is a crash report that says so.
@@ -598,7 +611,9 @@ Wii, `abort` elsewhere; `wl_xb_crash_set_stop` replaces it).
   zero pages, swap-outs in batches and swap-ins, clean pages going for nothing, changed pages
   cleared to zero going for nothing, file reads over swapped pages not reading them back, both EAs of a page,
   pinned pages, relocations and frees of swapped pages, accesses across pages and copies between
-  buffers larger than the pool; built again without a swap file (`test_xboxrt_paging_no_swap`).
+  buffers larger than the pool, file copies read ahead with the lock kept, a read back that gives the
+  guest lock up while another thread holds the card (a second guest thread runs meanwhile and waits
+  for the page in transit); built again without a swap file (`test_xboxrt_paging_no_swap`).
 - `tests/xboxrt/test_xboxrt_decode.c`: the PowerPC decoder over a matrix of forms, the x86-64
   decoder over byte strings (portable).
 - `tests/xboxrt/test_xboxrt_pad.c`: the gamepad's report both ways, rumble, merging, the
