@@ -64,6 +64,14 @@ typedef WlResult (*WlXbeRead)(void *user, uint32_t offset, void *dst, uint32_t n
 // threads. Needs wl_xb_mem_init. The file is read through `read` in chunks (a bounce buffer: the
 // Wii's file layer must never DMA into guest memory).
 WlResult wl_xbe_load(const WlXbe *xbe, WlXbeRead read, void *user);
+// wl_xbe_load, and each whole guest page of a section's raw bytes remembers that it came from
+// `file` (mem.h, wl_xb_file_pages): while the title leaves it unchanged (its x86 code, constants),
+// paging gives its frame back with nothing written to the swap file and reads it from the file
+// again when touched. The caller keeps `file` open and unchanged for as long as the image lives.
+// A page shared by two sections, or with a section's zero tail, stays an ordinary copy. NULL:
+// wl_xbe_load.
+struct WlPlatformFile;
+WlResult wl_xbe_load_backed(const WlXbe *xbe, WlXbeRead read, void *user, struct WlPlatformFile *file);
 
 // How an import resolves (the kernel's answer for an ordinal).
 typedef struct {

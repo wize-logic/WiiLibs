@@ -600,9 +600,11 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     }
 
     // ---- the image, the kernel, the devices -----------------------------------------------------
-    r = wl_xbe_load(xbe, read_file, file);
-    wl_platform_fs_close(file);
+    // the sections' whole pages stay backed by the file (its x86 code is evicted without a swap
+    // write and read from it again), so it stays open for the image's life
+    r = wl_xbe_load_backed(xbe, read_file, file, file);
     if (r != WL_OK) {
+        wl_platform_fs_close(file);
         return r;
     }
     apply_title_patches();
