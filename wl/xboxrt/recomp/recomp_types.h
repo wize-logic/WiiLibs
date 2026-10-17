@@ -316,50 +316,55 @@ extern RECOMP_TLS uint16_t g_fp_cc;
  * So a plain (float) cast is right only inside float's range -- outside it,
  * it would turn a large intermediate into inf (and inf*0 into NaN) or flush a
  * tiny one to 0, where the x87 carries on. Those go the long way. */
-/* WiiLibs: on PowerPC the inline PC=24 path calls the slow path through
- * recomp_fp_round24_keep, which saves every volatile register (r0, r3-r12, f0, f2-f13, CR, XER,
- * CTR, LR; f1 is the value in and out) around recomp_fp_round24, and returns a zero at once. A
- * plain call clobbers them all, so each x87 operation made GCC move a function's live values to
- * non-volatile registers or spill them around a call that almost never runs: a seventh of the
- * code of Halo's hot functions. One copy of the stub per program (a COMDAT group); it calls the
- * recomp_fp_round24 of the unit its copy came from. Its frame: r0 and r3-r12 at 8-52, LR 44,
- * CR 56, XER 60, CTR 64, f0 and f2-f13 at 72-175, the value's bits at 176. */
+/* WiiLibs: on PowerPC an x87 operation's slow path is a call of recomp_fp24_<d>_<s>, one small
+ * stub for each pair of registers the compiler chose (d the result, s the value): it moves s to
+ * f1, calls recomp_fp24_keep and moves f1 to d, keeping f1. recomp_fp24_keep saves every other
+ * volatile register (r0, r3-r12, f0, f2-f13, CR, XER, CTR, LR) around recomp_fp_round24 and
+ * clears FPSCR[OX, UX, FX] after it. A plain call clobbers them all, so each x87 operation made
+ * GCC move a function's live values to non-volatile registers or spill them around a call that
+ * almost never runs. One copy of each stub per program (COMDAT groups); recomp_fp24_keep calls
+ * the recomp_fp_round24 of the unit its copy came from. */
 #if (defined(__PPC__) || defined(__powerpc__)) && !defined(__powerpc64__) && !defined(WL_XB_EA_NO_ASM)
 #define RECOMP_FP_ROUND24_KEEP 1
 static __attribute__((used)) double recomp_fp_round24(double x);
 __asm__(
-    ".pushsection .text.recomp_fp_round24_keep,\"axG\",@progbits,recomp_fp_round24_keep,comdat\n"
-    ".weak recomp_fp_round24_keep\n"
-    ".type recomp_fp_round24_keep,@function\n"
-    "recomp_fp_round24_keep:\n"
-    "  stwu 1,-192(1)\n"
-    "  stw 11,48(1)\n  stw 12,52(1)\n"
-    "  mfcr 11\n  stw 11,56(1)\n"
-    "  stfd 1,176(1)\n  lwz 11,176(1)\n  lwz 12,180(1)\n"
-    "  clrlwi 11,11,1\n  or. 11,11,12\n"
-    "  beq 0,1f\n"
-    "  mflr 11\n  stw 11,44(1)\n"
-    "  stw 0,8(1)\n  stw 3,12(1)\n  stw 4,16(1)\n  stw 5,20(1)\n  stw 6,24(1)\n"
-    "  stw 7,28(1)\n  stw 8,32(1)\n  stw 9,36(1)\n  stw 10,40(1)\n"
-    "  mfxer 11\n  stw 11,60(1)\n  mfctr 11\n  stw 11,64(1)\n"
+    ".pushsection .text.recomp_fp24_keep,\"axG\",@progbits,recomp_fp24_keep,comdat\n"
+    ".weak recomp_fp24_keep\n"
+    ".type recomp_fp24_keep,@function\n"
+    "recomp_fp24_keep:\n"
+    "  stwu 1,-192(1)\n  stw 0,8(1)\n  mflr 0\n  stw 0,12(1)\n"
+    "  stw 3,16(1)\n  stw 4,20(1)\n  stw 5,24(1)\n  stw 6,28(1)\n  stw 7,32(1)\n"
+    "  stw 8,36(1)\n  stw 9,40(1)\n  stw 10,44(1)\n  stw 11,48(1)\n  stw 12,52(1)\n"
+    "  mfcr 0\n  stw 0,56(1)\n  mfxer 0\n  stw 0,60(1)\n  mfctr 0\n  stw 0,64(1)\n"
     "  stfd 0,72(1)\n  stfd 2,80(1)\n  stfd 3,88(1)\n  stfd 4,96(1)\n  stfd 5,104(1)\n"
     "  stfd 6,112(1)\n  stfd 7,120(1)\n  stfd 8,128(1)\n  stfd 9,136(1)\n  stfd 10,144(1)\n"
     "  stfd 11,152(1)\n  stfd 12,160(1)\n  stfd 13,168(1)\n"
     "  bl recomp_fp_round24\n"
+    "  mtfsb0 3\n  mtfsb0 4\n  mtfsb0 0\n"
     "  lfd 0,72(1)\n  lfd 2,80(1)\n  lfd 3,88(1)\n  lfd 4,96(1)\n  lfd 5,104(1)\n"
     "  lfd 6,112(1)\n  lfd 7,120(1)\n  lfd 8,128(1)\n  lfd 9,136(1)\n  lfd 10,144(1)\n"
     "  lfd 11,152(1)\n  lfd 12,160(1)\n  lfd 13,168(1)\n"
-    "  lwz 11,60(1)\n  mtxer 11\n  lwz 11,64(1)\n  mtctr 11\n"
-    "  lwz 0,8(1)\n  lwz 3,12(1)\n  lwz 4,16(1)\n  lwz 5,20(1)\n  lwz 6,24(1)\n"
-    "  lwz 7,28(1)\n  lwz 8,32(1)\n  lwz 9,36(1)\n  lwz 10,40(1)\n"
-    "  lwz 11,44(1)\n  mtlr 11\n"
-    "1:\n"
-    "  lwz 11,56(1)\n  mtcrf 255,11\n"
-    "  lwz 11,48(1)\n  lwz 12,52(1)\n"
-    "  addi 1,1,192\n"
-    "  blr\n"
-    ".size recomp_fp_round24_keep,.-recomp_fp_round24_keep\n"
-    ".popsection\n");
+    "  lwz 0,64(1)\n  mtctr 0\n  lwz 0,60(1)\n  mtxer 0\n  lwz 0,56(1)\n  mtcrf 255,0\n"
+    "  lwz 3,16(1)\n  lwz 4,20(1)\n  lwz 5,24(1)\n  lwz 6,28(1)\n  lwz 7,32(1)\n"
+    "  lwz 8,36(1)\n  lwz 9,40(1)\n  lwz 10,44(1)\n  lwz 11,48(1)\n  lwz 12,52(1)\n"
+    "  lwz 0,12(1)\n  mtlr 0\n  lwz 0,8(1)\n"
+    "  addi 1,1,192\n  blr\n"
+    ".size recomp_fp24_keep,.-recomp_fp24_keep\n"
+    ".popsection\n"
+    ".macro recomp_fp24_stub d, s\n"
+    ".pushsection .text.recomp_fp24_\\d\\()_\\s,\"axG\",@progbits,recomp_fp24_\\d\\()_\\s,comdat\n"
+    ".weak recomp_fp24_\\d\\()_\\s\n"
+    ".type recomp_fp24_\\d\\()_\\s,@function\n"
+    "recomp_fp24_\\d\\()_\\s:\n"
+    "  stwu 1,-32(1)\n  stw 0,8(1)\n  mflr 0\n  stw 0,12(1)\n"
+    "  stfd 1,16(1)\n  fmr 1,\\s\n"
+    "  bl recomp_fp24_keep\n"
+    "  stfd 1,24(1)\n  lfd 1,16(1)\n  lfd \\d,24(1)\n"
+    "  lwz 0,12(1)\n  mtlr 0\n  lwz 0,8(1)\n"
+    "  addi 1,1,32\n  blr\n"
+    ".size recomp_fp24_\\d\\()_\\s,.-recomp_fp24_\\d\\()_\\s\n"
+    ".popsection\n"
+    ".endm\n");
 #else
 #define RECOMP_FP_ROUND24_KEEP 0
 #endif
@@ -376,6 +381,22 @@ static __attribute__((noinline, cold, unused)) double recomp_fp_round24(double x
  * plain conversion is exact PC=24 rounding -- and only zero, denormal, overflowing, infinite and
  * NaN results take recomp_fp_round24, out of line. Upstream inlines the whole range test at
  * every x87 operation, which more than doubled the size of float-heavy functions on PowerPC. */
+#if RECOMP_FP_ROUND24_KEEP
+/* On PowerPC: frsp. rounds and copies FPSCR[FX] to CR1. FX is set when an instruction turns an
+ * exception bit from 0 to 1, and the stub clears it (with OX and UX) after each slow path; XX
+ * (inexact) stays set, so a normal float result leaves FX clear, and only an overflow or an
+ * inexact underflow sets it -- the results a plain conversion gets wrong. An exact denormal or
+ * zero is the x87's value as well. FX from other code (its own overflow, a thread's first
+ * inexact result) sends one operation to the slow path, which is exact for every input. Two
+ * instructions beside the frsp: a branch over, and a call of the stub for the register pair. */
+static inline double recomp_fp_pc24(double x) {
+    double r;
+    __asm__("frsp. %0,%1\n\tbf+ 4,1f\n\tbl recomp_fp24_%0_%1\n1:\n"
+            ".ifndef recomp_fp24_%0_%1\n\trecomp_fp24_stub %0, %1\n.endif"
+            : "=&f"(r) : "f"(x) : "lr", "cr1");
+    return r;
+}
+#else
 static inline double recomp_fp_pc24(double x) {
     float f = (float)x;
     uint32_t bits;
@@ -383,16 +404,9 @@ static inline double recomp_fp_pc24(double x) {
     /* exponent 1..254: +1 then its top seven bits not all zero (addis, andis., one branch) */
     if (__builtin_expect(((bits + 0x00800000u) & 0x7F000000u) != 0, 1))
         return (double)f;
-#if RECOMP_FP_ROUND24_KEEP
-    {
-        register double r __asm__("fr1") = x;
-        __asm__("bl recomp_fp_round24_keep" : "+f"(r) : : "lr");
-        return r;
-    }
-#else
     return recomp_fp_round24(x);
-#endif
 }
+#endif
 /* RECOMP_FP_PC_CW takes the control word as an argument: a function whose x87
  * state the lifter keeps in locals (--x87-locals) passes its local copy. */
 #define RECOMP_FP_PC_CW(cw, x) (((cw) & 0x300u) ? (double)(x) : recomp_fp_pc24(x))
