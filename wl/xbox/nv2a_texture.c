@@ -884,6 +884,47 @@ static bool convert_sphere(const WlNv2aTexture *t, const WlNv2aGxLayout *layout,
     return wl_gxc_encode(WL_GXC_RGBA8, sphere, size, size, dst, layout->image_bytes) != 0;
 }
 
+// an A4R4G4B4 level straight to GX's RGBA8 tiles, each channel's four bits doubled (as
+// wl_nv2a_texel_rgba): a tile's texels are at the same offsets from its first texel in every tile
+// (a swizzled index is its x part OR its y part, and a tile's corner has none of the bits below
+// it; a linear level's rows are `pitch` apart), so the offsets are made once. 0 when the level is
+// not whole tiles of a size swizzled or read in `size` bytes (decoded texel by texel instead).
+static size_t a4r4g4b4_to_rgba8(const WlNv2aTexture *t, const uint8_t *src, size_t size, uint32_t w, uint32_t h,
+                                uint8_t *out, size_t cap) {
+    uint32_t mask_x = 0, mask_y = 0, offs[16], tx, ty, i;
+    size_t pitch = t->linear ? t->pitch : (size_t)w * 2u;
+
+    if ((w & 3u) != 0 || (h & 3u) != 0 || cap < (size_t)w * h * 4u ||
+        (t->swizzled ? !wl_xbox_swizzle_masks(w, h, &mask_x, &mask_y) || size < (size_t)w * h * 2u
+                     : pitch < (size_t)w * 2u || size < (size_t)(h - 1u) * pitch + (size_t)w * 2u)) {
+        return 0;
+    }
+    for (i = 0; i < 16; i++) {
+        offs[i] = t->swizzled ? (deposit(i & 3u, mask_x) | deposit(i >> 2, mask_y)) * 2u
+                              : (uint32_t)((i >> 2) * pitch + (i & 3u) * 2u);
+    }
+    for (ty = 0; ty < h; ty += 4) {
+        size_t base_y = t->swizzled ? (size_t)deposit(ty, mask_y) * 2u : (size_t)ty * pitch;
+
+        for (tx = 0; tx < w; tx += 4, out += 64) {
+            const uint8_t *in = src + base_y + (t->swizzled ? (size_t)deposit(tx, mask_x) * 2u : (size_t)tx * 2u);
+
+            for (i = 0; i < 16; i++) {
+                uint32_t ar = in[offs[i] + 1u], gb = in[offs[i]];
+
+                // (each nibble doubled: 0xAR to 0xAARR)
+                ar = (ar & 0xF0u) << 8 | (ar & 0xF0u) << 4 | (ar & 0x0Fu) << 4 | (ar & 0x0Fu);
+                gb = (gb & 0xF0u) << 8 | (gb & 0xF0u) << 4 | (gb & 0x0Fu) << 4 | (gb & 0x0Fu);
+                out[i * 2u] = (uint8_t)(ar >> 8);
+                out[i * 2u + 1u] = (uint8_t)ar;
+                out[32u + i * 2u] = (uint8_t)(gb >> 8);
+                out[32u + i * 2u + 1u] = (uint8_t)gb;
+            }
+        }
+    }
+    return (size_t)w * h * 4u;
+}
+
 bool wl_nv2a_texture_convert(const WlNv2aTexture *t, const WlNv2aGxLayout *layout, const uint8_t *src,
                              const uint8_t *palette, void *dst, void *scratch) {
     FormatInfo info = format_info(t->color);
@@ -950,12 +991,18 @@ bool wl_nv2a_texture_convert(const WlNv2aTexture *t, const WlNv2aGxLayout *layou
         } else {
             uint8_t *unswizzled = scratch, *rgba;
 
-            if (scratch == NULL) {
-                return false;
+            made = (t->color == WL_NV2A_TEX_SZ_A4R4G4B4 || t->color == WL_NV2A_TEX_LU_A4R4G4B4) &&
+                           layout->format == WL_GXC_RGBA8
+                       ? a4r4g4b4_to_rgba8(t, level_src, level_size, w, h, out + done, cap)
+                       : 0;
+            if (made == 0) {
+                if (scratch == NULL) {
+                    return false;
+                }
+                rgba = unswizzled + (size_t)w * h * t->texel_bytes;
+                decode_level(t, level, level_src, palette, unswizzled, rgba);
+                made = wl_gxc_encode(layout->format, rgba, w, h, out + done, cap);
             }
-            rgba = unswizzled + (size_t)w * h * t->texel_bytes;
-            decode_level(t, level, level_src, palette, unswizzled, rgba);
-            made = wl_gxc_encode(layout->format, rgba, w, h, out + done, cap);
         }
         if (made == 0) {
             return false;
