@@ -581,7 +581,7 @@ small files). With `netrun.txt` and no PC command line, a Dolphin run sends its 
 | `WL_XB_AUDIO`, `_WAV`, `_TRACE`, `_HASH` | see "The GPU and the MCPX" |
 | `WL_XB_PAGE_CENSUS` | `path` (with a frame limit): the page census (`page_census.h`): each guest page's allocation, what used it (the GPU's textures and vertex arrays, the APU, a map file) and the working set each second; `tools/xb_page_census.py path` makes the tables |
 
-The imitation of the Wii's memory on the host is `WL_XB_FRAME_MB=24 WL_XB_HEAP_MB=14` (the Wii's before MEM1's rest joined the frame pools; about 32 and 13 since, to be set from a real-Wii log's "guest frames" lines).
+The imitation of the Wii's memory on the host is `WL_XB_FRAME_MB=24 WL_XB_HEAP_MB=14` (the Wii's before MEM1's rest joined the frame pools; about 33 and 12 since (the arena 15 MB, the host side 12 MB), to be set from a real-Wii log's "guest frames" lines).
 
 **What the log says.** Tag `xbirq`, every 10 s: `status:` lines for the guest clock against the
 host's, the guest's pages and frames, the heap's free memory and, with demand paging, the frames
