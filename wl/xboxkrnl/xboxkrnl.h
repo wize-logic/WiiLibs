@@ -56,6 +56,8 @@ typedef struct {
     bool inline_first_thread; // the first PsCreateSystemThreadEx runs on the calling thread
                               // (xboxrecomp's INLINE model); else every thread is real
     bool trace_calls;       // log every kernel call; first calls are logged at debug level anyway
+    bool no_read_ahead;     // no host thread reads ahead of a file read from start to end (a map
+                            // being inflated): each read waits for the card
 } WlXkConfig;
 
 void wl_xk_config_default(WlXkConfig *cfg);
@@ -95,11 +97,12 @@ typedef struct {
     uint32_t reads, writes;
     uint32_t jumps; // requests that did not start where the one before ended
     uint64_t read_bytes, write_bytes;
+    uint64_t ahead_bytes; // of the read bytes, those the read-ahead had ready
 } WlXkFileIo;
 bool wl_xk_file_io(uint32_t handle, WlXkFileIo *out);
 // Flushes every open file written since its last flush (its size and time reach the card's
 // directory entry). For the title's exit, with no guest thread running: a title keeps files open
-// for good, and leaving does not close them.
+// for good, and leaving does not close them. A read-ahead in flight ends first.
 void wl_xk_files_flush(void);
 
 #ifdef __cplusplus

@@ -59,9 +59,18 @@
 // what NtWriteFile needs: GENERIC_WRITE, GENERIC_ALL, MAXIMUM_ALLOWED, FILE_WRITE_DATA, FILE_APPEND_DATA
 #define DATA_WRITE_ACCESS (0x40000000u | 0x10000000u | 0x02000000u | 0x2u | 0x4u)
 
+// A file read from start to end past this size is read ahead (read_ahead.c)
+#define XK_AHEAD_MIN (1u << 20)
+
 static uint8_t *g_bounce;
+static bool g_ahead_on;
 static char g_data_dir[192];
 static uint32_t g_files_open;
+
+void xk_files_open_add(int delta) {
+    g_files_open += (uint32_t)delta;
+    g_xk_stats.files_open = g_files_open;
+}
 
 int xk_stricmp(const char *a, const char *b) {
     for (;; a++, b++) {
@@ -87,6 +96,8 @@ void xk_files_init(const WlXkConfig *cfg) {
     // card, and copies a misaligned one through its four pages (the FAT's sectors pushed out with it)
     g_bounce = aligned_alloc(64, BOUNCE);
     snprintf(g_data_dir, sizeof g_data_dir, "%s", cfg->data_dir);
+    g_ahead_on = !cfg->no_read_ahead;
+    xk_ahead_close(NULL);
     xk_paths_init(cfg);
 }
 
@@ -304,9 +315,11 @@ void xk_raw_write(uint32_t partition, uint64_t offset, const uint8_t *src, uint3
 // ---- Objects ---------------------------------------------------------------------------------------
 
 // Guest pages a read filled from a file remember its bytes (wl_xb_file_pages): before the bytes
-// [off, off + len) of the file `c` names change, every handle's pages over them forget them.
+// [off, off + len) of the file `c` names change, every handle's pages over them forget them (and a
+// read-ahead of the file ends).
 static void fcb_pages_forget(const XkFcb *c, uint64_t off, uint64_t len) {
     for (const XkFile *o = c != NULL ? c->files : NULL; o != NULL; o = o->fcb_next) {
+        xk_ahead_close(o);
         if (o->pf != NULL) {
             wl_xb_file_forget(o->pf, off, len);
         }
@@ -317,6 +330,7 @@ static void pages_forget(const XkFile *f, uint64_t off, uint64_t len) {
     if (f->fcb != NULL) {
         fcb_pages_forget(f->fcb, off, len);
     } else if (f->pf != NULL) {
+        xk_ahead_close(f);
         wl_xb_file_forget(f->pf, off, len);
     }
 }
@@ -333,10 +347,11 @@ void wl_xk_file_changed(const char *host) {
 // A handle's I/O so far, in the log: how a load reads and writes (sizes, jumps, the card's time).
 static void io_log(const XkFile *f, const char *why) {
     uint32_t ops = f->io_reads + f->io_writes;
-    WL_LOG_I(XK_TAG, "file I/O %s: %s: %u reads (%u KB, %u KB each), %u writes (%u KB, %u KB each), %u jumps, %u ms",
+    WL_LOG_I(XK_TAG,
+             "file I/O %s: %s: %u reads (%u KB, %u KB each, %u KB read ahead), %u writes (%u KB, %u KB each), %u jumps, %u ms",
              why, f->name, (unsigned)f->io_reads, (unsigned)(f->io_read_bytes >> 10),
-             f->io_reads != 0 ? (unsigned)(f->io_read_bytes / f->io_reads >> 10) : 0u, (unsigned)f->io_writes,
-             (unsigned)(f->io_write_bytes >> 10),
+             f->io_reads != 0 ? (unsigned)(f->io_read_bytes / f->io_reads >> 10) : 0u,
+             (unsigned)(f->io_ahead_bytes >> 10), (unsigned)f->io_writes, (unsigned)(f->io_write_bytes >> 10),
              f->io_writes != 0 ? (unsigned)(f->io_write_bytes / f->io_writes >> 10) : 0u, (unsigned)f->io_jumps,
              ops != 0 ? (unsigned)(f->io_us / 1000u) : 0u);
 }
@@ -372,7 +387,8 @@ bool wl_xk_file_io(uint32_t handle, WlXkFileIo *out) {
                         .writes = f->io_writes,
                         .jumps = f->io_jumps,
                         .read_bytes = f->io_read_bytes,
-                        .write_bytes = f->io_write_bytes};
+                        .write_bytes = f->io_write_bytes,
+                        .ahead_bytes = f->io_ahead_bytes};
     return true;
 }
 
@@ -383,6 +399,7 @@ void xk_file_close(XkFile *f) {
     if (f->io_read_bytes + f->io_write_bytes >= XK_IO_LOG_BYTES) {
         io_log(f, "at close");
     }
+    xk_ahead_close(f);
     if (f->pf != NULL) {
         wl_xb_file_forget(f->pf, 0, UINT64_MAX); // its pages' bytes are read back while it is open
         if (f->sparse && f->resized && f->fcb != NULL) {
@@ -657,6 +674,20 @@ static uint64_t io_offset(XkFile *f, uint32_t offset_va) {
     return f->pos;
 }
 
+// A handle read from where its last read ended, on a large file nobody writes: read ahead.
+static bool ahead_wanted(const XkFile *f, uint64_t off) {
+    if (!g_ahead_on || f->kind != XK_FILE_REGULAR || f->sparse || f->can_write || f->pf == NULL ||
+        f->io_reads == 0 || off != f->io_end || physical_size(f) < XK_AHEAD_MIN) {
+        return false;
+    }
+    for (const XkFile *o = f->fcb != NULL ? f->fcb->files : NULL; o != NULL; o = o->fcb_next) {
+        if (o->can_write) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uint32_t *done) {
     *done = 0;
     if (f->kind == XK_FILE_DIRECTORY) {
@@ -674,9 +705,23 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
     }
     uint32_t n = size - off < len ? (uint32_t)(size - off) : len;
     uint64_t phys = f->kind == XK_FILE_REGULAR ? physical_size(f) : 0;
+    bool ahead = f->kind == XK_FILE_REGULAR && xk_ahead_owned(f);
     while (*done < n) {
         uint32_t chunk = n - *done < BOUNCE ? n - *done : BOUNCE;
         uint64_t at = off + *done;
+        if (ahead) {
+            uint32_t avail = 0;
+            const uint8_t *src = xk_ahead_peek(f, at, &avail);
+            if (src != NULL) {
+                chunk = n - *done < avail ? n - *done : avail;
+                wl_xb_copy_in(buf + *done, src, chunk);
+                f->io_ahead_bytes += chunk;
+                *done += chunk;
+                continue;
+            }
+            xk_ahead_close(f); // a jump, or past what it could read: the card's again
+            ahead = false;
+        }
         if (f->kind == XK_FILE_PARTITION) {
             xk_raw_read(f->partition, at, g_bounce, chunk);
         } else if (f->kind == XK_FILE_CDROM) {
@@ -693,6 +738,9 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
         }
         wl_xb_copy_in(buf + *done, g_bounce, chunk);
         *done += chunk;
+    }
+    if (!ahead && off + n < phys && ahead_wanted(f, off)) {
+        xk_ahead_open(f, f->host, off + n, phys);
     }
     if (off < phys) {
         // the whole pages filled from the file's bytes remember them: unchanged, they are read
@@ -713,6 +761,14 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
         return STATUS_ACCESS_VIOLATION;
     }
     uint32_t status = STATUS_SUCCESS;
+    // A write at the start of a file written since its last flush: the file's other bytes (and its
+    // size) reach the card first, and it then. Halo fills a Z: cache slot with its header cleared,
+    // then its body, and writes the header that makes it valid last: a power-off leaves it old or
+    // whole, never a valid header over a body the card's FAT lost.
+    bool barrier = f->kind == XK_FILE_REGULAR && off == 0 && f->unflushed != 0;
+    if (barrier) {
+        file_flush(f, false);
+    }
     if (f->kind != XK_FILE_PARTITION) {
         pages_forget(f, off, len);
     }
@@ -733,7 +789,7 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
     }
     if (f->kind == XK_FILE_REGULAR) {
         f->unflushed += *done;
-        if (f->unflushed >= XK_FLUSH_BYTES) {
+        if (barrier || f->unflushed >= XK_FLUSH_BYTES) {
             file_flush(f, false);
         }
     }
@@ -836,7 +892,12 @@ void k_NtWriteFile(void) {
 static void file_flush(XkFile *f, bool card) {
     if (f->pf != NULL) {
         if (card || XK_FLUSH_CARD) {
-            wl_platform_fs_flush(f->pf);
+            WlResult r = wl_platform_fs_flush(f->pf);
+            if (r != WL_OK && !f->flush_failed) {
+                // its size and time may stay as they were on the card
+                f->flush_failed = true;
+                WL_LOG_W(XK_TAG, "flush of %s failed: %s", f->name, wl_result_name(r));
+            }
         }
         if (f->sparse && f->resized && f->fcb != NULL) {
             fcb_sidecar_write(f->fcb, physical_size(f));
@@ -846,6 +907,7 @@ static void file_flush(XkFile *f, bool card) {
 }
 
 void wl_xk_files_flush(void) {
+    xk_ahead_close(NULL); // the read-ahead's thread off the card before it is unmounted
     for (XkFcb *c = g_fcbs; c != NULL; c = c->next) {
         for (XkFile *f = c->files; f != NULL; f = f->fcb_next) {
             if (f->unflushed != 0) {
@@ -1087,6 +1149,7 @@ void k_NtSetInformationFile(void) {
         // every handle on the file lets go of the host file while it is renamed (a FAT driver may
         // not rename an open file), and all of them follow it to its new name
         for (XkFile *o = f->fcb->files; o != NULL; o = o->fcb_next) {
+            xk_ahead_close(o); // (its own handle on the file too)
             if (o->pf != NULL) {
                 wl_xb_file_forget(o->pf, 0, UINT64_MAX);
                 wl_platform_fs_close(o->pf);
