@@ -85,6 +85,9 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
   gathered becomes a zero page (no write, and its next touch zero-fills it). A file read into guest
   memory (`wl_xb_copy_in`) overwrites whole pages: a swapped one among them forgets its slot first
   (`wl_xb_pg_discard`), so the read does not fetch from the swap file bytes it is about to replace.
+  A title that knows a buffer is dead (it writes it again before reading it) says so with
+  `wl_xb_va_discard`: its whole pages give back their frames and slots and read zero (Halo: the
+  texture cache's pages a movie or a map's copy borrowed, when they come back to the cache).
 - **File-backed pages.** The kernel's file reads (NtReadFile) tell the core which whole pages they
   filled from a file's bytes (`wl_xb_file_pages`): such a page is made clean and remembers its file
   and offset in place of a slot, so while unchanged it gives its frame back with nothing written and
