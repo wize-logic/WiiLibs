@@ -281,7 +281,9 @@ even, so its winding holds).
   `targets_written`); an image read through a format without alpha (X8R8G8B8, R5G6B5) has 1 for its
   alpha, not the EFB's. Once a title
   samples a surface it showed (a displayed picture as a texture), each finished back buffer is
-  copied out of the EFB into a target at its address too, for the next frame (not for a read of the
+  copied out of the EFB into one kept frame at its address, for the next frame: one 1.2 MB image
+  that moves to the address of the buffer last shown, not one per buffer (a read of an older
+  picture, which only more buffers than two would make, is counted as `kept_frame_misses`) (not for a read of the
   picture being drawn, which the park serves: the back buffer is a displayed surface too, and a10's
   opening kept two 1.2 MB frames and copied one out every frame that nothing read; nor is the
   picture being drawn converted from its guest memory, which holds none, before the park is whole:

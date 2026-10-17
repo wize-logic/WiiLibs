@@ -84,6 +84,8 @@ typedef struct RenderTarget {
     // resolved (0: none): a store there (the memory used again for a texture the processor fills)
     // makes the guest's texels the texture's again
     uint32_t guest_bytes, stamp;
+    // the kept frame (frame_keep): the last finished back buffer, at that buffer's address
+    bool kept;
     WlGxTarget target;
 } RenderTarget;
 
@@ -570,13 +572,30 @@ static RenderTarget *target_for(WlNv2aGx *gx, const WlNv2aSurface *s) {
 static void frame_keep(WlNv2aGx *gx) {
     uint32_t w = gx->cfg.width & ~3u, h = gx->cfg.height & ~3u;
     RenderTarget *t;
+    unsigned i;
 
     if (!gx->keep_frames || !gx->back_drawn || gx->back_phys == 0 || gx->owner != NULL) {
         return;
     }
-    t = slot_for(gx, gx->back_phys, w, h, (uint8_t)WL_GX_TEX_RGBA8);
-    if (t == NULL) {
-        return;
+    // (one kept frame, the last shown, at the address of the buffer that held it: a title reads the
+    // picture before the one it draws, and with two buffers that is the other one's; one per buffer
+    // would be a second megabyte that only a read of an older picture uses)
+    for (t = NULL, i = 0; i < TARGETS && t == NULL; i++) {
+        if (gx->targets[i].kept && gx->targets[i].memory != NULL && gx->targets[i].width == w &&
+            gx->targets[i].height == h && &gx->targets[i] != gx->owner) {
+            t = &gx->targets[i];
+        }
+    }
+    if (t != NULL) {
+        t->phys = gx->back_phys;
+        t->target.user = gx->back_phys;
+        t->used_frame = gx->frame;
+    } else {
+        t = slot_for(gx, gx->back_phys, w, h, (uint8_t)WL_GX_TEX_RGBA8);
+        if (t == NULL) {
+            return;
+        }
+        t->kept = true;
     }
     if (t->target.resident) {
         wl_gx_copy_efb_texture_again(0, 0, (int)w, (int)h, t->memory, WL_GX_TEX_RGBA8, false);
@@ -585,6 +604,7 @@ static void frame_keep(WlNv2aGx *gx) {
     }
     t->guest_bytes = w * h * 4u;
     target_image_made(gx, t);
+    gx->stats.frames_kept++;
     gx->texture_memory_changed = true;
 }
 
@@ -939,6 +959,7 @@ static const WlNv2aTexEntry *target_texture(WlNv2aGx *gx, unsigned stage, const 
             WlNv2aTexEntry *e = &gx->target_entries[stage];
 
             r->used_frame = gx->frame; // (read: in use, targets_idle)
+            gx->stats.kept_frame_reads += r->kept ? 1u : 0u;
             memset(e, 0, sizeof *e);
             e->phys = r->phys;
             e->image = r->memory;
@@ -999,6 +1020,12 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
                            t.min_filter <= WL_NV2A_FILTER_LINEAR_MIP_LINEAR;
 
             display_read(gx, t.phys);
+            if (gx->stats.frames_kept != 0 && is_display(gx, t.phys) && !reads_picture_drawn(gx, t.phys) &&
+                gx->stats.kept_frame_misses++ == 0) {
+                // (a picture older than the kept frame, the last shown: its guest memory holds none)
+                WL_LOG_W(TAG, "a displayed surface (%08x) is read that the kept frame (the last shown) is not",
+                         (unsigned)t.phys);
+            }
             if (reads_picture_drawn(gx, t.phys)) {
                 // (the picture being drawn is in the EFB, its guest memory holds none: not
                 // converted into the arena, a megabyte the frame's textures need, before the park
