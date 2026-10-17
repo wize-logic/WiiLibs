@@ -6,7 +6,8 @@
 // pages, a file read over swapped pages does not read them back first, pages a file read filled
 // whole go for nothing and come back from the file until they change or the file does, both EAs of
 // a page see one page whatever happened to its frame, pinned pages keep theirs, relocations and
-// frees carry the paging state, accesses across two pages and copies between two buffers larger
+// frees carry the paging state, an XBE's sections stay their file's pages (at any offset in it)
+// until they change, accesses across two pages and copies between two buffers larger
 // than the pool work, a read back gives the guest lock up while the card works (another thread that
 // touches the page waits for it), devices still fault, and the write watch sees the stores to a
 // range (and only those: not reads, not a swap-out and read back) through either EA. Built twice:
@@ -29,6 +30,7 @@
 #include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/thread.h"
+#include "wl/xboxrt/xbe.h"
 
 #define FRAMES 64u
 #define PAGE WL_XB_PAGE
@@ -691,6 +693,87 @@ TEST file_pages_forget_their_file(void) {
     ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
     PASS();
 }
+
+static WlResult xbe_read(void *user, uint32_t offset, void *dst, uint32_t n) {
+    return wl_platform_fs_read_at(user, offset, dst, n);
+}
+
+// Whether the guest page at `va` holds the file's bytes at `at`.
+static bool page_is_file(uint32_t va, WlPlatformFile *f, uint64_t at) {
+    static uint8_t want[PAGE], got[PAGE];
+    if (wl_platform_fs_read_at(f, at, want, PAGE) != WL_OK) {
+        return false;
+    }
+    wl_xb_copy_out(got, va, PAGE);
+    return memcmp(want, got, PAGE) == 0;
+}
+
+TEST xbe_sections_stay_file_pages(void) {
+    up();
+    // an image larger than the pool: a section aligned in the file and in memory, and one whose
+    // address is not page-aligned (its whole pages lie at offsets inside the file's pages), with
+    // a zero tail
+    const uint32_t base = 0x00010000u, text = 64u, data = 32u;
+    WlPlatformFile *f = pattern_file("sd:/image.xbe", 1u + text + data + 1u, 23);
+    ASSERT(f != NULL);
+    static WlXbe x;
+    memset(&x, 0, sizeof x);
+    x.base = base;
+    x.headers_size = 0x800u;
+    x.image_size = (2u + text + data + 3u) * PAGE;
+    x.section_count = 2;
+    snprintf(x.sections[0].name, sizeof x.sections[0].name, ".text");
+    x.sections[0].flags = WL_XBE_SEC_EXECUTABLE;
+    x.sections[0].va = base + PAGE;
+    x.sections[0].vsize = x.sections[0].raw_size = text * PAGE;
+    x.sections[0].raw_offset = PAGE;
+    snprintf(x.sections[1].name, sizeof x.sections[1].name, ".data");
+    x.sections[1].flags = WL_XBE_SEC_WRITABLE;
+    x.sections[1].va = base + (1u + text) * PAGE + 0x800u;
+    x.sections[1].raw_size = data * PAGE;
+    x.sections[1].vsize = (data + 2u) * PAGE;
+    x.sections[1].raw_offset = (1u + text) * PAGE;
+    WlXbMemStats a = stats();
+    ASSERT_EQ(WL_OK, wl_xbe_load_backed(&x, xbe_read, f, f));
+    WlXbMemStats b = stats();
+    // every whole page of the sections' bytes: .text's 64, .data's 31 (its first and last are shared)
+    ASSERT_EQ(text + data - 1u, b.file_copies - a.file_copies);
+    const uint32_t d0 = x.sections[1].va + 0x800u;
+    const uint64_t o0 = x.sections[1].raw_offset + 0x800u;
+    // the pool read through twice: each page comes back from the file and goes with nothing written
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        for (uint32_t i = 0; i < text; i++) {
+            ASSERT(page_is_file(x.sections[0].va + i * PAGE, f, PAGE + (uint64_t)i * PAGE));
+        }
+        for (uint32_t i = 0; i + 1u < data; i++) {
+            ASSERT(page_is_file(d0 + i * PAGE, f, o0 + (uint64_t)i * PAGE));
+        }
+    }
+    WlXbMemStats c = stats();
+    ASSERT_EQ(0u, c.swap_outs - b.swap_outs);
+    ASSERT_EQ(0u, c.swap_ins - b.swap_ins);
+    ASSERT((c.file_ins + c.file_ahead) - (b.file_ins + b.file_ahead) >= text + data - 1u - FRAMES);
+    ASSERT(c.file_evictions > b.file_evictions);
+    ASSERT_EQ(0u, wl_xb_rd32(x.sections[1].va + (data + 1u) * PAGE)); // the zero tail
+    // a store (a title patch, a thunk): that page is no longer the file's, and keeps its bytes
+    wl_xb_wr32(x.sections[0].va + 7u * PAGE + 12u, 0xC0DEu);
+    wl_xb_wr32(d0 + 3u * PAGE + 4u, 0xDA7Au);
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        for (uint32_t i = 0; i < text; i++) {
+            ASSERT_EQ(i == 7u, !page_is_file(x.sections[0].va + i * PAGE, f, PAGE + (uint64_t)i * PAGE));
+        }
+        for (uint32_t i = 0; i + 1u < data; i++) {
+            ASSERT_EQ(i == 3u, !page_is_file(d0 + i * PAGE, f, o0 + (uint64_t)i * PAGE));
+        }
+    }
+    ASSERT_EQ(0xC0DEu, wl_xb_rd32(x.sections[0].va + 7u * PAGE + 12u));
+    ASSERT_EQ(0xDA7Au, wl_xb_rd32(d0 + 3u * PAGE + 4u));
+    ASSERT_EQ(WL_OK, wl_xb_va_release(base, NULL));
+    ASSERT_EQ(WL_OK, wl_xb_file_forget(f, 0, UINT64_MAX));
+    wl_platform_fs_close(f);
+    wl_platform_fs_remove("sd:/image.xbe");
+    PASS();
+}
 #endif
 
 TEST across_pages_and_big_copies(void) {
@@ -888,6 +971,7 @@ SUITE(paging) {
     RUN_TEST(file_reads_spare_swap_ins);
     RUN_TEST(file_pages_need_no_swap_out);
     RUN_TEST(file_pages_forget_their_file);
+    RUN_TEST(xbe_sections_stay_file_pages);
     RUN_TEST(across_pages_and_big_copies);
     RUN_TEST(files_written_from_paged_out_memory);
     RUN_TEST(read_back_gives_the_lock_up); // (last: the boot thread becomes a guest thread)
