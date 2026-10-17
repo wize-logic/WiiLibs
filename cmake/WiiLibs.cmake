@@ -275,8 +275,8 @@ endfunction()
 # lift to C. Its output stays in the build tree (${CMAKE_CURRENT_BINARY_DIR}/<target>_recomp/:
 # derived from the title's code, never commit it); each stage reruns only when its inputs change.
 # The C is compiled into the object library <target>_code with the flags it needs
-# (-ffp-contract=off -fno-strict-aliasing -w, OPT, default -Os; on the Wii -msdata=eabi and
-# WL_XB_EA_BASE_ZERO) against WiiLibs' big-endian runtime header (wl/xboxrt/recomp/recomp_types.h,
+# (-ffp-contract=off -fno-strict-aliasing -w, OPT, default -Os; on the Wii -msdata=eabi,
+# WL_XB_EA_BASE_ZERO and no unwind tables) against WiiLibs' big-endian runtime header (wl/xboxrt/recomp/recomp_types.h,
 # README.md there lists the symbols a runtime must define). Then the executable <target>: SOURCES
 # (the title project's own code: hand-written overrides, data) plus the generated code, linked with
 # RUNTIME (default WiiLibs::xboxrt). On the Wii it also gets its .dol (ogc_create_dol).
@@ -420,6 +420,9 @@ function(wl_add_xbox_title target)
         # globals are reached through r13 (devkitPPC's crt0 sets it; libogc's own code uses data)
         target_compile_definitions(${target}_code PUBLIC WL_XB_EA_BASE_ZERO)
         target_compile_options(${target}_code PRIVATE -msdata=eabi)
+        # no unwind tables: C on the Wii never unwinds (backtraces follow the stack's back chain), and
+        # devkitPPC's GCC otherwise puts .eh_frame in the DOL (492 KB of MEM1 for Halo, .eh_frame and its index)
+        target_compile_options(${target}_code PRIVATE -fno-asynchronous-unwind-tables -fno-unwind-tables)
     endif()
     if(A_NO_EXECUTABLE)
         return()
@@ -440,6 +443,9 @@ function(wl_add_xbox_title target)
             "RUNTIME was given; the link needs the runtime ABI from SOURCES")
     endif()
     target_link_libraries(${target} PRIVATE m)
+    if(WL_PLATFORM STREQUAL "wii")
+        target_compile_options(${target} PRIVATE -fno-asynchronous-unwind-tables -fno-unwind-tables)
+    endif()
     wl_gfx_wrap_sqrtf(${target})
     wl_gfx_wrap_sqrt(${target})
     # the title's vertex programs compiled ahead of time
