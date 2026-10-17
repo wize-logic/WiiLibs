@@ -181,6 +181,7 @@ void wl_nv2a_draw_fetch_some(const WlNv2aDraw *draw, const WlNv2aKelvin *k, uint
 // values (the same for every vertex: wl_nv2a_fetch_constants writes them). wl_nv2a_fetch_vertex then
 // gives what wl_nv2a_draw_fetch_some gives, to the bit, for the streamed ones (an immediate vertex's
 // registers all copied).
+enum { WL_NV2A_PREFETCH_AREAS = 2 };
 typedef struct WlNv2aFetchPlan {
     uint8_t source; // WL_NV2A_SOURCE_*
     uint8_t count;  // streamed attributes
@@ -193,8 +194,50 @@ typedef struct WlNv2aFetchPlan {
     uint32_t constants; // the current values' attributes
     const uint32_t *indices;
     uint32_t index_base;
+    // (the arrays' bytes a vertex reads, for wl_nv2a_fetch_prefetch: the streamed attributes of one
+    // stride whose bytes lie within one stride of each other taken together, WL_NV2A_PREFETCH_AREAS at
+    // most; `last` the offset of the last byte from data)
+    uint8_t prefetch_count;
+    struct {
+        const uint8_t *data;
+        uint32_t stride, last;
+    } prefetch[WL_NV2A_PREFETCH_AREAS];
 } WlNv2aFetchPlan;
 void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetchPlan *plan);
+
+// Broadway does not prefetch by itself, and the guest's vertex data and push buffer are first read
+// where they are used: a miss for each 32-byte line. The vertex path asks for the lines ahead with
+// dcbt (a hint: no fault on an address not mapped, and no change to what is read). PowerPC only; the
+// host's build has none of it. wl_nv2a_set_prefetch(false) (the title folder's file "noprefetch",
+// the replay's --no-prefetch) leaves them out, for an A/B on the console.
+#if defined(__powerpc__) || defined(__PPC__)
+#define WL_NV2A_PREFETCHES 1
+// (in asm: GCC removes a loop of __builtin_prefetch alone as having no effect)
+#define WL_NV2A_PREFETCH(p) __asm__ volatile("dcbt 0,%0" : : "r"((const void *)(p)))
+#else
+#define WL_NV2A_PREFETCHES 0
+#define WL_NV2A_PREFETCH(p) ((void)(p))
+#endif
+enum {
+    WL_NV2A_CACHE_LINE = 32,
+    WL_NV2A_PUSH_AHEAD = 4 * WL_NV2A_CACHE_LINE // the push buffer's bytes asked for ahead of its reads
+};
+extern bool wl_nv2a_prefetch_on;
+void wl_nv2a_set_prefetch(bool on);
+static inline bool wl_nv2a_prefetching(void) {
+    return WL_NV2A_PREFETCHES && wl_nv2a_prefetch_on;
+}
+// the lines of element `element`'s streamed bytes asked for (a vertex's element: wl_nv2a_fetch_element's)
+static inline void wl_nv2a_fetch_prefetch(const WlNv2aFetchPlan *plan, uint32_t element) {
+    unsigned a;
+
+    for (a = 0; a < plan->prefetch_count; a++) {
+        const uint8_t *data = plan->prefetch[a].data + (size_t)element * plan->prefetch[a].stride;
+
+        WL_NV2A_PREFETCH(data);
+        WL_NV2A_PREFETCH(data + plan->prefetch[a].last);
+    }
+}
 // the current values' attributes into each of `count` input register sets
 void wl_nv2a_fetch_constants(const WlNv2aFetchPlan *plan, const WlNv2aKelvin *k, float (*inputs)[WL_NV2A_ATTRIBS][4],
                              unsigned count);

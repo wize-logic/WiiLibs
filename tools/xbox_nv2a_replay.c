@@ -41,6 +41,8 @@
 //               counted either way
 //   --no-xf-light  a colour affine in one input (a light's dot product) made by the processor, not
 //               lit by GX's transform unit (WlNv2aGxConfig.no_xf_light)
+//   --no-prefetch  no dcbt ahead of the guest's vertex data and push buffer (wl_nv2a_set_prefetch; a
+//               PowerPC build's only)
 //   --no-fused  the processor's vertices made the general way, never by a program's fused batch
 //               (WlNv2aGxConfig.no_fused)
 //   --fused-forms  the forms of the draws whose batches could run fused, each with the program's hash
@@ -1191,7 +1193,7 @@ static void fused_seen(void *user, unsigned long hash, const WlXboxVshFusedKey *
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] [--gx-dump-all] [--gx-scan] "
                     "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] [--model-only] [--xf-programs] "
-                    "[--stream] [--cpu-transform] [--no-fused] [--fused-forms] [--no-xf-light] [--overlap] [--png-alpha] [--survey]\n");
+                    "[--stream] [--cpu-transform] [--no-fused] [--no-prefetch] [--fused-forms] [--no-xf-light] [--overlap] [--png-alpha] [--survey]\n");
     return 2;
 }
 
@@ -1266,6 +1268,8 @@ int main(int argc, char **argv) {
             g_gcfg.no_xf_light = true;
         } else if (strcmp(argv[i], "--no-fused") == 0) {
             g_gcfg.no_fused = true;
+        } else if (strcmp(argv[i], "--no-prefetch") == 0) {
+            wl_nv2a_set_prefetch(false);
         } else if (strcmp(argv[i], "--fused-forms") == 0) {
             g_fused_forms = true;
             g_gcfg.fused_seen = fused_seen;

@@ -1154,6 +1154,20 @@ static float fit_error(float a, float b, const float *inverse_w, const float *de
     return worst;
 }
 
+// the guest's bytes of the draw's vertices first .. first + count - 1 (those in the draw) asked for
+// ahead of their fetch (wl_nv2a_fetch_prefetch): a batch ahead, a miss each line otherwise
+static void draw_prefetch(const WlNv2aFetchPlan *fetch, const WlNv2aDraw *draw, uint32_t first, uint32_t count) {
+    uint32_t v, end;
+
+    if (!wl_nv2a_prefetching() || fetch->prefetch_count == 0 || first >= draw->count) {
+        return;
+    }
+    end = draw->count - first < count ? draw->count : first + count;
+    for (v = first; v < end; v++) {
+        wl_nv2a_fetch_prefetch(fetch, wl_nv2a_fetch_element(fetch, v));
+    }
+}
+
 // The projection of a draw: a few of its vertices, for their w and depth (OpenCE-Wii's
 // projection_fit). A program that captures its clip-space position (divides by w) is drawn through
 // the perspective projection, its depth a + b / w; vertices all at w 1 are screen space.
@@ -1194,11 +1208,14 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
     // (the fetch decided once for the draw, as the draw's own: wl_nv2a_draw_fetch_some's values)
     wl_nv2a_fetch_plan(draw, attributes, &fetch);
     wl_nv2a_fetch_constants(&fetch, k, gx->batch.inputs, FIT_BATCH);
+    draw_prefetch(&fetch, draw, 0, probes < FIT_BATCH ? probes : FIT_BATCH);
     for (v = 0; v < probes && n < FIT_PROBES && !enough; v += run) {
         run = probes - v < FIT_BATCH ? probes - v : FIT_BATCH;
         for (i = 0; i < run; i++) {
             numbers[i] = v + i;
         }
+        // (the next run's positions asked for while this one's are fetched and run)
+        draw_prefetch(&fetch, draw, v + run, probes - v - run < FIT_BATCH ? probes - v - run : FIT_BATCH);
         wl_nv2a_fetch_vertices(&fetch, draw, numbers, run, gx->batch.inputs);
         wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, run,
                                   WL_XBOX_VSH_LIVE_POSITION, outputs, &gx->batch.work);
@@ -2637,6 +2654,9 @@ static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2
 
         if (n == 0) {
             first = v;
+            // (this batch's vertices when it is the first, and the next batch's, asked for ahead)
+            draw_prefetch(&gx->fetch, draw, v == 0 ? 0 : v + WL_XBOX_VSH_BATCH,
+                          v == 0 ? 2u * WL_XBOX_VSH_BATCH : WL_XBOX_VSH_BATCH);
             vertices_make(gx, k, draw, v, draw->count - v < WL_XBOX_VSH_BATCH ? draw->count - v : WL_XBOX_VSH_BATCH,
                           &plan, NULL);
         }
@@ -2973,6 +2993,8 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
                                    : wl_nv2a_pipeline_inputs(&gx->pipeline, plan.live) | 1u;
     wl_nv2a_fetch_plan(draw, attributes, &gx->fetch);
     wl_nv2a_fetch_constants(&gx->fetch, k, gx->batch.inputs, WL_XBOX_VSH_BATCH);
+    // (the first two batches' vertices asked for, then each batch the next one's: wl_nv2a_fetch_prefetch)
+    draw_prefetch(&gx->fetch, draw, 0, 2u * WL_XBOX_VSH_BATCH);
     // (the first batch, which finds the projective coordinates GX is to divide at each pixel)
     if (draw->count != 0 &&
         vertices_make(gx, k, draw, 0, draw->count < WL_XBOX_VSH_BATCH ? draw->count : WL_XBOX_VSH_BATCH, &plan,
@@ -2983,6 +3005,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     for (first = 0; first < draw->count; first += run) {
         run = draw->count - first < WL_XBOX_VSH_BATCH ? draw->count - first : WL_XBOX_VSH_BATCH;
         if (first != 0) {
+            draw_prefetch(&gx->fetch, draw, first + WL_XBOX_VSH_BATCH, WL_XBOX_VSH_BATCH);
             vertices_make(gx, k, draw, first, run, &plan, NULL);
         }
         // (the batch's vertices into the FIFO in one call)
