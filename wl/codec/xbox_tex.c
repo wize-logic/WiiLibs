@@ -449,12 +449,13 @@ void wl_xbox_dxt_alpha_block(WlXboxFormat dxt, const uint8_t block[8], uint8_t a
         pal[6] = 0;
         pal[7] = 255;
     }
-    uint64_t bits = 0;
-    for (int k = 0; k < 6; k++) {
-        bits |= (uint64_t)block[2 + k] << (8 * k);
-    }
-    for (int i = 0; i < 16; i++) {
-        alpha[i] = (uint8_t)pal[(bits >> (3 * i)) & 7u];
+    // (the 48 index bits as two halves of eight texels, 24 bits each: no 64-bit shifts)
+    for (int half = 0; half < 2; half++) {
+        const uint8_t *p = block + 2 + 3 * half;
+        uint32_t bits = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+        for (int i = 0; i < 8; i++) {
+            alpha[8 * half + i] = (uint8_t)pal[(bits >> (3 * i)) & 7u];
+        }
     }
 }
 
@@ -469,6 +470,31 @@ size_t wl_xbox_dxt_alpha_i4(WlXboxFormat dxt, const void *src, size_t src_len, u
     uint32_t cols = (w + 3u) / 4u;
     uint32_t rows = (h + 3u) / 4u;
     uint32_t tiles_x = (w + 7u) / 8u;
+    if ((w & 3u) == 0 && (h & 3u) == 0) {
+        // Whole blocks: a block's row of four is two bytes of its I4 tile's row (the tile's quarter
+        // (bx & 1, by & 1)). DXT3's alpha nibbles are already four bits: each byte's two swapped
+        // (S3TC puts the first texel in the low nibble, I4 in the high).
+        for (uint32_t by = 0; by < rows; by++) {
+            for (uint32_t bx = 0; bx < cols; bx++) {
+                const uint8_t *block = in + ((size_t)by * cols + bx) * 16u;
+                uint8_t *o = out + ((size_t)(by >> 1) * tiles_x + (bx >> 1)) * 32u + (by & 1u) * 16u + (bx & 1u) * 2u;
+                if (dxt == WL_XBOX_DXT3) {
+                    for (uint32_t r = 0; r < 4; r++) {
+                        o[r * 4u] = (uint8_t)(block[r * 2u] << 4 | block[r * 2u] >> 4);
+                        o[r * 4u + 1u] = (uint8_t)(block[r * 2u + 1u] << 4 | block[r * 2u + 1u] >> 4);
+                    }
+                } else {
+                    uint8_t a[16];
+                    wl_xbox_dxt_alpha_block(dxt, block, a);
+                    for (uint32_t r = 0; r < 4; r++) {
+                        o[r * 4u] = (uint8_t)((a[r * 4u] & 0xF0u) | a[r * 4u + 1u] >> 4);
+                        o[r * 4u + 1u] = (uint8_t)((a[r * 4u + 2u] & 0xF0u) | a[r * 4u + 3u] >> 4);
+                    }
+                }
+            }
+        }
+        return total;
+    }
     for (uint32_t by = 0; by < rows; by++) {
         for (uint32_t bx = 0; bx < cols; bx++) {
             uint8_t a[16];
