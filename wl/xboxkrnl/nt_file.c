@@ -73,6 +73,8 @@ static uint8_t *g_bounce;
 static bool g_ahead_on;
 static char g_data_dir[192];
 static uint32_t g_files_open;
+// The title has left (wl_xk_files_stop): no transfer reaches the card again. Under the card's lock.
+static bool g_card_stopped;
 
 void xk_files_open_add(int delta) {
     g_files_open += (uint32_t)delta;
@@ -105,6 +107,9 @@ void xk_files_init(const WlXkConfig *cfg) {
     snprintf(g_data_dir, sizeof g_data_dir, "%s", cfg->data_dir);
     g_ahead_on = !cfg->no_read_ahead;
     xk_ahead_close(NULL);
+    wl_xb_card_lock();
+    g_card_stopped = false;
+    wl_xb_card_unlock();
     xk_paths_init(cfg);
 }
 
@@ -158,6 +163,8 @@ struct XkFcb {
     XkFile *files;    // ... linked by fcb_next
     bool delete_pending;
     bool no_sidecar;  // known to have none on disk (a removal would only cost a path walk on libfat)
+    uint32_t changes; // counts fcb_pages_forget: a read outside the guest lock remembers no pages of a
+                      // file that changed meanwhile
     XkFcb *next;
 };
 
@@ -323,8 +330,12 @@ void xk_raw_write(uint32_t partition, uint64_t offset, const uint8_t *src, uint3
 
 // Guest pages a read filled from a file remember its bytes (wl_xb_file_pages): before the bytes
 // [off, off + len) of the file `c` names change, every handle's pages over them forget them (and a
-// read-ahead of the file ends).
-static void fcb_pages_forget(const XkFcb *c, uint64_t off, uint64_t len) {
+// read-ahead of the file ends). A read whose card part ran outside the guest lock meanwhile sees the
+// change in c->changes and remembers nothing.
+static void fcb_pages_forget(XkFcb *c, uint64_t off, uint64_t len) {
+    if (c != NULL) {
+        c->changes++;
+    }
     for (const XkFile *o = c != NULL ? c->files : NULL; o != NULL; o = o->fcb_next) {
         xk_ahead_close(o);
         if (o->pf != NULL) {
@@ -349,6 +360,7 @@ void wl_xk_file_changed(const char *host) {
     }
     WL_LOG_I(XK_TAG, "changed outside the kernel: %s (%s)", host, c != NULL ? "open" : "not open");
     fcb_pages_forget(c, 0, UINT64_MAX);
+    xk_ahead_settle(); // (the read-ahead's handle on it closed: it may be replaced)
 }
 
 // A handle's I/O so far, in the log: how a load reads and writes (sizes, jumps, the card's time).
@@ -427,6 +439,7 @@ void xk_file_close(XkFile *f) {
         }
         if (--c->opens == 0) {
             if (c->delete_pending) {
+                xk_ahead_settle(); // (a read-ahead of it closed with its handle: off the file first)
                 if (f->kind == XK_FILE_DIRECTORY) {
                     wl_platform_fs_rmdir(c->host);
                 } else {
@@ -581,6 +594,7 @@ static uint32_t open_file(uint32_t handle_out, uint32_t access, uint32_t oa, uin
             }
             if (truncate) {
                 fcb_pages_forget(fcb_find(f->host), 0, UINT64_MAX); // its other handles' pages
+                xk_ahead_settle(); // (and the read-ahead's handle on it, closed)
             }
             WlResult pr = wl_platform_fs_open(f->host, mode, &f->pf);
             if (pr == WL_OK && mode == WL_FILE_WRITE_NEW) {
@@ -707,8 +721,9 @@ static uint32_t card_read(XkFile *f, uint64_t at, uint8_t *dst, uint32_t len, ui
             uint64_t left = phys - (at + done);
             uint32_t want = left < chunk ? (uint32_t)left : chunk;
             wl_xb_card_lock();
-            WlResult r = f->pf != NULL ? wl_platform_fs_read_some_at(f->pf, at + done, dst + done, want, &got)
-                                       : WL_ERR_STATE; // (renamed meanwhile: its handle let go)
+            WlResult r = g_card_stopped ? WL_ERR_STATE // (the title left meanwhile: the card is going)
+                         : f->pf != NULL ? wl_platform_fs_read_some_at(f->pf, at + done, dst + done, want, &got)
+                                         : WL_ERR_STATE; // (its reopen after a rename failed)
             wl_xb_card_unlock();
             if (r != WL_OK) {
                 return done;
@@ -725,7 +740,9 @@ static bool card_write(XkFile *f, uint64_t at, const uint8_t *src, uint32_t len)
     for (uint32_t done = 0; done < len;) {
         uint32_t chunk = len - done < BOUNCE ? len - done : BOUNCE;
         wl_xb_card_lock();
-        WlResult r = f->pf != NULL ? wl_platform_fs_write_at(f->pf, at + done, src + done, chunk) : WL_ERR_STATE;
+        WlResult r = g_card_stopped ? WL_ERR_STATE // (the title left meanwhile: the card is going)
+                     : f->pf != NULL ? wl_platform_fs_write_at(f->pf, at + done, src + done, chunk)
+                                     : WL_ERR_STATE;
         wl_xb_card_unlock();
         if (r != WL_OK) {
             return false;
@@ -780,15 +797,15 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
     }
     uint32_t n = size - off < len ? (uint32_t)(size - off) : len;
     uint64_t phys = f->kind == XK_FILE_REGULAR ? physical_size(f) : 0;
+    uint32_t changes = f->fcb != NULL ? f->fcb->changes : 0u;
     bool ahead = f->kind == XK_FILE_REGULAR && xk_ahead_owned(f);
-    uint32_t cap, status = STATUS_SUCCESS;
-    bool span;
-    uint8_t *io = io_buffer(f, off < phys ? n : 0u, &cap, &span);
+    uint32_t cap = 0, status = STATUS_SUCCESS;
+    bool span = false;
+    uint8_t *io = NULL; // made at the card's first part (none when the read-ahead serves it all)
     while (*done < n) {
-        uint32_t chunk = n - *done < cap ? n - *done : cap;
         uint64_t at = off + *done;
         if (ahead) {
-            uint32_t avail = 0;
+            uint32_t chunk, avail = 0;
             const uint8_t *src = xk_ahead_peek(f, at, &avail);
             if (src != NULL) {
                 chunk = n - *done < avail ? n - *done : avail;
@@ -800,6 +817,10 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
             xk_ahead_close(f); // a jump, or past what it could read: the card's again
             ahead = false;
         }
+        if (io == NULL) {
+            io = io_buffer(f, off < phys ? n - *done : 0u, &cap, &span);
+        }
+        uint32_t chunk = n - *done < cap ? n - *done : cap;
         uint32_t got = chunk;
         if (f->kind == XK_FILE_PARTITION) {
             xk_raw_read(f->partition, at, io, chunk);
@@ -823,13 +844,14 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
     if (*done < n) {
         return status;
     }
-    if (!ahead && off + n < phys && ahead_wanted(f, off)) {
-        xk_ahead_open(f, f->host, off + n, phys);
-    }
-    if (off < phys) {
+    if (off < phys && f->pf != NULL && (f->fcb == NULL || f->fcb->changes == changes)) {
         // the whole pages filled from the file's bytes remember them: unchanged, they are read
-        // from it again rather than written to the swap file
+        // from it again rather than written to the swap file (not when another thread changed the
+        // file while this one read it outside the guest lock: the bytes read may be the old ones)
         wl_xb_file_pages(buf, phys - off < n ? (uint32_t)(phys - off) : n, f->pf, off);
+    }
+    if (!ahead && off + n < phys && ahead_wanted(f, off)) {
+        xk_ahead_open(f, f->host, off + n, phys); // (it may give the guest lock up: last)
     }
     return STATUS_SUCCESS;
 }
@@ -892,38 +914,37 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
 }
 
 // Before an I/O is dispatched: the caller's event and the file object's are cleared, as NT does, so
-// a request that then fails leaves both non-signalled.
-static void begin_io(uint32_t handle, uint32_t event) {
-    uint32_t file_body = xk_handle_waitable(handle);
-    if (file_body != 0) {
-        xk_event_reset(file_body);
+// a request that then fails leaves both non-signalled. The event's object, referenced (NULL: none):
+// complete_io signals it, not what its handle names by then (the card's part runs outside the guest
+// lock, and a handle closed meanwhile may be given to a new object).
+static XkObject *begin_io(XkObject *file, uint32_t event) {
+    if (file->body != 0) {
+        xk_event_reset(file->body);
     }
-    if (event != 0) {
-        uint32_t ev = xk_handle_waitable(event);
-        if (ev != 0) {
-            xk_event_reset(ev);
+    XkObject *eo = event != 0 ? xk_handle_get(event) : NULL;
+    if (eo != NULL) {
+        xk_object_reference(eo);
+        if (eo->body != 0) {
+            xk_event_reset(eo->body);
         }
     }
+    return eo;
 }
 
 // After an I/O: the status block, the event, the file object, the APC (overlapped handles). An error
 // (an NT_ERROR status, STATUS_END_OF_FILE among them) is returned alone: NT sets none of them for a
 // request that fails before it is pending (begin_io cleared the events).
-static uint32_t complete_io(XkFile *f, uint32_t handle, uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb,
+static uint32_t complete_io(XkFile *f, XkObject *file, XkObject *event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb,
                             uint32_t status, uint32_t done) {
     if (NT_ERROR(status)) {
         return status;
     }
     xk_iosb(iosb, status, done);
-    uint32_t file_body = xk_handle_waitable(handle);
-    if (file_body != 0) {
-        xk_event_set(file_body);
+    if (file->body != 0) {
+        xk_event_set(file->body);
     }
-    if (event != 0) {
-        uint32_t ev = xk_handle_waitable(event);
-        if (ev != 0) {
-            xk_event_set(ev);
-        }
+    if (event != NULL && event->body != 0) {
+        xk_event_set(event->body);
     }
     if (apc != 0 && !f->synchronous) {
         xk_apc_queue(wl_xb_current(), apc, apc_ctx, iosb, 0);
@@ -934,32 +955,26 @@ static uint32_t complete_io(XkFile *f, uint32_t handle, uint32_t event, uint32_t
     return status;
 }
 
-// NTSTATUS NtReadFile(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
-//     PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset)
-void k_NtReadFile(void) {
-    uint32_t handle = ARG(0);
-    XkObject *o = xk_handle_get_type(handle, XK_OBJ_FILE);
-    XkFile *f = o != NULL ? o->file : NULL;
-    if (f == NULL) {
-        RET(STATUS_INVALID_HANDLE);
+// A synchronous handle's requests take turns, as NT's file object lock makes them: its position is
+// read and moved by one at a time. Only a request outside the guest lock (the card's part) can be
+// found under way; the next one waits for it with the lock given up (unless it cannot give it up).
+static void io_turn_take(XkFile *f) {
+    if (!f->synchronous) {
         return;
     }
-    xk_object_reference(o); // the file stays while the card's part runs outside the guest lock (do_read)
-    begin_io(handle, ARG(1));
-    uint64_t off = io_offset(f, ARG(7));
-    uint32_t done = 0;
-    uint64_t t0 = wl_platform_time_us();
-    uint32_t status = do_read(f, off, ARG(5), ARG(6), &done);
-    if (NT_SUCCESS(status)) {
-        f->pos = off + done;
-        io_note(f, false, off, done, wl_platform_time_us() - t0);
+    while (f->io_busy) {
+        WlXbThread *self = wl_xb_block_begin();
+        if (self == NULL) {
+            break; // (it cannot wait: it goes alongside, as before)
+        }
+        wl_platform_thread_sleep_ms(1);
+        wl_xb_block_end(self);
     }
-    RET(complete_io(f, handle, ARG(1), ARG(2), ARG(3), ARG(4), status, done));
-    xk_object_release(o);
+    f->io_busy = true;
 }
 
-// NTSTATUS NtWriteFile(...the same arguments...)
-void k_NtWriteFile(void) {
+// NtReadFile and NtWriteFile.
+static void file_io(bool write) {
     uint32_t handle = ARG(0);
     XkObject *o = xk_handle_get_type(handle, XK_OBJ_FILE);
     XkFile *f = o != NULL ? o->file : NULL;
@@ -967,24 +982,41 @@ void k_NtWriteFile(void) {
         RET(STATUS_INVALID_HANDLE);
         return;
     }
-    if (f->kind != XK_FILE_DIRECTORY && f->kind != XK_FILE_CDROM && !f->can_write) {
+    if (write && f->kind != XK_FILE_DIRECTORY && f->kind != XK_FILE_CDROM && !f->can_write) {
         // a read-only mount, or a handle opened without write access: refused with the handle,
         // before NT looks at the event
         RET(STATUS_ACCESS_DENIED);
         return;
     }
-    xk_object_reference(o); // the file stays while the card's part runs outside the guest lock (do_read)
-    begin_io(handle, ARG(1));
+    // the file and the event stay while the card's part runs outside the guest lock (do_read)
+    xk_object_reference(o);
+    XkObject *ev = begin_io(o, ARG(1));
+    io_turn_take(f);
     uint64_t off = io_offset(f, ARG(7));
     uint32_t done = 0;
     uint64_t t0 = wl_platform_time_us();
-    uint32_t status = do_write(f, off, ARG(5), ARG(6), &done);
+    uint32_t status = write ? do_write(f, off, ARG(5), ARG(6), &done) : do_read(f, off, ARG(5), ARG(6), &done);
     if (NT_SUCCESS(status)) {
         f->pos = off + done;
-        io_note(f, true, off, done, wl_platform_time_us() - t0);
+        io_note(f, write, off, done, wl_platform_time_us() - t0);
     }
-    RET(complete_io(f, handle, ARG(1), ARG(2), ARG(3), ARG(4), status, done));
+    f->io_busy = false;
+    RET(complete_io(f, o, ev, ARG(2), ARG(3), ARG(4), status, done));
+    if (ev != NULL) {
+        xk_object_release(ev);
+    }
     xk_object_release(o);
+}
+
+// NTSTATUS NtReadFile(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+//     PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset)
+void k_NtReadFile(void) {
+    file_io(false);
+}
+
+// NTSTATUS NtWriteFile(...the same arguments...)
+void k_NtWriteFile(void) {
+    file_io(true);
 }
 
 // NTSTATUS NtFlushBuffersFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock)
@@ -1005,6 +1037,15 @@ static void file_flush(XkFile *f, bool card) {
         }
     }
     f->unflushed = 0;
+}
+
+void wl_xk_files_stop(bool stop) {
+    wl_xb_card_lock(); // (a transfer outside the guest lock is between two pieces once this is held)
+    g_card_stopped = stop;
+    wl_xb_card_unlock();
+    if (stop) {
+        xk_ahead_close(NULL);
+    }
 }
 
 void wl_xk_files_flush(void) {
@@ -1248,15 +1289,22 @@ void k_NtSetInformationFile(void) {
             break;
         }
         // every handle on the file lets go of the host file while it is renamed (a FAT driver may
-        // not rename an open file), and all of them follow it to its new name
+        // not rename an open file), and all of them follow it to its new name. Another thread's read
+        // or write outside the guest lock may be on one of them: the card's lock is held from the
+        // closes to the reopens, so its next piece goes to the renamed file.
+        f->fcb->changes++;
         for (XkFile *o = f->fcb->files; o != NULL; o = o->fcb_next) {
             xk_ahead_close(o); // (its own handle on the file too)
             if (o->pf != NULL) {
-                wl_xb_file_forget(o->pf, 0, UINT64_MAX);
-                wl_xb_card_lock(); // (a read or write of another thread may be on it, outside the guest lock)
+                wl_xb_file_forget(o->pf, 0, UINT64_MAX); // (it may read the card: before the lock)
+            }
+        }
+        xk_ahead_settle();
+        wl_xb_card_lock();
+        for (XkFile *o = f->fcb->files; o != NULL; o = o->fcb_next) {
+            if (o->pf != NULL) {
                 wl_platform_fs_close(o->pf);
                 o->pf = NULL;
-                wl_xb_card_unlock();
                 g_files_open--;
             }
         }
@@ -1282,6 +1330,7 @@ void k_NtSetInformationFile(void) {
                 g_files_open++;
             }
         }
+        wl_xb_card_unlock();
         g_xk_stats.files_open = g_files_open;
         break;
     }
@@ -1599,6 +1648,7 @@ void k_NtDeleteFile(void) {
         RET(STATUS_SUCCESS);
         return;
     }
+    xk_ahead_settle(); // (a read-ahead of it, closed with its last handle, off the file)
     WlResult rr = st.is_dir ? wl_platform_fs_rmdir(r.host) : wl_platform_fs_remove(r.host);
     if (rr == WL_OK && !st.is_dir && r.mount.sparse) {
         char side[340];

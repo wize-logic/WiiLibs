@@ -104,6 +104,10 @@ bool wl_xk_file_io(uint32_t handle, WlXkFileIo *out);
 // directory entry). For the title's exit, with no guest thread running: a title keeps files open
 // for good, and leaving does not close them. A read-ahead in flight ends first.
 void wl_xk_files_flush(void);
+// The title has left (true): no file transfer reaches the card from now on. A guest thread's read or
+// write outside the guest lock stops at its next piece (failed), and the read-ahead ends: the card
+// can be flushed and unmounted under it. Before wl_xk_files_flush at the exit; false undoes it.
+void wl_xk_files_stop(bool stop);
 
 #ifdef __cplusplus
 }
