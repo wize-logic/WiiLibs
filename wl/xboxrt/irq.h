@@ -103,8 +103,15 @@ uint32_t wl_xb_tick_ms(void);
 
 typedef struct {
     uint32_t vblanks, handler_runs, polls_with_work, service_thread_runs;
+    // vertical blanks raised (each runs, up to a second's worth owed); raised while one was still
+    // pending; periods a late service thread raised at once; owed past the second's worth (lost)
+    uint32_t vblanks_raised, vblanks_merged, vblanks_skipped, vblanks_dropped;
 } WlXbServiceStats;
 void wl_xb_service_stats(WlXbServiceStats *out);
+// More lines for the status report every 10 s (the kernel's I/O numbers); called on the service
+// thread, lock not held. NULL removes it.
+typedef void (*WlXbStatusFn)(void);
+void wl_xb_service_set_status_hook(WlXbStatusFn fn);
 
 // ---- Between irq.c and thread.c: the deterministic mode (thread.h) ----------------------------
 

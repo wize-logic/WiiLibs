@@ -169,7 +169,7 @@ void wl_xb_wake(WlXbThread *t);
 // (never at DISPATCH_LEVEL or above: see wl_xb_safe_point).
 // Also runs pending interrupt work (irq.h).
 void wl_xb_yield_point(void);
-// Gives the lock up to every ready thread of equal or higher priority (NtYieldExecution); not at
+// Gives the lock up to every ready thread of equal or higher priority (a delay of 0); not at
 // DISPATCH_LEVEL or above (see wl_xb_safe_point).
 void wl_xb_yield(void);
 // A kernel call's host work that blocks (the card's reads and writes) runs outside the lock, as an
@@ -189,6 +189,9 @@ void wl_xb_card_lock(void);
 void wl_xb_card_unlock(void);
 // Whether another thread has the card's lock now (a hint: it may change at once).
 bool wl_xb_card_busy(void);
+// NtYieldExecution: gives the lock to the best ready thread whatever its priority; one below the
+// caller keeps it for a quantum (or until it waits). false when none was ready (or at DISPATCH_LEVEL).
+bool wl_xb_yield_any(void);
 
 // A safe point in the middle of guest code: what wl_xb_yield_point does (the interrupt work, with
 // the level sources asked too, then a yield when one is due), for the device-access fault paths
@@ -276,6 +279,7 @@ typedef struct {
     // is due
     uint32_t kernel_calls;
     uint32_t io_blocks; // kernel calls that gave the lock up for the card (wl_xb_block_begin)
+    uint32_t yields, yields_lower; // NtYieldExecution calls; those that gave way to a lower priority
 } WlXbThreadStats;
 void wl_xb_thread_stats(WlXbThreadStats *out);
 // What the stall watch counts as the guest moving on: hand-offs, safe points, waits, wakes,
@@ -292,6 +296,20 @@ uint32_t wl_xb_stall_watch_look(WlXbStallWatch *w, uint32_t progress);
 // (wl_xb_thread_progress plus `paging`, the paging's faults and reads), the lock's holder and every
 // thread's state are logged (once a minute while the stall lasts).
 void wl_xb_thread_stall_check(uint32_t paging);
+
+// A histogram of waits in milliseconds (counters only: an increment per sample). Bounds, ms:
+// <1 <2 <5 <10 <20 <30 <40 <60 <100 and above.
+#define WL_XB_LAT_BUCKETS 10u
+typedef struct {
+    uint32_t n[WL_XB_LAT_BUCKETS];
+    uint32_t count, max_ms;
+} WlXbLatency;
+void wl_xb_latency_add(WlXbLatency *h, uint64_t us);
+// One log line ("<what>: <count>, ms <1:a <2:b ... max M"), and the histogram starts again; nothing
+// when it is empty.
+void wl_xb_latency_log(const char *tag, const char *what, WlXbLatency *h);
+// The time guest threads spent in the ready queue (enqueued to handed the lock), since the last log.
+void wl_xb_thread_log_ready_waits(void);
 // Each guest thread's stack scanned for return addresses into the image, for a frozen title.
 void wl_xb_thread_log_guest_stacks(void);
 

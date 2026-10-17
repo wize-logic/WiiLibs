@@ -84,6 +84,10 @@ typedef struct {
     uint32_t handles, objects, files_open;
     uint32_t waits, wait_timeouts, apcs_delivered, dpcs_run, isrs_run, timers_fired;
     uint32_t pool_bytes;
+    uint32_t apcs_queued;
+    // KeDelayExecutionThread with a zero interval; of those alertable from user mode with an APC
+    // queued (the APC is delivered first, as the console does)
+    uint32_t zero_delays, zero_delays_with_apc;
 } WlXkStats;
 void wl_xk_stats(WlXkStats *out);
 // The allocation census (diagnostics; WL_XB_ALLOCS=<KB> arms it on the host at the kernel's start):

@@ -71,6 +71,11 @@ static WlXbServiceStats g_stats;
 static uint32_t g_work_esp; // the top of the service thread's guest stack: where the work runs
 static uint64_t g_det_vblank_us; // the deterministic mode: the next vertical blank (virtual clock)
 static uint64_t g_vblank_period_us;
+static WlXbStatusFn g_status_hook;
+// Vertical blanks raised and not yet run: each is an interrupt of its own (Halo's game clock counts
+// its vblank callback's calls), however late the service gets to them; at most a second's worth.
+#define VBLANKS_OWED_MAX 60u
+static volatile uint32_t g_vblanks_owed;
 
 void wl_xb_service_config_default(WlXbServiceConfig *cfg) {
     cfg->vblank_hz_milli = 59940;
@@ -210,7 +215,31 @@ static void wake_service(void) {
     }
 }
 
+// A vertical blank is raised, after `skipped` periods a late service thread did not raise: all are
+// owed (the caller sets WL_XB_SVC_VBLANK).
+static void note_vblank(uint32_t skipped) {
+    uint32_t n = 1u + skipped;
+    g_stats.vblanks_raised += n;
+    g_stats.vblanks_skipped += skipped;
+    if (g_pending & WL_XB_SVC_VBLANK) {
+        g_stats.vblanks_merged++;
+    }
+    uint32_t owed = __atomic_load_n(&g_vblanks_owed, __ATOMIC_SEQ_CST);
+    if (owed + n > VBLANKS_OWED_MAX) {
+        g_stats.vblanks_dropped += owed + n - VBLANKS_OWED_MAX;
+        n = owed < VBLANKS_OWED_MAX ? VBLANKS_OWED_MAX - owed : 0u;
+    }
+    __atomic_fetch_add(&g_vblanks_owed, n, __ATOMIC_SEQ_CST);
+}
+
+void wl_xb_service_set_status_hook(WlXbStatusFn fn) {
+    g_status_hook = fn;
+}
+
 void wl_xb_service_raise(uint32_t reasons) {
+    if (reasons & WL_XB_SVC_VBLANK) {
+        note_vblank(0);
+    }
     g_xb_attention = 1;
     g_xb_det_work = 1;
     if (g_started) {
@@ -299,6 +328,11 @@ static void run_service(void) {
             reasons |= WL_XB_SVC_TIMER;
         }
         if (reasons & WL_XB_SVC_VBLANK) {
+            // one a round: the next round (or the next service) runs the others, each its interrupt
+            if (__atomic_load_n(&g_vblanks_owed, __ATOMIC_SEQ_CST) != 0u &&
+                __atomic_sub_fetch(&g_vblanks_owed, 1u, __ATOMIC_SEQ_CST) != 0u) {
+                __atomic_fetch_or(&g_pending, WL_XB_SVC_VBLANK, __ATOMIC_SEQ_CST);
+            }
             g_stats.vblanks++;
             g_vblank_count++;
             if (g_vblank_fn != NULL) {
@@ -373,9 +407,12 @@ uint64_t wl_xb_det_service_due(uint64_t now) {
     if (g_cfg.vblank) {
         if (now >= g_det_vblank_us) {
             g_det_vblank_us += g_vblank_period_us;
+            uint32_t skipped = 0;
             if (g_det_vblank_us <= now) {
-                g_det_vblank_us = now + g_vblank_period_us; // fell behind: no burst of vblanks
+                skipped = (uint32_t)((now - g_det_vblank_us) / g_vblank_period_us + 1u);
+                g_det_vblank_us = now + g_vblank_period_us; // fell behind: the missed ones are owed
             }
+            note_vblank(skipped);
             __atomic_fetch_or(&g_pending, WL_XB_SVC_VBLANK, __ATOMIC_SEQ_CST);
             g_xb_det_work = 1;
         }
@@ -501,6 +538,18 @@ static void status_report(void) {
         WL_LOG_I(TAG, "scheduling: %u handoffs, %u yields at safe points, %u kept at a raised IRQL, %u waits",
                  (unsigned)ts.handoffs, (unsigned)ts.safe_yields, (unsigned)ts.raised_holds, (unsigned)ts.waits);
     }
+    // what the guest's frame clock lost: vertical blanks merged into a pending one, periods skipped
+    static WlXbServiceStats last;
+    WL_LOG_I(TAG, "vblanks: %u raised, %u run, %u raised while one was pending, %u late, %u dropped (10 s)",
+             (unsigned)(g_stats.vblanks_raised - last.vblanks_raised), (unsigned)(g_stats.vblanks - last.vblanks),
+             (unsigned)(g_stats.vblanks_merged - last.vblanks_merged),
+             (unsigned)(g_stats.vblanks_skipped - last.vblanks_skipped),
+             (unsigned)(g_stats.vblanks_dropped - last.vblanks_dropped));
+    last = g_stats;
+    wl_xb_thread_log_ready_waits();
+    if (g_status_hook != NULL) {
+        g_status_hook();
+    }
     if (m.frames_total != 0) {
         // demand paging: what the frames' shortage costs
         // (two lines: the Wii's log cuts a long one)
@@ -605,9 +654,12 @@ static void *service_main(void *arg) {
         }
         if (host_vblank && now >= next_vblank) {
             next_vblank += vblank_period;
+            uint32_t skipped = 0;
             if (next_vblank < now) {
-                next_vblank = now + vblank_period; // fell behind: no burst of vblanks
+                skipped = (uint32_t)((now - next_vblank) / vblank_period + 1u);
+                next_vblank = now + vblank_period; // fell behind: the missed ones are owed
             }
+            note_vblank(skipped);
             __atomic_fetch_or(&g_pending, WL_XB_SVC_VBLANK, __ATOMIC_SEQ_CST);
         }
         deadline = g_deadline;
