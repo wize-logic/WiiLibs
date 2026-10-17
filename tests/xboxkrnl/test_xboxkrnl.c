@@ -2127,6 +2127,38 @@ TEST files_pages_keep_what_was_read(void) {
     PASS();
 }
 
+// A thread's own KPCR page read back from the swap file (paged): its touch keeps the lock, since the
+// lock's give-up reads the IRQL there (a read in transit would wait for itself: the paging test hung
+// so under load, about one run in twelve, when a new thread's first look at its KPCR came after
+// another test had sent that page out).
+TEST own_kpcr_page_comes_back_from_swap(void) {
+    boot();
+    ASSERT(g_ready);
+#if !defined(WL_XK_TEST_PAGING)
+    SKIPm("not paged");
+#else
+    reset_scratch();
+    const WlXbThread *self = wl_xb_current();
+    ASSERT(self != NULL && self->kpcr != 0);
+    // fresh pages written over the frames three times: the clock goes round and sends the KPCR out
+    const uint32_t pages = 3u * PAGED_FRAMES;
+    uint32_t buf = 0;
+    ASSERT_EQ(WL_OK, wl_xb_va_alloc(&buf, pages * WL_XB_PAGE, 0x00400000u, WL_XB_PROT_READWRITE));
+    for (uint32_t i = 0; i < pages; i++) {
+        wl_xb_wr32(buf + i * WL_XB_PAGE, 0x4B504352u + i);
+    }
+    ASSERT(!wl_xb_mem_resident(self->kpcr));
+    WlXbMemStats m0, m1;
+    wl_xb_mem_stats(&m0);
+    ASSERT_EQ_FMT(0u, (unsigned)wl_xb_rd8(self->kpcr + 0x24u), "%u"); // Irql: PASSIVE_LEVEL
+    wl_xb_mem_stats(&m1);
+    ASSERT(m1.swap_ins > m0.swap_ins);
+    ASSERT_EQ_FMT(self->kpcr, wl_xb_rd32(self->kpcr + 0x18u), "%08x"); // NtTib.Self, as written
+    ASSERT_EQ(WL_OK, wl_xb_va_release(buf, NULL));
+    PASS();
+#endif
+}
+
 // ---- Another thread in a transfer's gap ------------------------------------------------------------
 // A read or write gives the guest lock up while the card works (card_io_gives_the_lock_up): the other
 // threads run meanwhile, and may close, rename, cut, write or leave. Here a host thread holds the
@@ -2784,6 +2816,7 @@ SUITE(kernel_suite) {
     RUN_TEST(files_delete_pending_refuses_opens);
     RUN_TEST(files_rename_moves_every_handle);
     RUN_TEST(files_pages_keep_what_was_read);
+    RUN_TEST(own_kpcr_page_comes_back_from_swap);
     RUN_TEST(files_read_ahead_waits_without_the_lock);
     RUN_TEST(files_gap_changes_forget_the_read);
     RUN_TEST(files_gap_signals_the_event_it_was_given);

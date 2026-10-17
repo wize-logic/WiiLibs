@@ -577,6 +577,17 @@ static struct {
 } g_transit[TRANSITS];
 static bool g_giving_up; // in wl_xb_block_begin for a read back (the lock holder's)
 
+// The physical page under guest VA `va`, + 1 (0: none): user space through its table, the window
+// and its tiled alias as they are.
+static uint32_t phys_page(uint32_t va) {
+    if (va < WL_XB_USER_LIMIT) {
+        return g_xb_va2phys != NULL ? g_xb_va2phys[va >> WL_XB_PAGE_SHIFT] : 0u;
+    }
+    uint32_t base = va >= WL_XB_TILED ? WL_XB_TILED : WL_XB_WINDOW;
+    uint32_t p = (va - base) >> WL_XB_PAGE_SHIFT;
+    return va >= WL_XB_WINDOW && p < g_xb_ram_pages ? p + 1u : 0u;
+}
+
 static uint32_t transit_of(uint32_t p) {
     for (uint32_t t = 0; t < TRANSITS; t++) {
         if (g_transit[t].p1 == p + 1u && !g_transit[t].ended) {
@@ -699,9 +710,12 @@ static WlResult fault(uint32_t p, uint32_t keep, bool give_up) {
     uint64_t at = file ? g_foff[p] : (uint64_t)(slot - 1u) * PAGE;
     // the card's work without the guest lock where it can be given up: the others run meanwhile
     // (not inside a kernel call or a device's emulation: their C code expects the lock throughout)
+    // (nor for the thread's own KPCR page: wl_xb_block_begin reads the IRQL there, and with the page
+    // in transit that read would wait for its own read, which comes only after it: a hang with the
+    // lock held, seen when a thread's first look at its KPCR came after that page went to swap)
     WlXbThread *cur = wl_xb_current();
-    give_up =
-        give_up && !g_giving_up && cur != NULL && cur->kernel_depth == 0 && g_xb_mmio_depth == 0;
+    give_up = give_up && !g_giving_up && cur != NULL && cur->kernel_depth == 0 &&
+              g_xb_mmio_depth == 0 && phys_page(cur->kpcr) != p + 1u;
     uint32_t t1 = 0;
     for (uint32_t t = 0; give_up && t1 == 0 && t < TRANSITS; t++) {
         if (g_transit[t].p1 == 0) {
