@@ -31,6 +31,10 @@ a little-endian one:
 - an indirect call or jump resolves its target with one call, `RECOMP_RESOLVE` (`wl_xb_lookup`),
   not three: the runtime caches the answers in front of the generated binary search;
 - `MMX_CVT_F2I` rounds independently of the host's rounding mode;
+- in code built for size (`__OPTIMIZE_SIZE__`: a title's units at -Os, not its hot unit) `PUSH32` onto
+  `g_esp` (every direct call's return address) calls one small function per unit,
+  `recomp_push32_esp`, instead of eight inline instructions: 348 KB less of Halo's DOL;
+  `RECOMP_NO_PUSH32_CALL` keeps it inline;
 - GCC only: `#error` when the compiler lacks `scalar_storage_order` (clang ignores it).
 
 The header is **generated**: `gen_recomp_types.py` patches the vendored pipeline in a scratch

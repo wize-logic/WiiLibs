@@ -1123,11 +1123,28 @@ static inline uint16_t ROR16(uint16_t val, int n) {
  * Evaluates val BEFORE decrementing sp, matching x86 semantics
  * where push [esp+N] reads the operand before adjusting ESP.
  */
-#define PUSH32(sp, val) do { \
+#define RECOMP_PUSH32_INLINE(sp, val) do { \
     uint32_t _pv = (uint32_t)(val); \
     (sp) -= 4; \
     MEM32(sp) = _pv; \
 } while(0)
+/* WiiLibs: in code built for size (-Os, the units the profile does not name hot) a push onto the
+ * guest's own esp, g_esp, is a call of recomp_push32_esp: load, decrement, store, the address
+ * transform and the byte-reversed store (about eight instructions) become one branch. Every direct
+ * call pushes its return address so, about 14,000 sites in Halo: 348 KB of the Wii's MEM1, for
+ * two branches per push run. A push onto a local copy of esp stays inline (the local is a register
+ * there). */
+#if defined(__OPTIMIZE_SIZE__) && !defined(RECOMP_NO_PUSH32_CALL)
+static __attribute__((noinline, unused)) void recomp_push32_esp(uint32_t v) {
+    RECOMP_PUSH32_INLINE(g_esp, v);
+}
+#define PUSH32(sp, val) do { \
+    if (&(sp) == &g_esp) recomp_push32_esp((uint32_t)(val)); \
+    else RECOMP_PUSH32_INLINE(sp, val); \
+} while(0)
+#else
+#define PUSH32(sp, val) RECOMP_PUSH32_INLINE(sp, val)
+#endif
 
 /**
  * x86 parity flag: 1 when the low byte of the result has an EVEN number of set
