@@ -803,6 +803,8 @@ TEST cache_keeps_smaller_for_want_of_memory(void) {
         ASSERT_EQ(1u, (unsigned)e->reduced);
     }
     wl_nv2a_texcache_frame_done(&cache);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(1u, s.frame_reduced); // (drawn smaller in the frame just finished)
     e = wl_nv2a_texcache_get(&cache, g.dev, &big, false, &made);
     ASSERT(e != NULL);
     ASSERT(made);
@@ -813,6 +815,9 @@ TEST cache_keeps_smaller_for_want_of_memory(void) {
     ASSERT_EQ(0, rgba[1]);
     wl_nv2a_texcache_stats(&cache, &s);
     ASSERT_EQ(1u, s.restored);
+    wl_nv2a_texcache_frame_done(&cache);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(0u, s.frame_reduced);
     ASSERT(s.evicted >= 1 && s.evicted <= 3);
     ASSERT_EQ(4096u + 1024u * (3u - s.evicted), (unsigned)s.bytes);
     ASSERT(wl_heap_check(&cache.heap));

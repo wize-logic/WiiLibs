@@ -172,7 +172,7 @@ void wl_nv2a_texcache_clear(WlNv2aTexCache *cache) {
 
 void wl_nv2a_texcache_frame_done(WlNv2aTexCache *cache) {
     size_t drawn = 0;
-    unsigned i, kept = 0;
+    unsigned i, kept = 0, smaller = 0;
 
     // (the GPU is past the frames gpu_lag before this one)
     for (i = 0; i < cache->pending_count; i++) {
@@ -187,9 +187,11 @@ void wl_nv2a_texcache_frame_done(WlNv2aTexCache *cache) {
     for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
         if (cache->entries[i].image != NULL && cache->entries[i].used_frame == cache->frame) {
             drawn += cache->entries[i].layout.total_bytes;
+            smaller += cache->entries[i].reduced != 0;
         }
     }
     cache->stats.frame_bytes = drawn;
+    cache->stats.frame_reduced = smaller;
     if (drawn > cache->stats.peak_frame_bytes) {
         cache->stats.peak_frame_bytes = drawn;
     }
