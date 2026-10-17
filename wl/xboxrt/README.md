@@ -568,7 +568,11 @@ meanwhile and how many of them kept the lock at a raised IRQL, its return addres
 (`held off:`), and where its host thread runs (the host: its PC and translated callers; the Wii: a
 0.2 s profile into the log, the first four times). While the service thread waits for the lock,
 the holder's safe points mark the devices' ticks due in its place, so the audio processor's frames
-go on.
+go on. A kernel call that waits for the card gives the lock up meanwhile (`wl_xb_block_begin`), as
+an Xbox thread waits in its disk I/O: the real Wii's slow SD card held interrupts off for one to two
+seconds at every level load, checkpoint revert and profile dump while a read held the lock.
+`wl_xb_card_lock` keeps the transfers on one host file handle apart (the kernel's, outside the guest
+lock, and the paging's reads of file-backed pages, inside it).
 
 The title's build learns from a run: every indirect-call target with no translated function is
 added to the seed file, and every NV2A vertex program drawn that is not compiled in to the program

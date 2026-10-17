@@ -27,6 +27,8 @@
 #define KTHREAD_BYTES 0x200u
 
 static WlPlatformMutex g_m;
+static WlPlatformMutex g_card; // wl_xb_card_lock
+static bool g_card_made;
 static WlPlatformCond g_proc_cond;
 static bool g_ready_init;
 static WlXbThreadConfig g_cfg;
@@ -578,6 +580,43 @@ void wl_xb_yield(void) {
     requeue(self);
 }
 
+WlXbThread *wl_xb_block_begin(void) {
+    WlXbThread *self = g_cur;
+    if (g_det || !g_ready_init || self == NULL || self->is_service || wl_xb_in_service() ||
+        self->host_tid != wl_platform_thread_self_id() || irql_raised(self)) {
+        return NULL;
+    }
+    g_stats.io_blocks++;
+    wl_xb_unlock(self);
+    return self;
+}
+
+void wl_xb_block_end(WlXbThread *self) {
+    if (self != NULL) {
+        wl_xb_lock(self);
+    }
+}
+
+void wl_xb_card_lock(void) {
+    if (g_card_made) {
+        wl_platform_mutex_lock(g_card);
+    }
+}
+
+void wl_xb_card_unlock(void) {
+    if (g_card_made) {
+        wl_platform_mutex_unlock(g_card);
+    }
+}
+
+bool wl_xb_card_busy(void) {
+    if (!g_card_made || !wl_platform_mutex_try_lock(g_card)) {
+        return g_card_made;
+    }
+    wl_platform_mutex_unlock(g_card);
+    return false;
+}
+
 // ---- Threads -----------------------------------------------------------------------------------
 
 static WlXbThread *new_thread(int priority) {
@@ -613,6 +652,12 @@ WlResult wl_xb_threads_init(const WlXbThreadConfig *cfg, WlXbThread **out) {
     }
     if (wl_platform_mutex_create(&g_m) != WL_OK || wl_platform_cond_create(&g_proc_cond) != WL_OK) {
         return WL_ERR_NOMEM;
+    }
+    if (!g_card_made) {
+        if (wl_platform_mutex_create(&g_card) != WL_OK) {
+            return WL_ERR_NOMEM;
+        }
+        g_card_made = true;
     }
     g_det = g_cfg.deterministic;
     if (g_det) {

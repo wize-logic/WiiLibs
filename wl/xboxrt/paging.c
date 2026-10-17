@@ -41,6 +41,7 @@
 
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/mem_internal.h"
+#include "wl/xboxrt/thread.h"
 
 #define TAG "xbpage"
 #define BATCH 32u      // pages a swap write takes at most (128 KB)
@@ -386,7 +387,9 @@ WlResult wl_xb_pg_fault(uint32_t p, uint32_t keep) {
         uint64_t t0 = wl_platform_time_us();
         bool file = (slot & FILE_SLOT) != 0;
         if (file) {
+            wl_xb_card_lock(); // the kernel may read the same handle outside the guest lock
             r = wl_platform_fs_read_at(g_src[(slot & ~FILE_SLOT) - 1u].file, g_foff[p], g_io, PAGE);
+            wl_xb_card_unlock();
         } else {
             r = wl_platform_fs_read_at(g_swap, (uint64_t)(slot - 1u) * PAGE, g_io, PAGE);
         }
