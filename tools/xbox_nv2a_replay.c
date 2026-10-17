@@ -43,6 +43,8 @@
 //               lit by GX's transform unit (WlNv2aGxConfig.no_xf_light)
 //   --no-prefetch  no dcbt ahead of the guest's vertex data and push buffer (wl_nv2a_set_prefetch; a
 //               PowerPC build's only)
+//   --depth-check  each perspective draw's fitted depth against its program's: a line for each draw
+//               beyond 8 of the depth's steps (each draw with -v), and a summary
 //   --no-fused  the processor's vertices made the general way, never by a program's fused batch
 //               (WlNv2aGxConfig.no_fused)
 //   --fused-forms  the forms of the draws whose batches could run fused, each with the program's hash
@@ -145,6 +147,12 @@ static unsigned g_png_count;
 static WlNv2aRecorder g_recorder;
 static WlNv2aGx *g_gx;
 static uint32_t g_backend_draws;
+// --depth-check: each perspective draw's fitted depth against its program's (WlNv2aGxDepthCheck), a
+// line for each draw beyond DEPTH_CHECK_STEPS of the depth's 24-bit steps (each with -v), a summary
+#define DEPTH_CHECK_STEPS 8.0f
+static bool g_depth_check;
+static uint32_t g_depth_checked, g_depth_beyond, g_depth_nearer_draws, g_depth_clamped_draws;
+static float g_depth_worst_nearer;
 // the write watch over the replay's guest memory (--watch): each page's epoch of its last block
 static uint32_t *g_page_epoch;
 static uint32_t g_epoch = 1, g_page_count;
@@ -346,6 +354,52 @@ static void survey_draw(const WlNv2aKelvin *k) {
     }
 }
 
+// --depth-check's line for the last draw (its program's hash, its fit, how far the fit strayed in
+// steps, and the blending and depth writes that tell an effect)
+static void depth_check_note(const WlNv2aKelvin *k) {
+    WlNv2aGxDepthCheck c;
+    float a, b, nearer, farther;
+    unsigned long hash = 0;
+    const uint32_t *words;
+    unsigned long count;
+
+    if (!wl_nv2a_gx_last_depth_check(g_gx, &c)) {
+        return;
+    }
+    if (wl_nv2a_program_mode(k)) {
+        wl_nv2a_program(k, &words, &count);
+        hash = count != 0 ? wl_xbox_vsh_hash(words, count) : 0;
+    }
+    if (!wl_nv2a_gx_last_projection(g_gx, &a, &b, NULL)) {
+        g_depth_clamped_draws += c.clamped != 0;
+        if (c.clamped != 0 || g_verbosity != 0) {
+            printf("  depth check: draw %u vsh %08lx, screen space, %u vertices, %u clamped to the depth range; "
+                   "blend %u zwrite %u ztest %u\n",
+                   (unsigned)g_backend_draws, hash, (unsigned)c.checked, (unsigned)c.clamped,
+                   (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_ENABLE), (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_MASK),
+                   (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_TEST_ENABLE));
+        }
+        return;
+    }
+    nearer = c.nearer * 16777216.0f;
+    farther = c.farther * 16777216.0f;
+    g_depth_checked++;
+    g_depth_worst_nearer = nearer > g_depth_worst_nearer ? nearer : g_depth_worst_nearer;
+    if (nearer > DEPTH_CHECK_STEPS) {
+        g_depth_nearer_draws++;
+    }
+    if (nearer <= DEPTH_CHECK_STEPS && farther <= DEPTH_CHECK_STEPS && g_verbosity == 0) {
+        return;
+    }
+    g_depth_beyond += nearer > DEPTH_CHECK_STEPS || farther > DEPTH_CHECK_STEPS;
+    printf("  depth check: draw %u vsh %08lx, %u vertices, fit %s%s %.9g + %.9g / w: nearer %.0f steps, farther %.0f "
+           "steps; in w nearer %.3g, farther %.3g (worst at w %.4g); blend %u zwrite %u ztest %u\n",
+           (unsigned)g_backend_draws, hash, (unsigned)c.checked, c.made ? "made" : "kept", c.narrow ? " (narrow)" : "",
+           (double)a, (double)b, (double)nearer, (double)farther, (double)c.nearer_w, (double)c.farther_w,
+           (double)c.worst_w, (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_ENABLE),
+           (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_MASK), (unsigned)wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_TEST_ENABLE));
+}
+
 static uint32_t tee_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
     Tee *t = user;
     uint32_t pixels = 0;
@@ -427,6 +481,9 @@ static uint32_t tee_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *dr
                 }
             }
         }
+    }
+    if (g_gx != NULL && g_depth_check) {
+        depth_check_note(k);
     }
     g_backend_draws++;
     return pixels;
@@ -1205,7 +1262,7 @@ static void fused_seen(void *user, unsigned long hash, const WlXboxVshFusedKey *
 static int usage(void) {
     fprintf(stderr, "usage: xbox_nv2a_replay CAPTURE [-v | -vv] [--png-gx DIR] [--efb-after N DIR] [--gx-dump N] [--gx-dump-all] [--gx-scan] "
                     "[--gx-textures DIR] [--psh-dump N] [--programs FILE] [--textures-mb N] [--vertex-cache-kb N] [--watch] [--bench N] [--model-only] [--xf-programs] "
-                    "[--stream] [--cpu-transform] [--no-fused] [--no-prefetch] [--fused-forms] [--no-xf-light] [--overlap] [--png-alpha] [--survey]\n");
+                    "[--stream] [--cpu-transform] [--depth-check] [--no-fused] [--no-prefetch] [--fused-forms] [--no-xf-light] [--overlap] [--png-alpha] [--survey]\n");
     return 2;
 }
 
@@ -1278,6 +1335,9 @@ int main(int argc, char **argv) {
             watch = true;
         } else if (strcmp(argv[i], "--no-xf-light") == 0) {
             g_gcfg.no_xf_light = true;
+        } else if (strcmp(argv[i], "--depth-check") == 0) {
+            g_depth_check = true;
+            g_gcfg.depth_check = true;
         } else if (strcmp(argv[i], "--no-fused") == 0) {
             g_gcfg.no_fused = true;
         } else if (strcmp(argv[i], "--no-prefetch") == 0) {
@@ -1390,6 +1450,12 @@ int main(int argc, char **argv) {
                (unsigned)gs.target_draws,
                (unsigned)gs.target_skipped, (unsigned)gs.stencil_skipped, (unsigned)gs.programs_unusable,
                (unsigned)gs.approximations, (unsigned)gs.clears, (unsigned)gs.quad_clears, (unsigned)gs.frames);
+        if (g_depth_check) {
+            printf("depth check: %u perspective draws checked, %u beyond %.0f steps, %u nearer by more, the most "
+                   "%.0f steps nearer; %u screen-space draws with depths clamped\n",
+                   (unsigned)g_depth_checked, (unsigned)g_depth_beyond, (double)DEPTH_CHECK_STEPS,
+                   (unsigned)g_depth_nearer_draws, (double)g_depth_worst_nearer, (unsigned)g_depth_clamped_draws);
+        }
         printf("            %u programs' signed sums made unsigned, %u textures with border addressing clamped, "
                "%u targets stored to after their image\n",
                (unsigned)gs.programs_unbiased, (unsigned)gs.border_clamped, (unsigned)gs.targets_written);
@@ -1398,9 +1464,9 @@ int main(int argc, char **argv) {
                (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws,
                (unsigned)gs.projected_draws, (unsigned)gs.vertices_reused);
         printf("            %u vertices made by fused batches\n", (unsigned)gs.vertices_fused);
-        printf("            %u draws counted without drawing (they write nothing), %u skipped; %u kept the raster "
-               "state, %u the textures, %u the pixel program\n",
-               (unsigned)gs.unwritten_counted, (unsigned)gs.unwritten_skipped, (unsigned)gs.raster_kept,
+        printf("            %u draws counted without drawing (they write nothing; %u depth-tested), %u skipped; %u kept "
+               "the raster state, %u the textures, %u the pixel program\n",
+               (unsigned)gs.unwritten_counted, (unsigned)gs.queries_tested, (unsigned)gs.unwritten_skipped, (unsigned)gs.raster_kept,
                (unsigned)gs.textures_kept, (unsigned)gs.combiners_kept);
         printf("software GX: %u primitives, %u triangles (%u culled, %u clipped), %u pixels, %u written, %u copies, "
                "%u restores, %u clears, %u frames, %u textures decoded\n",

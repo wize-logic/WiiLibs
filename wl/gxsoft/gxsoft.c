@@ -1334,6 +1334,14 @@ static void on_frame_end(void *user, uint32_t width, uint32_t height) {
     }
 }
 
+static uint32_t on_peek_z(void *user, int x, int y) {
+    (void)user;
+    if (g.depth == NULL || x < 0 || y < 0 || x >= (int)EFB_W || y >= (int)EFB_H) {
+        return 0xFFFFFFFFu;
+    }
+    return g.depth[(size_t)y * EFB_W + (size_t)x] & 0xFFFFFFu;
+}
+
 static uint32_t on_peek(void *user, int x, int y) {
     uint8_t px[4];
     uint32_t z;
@@ -1388,6 +1396,7 @@ WlResult wl_gxsoft_attach(const WlGxSoftConfig *cfg) {
     r.clear = on_clear;
     r.squeeze = on_squeeze;
     r.peek = on_peek;
+    r.peek_z = on_peek_z;
     r.efb_alpha = on_efb_alpha;
     r.texture_invalidate = on_texture_invalidate;
     wl_host_gx_set_renderer(&r);

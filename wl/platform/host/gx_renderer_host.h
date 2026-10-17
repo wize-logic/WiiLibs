@@ -44,6 +44,8 @@ typedef struct WlHostGxRenderer {
     void (*squeeze)(void *user, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w);
     // wl_gx_peek_rgba
     uint32_t (*peek)(void *user, int x, int y);
+    // wl_gx_peek_z
+    uint32_t (*peek_z)(void *user, int x, int y);
     // wl_gx_set_efb_alpha: the EFB with a destination alpha (RGBA6_Z24) or without (RGB8_Z24)
     void (*efb_alpha)(void *user, bool on);
     // GX's texture cache emptied (wl_gx_direct_texture_invalidate, wl_gx_tex_invalidate)

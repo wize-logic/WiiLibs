@@ -177,6 +177,12 @@ struct WlNv2aGx {
     } signatures[FIT_SETS][FIT_WAYS];
     uint32_t signature_use;
     bool last_shared;
+    // (the last draw's fit made with the camera's slope, made or kept; its depth_check)
+    bool last_narrow;
+    WlNv2aGxDepthCheck depth_check;
+    // the EFB as GX has drawn it is readable (wl_gx_sync since the last draw, clear or frame): an
+    // occlusion query's depth test (query_count) reads it
+    bool query_synced;
     // (stamp: the draw; memo_batch: the batch that last used the slot, which no other index may then
     // take until it is sent; memo_vertices: the slot's vertex. Apart, the tags a lookup reads are four
     // to a 32-byte cache line, a strip's neighbouring indices in one, and each vertex starts a line:
@@ -360,6 +366,13 @@ const WlNv2aVCache *wl_nv2a_gx_vertex_cache(const WlNv2aGx *gx) {
 
 unsigned wl_nv2a_gx_last_xf(const WlNv2aGx *gx) {
     return gx->xf_why;
+}
+
+bool wl_nv2a_gx_last_depth_check(const WlNv2aGx *gx, WlNv2aGxDepthCheck *out) {
+    if (out != NULL) {
+        *out = gx->depth_check;
+    }
+    return gx->depth_check.checked != 0;
 }
 
 bool wl_nv2a_gx_last_projection(const WlNv2aGx *gx, float *a, float *b, bool *shared) {
@@ -1459,6 +1472,7 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
     uint32_t numbers[FIT_BATCH];
 
     gx->last_shared = false;
+    gx->last_narrow = false;
     // (a program that never converts its position to the screen leaves no clip-space position)
     if (gx->pipeline.program == NULL || !gx->pipeline.program->captures_clip) {
         return p;
@@ -1559,6 +1573,7 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
                 p.a = gx->fit_a = set[i].a;
                 p.b = gx->fit_b = set[i].b;
                 gx->last_shared = true;
+                gx->last_narrow = set[i].narrow;
                 gx->stats.fits_shared++;
                 return p;
             }
@@ -1593,6 +1608,7 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
     set[slot].b = b;
     set[slot].used = gx->signature_use;
     set[slot].narrow = narrow;
+    gx->last_narrow = narrow;
     p.a = gx->fit_a = a;
     p.b = gx->fit_b = b;
     return p;
@@ -1608,6 +1624,61 @@ static float projection_bias(const WlNv2aKelvin *k) {
     }
     offset = wl_nv2a_kf(k, WL_NV2A_K_SET_POLYGON_OFFSET_BIAS);
     return offset < 0.0f ? -offset : 0.0f;
+}
+
+// WlNv2aGxConfig.depth_check: the draw's fit p against its program's depth at each of its vertices
+// in front of the eye and within the depth range (the program run again for them, FIT_BATCH at a
+// time, as projection_fit runs it)
+static void projection_check(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, const Projection *p,
+                             float depth_max) {
+    WlNv2aGxDepthCheck *c = &gx->depth_check;
+    WlXboxVshOutput *outputs = gx->batch.outputs;
+    WlNv2aFetchPlan fetch;
+    uint32_t numbers[FIT_BATCH], v, i, run;
+
+    memset(c, 0, sizeof *c);
+    if (gx->pipeline.program == NULL || (p->perspective && !gx->pipeline.program->captures_clip)) {
+        return;
+    }
+    c->perspective = p->perspective;
+    c->made = !gx->last_shared;
+    c->narrow = gx->last_narrow;
+    wl_nv2a_fetch_plan(draw, wl_nv2a_pipeline_inputs(&gx->pipeline, WL_XBOX_VSH_LIVE_POSITION), &fetch);
+    wl_nv2a_fetch_constants(&fetch, k, gx->batch.inputs, FIT_BATCH);
+    for (v = 0; v < draw->count; v += run) {
+        run = draw->count - v < FIT_BATCH ? draw->count - v : FIT_BATCH;
+        for (i = 0; i < run; i++) {
+            numbers[i] = v + i;
+        }
+        wl_nv2a_fetch_vertices(&fetch, draw, numbers, run, gx->batch.inputs);
+        wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, run,
+                                  WL_XBOX_VSH_LIVE_POSITION, outputs, &gx->batch.work);
+        for (i = 0; i < run; i++) {
+            const WlXboxVshOutput *out = &outputs[i];
+            float d = out->position[2] / depth_max, error, moved;
+
+            if (!p->perspective || !out->clip_captured) {
+                // (a screen-space vertex: its depth as_depth's, clamped to the range)
+                c->clamped += !(d >= 0.0f && d <= 1.0f);
+                c->checked++;
+                continue;
+            }
+            if (!(out->clip[3] > 1.0e-4f) || !(d >= 0.0f && d <= 1.0f)) {
+                continue;
+            }
+            error = p->a + p->b / out->clip[3] - d;
+            // (in w: the depth's error over its slope there, d depth / d w = -b / w^2)
+            moved = p->b != 0.0f ? error * out->clip[3] * out->clip[3] / -p->b : 0.0f;
+            if (fabsf(moved) > (c->nearer_w > c->farther_w ? c->nearer_w : c->farther_w)) {
+                c->worst_w = out->clip[3];
+            }
+            c->nearer = -error > c->nearer ? -error : c->nearer;
+            c->farther = error > c->farther ? error : c->farther;
+            c->nearer_w = -moved > c->nearer_w ? -moved : c->nearer_w;
+            c->farther_w = moved > c->farther_w ? moved : c->farther_w;
+            c->checked++;
+        }
+    }
 }
 
 static void projection_load(WlNv2aGx *gx, const WlNv2aKelvin *k, const Projection *p) {
@@ -2885,6 +2956,156 @@ static void landing_area(uint32_t primitive, const PackedVertex *vertex, uint32_
     *seen_count = seen + 1u;
 }
 
+// a vertex as vertices_pack made it (landing x, y; its position words) as the EFB's x, y and GX's
+// depth 0..1, the projection_load's mapping (the far plane's scale; the polygon offset left out)
+static void query_vertex(const WlNv2aGx *gx, const PackedVertex *vertex, float out[3]) {
+    float z, d;
+
+    memcpy(&z, &vertex->w[2], sizeof z);
+    out[0] = vertex->x;
+    out[1] = vertex->y;
+    if (gx->projection.perspective) {
+        // (z is -w)
+        float scale = gx->projection.a * DEPTH_SCALE > 1.0f ? 1.0f / gx->projection.a : DEPTH_SCALE;
+
+        d = z < 0.0f ? (gx->projection.a + gx->projection.b / -z) * scale : 0.0f;
+    } else {
+        // (z is the depth less 1)
+        d = (z + 1.0f) * DEPTH_SCALE;
+    }
+    out[2] = d;
+}
+
+// an occlusion query's vertices tested against the EFB's depth (query_count), at most
+#define QUERY_VERTICES 16u
+// and at most this many of its pixels read (a grid over a larger query, each read standing for its cell)
+#define QUERY_READS 64u
+
+// whether depth `z` (0..0xFFFFFF) passes the draw's depth test against `stored`
+static bool query_passes(uint32_t func, uint32_t z, uint32_t stored) {
+    switch (func) {
+    case WL_NV2A_FUNC_NEVER:
+        return false;
+    case WL_NV2A_FUNC_LESS:
+        return z < stored;
+    case WL_NV2A_FUNC_EQUAL:
+        return z == stored;
+    case WL_NV2A_FUNC_LEQUAL:
+        return z <= stored;
+    case WL_NV2A_FUNC_GREATER:
+        return z > stored;
+    case WL_NV2A_FUNC_NOTEQUAL:
+        return z != stored;
+    case WL_NV2A_FUNC_GEQUAL:
+        return z >= stored;
+    default:
+        return true;
+    }
+}
+
+// The pixels of an occlusion query's triangle (a, b, c: EFB x, y and GX's depth 0..1) that pass the
+// draw's depth test against the EFB's depth, read at pixel centres (a grid of cells over a large
+// one, QUERY_READS reads at most, each counting for its cell). -1 when the EFB cannot be read.
+static float query_triangle(const float a[3], const float b[3], const float c[3], uint32_t func) {
+    float area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]), passed = 0.0f, step = 1.0f;
+    float x0 = fminf(a[0], fminf(b[0], c[0])), x1 = fmaxf(a[0], fmaxf(b[0], c[0]));
+    float y0 = fminf(a[1], fminf(b[1], c[1])), y1 = fmaxf(a[1], fmaxf(b[1], c[1]));
+    float x, y;
+
+    if (!(fabsf(area) > 0.0f)) {
+        return 0.0f;
+    }
+    // (cells of step by step pixels: no more than QUERY_READS over the triangle's bounds)
+    while ((x1 - x0) * (y1 - y0) / (step * step) > (float)QUERY_READS) {
+        step *= 2.0f;
+    }
+    x0 = fmaxf(x0, 0.0f);
+    y0 = fmaxf(y0, 0.0f);
+    for (y = floorf(y0 / step) * step + 0.5f * step; y < y1; y += step) {
+        for (x = floorf(x0 / step) * step + 0.5f * step; x < x1; x += step) {
+            // (barycentric weights of the cell's centre, nudged off the edges two triangles of a quad
+            // share, so that a centre on one counts once: inside when all three are >= 0)
+            float sx = x + 1.0f / 64.0f, sy = y + 1.0f / 128.0f;
+            float wa = ((b[0] - sx) * (c[1] - sy) - (c[0] - sx) * (b[1] - sy)) / area;
+            float wb = ((c[0] - sx) * (a[1] - sy) - (a[0] - sx) * (c[1] - sy)) / area;
+            float wc = 1.0f - wa - wb, depth;
+            uint32_t z, stored;
+
+            if (wa < 0.0f || wb < 0.0f || wc < 0.0f) {
+                continue;
+            }
+            depth = wa * a[2] + wb * b[2] + wc * c[2];
+            depth = depth < 0.0f ? 0.0f : depth > 1.0f ? 1.0f : depth;
+            z = (uint32_t)(depth * 16777215.0f + 0.5f);
+            stored = wl_gx_peek_z((int)x, (int)y);
+            if (stored > 0xFFFFFFu) {
+                return -1.0f;
+            }
+            if (query_passes(func, z, stored)) {
+                passed += step * step;
+            }
+        }
+    }
+    return passed;
+}
+
+// An occlusion query's pixel count with the depth test, as the NV2A counts it: its triangles' pixels
+// tested against the EFB's depth (GX synced once for a run of queries, the draws before them drawn).
+// Halo asks one for each lens flare and glow and scales the flare by it; counted by area alone, a
+// flare behind a wall or a person showed through them (a10's opening: rings over the captain, the
+// engines' glare). -1 when the query has too many vertices or the EFB cannot be read (the host with
+// no renderer): the caller counts its area instead.
+static float query_count(WlNv2aGx *gx, const WlNv2aKelvin *k, uint32_t primitive, const float (*v)[3], uint32_t n) {
+    uint32_t func = wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_FUNC), i;
+    float total = 0.0f, part;
+
+    if (!wl_nv2a_k(k, WL_NV2A_K_SET_DEPTH_TEST_ENABLE)) {
+        return -1.0f;
+    }
+    if (!gx->query_synced) {
+        (void)wl_gx_sync();
+        gx->query_synced = true;
+    }
+    for (i = 2; i < n; i++) {
+        const float *a, *b, *c = v[i];
+
+        switch (primitive) {
+        case WL_NV2A_PRIM_TRIANGLES:
+            if (i % 3u != 2u) {
+                continue;
+            }
+            a = v[i - 2];
+            b = v[i - 1];
+            break;
+        case WL_NV2A_PRIM_TRIANGLE_STRIP:
+        case WL_NV2A_PRIM_QUAD_STRIP:
+            a = v[i - 2];
+            b = v[i - 1];
+            break;
+        case WL_NV2A_PRIM_TRIANGLE_FAN:
+        case WL_NV2A_PRIM_POLYGON:
+            a = v[0];
+            b = v[i - 1];
+            break;
+        case WL_NV2A_PRIM_QUADS:
+            if (i % 4u < 2u) {
+                continue;
+            }
+            a = v[i - i % 4u];
+            b = v[i - 1];
+            break;
+        default:
+            return -1.0f;
+        }
+        part = query_triangle(a, b, c, func);
+        if (part < 0.0f) {
+            return -1.0f;
+        }
+        total += part;
+    }
+    return total;
+}
+
 // what textures_bind notes of a draw's textures for later frames, for a draw that binds none: a
 // picture the title showed, read as a texture (each frame then kept as one)
 static void display_textures_note(WlNv2aGx *gx, const WlNv2aKelvin *k) {
@@ -2910,7 +3131,7 @@ static void display_textures_note(WlNv2aGx *gx, const WlNv2aKelvin *k) {
 static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw,
                                 const WlNv2aSurface *surface) {
     DrawPlan plan;
-    float corners[3][2], area = 0.0f;
+    float corners[3][2], area = 0.0f, query[QUERY_VERTICES][3], counted;
     uint32_t v, seen = 0, first = 0;
 
     memset(&plan, 0, sizeof plan);
@@ -2939,8 +3160,17 @@ static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2
                           &plan, NULL);
         }
         landing_area(draw->primitive, batch_vertex(gx, n), &seen, corners, &area);
+        if (v < QUERY_VERTICES) {
+            query_vertex(gx, batch_vertex(gx, n), query[v]);
+        }
     }
     gx->stats.unwritten_counted++;
+    counted = draw->count <= QUERY_VERTICES ? query_count(gx, k, draw->primitive, (const float (*)[3])query, draw->count)
+                                            : -1.0f;
+    if (counted >= 0.0f) {
+        gx->stats.queries_tested++;
+        return (uint32_t)(counted + 0.5f);
+    }
     {
         float most = (float)gx->view_w * (float)gx->view_h, pixels = area * 0.5f;
 
@@ -3162,6 +3392,9 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     plan.offset = k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET];
 
     gx->projection = projection_fit(gx, k, draw, plan.depth_max, fit_target(gx, &surface));
+    if (gx->cfg.depth_check) {
+        projection_check(gx, k, draw, &gx->projection, plan.depth_max);
+    }
     if (gx->projection.perspective) {
         gx->stats.perspective_draws++;
     }
@@ -3307,6 +3540,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
 // ---- clears ---------------------------------------------------------------------------------------
 
 static void backend_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
+    ((WlNv2aGx *)user)->query_synced = false;
     WlNv2aGx *gx = user;
     WlNv2aSurface s;
     uint32_t h = wl_nv2a_k(k, WL_NV2A_K_SET_CLEAR_RECT_HORIZONTAL);
@@ -3368,6 +3602,7 @@ static void backend_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
 // ---- frames and flips -------------------------------------------------------------------------------
 
 static void backend_frame_done(void *user, const WlNv2aKelvin *k) {
+    ((WlNv2aGx *)user)->query_synced = false;
     WlNv2aGx *gx = user;
 
     (void)k;
@@ -3378,6 +3613,7 @@ static void backend_frame_done(void *user, const WlNv2aKelvin *k) {
 }
 
 static void backend_flip(void *user, const WlNv2aKelvin *k, uint32_t phys) {
+    ((WlNv2aGx *)user)->query_synced = false;
     WlNv2aGx *gx = user;
 
     (void)k;

@@ -221,6 +221,46 @@ TEST depth_test_keeps_the_nearer(void) {
     PASS();
 }
 
+// an occlusion query (nothing written, pixels counted) counts the pixels that pass the depth test,
+// as the NV2A does: Halo's lens flares and glows are scaled by it
+static uint32_t query_quad(TGuest *g, float x0, float y0, float x1, float y1, float z, uint32_t offset) {
+    t_m1(g, WL_NV2A_K_SET_COLOR_MASK, 0);
+    t_m1(g, WL_NV2A_K_SET_DEPTH_MASK, 0);
+    t_m1(g, WL_NV2A_K_CLEAR_REPORT_VALUE, WL_NV2A_REPORT_ZPASS_PIXEL_COUNT);
+    t_m1(g, WL_NV2A_K_SET_ZPASS_PIXEL_COUNT_ENABLE, 1);
+    f_quad(g, x0, y0, x1, y1, z, 0xFFFFFFFFu);
+    t_m1(g, WL_NV2A_K_SET_ZPASS_PIXEL_COUNT_ENABLE, 0);
+    t_m1(g, WL_NV2A_K_GET_REPORT, (WL_NV2A_REPORT_ZPASS_PIXEL_COUNT << 24) | offset);
+    t_m1(g, WL_NV2A_K_SET_COLOR_MASK, 0x01010101u);
+    t_m1(g, WL_NV2A_K_SET_DEPTH_MASK, 1);
+    t_kick(g);
+    return t_r32(g, offset + 8u);
+}
+
+TEST occlusion_queries_count_the_pixels_that_pass_the_depth_test(void) {
+    TGuest g;
+    uint32_t count;
+
+    ASSERT(pixel_device(&g) != NULL);
+    f_program(&g, 0, f_screen_program, 3);
+    f_clear(&g, 0xFF000000u);
+    // a wall at depth 0.3 over (100, 100)-(200, 200)
+    f_quad(&g, 100, 100, 200, 200, 0.3f, 0xFF0000FFu);
+    t_kick(&g);
+    // behind it: none; in front: all 16 x 16; half beside it (the far depth there): half
+    // (a query of more than 64 pixels is read on a grid: whole cells along the diagonal, a few pixels
+    // either way)
+    ASSERT_EQ(0u, query_quad(&g, 120, 120, 136, 136, 0.5f, 0x21000));
+    count = query_quad(&g, 120, 120, 136, 136, 0.1f, 0x21010);
+    ASSERT(count >= 240u && count <= 272u);
+    count = query_quad(&g, 192, 120, 208, 136, 0.5f, 0x21020);
+    ASSERT(count >= 112u && count <= 144u);
+    // (a small one exactly: the 2 of its 6 columns beside the wall)
+    ASSERT_EQ(12u, query_quad(&g, 196, 120, 202, 126, 0.5f, 0x21030));
+    pixel_done(&g);
+    PASS();
+}
+
 TEST two_combiner_stages_with_their_constants(void) {
     TGuest g;
 
@@ -1093,6 +1133,7 @@ SUITE(pixels_suite) {
     RUN_TEST(console_suite_on_the_software_gx);
     RUN_TEST(textured_quad_through_the_combiners);
     RUN_TEST(depth_test_keeps_the_nearer);
+    RUN_TEST(occlusion_queries_count_the_pixels_that_pass_the_depth_test);
     RUN_TEST(two_combiner_stages_with_their_constants);
     RUN_TEST(alpha_blending);
     RUN_TEST(perspective_triangle);

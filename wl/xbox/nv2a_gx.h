@@ -79,6 +79,9 @@ typedef struct WlNv2aGxConfig {
     // made, whether its program had the form), to list the forms a title draws (NULL: none)
     void (*fused_seen)(void *user, unsigned long hash, const WlXboxVshFusedKey *key, unsigned vertices, bool fused);
     void *fused_user;
+    // each perspective draw's depth a + b / w checked against the program's own depth at every vertex
+    // (wl_nv2a_gx_last_depth_check): a diagnostic, the program run twice for a draw's positions
+    bool depth_check;
 } WlNv2aGxConfig;
 
 // Where a draw's vertices were transformed, and why not further on (WlNv2aGxStats.xf_why_*)
@@ -137,6 +140,7 @@ typedef struct WlNv2aGxStats {
     uint32_t projected_draws;     // draws with a projective coordinate whose q varies: divided by GX per pixel
     uint32_t unwritten_counted;   // draws that write nothing (no colour, no depth) counting pixels: counted, not drawn
     uint32_t unwritten_skipped;   // ...and not counting: skipped
+    uint32_t queries_tested;      // counted draws whose pixels were depth-tested against the EFB (else their area)
     uint32_t indexed_draws;       // draws through the transform unit that sent their indices alone
     uint32_t indexed_vertices;    // ...and their vertices
     uint32_t raster_kept;         // draws that left GX's raster state as the draw before (unchanged)
@@ -174,6 +178,23 @@ const WlXboxPshProgram *wl_nv2a_gx_last_program(const WlNv2aGx *gx, bool *used);
 // depth range, before the far plane's scale), and whether that was the fit kept for its transform
 // (shared with the draws of the same transform). For logs and tools.
 bool wl_nv2a_gx_last_projection(const WlNv2aGx *gx, float *a, float *b, bool *shared);
+// With WlNv2aGxConfig.depth_check, how far the last draw's depth a + b / w strayed from its
+// program's depth (0..1 of the depth range) over its vertices in front of the eye and within the
+// depth range: nearer, the most the fit put a vertex nearer the eye (>= 0); farther, the most it put
+// one farther; checked, the vertices compared. False when the draw was not checked (no program, or
+// no depth_check). made: the fit was made for this draw (not the one kept for its transform);
+// narrow: made or kept with the camera's slope. For logs and tools.
+typedef struct WlNv2aGxDepthCheck {
+    float nearer, farther;
+    // the same in the eye's distance (w): the most a vertex was moved toward the eye and away from it
+    // (the depth's error over its slope there), and the w of the vertex moved the most
+    float nearer_w, farther_w, worst_w;
+    uint32_t checked;
+    // (a screen-space draw: nearer and farther 0, its vertices whose depth is clamped to the range)
+    uint32_t clamped;
+    bool made, narrow, perspective;
+} WlNv2aGxDepthCheck;
+bool wl_nv2a_gx_last_depth_check(const WlNv2aGx *gx, WlNv2aGxDepthCheck *out);
 // The camera's depth slope, which a draw whose vertices span too little depth to set a slope of their
 // own borrows (projection_fit), with the frame, the target (its colour surface) and the depth range
 // it was kept in. Shown for the tests.

@@ -83,6 +83,13 @@ static uint32_t r_peek(void *user, int x, int y) {
     return v;
 }
 
+static uint32_t r_peek_z(void *user, int x, int y) {
+    exempt(true);
+    uint32_t v = g_inner.peek_z(user, x, y);
+    exempt(false);
+    return v;
+}
+
 static void r_efb_alpha(void *user, bool on) {
     exempt(true);
     g_inner.efb_alpha(user, on);
@@ -113,6 +120,7 @@ void wl_host_gx_set_renderer(const WlHostGxRenderer *renderer) {
         WRAP(clear);
         WRAP(squeeze);
         WRAP(peek);
+        WRAP(peek_z);
         WRAP(efb_alpha);
         WRAP(texture_invalidate);
 #undef WRAP
@@ -433,6 +441,13 @@ uint32_t wl_gx_peek_rgba(int x, int y) {
         return g_renderer.peek(g_renderer.user, x, y);
     }
     return 0;
+}
+
+uint32_t wl_gx_peek_z(int x, int y) {
+    if (g_renderer_set && g_renderer.peek_z != NULL) {
+        return g_renderer.peek_z(g_renderer.user, x, y);
+    }
+    return 0xFFFFFFFFu;
 }
 
 void wl_gx_copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat fmt, bool clear) {
