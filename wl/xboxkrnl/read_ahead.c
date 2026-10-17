@@ -14,8 +14,10 @@
 // (wl_xb_block_begin), and a close does not wait for the read in flight (the thread lets go of a
 // closed window's handle and buffer itself once its read is over; xk_ahead_settle waits for that).
 #include <stdlib.h>
+#include <string.h>
 
 #include "wl/xboxkrnl/nt_file.h"
+#include "wl/xboxrt/page_census.h"
 
 #define AHEAD_SLOT (128u << 10)
 #define AHEAD_SLOTS 4u
@@ -39,6 +41,7 @@ static struct {
     // the window (under the lock)
     const void *owner;      // the handle it is for; NULL: none
     WlPlatformFile *pf;     // the thread's own handle on the file
+    bool map;               // the file is a map (for the page census's counts)
     uint8_t *buf;           // AHEAD_SLOTS x AHEAD_SLOT, 64-byte aligned (straight to the card)
     AheadSlot slot[AHEAD_SLOTS];
     uint32_t head, count;   // the oldest slot of the window and how many are in it
@@ -74,6 +77,7 @@ static void *ahead_main(void *arg) {
         uint32_t want = s->len;
         uint8_t *base = g_ra.buf;
         uint8_t *dst = base + (size_t)i * AHEAD_SLOT;
+        bool map = g_ra.map;
         wl_platform_mutex_unlock(g_ra.lock);
 
         uint32_t got = 0;
@@ -82,6 +86,7 @@ static void *ahead_main(void *arg) {
             got = 0;
         }
         wl_xb_card_unlock();
+        wl_xb_census_card(WL_XB_CCARD_AHEAD, map, got); // (the page census: a diagnostic)
 
         wl_platform_mutex_lock(g_ra.lock);
         if (gen != g_ra.gen) {
@@ -199,6 +204,7 @@ bool xk_ahead_open(const void *owner, const char *host, uint64_t from, uint64_t 
         if (g_ra.buf != NULL && wl_platform_fs_open(host, WL_FILE_READ, &g_ra.pf) == WL_OK) {
             xk_files_open_add(1); // (the card's open files are few: it counts with the title's)
             g_ra.owner = owner;
+            g_ra.map = strstr(host, ".map") != NULL;
             g_ra.head = 0;
             g_ra.count = 0;
             g_ra.next = from;

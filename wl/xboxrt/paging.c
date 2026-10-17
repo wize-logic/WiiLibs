@@ -56,6 +56,7 @@
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/mmio.h"
+#include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/thread.h"
 
 #define TAG "xbpage"
@@ -231,6 +232,7 @@ static uint32_t z_take(uint32_t p) {
 
 // Page `p` lost its frame (its contents kept: a copy, or zero).
 static void stamp_evicted(uint32_t p) {
+    wl_xb_census_io(WL_XB_CIO_EVICT, p, false);
     uint16_t st = (uint16_t)++g_evcount;
     g_evstamp[p] = st != 0 ? st : 1u;
 }
@@ -271,6 +273,7 @@ static void evict_clean(uint32_t q, uint32_t f) {
     if ((g_xb_pg_flags[q] & WL_XB_PG_AHEAD) != 0) {
         g_xb_pg_flags[q] &= (uint8_t)~WL_XB_PG_AHEAD;
         g_st.ahead_unused++;
+        wl_xb_census_io(WL_XB_CIO_AHEAD_UNUSED, q, false);
     }
     if ((g_xb_pg_slot[q] & FILE_SLOT) != 0) {
         g_st.file_evictions++;
@@ -507,6 +510,9 @@ static WlResult batch_write(void) {
         }
         g_st.swap_writes++;
         g_st.write_bytes += (uint64_t)len * PAGE;
+        for (uint32_t k = 0; k < len; k++) {
+            wl_xb_census_io(WL_XB_CIO_SWAP_OUT, g_batch[done + k], k == 0);
+        }
         done += len;
     }
     for (uint32_t i = 0; i < n; i++) {
@@ -679,6 +685,7 @@ static WlResult fault(uint32_t p, uint32_t keep, bool give_up) {
     if (zn != 0) {
         if (wl_xb_page_unpack(g_zspan, zn, wl_xb_mmu_frame_ptr(p, f))) {
             g_st.z_hits++;
+            wl_xb_census_io(WL_XB_CIO_ZHIT, p, false);
             read_end(p, WL_OK);
             return WL_OK;
         }
@@ -757,9 +764,14 @@ static WlResult fault(uint32_t p, uint32_t keep, bool give_up) {
     } else if (file) {
         g_st.file_ins++;
         g_st.file_ahead += run - 1u;
+        wl_xb_census_io(WL_XB_CIO_FILE_IN, p, true);
+        for (uint32_t k = 1; k < run; k++) {
+            wl_xb_census_io(WL_XB_CIO_AHEAD, p + k * step, false);
+        }
     } else {
         g_st.swap_ins++;
         g_st.read_bytes += PAGE;
+        wl_xb_census_io(WL_XB_CIO_SWAP_IN, p, true);
     }
     if (t1 != 0) {
         if (!g_transit[t1 - 1u].ended) {
@@ -965,6 +977,7 @@ WlResult wl_xb_pg_forget(WlPlatformFile *file, uint64_t offset, uint64_t bytes) 
         g_xb_pg_flags[k] |= WL_XB_PG_DIRTY; // written to the swap file when it goes
         wl_xb_mmu_unlock(lv);
         g_st.file_forgets++;
+        wl_xb_census_io(WL_XB_CIO_FORGET, k, false);
     }
     if (all && g_src[i].pages == 0) {
         g_src[i].file = NULL; // (the file may be closed and its handle reused)

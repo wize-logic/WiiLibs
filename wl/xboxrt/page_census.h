@@ -92,6 +92,56 @@ static inline void wl_xb_census_alloc(WlXbCensusAlloc kind, uint32_t va, uint32_
     }
 }
 
+// ---- The card's traffic (where SD reads and writes come from), counted by second ------------------
+// Each second with traffic gets `io <second> <kind> ops <n> pages <n> map <n> fresh <n> <class> <n>...
+// @<allocation> <pages>/<fresh>...` lines (a page's class as in the second's line, its allocation's number
+// in `<file>.pages`; `map`: pages a map read filled; `fresh`: pages a file
+// read filled and no device (GPU, APU) used since: a texture evicted or read back before its conversion)
+// and a `card <second> ...` line for the kernel's own file I/O. tools/xb_paging_io.py makes the tables.
+typedef enum {
+    WL_XB_CIO_SWAP_IN,      // a page read back from the swap file (an op each)
+    WL_XB_CIO_SWAP_OUT,     // a page written to the swap file (an op for each run of slots)
+    WL_XB_CIO_FILE_IN,      // a file copy read back from its file (an op each, its read-ahead with it)
+    WL_XB_CIO_AHEAD,        // a file copy that came in that read after it (no op of its own)
+    WL_XB_CIO_ZHIT,         // a page unpacked from the compressed page cache (no op)
+    WL_XB_CIO_EVICT,        // a page losing its frame (any way)
+    WL_XB_CIO_AHEAD_UNUSED, // of those, a read-ahead page never used
+    WL_XB_CIO_FORGET,       // a file copy forgotten (its file changed or closed): a swap write later
+    WL_XB_CIO_COUNT
+} WlXbCensusIo;
+
+// The kernel's own card I/O: a read with the guest lock given up, one with it kept (a read under
+// XK_BLOCK_MIN: the other threads wait, as for the pager's), a read by the file read-ahead's thread, or
+// a write, of `bytes` of a map file (`map`) or another, as one op.
+typedef enum {
+    WL_XB_CCARD_READ,
+    WL_XB_CCARD_READ_HELD,
+    WL_XB_CCARD_AHEAD,
+    WL_XB_CCARD_WRITE,
+    WL_XB_CCARD_COUNT
+} WlXbCensusCard;
+
+void wl_xb_census_io_slow(WlXbCensusIo kind, uint32_t p, bool op);
+void wl_xb_census_card_slow(WlXbCensusCard kind, bool map, uint32_t bytes);
+
+// Page `p` went through `kind`; `op`: it started a card transfer.
+static inline void wl_xb_census_io(WlXbCensusIo kind, uint32_t p, bool op) {
+    if (g_xb_census_use != NULL) {
+        wl_xb_census_io_slow(kind, p, op);
+    }
+}
+
+static inline void wl_xb_census_card(WlXbCensusCard kind, bool map, uint32_t bytes) {
+    if (g_xb_census_use != NULL) {
+        wl_xb_census_card_slow(kind, map, bytes);
+    }
+}
+
+// The counts of the current second so far, for the tests: `kind`'s ops and pages, and of the pages
+// those of class "fresh" (filled from a file, no device use since).
+void wl_xb_census_io_now(WlXbCensusIo kind, uint32_t *ops, uint32_t *pages, uint32_t *fresh);
+void wl_xb_census_card_now(WlXbCensusCard kind, uint32_t *ops, uint64_t *bytes);
+
 // Ends the current second now (the vertical blank's hook does it every 60): its line written, the
 // touched pages' EAs closed. Returns the pages touched in it.
 uint32_t wl_xb_census_interval(void);
