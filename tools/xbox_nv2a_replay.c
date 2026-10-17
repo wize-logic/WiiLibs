@@ -1028,11 +1028,11 @@ static void texture_cache_line(const char *prefix) {
 
         wl_nv2a_gx_stats(g_gx, &gs);
         printf("%s          failed: %u refused again, %u formats or sizes GX cannot take, %u unreadable, %u bad texels; "
-               "%u stood in; not looked up: %u unread, %u disabled, %u unsampled; %u without mip-maps answered by "
+               "%u stood in, %u draws hidden; not looked up: %u unread, %u disabled, %u unsampled; %u without mip-maps answered by "
                "the texture with them (%u given back)\n",
                prefix, (unsigned)ts.refused_again, (unsigned)ts.unknown, (unsigned)ts.unreadable,
-               (unsigned)ts.bad_texels, (unsigned)gs.textures_stood_in, (unsigned)gs.textures_unread,
-               (unsigned)gs.textures_disabled, (unsigned)gs.textures_unsampled, (unsigned)ts.mip_shared,
+               (unsigned)ts.bad_texels, (unsigned)gs.textures_stood_in, (unsigned)gs.standin_hidden,
+               (unsigned)gs.textures_unread, (unsigned)gs.textures_disabled, (unsigned)gs.textures_unsampled, (unsigned)ts.mip_shared,
                (unsigned)ts.mip_replaced);
     }
 }

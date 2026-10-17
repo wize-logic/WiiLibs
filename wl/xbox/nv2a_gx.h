@@ -122,6 +122,7 @@ typedef struct WlNv2aGxStats {
     uint32_t textures_disabled;   // ...the stage disabled (D3D's texture NULL: CONTROL0's enable 0)
     uint32_t textures_unsampled;  // ...a stage program that samples none (pass-through, clip plane, DOT_ZW, dot product)
     uint32_t textures_stood_in;   // stage textures that could not be made, bound as a stand-in of their average colour
+    uint32_t standin_hidden;      // draws not drawn: a texture could not be made and they blend onto the picture
     uint32_t programs_unusable;   // draws whose combiners GX cannot hold (texture 0 times colour)
     uint32_t approximations;      // draws whose combiners or blending were approximated
     uint32_t vertices_reused;     // vertices of indexed draws taken from the ones already run

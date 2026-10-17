@@ -142,15 +142,16 @@ struct WlNv2aGx {
     // the draw's
     const WlNv2aTexEntry *entries[WL_NV2A_TEXTURES];
     WlNv2aTexEntry target_entries[WL_NV2A_TEXTURES];
-    // what is bound for a texture that could not be made (standin_bind): 4 x 4 images, transparent
-    // black and a stage's average colour, in `standin_memory` 32-byte aligned for GX
+    // what is bound for a texture that could not be made (standin_bind): a 4 x 4 image of its
+    // average colour a stage, in `standin_memory` 32-byte aligned for GX; a draw with one that
+    // standin_hides is not drawn (`standin_hidden`, set by textures_bind)
     WlNv2aTexEntry standin_entries[WL_NV2A_TEXTURES];
     struct {
         uint32_t phys, format_word, rgba;
         bool made;
     } standins[WL_NV2A_TEXTURES];
-    uint8_t standin_memory[(1 + WL_NV2A_TEXTURES) * STANDIN_BYTES + 32];
-    bool standins_cleared;
+    uint8_t standin_memory[WL_NV2A_TEXTURES * STANDIN_BYTES + 32];
+    bool standin_hidden;
     WlGxTexObj stage_objects[WL_NV2A_TEXTURES], alpha_objects[WL_NV2A_TEXTURES];
     // what each object was made from (bit n of objects_known: stage n's, bit n + 4: its alpha's)
     WlGxTexDesc stage_descs[WL_NV2A_TEXTURES], alpha_descs[WL_NV2A_TEXTURES];
@@ -1071,32 +1072,30 @@ static bool stage_sampled(WlNv2aGx *gx, const WlNv2aKelvin *k, unsigned stage, c
     return true;
 }
 
-// What a stage binds for a texture the cache could not make (no memory for it, a format GX cannot
-// take, texels outside memory), so that an opaque draw is not drawn untextured: a 4 x 4 image of
-// its average colour (grey when its texels cannot be read), made again when the stage's texture
-// changes (a multiplying pass, a detail map's, takes the average as well). A draw that adds onto
-// what is drawn (blending whose destination factor is one or the source's alpha: an effect, a
-// decal, the HUD, where a square of one colour would show) binds transparent black, which adds
-// nothing, as no texture did. Halo never draws without its texture: it waits for one to load. The
-// entry is dynamic: the texture is looked up again at the next draw.
-static const WlNv2aTexEntry *standin_bind(WlNv2aGx *gx, const WlNv2aKelvin *k, unsigned stage,
-                                          const WlNv2aTexture *t) {
-    WlNv2aTexEntry *e = &gx->standin_entries[stage];
-    uint8_t *images = (uint8_t *)(((uintptr_t)gx->standin_memory + 31u) & ~(uintptr_t)31u);
-    uint8_t *image = images + (1u + stage) * STANDIN_BYTES; // (the first: transparent black)
+// Whether a draw whose texture could not be made is left undrawn: one that blends onto what is
+// drawn (the destination's factor one, one minus the source's colour or alpha, or the source's
+// alpha: an effect, a decal, the HUD), where any one colour shows as a square (the HUD's meters,
+// whose colour is their constants' and whose texture gives only the alpha, drew a solid bar), as
+// Halo, which never draws without its texture, would not have drawn it
+static bool standin_hides(const WlNv2aKelvin *k) {
     uint32_t destination = wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_DFACTOR);
-    bool clear = wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_ENABLE) != 0 &&
-                 (destination == WL_NV2A_BLEND_ONE || destination == WL_NV2A_BLEND_SRC_ALPHA ||
-                  destination == WL_NV2A_BLEND_ONE_MINUS_SRC_ALPHA);
+
+    return wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_ENABLE) != 0 &&
+           (destination == WL_NV2A_BLEND_ONE || destination == WL_NV2A_BLEND_ONE_MINUS_SRC_COLOR ||
+            destination == WL_NV2A_BLEND_SRC_ALPHA || destination == WL_NV2A_BLEND_ONE_MINUS_SRC_ALPHA);
+}
+
+// What a stage binds for a texture the cache could not make (no memory for it, a format GX cannot
+// take, texels outside memory) in a draw drawn (standin_hides) so that it is not drawn untextured:
+// a 4 x 4 image of its average colour (grey when its texels cannot be read), made again when the
+// stage's texture changes (a multiplying pass, a detail map's, takes the average as well). The
+// entry is dynamic: the texture is looked up again at the next draw.
+static const WlNv2aTexEntry *standin_bind(WlNv2aGx *gx, unsigned stage, const WlNv2aTexture *t) {
+    WlNv2aTexEntry *e = &gx->standin_entries[stage];
+    uint8_t *image = (uint8_t *)(((uintptr_t)gx->standin_memory + 31u) & ~(uintptr_t)31u) + stage * STANDIN_BYTES;
 
     gx->stats.textures_stood_in++;
-    if (!gx->standins_cleared) {
-        memset(images, 0, STANDIN_BYTES);
-        commit(NULL, images, STANDIN_BYTES);
-        gx->standins_cleared = true;
-        gx->texture_memory_changed = true;
-    }
-    if (!clear && (!gx->standins[stage].made || gx->standins[stage].phys != t->phys ||
+    if ((!gx->standins[stage].made || gx->standins[stage].phys != t->phys ||
                    gx->standins[stage].format_word != t->format_word)) {
         uint8_t rgba[4] = {128, 128, 128, 255}, texels[16 * 4];
         const uint8_t *src = t->known ? wl_nv2a_phys(gx->dev, t->phys, t->total_bytes) : NULL;
@@ -1128,7 +1127,7 @@ static const WlNv2aTexEntry *standin_bind(WlNv2aGx *gx, const WlNv2aKelvin *k, u
     memset(e, 0, sizeof *e);
     e->phys = t->phys;
     e->format_word = t->format_word;
-    e->image = clear ? images : image;
+    e->image = image;
     e->layout.format = WL_GXC_RGBA8;
     e->layout.width = e->layout.height = 4;
     e->layout.levels = 1;
@@ -1146,6 +1145,7 @@ static const WlNv2aTexEntry *standin_bind(WlNv2aGx *gx, const WlNv2aKelvin *k, u
 static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
     unsigned stage, wanted = 0, read = stages_read(k);
 
+    gx->standin_hidden = false;
     for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
         WlNv2aTexture t;
         const WlNv2aTexEntry *e;
@@ -1182,7 +1182,11 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
             }
             e = wl_nv2a_texcache_get(&gx->textures, gx->dev, &t, mipmaps, &made);
             if (e == NULL) {
-                e = standin_bind(gx, k, stage, &t);
+                if (standin_hides(k)) {
+                    gx->standin_hidden = true;
+                    continue;
+                }
+                e = standin_bind(gx, stage, &t);
             }
         }
         if (made) {
@@ -3106,6 +3110,10 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     }
     gx->state_valid = true;
     gx->dirty = 0;
+    if (gx->standin_hidden) {
+        gx->stats.standin_hidden++;
+        return 0;
+    }
     exact = gx->states_exact && gx->tev_exact;
     if (!exact) {
         gx->stats.approximations++;
