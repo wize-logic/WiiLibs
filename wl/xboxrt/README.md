@@ -95,6 +95,9 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
   a write through any handle on the file, a smaller size, a truncating open, a rename (every handle
   reopens) and a close. A program that writes a file the kernel has open behind its back says so
   first (`wl_xk_file_changed`: the play harness's checkpoint snapshots over z:\savegame.bin).
+  The XBE's sections are loaded the same way (`wl_xbe_load_backed`: the boot keeps default.xbe
+  open), so its x86 code and constants never go to the swap file; a page two sections share, or
+  one with a section's zero tail, stays an ordinary copy.
 - **The swap file**: `<the title's hard disk folder>/pagefile.sys` (`WlXbTitleConfig.swap_path`, ""
   for none), the guest RAM's size by default, grown once (the card allocates its clusters then, not
   during play) and kept; its contents mean nothing across runs. Slots are pages; a bit map says

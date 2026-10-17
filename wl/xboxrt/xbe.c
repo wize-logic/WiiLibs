@@ -134,6 +134,10 @@ static bool census_code(const WlXbeSection *s) {
 }
 
 WlResult wl_xbe_load(const WlXbe *x, WlXbeRead read, void *user) {
+    return wl_xbe_load_backed(x, read, user, NULL);
+}
+
+WlResult wl_xbe_load_backed(const WlXbe *x, WlXbeRead read, void *user, struct WlPlatformFile *file) {
     if (x == NULL || read == NULL || !wl_xb_mem_ready()) {
         return WL_ERR_ARG;
     }
@@ -157,6 +161,10 @@ WlResult wl_xbe_load(const WlXbe *x, WlXbeRead read, void *user) {
             continue; // outside the image: logged by the parser
         }
         r = copy_file(read, user, bounce, s->raw_offset, s->va, n);
+        if (r == WL_OK && file != NULL) {
+            // (the file's offsets need not be page-aligned: a page is read back from any offset)
+            wl_xb_file_pages(s->va, n, file, s->raw_offset);
+        }
         if (s->flags & WL_XBE_SEC_EXECUTABLE) {
             if (s->va < code_lo) {
                 code_lo = s->va;
