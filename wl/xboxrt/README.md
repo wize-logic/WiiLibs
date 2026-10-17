@@ -497,7 +497,7 @@ The host: `prog <title folder> [hard disk folder]`; the title folder holds `defa
 guest's D:, the hard disk folder (default `<title folder>/hdd`) its C:, E: and the cache drives. The
 Wii: `sd:/xbox/<WL_XB_TITLE_NAME>` (a compile definition of `wl_xboxrt_main`, `title` by default),
 the log in `<title folder>/logs`. A title project's own `main` fills a `WlXbTitleConfig`
-(`boot.h`); the defaults are `ram_mb` 64, `keep_free_bytes` 14 MB (the host side's memory on the
+(`boot.h`); the defaults are `ram_mb` 64, `keep_free_bytes` 13 MB (the host side's memory on the
 Wii besides the textures' arena), `texture_bytes` 13 MB, `htab_bytes` 256 KB and a swap file of the
 guest RAM's size.
 
@@ -580,7 +580,7 @@ small files). With `netrun.txt` and no PC command line, a Dolphin run sends its 
 | `WL_XB_CAPTURE` | `path[,frames[,after]]`: a GPU capture of `frames` frames (2) starting `after` vertical blanks in (600) |
 | `WL_XB_AUDIO`, `_WAV`, `_TRACE`, `_HASH` | see "The GPU and the MCPX" |
 
-The imitation of the Wii's memory on the host is `WL_XB_FRAME_MB=24 WL_XB_HEAP_MB=14`.
+The imitation of the Wii's memory on the host is `WL_XB_FRAME_MB=24 WL_XB_HEAP_MB=14` (the Wii's before MEM1's rest joined the frame pools; about 32 and 13 since, to be set from a real-Wii log's "guest frames" lines).
 
 **What the log says.** Tag `xbirq`, every 10 s: `status:` lines for the guest clock against the
 host's, the guest's pages and frames, the heap's free memory and, with demand paging, the frames

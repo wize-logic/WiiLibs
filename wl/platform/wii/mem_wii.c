@@ -179,10 +179,14 @@ void wl_platform_heap_info(WlPlatformHeapInfo *out) {
     out->free_inside = (size_t)mi.fordblks;
     if (top >= 0x90000000u) {
         out->top = mem2_hi > top ? mem2_hi - top : 0;
-        // newlib counts the hole between MEM1's arena and MEM2 (where sbrk went on) as a block in
-        // use: taken back out, MEM1's top as the hole's start, so the figure is close, not exact
-        uintptr_t hole = 0x90000000u - (uintptr_t)SYS_GetArena1Hi();
+        // newlib counts the hole between sbrk's last end in MEM1 (MEM1's arena lo, which stays
+        // there) and its start in MEM2 as a block in use: taken back out (to MEM2's first byte, so
+        // the figure is a few KB high, not exact). The part of it inside MEM1's arena, up to its hi,
+        // is memory malloc can no longer reach: stranded.
+        uintptr_t mem1_lo = (uintptr_t)SYS_GetArena1Lo(), mem1_hi = (uintptr_t)SYS_GetArena1Hi();
+        uintptr_t hole = 0x90000000u - mem1_lo;
         out->in_use = out->in_use > hole ? out->in_use - hole : out->in_use;
+        out->stranded = mem1_hi > mem1_lo ? mem1_hi - mem1_lo : 0;
     } else {
         uintptr_t mem1_hi = (uintptr_t)SYS_GetArena1Hi();
         out->top = mem1_hi > top ? mem1_hi - top : 0;

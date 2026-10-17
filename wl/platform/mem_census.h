@@ -34,6 +34,10 @@ typedef struct {
     // of its own: an allocation fits in the larger of `top` and this)
     size_t elsewhere;
     size_t free_total; // free_inside + top + elsewhere (SIZE_MAX when top is)
+    // The Wii once sbrk has moved on to MEM2: the rest of MEM1's arena it left behind, which malloc
+    // can no longer reach (libogc's sbrk does not go back while MEM2 holds anything). Neither in
+    // use nor free: newlib counts it as in use, and in_use has it taken back out.
+    size_t stranded;
     // the host's cap (0: none): the limit on what was allocated since it was set, and the requests
     // it refused
     size_t cap, cap_used, cap_peak;

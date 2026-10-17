@@ -37,10 +37,12 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     memset(cfg, 0, sizeof *cfg);
     cfg->xbe_name = "default.xbe";
     cfg->ram_mb = 64;
-    // the host side: caches, buffers, render targets (14 MB), and the GX textures converted from the
-    // guest's in an arena of their own (13 MB: a10 draws at most ~11.6 MB of them in a frame; an
+    // the host side: caches, buffers, render targets (13 MB: real-Wii runs of a10, a30 and d40 used
+    // at most 9.9 MB of 14, the census's lowest free 4.1 MB; 3 MB stay for what a 10 s census misses,
+    // a shot's 1.2 MB and the freeze profile's 320 KB among them), and the GX textures converted from
+    // the guest's in an arena of their own (13 MB: a10 draws at most ~11.6 MB of them in a frame; an
     // arena too small for a frame's textures converts them again in every frame)
-    cfg->keep_free_bytes = 14u << 20;
+    cfg->keep_free_bytes = 13u << 20;
     cfg->texture_bytes = 13u << 20;
     cfg->htab_bytes = 256u << 10;
 }
@@ -122,6 +124,29 @@ static void apply_title_patches(void) {
     }
 }
 
+#if defined(__wii__)
+// The largest page-aligned block memalign gives now, of at least 1 MB: tried down from `room` (the
+// heap's figure for the piece sbrk can still take, less what newlib adds to a request) in 64 KB
+// steps; room 0 (not known): from 64 MB down in 1 MB steps.
+static void *largest_block(size_t room, uint32_t *bytes) {
+    const uint32_t margin = 64u << 10;
+    uint32_t step = room != 0 ? 64u << 10 : 1u << 20;
+    uint32_t t = 64u << 20;
+    if (room != 0) {
+        t = room < (1u << 20) + margin ? 0 : room - margin < t ? (uint32_t)(room - margin) & ~(step - 1u) : t;
+    }
+    for (; t >= (1u << 20); t -= step) {
+        void *p = memalign(WL_XB_PAGE, t);
+        if (p != NULL) {
+            *bytes = t;
+            return p;
+        }
+    }
+    *bytes = 0;
+    return NULL;
+}
+#endif
+
 // Guest memory (the Wii's frames from the heap), the GPU's textures' arena (when `want_textures`)
 // and the guest threads with the calling thread as the boot thread, holding the guest lock: what
 // the title and the capture bench both need.
@@ -163,17 +188,25 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
             pool[0] = memalign(WL_XB_PAGE, want);
             bytes[0] = pool[0] != NULL ? want : 0;
         } else {
-            // the two largest blocks the heap gives (MEM2's and what is left of MEM1's), held while
-            // probing, then `keep_free_bytes` and the textures' arena given back from the smaller
-            // one first
-            for (unsigned i = 0; i < 2u; i++) {
-                for (uint32_t t = 64u << 20; t >= (1u << 20) && pool[i] == NULL; t -= 1u << 20) {
-                    pool[i] = memalign(WL_XB_PAGE, t);
-                    bytes[i] = pool[i] != NULL ? t : 0;
-                }
+            // the two largest blocks the heap gives, held while probing: MEM1's rest first, while
+            // sbrk is still there (libogc's sbrk moves on to MEM2 for good at the first request
+            // MEM1 cannot hold, and MEM1's rest is then out of malloc's reach: a probe that began
+            // with MEM2's block left ~7 MB of MEM1 to nobody), then MEM2's
+            WlPlatformHeapInfo h;
+            wl_platform_heap_info(&h);
+            bool mem1_first = h.known && h.elsewhere != 0;
+            pool[0] = largest_block(h.known ? h.top : 0, &bytes[0]);
+            wl_platform_heap_info(&h);
+            if (mem1_first && h.elsewhere == 0) {
+                WL_LOG_W(TAG, "guest frames: MEM1's rest was not had (sbrk moved on to MEM2)");
             }
+            pool[1] = largest_block(mem1_first ? (h.elsewhere != 0 ? h.elsewhere : h.top) : 0, &bytes[1]);
+            // then `keep_free_bytes` and the textures' arena given back from the larger block first
+            // (MEM2's): the host side keeps one piece at MEM2's top, the frames MEM1's faster memory
             uint32_t give = cfg->keep_free_bytes + cfg->texture_bytes;
-            for (int i = 1; i >= 0 && give != 0; i--) {
+            unsigned larger = bytes[0] >= bytes[1] ? 0u : 1u;
+            for (unsigned k = 0; k < 2u && give != 0; k++) {
+                unsigned i = k == 0 ? larger : 1u - larger;
                 if (pool[i] == NULL) {
                     continue;
                 }
@@ -229,7 +262,7 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
         // threads' stacks, the GPU's and everyone's buffers: on the Wii all of it comes out of
         // keep_free_bytes, the frames and the textures' arena being had already) capped, so that a
         // run shows what would fail first. The host's own stand-ins (the software GX of the
-        // screenshots, the GX recorders) are not counted (mem_census.h). WL_XB_HEAP_MB=14 is the Wii's.
+        // screenshots, the GX recorders) are not counted (mem_census.h). WL_XB_HEAP_MB=13 is the Wii's.
         const char *mb = getenv("WL_XB_HEAP_MB");
         const char *kb = getenv("WL_XB_HEAP_KB");
         size_t cap = 0;
