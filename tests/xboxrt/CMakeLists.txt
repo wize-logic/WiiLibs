@@ -38,6 +38,10 @@ wl_add_test(test_xboxrt_usb SOURCES test_xboxrt_usb.c LIBS wl_xboxrt LABELS unit
 wl_add_test(test_xboxrt_play SOURCES test_xboxrt_play.c LIBS wl_xboxrt LABELS unit be)
 # The run chosen by the command line and netrun.txt (wl/xboxrt/runopts.h): flag and settings files, strings, order.
 wl_add_test(test_xboxrt_runopts SOURCES test_xboxrt_runopts.c LIBS wl_xboxrt LABELS unit be)
+# One run at a time on a hard disk's folder (wl/xboxrt/boot.h, wl_xb_hdd_lock): the host's flock.
+if(NOT WL_PLATFORM STREQUAL "wii" AND TARGET wl_xboxrt_boot)
+    wl_add_test(test_xboxrt_hdd_lock SOURCES test_xboxrt_hdd_lock.c LIBS wl_xboxrt_boot LABELS unit be)
+endif()
 # The PowerPC and x86-64 decoders against a fake device (portable).
 wl_add_test(test_xboxrt_decode SOURCES test_xboxrt_decode.c LIBS wl_xboxrt LABELS unit be)
 # The capture bench (wl/xboxrt/bench.h): the capture test_xbox_nv2a_pixels writes, replayed through

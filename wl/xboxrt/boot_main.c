@@ -61,6 +61,20 @@ int main(int argc, char **argv) {
         cfg.data_dir = data;
         first_option = 3;
     }
+    // the hard disk's folder is this run's alone (boot.h, wl_xb_hdd_lock): a second run on it
+    // would write the files this one reads its dropped pages back from
+    {
+        char hdd[PATH_MAX];
+        snprintf(hdd, sizeof hdd, "%s%s", first_option == 3 ? argv[2] : argv[1], first_option == 3 ? "" : "/hdd");
+        int fd = -1;
+        const char *held = getenv("WL_XB_HDD_LOCKED"); // the harness that started the run holds it for us
+        if ((held == NULL || strcmp(held, "1") != 0) && wl_xb_hdd_lock(hdd, &fd) == WL_ERR_DENIED) {
+            fprintf(stderr, "the hard disk folder %s is in use by another run: two runs on one folder write each "
+                            "other's swap file, savegame.bin and cache slots (give each run its own copy)\n", hdd);
+            return 2;
+        }
+        (void)fd; // (held to the end of the process)
+    }
     // options as on the Wii's command line (runopts.h: play=, switch=, file=, net=, run=)
     cfg.arg_count = argc > first_option ? argc - first_option : 0;
     cfg.args = argc > first_option ? argv + first_option : NULL;

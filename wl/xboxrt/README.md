@@ -281,6 +281,12 @@ The title runs as fast as the host lets it (a menu that waits for vertical blank
 the host, Halo's a10 runs about 10% slower a frame than without it (two runs of a script give the
 same log lines and the same screenshots). Off, nothing changes: `wl_xb_time_us` is the host's clock.
 
+Host load does not reach the schedule: three escape runs at once with a busy loop on each of the
+24 cores and a 512 MB direct-I/O loop gave the golden's lines, audio checksums and screenshots. What
+the host's clock still drives is only reported: the service thread's 10 s status lines, the stall
+and freeze watches. A run that differs under load is first suspected of sharing its hard disk
+folder ("Running a title").
+
 ## The GPU and the MCPX (`devices.h`)
 
 `wl_xb_devices_register_mcpx` registers the MCPX's devices: the APU (idle, its sample counter
@@ -495,6 +501,18 @@ the log in `<title folder>/logs`. A title project's own `main` fills a `WlXbTitl
 Wii besides the textures' arena), `texture_bytes` 13 MB, `htab_bytes` 256 KB and a swap file of the
 guest RAM's size.
 
+**One run per hard disk folder.** A run writes its hard disk folder (the swap file, `Z/savegame.bin`,
+the cache slots), and its paging reads dropped pages back from the files they were read from
+(`wl_xb_file_pages`), so another run on the same folder, or a harness putting the folder's files back
+for its own run, changes this run's memory under it. In the deterministic mode that is a crash at a
+tick that repeats exactly and looks like a race: a Halo script crashed at the same tick and address
+every time another process put `savegame.bin` back while it played. On the host
+`wl_xboxrt_main` takes an exclusive `flock` on the folder (`wl_xb_hdd_lock`, `boot.h`) for the
+process's life and stops with a message when another process holds it; `tools/golden_check.py` waits
+for the same lock before its put-back and passes it on to the program (`WL_XB_HDD_LOCKED=1`). A
+script that puts files back before it starts the program writes them before the program can refuse,
+so it takes the lock too, or each concurrent run has a copy of its own (AGENTS.md, "Disk space").
+
 **Files in the title folder** (read at start; on the host too, except `play.cfg`):
 
 | File | Effect |
@@ -553,6 +571,7 @@ small files). With `netrun.txt` and no PC command line, a Dolphin run sends its 
 | `WL_XB_PLAY` | the play setting: `script:<host path>`, `bot:<seed>`, `look:<seed>` or `replay:<capture> [runs]` |
 | `WL_XB_PLAY_OUT` | the folder for screenshots and captures (default `<title folder>/play`) |
 | `WL_XB_DETERMINISTIC` | anything but empty or `0`: the deterministic mode |
+| `WL_XB_HDD_LOCKED` | `1`: the harness holds the hard disk folder's lock for the run (`wl_xb_hdd_lock` is not taken) |
 | `WL_XB_DET_NS` | `<backward jump>,<kernel call>,<device access>` nanoseconds of virtual time (default 40,400,400) |
 | `WL_XB_FRAME_MB`, `WL_XB_FRAME_KB` | a frame limit for guest memory, paged as the Wii pages (KB wins) |
 | `WL_XB_TEXTURE_MB` | the textures' arena (the Wii's is `texture_bytes`) |

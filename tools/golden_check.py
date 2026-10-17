@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import fcntl
 import json
 import os
 import re
@@ -97,21 +98,35 @@ def run_one(cfg: dict, run: dict, out: Path, restorer: Restorer) -> dict:
     if d.exists():
         shutil.rmtree(d)
     d.mkdir(parents=True)
-    restorer.put_back()
-    env = dict(os.environ)
-    env.update(cfg["env"])
-    env["WL_XB_DETERMINISTIC"] = "1"
-    env["WL_XB_PLAY"] = "script:" + run["script"]
-    env["WL_XB_PLAY_OUT"] = str(d)
-    env["WL_XB_AUDIO_HASH"] = str(d / "audio.txt")
-    log = d / "run.log"
-    with open(log, "wb") as lf:
+    # The hdd folder is this run's alone from the put-back to the end (wl/xboxrt/boot.h,
+    # wl_xb_hdd_lock): another run on it, or another harness's put-back, writes the files this one
+    # reads its dropped pages back from (a crash at a fixed tick that looks like a race). The lock is
+    # waited for, then passed to the program (WL_XB_HDD_LOCKED says so) and held by both.
+    hdd_fd = os.open(cfg["hdd"], os.O_RDONLY | os.O_DIRECTORY)
+    try:
         try:
-            p = subprocess.run([cfg["exe"], cfg["title"], cfg["hdd"]], env=env, stdout=lf,
-                               stderr=subprocess.STDOUT, timeout=cfg["timeout"])
-            status = f"exit {p.returncode}"
-        except subprocess.TimeoutExpired:
-            status = "timeout"
+            fcntl.flock(hdd_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"{run['name']}: waiting for {cfg['hdd']} (another run has it)", flush=True)
+            fcntl.flock(hdd_fd, fcntl.LOCK_EX)
+        restorer.put_back()
+        env = dict(os.environ)
+        env.update(cfg["env"])
+        env["WL_XB_DETERMINISTIC"] = "1"
+        env["WL_XB_PLAY"] = "script:" + run["script"]
+        env["WL_XB_PLAY_OUT"] = str(d)
+        env["WL_XB_AUDIO_HASH"] = str(d / "audio.txt")
+        env["WL_XB_HDD_LOCKED"] = "1"
+        log = d / "run.log"
+        with open(log, "wb") as lf:
+            try:
+                p = subprocess.run([cfg["exe"], cfg["title"], cfg["hdd"]], env=env, stdout=lf,
+                                   stderr=subprocess.STDOUT, timeout=cfg["timeout"], pass_fds=(hdd_fd,))
+                status = f"exit {p.returncode}"
+            except subprocess.TimeoutExpired:
+                status = "timeout"
+    finally:
+        os.close(hdd_fd)
     lines = []
     for raw in log.read_text(errors="replace").splitlines():
         m = LINE_RE.search(raw)
