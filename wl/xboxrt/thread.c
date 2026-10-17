@@ -109,6 +109,24 @@ bool wl_xb_lock_held(void) {
 
 // ---- Ready queue (g_m held) ------------------------------------------------------------------
 
+// A wait or a card transfer begins / ends: its time to the thread's (g_m held).
+static void off_begin(WlXbThread *t, bool io) {
+    t->off_since_us = wl_xb_time_us();
+    t->off_io = io;
+}
+
+static void off_end(WlXbThread *t, uint64_t now) {
+    if (t->off_since_us != 0) {
+        uint64_t us = now > t->off_since_us ? now - t->off_since_us : 0u;
+        if (t->off_io) {
+            t->io_us += us;
+        } else {
+            t->waited_us += us;
+        }
+        t->off_since_us = 0;
+    }
+}
+
 static void enqueue(WlXbThread *t) {
     WlXbThread *volatile *pp = &g_ready;
     while (*pp != NULL && (*pp)->priority >= t->priority) {
@@ -118,13 +136,16 @@ static void enqueue(WlXbThread *t) {
     *pp = t;
     t->ready = true;
     t->ready_since_us = wl_xb_time_us();
+    off_end(t, t->ready_since_us);
     g_xb_attention = 1; // the holder gives the lock up at its next safe point when this one outranks it
 }
 
 // `t` leaves the ready queue for the lock: how long it waited (g_m held).
-static void note_ready_wait(const WlXbThread *t) {
+static void note_ready_wait(WlXbThread *t) {
+    uint64_t us = wl_xb_time_us() - t->ready_since_us;
+    t->ready_us += us;
     if (!t->is_service) {
-        wl_xb_latency_add(&g_ready_waits, wl_xb_time_us() - t->ready_since_us);
+        wl_xb_latency_add(&g_ready_waits, us);
     }
 }
 
@@ -179,6 +200,7 @@ static void log_guest_stack(const char *what, const WlXbThread *t, const WlXbThr
 // addresses, and where its host thread is (wl_xb_backend_probe). Nothing of this runs before.
 static void take(WlXbThread *self) {
     if (g_owner == NULL && g_ready == NULL) {
+        off_end(self, wl_xb_time_us());
         g_owner = self;
     } else {
         enqueue(self);
@@ -260,6 +282,7 @@ static bool det_wait(WlXbThread *self, uint32_t timeout_ms) {
     g_cur = NULL;
     wl_platform_mutex_lock(g_m);
     g_stats.waits++;
+    off_begin(self, false);
     if (self->woken || timeout_ms == 0) {
         enqueue(self); // a wake came first, or no time to wait: only a yield
     } else {
@@ -309,6 +332,7 @@ bool wl_xb_wait(WlXbThread *self, uint32_t timeout_ms) {
     g_cur = NULL;
     wl_platform_mutex_lock(g_m);
     g_stats.waits++;
+    off_begin(self, false);
     hand_off();
     uint64_t start = wl_platform_time_ms();
     while (!self->woken) {
@@ -608,6 +632,9 @@ WlXbThread *wl_xb_block_begin(void) {
         return NULL;
     }
     g_stats.io_blocks++;
+    wl_platform_mutex_lock(g_m);
+    off_begin(self, true);
+    wl_platform_mutex_unlock(g_m);
     wl_xb_unlock(self);
     return self;
 }
@@ -1248,6 +1275,22 @@ void wl_xb_latency_log(const char *tag, const char *what, WlXbLatency *h) {
              (unsigned)c.count, (unsigned)c.n[0], (unsigned)c.n[1], (unsigned)c.n[2], (unsigned)c.n[3],
              (unsigned)c.n[4], (unsigned)c.n[5], (unsigned)c.n[6], (unsigned)c.n[7], (unsigned)c.n[8],
              (unsigned)c.n[9], (unsigned)c.max_ms);
+}
+
+void wl_xb_thread_times(const WlXbThread *t, WlXbThreadTimes *out) {
+    memset(out, 0, sizeof *out);
+    if (t == NULL) {
+        return;
+    }
+    wl_platform_mutex_lock(g_m);
+    uint64_t now = wl_xb_time_us();
+    out->ready_us = t->ready_us + (t->ready ? now - t->ready_since_us : 0u);
+    out->waited_us = t->waited_us;
+    out->io_us = t->io_us;
+    if (t->off_since_us != 0 && now > t->off_since_us) {
+        *(t->off_io ? &out->io_us : &out->waited_us) += now - t->off_since_us;
+    }
+    wl_platform_mutex_unlock(g_m);
 }
 
 void wl_xb_thread_log_ready_waits(void) {

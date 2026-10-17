@@ -38,6 +38,10 @@ static struct {
 } g_vblank_hooks[MAX_VBLANK_HOOKS];
 static uint32_t g_vblank_hook_count;
 static volatile uint32_t g_vblank_count;
+// threads in wl_xb_vblank_wait (the guest lock guards it)
+#define MAX_VBLANK_WAITERS 4u
+static WlXbThread *g_vblank_waiters[MAX_VBLANK_WAITERS];
+static uint32_t g_vblank_waits, g_vblank_wait_us; // since the last status line
 
 static WlPlatformMutex g_sm; // g_pending, g_deadline, the service thread's sleep
 static WlPlatformCond g_sc;
@@ -112,6 +116,42 @@ WlResult wl_xb_service_add_vblank_hook(WlXbVblankFn fn, void *user) {
 
 uint32_t wl_xb_vblank_count(void) {
     return g_vblank_count;
+}
+
+bool wl_xb_vblank_wait(uint32_t timeout_ms) {
+    WlXbThread *self = wl_xb_current();
+    if (self == NULL || self->is_service || g_in_service) {
+        return false;
+    }
+    uint32_t slot = 0;
+    while (slot < MAX_VBLANK_WAITERS && g_vblank_waiters[slot] != NULL) {
+        slot++;
+    }
+    if (slot == MAX_VBLANK_WAITERS) {
+        return false;
+    }
+    g_vblank_waiters[slot] = self;
+    uint32_t count = g_vblank_count;
+    uint64_t t0 = wl_xb_time_us();
+    // (a vertical blank between here and the wait leaves the thread woken: the wait returns at once)
+    bool woke = wl_xb_wait(self, timeout_ms);
+    if (g_vblank_waiters[slot] == self) {
+        g_vblank_waiters[slot] = NULL;
+    }
+    g_vblank_waits++;
+    g_vblank_wait_us += (uint32_t)(wl_xb_time_us() - t0);
+    return woke && g_vblank_count != count;
+}
+
+// The vertical blank's round, after the hooks: the threads waiting for it go on.
+static void vblank_wake_waiters(void) {
+    for (uint32_t i = 0; i < MAX_VBLANK_WAITERS; i++) {
+        WlXbThread *t = g_vblank_waiters[i];
+        if (t != NULL) {
+            g_vblank_waiters[i] = NULL;
+            wl_xb_wake(t);
+        }
+    }
 }
 
 WlResult wl_xb_service_add_tick(WlXbTickFn fn, void *user, uint32_t period_us) {
@@ -341,6 +381,7 @@ static void run_service(void) {
             for (uint32_t i = 0; i < g_vblank_hook_count; i++) {
                 g_vblank_hooks[i].fn(g_vblank_hooks[i].user);
             }
+            vblank_wake_waiters();
         }
         if (reasons & WL_XB_SVC_DEVICE) {
             run_ticks();
@@ -546,6 +587,13 @@ static void status_report(void) {
              (unsigned)(g_stats.vblanks_skipped - last.vblanks_skipped),
              (unsigned)(g_stats.vblanks_dropped - last.vblanks_dropped));
     last = g_stats;
+    if (g_vblank_waits != 0) {
+        // a title's frame loop waiting for its vblank asleep (wl_xb_vblank_wait) instead of spinning
+        WL_LOG_I(TAG, "vblank waits: %u, %u ms asleep (10 s)", (unsigned)g_vblank_waits,
+                 (unsigned)(g_vblank_wait_us / 1000u));
+        g_vblank_waits = 0;
+        g_vblank_wait_us = 0;
+    }
     wl_xb_thread_log_ready_waits();
     if (g_status_hook != NULL) {
         g_status_hook();
