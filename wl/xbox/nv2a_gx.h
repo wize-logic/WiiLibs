@@ -114,6 +114,9 @@ typedef struct WlNv2aGxStats {
     uint32_t target_skipped;      // ... that had no render target (no memory, a size or format GX has not)
     uint32_t targets_written;     // targets the guest stored to after their image was made
     uint32_t border_clamped;      // textures bound with border addressing, clamped to their edge
+    uint32_t frames_kept;         // finished back buffers kept as a texture (a title that reads one it showed)
+    uint32_t kept_frame_reads;    // texture binds the kept frame served
+    uint32_t kept_frame_misses;   // reads of a displayed surface other than the kept frame's (an older picture)
     uint32_t screen_reads_unserved; // reads of a picture GX drew that no park or kept frame served (no texture)
     uint32_t programs_unusable;   // draws whose combiners GX cannot hold (texture 0 times colour)
     uint32_t approximations;      // draws whose combiners or blending were approximated

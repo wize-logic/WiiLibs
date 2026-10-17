@@ -248,10 +248,12 @@ static void gpu_status(void) {
     WlNv2aTexCacheStats ts;
     wl_nv2a_texcache_stats(wl_nv2a_gx_textures(g_gx), &ts);
     WL_LOG_I(TAG, "status: %u frames, %u draws (%u perspective, %u into targets, %u target-less, %u stencil "
-             "only (skipped), %u stencil ignored, %u programs beyond GX, %u approximated)", (unsigned)gs.frames, (unsigned)gs.draws,
+             "only (skipped), %u stencil ignored, %u programs beyond GX, %u approximated); %u frames kept as a texture (%u "
+             "reads, %u of an older one)", (unsigned)gs.frames, (unsigned)gs.draws,
              (unsigned)gs.perspective_draws, (unsigned)gs.target_draws, (unsigned)gs.target_skipped,
              (unsigned)gs.stencil_skipped, (unsigned)gs.stencil_ignored, (unsigned)gs.programs_unusable,
-             (unsigned)gs.approximations);
+             (unsigned)gs.approximations, (unsigned)gs.frames_kept, (unsigned)gs.kept_frame_reads,
+             (unsigned)gs.kept_frame_misses);
     WlXboxPshCacheCounts pc;
     wl_nv2a_gx_psh_counts(g_gx, &pc);
     // (the pixel programs' cache: a translation is long, and a program should be translated about once)

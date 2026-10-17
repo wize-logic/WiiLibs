@@ -505,9 +505,10 @@ static void frame_finished(TGuest *g, uint32_t color) {
 // A title that samples a picture it showed (the surface it flipped to, as a linear 640x480
 // texture), as Halo's sun glare reads the last frame's alpha: on the NV2A that picture is in
 // memory, on GX it was only in the EFB. Once a displayed surface is read, each finished back buffer
-// is copied into a target at its address, and the next frame samples it.
+// is copied into one kept frame at its address, and the next frame samples it.
 TEST a_picture_shown_is_sampled_the_next_frame(void) {
     TGuest g;
+    WlNv2aGxStats stats;
     unsigned frame;
     enum { F_COLOR2 = 0x180000 };
 
@@ -517,9 +518,10 @@ TEST a_picture_shown_is_sampled_the_next_frame(void) {
     t_m1(&g, WL_NV2A_K_SET_DEPTH_TEST_ENABLE, 0);
     // frames into F_COLOR and F_COLOR2 by turns: a quad of the frame's colour at (100, 100), and
     // from the second on a quad at (300, 100) sampling the picture shown before
-    for (frame = 0; frame < 3; frame++) {
+    for (frame = 0; frame < 4; frame++) {
         uint32_t back = frame & 1u ? (uint32_t)F_COLOR2 : (uint32_t)F_COLOR, shown = back == F_COLOR ? F_COLOR2 : F_COLOR;
-        uint32_t colour = frame == 1 ? 0xFF00FF00u : 0xFF0000FFu; // (ABGR: green, then red)
+        // (ABGR: red, green, blue, red)
+        uint32_t colour = frame == 1 ? 0xFF00FF00u : frame == 2 ? 0xFFFF0000u : 0xFF0000FFu;
 
         frame_into(&g, back);
         f_texture(&g, F_TEXTURE, WL_NV2A_TEX_SZ_A8R8G8B8, 2, 2);
@@ -539,13 +541,21 @@ TEST a_picture_shown_is_sampled_the_next_frame(void) {
         }
         t_kick(&g);
         if (frame == 2) {
-            // the third frame shows the second's green quad (the first, read before any picture was
-            // kept, is not looked at)
-            ASSERT(near_rgb(pixel(150, 150), 0xFF0000FFu, 4));
+            // the third frame (blue) shows the second's green quad (the first, read before any picture
+            // was kept, is not looked at)
+            ASSERT(near_rgb(pixel(150, 150), 0x0000FFFFu, 4));
             ASSERT(near_rgb(pixel(350, 150), 0x00FF00FFu, 4));
+        }
+        if (frame == 3) {
+            // the fourth the third's blue: the one kept frame moved to the other buffer's address
+            ASSERT(near_rgb(pixel(350, 150), 0x0000FFFFu, 4));
         }
         frame_finished(&g, back);
     }
+    wl_nv2a_gx_stats(g_gx, &stats);
+    ASSERT(stats.frames_kept >= 2u);
+    ASSERT(stats.kept_frame_reads >= 2u);
+    ASSERT_EQ(0u, stats.kept_frame_misses);
     pixel_done(&g);
     PASS();
 }
