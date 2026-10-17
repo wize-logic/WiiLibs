@@ -281,7 +281,11 @@ even, so its winding holds).
   `targets_written`); an image read through a format without alpha (X8R8G8B8, R5G6B5) has 1 for its
   alpha, not the EFB's. Once a title
   samples a surface it showed (a displayed picture as a texture), each finished back buffer is
-  copied out of the EFB into a target at its address too, for the next frame. The frame's first
+  copied out of the EFB into a target at its address too, for the next frame (not for a read of the
+  picture being drawn, which the park serves: the back buffer is a displayed surface too, and a10's
+  opening kept two 1.2 MB frames and copied one out every frame that nothing read; nor is the
+  picture being drawn converted from its guest memory, which holds none, before the park is whole:
+  that took 1.2 MB of the textures' arena). The frame's first
   full clear is GX's copy clear, others are quads. A frame is shown on FLIP_INCREMENT_WRITE, on a
   switch to another screen-sized surface, or when the display flips to the surface in the EFB.
 - **Textures** (`nv2a_texture.h`, `nv2a_texcache.h`): a stage's registers decoded (swizzled, linear,
