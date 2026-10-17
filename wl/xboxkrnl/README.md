@@ -149,6 +149,10 @@ Stubs and approximations among them:
 
 - The AV option numbers and the capability word follow xboxrecomp's numbering (option 6 gives the
   AV pack, the standard in bits 8 and up, 60 Hz).
+- `NtReadFile`/`NtWriteFile` on a regular file give the guest lock up while the card works (a
+  transfer of 16 KB or more, or any while another thread has the card), 256 KB at a time, holding a
+  reference on the file: other threads run meanwhile, as on the console. The deterministic mode keeps
+  the lock (its clock does not see the card).
 - `ETHREAD.UniqueThread` is at KTHREAD + 0x134. The `XC_MAX_OS` user section's layout comes from
   public headers as remembered and is not checked against a console.
 - `KeQueryPerformanceFrequency` is 3 375 000 Hz, `KeTimeIncrement` 1 ms in 100 ns units.

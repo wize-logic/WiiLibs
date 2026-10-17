@@ -25,6 +25,13 @@
 #include "wl/xboxkrnl/nt_file.h"
 
 #define BOUNCE 65536u
+// A regular file's read or write of XK_BLOCK_MIN bytes or more (or any, while another thread has the
+// card) goes to the card outside the guest lock, XK_SPAN bytes at a time (wl_xb_block_begin): the
+// other threads and the interrupts go on, as while an Xbox thread waits for its disk. A slow card
+// held them all off for seconds (a level load, a checkpoint's 3 MB save): no vertical blank, no
+// audio frame, no input.
+#define XK_BLOCK_MIN (16u << 10)
+#define XK_SPAN (256u << 10)
 #define SIDECAR ".wlsz"
 #define RAW_KEEP 0x10000u
 #define XK_IO_LOG_BYTES (64ull << 20)
@@ -657,6 +664,74 @@ static uint64_t io_offset(XkFile *f, uint32_t offset_va) {
     return f->pos;
 }
 
+// A regular file's bytes [at, at + len) from the card into `dst`, BOUNCE bytes at a time under the
+// card's lock (with or without the guest lock), zeros past its written bytes `phys`. The bytes read
+// before a failure, or `len`.
+static uint32_t card_read(XkFile *f, uint64_t at, uint8_t *dst, uint32_t len, uint64_t phys) {
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t chunk = len - done < BOUNCE ? len - done : BOUNCE;
+        uint32_t got = 0;
+        if (at + done < phys) {
+            uint64_t left = phys - (at + done);
+            uint32_t want = left < chunk ? (uint32_t)left : chunk;
+            wl_xb_card_lock();
+            WlResult r = f->pf != NULL ? wl_platform_fs_read_some_at(f->pf, at + done, dst + done, want, &got)
+                                       : WL_ERR_STATE; // (renamed meanwhile: its handle let go)
+            wl_xb_card_unlock();
+            if (r != WL_OK) {
+                return done;
+            }
+        }
+        memset(dst + done + got, 0, chunk - got); // past the written bytes of a sparse file
+        done += chunk;
+    }
+    return done;
+}
+
+// The same for a write: true when every byte went to the card.
+static bool card_write(XkFile *f, uint64_t at, const uint8_t *src, uint32_t len) {
+    for (uint32_t done = 0; done < len;) {
+        uint32_t chunk = len - done < BOUNCE ? len - done : BOUNCE;
+        wl_xb_card_lock();
+        WlResult r = f->pf != NULL ? wl_platform_fs_write_at(f->pf, at + done, src + done, chunk) : WL_ERR_STATE;
+        wl_xb_card_unlock();
+        if (r != WL_OK) {
+            return false;
+        }
+        done += chunk;
+    }
+    return true;
+}
+
+// The buffer of an I/O of `len` bytes on `f`: a regular file's has its own (up to XK_SPAN bytes: *own
+// true), so that the guest lock can be given up around the card's part; another's is g_bounce, the
+// lock kept (BOUNCE bytes).
+static uint8_t *io_buffer(const XkFile *f, uint32_t len, uint32_t *cap, bool *own) {
+    *own = false;
+    *cap = BOUNCE;
+    if (f->kind != XK_FILE_REGULAR || len == 0 || wl_xb_deterministic()) {
+        return g_bounce;
+    }
+    uint32_t bytes = len < XK_SPAN ? len : XK_SPAN;
+    uint8_t *p = aligned_alloc(64, (bytes + 63u) & ~63u);
+    if (p == NULL) {
+        return g_bounce;
+    }
+    *own = true;
+    *cap = bytes;
+    return p;
+}
+
+// Whether a transfer of `len` bytes into its own buffer gives the guest lock up: a large one always,
+// a small one when another thread has the card (its wait would hold every thread off).
+static WlXbThread *card_begin(bool own, uint32_t len) {
+    if (!own || (len < XK_BLOCK_MIN && !wl_xb_card_busy())) {
+        return NULL;
+    }
+    return wl_xb_block_begin();
+}
+
 static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uint32_t *done) {
     *done = 0;
     if (f->kind == XK_FILE_DIRECTORY) {
@@ -674,25 +749,34 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
     }
     uint32_t n = size - off < len ? (uint32_t)(size - off) : len;
     uint64_t phys = f->kind == XK_FILE_REGULAR ? physical_size(f) : 0;
+    uint32_t cap, status = STATUS_SUCCESS;
+    bool span;
+    uint8_t *io = io_buffer(f, off < phys ? n : 0u, &cap, &span);
     while (*done < n) {
-        uint32_t chunk = n - *done < BOUNCE ? n - *done : BOUNCE;
+        uint32_t chunk = n - *done < cap ? n - *done : cap;
         uint64_t at = off + *done;
+        uint32_t got = chunk;
         if (f->kind == XK_FILE_PARTITION) {
-            xk_raw_read(f->partition, at, g_bounce, chunk);
+            xk_raw_read(f->partition, at, io, chunk);
         } else if (f->kind == XK_FILE_CDROM) {
-            memset(g_bounce, 0, chunk);
+            memset(io, 0, chunk);
         } else {
-            uint32_t got = 0;
-            if (at < phys) {
-                uint32_t want = phys - at < chunk ? (uint32_t)(phys - at) : chunk;
-                if (wl_platform_fs_read_some_at(f->pf, at, g_bounce, want, &got) != WL_OK) {
-                    return *done > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-                }
-            }
-            memset(g_bounce + got, 0, chunk - got); // past the written bytes of a sparse file
+            WlXbThread *self = card_begin(span, n);
+            got = card_read(f, at, io, chunk, phys);
+            wl_xb_block_end(self);
         }
-        wl_xb_copy_in(buf + *done, g_bounce, chunk);
-        *done += chunk;
+        wl_xb_copy_in(buf + *done, io, got);
+        *done += got;
+        if (got < chunk) {
+            status = *done > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+            break;
+        }
+    }
+    if (span) {
+        free(io);
+    }
+    if (*done < n) {
+        return status;
     }
     if (off < phys) {
         // the whole pages filled from the file's bytes remember them: unchanged, they are read
@@ -716,16 +800,27 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
     if (f->kind != XK_FILE_PARTITION) {
         pages_forget(f, off, len);
     }
+    uint32_t cap;
+    bool span;
+    uint8_t *io = io_buffer(f, len, &cap, &span);
     while (*done < len) {
-        uint32_t chunk = len - *done < BOUNCE ? len - *done : BOUNCE;
-        wl_xb_copy_out(g_bounce, buf + *done, chunk);
+        uint32_t chunk = len - *done < cap ? len - *done : cap;
+        wl_xb_copy_out(io, buf + *done, chunk);
         if (f->kind == XK_FILE_PARTITION) {
-            xk_raw_write(f->partition, off + *done, g_bounce, chunk);
-        } else if (wl_platform_fs_write_at(f->pf, off + *done, g_bounce, chunk) != WL_OK) {
-            status = STATUS_DISK_FULL; // the card is full: what was written stays, and counts
-            break;
+            xk_raw_write(f->partition, off + *done, io, chunk);
+        } else {
+            WlXbThread *self = card_begin(span, len);
+            bool ok = card_write(f, off + *done, io, chunk);
+            wl_xb_block_end(self);
+            if (!ok) {
+                status = STATUS_DISK_FULL; // the card is full: what was written stays, and counts
+                break;
+            }
         }
         *done += chunk;
+    }
+    if (span) {
+        free(io);
     }
     if (f->sparse && f->fcb != NULL && off + *done > f->fcb->logical) {
         f->fcb->logical = off + *done;
@@ -787,11 +882,13 @@ static uint32_t complete_io(XkFile *f, uint32_t handle, uint32_t event, uint32_t
 //     PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset)
 void k_NtReadFile(void) {
     uint32_t handle = ARG(0);
-    XkFile *f = file_of(handle);
+    XkObject *o = xk_handle_get_type(handle, XK_OBJ_FILE);
+    XkFile *f = o != NULL ? o->file : NULL;
     if (f == NULL) {
         RET(STATUS_INVALID_HANDLE);
         return;
     }
+    xk_object_reference(o); // the file stays while the card's part runs outside the guest lock (do_read)
     begin_io(handle, ARG(1));
     uint64_t off = io_offset(f, ARG(7));
     uint32_t done = 0;
@@ -802,12 +899,14 @@ void k_NtReadFile(void) {
         io_note(f, false, off, done, wl_platform_time_us() - t0);
     }
     RET(complete_io(f, handle, ARG(1), ARG(2), ARG(3), ARG(4), status, done));
+    xk_object_release(o);
 }
 
 // NTSTATUS NtWriteFile(...the same arguments...)
 void k_NtWriteFile(void) {
     uint32_t handle = ARG(0);
-    XkFile *f = file_of(handle);
+    XkObject *o = xk_handle_get_type(handle, XK_OBJ_FILE);
+    XkFile *f = o != NULL ? o->file : NULL;
     if (f == NULL) {
         RET(STATUS_INVALID_HANDLE);
         return;
@@ -818,6 +917,7 @@ void k_NtWriteFile(void) {
         RET(STATUS_ACCESS_DENIED);
         return;
     }
+    xk_object_reference(o); // the file stays while the card's part runs outside the guest lock (do_read)
     begin_io(handle, ARG(1));
     uint64_t off = io_offset(f, ARG(7));
     uint32_t done = 0;
@@ -828,6 +928,7 @@ void k_NtWriteFile(void) {
         io_note(f, true, off, done, wl_platform_time_us() - t0);
     }
     RET(complete_io(f, handle, ARG(1), ARG(2), ARG(3), ARG(4), status, done));
+    xk_object_release(o);
 }
 
 // NTSTATUS NtFlushBuffersFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock)
@@ -1089,8 +1190,10 @@ void k_NtSetInformationFile(void) {
         for (XkFile *o = f->fcb->files; o != NULL; o = o->fcb_next) {
             if (o->pf != NULL) {
                 wl_xb_file_forget(o->pf, 0, UINT64_MAX);
+                wl_xb_card_lock(); // (a read or write of another thread may be on it, outside the guest lock)
                 wl_platform_fs_close(o->pf);
                 o->pf = NULL;
+                wl_xb_card_unlock();
                 g_files_open--;
             }
         }

@@ -743,6 +743,75 @@ TEST a_raised_irql_keeps_the_processor(void) {
     PASS();
 }
 
+// ---- The card's I/O outside the lock ------------------------------------------------------------
+// An Xbox thread waits in its disk I/O while the others run. A real Wii's card is slow (and busy with
+// a profile's dump or a checkpoint's copy): a read made with the guest lock held kept the interrupts
+// and every other thread off for one to two seconds. Here another host thread holds the card for
+// 150 ms while the guest reads a file; the devices' ticks go on meanwhile.
+
+static uint32_t open_path(const char *path, uint32_t access, uint32_t disposition, uint32_t options, uint32_t *status);
+static _Alignas(32) uint8_t g_card_stack[64 * 1024];
+static volatile uint32_t g_card_state;
+
+static void *card_holder(void *arg) {
+    (void)arg;
+    wl_xb_card_lock();
+    g_card_state = 1;
+    wl_platform_thread_sleep_ms(150);
+    g_card_state = 2;
+    wl_xb_card_unlock();
+    return NULL;
+}
+
+TEST card_io_gives_the_lock_up(void) {
+    boot();
+    ASSERT(g_ready);
+    if (wl_xb_deterministic()) {
+        SKIPm("the virtual clock: the card's I/O keeps the lock");
+    }
+    reset_scratch();
+    const uint32_t n = 64u * 1024u;
+    uint32_t st = 0, iosb = gmem(8), off = gmem(8), base_p = gmem(4), size_p = gmem(4);
+    wl_xb_wr32(base_p, 0);
+    wl_xb_wr32(size_p, n);
+    ASSERT_EQ_FMT(0u, KN(S_NT_ALLOC_VM, base_p, 0, size_p, 0x3000, 4), "%08x"); // MEM_RESERVE | MEM_COMMIT
+    uint32_t buf = wl_xb_rd32(base_p);
+    uint32_t h = open_path("z:\\cardio.bin", 0xC0000000u, 5, 0x20, &st); // OVERWRITE_IF
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    for (uint32_t i = 0; i < n; i += 4u) {
+        wl_xb_wr32(buf + i, i * 2654435761u);
+    }
+    wl_xb_wr64(off, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h, 0, 0, 0, iosb, buf, n, off), "%08x");
+    for (uint32_t i = 0; i < n; i += 4u) {
+        wl_xb_wr32(buf + i, 0);
+    }
+    g_card_state = 0;
+    WlPlatformThread holder;
+    ASSERT_EQ(WL_OK, wl_platform_thread_create(&holder, card_holder, NULL, g_card_stack, sizeof g_card_stack,
+                                               WL_THREAD_PRIO_MAIN));
+    while (g_card_state == 0) {
+        wl_platform_thread_sleep_ms(1);
+    }
+    WlXbThreadStats ts0, ts1;
+    wl_xb_thread_stats(&ts0);
+    const uint32_t ticks0 = g_tick_runs; // (device_ticks_run_at_safe_points's tick, every 2 ms)
+    ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, 0, 0, 0, iosb, buf, n, off), "%08x");
+    ASSERT_EQ_FMT(2u, g_card_state, "%u"); // the read waited for the card
+    ASSERT(g_tick_runs - ticks0 >= 10u);   // about 75: the service thread had the lock meanwhile
+    wl_xb_thread_stats(&ts1);
+    ASSERT(ts1.io_blocks > ts0.io_blocks);
+    ASSERT_EQ_FMT(n, wl_xb_rd32(iosb + 4), "%u");
+    for (uint32_t i = 0; i < n; i += 4u) {
+        if (wl_xb_rd32(buf + i) != i * 2654435761u) {
+            FAILm("the bytes read differ");
+        }
+    }
+    ASSERT_EQ(WL_OK, wl_platform_thread_join(holder, NULL));
+    KN(S_NT_CLOSE, h);
+    PASS();
+}
+
 // ---- Waits satisfied at signal time ----------------------------------------------------------------
 // A signal satisfies the waits it can at once, as NT does, so the waiter gets the object even when
 // it runs only after the signaller has undone the signal: a pulse, a set and a reset in one go, a
@@ -2119,6 +2188,7 @@ SUITE(kernel_suite) {
     RUN_TEST(device_polls_are_safe_points);
     RUN_TEST(device_ticks_run_at_safe_points);
     RUN_TEST(a_raised_irql_keeps_the_processor);
+    RUN_TEST(card_io_gives_the_lock_up);
     RUN_TEST(a_signal_satisfies_the_waiter_at_once);
     RUN_TEST(no_yield_at_dispatch_level);
     RUN_TEST(an_ended_owner_abandons_its_mutants);

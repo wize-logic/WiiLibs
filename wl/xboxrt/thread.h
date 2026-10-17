@@ -172,6 +172,23 @@ void wl_xb_yield_point(void);
 // Gives the lock up to every ready thread of equal or higher priority (NtYieldExecution); not at
 // DISPATCH_LEVEL or above (see wl_xb_safe_point).
 void wl_xb_yield(void);
+// A kernel call's host work that blocks (the card's reads and writes) runs outside the lock, as an
+// Xbox thread waits in its I/O while the others run (and the interrupts go on): wl_xb_block_begin
+// saves the caller's registers and gives the lock up, returning the caller, or keeps it and returns
+// NULL (the deterministic mode, whose clock does not see the card; DISPATCH_LEVEL or above; the
+// service thread; a caller without the lock). Between the two the caller touches no guest memory and
+// no state the lock guards; wl_xb_block_end(the result) takes the lock back (NULL: nothing).
+WlXbThread *wl_xb_block_begin(void);
+void wl_xb_block_end(WlXbThread *self);
+// The card's lock: a host file's transfer at an offset (a seek, then the read or write, on one
+// handle) that may run outside the guest lock is made under it (the kernel's file I/O after
+// wl_xb_block_begin), and so is every other transfer on a handle such a one may use (the paging's
+// reads of the files its pages remember). Taken with or without the guest lock; the guest lock is
+// never taken while it is held. Nothing before wl_xb_threads_init.
+void wl_xb_card_lock(void);
+void wl_xb_card_unlock(void);
+// Whether another thread has the card's lock now (a hint: it may change at once).
+bool wl_xb_card_busy(void);
 
 // A safe point in the middle of guest code: what wl_xb_yield_point does (the interrupt work, with
 // the level sources asked too, then a yield when one is due), for the device-access fault paths
@@ -258,6 +275,7 @@ typedef struct {
     // I/O alone moves on by them, as the deterministic mode counts a safe point only when something
     // is due
     uint32_t kernel_calls;
+    uint32_t io_blocks; // kernel calls that gave the lock up for the card (wl_xb_block_begin)
 } WlXbThreadStats;
 void wl_xb_thread_stats(WlXbThreadStats *out);
 // What the stall watch counts as the guest moving on: hand-offs, safe points, waits, wakes,
