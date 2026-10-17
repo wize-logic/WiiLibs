@@ -151,16 +151,15 @@ struct WlNv2aGx {
     float loaded_bias;
     uint32_t loaded_w, loaded_h;
     float fit_a, fit_b;
-    // the last fit made through the canonical points as well as the vertices (spread through the
-    // depth: the camera's projection), for a draw whose vertices alone span too little
-    float wide_a, wide_b;
-    bool wide;
+    // the camera's slope (wl_nv2a_gx_slope_keep), for a draw whose vertices alone span too little
+    WlNv2aGxSlope slope;
     // the fits kept by their transform's signature: the clip-space positions the program gives the
     // canonical inputs, bit for bit
     struct FitSignature {
         uint32_t clip[CANONICAL_POINTS][4];
         float a, b;
         uint32_t used;
+        bool narrow; // (made with the camera's slope: shared within NARROW_TOLERANCE only)
     } signatures[FIT_SETS][FIT_WAYS];
     uint32_t signature_use;
     bool last_shared;
@@ -1176,6 +1175,44 @@ static float offset_fit(float b, const float *inverse_w, const float *depth, uns
     return 0.5f * (high - low);
 }
 
+bool wl_nv2a_gx_slope_keep(WlNv2aGxSlope *s, float a, float b, const float *inverse_w, const float *depth, unsigned n,
+                           float depth_max, uint32_t frame, uint32_t target) {
+    float near_w = 0.0f, far_w = 0.0f;
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        near_w = i == 0 || inverse_w[i] < near_w ? inverse_w[i] : near_w;
+        far_w = i == 0 || inverse_w[i] > far_w ? inverse_w[i] : far_w;
+    }
+    // (a few vertices spread in depth, as projection_fit's enough, and the fit holding for them: a fit
+    // through the canonical points alone, or over vertices at one depth, is no camera's)
+    if (n < FIT_ENOUGH || !(far_w - near_w > 1.0e-3f * far_w) ||
+        !(fit_error(a, b, inverse_w, depth, n) <= FIT_TOLERANCE)) {
+        return false;
+    }
+    s->b = b;
+    s->depth_max = depth_max;
+    s->frame = frame;
+    s->target = target;
+    s->known = true;
+    return true;
+}
+
+bool wl_nv2a_gx_slope_offset(const WlNv2aGxSlope *s, const float *inverse_w, const float *depth, unsigned n,
+                             float depth_max, uint32_t frame, uint32_t target, float *a, float *b) {
+    float offset;
+
+    // (kept in this frame or the last: a frame's first draws, its characters among them, come before
+    // any fit of the camera's in it)
+    if (!s->known || n == 0 || frame - s->frame > 1u || s->target != target || s->depth_max != depth_max ||
+        !(offset_fit(s->b, inverse_w, depth, n, &offset) <= NARROW_TOLERANCE)) {
+        return false;
+    }
+    *a = offset;
+    *b = s->b;
+    return true;
+}
+
 // the guest's bytes of the draw's vertices first .. first + count - 1 (those in the draw) asked for
 // ahead of their fetch (wl_nv2a_fetch_prefetch): a batch ahead, a miss each line otherwise
 static void draw_prefetch(const WlNv2aFetchPlan *fetch, const WlNv2aDraw *draw, uint32_t first, uint32_t count) {
@@ -1188,6 +1225,12 @@ static void draw_prefetch(const WlNv2aFetchPlan *fetch, const WlNv2aDraw *draw, 
     for (v = first; v < end; v++) {
         wl_nv2a_fetch_prefetch(fetch, wl_nv2a_fetch_element(fetch, v));
     }
+}
+
+// the target a draw's fit is kept for (wl_nv2a_gx_slope_keep): 0 for the screen, whichever back
+// buffer it is drawn into (two take turns, frame by frame), else the render target's colour surface
+static uint32_t fit_target(const WlNv2aGx *gx, const WlNv2aSurface *s) {
+    return surface_is_screen(gx, s) ? 0u : s->color_phys;
 }
 
 // The projection of a draw: a few of its vertices, for their w and depth (OpenCE-Wii's
@@ -1208,14 +1251,15 @@ static void draw_prefetch(const WlNv2aFetchPlan *fetch, const WlNv2aDraw *draw, 
 // a + b / w everywhere). The points that count are those within the depth range (between the near
 // and far planes: what GX draws), the draw's first 24 of them among its first 128 vertices; a draw
 // with none uses its transform's fit as it is.
-static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, float depth_max) {
+static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, float depth_max,
+                                 uint32_t target) {
     Projection p = {false, gx->fit_a, gx->fit_b};
     float inverse_w[FIT_PROBES + CANONICAL_POINTS], depth[FIT_PROBES + CANONICAL_POINTS];
     uint32_t clip[CANONICAL_POINTS][4];
     uint32_t probes = draw->count < FIT_SCAN ? draw->count : FIT_SCAN, v, n = 0, c, i, slot = 0, attributes, run;
     struct FitSignature *set;
     float near_w = 0.0f, far_w = 0.0f, a, b, d;
-    bool all_w1 = true, in_front = false, enough = false;
+    bool all_w1 = true, in_front = false, enough = false, narrow = false;
     WlXboxVshOutput *outputs = gx->batch.outputs;
     WlNv2aFetchPlan fetch;
     uint32_t numbers[FIT_BATCH];
@@ -1307,8 +1351,17 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
     for (i = 0; i < FIT_WAYS; i++) {
         if (set[i].used != 0 && memcmp(set[i].clip, clip, sizeof clip) == 0) {
             // (no vertex in front of the eye among those looked at: the transform's fit as it is)
-            if (n == 0 || fit_error(set[i].a, set[i].b, inverse_w, depth, n) <= SIGNATURE_TOLERANCE) {
+            // (a fit made with the camera's slope, from vertices spanning little depth, only as near as it
+            // was made: the loose tolerance would let it stand for a draw it does not fit)
+            if (n == 0 || fit_error(set[i].a, set[i].b, inverse_w, depth, n) <=
+                              (set[i].narrow ? NARROW_TOLERANCE : SIGNATURE_TOLERANCE)) {
                 set[i].used = gx->signature_use;
+                // (the camera's slope kept for this frame and target by a shared fit too, as most of a
+                // frame's draws share theirs: when it holds for this draw's vertices spread in depth)
+                if (enough && !set[i].narrow) {
+                    wl_nv2a_gx_slope_keep(&gx->slope, set[i].a, set[i].b, inverse_w, depth, n, depth_max, gx->frame,
+                                          target);
+                }
                 p.a = gx->fit_a = set[i].a;
                 p.b = gx->fit_b = set[i].b;
                 gx->last_shared = true;
@@ -1326,17 +1379,17 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
     // a fit for a transform not seen: through the vertices and the canonical points, unless they
     // stray from the vertices; else through the vertices alone (with none in front of the eye, the
     // canonical points alone; with neither, the last fit). Through the vertices alone, the slope of
-    // the last wide fit (the camera's) first when it holds for them, with an offset of their own: a
-    // small or distant model (Halo's skinned characters, whose canonical points stray) spans too
-    // little depth to set a slope (a10's captain: 1 / w over 0.0916..0.0916), and one of its own,
-    // kept for its transform, put him in front of the bridge's console in one frame and behind it
-    // in the next (its error over his body 4e-5, 700 of the depth's steps)
+    // the camera's slope first, for vertices spanning too little depth, when it holds for them with an
+    // offset of their own: a small or distant model (Halo's skinned characters, whose canonical
+    // points stray) spans too little depth to set a slope (a10's captain: 1 / w over
+    // 0.0916..0.0916), and one of its own, kept for its transform, put him in front of the bridge's
+    // console in one frame and behind it in the next (its error over his body 4e-5, 700 of the
+    // depth's steps). The camera's slope is that of the last fit here that held for vertices spread
+    // in depth (never the canonical points' alone), in this frame or the last, target and depth range
     if (fit_two(inverse_w, depth, c, &a, &b) && fit_error(a, b, inverse_w, depth, n) <= FIT_TOLERANCE) {
-        gx->wide_a = a;
-        gx->wide_b = b;
-        gx->wide = true;
-    } else if (n > 0 && gx->wide && offset_fit(gx->wide_b, inverse_w, depth, n, &a) <= NARROW_TOLERANCE) {
-        b = gx->wide_b;
+        wl_nv2a_gx_slope_keep(&gx->slope, a, b, inverse_w, depth, n, depth_max, gx->frame, target);
+    } else if (wl_nv2a_gx_slope_offset(&gx->slope, inverse_w, depth, n, depth_max, gx->frame, target, &a, &b)) {
+        narrow = true;
     } else if (!fit_two(inverse_w, depth, n, &a, &b)) {
         return p;
     }
@@ -1345,6 +1398,7 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
     set[slot].a = a;
     set[slot].b = b;
     set[slot].used = gx->signature_use;
+    set[slot].narrow = narrow;
     p.a = gx->fit_a = a;
     p.b = gx->fit_b = b;
     return p;
@@ -2677,7 +2731,7 @@ static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2
     plan.depth_max = surface->depth_max > 0.0f ? surface->depth_max : 16777215.0f;
     plan.scale = k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE];
     plan.offset = k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET];
-    gx->projection = projection_fit(gx, k, draw, plan.depth_max);
+    gx->projection = projection_fit(gx, k, draw, plan.depth_max, fit_target(gx, surface));
     gx->memo_stamp++;
     wl_nv2a_fetch_plan(draw, wl_nv2a_pipeline_inputs(&gx->pipeline, plan.live), &gx->fetch);
     wl_nv2a_fetch_constants(&gx->fetch, k, gx->batch.inputs, WL_XBOX_VSH_BATCH);
@@ -2911,7 +2965,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     plan.scale = k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE];
     plan.offset = k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET];
 
-    gx->projection = projection_fit(gx, k, draw, plan.depth_max);
+    gx->projection = projection_fit(gx, k, draw, plan.depth_max, fit_target(gx, &surface));
     if (gx->projection.perspective) {
         gx->stats.perspective_draws++;
     }
