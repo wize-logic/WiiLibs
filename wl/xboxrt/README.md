@@ -85,6 +85,9 @@ The same code runs on the host and ppc-be under a frame limit, through `SIGSEGV`
   gathered becomes a zero page (no write, and its next touch zero-fills it). A file read into guest
   memory (`wl_xb_copy_in`) overwrites whole pages: a swapped one among them forgets its slot first
   (`wl_xb_pg_discard`), so the read does not fetch from the swap file bytes it is about to replace.
+  A title that knows a buffer is dead (it writes it again before reading it) says so with
+  `wl_xb_va_discard`: its whole pages give back their frames and slots and read zero (Halo: the
+  texture cache's pages a movie or a map's copy borrowed, when they come back to the cache).
 - **File-backed pages.** The kernel's file reads (NtReadFile) tell the core which whole pages they
   filled from a file's bytes (`wl_xb_file_pages`): such a page is made clean and remembers its file
   and offset in place of a slot, so while unchanged it gives its frame back with nothing written and
@@ -579,6 +582,7 @@ small files). With `netrun.txt` and no PC command line, a Dolphin run sends its 
 | Variable | Effect |
 |---|---|
 | `WL_XB_TRACE` | any value: log every kernel call |
+| `WL_XB_ALLOCS` | `<KB>`: the kernel's allocation census: every contiguous, system or virtual allocation of at least that size logged with its guest callers ("alloc ..."), and `wl_xk_alloc_census_report` (a title's play step) logs each one kept: KB asked, with a frame, not all zero, and a map of where |
 | `WL_XB_PLAY` | the play setting: `script:<host path>`, `bot:<seed>`, `look:<seed>` or `replay:<capture> [runs]` |
 | `WL_XB_PLAY_OUT` | the folder for screenshots and captures (default `<title folder>/play`) |
 | `WL_XB_DETERMINISTIC` | anything but empty or `0`: the deterministic mode |

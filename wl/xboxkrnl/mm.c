@@ -2,7 +2,10 @@
 // Memory exports: contiguous and system memory from the guest-physical allocator (window VAs
 // 0x80000000|P), user virtual memory (reservations and commits), queries, protection (recorded;
 // the mapping is read-write), the GPU's instance memory, and the pools (Ex).
+#include <stdlib.h>
+
 #include "wl/xboxkrnl/kernel_internal.h"
+#include "wl/xboxrt/crash.h"
 #include "wl/xboxrt/page_census.h"
 
 #define MEM_COMMIT 0x1000u
@@ -11,6 +14,115 @@
 #define MEM_RELEASE 0x8000u
 #define MEM_RESET 0x80000u
 #define MEM_PRIVATE 0x20000u
+
+// ---- Allocation census (diagnostics) --------------------------------------------------------------
+// Off until armed (WL_XB_ALLOCS=<KB> on the host, or wl_xk_alloc_census): then every contiguous,
+// system or virtual allocation of at least that size is logged with its guest callers, and kept
+// until freed for wl_xk_alloc_census_report. Off, it costs one compare per allocation.
+
+#define CENSUS_MAX 256u
+#define CENSUS_CALLERS 4u
+
+typedef struct {
+    uint32_t va, bytes;
+    char kind; // 'C' contiguous, 'S' system, 'V' virtual
+    uint32_t callers[CENSUS_CALLERS];
+} XkCensusEntry;
+
+static XkCensusEntry s_census[CENSUS_MAX];
+static uint32_t s_census_count, s_census_min;
+
+void wl_xk_alloc_census(uint32_t min_bytes) {
+    s_census_min = min_bytes;
+}
+
+// The kernel call's return address, then the next return addresses on the guest stack.
+static void census_callers(uint32_t *out) {
+    memset(out, 0, CENSUS_CALLERS * sizeof *out);
+    out[0] = wl_xb_kernel_caller();
+    uint32_t n = 1;
+    for (uint32_t i = 0; i < 96u && n < CENSUS_CALLERS; i++) {
+        uint32_t slot = g_esp + 4u * i;
+        if (!wl_xb_range_ok(slot, 4)) {
+            break;
+        }
+        uint32_t w = wl_xb_rd32(slot);
+        if (w != out[n - 1u] && wl_xb_guest_return_address(w)) {
+            out[n++] = w;
+        }
+    }
+}
+
+static void census_add(char kind, uint32_t va, uint32_t bytes) {
+    if (s_census_min == 0 || bytes < s_census_min) {
+        return;
+    }
+    XkCensusEntry e = {.va = va, .bytes = bytes, .kind = kind};
+    census_callers(e.callers);
+    WL_LOG_I(XK_TAG, "alloc %c 0x%08x %u KB from %08x %08x %08x %08x", kind, (unsigned)va, (unsigned)(bytes >> 10),
+             (unsigned)e.callers[0], (unsigned)e.callers[1], (unsigned)e.callers[2], (unsigned)e.callers[3]);
+    if (s_census_count < CENSUS_MAX) {
+        s_census[s_census_count++] = e;
+    }
+}
+
+static void census_remove(uint32_t va) {
+    if (s_census_min == 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < s_census_count; i++) {
+        if (s_census[i].va == va) {
+            WL_LOG_I(XK_TAG, "free %c 0x%08x %u KB", s_census[i].kind, (unsigned)va, (unsigned)(s_census[i].bytes >> 10));
+            s_census[i] = s_census[--s_census_count];
+            return;
+        }
+    }
+}
+
+// Each allocation kept: its pages with a frame now, and of those the ones not all zero (a page never
+// touched is zero; one swapped out is not seen). A map of the allocation, one character a 256 KB:
+// ' ' nothing nonzero seen, '.' under a quarter, '+' under three quarters, '#' more. Lock held.
+void wl_xk_alloc_census_report(void) {
+    static uint8_t page[WL_XB_PAGE];
+    uint32_t total = 0, total_resident = 0, total_used = 0;
+    WL_LOG_I(XK_TAG, "allocs: %u kept of at least %u KB (KB: asked, resident, nonzero)", (unsigned)s_census_count,
+             (unsigned)(s_census_min >> 10));
+    for (uint32_t i = 0; i < s_census_count; i++) {
+        const XkCensusEntry *e = &s_census[i];
+        uint32_t pages = (e->bytes + WL_XB_PAGE - 1u) >> WL_XB_PAGE_SHIFT, resident = 0, used = 0, chunk_used = 0;
+        char map[129];
+        uint32_t m = 0;
+        for (uint32_t p = 0; p < pages; p++) {
+            uint32_t va = e->va + (p << WL_XB_PAGE_SHIFT);
+            if (wl_xb_mem_peek(va, page, WL_XB_PAGE)) {
+                resident++;
+                for (uint32_t b = 0; b < WL_XB_PAGE; b++) {
+                    if (page[b] != 0) {
+                        used++;
+                        chunk_used++;
+                        break;
+                    }
+                }
+            }
+            if ((p & 63u) == 63u || p + 1u == pages) {
+                uint32_t of = (p & 63u) + 1u;
+                if (m < sizeof map - 1u) {
+                    map[m++] = chunk_used == 0 ? ' ' : chunk_used * 4u < of ? '.' : chunk_used * 4u < of * 3u ? '+' : '#';
+                }
+                chunk_used = 0;
+            }
+        }
+        map[m] = '\0';
+        WL_LOG_I(XK_TAG, "allocs: %c 0x%08x %6u %6u %6u from %08x %08x %08x %08x |%s|", e->kind, (unsigned)e->va,
+                 (unsigned)(e->bytes >> 10), (unsigned)(resident << 2), (unsigned)(used << 2), (unsigned)e->callers[0],
+                 (unsigned)e->callers[1], (unsigned)e->callers[2], (unsigned)e->callers[3], map);
+        total += e->bytes >> 10;
+        total_resident += resident << 2;
+        total_used += used << 2;
+    }
+    WL_LOG_I(XK_TAG, "allocs: total %u KB asked, %u resident, %u nonzero", (unsigned)total, (unsigned)total_resident,
+             (unsigned)total_used);
+}
 
 static uint32_t window_va(uint32_t phys) {
     return WL_XB_WINDOW | phys;
@@ -23,6 +135,7 @@ static uint32_t contiguous(uint32_t bytes, uint32_t lowest, uint32_t highest, ui
                  (unsigned)lowest, (unsigned)highest, (unsigned)align, (unsigned)wl_xb_kernel_caller());
         return 0;
     }
+    census_add(kind == WL_XB_CA_SYSTEM ? 'S' : 'C', window_va(phys), bytes);
     wl_xb_census_alloc(kind, window_va(phys), bytes, wl_xb_kernel_caller());
     return window_va(phys);
 }
@@ -51,6 +164,7 @@ static uint32_t phys_of_window(uint32_t va) {
 // VOID MmFreeContiguousMemory(PVOID BaseAddress)
 void k_MmFreeContiguousMemory(void) {
     uint32_t phys = phys_of_window(ARG(0));
+    census_remove(ARG(0));
     if (phys == 0xFFFFFFFFu || wl_xb_phys_free(phys) != WL_OK) {
         WL_LOG_W(XK_TAG, "MmFreeContiguousMemory(0x%08x): not an allocation", (unsigned)ARG(0));
     }
@@ -66,6 +180,7 @@ void k_MmFreeSystemMemory(void) {
     uint32_t phys = phys_of_window(ARG(0));
     uint32_t size = phys != 0xFFFFFFFFu ? wl_xb_phys_size(phys) : 0;
     if (size != 0) {
+        census_remove(ARG(0));
         wl_xb_phys_free(phys);
     }
     RET(size >> WL_XB_PAGE_SHIFT);
@@ -216,6 +331,7 @@ void k_NtAllocateVirtualMemory(void) {
         if (r == WL_OK) {
             base = va;
             size = (span + WL_XB_PAGE - 1u) & ~(WL_XB_PAGE - 1u);
+            census_add('V', base, size);
         }
     } else {
         uint32_t first = base & ~(WL_XB_PAGE - 1u);
@@ -247,6 +363,7 @@ void k_NtFreeVirtualMemory(void) {
     WlResult r;
     if (type & MEM_RELEASE) {
         uint32_t released = 0;
+        census_remove(base & ~(WL_XB_PAGE - 1u));
         r = wl_xb_va_release(base & ~(WL_XB_PAGE - 1u), &released);
         size = released;
     } else if (type & MEM_DECOMMIT) {
@@ -333,4 +450,9 @@ void k_ExQueryPoolBlockSize(void) {
 }
 
 void xk_link_mm(void) {
+    const char *kb = getenv("WL_XB_ALLOCS");
+    if (kb != NULL && s_census_min == 0) {
+        long v = strtol(kb, NULL, 10);
+        s_census_min = (v > 0 ? (uint32_t)v : 64u) << 10;
+    }
 }

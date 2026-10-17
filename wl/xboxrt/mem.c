@@ -337,6 +337,37 @@ WlResult wl_xb_phys_free(uint32_t phys) {
     return WL_OK;
 }
 
+WlResult wl_xb_va_discard(uint32_t va, uint32_t bytes, uint32_t *held) {
+    uint32_t n = 0;
+    if (held != NULL) {
+        *held = 0;
+    }
+    if (!g_ready || bytes == 0 || (uint64_t)va + bytes > 0x100000000ull) {
+        return WL_ERR_RANGE;
+    }
+    uint32_t first = (va + WL_XB_PAGE - 1u) >> WL_XB_PAGE_SHIFT; // whole pages only
+    uint32_t end = (uint32_t)(((uint64_t)va + bytes) >> WL_XB_PAGE_SHIFT);
+    for (uint32_t vp = first; vp < end; vp++) {
+        uint32_t phys = 0;
+        if (!wl_xb_va_to_phys(vp << WL_XB_PAGE_SHIFT, &phys)) {
+            continue;
+        }
+        uint32_t p = phys >> WL_XB_PAGE_SHIFT;
+        if (g_kind[p] == K_FREE || g_locks[p] != 0 ||
+            (g_xb_pg_flags != NULL && (g_xb_pg_flags[p] & WL_XB_PG_PINNED) != 0)) {
+            continue; // nobody's, or a device may be using it
+        }
+        if (g_xb_pg_frame != NULL && (g_xb_pg_frame[p] != 0 || g_xb_pg_slot[p] != 0)) {
+            n++;
+        }
+        wl_xb_backend_release_phys(p, 1);
+    }
+    if (held != NULL) {
+        *held = n;
+    }
+    return WL_OK;
+}
+
 uint32_t wl_xb_phys_size(uint32_t phys) {
     uint32_t p = phys >> WL_XB_PAGE_SHIFT;
     if (!g_ready || (phys & (WL_XB_PAGE - 1u)) != 0 || p >= g_xb_ram_pages) {

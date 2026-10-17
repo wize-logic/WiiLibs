@@ -87,8 +87,7 @@ bool wl_xb_symbolize(uintptr_t host_pc, WlXbSymbol *out) {
     return true;
 }
 
-// A guest return address: inside the code, and the bytes before it are a call.
-static bool after_call(uint32_t ra) {
+bool wl_xb_guest_return_address(uint32_t ra) {
     if (ra < g_xbox_code_lo + 7u || ra >= g_xbox_code_hi || !wl_xb_range_ok(ra - 7u, 7)) {
         return false;
     }
@@ -132,7 +131,7 @@ void wl_xb_crash_report(const WlXbCrash *c) {
             break;
         }
         uint32_t w = wl_xb_rd32(slot);
-        if (after_call(w)) {
+        if (wl_xb_guest_return_address(w)) {
             WL_LOG_E(TAG, "GS %08X %08X", (unsigned)slot, (unsigned)w);
             frames++;
         }
