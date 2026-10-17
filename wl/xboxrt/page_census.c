@@ -11,6 +11,15 @@
 #include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/thread.h"
 
+#if defined(__GLIBC__) && defined(__x86_64__)
+#include <execinfo.h>
+#include <fcntl.h>
+#include <unistd.h>
+#define CENSUS_STACKS 1
+#else
+#define CENSUS_STACKS 0
+#endif
+
 #define TAG "xbcensus"
 #define VBLANKS 60u     // a second of guest time
 #define DUMP_EVERY 30u  // seconds between dumps of the pages
@@ -41,6 +50,111 @@ static uint32_t g_pages, g_second, g_vblanks;
 static FILE *g_out;
 static char g_path[512];
 
+// ---- Who touched (WL_XB_PAGE_CENSUS_STACKS=1, x86-64 glibc hosts) ----------------------------------
+// (not under qemu-ppc: a backtrace from its fault handler crashes)
+// Each touch the census sees (a page's first in a second: a fault) has its host call stack taken;
+// the distinct stacks go to `<file>.stacks` ("stack <id> <frames...>", after a line "anchor <address
+// of wl_xb_census_start>" that gives the program's load bias) and the touches to `<file>.touch`, three
+// 32-bit words each in the host's order: the census second, the page, the stack's id (0: no room).
+// tools/xb_page_census.py --who symbolizes them (guest functions, our texture cache, the kernel...).
+#if CENSUS_STACKS
+#define ST_DEPTH 16u
+#define ST_SLOTS 32768u
+typedef struct {
+    uint32_t hash, n;
+    void *pc[ST_DEPTH];
+} Stack;
+static Stack *g_stacks; // [ST_SLOTS] open addressing; n == 0: free
+static int g_touch_fd = -1, g_stack_fd = -1;
+static uint32_t g_touch_buf[3u * 4096u], g_touch_n;
+static uint32_t g_st_lock;
+static uint32_t g_st_ids;
+
+static void st_flush(void) {
+    if (g_touch_n != 0 && g_touch_fd >= 0) {
+        ssize_t w = write(g_touch_fd, g_touch_buf, g_touch_n * sizeof g_touch_buf[0]);
+        (void)w;
+    }
+    g_touch_n = 0;
+}
+
+// the stack's id (1..; 0: the table is full), written out the first time it is seen
+static uint32_t st_intern(void *const *pc, uint32_t n) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) {
+        h = (h ^ (uint32_t)((uintptr_t)pc[i] >> 2)) * 16777619u;
+    }
+    for (uint32_t k = 0; k < ST_SLOTS; k++) {
+        Stack *s = &g_stacks[(h + k) & (ST_SLOTS - 1u)];
+        if (s->n == 0) {
+            if (g_st_ids + 1u >= ST_SLOTS * 3u / 4u) {
+                return 0;
+            }
+            s->hash = h;
+            s->n = n;
+            memcpy(s->pc, pc, n * sizeof pc[0]);
+            uint32_t id = (uint32_t)(s - g_stacks) + 1u;
+            g_st_ids++;
+            char line[32 + ST_DEPTH * 20u];
+            int at = snprintf(line, sizeof line, "stack %u", (unsigned)id);
+            for (uint32_t i = 0; i < n && at < (int)sizeof line - 24; i++) {
+                at += snprintf(line + at, sizeof line - (size_t)at, " %lx", (unsigned long)(uintptr_t)pc[i]);
+            }
+            line[at++] = '\n';
+            ssize_t w = write(g_stack_fd, line, (size_t)at);
+            (void)w;
+            return id;
+        }
+        if (s->hash == h && s->n == n && memcmp(s->pc, pc, n * sizeof pc[0]) == 0) {
+            return (uint32_t)(s - g_stacks) + 1u;
+        }
+    }
+    return 0;
+}
+
+static void st_record(uint32_t p) {
+    void *pc[ST_DEPTH];
+    int n = backtrace(pc, (int)ST_DEPTH);
+    // (the census's own frames and the fault handler's are left in: the tool knows their names)
+    while (__atomic_exchange_n(&g_st_lock, 1u, __ATOMIC_ACQUIRE) != 0) {
+    }
+    uint32_t id = n > 0 ? st_intern(pc, (uint32_t)n) : 0u;
+    if (g_touch_n + 3u > sizeof g_touch_buf / sizeof g_touch_buf[0]) {
+        st_flush();
+    }
+    g_touch_buf[g_touch_n++] = g_second + 1u; // (the second the touch is counted in)
+    g_touch_buf[g_touch_n++] = p;
+    g_touch_buf[g_touch_n++] = id;
+    __atomic_store_n(&g_st_lock, 0u, __ATOMIC_RELEASE);
+}
+
+static void st_start(const char *path) {
+    const char *on = getenv("WL_XB_PAGE_CENSUS_STACKS");
+    if (on == NULL || on[0] == '\0' || on[0] == '0') {
+        return;
+    }
+    char name[sizeof g_path + 8];
+    Stack *stacks = calloc(ST_SLOTS, sizeof *stacks);
+    snprintf(name, sizeof name, "%s.stacks", path);
+    g_stack_fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    snprintf(name, sizeof name, "%s.touch", path);
+    g_touch_fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (stacks == NULL || g_stack_fd < 0 || g_touch_fd < 0) {
+        WL_LOG_W(TAG, "the census's stacks: cannot write %s", name);
+        free(stacks);
+        return;
+    }
+    void *prime[2];
+    (void)backtrace(prime, 2); // (its first call loads the unwinder: not in a fault handler)
+    char line[64];
+    int at = snprintf(line, sizeof line, "anchor %lx\n", (unsigned long)(uintptr_t)&wl_xb_census_start);
+    ssize_t w = write(g_stack_fd, line, (size_t)at);
+    (void)w;
+    g_stacks = stacks;
+    WL_LOG_I(TAG, "the census takes each touch's host stack (%s.stacks, %s.touch)", path, path);
+}
+#endif
+
 bool wl_xb_census_on(void) {
     return g_xb_census_use != NULL;
 }
@@ -49,6 +163,11 @@ void wl_xb_census_seen_slow(uint32_t p, bool write) {
     if (p >= g_pages) {
         return;
     }
+#if CENSUS_STACKS
+    if (g_stacks != NULL && g_now[p] == 0) {
+        st_record(p);
+    }
+#endif
     g_now[p] = 1;
     if (write) {
         g_xb_census_use[p] |= WL_XB_CU_WRITE;
@@ -194,6 +313,14 @@ void wl_xb_census_dump(void) {
     if (g_xb_census_use == NULL || g_path[0] == '\0') {
         return;
     }
+#if CENSUS_STACKS
+    if (g_stacks != NULL) {
+        while (__atomic_exchange_n(&g_st_lock, 1u, __ATOMIC_ACQUIRE) != 0) {
+        }
+        st_flush();
+        __atomic_store_n(&g_st_lock, 0u, __ATOMIC_RELEASE);
+    }
+#endif
     char path[sizeof g_path + 8];
     snprintf(path, sizeof path, "%s.pages", g_path);
     FILE *f = fopen(path, "w");
@@ -264,6 +391,9 @@ WlResult wl_xb_census_start(const char *path) {
             WL_LOG_W(TAG, "cannot write %s", path);
         }
         atexit(census_exit);
+#if CENSUS_STACKS
+        st_start(path);
+#endif
     }
     (void)wl_xb_service_add_vblank_hook(census_vblank, NULL);
     g_xb_census_use = use; // (last: the hooks run from here on)

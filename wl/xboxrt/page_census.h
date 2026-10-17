@@ -15,7 +15,9 @@
 // a window); the touched pages' guest EAs are closed again, so a touch in the next second faults
 // once more (the census leaves the paging's own R bits alone: the clock decides as without it).
 // `<file>.pages` gets the allocations and every page's record every 30 s and at exit;
-// tools/xb_page_census.py makes the tables.
+// tools/xb_page_census.py makes the tables. With WL_XB_PAGE_CENSUS_STACKS=1 too (x86-64 glibc hosts), each
+// touch's host call stack is kept (`<file>.stacks`, `<file>.touch`): tools/xb_page_who.py says who
+// touched (a guest function, the texture cache hashing or converting, the kernel reading a file).
 #ifndef WL_XBOXRT_PAGE_CENSUS_H
 #define WL_XBOXRT_PAGE_CENSUS_H
 

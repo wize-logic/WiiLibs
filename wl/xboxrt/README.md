@@ -591,6 +591,7 @@ small files). With `netrun.txt` and no PC command line, a Dolphin run sends its 
 | `WL_XB_CAPTURE` | `path[,frames[,after]]`: a GPU capture of `frames` frames (2) starting `after` vertical blanks in (600) |
 | `WL_XB_AUDIO`, `_WAV`, `_TRACE`, `_HASH` | see "The GPU and the MCPX" |
 | `WL_XB_PAGE_CENSUS` | `path` (with a frame limit): the page census (`page_census.h`): each guest page's allocation, what used it (the GPU's textures and vertex arrays, the APU, a map file) and the working set each second; `tools/xb_page_census.py path` makes the tables |
+| `WL_XB_PAGE_CENSUS_STACKS` | `1` (with the census, x86-64 glibc hosts): who touched each page: every touch's host call stack to `path.stacks` and `path.touch`; `tools/xb_page_who.py path --elf <program> [--alloc VA]` says by toucher (guest functions, the texture cache's paths, the kernel's file reads) |
 
 The imitation of the Wii's memory on the host is `WL_XB_FRAME_MB=24 WL_XB_HEAP_MB=14` (the Wii's before MEM1's rest joined the frame pools; about 33 and 12 since (the arena 15 MB, the host side 12 MB), to be set from a real-Wii log's "guest frames" lines).
 
