@@ -1312,10 +1312,13 @@ static uint8_t ahead_byte(uint32_t at) {
 
 static bool ahead_check(uint32_t buf, uint32_t at, uint32_t n) {
     uint8_t got[4096];
-    wl_xb_copy_out(got, buf, n);
-    for (uint32_t i = 0; i < n; i++) {
-        if (got[i] != ahead_byte(at + i)) {
-            return false;
+    for (uint32_t k = 0; k < n; k += sizeof got) {
+        uint32_t m = n - k < sizeof got ? n - k : (uint32_t)sizeof got;
+        wl_xb_copy_out(got, buf + k, m);
+        for (uint32_t i = 0; i < m; i++) {
+            if (got[i] != ahead_byte(at + k + i)) {
+                return false;
+            }
         }
     }
     return true;
@@ -2124,6 +2127,313 @@ TEST files_pages_keep_what_was_read(void) {
     PASS();
 }
 
+// ---- Another thread in a transfer's gap ------------------------------------------------------------
+// A read or write gives the guest lock up while the card works (card_io_gives_the_lock_up): the other
+// threads run meanwhile, and may close, rename, cut, write or leave. Here a host thread holds the
+// card, a guest worker's request waits for it outside the guest lock (its gap), the test thread does
+// its part, and the card is let go after a while (the test thread's part may wait for the card too).
+
+static _Alignas(32) uint8_t g_gap_stack[64 * 1024];
+static volatile uint32_t g_gap_held;
+static volatile uint64_t g_gap_until; // the holder lets go at this time (ms)
+static uint32_t g_gap_args[8];       // the worker's NtReadFile/NtWriteFile arguments
+static uint32_t g_gap_slot;
+static volatile uint32_t g_gap_status, g_gap_finished;
+
+static void *gap_holder(void *arg) {
+    (void)arg;
+    wl_xb_card_lock();
+    g_gap_held = 1;
+    while (now_ms() < g_gap_until) {
+        wl_platform_thread_sleep_ms(1);
+    }
+    g_gap_held = 0;
+    wl_xb_card_unlock();
+    return NULL;
+}
+
+static void gap_worker(void) {
+    // stdcall SystemRoutine(ctx1, ctx2)
+    uint32_t esp = g_esp;
+    g_gap_status = call_import(g_gap_slot, 8, g_gap_args);
+    g_gap_finished = 1;
+    g_esp = esp;
+    guest_ret(8);
+}
+
+// The card held (`ms` from now), and a worker's request in its gap: true once it waits for the card
+// outside the guest lock.
+static WlPlatformThread g_gap_thread;
+static bool gap_begin(uint32_t slot, const uint32_t args[8], uint32_t ms) {
+    g_gap_slot = slot;
+    memcpy(g_gap_args, args, sizeof g_gap_args);
+    g_gap_finished = 0;
+    g_gap_status = 0xFFFFFFFFu;
+    g_gap_held = 0;
+    g_gap_until = now_ms() + ms;
+    if (wl_platform_thread_create(&g_gap_thread, gap_holder, NULL, g_gap_stack, sizeof g_gap_stack,
+                                  WL_THREAD_PRIO_MAIN) != WL_OK) {
+        return false;
+    }
+    while (g_gap_held == 0) {
+        wl_platform_thread_sleep_ms(1);
+    }
+    WlXbThreadStats ts0, ts;
+    wl_xb_thread_stats(&ts0);
+    uint32_t hp = gmem(4);
+    if (KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(13, gap_worker)) != 0) {
+        return false;
+    }
+    KN(S_NT_CLOSE, wl_xb_rd32(hp));
+    for (int i = 0; i < 500; i++) {
+        delay_ms(1);
+        wl_xb_thread_stats(&ts);
+        if (ts.io_blocks > ts0.io_blocks) {
+            return g_gap_held != 0 && g_gap_finished == 0;
+        }
+    }
+    return false;
+}
+
+// Guest memory for a request's buffer larger than the scratch page (released with wl_xb_va_release).
+static uint32_t gbig(uint32_t bytes) {
+    uint32_t va = 0;
+    return wl_xb_va_alloc(&va, bytes, 0x00400000u, WL_XB_PROT_READWRITE) == WL_OK ? va : 0u;
+}
+
+// The card let go and the worker's request over: its status.
+static uint32_t gap_end(void) {
+    wl_platform_thread_join(g_gap_thread, NULL);
+    for (int i = 0; i < 2000 && g_gap_finished == 0; i++) {
+        delay_ms(1);
+    }
+    return g_gap_finished != 0 ? g_gap_status : 0xDEADDEADu;
+}
+
+// A read-ahead's wait for the slot being read gives the guest lock up: the interrupts go on (a map's
+// load waited for the card with them held off, at every catch-up).
+TEST files_read_ahead_waits_without_the_lock(void) {
+    boot();
+    ASSERT(g_ready);
+    if (wl_xb_deterministic()) {
+        SKIPm("the virtual clock: the card's I/O keeps the lock");
+    }
+    reset_scratch();
+    const uint32_t size = 2u << 20, from = 8192u, req = 64u * 1024u;
+    char path[512];
+    ASSERT(ahead_file("ra_wait.bin", size, path, sizeof path));
+    uint32_t st = 0, iosb = gmem(8), off = gmem(8), buf = gbig(req);
+    uint32_t h = open_path("\\Device\\Harddisk0\\Partition1\\TDATA\\ra_wait.bin", 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    bool ok = true;
+    ASSERT_EQ_FMT(from, ahead_read(h, 0, from, 4096u, &ok), "%u"); // the second read opens the window
+    ASSERT(ok);
+    wl_platform_thread_sleep_ms(50); // its four slots read
+    g_gap_until = now_ms() + 150u;
+    g_gap_held = 0;
+    WlPlatformThread holder;
+    ASSERT_EQ(WL_OK, wl_platform_thread_create(&holder, gap_holder, NULL, g_gap_stack, sizeof g_gap_stack,
+                                               WL_THREAD_PRIO_MAIN));
+    while (g_gap_held == 0) {
+        wl_platform_thread_sleep_ms(1);
+    }
+    WlXbThreadStats ts0, ts1;
+    wl_xb_thread_stats(&ts0);
+    const uint32_t ticks0 = g_tick_runs;
+    // the window's four slots, then the fifth: being read (its thread waits for the card)
+    for (uint32_t at = from; at <= from + 4u * 128u * 1024u; at += req) {
+        wl_xb_wr64(off, at);
+        ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, 0, 0, 0, iosb, buf, req, off), "%08x");
+        ASSERT(ahead_check(buf, at, req));
+    }
+    ASSERT_EQ_FMT(0u, g_gap_held, "%u"); // the last read waited for the card
+    ASSERT(g_tick_runs - ticks0 >= 10u);  // and the service thread had the lock meanwhile
+    wl_xb_thread_stats(&ts1);
+    ASSERT(ts1.io_blocks > ts0.io_blocks);
+    WlXkFileIo io;
+    ASSERT(wl_xk_file_io(h, &io));
+    ASSERT(io.ahead_bytes >= 5u * req);
+    ASSERT_EQ(WL_OK, wl_platform_thread_join(holder, NULL));
+    KN(S_NT_CLOSE, h);
+    ASSERT_EQ(WL_OK, wl_xb_va_release(buf, NULL));
+    remove(path);
+    PASS();
+}
+
+// A read's pages remember nothing of a file another thread changed during the read's gap (a write
+// through another handle, then a smaller end of file, and the reading handle closed): its pages would
+// come back from the file with bytes the read never gave.
+TEST files_gap_changes_forget_the_read(void) {
+    boot();
+    ASSERT(g_ready);
+    if (wl_xb_deterministic()) {
+        SKIPm("the virtual clock: the card's I/O keeps the lock");
+    }
+    reset_scratch();
+    const uint32_t pages = 64u;
+    uint32_t src = 0, buf = 0, st = 0, iosb = gmem(8), off = gmem(8);
+    ASSERT_EQ(WL_OK, wl_xb_va_alloc(&src, pages * WL_XB_PAGE, 0x00400000u, WL_XB_PROT_READWRITE));
+    ASSERT_EQ(WL_OK, wl_xb_va_alloc(&buf, pages * WL_XB_PAGE, 0x00400000u, WL_XB_PROT_READWRITE));
+    uint32_t h = open_path("z:\\gap_pages.bin", 0xC0000000u, 5, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    fill_pages(src, pages, 1);
+    wl_xb_wr64(off, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h, 0, 0, 0, iosb, src, pages * WL_XB_PAGE, off), "%08x");
+    uint32_t h2 = open_path("z:\\gap_pages.bin", 0xC0000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    WlXbMemStats m0, m1;
+    wl_xb_mem_stats(&m0);
+    uint32_t wiosb = gmem(8), woff = gmem(8);
+    wl_xb_wr64(woff, 0);
+    const uint32_t args[8] = {h, 0, 0, 0, wiosb, buf, pages * WL_XB_PAGE, woff};
+    ASSERT(gap_begin(S_NT_READ, args, 60));
+    fill_pages(src, pages, 2);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h2, 0, 0, 0, iosb, src, 4u * WL_XB_PAGE, off), "%08x"); // waits for the card
+    ASSERT_EQ_FMT(0u, set_eof(h2, (uint64_t)(pages / 2u) * WL_XB_PAGE), "%08x");
+    KN(S_NT_CLOSE, h); // the worker's handle: its file stays until the read is over
+    ASSERT_EQ_FMT(0u, gap_end(), "%08x");
+    wl_xb_mem_stats(&m1);
+    ASSERT_EQ_FMT(0u, (uint32_t)(m1.file_copies - m0.file_copies), "%u");
+    KN(S_NT_CLOSE, h2);
+    ASSERT_EQ_FMT(0u, KN(S_NT_DELETE_FILE, gattr("z:\\gap_pages.bin")), "%08x");
+    ASSERT_EQ(WL_OK, wl_xb_va_release(src, NULL));
+    ASSERT_EQ(WL_OK, wl_xb_va_release(buf, NULL));
+    PASS();
+}
+
+// A request signals the event it was given, even when its handle is closed during the gap and given
+// to a new event: the new one stays as it was.
+TEST files_gap_signals_the_event_it_was_given(void) {
+    boot();
+    ASSERT(g_ready);
+    if (wl_xb_deterministic()) {
+        SKIPm("the virtual clock: the card's I/O keeps the lock");
+    }
+    reset_scratch();
+    const uint32_t n = 64u * 1024u;
+    char path[512];
+    ASSERT(ahead_file("gap_event.bin", n, path, sizeof path));
+    uint32_t st = 0, ehp = gmem(4), wiosb = gmem(8), woff = gmem(8), buf = gbig(n), zero = gmem(8);
+    uint32_t h = open_path("\\Device\\Harddisk0\\Partition1\\TDATA\\gap_event.bin", 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    ASSERT_EQ_FMT(0u, KN(S_NT_CREATE_EVENT, ehp, 0, 0, 0), "%08x"); // notification, not signalled
+    uint32_t ev = wl_xb_rd32(ehp);
+    wl_xb_wr64(woff, 0);
+    const uint32_t args[8] = {h, ev, 0, 0, wiosb, buf, n, woff};
+    ASSERT(gap_begin(S_NT_READ, args, 60));
+    KN(S_NT_CLOSE, ev);
+    ASSERT_EQ_FMT(0u, KN(S_NT_CREATE_EVENT, ehp, 0, 0, 0), "%08x");
+    uint32_t ev2 = wl_xb_rd32(ehp);
+    ASSERT_EQ_FMT(ev, ev2, "%08x"); // (the lowest free slot: the handle the request was given)
+    ASSERT_EQ_FMT(0u, gap_end(), "%08x");
+    ASSERT_EQ_FMT(n, wl_xb_rd32(wiosb + 4), "%u");
+    ASSERT(ahead_check(buf, 0, n));
+    ASSERT_EQ_FMT(0x102u, KN(S_NT_WAIT1, ev2, 0, zero), "%08x"); // STATUS_TIMEOUT: left alone
+    KN(S_NT_CLOSE, ev2);
+    KN(S_NT_CLOSE, h);
+    ASSERT_EQ(WL_OK, wl_xb_va_release(buf, NULL));
+    remove(path);
+    PASS();
+}
+
+// The title leaves while a thread writes outside the guest lock: the write goes no further once the
+// files are stopped (the card is flushed and unmounted next), and fails.
+TEST files_exit_stops_a_write_in_its_gap(void) {
+    boot();
+    ASSERT(g_ready);
+    if (wl_xb_deterministic()) {
+        SKIPm("the virtual clock: the card's I/O keeps the lock");
+    }
+    reset_scratch();
+    const uint32_t n = 1u << 20;
+    uint32_t st = 0, wiosb = gmem(8), woff = gmem(8), base_p = gmem(4), size_p = gmem(4);
+    wl_xb_wr32(base_p, 0);
+    wl_xb_wr32(size_p, n);
+    ASSERT_EQ_FMT(0u, KN(S_NT_ALLOC_VM, base_p, 0, size_p, 0x3000, 4), "%08x");
+    uint32_t buf = wl_xb_rd32(base_p);
+    uint32_t h = open_path("\\Device\\Harddisk0\\Partition1\\gap_exit.bin", 0xC0000000u, 5, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    wl_xb_wr64(woff, 0);
+    const uint32_t args[8] = {h, 0, 0, 0, wiosb, buf, n, woff};
+    ASSERT(gap_begin(S_NT_WRITE, args, 60));
+    wl_xk_files_stop(true); // (waits for the card)
+    wl_xk_files_flush();
+    char path[512];
+    struct stat sb;
+    snprintf(path, sizeof path, "%s/hdd/E/gap_exit.bin", g_root);
+    ASSERT_EQ(0, stat(path, &sb));
+    off_t at_stop = sb.st_size;
+    ASSERT(at_stop < (off_t)n); // what had the card before the stop
+    ASSERT_EQ_FMT(0xC000007Fu, gap_end(), "%08x"); // STATUS_DISK_FULL: what was written stays
+    ASSERT_EQ(0, stat(path, &sb));
+    ASSERT_EQ(at_stop, sb.st_size);
+    wl_xk_files_stop(false);
+    KN(S_NT_CLOSE, h);
+    remove(path);
+    PASS();
+}
+
+// Two threads on one synchronous handle take turns: the second request starts where the first one,
+// waiting for the card outside the guest lock, ended.
+TEST files_sync_handle_takes_turns(void) {
+    boot();
+    ASSERT(g_ready);
+    if (wl_xb_deterministic()) {
+        SKIPm("the virtual clock: the card's I/O keeps the lock");
+    }
+    reset_scratch();
+    const uint32_t n = 64u * 1024u, size = 256u * 1024u;
+    char path[512];
+    ASSERT(ahead_file("gap_turns.bin", size, path, sizeof path));
+    uint32_t st = 0, iosb = gmem(8), wiosb = gmem(8), buf = gbig(n), buf2 = gmem(4096);
+    uint32_t h = open_path("\\Device\\Harddisk0\\Partition1\\TDATA\\gap_turns.bin", 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    const uint32_t args[8] = {h, 0, 0, 0, wiosb, buf, n, 0}; // at the file's position
+    ASSERT(gap_begin(S_NT_READ, args, 60));
+    ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, 0, 0, 0, iosb, buf2, 4096u, 0), "%08x");
+    ASSERT_EQ_FMT(1u, g_gap_finished, "%u"); // it waited for the first
+    ASSERT(ahead_check(buf2, n, 4096u));
+    ASSERT_EQ_FMT(0u, gap_end(), "%08x");
+    ASSERT(ahead_check(buf, 0, n));
+    KN(S_NT_CLOSE, h);
+    ASSERT_EQ(WL_OK, wl_xb_va_release(buf, NULL));
+    remove(path);
+    PASS();
+}
+
+// A rename during a read's gap: the read goes on in the renamed file, every byte.
+TEST files_gap_rename_keeps_the_read(void) {
+    boot();
+    ASSERT(g_ready);
+    if (wl_xb_deterministic()) {
+        SKIPm("the virtual clock: the card's I/O keeps the lock");
+    }
+    reset_scratch();
+    const uint32_t n = 512u * 1024u;
+    char path[512];
+    ASSERT(ahead_file("gap_ren.bin", n, path, sizeof path));
+    uint32_t st = 0, wiosb = gmem(8), woff = gmem(8), base_p = gmem(4), size_p = gmem(4);
+    wl_xb_wr32(base_p, 0);
+    wl_xb_wr32(size_p, n);
+    ASSERT_EQ_FMT(0u, KN(S_NT_ALLOC_VM, base_p, 0, size_p, 0x3000, 4), "%08x");
+    uint32_t buf = wl_xb_rd32(base_p);
+    uint32_t h = open_path("\\Device\\Harddisk0\\Partition1\\TDATA\\gap_ren.bin", 0xC0000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    wl_xb_wr64(woff, 0);
+    const uint32_t args[8] = {h, 0, 0, 0, wiosb, buf, n, woff};
+    ASSERT(gap_begin(S_NT_READ, args, 60));
+    ASSERT_EQ_FMT(0u, rename_to(h, "\\Device\\Harddisk0\\Partition1\\TDATA\\gap_ren2.bin", false), "%08x");
+    ASSERT_EQ_FMT(0u, gap_end(), "%08x");
+    ASSERT_EQ_FMT(n, wl_xb_rd32(wiosb + 4), "%u");
+    for (uint32_t at = 0; at < n; at += 4096u) {
+        ASSERT(ahead_check(buf + at, at, 4096u));
+    }
+    ASSERT(host_exists("hdd/E/TDATA/gap_ren2.bin"));
+    KN(S_NT_CLOSE, h);
+    ASSERT_EQ_FMT(0u, KN(S_NT_DELETE_FILE, gattr("\\Device\\Harddisk0\\Partition1\\TDATA\\gap_ren2.bin")), "%08x");
+    PASS();
+}
+
 TEST files_rename_moves_every_handle(void) {
     boot();
     ASSERT(g_ready);
@@ -2474,6 +2784,12 @@ SUITE(kernel_suite) {
     RUN_TEST(files_delete_pending_refuses_opens);
     RUN_TEST(files_rename_moves_every_handle);
     RUN_TEST(files_pages_keep_what_was_read);
+    RUN_TEST(files_read_ahead_waits_without_the_lock);
+    RUN_TEST(files_gap_changes_forget_the_read);
+    RUN_TEST(files_gap_signals_the_event_it_was_given);
+    RUN_TEST(files_exit_stops_a_write_in_its_gap);
+    RUN_TEST(files_sync_handle_takes_turns);
+    RUN_TEST(files_gap_rename_keeps_the_read);
     RUN_TEST(objects_live_while_referenced);
     RUN_TEST(a_wait_keeps_its_object);
     RUN_TEST(virtual_memory_corners);

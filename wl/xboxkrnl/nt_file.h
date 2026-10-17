@@ -76,17 +76,21 @@ struct XkFile {
     uint64_t unflushed;      // bytes written since the file was last flushed (XK_FLUSH_BYTES)
     uint64_t io_ahead_bytes; // read bytes the read-ahead had ready (read_ahead.c)
     bool flush_failed;       // a flush of it failed (logged once)
+    bool io_busy;            // a synchronous handle's read or write is under way (they take turns)
 };
 
 // Read-ahead (read_ahead.c): one window at a time, for the handle `owner`, read by a host thread
 // through its own handle on `host` from `from` to `size`. xk_ahead_peek gives the window's bytes at
 // `off` (waiting for a read in flight; *avail of them, to the end of a slot) or NULL when `off` is
-// outside it: they stay valid until the owner's next peek or close. Closing waits for the thread's
-// read in flight; `owner` NULL closes any window.
+// outside it: they stay valid until the owner's next peek or close, and while the caller keeps the
+// guest lock (a peek that waits gives it up meanwhile). A close does not wait for the thread's read
+// in flight (its handle on the file closes when that is over); `owner` NULL closes any window and
+// waits, as xk_ahead_settle does: before the file is renamed or removed, and before the card goes.
 bool xk_ahead_open(const void *owner, const char *host, uint64_t from, uint64_t size);
 bool xk_ahead_owned(const void *owner);
 const uint8_t *xk_ahead_peek(const void *owner, uint64_t off, uint32_t *avail);
 void xk_ahead_close(const void *owner);
+void xk_ahead_settle(void);
 // The host files open for the title, counted in its stats (the read-ahead's own handle too).
 void xk_files_open_add(int delta);
 

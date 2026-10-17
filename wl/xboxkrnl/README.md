@@ -112,9 +112,12 @@ ended, on a file no handle may write, gets a window of four 128 KB slots that a 
 the guest's threads) fills through a handle of its own, so the card reads the next piece while the
 title works on the last (Halo inflating a map into a Z: cache slot). One window at a time; a read
 outside it, a write or resize of the file, `wl_xk_file_changed` and the handle's close end it. The
-bytes are the file's either way, so deterministic runs are unchanged. `no_read_ahead` in the
-config turns it off (the title folder's `noreadahead`). The log's "file I/O" lines count the KB
-the window had ready.
+bytes are the file's either way, so deterministic runs are unchanged. The thread reads under the
+card's lock, taking turns with the guest's transfers; a read that waits for its slot gives the guest
+lock up meanwhile, and a close does not wait for the slot in flight (the thread closes its handle
+once that read is over; a rename, a removal or a truncating open of the file waits for it first).
+`no_read_ahead` in the config turns it off (the title folder's `noreadahead`). The log's "file I/O"
+lines count the KB the window had ready.
 
 ## Halo's imports
 
@@ -160,8 +163,14 @@ Stubs and approximations among them:
   AV pack, the standard in bits 8 and up, 60 Hz).
 - `NtReadFile`/`NtWriteFile` on a regular file give the guest lock up while the card works (a
   transfer of 16 KB or more, or any while another thread has the card), 256 KB at a time, holding a
-  reference on the file: other threads run meanwhile, as on the console. The deterministic mode keeps
-  the lock (its clock does not see the card).
+  reference on the file and on the request's event: other threads run meanwhile, as on the console.
+  The deterministic mode keeps the lock (its clock does not see the card). What other threads do
+  meanwhile: a close leaves the request its file; the completion signals the event it was given,
+  even if its handle was closed and given again; a write, resize, truncating open or rename of the
+  file makes the read remember none of its pages (`wl_xb_file_pages`); a rename holds the card's
+  lock from its closes to its reopens, so the transfer goes on in the renamed file; requests on one
+  synchronous handle take turns (its position). At the title's exit `wl_xk_files_stop` ends every
+  transfer at its next 64 KB piece (it fails) before the files are flushed and the card unmounted.
 - `ETHREAD.UniqueThread` is at KTHREAD + 0x134. The `XC_MAX_OS` user section's layout comes from
   public headers as remembered and is not checked against a console.
 - `KeQueryPerformanceFrequency` is 3 375 000 Hz, `KeTimeIncrement` 1 ms in 100 ns units.
@@ -176,7 +185,9 @@ timeouts and mutants; timers with DPCs; an interrupt line with its ISR and DPC; 
 switch delivered to a loop that only polls a device register (D3D's fence wait); overlapped reads
 with their APC, and a failed one that leaves its events cleared; the read-only DVD, a sparse cache drive and
 its size shared by handles, listings (a buffer too small, "*.*"), delete at the last close (opens refused meanwhile), a rename that moves every handle, a full
-card, read-only handles; objects kept by a reference by pointer and by a wait; virtual and
+card, read-only handles; another thread during a transfer's gap outside the guest lock (a write,
+resize and close, an event's handle given again, a rename, the exit, a second request on a
+synchronous handle) and a read-ahead's wait for the card with the interrupts going on; objects kept by a reference by pointer and by a wait; virtual and
 contiguous memory and the GPU instance, a commit with no address, decommits; Rtl strings, time and
 printf past 2 KB; SHA-1, HMAC (RFC 2202) and
 RC4; the EEPROM settings. It runs on the host and on ppc-be, and again in the runtime's deterministic mode (`test_xboxkrnl_det`). `tests/xboxrt/e2e/` runs a lifted title on
