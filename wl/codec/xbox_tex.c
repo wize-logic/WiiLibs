@@ -228,14 +228,94 @@ static uint32_t rgb5a3_from_a4r4g4b4(uint32_t v) {
     return ((a >> 1) << 12) | (r << 8) | (g << 4) | b;
 }
 
+// v's bits placed, from the lowest, at the set bits of `mask` (a coordinate's bits in a swizzled
+// index: Morton order is the x part OR the y part)
+static uint32_t deposit_bits(uint32_t v, uint32_t mask) {
+    uint32_t out = 0;
+    for (uint32_t bit = 1; mask != 0 && bit != 0; bit <<= 1) {
+        if ((v & bit) != 0) {
+            out |= mask & (~mask + 1u);
+        }
+        mask &= mask - 1u;
+    }
+    return out;
+}
+
+// One GX tile from the texels at `in` + offs[i] (i = y * tw + x; `n` texels, those of a tile's
+// texels outside the level left out by the caller through `inside`)
+static void tile_convert(WlXboxFormat fmt, const uint8_t *in, const uint32_t *offs, uint32_t n,
+                         const uint8_t *inside, uint8_t *tile) {
+    uint32_t i;
+    switch (fmt) {
+    case WL_XBOX_A8R8G8B8: // B, G, R, A to the AR plane, then the GB plane
+    case WL_XBOX_X8R8G8B8:
+        for (i = 0; i < n; i++) {
+            if (inside == NULL || inside[i]) {
+                const uint8_t *t = in + offs[i];
+                tile[i * 2] = fmt == WL_XBOX_X8R8G8B8 ? 255 : t[3];
+                tile[i * 2 + 1] = t[2];
+                tile[32 + i * 2] = t[1];
+                tile[32 + i * 2 + 1] = t[0];
+            }
+        }
+        break;
+    case WL_XBOX_R5G6B5:
+        for (i = 0; i < n; i++) {
+            if (inside == NULL || inside[i]) {
+                const uint8_t *t = in + offs[i];
+                tile[i * 2] = t[1];
+                tile[i * 2 + 1] = t[0];
+            }
+        }
+        break;
+    case WL_XBOX_A1R5G5B5:
+        for (i = 0; i < n; i++) {
+            if (inside == NULL || inside[i]) {
+                const uint8_t *t = in + offs[i];
+                put_be16(tile + i * 2, rgb5a3_from_a1r5g5b5((uint32_t)t[0] | ((uint32_t)t[1] << 8)));
+            }
+        }
+        break;
+    case WL_XBOX_A4R4G4B4:
+        for (i = 0; i < n; i++) {
+            if (inside == NULL || inside[i]) {
+                const uint8_t *t = in + offs[i];
+                put_be16(tile + i * 2, rgb5a3_from_a4r4g4b4((uint32_t)t[0] | ((uint32_t)t[1] << 8)));
+            }
+        }
+        break;
+    case WL_XBOX_A8L8: // the word is (alpha << 8 | luminance); IA8 stores alpha first
+        for (i = 0; i < n; i++) {
+            if (inside == NULL || inside[i]) {
+                const uint8_t *t = in + offs[i];
+                tile[i * 2] = t[1];
+                tile[i * 2 + 1] = t[0];
+            }
+        }
+        break;
+    default: // L8, A8, AL8, P8
+        for (i = 0; i < n; i++) {
+            if (inside == NULL || inside[i]) {
+                tile[i] = in[offs[i]];
+            }
+        }
+        break;
+    }
+}
+
+// Tile by tile: a tile's texels are at the same offsets from its first texel in every tile (a
+// swizzled index is its x part OR its y part, and a tile's corner has no bits below the tile's
+// size; a linear level's rows are `row` apart), so the offsets are made once and each tile adds
+// its corner's.
 size_t wl_xbox_to_gx(WlXboxFormat fmt, int swizzled, uint32_t pitch, const void *src, size_t src_len,
                      uint32_t w, uint32_t h, void *dst, size_t cap) {
     WlGxcFormat g = wl_xbox_gx_format(fmt);
     if (g == WL_GXC_FORMAT_COUNT || is_dxt(fmt) || src == NULL || dst == NULL) {
         return 0;
     }
+    uint32_t mask_x = 0, mask_y = 0;
     if (swizzled) {
-        if (!pow2(w) || !pow2(h)) {
+        if (!wl_xbox_swizzle_masks(w, h, &mask_x, &mask_y)) {
             return 0;
         }
         pitch = 0;
@@ -249,9 +329,12 @@ size_t wl_xbox_to_gx(WlXboxFormat fmt, int swizzled, uint32_t pitch, const void 
     uint32_t row = pitch != 0 ? pitch : w * tb;
     uint32_t tw, th, tsz;
     tile_of(g, &tw, &th, &tsz);
-    Morton m;
-    if (swizzled) {
-        morton_init(&m, w, h);
+    uint32_t offs[32];
+    uint32_t n = tw * th;
+    for (uint32_t y = 0; y < th; y++) {
+        for (uint32_t x = 0; x < tw; x++) {
+            offs[y * tw + x] = swizzled ? (deposit_bits(x, mask_x) | deposit_bits(y, mask_y)) * tb : y * row + x * tb;
+        }
     }
     memset(dst, 0, total);
     const uint8_t *in = src;
@@ -259,44 +342,21 @@ size_t wl_xbox_to_gx(WlXboxFormat fmt, int swizzled, uint32_t pitch, const void 
     uint32_t tiles_x = (w + tw - 1u) / tw;
     uint32_t tiles_y = (h + th - 1u) / th;
     for (uint32_t ty = 0; ty < tiles_y; ty++) {
+        uint32_t sy = ty * th;
+        size_t base_y = swizzled ? (size_t)deposit_bits(sy, mask_y) * tb : (size_t)sy * row;
         for (uint32_t tx = 0; tx < tiles_x; tx++) {
+            uint32_t sx = tx * tw;
+            size_t base = base_y + (swizzled ? (size_t)deposit_bits(sx, mask_x) * tb : (size_t)sx * tb);
             uint8_t *tile = out + ((size_t)ty * tiles_x + tx) * tsz;
-            for (uint32_t y = 0; y < th; y++) {
-                for (uint32_t x = 0; x < tw; x++) {
-                    uint32_t sx = tx * tw + x;
-                    uint32_t sy = ty * th + y;
-                    if (sx >= w || sy >= h) {
-                        continue;
-                    }
-                    const uint8_t *t = swizzled ? in + (size_t)morton_index(&m, sx, sy) * tb
-                                                : in + (size_t)sy * row + (size_t)sx * tb;
-                    uint32_t i = y * tw + x;
-                    switch (fmt) {
-                    case WL_XBOX_A8R8G8B8:
-                    case WL_XBOX_X8R8G8B8: // B, G, R, A to the AR plane, then the GB plane
-                        tile[i * 2] = fmt == WL_XBOX_X8R8G8B8 ? 255 : t[3];
-                        tile[i * 2 + 1] = t[2];
-                        tile[32 + i * 2] = t[1];
-                        tile[32 + i * 2 + 1] = t[0];
-                        break;
-                    case WL_XBOX_R5G6B5:
-                        put_be16(tile + i * 2, (uint32_t)t[0] | ((uint32_t)t[1] << 8));
-                        break;
-                    case WL_XBOX_A1R5G5B5:
-                        put_be16(tile + i * 2, rgb5a3_from_a1r5g5b5((uint32_t)t[0] | ((uint32_t)t[1] << 8)));
-                        break;
-                    case WL_XBOX_A4R4G4B4:
-                        put_be16(tile + i * 2, rgb5a3_from_a4r4g4b4((uint32_t)t[0] | ((uint32_t)t[1] << 8)));
-                        break;
-                    case WL_XBOX_A8L8: // the word is (alpha << 8 | luminance); IA8 stores alpha first
-                        tile[i * 2] = t[1];
-                        tile[i * 2 + 1] = t[0];
-                        break;
-                    default: // L8, A8, AL8, P8
-                        tile[i] = t[0];
-                        break;
-                    }
+            if (sx + tw <= w && sy + th <= h) {
+                tile_convert(fmt, in + base, offs, n, NULL, tile);
+            } else {
+                // (a tile past the level's edge: its texels outside it left 0)
+                uint8_t inside[32];
+                for (uint32_t i = 0; i < n; i++) {
+                    inside[i] = (uint8_t)(sx + i % tw < w && sy + i / tw < h);
                 }
+                tile_convert(fmt, in + base, offs, n, inside, tile);
             }
         }
     }
