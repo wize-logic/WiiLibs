@@ -165,6 +165,23 @@ const WlXboxPshProgram *wl_nv2a_gx_last_program(const WlNv2aGx *gx, bool *used);
 // depth range, before the far plane's scale), and whether that was the fit kept for its transform
 // (shared with the draws of the same transform). For logs and tools.
 bool wl_nv2a_gx_last_projection(const WlNv2aGx *gx, float *a, float *b, bool *shared);
+// The camera's depth slope, which a draw whose vertices span too little depth to set a slope of their
+// own borrows (projection_fit), with the frame, the target (its colour surface) and the depth range
+// it was kept in. Shown for the tests.
+typedef struct WlNv2aGxSlope {
+    float b, depth_max;
+    uint32_t frame, target;
+    bool known;
+} WlNv2aGxSlope;
+// Keeps the slope b of the fit a + b / w when that fit holds, within a few of the depth's steps, for
+// n vertices spread through the depth; false (s as it was) otherwise.
+bool wl_nv2a_gx_slope_keep(WlNv2aGxSlope *s, float a, float b, const float *inverse_w, const float *depth, unsigned n,
+                           float depth_max, uint32_t frame, uint32_t target);
+// The fit a + b / w of n vertices with the kept slope and an offset of their own: false when no
+// slope was kept in this frame or the last, in this target and depth range, or when it misses a
+// vertex by more than 512 of the depth's steps.
+bool wl_nv2a_gx_slope_offset(const WlNv2aGxSlope *s, const float *inverse_w, const float *depth, unsigned n,
+                             float depth_max, uint32_t frame, uint32_t target, float *a, float *b);
 // Where the last draw's vertices were transformed (WlNv2aGxXfWhy), or WL_NV2A_GX_XF_WHYS when it
 // was left before that was chosen (skipped, nothing written). For logs and tools.
 unsigned wl_nv2a_gx_last_xf(const WlNv2aGx *gx);

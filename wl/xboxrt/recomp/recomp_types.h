@@ -617,7 +617,8 @@ typedef struct RECOMP_GUEST_LE { volatile int64_t  v; } recomp_le_s64;
  * one from a device, and a byte-reversed float load is three instructions through the stack
  * (lwbrx, stw, lfs): volatile made each `fcomp [mem]` load its operand up to four times and every
  * `fmul [esp+x]` reload a value the block had just read. GCC still orders them after every
- * store that may alias and every call; only a device read (a safe point, so another guest thread
+ * store that may alias and every call; only an access that hands the guest lock over (a device
+ * read, or a page-in: paging gives the lock up while it reads the page, so another guest thread
  * may run in it) no longer forces a float read before it to be read again after it. */
 typedef struct RECOMP_GUEST_LE { float  v; } recomp_le_f32;
 typedef struct RECOMP_GUEST_LE { double v; } recomp_le_f64;

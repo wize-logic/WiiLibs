@@ -7,7 +7,8 @@
 // render targets, and a screen blur through the back buffer's depth buffer drawn in one frame. A
 // projective coordinate whose q varies sent as (s, t, q) for GX to divide at each pixel. The pixel
 // program kept from draw to draw until one of its inputs changes. A texture the guest rewrites drawn
-// with its new texels, a stage's GX object kept while its texture is.
+// with its new texels, a stage's GX object kept while its texture is. The camera's depth slope a
+// narrow draw borrows, never stale or unchecked.
 #include <math.h>
 #include <string.h>
 
@@ -674,6 +675,56 @@ TEST the_pixel_program_is_made_again_only_when_its_inputs_change(void) {
     PASS();
 }
 
+// The camera's depth slope a draw borrows when its vertices span too little depth to set one (a10's
+// captain): kept only from a fit that holds for vertices spread in depth (never the canonical
+// points' alone, nor vertices at one depth), and taken only in the frame it was kept in or the next,
+// in its target and depth range, and only when it holds for the draw's vertices within 512 of the depth's steps.
+static void slope_points(float near_w, float far_w, float a, float b, float *inverse_w, float *depth) {
+    unsigned i;
+
+    for (i = 0; i < 6u; i++) {
+        float w = near_w + (far_w - near_w) * (float)i / 5.0f;
+
+        inverse_w[i] = 1.0f / w;
+        depth[i] = a + b * inverse_w[i];
+    }
+}
+
+TEST a_stale_or_unchecked_camera_slope_is_not_taken(void) {
+    // the camera: near 0.1, far 1000
+    const float A = 1000.0f / 999.9f, B = -100.0f / 999.9f, depth_max = 16777215.0f;
+    float wide_w[6], wide_d[6], narrow_w[6], narrow_d[6], a = 0.0f, b = 0.0f;
+    WlNv2aGxSlope slope;
+
+    memset(&slope, 0, sizeof slope);
+    slope_points(2.0f, 200.0f, A, B, wide_w, wide_d);
+    // (a skinned model's head: w 50 .. 50.004, a small depth offset of its own)
+    slope_points(50.0f, 50.004f, A + 1.0e-6f, B, narrow_w, narrow_d);
+    // a fit of the canonical points alone (no vertex), of vertices at one depth, or one that misses
+    // its vertices: not kept
+    ASSERT_FALSE(wl_nv2a_gx_slope_keep(&slope, A, B, wide_w, wide_d, 0, depth_max, 7, 0x1000u));
+    ASSERT_FALSE(wl_nv2a_gx_slope_keep(&slope, A, 0.5f * B, narrow_w, narrow_d, 6, depth_max, 7, 0x1000u));
+    ASSERT_FALSE(wl_nv2a_gx_slope_keep(&slope, A + 1.0e-4f, B, wide_w, wide_d, 6, depth_max, 7, 0x1000u));
+    ASSERT_FALSE(slope.known);
+    ASSERT_FALSE(wl_nv2a_gx_slope_offset(&slope, narrow_w, narrow_d, 6, depth_max, 7, 0x1000u, &a, &b));
+    // the camera's fit over vertices spread in depth: kept, and taken by the narrow draw
+    ASSERT(wl_nv2a_gx_slope_keep(&slope, A, B, wide_w, wide_d, 6, depth_max, 7, 0x1000u));
+    ASSERT(wl_nv2a_gx_slope_offset(&slope, narrow_w, narrow_d, 6, depth_max, 7, 0x1000u, &a, &b));
+    ASSERT_EQ(B, b);
+    ASSERT(fabsf(a - (A + 1.0e-6f)) < 1.0e-6f);
+    // in the next frame (before the camera's first fit in it) still taken; a frame later, in another
+    // target, or with another depth range: stale, not taken
+    ASSERT(wl_nv2a_gx_slope_offset(&slope, narrow_w, narrow_d, 6, depth_max, 8, 0x1000u, &a, &b));
+    ASSERT_FALSE(wl_nv2a_gx_slope_offset(&slope, narrow_w, narrow_d, 6, depth_max, 9, 0x1000u, &a, &b));
+    ASSERT_FALSE(wl_nv2a_gx_slope_offset(&slope, narrow_w, narrow_d, 6, depth_max, 7, 0x2000u, &a, &b));
+    ASSERT_FALSE(wl_nv2a_gx_slope_offset(&slope, narrow_w, narrow_d, 6, 65535.0f, 7, 0x1000u, &a, &b));
+    // no vertex, or vertices of another projection that it misses by more than 512 steps: not taken
+    ASSERT_FALSE(wl_nv2a_gx_slope_offset(&slope, narrow_w, narrow_d, 0, depth_max, 7, 0x1000u, &a, &b));
+    slope_points(40.0f, 50.0f, A, 2.0f * B, narrow_w, narrow_d);
+    ASSERT_FALSE(wl_nv2a_gx_slope_offset(&slope, narrow_w, narrow_d, 6, depth_max, 7, 0x1000u, &a, &b));
+    PASS();
+}
+
 SUITE(gx_suite) {
     RUN_TEST(screen_space_quad_with_texture_and_combiners);
     RUN_TEST(a_projective_coordinate_whose_q_varies_is_sent_undivided);
@@ -685,6 +736,7 @@ SUITE(gx_suite) {
     RUN_TEST(a_texture_the_guest_rewrites_is_drawn_with_its_new_texels);
     RUN_TEST(a_target_read_as_x8r8g8b8_has_no_alpha);
     RUN_TEST(the_pixel_program_is_made_again_only_when_its_inputs_change);
+    RUN_TEST(a_stale_or_unchecked_camera_slope_is_not_taken);
 }
 
 GREATEST_MAIN_DEFS();
