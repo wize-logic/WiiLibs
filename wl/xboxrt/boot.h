@@ -67,6 +67,22 @@ void wl_xb_title_setup(WlXbTitleConfig *cfg);
 // WlResult when it could not start (a missing XBE, no memory).
 int wl_xb_boot_run(const WlXbTitleConfig *cfg);
 
+#if !defined(__wii__)
+// The host: one run at a time on a hard disk's folder. Two runs on one folder write each other's
+// files under them: the swap file, z:\savegame.bin, the Z: cache slots. A page the paging dropped
+// because the file it was read from still holds its bytes (wl_xb_file_pages) comes back from that
+// file, so another run's (or its harness's) write there is read back as this run's memory: a
+// crash minutes later, at a point the virtual clock repeats exactly, that looks like a race.
+// wl_xb_hdd_lock takes an exclusive lock (flock) on the folder `host_dir`, held until
+// wl_xb_hdd_unlock or the process's end, a crash included; *out_fd is its descriptor. WL_ERR_DENIED:
+// another process holds it. wl_xboxrt_main takes it and stops with a message when it is refused,
+// unless WL_XB_HDD_LOCKED=1: the harness holds it for the run (tools/golden_check.py waits for it
+// before its put-back of the hdd's files and passes its descriptor on to the program).
+// Another error (no such folder, a file system without locks): nothing is held, *out_fd is -1.
+WlResult wl_xb_hdd_lock(const char *host_dir, int *out_fd);
+void wl_xb_hdd_unlock(int fd);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
