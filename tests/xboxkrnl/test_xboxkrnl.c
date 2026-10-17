@@ -12,6 +12,8 @@
 // memory paged over a few frames and a swap file (WL_XK_TEST_PAGING), where pages a file read filled
 // come back from the file until it changes.
 #define _DEFAULT_SOURCE
+#define _XOPEN_SOURCE 700 // nftw
+#include <ftw.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -199,6 +201,22 @@ static uint32_t guest_arg(uint32_t n) {
 static char g_root[256];
 static bool g_ready;
 
+static int remove_one(const char *path, const struct stat *st, int flag, struct FTW *ftw) {
+    (void)st;
+    (void)flag;
+    (void)ftw;
+    (void)remove(path); // (what cannot go stays: the walk goes on)
+    return 0;
+}
+
+// The run's folder goes at exit (its swap file and files are about 15 MB: a thousand runs' worth
+// filled /tmp with 7 GB).
+static void remove_root(void) {
+    if (g_root[0] != '\0') {
+        nftw(g_root, remove_one, 16, FTW_DEPTH | FTW_PHYS);
+    }
+}
+
 static void make_file(const char *rel, const char *text) {
     char path[512];
     snprintf(path, sizeof path, "%s/%s", g_root, rel);
@@ -231,6 +249,7 @@ static void boot(void) {
     snprintf(g_root, sizeof g_root, "/tmp/wl_xk_test_%d", (int)getpid());
     char path[512];
     mkdir(g_root, 0777);
+    atexit(remove_root);
     snprintf(path, sizeof path, "%s/title", g_root);
     mkdir(path, 0777);
     snprintf(path, sizeof path, "%s/title/maps", g_root);
