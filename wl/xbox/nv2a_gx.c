@@ -873,21 +873,6 @@ static bool target_written(WlNv2aGx *gx, RenderTarget *r) {
     return true;
 }
 
-// whether a texture at `phys` is the picture being drawn, read while a target has the EFB: its
-// colour comes from the back buffer's park (target_texture), never from a frame kept before
-static bool reads_picture_drawn(const WlNv2aGx *gx, uint32_t phys) {
-    return gx->owner != NULL && gx->frame_open && gx->back_drawn && phys == gx->back_phys && phys != 0;
-}
-
-// a picture the title showed, read as a texture (not the one being drawn, which parks serve):
-// each finished back buffer kept as one from the next frame on
-static void display_read(WlNv2aGx *gx, uint32_t phys) {
-    if (!gx->keep_frames && is_display(gx, phys) && !reads_picture_drawn(gx, phys)) {
-        gx->keep_frames = true;
-        WL_LOG_I(TAG, "a displayed surface (%08x) is read as a texture: each frame is kept as one", (unsigned)phys);
-    }
-}
-
 // a resolved render target at a texture's address, as an entry the stages read like any texture;
 // or the back buffer of the frame being drawn, while a target has the EFB: its colour as it was
 // parked, the picture so far (Halo's blur reads it into a target of its size, and the next pass
@@ -895,7 +880,8 @@ static void display_read(WlNv2aGx *gx, uint32_t phys) {
 static const WlNv2aTexEntry *target_texture(WlNv2aGx *gx, unsigned stage, const WlNv2aTexture *t) {
     unsigned i;
 
-    if (reads_picture_drawn(gx, t->phys)) {
+    if (gx->owner != NULL && gx->frame_open && gx->back_drawn && t->phys == gx->back_phys &&
+        t->phys != 0) {
         uint32_t w = 0, h = 0;
         const void *parked = wl_gx_target_parked_colour(&w, &h);
 
@@ -994,11 +980,16 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
             gx->stats.border_clamped++;
         }
         e = target_texture(gx, stage, &t);
+        if (e == NULL && !gx->keep_frames && is_display(gx, t.phys)) {
+            // (a picture the title showed, as a texture: kept from the next frame on)
+            gx->keep_frames = true;
+            WL_LOG_I(TAG, "a displayed surface (%08x) is read as a texture: each frame is kept as one",
+                     (unsigned)t.phys);
+        }
         if (e == NULL) {
             bool mipmaps = t.levels > 1 && t.min_filter >= WL_NV2A_FILTER_NEAREST_MIP_NEAREST &&
                            t.min_filter <= WL_NV2A_FILTER_LINEAR_MIP_LINEAR;
 
-            display_read(gx, t.phys);
             e = wl_nv2a_texcache_get(&gx->textures, gx->dev, &t, mipmaps, &made);
             if (e == NULL) {
                 continue;
@@ -2711,8 +2702,10 @@ static void display_textures_note(WlNv2aGx *gx, const WlNv2aKelvin *k) {
         if (wl_nv2a_stage_program(k, stage) == WL_NV2A_STAGE_NONE || !wl_nv2a_texture(k, stage, &t)) {
             continue;
         }
-        if (target_texture(gx, stage, &t) == NULL) {
-            display_read(gx, t.phys);
+        if (target_texture(gx, stage, &t) == NULL && is_display(gx, t.phys)) {
+            gx->keep_frames = true;
+            WL_LOG_I(TAG, "a displayed surface (%08x) is read as a texture: each frame is kept as one",
+                     (unsigned)t.phys);
         }
     }
 }
