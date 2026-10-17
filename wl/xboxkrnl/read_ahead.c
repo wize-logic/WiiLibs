@@ -129,6 +129,7 @@ static void ahead_close_locked(void) {
     if (g_ra.pf != NULL) {
         wl_platform_fs_close(g_ra.pf);
         g_ra.pf = NULL;
+        xk_files_open_add(-1);
     }
     free(g_ra.buf);
     g_ra.buf = NULL;
@@ -143,6 +144,7 @@ bool xk_ahead_open(const void *owner, const char *host, uint64_t from, uint64_t 
     if (g_ra.owner == NULL) {
         g_ra.buf = aligned_alloc(64, (size_t)AHEAD_SLOTS * AHEAD_SLOT);
         if (g_ra.buf != NULL && wl_platform_fs_open(host, WL_FILE_READ, &g_ra.pf) == WL_OK) {
+            xk_files_open_add(1); // (the card's open files are few: it counts with the title's)
             g_ra.owner = owner;
             g_ra.head = 0;
             g_ra.count = 0;
@@ -185,9 +187,14 @@ const uint8_t *xk_ahead_peek(const void *owner, uint64_t off, uint32_t *avail) {
             }
             break;
         }
-        // the slots wholly behind `off` go back to the thread
+        // the slots wholly behind `off` go back to the thread (once read), also when `off` is where
+        // the window ends: the guest caught the thread up, and waits for its next slot above
         AheadSlot *h = &g_ra.slot[g_ra.head];
-        if (h->state == SLOT_READY && h->off + h->len <= off && off < g_ra.next) {
+        if (h->off + h->len <= off && off <= g_ra.next) {
+            if (h->state == SLOT_FILLING) {
+                wl_platform_cond_wait(g_ra.cond, g_ra.lock);
+                continue;
+            }
             h->state = SLOT_EMPTY;
             g_ra.head = (g_ra.head + 1u) % AHEAD_SLOTS;
             g_ra.count--;

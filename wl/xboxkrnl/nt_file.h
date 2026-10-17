@@ -75,6 +75,7 @@ struct XkFile {
     uint64_t io_logged;      // the bytes at the last log line
     uint64_t unflushed;      // bytes written since the file was last flushed (XK_FLUSH_BYTES)
     uint64_t io_ahead_bytes; // read bytes the read-ahead had ready (read_ahead.c)
+    bool flush_failed;       // a flush of it failed (logged once)
 };
 
 // Read-ahead (read_ahead.c): one window at a time, for the handle `owner`, read by a host thread
@@ -86,6 +87,8 @@ bool xk_ahead_open(const void *owner, const char *host, uint64_t from, uint64_t 
 bool xk_ahead_owned(const void *owner);
 const uint8_t *xk_ahead_peek(const void *owner, uint64_t off, uint32_t *avail);
 void xk_ahead_close(const void *owner);
+// The host files open for the title, counted in its stats (the read-ahead's own handle too).
+void xk_files_open_add(int delta);
 
 // Raw partition sectors (the partition table on Partition0; what the title wrote to a partition's
 // first 64 KB, kept in data_dir).

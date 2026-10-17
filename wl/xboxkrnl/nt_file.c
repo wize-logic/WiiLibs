@@ -67,6 +67,11 @@ static bool g_ahead_on;
 static char g_data_dir[192];
 static uint32_t g_files_open;
 
+void xk_files_open_add(int delta) {
+    g_files_open += (uint32_t)delta;
+    g_xk_stats.files_open = g_files_open;
+}
+
 int xk_stricmp(const char *a, const char *b) {
     for (;; a++, b++) {
         int x = (*a >= 'A' && *a <= 'Z') ? *a + 32 : *a, y = (*b >= 'A' && *b <= 'Z') ? *b + 32 : *b;
@@ -756,6 +761,14 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
         return STATUS_ACCESS_VIOLATION;
     }
     uint32_t status = STATUS_SUCCESS;
+    // A write at the start of a file written since its last flush: the file's other bytes (and its
+    // size) reach the card first, and it then. Halo fills a Z: cache slot with its header cleared,
+    // then its body, and writes the header that makes it valid last: a power-off leaves it old or
+    // whole, never a valid header over a body the card's FAT lost.
+    bool barrier = f->kind == XK_FILE_REGULAR && off == 0 && f->unflushed != 0;
+    if (barrier) {
+        file_flush(f, false);
+    }
     if (f->kind != XK_FILE_PARTITION) {
         pages_forget(f, off, len);
     }
@@ -776,7 +789,7 @@ static uint32_t do_write(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, ui
     }
     if (f->kind == XK_FILE_REGULAR) {
         f->unflushed += *done;
-        if (f->unflushed >= XK_FLUSH_BYTES) {
+        if (barrier || f->unflushed >= XK_FLUSH_BYTES) {
             file_flush(f, false);
         }
     }
@@ -879,7 +892,12 @@ void k_NtWriteFile(void) {
 static void file_flush(XkFile *f, bool card) {
     if (f->pf != NULL) {
         if (card || XK_FLUSH_CARD) {
-            wl_platform_fs_flush(f->pf);
+            WlResult r = wl_platform_fs_flush(f->pf);
+            if (r != WL_OK && !f->flush_failed) {
+                // its size and time may stay as they were on the card
+                f->flush_failed = true;
+                WL_LOG_W(XK_TAG, "flush of %s failed: %s", f->name, wl_result_name(r));
+            }
         }
         if (f->sparse && f->resized && f->fcb != NULL) {
             fcb_sidecar_write(f->fcb, physical_size(f));
@@ -889,6 +907,7 @@ static void file_flush(XkFile *f, bool card) {
 }
 
 void wl_xk_files_flush(void) {
+    xk_ahead_close(NULL); // the read-ahead's thread off the card before it is unmounted
     for (XkFcb *c = g_fcbs; c != NULL; c = c->next) {
         for (XkFile *f = c->files; f != NULL; f = f->fcb_next) {
             if (f->unflushed != 0) {
@@ -1130,6 +1149,7 @@ void k_NtSetInformationFile(void) {
         // every handle on the file lets go of the host file while it is renamed (a FAT driver may
         // not rename an open file), and all of them follow it to its new name
         for (XkFile *o = f->fcb->files; o != NULL; o = o->fcb_next) {
+            xk_ahead_close(o); // (its own handle on the file too)
             if (o->pf != NULL) {
                 wl_xb_file_forget(o->pf, 0, UINT64_MAX);
                 wl_platform_fs_close(o->pf);

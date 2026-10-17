@@ -1295,6 +1295,178 @@ TEST files_read_ahead(void) {
     PASS();
 }
 
+static uint32_t set_eof(uint32_t h, uint64_t size);
+
+// A file of ahead_byte()s on E: (not sparse: read ahead), `size` bytes; its host path in `path`.
+static bool ahead_file(const char *name, uint32_t size, char *path, size_t cap) {
+    snprintf(path, cap, "%s/hdd/E/TDATA", g_root);
+    mkdir(path, 0777);
+    snprintf(path, cap, "%s/hdd/E/TDATA/%s", g_root, name);
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) {
+        return false;
+    }
+    for (uint32_t i = 0; i < size; i++) {
+        fputc(ahead_byte(i), fp);
+    }
+    return fclose(fp) == 0;
+}
+
+// Reads [at, to) in requests of n, checked against ahead_byte(); the next offset.
+static uint32_t ahead_read(uint32_t h, uint32_t at, uint32_t to, uint32_t n, bool *ok) {
+    uint32_t scratch = g_scratch;
+    uint32_t iosb = gmem(8), off = gmem(8), buf = gmem(4096);
+    for (; at < to; at += n) {
+        wl_xb_wr64(off, at);
+        if (KN(S_NT_READ, h, 0, 0, 0, iosb, buf, n, off) != 0 || !ahead_check(buf, at, n)) {
+            *ok = false;
+        }
+    }
+    g_scratch = scratch;
+    return at;
+}
+
+// The guest reading as fast as the read-ahead waits for it rather than end
+// the window: every byte after the first request is the window's.
+TEST files_read_ahead_caught_up(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    const uint32_t size = 3u << 20;
+    char path[512];
+    ASSERT(ahead_file("caught.bin", size, path, sizeof path));
+    uint32_t st = 0, iosb = gmem(8), off = gmem(8), n = 8u << 10, buf = gmem(n);
+    uint32_t h = open_path("\\Device\\Harddisk0\\Partition1\\TDATA\\caught.bin", 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    for (uint32_t at = 0; at < size; at += n) {
+        wl_xb_wr64(off, at);
+        ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, 0, 0, 0, iosb, buf, n, off), "%08x");
+        ASSERT_EQ(ahead_byte(at + n - 1u), wl_xb_rd8(buf + n - 1u));
+    }
+    WlXkFileIo io;
+    ASSERT(wl_xk_file_io(h, &io));
+    ASSERT_EQ_FMT(size - 2u * n, (uint32_t)io.ahead_bytes, "%u"); // (it opens at the second)
+    KN(S_NT_CLOSE, h);
+    remove(path);
+    PASS();
+}
+
+// Another handle's write and resize, and a truncating open, end the read-ahead of the file: the
+// reader sees the new bytes and the new end, never the window's old ones.
+TEST files_read_ahead_sees_other_writers(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    const uint32_t size = 3u << 19;
+    char path[512];
+    ASSERT(ahead_file("shared.bin", size, path, sizeof path));
+    const char *dev = "\\Device\\Harddisk0\\Partition1\\TDATA\\shared.bin";
+    uint32_t st = 0, iosb = gmem(8), off = gmem(8), buf = gmem(4096), data = gstr("WXYZ");
+    uint32_t r = open_path(dev, 0x80000000u, 1, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    WlXkFileIo io;
+    uint64_t ahead = 0;
+    bool ok = true;
+    for (int part = 0; part < 3; part++) {
+        // the reader from the start: a window from about 300000 on
+        uint32_t at = ahead_read(r, 0, 300000u, 3000u, &ok);
+        ASSERT(ok);
+        ASSERT(wl_xk_file_io(r, &io));
+        ASSERT(io.ahead_bytes > ahead);
+        ahead = io.ahead_bytes;
+        uint32_t w = open_path(dev, 0xC0000000u, part == 2 ? 4u : 1u, 0x20, &st); // 2: FILE_OVERWRITE
+        ASSERT_EQ_FMT(0u, st, "%08x");
+        if (part == 0) { // a write ahead of the reader, inside the window
+            wl_xb_wr64(off, 400000u);
+            ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, w, 0, 0, 0, iosb, data, 4, off), "%08x");
+            at = ahead_read(r, at, 399000u, 3000u, &ok);
+            ASSERT(ok);
+            wl_xb_wr64(off, at);
+            ASSERT_EQ_FMT(0u, KN(S_NT_READ, r, 0, 0, 0, iosb, buf, 3000u, off), "%08x");
+            ASSERT_EQ('W', wl_xb_rd8(buf + 400000u - at));
+            ASSERT_EQ('Z', wl_xb_rd8(buf + 400003u - at));
+            ASSERT_EQ(ahead_byte(400004u), wl_xb_rd8(buf + 400004u - at));
+            uint8_t old[4];
+            for (uint32_t i = 0; i < 4u; i++) {
+                old[i] = ahead_byte(400000u + i);
+            }
+            wl_xb_copy_in(buf, old, 4);
+            wl_xb_wr64(off, 400000u); // the file as it was
+            ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, w, 0, 0, 0, iosb, buf, 4, off), "%08x");
+        } else if (part == 1) { // cut inside the window and grown again: zeros from the cut
+            ASSERT_EQ_FMT(0u, set_eof(w, 350000u), "%08x");
+            ASSERT_EQ_FMT(0u, set_eof(w, size), "%08x");
+            at = ahead_read(r, at, 348000u, 3000u, &ok);
+            ASSERT(ok);
+            wl_xb_wr64(off, at);
+            ASSERT_EQ_FMT(0u, KN(S_NT_READ, r, 0, 0, 0, iosb, buf, 3000u, off), "%08x");
+            ASSERT_EQ(ahead_byte(349999u), wl_xb_rd8(buf + 349999u - at));
+            ASSERT_EQ(0, wl_xb_rd8(buf + 350000u - at));
+            for (uint32_t k = 350000u; k < size; k += 4096u) { // the file as it was
+                uint8_t chunk[4096];
+                uint32_t m = size - k < 4096u ? size - k : 4096u;
+                for (uint32_t i = 0; i < m; i++) {
+                    chunk[i] = ahead_byte(k + i);
+                }
+                wl_xb_copy_in(buf, chunk, m);
+                wl_xb_wr64(off, k);
+                ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, w, 0, 0, 0, iosb, buf, m, off), "%08x");
+            }
+        } else { // emptied, then new bytes where the reader goes on
+            wl_xb_wr64(off, at);
+            ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, w, 0, 0, 0, iosb, data, 4, off), "%08x");
+            wl_xb_wr64(off, at);
+            ASSERT_EQ_FMT(0u, KN(S_NT_READ, r, 0, 0, 0, iosb, buf, 3000u, off), "%08x");
+            ASSERT_EQ('W', wl_xb_rd8(buf));
+            ASSERT_EQ('Z', wl_xb_rd8(buf + 3u));
+        }
+        KN(S_NT_CLOSE, w);
+    }
+    KN(S_NT_CLOSE, r);
+    remove(path);
+    PASS();
+}
+
+// A handle closed while the read-ahead's thread reads for it: the window ends after the read, the
+// thread's handle is counted with the title's and closed with it.
+TEST files_read_ahead_closed_while_reading(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    const uint32_t size = 3u << 20;
+    char path[512];
+    ASSERT(ahead_file("closed.bin", size, path, sizeof path));
+    WlXkStats s0, s1;
+    wl_xk_stats(&s0);
+    uint32_t iosb = gmem(8), off = gmem(8), buf = gmem(4096);
+    for (int k = 0; k < 40; k++) {
+        uint32_t st = 0;
+        uint32_t h = open_path("\\Device\\Harddisk0\\Partition1\\TDATA\\closed.bin", 0x80000000u, 1, 0x20, &st);
+        ASSERT_EQ_FMT(0u, st, "%08x");
+        for (uint32_t at = 0; at < 2u * 4096u; at += 4096u) { // the second read opens the window
+            wl_xb_wr64(off, at);
+            ASSERT_EQ_FMT(0u, KN(S_NT_READ, h, 0, 0, 0, iosb, buf, 4096u, off), "%08x");
+        }
+        wl_xk_stats(&s1);
+        ASSERT_EQ_FMT(s0.files_open + 2u, s1.files_open, "%u"); // its handle and the thread's
+        KN(S_NT_CLOSE, h);
+        wl_xk_stats(&s1);
+        ASSERT_EQ_FMT(s0.files_open, s1.files_open, "%u");
+    }
+    // and at the title's exit
+    uint32_t st = 0;
+    uint32_t h = open_path("\\Device\\Harddisk0\\Partition1\\TDATA\\closed.bin", 0x80000000u, 1, 0x20, &st);
+    bool ok = true;
+    ahead_read(h, 0, 30000u, 3000u, &ok);
+    ASSERT(ok);
+    wl_xk_files_flush();
+    wl_xk_stats(&s1);
+    ASSERT_EQ_FMT(s0.files_open + 1u, s1.files_open, "%u");
+    KN(S_NT_CLOSE, h);
+    remove(path);
+    PASS();
+}
+
 // ---- Memory -------------------------------------------------------------------------------------
 
 TEST virtual_and_contiguous_memory(void) {
@@ -1486,6 +1658,31 @@ TEST files_flushed_open(void) {
     ASSERT_EQ(0x01000000ull, host_sidecar("hdd/Z/slot.map")); // not yet
     wl_xk_files_flush();
     ASSERT_EQ(0ull, host_sidecar("hdd/Z/slot.map")); // its bytes hold its size: no sidecar
+    ASSERT_EQ(0x01000004ull, query_eof(h));
+    KN(S_NT_CLOSE, h);
+    PASS();
+}
+
+// A write at the start of a file written since its last flush (Halo's header, which makes a Z:
+// slot valid, written after its body): the file's size reaches the card before it.
+TEST files_flushed_before_the_header(void) {
+    boot();
+    ASSERT(g_ready);
+    reset_scratch();
+    uint32_t st = 0;
+    uint32_t h = open_path("z:\\fill.map", 0xC0000000u, 3, 0x20, &st);
+    ASSERT_EQ_FMT(0u, st, "%08x");
+    uint32_t iosb = gmem(8), zero = gmem(16), data = gstr("body"), head = gstr("head"), off = gmem(8);
+    wl_xb_wr64(off, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h, 0, 0, 0, iosb, zero, 16, off), "%08x"); // the header cleared
+    ASSERT_EQ_FMT(0u, set_eof(h, 0x01000000u), "%08x");
+    ASSERT_EQ(0x01000000ull, host_sidecar("hdd/Z/fill.map"));
+    wl_xb_wr64(off, 0x01000000u);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h, 0, 0, 0, iosb, data, 4, off), "%08x"); // the body, growing it
+    ASSERT_EQ(0x01000000ull, host_sidecar("hdd/Z/fill.map")); // not yet
+    wl_xb_wr64(off, 0);
+    ASSERT_EQ_FMT(0u, KN(S_NT_WRITE, h, 0, 0, 0, iosb, head, 4, off), "%08x");
+    ASSERT_EQ(0ull, host_sidecar("hdd/Z/fill.map")); // its bytes hold its size
     ASSERT_EQ(0x01000004ull, query_eof(h));
     KN(S_NT_CLOSE, h);
     PASS();
@@ -2100,9 +2297,13 @@ SUITE(kernel_suite) {
     RUN_TEST(files_sparse_cache_drive);
     RUN_TEST(files_io_counts);
     RUN_TEST(files_read_ahead);
+    RUN_TEST(files_read_ahead_caught_up);
+    RUN_TEST(files_read_ahead_sees_other_writers);
+    RUN_TEST(files_read_ahead_closed_while_reading);
     RUN_TEST(virtual_and_contiguous_memory);
     RUN_TEST(rtl_crypto_settings);
     RUN_TEST(files_flushed_open);
+    RUN_TEST(files_flushed_before_the_header);
     RUN_TEST(files_share_one_size);
     RUN_TEST(files_failures_leave_the_request_alone);
     RUN_TEST(files_deleted_at_the_last_close);
