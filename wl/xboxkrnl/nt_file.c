@@ -22,7 +22,9 @@
 #include <stdlib.h>
 
 #include "wl/base/endian.h"
+#include "wl/platform/mem_census.h"
 #include "wl/xboxkrnl/nt_file.h"
+#include "wl/xboxrt/page_census.h"
 
 #define BOUNCE 65536u
 // A regular file's read or write of XK_BLOCK_MIN bytes or more (or any, while another thread has the
@@ -100,10 +102,17 @@ int xk_strnicmp(const char *a, const char *b, size_t n) {
     return 0;
 }
 
+// What the files hold of the host's heap (mem_census.h): the bounce buffer and the read-ahead's.
+static void census_files(void *user, WlMemCensusReport *out) {
+    (void)user;
+    out->bytes = (g_bounce != NULL ? BOUNCE : 0u) + xk_ahead_host_bytes();
+}
+
 void xk_files_init(const WlXkConfig *cfg) {
     // aligned for the card: libdvm's cache moves a whole page of an aligned buffer straight to the
     // card, and copies a misaligned one through its four pages (the FAT's sectors pushed out with it)
     g_bounce = aligned_alloc(64, BOUNCE);
+    (void)wl_mem_census_add("kernel files", census_files, NULL);
     snprintf(g_data_dir, sizeof g_data_dir, "%s", cfg->data_dir);
     g_ahead_on = !cfg->no_read_ahead;
     xk_ahead_close(NULL);
@@ -843,6 +852,9 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
     }
     if (*done < n) {
         return status;
+    }
+    if (wl_xb_census_on()) {
+        wl_xb_census_va(buf, n, strstr(f->name, ".map") != NULL ? WL_XB_CU_MAP : WL_XB_CU_FILE);
     }
     if (off < phys && f->pf != NULL && (f->fcb == NULL || f->fcb->changes == changes)) {
         // the whole pages filled from the file's bytes remember them: unchanged, they are read

@@ -476,7 +476,7 @@ the address of its variable, and an ordinal with no body a slot whose first call
 rest stays malloc's), the SD card, the log and the crash screen; the XBE's header; guest memory (the
 Wii's frame pools: the two largest blocks malloc gives, less `keep_free_bytes` and `texture_bytes`;
 the host's frame limit, if any; the swap file `<hard disk folder>/pagefile.sys`); the converted
-textures' arena (`texture_bytes`, 13 MB, the vertex arrays' cache in its end; `WL_XB_TEXTURE_MB` on the host); threads; the
+textures' arena (`texture_bytes`, 15 MB, the vertex arrays' cache in its end; `WL_XB_TEXTURE_MB` on the host); threads; the
 image; the kernel (`wl/xboxkrnl`); the thunks; the MCPX devices and the GPU (wl/xbox's model when
 it is built in, else the stub); the service thread; then the entry point on a guest thread of its
 own. It returns the process's exit code. A play setting `replay:...` runs the capture bench instead,
@@ -497,8 +497,8 @@ The host: `prog <title folder> [hard disk folder]`; the title folder holds `defa
 guest's D:, the hard disk folder (default `<title folder>/hdd`) its C:, E: and the cache drives. The
 Wii: `sd:/xbox/<WL_XB_TITLE_NAME>` (a compile definition of `wl_xboxrt_main`, `title` by default),
 the log in `<title folder>/logs`. A title project's own `main` fills a `WlXbTitleConfig`
-(`boot.h`); the defaults are `ram_mb` 64, `keep_free_bytes` 14 MB (the host side's memory on the
-Wii besides the textures' arena), `texture_bytes` 13 MB, `htab_bytes` 256 KB and a swap file of the
+(`boot.h`); the defaults are `ram_mb` 64, `keep_free_bytes` 12 MB (the host side's memory on the
+Wii besides the textures' arena), `texture_bytes` 15 MB, `htab_bytes` 256 KB and a swap file of the
 guest RAM's size.
 
 **One run per hard disk folder.** A run writes its hard disk folder (the swap file, `Z/savegame.bin`,
@@ -580,8 +580,9 @@ small files). With `netrun.txt` and no PC command line, a Dolphin run sends its 
 | `WL_XB_NO_XF`, `WL_XB_VCACHE_KB` | as the files `noxf` and `vcache` (`0` turns the cache off) |
 | `WL_XB_CAPTURE` | `path[,frames[,after]]`: a GPU capture of `frames` frames (2) starting `after` vertical blanks in (600) |
 | `WL_XB_AUDIO`, `_WAV`, `_TRACE`, `_HASH` | see "The GPU and the MCPX" |
+| `WL_XB_PAGE_CENSUS` | `path` (with a frame limit): the page census (`page_census.h`): each guest page's allocation, what used it (the GPU's textures and vertex arrays, the APU, a map file) and the working set each second; `tools/xb_page_census.py path` makes the tables |
 
-The imitation of the Wii's memory on the host is `WL_XB_FRAME_MB=24 WL_XB_HEAP_MB=14`.
+The imitation of the Wii's memory on the host is `WL_XB_FRAME_MB=24 WL_XB_HEAP_MB=14` (the Wii's before MEM1's rest joined the frame pools; about 33 and 12 since (the arena 15 MB, the host side 12 MB), to be set from a real-Wii log's "guest frames" lines).
 
 **What the log says.** Tag `xbirq`, every 10 s: `status:` lines for the guest clock against the
 host's, the guest's pages and frames, the heap's free memory and, with demand paging, the frames

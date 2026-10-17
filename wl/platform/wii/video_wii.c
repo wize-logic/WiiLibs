@@ -17,6 +17,7 @@
 #include "wl/platform/platform.h"
 #include "wl/platform/timebase.h"
 #include "wl/platform/hwcount.h"
+#include "wl/platform/mem_census.h"
 #include "wl/platform/present.h"
 #include "wl/platform/video_mode.h"
 #include "wl/platform/wii/input_wii.h"
@@ -128,6 +129,13 @@ static void apply_ratio(void) {
     wl_present_set_ratio(&g_q, num, den);
 }
 
+// The framebuffers (SYS_AllocateFramebuffer: malloc's heap), for the census (mem_census.h).
+static void census_video(void *user, WlMemCensusReport *out) {
+    (void)user;
+    out->bytes = g_inited ? (size_t)g_buffers * VIDEO_GetFrameBufferSize(g_rmode) : 0u;
+    snprintf(out->note, sizeof out->note, "%u XFBs", (unsigned)g_buffers);
+}
+
 WlResult wl_platform_video_init(void) {
     if (g_inited) {
         return WL_OK;
@@ -196,6 +204,7 @@ WlResult wl_platform_video_init(void) {
     apply_ratio();
     g_last_present = g_retraces;
     IRQ_Restore(level);
+    (void)wl_mem_census_add("video", census_video, NULL);
     return WL_OK;
 }
 

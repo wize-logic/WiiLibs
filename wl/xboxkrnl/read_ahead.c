@@ -303,3 +303,11 @@ void xk_ahead_settle(void) {
     ahead_settle_locked();
     wl_platform_mutex_unlock(g_ra.lock);
 }
+
+size_t xk_ahead_host_bytes(void) {
+    size_t bytes = __atomic_load_n(&g_ra.stack, __ATOMIC_RELAXED) != NULL ? AHEAD_STACK : 0u;
+    if (__atomic_load_n(&g_ra.buf, __ATOMIC_RELAXED) != NULL) {
+        bytes += (size_t)AHEAD_SLOTS * AHEAD_SLOT;
+    }
+    return bytes;
+}

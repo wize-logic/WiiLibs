@@ -30,6 +30,8 @@ set_tests_properties(bench_irq_poll_runs PROPERTIES LABELS "unit;be")
 wl_add_test(test_xboxrt_paging SOURCES test_xboxrt_paging.c LIBS wl_xboxrt LABELS unit be)
 wl_add_test(test_xboxrt_paging_no_swap SOURCES test_xboxrt_paging.c LIBS wl_xboxrt LABELS unit be)
 target_compile_definitions(test_xboxrt_paging_no_swap PRIVATE WL_XBRT_PAGING_NO_SWAP=1)
+# The page census, a diagnostic of what guest pages are and the working set each second.
+wl_add_test(test_xboxrt_page_census SOURCES test_xboxrt_page_census.c LIBS wl_xboxrt LABELS unit be)
 # The gamepad state, its reports, the Wii controllers' mappings and the ports (portable).
 wl_add_test(test_xboxrt_pad SOURCES test_xboxrt_pad.c LIBS wl_xboxrt LABELS unit be)
 # The USB host controllers and the gamepads, driven as a title's XAPI drives them.

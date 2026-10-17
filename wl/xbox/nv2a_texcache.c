@@ -216,6 +216,31 @@ void wl_nv2a_texcache_memory(const WlNv2aTexCache *cache, WlNv2aTexCacheMemory *
     }
 }
 
+void wl_nv2a_texcache_kinds(const WlNv2aTexCache *cache, WlNv2aTexCacheKinds *out) {
+    unsigned i;
+
+    memset(out, 0, sizeof *out);
+    for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
+        const WlNv2aTexEntry *e = &cache->entries[i];
+        size_t bytes = e->layout.total_bytes;
+
+        if (e->image == NULL) {
+            continue;
+        }
+        if ((unsigned)e->layout.format < WL_GXC_FORMAT_COUNT) {
+            out->by_format[e->layout.format] += bytes;
+            out->count_by_format[e->layout.format]++;
+        }
+        if (e->linear) {
+            out->linear += bytes;
+        }
+        out->source += e->source_bytes;
+        if (bytes > out->largest) {
+            out->largest = bytes;
+        }
+    }
+}
+
 // ---- the check ----------------------------------------------------------------------------------
 
 static inline uint32_t rotl32(uint32_t v, unsigned n) {

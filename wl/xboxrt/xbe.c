@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "wl/base/endian.h"
+#include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/thread.h"
 #include "wl/xboxrt/thunk.h"
@@ -123,6 +124,15 @@ static WlResult copy_file(WlXbeRead read, void *user, uint8_t *bounce, uint32_t 
     return WL_OK;
 }
 
+// For the page census: whether a section is x86 code. Its executable flag is not enough: titles
+// mark .data and .rdata executable too (Halo's are), so the sections named as data are data.
+static bool census_code(const WlXbeSection *s) {
+    size_t n = strlen(s->name);
+    return (s->flags & WL_XBE_SEC_EXECUTABLE) != 0 && strncmp(s->name, ".data", 5) != 0 &&
+           strncmp(s->name, ".rdata", 6) != 0 && strncmp(s->name, ".bss", 4) != 0 && strncmp(s->name, "$$", 2) != 0 &&
+           strcmp(s->name, "DOLBY") != 0 && !(n >= 4 && strcmp(s->name + n - 4, "DATA") == 0);
+}
+
 WlResult wl_xbe_load(const WlXbe *x, WlXbeRead read, void *user) {
     if (x == NULL || read == NULL || !wl_xb_mem_ready()) {
         return WL_ERR_ARG;
@@ -160,6 +170,19 @@ WlResult wl_xbe_load(const WlXbe *x, WlXbeRead read, void *user) {
     if (r != WL_OK) {
         WL_LOG_E(TAG, "reading the image failed: %s", wl_result_name(r));
         return r;
+    }
+    if (wl_xb_census_on()) {
+        // the page census's allocations: the code first, so that a page code shares with data is data
+        for (uint32_t pass = 0; pass < 2u; pass++) {
+            for (uint32_t i = 0; i < x->section_count; i++) {
+                const WlXbeSection *s = &x->sections[i];
+                bool code = census_code(s);
+                if (code == (pass == 0) && wl_xb_range_ok(s->va, s->vsize)) {
+                    wl_xb_census_alloc(code ? WL_XB_CA_XBE_CODE : WL_XB_CA_XBE_DATA, s->va, s->vsize, i);
+                }
+            }
+        }
+        wl_xb_census_alloc(WL_XB_CA_XBE_DATA, x->base, x->headers_size, 0xFFFFFFFFu);
     }
     if (code_hi > code_lo) {
         wl_xb_set_code_bounds(code_lo, code_hi);

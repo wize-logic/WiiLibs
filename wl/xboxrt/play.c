@@ -1217,6 +1217,7 @@ static void script_frame(void) {
             } else {
                 wl_xb_play_log("line %d (%.1f s): %s", s->line, P.clock, s->text);
             }
+            wl_xb_mem_counters_log(); // (WL_XB_PAGING_LOG: the paging counters at each step)
             if (s->kind == K_TITLE_STEP) {
                 const Reg *r = reg_find(REG_STEP, s->name);
                 if (r == NULL) {

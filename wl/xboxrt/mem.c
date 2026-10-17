@@ -7,6 +7,7 @@
 
 #include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
+#include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/mem_internal.h"
 
 #define TAG "xbmem"
@@ -142,6 +143,10 @@ WlResult wl_xb_mem_init(const WlXbMemConfig *cfg) {
     (void)wl_mem_census_add("frames", census_frames, NULL);
     WL_LOG_I(TAG, "guest RAM %u MB (%u pages), host base %p, reserved low 0x%x, GPU instance 0x%x", cfg->ram_bytes >> 20,
              (unsigned)pages, (void *)base, (unsigned)cfg->reserved_low_bytes, (unsigned)cfg->gpu_instance_bytes);
+    const char *census = getenv("WL_XB_PAGE_CENSUS"); // the page census (page_census.h): a diagnostic
+    if (census != NULL && census[0] != '\0') {
+        (void)wl_xb_census_start(census);
+    }
     return WL_OK;
 }
 
@@ -900,6 +905,31 @@ uint32_t wl_xb_phys_watch(uint32_t phys, uint32_t bytes) {
 bool wl_xb_phys_written(uint32_t phys, uint32_t bytes, uint32_t stamp) {
     uint32_t first, pages;
     return !phys_pages(phys, bytes, &first, &pages) || wl_xb_pg_written(first, pages, stamp);
+}
+
+void wl_xb_mem_counters_log(void) {
+    static int counters = -1;
+    if (counters < 0) {
+        const char *env = getenv("WL_XB_PAGING_LOG");
+        counters = env != NULL && env[0] != '\0' && env[0] != '0';
+    }
+    if (counters <= 0 || !g_ready || g_xb_pg_frames == 0) {
+        return;
+    }
+    WlXbMemStats st;
+    memset(&st, 0, sizeof st);
+    wl_xb_pg_stats(&st);
+    uint32_t dz, cz;
+    wl_xb_pg_zero_census(&dz, &cz);
+    WL_LOG_I(TAG, "paging counters: ins %u swap %u file (+%u ahead); outs %u written %u zero %u clean (%u file, %u zero) "
+             "in %u fast; refaults %u swap %u file %u zero; returns %u; KB read %u written %u; ahead unused %u; "
+             "resident %u dirty %u file; zero %u dirty %u clean",
+             (unsigned)st.swap_ins, (unsigned)st.file_ins, (unsigned)st.file_ahead, (unsigned)st.swap_outs,
+             (unsigned)st.zero_outs, (unsigned)st.clean_evictions, (unsigned)st.file_evictions,
+             (unsigned)st.zero_evictions, (unsigned)st.fast_evictions, (unsigned)st.refaults_swap,
+             (unsigned)st.refaults_file, (unsigned)st.refaults_zero, (unsigned)st.returns,
+             (unsigned)(st.swap_read_bytes >> 10), (unsigned)(st.swap_write_bytes >> 10), (unsigned)st.ahead_unused,
+             (unsigned)st.resident_dirty, (unsigned)st.resident_file, (unsigned)dz, (unsigned)cz);
 }
 
 void wl_xb_mem_watch(uint32_t swap_ins_per_s) {

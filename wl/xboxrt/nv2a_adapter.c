@@ -17,6 +17,7 @@
 
 #include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
+#include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/thread.h"
@@ -189,12 +190,21 @@ static void *phys_ptr(void *user, uint32_t phys, uint32_t bytes) {
     if ((uint64_t)phys + bytes > wl_xb_ram_bytes()) {
         return NULL;
     }
+    wl_xb_census_phys(phys, bytes, WL_XB_CU_GPU);
     return wl_xb_phys_ptr(phys);
 }
 
 // the write watch (mem.h): a converted texture is only read again once its pages were stored to
 static uint32_t tex_watch(void *user, uint32_t phys, uint32_t bytes) {
     (void)user;
+    wl_xb_census_phys(phys, bytes, WL_XB_CU_TEX);
+    return wl_xb_phys_watch(phys, bytes);
+}
+
+// (the same for a vertex array the cache converted)
+static uint32_t vtx_watch(void *user, uint32_t phys, uint32_t bytes) {
+    (void)user;
+    wl_xb_census_phys(phys, bytes, WL_XB_CU_VTX);
     return wl_xb_phys_watch(phys, bytes);
 }
 
@@ -257,6 +267,20 @@ static void gpu_status(void) {
              (unsigned)ts.reconverted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.reduced,
              (unsigned)ts.restored, (unsigned)ts.evicted,
              (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed, (unsigned)(ts.hashed_bytes >> 10));
+    WlNv2aTexCacheKinds tk;
+    wl_nv2a_texcache_kinds(wl_nv2a_gx_textures(g_gx), &tk);
+    // (what fills the arena: KB by GX format, count in brackets)
+    WL_LOG_I(TAG, "status: textures KB by format: RGBA8 %u (%u), CMPR %u (%u), C8 %u (%u), RGB565 %u (%u), "
+             "RGB5A3 %u (%u), IA8 %u (%u), I8 %u (%u); %u linear; made from %u KB of the guest's; largest %u",
+             (unsigned)(tk.by_format[WL_GXC_RGBA8] >> 10), (unsigned)tk.count_by_format[WL_GXC_RGBA8],
+             (unsigned)(tk.by_format[WL_GXC_CMPR] >> 10), (unsigned)tk.count_by_format[WL_GXC_CMPR],
+             (unsigned)(tk.by_format[WL_GXC_C8] >> 10), (unsigned)tk.count_by_format[WL_GXC_C8],
+             (unsigned)(tk.by_format[WL_GXC_RGB565] >> 10), (unsigned)tk.count_by_format[WL_GXC_RGB565],
+             (unsigned)(tk.by_format[WL_GXC_RGB5A3] >> 10), (unsigned)tk.count_by_format[WL_GXC_RGB5A3],
+             (unsigned)(tk.by_format[WL_GXC_IA8] >> 10), (unsigned)tk.count_by_format[WL_GXC_IA8],
+             (unsigned)(tk.by_format[WL_GXC_I8] >> 10), (unsigned)tk.count_by_format[WL_GXC_I8],
+             (unsigned)(tk.linear >> 10), (unsigned)(tk.source >> 10),
+             (unsigned)(tk.largest >> 10));
     if (wl_nv2a_vcache_on(wl_nv2a_gx_vertex_cache(g_gx))) {
         WlNv2aVCacheStats vs;
         wl_nv2a_vcache_stats(wl_nv2a_gx_vertex_cache(g_gx), &vs);
@@ -316,6 +340,7 @@ void wl_xb_gpu_set_frame_overlap(bool on) {
 
 static void *g_vcache_arena;
 static uint32_t g_vcache_bytes;
+static bool g_vcache_carved; // the vertex arrays' arena is the end of the boot's textures' arena (of the heap)
 
 void wl_xb_gpu_set_vertex_cache(void *arena, uint32_t bytes) {
     g_vcache_arena = arena;
@@ -362,6 +387,12 @@ static void census_textures(void *user, WlMemCensusReport *out) {
     }
 }
 
+// the vertex arrays' arena when it is the end of the textures' (the boot's heap block)
+static void census_vertices(void *user, WlMemCensusReport *out) {
+    (void)user;
+    out->bytes = g_vcache_carved ? g_vcache_bytes : 0u;
+}
+
 static void census_scratch(void *user, WlMemCensusReport *out) {
     (void)user;
     WlNv2aTexCacheMemory m;
@@ -389,6 +420,7 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
             bytes -= vbytes;
             g_vcache_arena = (uint8_t *)texture_arena + bytes;
             g_vcache_bytes = vbytes;
+            g_vcache_carved = true;
         }
         if (texture_arena != NULL) {
             gcfg.textures.arena = texture_arena;
@@ -405,7 +437,7 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
             } else {
                 gcfg.vertices.budget = g_vcache_bytes;
             }
-            gcfg.vertices.watch = tex_watch;
+            gcfg.vertices.watch = vtx_watch;
             gcfg.vertices.written = tex_written;
             WL_LOG_I(TAG, "vertex arrays: %u KB %s for GX to read by index", (unsigned)(g_vcache_bytes >> 10),
                      g_vcache_arena != NULL ? "in an arena of their own" : "of the heap");
@@ -445,6 +477,7 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
         (void)wl_mem_census_add("targets", census_targets, NULL);
         (void)wl_mem_census_add("textures", census_textures, NULL);
         (void)wl_mem_census_add("tex scratch", census_scratch, NULL);
+        (void)wl_mem_census_add("vertex arena", census_vertices, NULL);
     }
     (void)wl_mem_census_add("gpu", census_gpu, NULL);
 #if !defined(__wii__)

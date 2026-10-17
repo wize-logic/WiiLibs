@@ -517,6 +517,11 @@ static void status_report(void) {
                  "back first)",
                  (unsigned)m.file_copies, (unsigned)m.file_evictions, (unsigned)m.file_ins, (unsigned)m.file_ahead,
                  (unsigned)m.file_forgets, (unsigned)m.file_forget_ins);
+        WL_LOG_I(TAG, "status: paging %u clean evictions were zero; %u pages back after an eviction, %u refaults "
+                 "(%u swap, %u file, %u zero)",
+                 (unsigned)m.zero_evictions, (unsigned)m.returns,
+                 (unsigned)(m.refaults_swap + m.refaults_file + m.refaults_zero), (unsigned)m.refaults_swap,
+                 (unsigned)m.refaults_file, (unsigned)m.refaults_zero);
         WL_LOG_I(TAG, "status: paging I/O with the guest lock held %u ms (longest %u us), %u transfers without it (%u "
                  "waited for)",
                  (unsigned)(m.io_held_us / 1000u), (unsigned)m.io_held_max_us, (unsigned)m.io_unlocked,
