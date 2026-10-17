@@ -595,6 +595,11 @@ void wl_gx_dl_call(const WlGxDisplayList *dl);
 // Reads an EFB pixel as 0xRRGGBBAA (syncs with the GPU first). Valid between begin_frame and
 // end_frame; for tests and debugging only (CPU EFB access is slow).
 uint32_t wl_gx_peek_rgba(int x, int y);
+// Reads an EFB pixel's depth, 0 (the nearest) to 0xFFFFFF (the farthest), without a sync: the
+// caller syncs (wl_gx_sync) after the draws it must see, once for a run of reads. Above 0xFFFFFF
+// when the EFB cannot be read (the host with no renderer) or (x, y) is outside it. An occlusion
+// query's pixel count (wl/xbox) reads a few pixels of each query.
+uint32_t wl_gx_peek_z(int x, int y);
 
 // Copies the EFB rectangle (x, y, w, h: even numbers, EFB pixels, origin top left) into a
 // texture image in `dst` (32-byte aligned, wl_gx_tex_bytes(fmt, w, h) bytes, tile-ordered like

@@ -163,6 +163,45 @@ TEST a_projective_coordinate_whose_q_varies_is_sent_undivided(void) {
     PASS();
 }
 
+// depth_check: a perspective draw's fit compared with its program's depth at each vertex
+TEST depth_check_compares_the_fit_with_the_program(void) {
+    TGuest g;
+    WlNv2aGxConfig cfg;
+    WlNv2aGxDepthCheck c;
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.depth_check = true;
+    ASSERT(gx_device_with(&g, &cfg) != NULL);
+    f_frame_setup(&g);
+    f_perspective(&g);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+    f_vertex(&g, 0, 0, 2, 1, 0, 0, 0xFF0000FFu);
+    f_vertex(&g, 1, 1, 4, 1, 1, 0, 0xFF0000FFu);
+    f_vertex(&g, -1, 1, 4, 1, 0, 1, 0xFF0000FFu);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+    t_kick(&g);
+    ASSERT(wl_nv2a_gx_last_depth_check(g_gx, &c));
+    ASSERT(c.perspective);
+    ASSERT(c.made);
+    ASSERT_EQ(3u, c.checked);
+    ASSERT(c.nearer * 16777216.0f <= 8.0f);
+    ASSERT(c.farther * 16777216.0f <= 8.0f);
+    gx_done(&g);
+    // (off by default: nothing checked)
+    ASSERT(gx_device(&g) != NULL);
+    f_frame_setup(&g);
+    f_perspective(&g);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+    f_vertex(&g, 0, 0, 2, 1, 0, 0, 0xFF0000FFu);
+    f_vertex(&g, 1, 1, 4, 1, 1, 0, 0xFF0000FFu);
+    f_vertex(&g, -1, 1, 4, 1, 0, 1, 0xFF0000FFu);
+    t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+    t_kick(&g);
+    ASSERT_FALSE(wl_nv2a_gx_last_depth_check(g_gx, &c));
+    gx_done(&g);
+    PASS();
+}
+
 TEST perspective_draws_send_x_w_y_w_minus_w(void) {
     TGuest g;
     const WlHostGxDirect *d;
@@ -729,6 +768,7 @@ SUITE(gx_suite) {
     RUN_TEST(screen_space_quad_with_texture_and_combiners);
     RUN_TEST(a_projective_coordinate_whose_q_varies_is_sent_undivided);
     RUN_TEST(perspective_draws_send_x_w_y_w_minus_w);
+    RUN_TEST(depth_check_compares_the_fit_with_the_program);
     RUN_TEST(culling_by_the_nv2a_rule_and_stencil_skipped);
     RUN_TEST(partial_clears_are_quads_and_render_targets_take_the_efb);
     RUN_TEST(a_blur_through_the_depth_buffer_is_drawn_in_one_frame);

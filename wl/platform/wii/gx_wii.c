@@ -551,6 +551,16 @@ uint32_t wl_gx_peek_rgba(int x, int y) {
     return ((uint32_t)c.r << 24) | ((uint32_t)c.g << 16) | ((uint32_t)c.b << 8) | c.a;
 }
 
+uint32_t wl_gx_peek_z(int x, int y) {
+    u32 z = 0;
+
+    if (!g.ready || x < 0 || y < 0 || (uint32_t)x >= g.fb_w || (uint32_t)y >= g.efb_h) {
+        return 0xFFFFFFFFu;
+    }
+    GX_PeekZ((u16)x, (u16)y, &z);
+    return z & 0xFFFFFFu;
+}
+
 static void copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat fmt, bool clear, bool invalidate) {
     WL_ASSERT(g.ready);
     // I4 and I8 copy the red channel straight (0 to 255 stay 0 to 255; the luminance copy would map black to 16 and white to 235)
