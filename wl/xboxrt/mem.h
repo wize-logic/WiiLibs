@@ -342,6 +342,14 @@ typedef struct {
     uint32_t io_unlocked;                      // transfers made with the guest lock given up
     uint32_t transit_waits;                    // of those, pages another thread met and waited for
     uint32_t swap_slots, swap_slots_used;      // the swap file's pages
+    uint32_t zero_evictions;                   // of the clean evictions, pages with no copy: zero
+    // Pages given a frame again after their frame was taken back (a diagnostic: how much of the
+    // paging is the pool's size): in all, and those within one pool's worth of evictions of losing it
+    // (refaults), by what their touch read: the swap file, their file, nothing (zero)
+    uint32_t returns;
+    uint32_t refaults_swap, refaults_file, refaults_zero;
+    uint32_t ahead_unused;                     // pages read ahead that went again without being used
+    uint32_t resident_dirty, resident_file;    // pages with frames now: changed; clean file copies
 } WlXbMemStats;
 void wl_xb_mem_stats(WlXbMemStats *out);
 
@@ -349,6 +357,8 @@ void wl_xb_mem_stats(WlXbMemStats *out);
 // swap-in rate above `swap_ins_per_s` (0: 128 a second, half a megabyte) is logged as thrashing,
 // at most every 10 s.
 void wl_xb_mem_watch(uint32_t swap_ins_per_s);
+// WL_XB_PAGING_LOG set (a measuring aid): the paging counters in one line (the play harness, at each step).
+void wl_xb_mem_counters_log(void);
 
 #ifdef __cplusplus
 }

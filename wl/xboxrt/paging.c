@@ -19,7 +19,9 @@
 //
 // The clock goes round the frames. A pinned page, or one in I/O, is passed by. The page's R bits
 // are harvested and cleared, and a page used since the last round is passed too (its second
-// chance). A clean page gives its frame back at once. A dirty one is left: in the slow path the
+// chance). A clean page gives its frame back at once, and so does a dirty one found zero again
+// (a heap clears its blocks: nothing to write, and its touch zero-fills it; in the exception
+// context only one with no copy to forget). Another dirty one is left: in the slow path the
 // dirty pages passed are gathered, and when a look finds no clean page they are written in one
 // write to consecutive slots and their frames taken (a batch: the SD card is slow at small
 // writes). The fault's exception context (the Wii's DSI) only looks a bounded way ahead and never
@@ -81,6 +83,10 @@ static uint16_t g_batch[BATCH];
 static uint32_t g_batch_n;
 
 static uint32_t *g_foff; // [ram pages] a file copy's offset in its file
+// A diagnostic: the eviction count (its low 16 bits, 0 skipped) when each page last lost its frame, 0
+// once it has one again or its contents went (a stamp from 65536 evictions back reads as recent)
+static uint16_t *g_evstamp; // [ram pages]
+static uint32_t g_evcount;
 static struct {
     WlPlatformFile *file; // NULL: free
     uint32_t pages;       // file copies of it
@@ -93,6 +99,7 @@ static struct {
     uint32_t file_copies, file_evictions, file_ins, file_ahead, file_forgets, file_forget_ins;
     uint64_t read_bytes, write_bytes, io_us, io_held_us;
     uint32_t io_held_max_us, io_unlocked, transit_waits;
+    uint32_t zero_evictions, returns, refaults_swap, refaults_file, refaults_zero, ahead_unused;
 } g_st;
 
 // A transfer of `us` microseconds ends: its time counted, and with `held` (the
@@ -120,9 +127,31 @@ static void give_free(uint32_t f) {
     g_free[g_free_n++] = (uint16_t)f;
 }
 
+// Page `p` lost its frame (its contents kept: a copy, or zero).
+static void stamp_evicted(uint32_t p) {
+    uint16_t st = (uint16_t)++g_evcount;
+    g_evstamp[p] = st != 0 ? st : 1u;
+}
+
 static void assign(uint32_t f, uint32_t p) {
     g_owner[f] = (uint16_t)(p + 1u);
     g_xb_pg_frame[p] = (uint16_t)f;
+    uint16_t st = g_evstamp[p];
+    if (st != 0) {
+        // back after losing its frame: a refault when that was within a pool's worth of evictions
+        g_evstamp[p] = 0;
+        g_st.returns++;
+        if ((uint16_t)((uint16_t)g_evcount - st) < g_xb_pg_frames) {
+            uint16_t s = g_xb_pg_slot[p];
+            if (s == 0) {
+                g_st.refaults_zero++;
+            } else if ((s & FILE_SLOT) != 0) {
+                g_st.refaults_file++;
+            } else {
+                g_st.refaults_swap++;
+            }
+        }
+    }
 }
 
 // A clean page `q` not used lately gives frame `f` back (q is unmapped).
@@ -131,15 +160,51 @@ static void evict_clean(uint32_t q, uint32_t f) {
     g_owner[f] = 0;
     g_xb_pg_flags[q] &= (uint8_t)~WL_XB_PG_REF;
     wl_xb_mmu_frame_drop(q, f);
+    stamp_evicted(q);
     g_st.evictions++;
     g_st.clean_evictions++;
+    if ((g_xb_pg_flags[q] & WL_XB_PG_AHEAD) != 0) {
+        g_xb_pg_flags[q] &= (uint8_t)~WL_XB_PG_AHEAD;
+        g_st.ahead_unused++;
+    }
     if ((g_xb_pg_slot[q] & FILE_SLOT) != 0) {
         g_st.file_evictions++;
+    } else if (g_xb_pg_slot[q] == 0) {
+        g_st.zero_evictions++;
     }
 }
 
-// One step of the clock, at frame g_hand. Returns the frame a clean page gave back, or 0. With
-// `collect`, an unused dirty page is unmapped, marked IO and added to g_batch (while it has room).
+// Whether a page's bytes are all zero (a frame: page aligned).
+static bool page_is_zero(const uint8_t *bytes) {
+    const uint64_t *w = (const uint64_t *)(const void *)bytes;
+    uint64_t any = 0;
+    for (uint32_t i = 0; i < PAGE / 8u; i += 4u) {
+        any |= w[i] | w[i + 1] | w[i + 2] | w[i + 3];
+        if (any != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void copy_drop(uint32_t p);
+
+// A changed page `q` (unmapped) found zero gives frame `f` back: a zero page again, with its
+// write epoch as it is (its bytes are).
+static void evict_zero(uint32_t q, uint32_t f) {
+    copy_drop(q); // (stale)
+    g_xb_pg_frame[q] = 0;
+    g_owner[f] = 0;
+    g_xb_pg_flags[q] &= (uint8_t)~(WL_XB_PG_DIRTY | WL_XB_PG_REF | WL_XB_PG_AHEAD);
+    wl_xb_mmu_frame_drop(q, f);
+    stamp_evicted(q);
+    g_st.evictions++;
+    g_st.zero_outs++;
+}
+
+// One step of the clock, at frame g_hand. Returns the frame a clean page, or a changed page found
+// zero, gave back, or 0. With `collect`, an unused dirty page is unmapped, marked IO and added to
+// g_batch (while it has room).
 static uint32_t clock_step(uint32_t keep, bool collect) {
     uint32_t f = g_hand;
     g_hand = f >= g_xb_pg_frames ? 1u : f + 1u;
@@ -154,10 +219,20 @@ static uint32_t clock_step(uint32_t keep, bool collect) {
     wl_xb_mmu_harvest(q, true);
     uint8_t fl = g_xb_pg_flags[q];
     if ((fl & WL_XB_PG_REF) != 0) {
-        g_xb_pg_flags[q] = (uint8_t)(fl & ~WL_XB_PG_REF); // its second chance
+        g_xb_pg_flags[q] = (uint8_t)(fl & ~(WL_XB_PG_REF | WL_XB_PG_AHEAD)); // its second chance
         return 0;
     }
     if ((fl & WL_XB_PG_DIRTY) != 0) {
+        // changed, but zero again (cleared, as a heap's fresh blocks are): goes as a zero page, with
+        // nothing to write or read back (the exception context: only a page with no copy to forget)
+        if ((collect || g_xb_pg_slot[q] == 0) && page_is_zero(wl_xb_mmu_frame_ptr(q, f))) {
+            wl_xb_mmu_unmap(q);
+            if (!page_is_zero(wl_xb_mmu_frame_ptr(q, f))) {
+                return 0; // stored to before the unmap (left unmapped: its next touch maps it again)
+            }
+            evict_zero(q, f);
+            return f;
+        }
         if (collect && g_batch_n < BATCH) {
             wl_xb_mmu_unmap(q);
             g_xb_pg_flags[q] |= WL_XB_PG_IO;
@@ -260,19 +335,6 @@ static uint32_t slot_run(uint32_t want, uint32_t *first) {
 }
 
 // The gathered pages from `from` on stay resident (dirty, unmapped: they fault back in cheaply).
-// Whether a page's bytes are all zero (a frame: page aligned).
-static bool page_is_zero(const uint8_t *bytes) {
-    const uint64_t *w = (const uint64_t *)(const void *)bytes;
-    uint64_t any = 0;
-    for (uint32_t i = 0; i < PAGE / 8u; i += 4u) {
-        any |= w[i] | w[i + 1] | w[i + 2] | w[i + 3];
-        if (any != 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static void batch_abandon(uint32_t from) {
     uint32_t lv = wl_xb_mmu_lock();
     for (uint32_t i = from; i < g_batch_n; i++) {
@@ -299,6 +361,7 @@ static WlResult batch_write(void) {
             g_xb_pg_flags[p] &= (uint8_t)~(WL_XB_PG_IO | WL_XB_PG_DIRTY | WL_XB_PG_REF);
             give_free(f);
             wl_xb_mmu_frame_drop(p, f);
+            stamp_evicted(p);
             wl_xb_mmu_unlock(lv);
             zeroed++;
             continue;
@@ -347,6 +410,7 @@ static WlResult batch_write(void) {
         g_xb_pg_flags[p] &= (uint8_t)~(WL_XB_PG_IO | WL_XB_PG_DIRTY | WL_XB_PG_REF);
         give_free(f);
         wl_xb_mmu_frame_drop(p, f);
+        stamp_evicted(p);
         wl_xb_mmu_unlock(lv);
     }
     g_st.swap_outs += n;
@@ -591,6 +655,7 @@ static WlResult fault(uint32_t p, uint32_t keep, bool give_up) {
         for (uint32_t k = 1; k < run; k++) {
             uint32_t q = p + k * step;
             g_xb_pg_flags[q] &= (uint8_t)~(WL_XB_PG_IO | WL_XB_PG_DIRTY | WL_XB_PG_REF);
+            g_xb_pg_flags[q] |= WL_XB_PG_AHEAD;
             if (r != WL_OK) {
                 uint32_t fq = g_xb_pg_frame[q];
                 g_xb_pg_frame[q] = 0;
@@ -633,6 +698,7 @@ void wl_xb_pg_release(uint32_t p, uint32_t pages) {
             g_pinned--;
         }
         g_xb_pg_flags[k] = 0;
+        g_evstamp[k] = 0;
         wl_xb_pg_wrote(k); // (zero from now on)
         wl_xb_mmu_unlock(lv);
     }
@@ -648,6 +714,7 @@ void wl_xb_pg_discard(uint32_t p, uint32_t pages) {
             copy_drop(k);
             wl_xb_pg_wrote(k); // (zero until the caller's stores)
             g_st.discards++;
+            g_evstamp[k] = 0;
         }
         wl_xb_mmu_unlock(lv);
     }
@@ -661,6 +728,8 @@ void wl_xb_pg_move(uint32_t from, uint32_t to) {
     (void)settle(from);
     uint32_t lv = wl_xb_mmu_lock();
     wl_xb_mmu_unmap(from);
+    g_evstamp[to] = g_evstamp[from];
+    g_evstamp[from] = 0;
     uint32_t f = g_xb_pg_frame[from];
     if (f != 0) {
         wl_xb_mmu_frame_move(from, to, f);
@@ -849,6 +918,21 @@ bool wl_xb_pg_written(uint32_t p, uint32_t pages, uint32_t stamp) {
     return written;
 }
 
+void wl_xb_pg_zero_census(uint32_t *dirty_zero, uint32_t *clean_zero) {
+    *dirty_zero = *clean_zero = 0;
+    for (uint32_t f = 1; f <= g_xb_pg_frames; f++) {
+        uint32_t q1 = g_owner[f];
+        if (q1 == 0 || (g_xb_pg_flags[q1 - 1u] & WL_XB_PG_IO) != 0) {
+            continue;
+        }
+        uint32_t q = q1 - 1u;
+        bool dirty = (g_xb_pg_flags[q] & WL_XB_PG_DIRTY) != 0;
+        if ((dirty || g_xb_pg_slot[q] == 0) && page_is_zero(wl_xb_mmu_frame_ptr(q, f))) {
+            *(dirty ? dirty_zero : clean_zero) += 1u;
+        }
+    }
+}
+
 void wl_xb_pg_stats(WlXbMemStats *out) {
     out->frames_total = g_xb_pg_frames;
     out->frames_free = g_free_n;
@@ -876,6 +960,20 @@ void wl_xb_pg_stats(WlXbMemStats *out) {
     out->transit_waits = g_st.transit_waits;
     out->swap_slots = g_slots;
     out->swap_slots_used = g_slots_used;
+    out->zero_evictions = g_st.zero_evictions;
+    out->returns = g_st.returns;
+    out->refaults_swap = g_st.refaults_swap;
+    out->refaults_file = g_st.refaults_file;
+    out->refaults_zero = g_st.refaults_zero;
+    out->ahead_unused = g_st.ahead_unused;
+    out->resident_dirty = out->resident_file = 0;
+    for (uint32_t f = 1; f <= g_xb_pg_frames; f++) {
+        uint32_t q1 = g_owner[f];
+        if (q1 != 0) {
+            out->resident_dirty += (g_xb_pg_flags[q1 - 1u] & WL_XB_PG_DIRTY) != 0;
+            out->resident_file += (g_xb_pg_slot[q1 - 1u] & FILE_SLOT) != 0;
+        }
+    }
 }
 
 // ---- Set-up ------------------------------------------------------------------------------------
@@ -924,7 +1022,7 @@ size_t wl_xb_pg_host_bytes(void) {
     }
     size_t pages = g_xb_ram_pages;
     return pages * (sizeof *g_xb_pg_flags + sizeof *g_xb_pg_frame + sizeof *g_xb_pg_slot + sizeof *g_xb_pg_wgen +
-                    sizeof *g_foff) +
+                    sizeof *g_foff + sizeof *g_evstamp) +
            (g_xb_pg_frames + 1u) * sizeof *g_owner + g_xb_pg_frames * sizeof *g_free +
            (g_slot_used != NULL ? (g_slots + 31u) / 32u * sizeof *g_slot_used : 0u) +
            (g_io != NULL ? (BATCH + 1u) * PAGE : 0u);
@@ -942,7 +1040,8 @@ WlResult wl_xb_pg_init(const WlXbMemConfig *cfg, uint32_t frames) {
     g_free = calloc(frames, sizeof *g_free);
     g_xb_pg_wgen = calloc(pages, sizeof *g_xb_pg_wgen);
     g_foff = calloc(pages, sizeof *g_foff);
-    if (g_xb_pg_flags == NULL || g_xb_pg_frame == NULL || g_xb_pg_slot == NULL || g_owner == NULL || g_free == NULL ||
+    g_evstamp = calloc(pages, sizeof *g_evstamp);
+    if (g_evstamp == NULL || g_xb_pg_flags == NULL || g_xb_pg_frame == NULL || g_xb_pg_slot == NULL || g_owner == NULL || g_free == NULL ||
         g_xb_pg_wgen == NULL || g_foff == NULL) {
         return WL_ERR_NOMEM;
     }
