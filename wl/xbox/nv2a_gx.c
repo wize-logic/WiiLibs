@@ -51,7 +51,9 @@ enum {
     // the inputs a draw's program is also run with for its transform's signature
     CANONICAL_POINTS = 4,
     // programs whose analyses are kept
-    XF_ANALYSES = 8
+    XF_ANALYSES = 8,
+    // a stand-in texture's image: 4 x 4 RGBA8, one GX tile
+    STANDIN_BYTES = 64
 };
 
 // how far (in the depth's 0..1) a fit made with the canonical points may be from a draw's own
@@ -140,6 +142,15 @@ struct WlNv2aGx {
     // the draw's
     const WlNv2aTexEntry *entries[WL_NV2A_TEXTURES];
     WlNv2aTexEntry target_entries[WL_NV2A_TEXTURES];
+    // what is bound for a texture that could not be made (standin_bind): 4 x 4 images, transparent
+    // black and a stage's average colour, in `standin_memory` 32-byte aligned for GX
+    WlNv2aTexEntry standin_entries[WL_NV2A_TEXTURES];
+    struct {
+        uint32_t phys, format_word, rgba;
+        bool made;
+    } standins[WL_NV2A_TEXTURES];
+    uint8_t standin_memory[(1 + WL_NV2A_TEXTURES) * STANDIN_BYTES + 32];
+    bool standins_cleared;
     WlGxTexObj stage_objects[WL_NV2A_TEXTURES], alpha_objects[WL_NV2A_TEXTURES];
     // what each object was made from (bit n of objects_known: stage n's, bit n + 4: its alpha's)
     WlGxTexDesc stage_descs[WL_NV2A_TEXTURES], alpha_descs[WL_NV2A_TEXTURES];
@@ -997,8 +1008,143 @@ static bool texture_object(WlNv2aGx *gx, WlGxTexObj *obj, WlGxTexDesc *made_from
     return true;
 }
 
+// The texture stages the pixel program reads: a stage whose register (t0..t3) a combiner stage in
+// use or the final combiner takes as an input, and every stage before one whose texture shader
+// program reads the stages before it (a dependent lookup, a dot product: modes 6 and up). Stage 0
+// counts as read (the stand-in for combiners beyond GX is texture 0 times the colour).
+static unsigned stages_read(const WlNv2aKelvin *k) {
+    uint32_t words[WL_XBOX_PSH_WORDS];
+    unsigned read = 1u, count, stage, shift;
+
+    wl_nv2a_psh_words(k, words);
+    count = words[WL_XBOX_PSH_COMBINER_COUNT] & 0xFFu;
+    if (count == 0 || count > 8) {
+        count = 8;
+    }
+    for (stage = 0; stage < count; stage++) {
+        uint32_t inputs = words[WL_XBOX_PSH_RGB_INPUTS0 + stage], alpha = words[WL_XBOX_PSH_ALPHA_INPUTS0 + stage];
+
+        for (shift = 0; shift < 32; shift += 8) {
+            unsigned a = (inputs >> shift) & 0xFu, b = (alpha >> shift) & 0xFu;
+
+            read |= (a >= 8u && a <= 11u ? 1u << (a - 8u) : 0u) | (b >= 8u && b <= 11u ? 1u << (b - 8u) : 0u);
+        }
+    }
+    for (shift = 0; shift < 32; shift += 8) {
+        unsigned a = (words[WL_XBOX_PSH_FINAL_INPUTS_ABCD] >> shift) & 0xFu;
+        unsigned b = shift != 0 ? (words[WL_XBOX_PSH_FINAL_INPUTS_EFG] >> shift) & 0xFu : 0u;
+
+        read |= (a >= 8u && a <= 11u ? 1u << (a - 8u) : 0u) | (b >= 8u && b <= 11u ? 1u << (b - 8u) : 0u);
+    }
+    for (stage = 1; stage < WL_NV2A_TEXTURES; stage++) {
+        if (wl_nv2a_stage_program(k, stage) >= WL_NV2A_STAGE_BUMPENVMAP) {
+            read |= (1u << stage) - 1u;
+        }
+    }
+    return read;
+}
+
+// whether a stage's texture is looked up: its program samples it (not pass-through, clip plane,
+// DOT_ZW or dot product, which read none of their own), D3D bound one (CONTROL0's enable: D3D's
+// SetTexture(stage, NULL) leaves the format and offset of the texture before) and the pixel
+// program reads it (`read`, stages_read)
+static bool stage_sampled(WlNv2aGx *gx, const WlNv2aKelvin *k, unsigned stage, const WlNv2aTexture *t,
+                          unsigned read) {
+    switch (wl_nv2a_stage_program(k, stage)) {
+    case WL_NV2A_STAGE_PASS_THROUGH:
+    case WL_NV2A_STAGE_CLIP_PLANE:
+    case WL_NV2A_STAGE_DOT_ZW:
+    case WL_NV2A_STAGE_DOT_PRODUCT:
+        gx->stats.textures_unsampled++;
+        return false;
+    default:
+        break;
+    }
+    if (!t->enabled) {
+        gx->stats.textures_disabled++;
+        return false;
+    }
+    if (!(read & (1u << stage))) {
+        gx->stats.textures_unread++;
+        return false;
+    }
+    return true;
+}
+
+// What a stage binds for a texture the cache could not make (no memory for it, a format GX cannot
+// take, texels outside memory), so that an opaque draw is not drawn untextured: a 4 x 4 image of
+// its average colour (grey when its texels cannot be read), made again when the stage's texture
+// changes (a multiplying pass, a detail map's, takes the average as well). A draw that adds onto
+// what is drawn (blending whose destination factor is one or the source's alpha: an effect, a
+// decal, the HUD, where a square of one colour would show) binds transparent black, which adds
+// nothing, as no texture did. Halo never draws without its texture: it waits for one to load. The
+// entry is dynamic: the texture is looked up again at the next draw.
+static const WlNv2aTexEntry *standin_bind(WlNv2aGx *gx, const WlNv2aKelvin *k, unsigned stage,
+                                          const WlNv2aTexture *t) {
+    WlNv2aTexEntry *e = &gx->standin_entries[stage];
+    uint8_t *images = (uint8_t *)(((uintptr_t)gx->standin_memory + 31u) & ~(uintptr_t)31u);
+    uint8_t *image = images + (1u + stage) * STANDIN_BYTES; // (the first: transparent black)
+    uint32_t destination = wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_FUNC_DFACTOR);
+    bool clear = wl_nv2a_k(k, WL_NV2A_K_SET_BLEND_ENABLE) != 0 &&
+                 (destination == WL_NV2A_BLEND_ONE || destination == WL_NV2A_BLEND_SRC_ALPHA ||
+                  destination == WL_NV2A_BLEND_ONE_MINUS_SRC_ALPHA);
+
+    gx->stats.textures_stood_in++;
+    if (!gx->standins_cleared) {
+        memset(images, 0, STANDIN_BYTES);
+        commit(NULL, images, STANDIN_BYTES);
+        gx->standins_cleared = true;
+        gx->texture_memory_changed = true;
+    }
+    if (!clear && (!gx->standins[stage].made || gx->standins[stage].phys != t->phys ||
+                   gx->standins[stage].format_word != t->format_word)) {
+        uint8_t rgba[4] = {128, 128, 128, 255}, texels[16 * 4];
+        const uint8_t *src = t->known ? wl_nv2a_phys(gx->dev, t->phys, t->total_bytes) : NULL;
+        const uint8_t *palette = src != NULL && t->palette_entries != 0
+                                     ? wl_nv2a_phys(gx->dev, t->palette_phys, 4u * t->palette_entries)
+                                     : NULL;
+        uint32_t value;
+        unsigned i;
+
+        if (src != NULL && !wl_nv2a_texture_average(t, src, palette, rgba)) {
+            rgba[0] = rgba[1] = rgba[2] = 128, rgba[3] = 255;
+        }
+        value = (uint32_t)rgba[0] << 24 | (uint32_t)rgba[1] << 16 | (uint32_t)rgba[2] << 8 | rgba[3];
+        if (!gx->standins[stage].made || value != gx->standins[stage].rgba) {
+            for (i = 0; i < 16; i++) {
+                memcpy(texels + 4u * i, rgba, 4);
+            }
+            wl_gxc_encode(WL_GXC_RGBA8, texels, 4, 4, image, STANDIN_BYTES);
+            commit(NULL, image, STANDIN_BYTES);
+            gx->texture_memory_changed = true;
+        }
+        gx->standins[stage].phys = t->phys;
+        gx->standins[stage].format_word = t->format_word;
+        gx->standins[stage].rgba = value;
+        gx->standins[stage].made = true;
+        WL_LOG_D(TAG, "stage %u: texture %08x (format %02x) stood in by %08x", stage, (unsigned)t->phys,
+                 (unsigned)t->color, (unsigned)value);
+    }
+    memset(e, 0, sizeof *e);
+    e->phys = t->phys;
+    e->format_word = t->format_word;
+    e->image = clear ? images : image;
+    e->layout.format = WL_GXC_RGBA8;
+    e->layout.width = e->layout.height = 4;
+    e->layout.levels = 1;
+    e->layout.image_bytes = e->layout.total_bytes = STANDIN_BYTES;
+    e->layout.sphere = t->cube != 0;
+    e->sphere = t->cube;
+    e->contents = t->contents;
+    e->linear = t->linear;
+    e->width = (uint16_t)t->width;
+    e->height = (uint16_t)t->height;
+    e->dynamic = 1;
+    return e;
+}
+
 static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
-    unsigned stage, wanted = 0;
+    unsigned stage, wanted = 0, read = stages_read(k);
 
     for (stage = 0; stage < WL_NV2A_TEXTURES; stage++) {
         WlNv2aTexture t;
@@ -1007,7 +1153,8 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
         bool made = false, mipmapped;
 
         gx->entries[stage] = NULL;
-        if (wl_nv2a_stage_program(k, stage) == WL_NV2A_STAGE_NONE || !wl_nv2a_texture(k, stage, &t)) {
+        if (wl_nv2a_stage_program(k, stage) == WL_NV2A_STAGE_NONE || !wl_nv2a_texture(k, stage, &t) ||
+            !stage_sampled(gx, k, stage, &t, read)) {
             continue;
         }
         wanted |= 1u << stage;
@@ -1035,7 +1182,7 @@ static void textures_bind(WlNv2aGx *gx, const WlNv2aKelvin *k) {
             }
             e = wl_nv2a_texcache_get(&gx->textures, gx->dev, &t, mipmaps, &made);
             if (e == NULL) {
-                continue;
+                e = standin_bind(gx, k, stage, &t);
             }
         }
         if (made) {

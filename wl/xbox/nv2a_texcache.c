@@ -372,19 +372,30 @@ static uint32_t rect_of(const WlNv2aTexture *t) {
     return t->linear ? t->rect_word : 0u;
 }
 
-static WlNv2aTexEntry *find(WlNv2aTexCache *cache, const WlNv2aTexture *t, bool mipmaps) {
+static WlNv2aTexEntry *find_exact(WlNv2aTexCache *cache, const WlNv2aTexture *t, bool mipmaps) {
     uint16_t link = cache->buckets[bucket_of(t->phys, t->format_word)];
 
     while (link != 0) {
         WlNv2aTexEntry *e = &cache->entries[link - 1];
 
         if (e->phys == t->phys && e->format_word == t->format_word && e->rect_word == rect_of(t) &&
-            e->palette_phys == t->palette_phys && e->mipmaps == (uint8_t)mipmaps) {
+            e->palette_phys == t->palette_phys && e->signs == t->signs && e->mipmaps == (uint8_t)mipmaps) {
             return e;
         }
         link = e->next;
     }
     return NULL;
+}
+
+// The texture's entry: without mip-maps, the one with them if there is no other (GX samples its
+// first level alone with a filter that takes no mip-map, wl_nv2a_gx's gx_min_filter)
+static WlNv2aTexEntry *find(WlNv2aTexCache *cache, const WlNv2aTexture *t, bool mipmaps) {
+    WlNv2aTexEntry *e = find_exact(cache, t, mipmaps);
+
+    if (e == NULL && !mipmaps && (e = find_exact(cache, t, true)) != NULL) {
+        cache->stats.mip_shared++;
+    }
+    return e;
 }
 
 // the least recently drawn entry with an image, other than `keep`; with `idle`, only one not drawn
@@ -832,6 +843,19 @@ static bool restore(WlNv2aTexCache *cache, WlNv2a *dev, WlNv2aTexEntry *e, const
     return true;
 }
 
+// a texture GX cannot take: counted, its format code logged once
+static void unknown_note(WlNv2aTexCache *cache, const WlNv2aTexture *t) {
+    uint32_t bit = 1u << (t->color & 31u);
+
+    cache->stats.unknown++;
+    if (!(cache->unknown_logged[t->color >> 5] & bit)) {
+        cache->unknown_logged[t->color >> 5] |= bit;
+        WL_LOG_W(TAG, "a texture GX cannot take: format %02x (%s), %ux%u, %u levels", (unsigned)t->color,
+                 t->known ? "a size beyond GX" : "not known", (unsigned)t->width, (unsigned)t->height,
+                 (unsigned)t->levels);
+    }
+}
+
 const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, const WlNv2aTexture *t,
                                            bool mipmaps, bool *made) {
     WlNv2aTexEntry *e;
@@ -858,7 +882,7 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     if (e != NULL && e->stamp != 0 && watching(cache, dev) && !watch_written(cache, e, t)) {
         // no store to its pages since it was checked: as it was
         if (!restore(cache, dev, e, t, gpu_reads(cache, e->used_frame), NULL, NULL, made)) {
-            cache->stats.failed++;
+            cache->stats.no_memory++, cache->stats.failed++;
             return NULL;
         }
         e->checked_frame = cache->frame;
@@ -868,11 +892,13 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
         return e;
     }
     if (e == NULL && refused_now(cache, t)) {
+        cache->stats.refused_again++;
         cache->stats.failed++;
         return NULL;
     }
     src = wl_nv2a_phys(dev, t->phys, t->total_bytes);
     if (src == NULL) {
+        cache->stats.unreadable++;
         cache->stats.failed++;
         return NULL;
     }
@@ -898,7 +924,7 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
             hash = hash_texels(cache, src, t->total_bytes);
             if (e->hash == hash && e->palette_hash == palette_hash) {
                 if (!restore(cache, dev, e, t, drawn_now, src, palette, made)) {
-                    cache->stats.failed++;
+                    cache->stats.no_memory++, cache->stats.failed++;
                     return NULL;
                 }
                 cache->stats.hits++;
@@ -926,6 +952,7 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
         }
         if (!convert(cache, e, t, src, palette)) {
             evict(cache, e);
+            cache->stats.bad_texels++;
             cache->stats.failed++;
             return NULL;
         }
@@ -936,12 +963,14 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
         return e;
     }
     if (!t->known || !wl_nv2a_texture_layout(t, mipmaps, &layout)) {
+        unknown_note(cache, t);
         cache->stats.failed++;
         return NULL;
     }
     make_room(cache, layout.total_bytes, NULL);
     e = victim(cache);
     if (e == NULL) {
+        cache->stats.no_memory++;
         cache->stats.failed++;
         return NULL;
     }
@@ -980,6 +1009,7 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     e->hash = hash;
     e->palette_hash = palette_hash;
     e->mipmaps = (uint8_t)mipmaps;
+    e->signs = t->signs;
     e->layout = layout;
     e->contents = t->contents;
     e->linear = t->linear;
@@ -992,12 +1022,21 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     if (!convert(cache, e, t, src, palette)) {
         image_free(cache, e->image);
         memset(e, 0, sizeof *e);
+        cache->stats.bad_texels++;
         cache->stats.failed++;
         return NULL;
     }
     link_entry(cache, e);
     cache->stats.bytes += layout.total_bytes;
     cache->stats.converted++;
+    if (mipmaps) {
+        // (the texture without mip-maps, not drawn in this frame, given back: this one answers for it)
+        WlNv2aTexEntry *plain = find_exact(cache, t, false);
+
+        if (plain != NULL && plain->used_frame != cache->frame && evict(cache, plain)) {
+            cache->stats.mip_replaced++;
+        }
+    }
     if (made != NULL) {
         *made = true;
     }
