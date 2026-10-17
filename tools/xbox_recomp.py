@@ -38,7 +38,9 @@ identical), and its integer registers too (--reg-locals, patch 0014: every guest
 compiler reload them). A title's config can turn either off ("x87_locals": false,
 "reg_locals": false). It writes a guest access's small constant displacement apart from its base
 (--mem-disp, patch 0021: MEM32_D(esi, 0x8)), so the PowerPC header maps the base once for the
-accesses through it ("mem_disp": false turns it off).
+accesses through it ("mem_disp": false turns it off), and an access at esp + a small constant as
+MEMxx_SP(esp, disp) (--stack-disp, patch 0023), which the header addresses without the map: every
+guest stack is below 0x10000000, where it is the identity ("stack_disp": false turns it off).
 
 A title's own knowledge is data, passed with --config (JSON; relative paths are relative to it):
 
@@ -72,6 +74,8 @@ A title's own knowledge is data, passed with --config (JSON; relative paths are 
       "reg_locals": false,                   the same for the integer registers (default true)
       "mem_disp": false,                     every access's address whole (the default true writes a
                                              small displacement apart: MEM32_D(esi, 0x8), patch 0021)
+      "stack_disp": false,                   esp-based accesses through the address map too (the
+                                             default true writes MEMxx_SP(esp, disp), patch 0023)
       "hot_functions": "hot.txt" or ["sub_00052520", "0x00088B80"],   the functions compiled at
                                              -O2 (tu/recomp_tu_hot.c); a file is read for its
                                              sub_XXXXXXXX names and 0x addresses (a profile report
@@ -339,6 +343,8 @@ class Run:
             rcmd.append("--reg-locals")
         if c.get("mem_disp", True):
             rcmd.append("--mem-disp")
+        if c.get("stack_disp", True):
+            rcmd.append("--stack-disp")
         rin = [self.xbe, functions, disasm / "labels.json", func_id / "identified_functions.json", abi]
         if c.get("icall_sites"):
             rcmd += ["--icall-sites", str(self.cfg_path(c["icall_sites"]))]
@@ -567,7 +573,7 @@ def load_config(path):
     known = {"name", "seed_functions", "extra_sections", "text_only", "manual_functions",
              "coalesce_functions", "trace_functions", "split", "disasm_args", "func_id_args",
              "abi_args", "recomp_args", "icall_sites", "patches", "comment", "vertex_programs", "x87_locals",
-             "reg_locals", "mem_disp", "hot_functions"}
+             "reg_locals", "mem_disp", "stack_disp", "hot_functions"}
     unknown = sorted(set(cfg) - known)
     if unknown:
         raise Failure(f"{path}: unknown keys {unknown} (known: {sorted(known)})")

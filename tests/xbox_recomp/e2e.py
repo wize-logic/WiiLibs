@@ -162,6 +162,9 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False
     ft = FunctionTranslator(image, db)
     ft.x87_locals = x87_locals
     ft.reg_locals = reg_locals
+    # the register-locals mode is the title's: displacements apart, the stack's without the map
+    ft.mem_disp = reg_locals
+    ft.stack_disp = reg_locals
     # as tools.recomp does last: a called address inside a body gets a function of its own
     ft.discover_interior_entries()
     db = {a: info for a, info in ft.func_db.items() if a not in ft.owned_function_starts}
