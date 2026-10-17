@@ -39,6 +39,9 @@ WiiLibs' copy (wl/xboxrt/recomp/recomp_types.h) is that template, with WiiLibs' 
  13. the indirect-call macros resolve their target with one call, RECOMP_RESOLVE (wl/xboxrt's
      wl_xb_lookup: manual, generated, kernel behind a direct-mapped cache), not three
  14. RECOMP_FCMP is an inline function: one evaluation of each operand, ordered tests first
+ 15. PUSH32 onto the guest's own esp (g_esp, how every direct call pushes its return address) is a
+     call of one small function per unit in code built for size (-Os: the units the profile does
+     not name hot), not eight inline instructions
 
 On a little-endian host the storage-order attribute does nothing and the byte swaps are
 identities, so the same header serves host tests.
@@ -499,6 +502,37 @@ recomp_func_t wl_xb_lookup(uint32_t xbox_va);
 """ + RESOLVE_DEF_ANCHOR
 
 
+PUSH_OLD = """#define PUSH32(sp, val) do { \\
+    uint32_t _pv = (uint32_t)(val); \\
+    (sp) -= 4; \\
+    MEM32(sp) = _pv; \\
+} while(0)
+"""
+PUSH_NEW = """#define RECOMP_PUSH32_INLINE(sp, val) do { \\
+    uint32_t _pv = (uint32_t)(val); \\
+    (sp) -= 4; \\
+    MEM32(sp) = _pv; \\
+} while(0)
+/* WiiLibs: in code built for size (-Os, the units the profile does not name hot) a push onto the
+ * guest's own esp, g_esp, is a call of recomp_push32_esp: load, decrement, store, the address
+ * transform and the byte-reversed store (about eight instructions) become one branch. Every direct
+ * call pushes its return address so, about 14,000 sites in Halo: 348 KB of the Wii's MEM1, for
+ * two branches per push run. A push onto a local copy of esp stays inline (the local is a register
+ * there). */
+#if defined(__OPTIMIZE_SIZE__) && !defined(RECOMP_NO_PUSH32_CALL)
+static __attribute__((noinline, unused)) void recomp_push32_esp(uint32_t v) {
+    RECOMP_PUSH32_INLINE(g_esp, v);
+}
+#define PUSH32(sp, val) do { \\
+    if (&(sp) == &g_esp) recomp_push32_esp((uint32_t)(val)); \\
+    else RECOMP_PUSH32_INLINE(sp, val); \\
+} while(0)
+#else
+#define PUSH32(sp, val) RECOMP_PUSH32_INLINE(sp, val)
+#endif
+"""
+
+
 PORT_OLD = """#ifndef RECOMP_PORT_IN
 #define RECOMP_PORT_IN(port, size) ((void)(port), (void)(size), 0u)
 #endif
@@ -548,6 +582,7 @@ def transform(src: str, commit: str, release: str, patches: list[str]) -> str:
     src = hoist_mmx(src)
     src = replace_once(src, BACKEDGE_OLD, BACKEDGE_NEW, "RECOMP_BACKEDGE safe point")
     src = replace_once(src, PORT_OLD, PORT_NEW, "RECOMP_PORT_IN/OUT")
+    src = replace_once(src, PUSH_OLD, PUSH_NEW, "PUSH32 onto g_esp out of line")
     for needle in ("__thread", "_InterlockedExchangeAdd", "(*(volatile uint32_t *)XBOX_PTR"):
         if needle in src:
             raise AnchorError(f"after the edits the header still has {needle!r}: an edit missed a new copy")
