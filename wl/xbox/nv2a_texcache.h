@@ -163,3 +163,13 @@ typedef struct WlNv2aTexCacheMemory {
     size_t arena_largest; // its largest free block (the largest image that fits without evicting)
 } WlNv2aTexCacheMemory;
 void wl_nv2a_texcache_memory(const WlNv2aTexCache *cache, WlNv2aTexCacheMemory *out);
+
+// What the images kept are, for a census of the arena: bytes and count by GX format (a C8's TLUT
+// and a DXT3/5's alpha included), the bytes of linear textures (pictures of the screen's size
+// among them), the guest's bytes they were made from, and the largest image.
+typedef struct WlNv2aTexCacheKinds {
+    size_t by_format[WL_GXC_FORMAT_COUNT];
+    uint32_t count_by_format[WL_GXC_FORMAT_COUNT];
+    size_t linear, source, largest;
+} WlNv2aTexCacheKinds;
+void wl_nv2a_texcache_kinds(const WlNv2aTexCache *cache, WlNv2aTexCacheKinds *out);

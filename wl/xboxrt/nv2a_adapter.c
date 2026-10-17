@@ -267,6 +267,20 @@ static void gpu_status(void) {
              (unsigned)ts.reconverted, (unsigned)ts.failed, (unsigned)ts.no_memory, (unsigned)ts.reduced,
              (unsigned)ts.restored, (unsigned)ts.evicted,
              (unsigned)ts.checks, (unsigned)ts.watched, (unsigned)ts.hashed, (unsigned)(ts.hashed_bytes >> 10));
+    WlNv2aTexCacheKinds tk;
+    wl_nv2a_texcache_kinds(wl_nv2a_gx_textures(g_gx), &tk);
+    // (what fills the arena: KB by GX format, count in brackets)
+    WL_LOG_I(TAG, "status: textures KB by format: RGBA8 %u (%u), CMPR %u (%u), C8 %u (%u), RGB565 %u (%u), "
+             "RGB5A3 %u (%u), IA8 %u (%u), I8 %u (%u); %u linear; made from %u KB of the guest's; largest %u",
+             (unsigned)(tk.by_format[WL_GXC_RGBA8] >> 10), (unsigned)tk.count_by_format[WL_GXC_RGBA8],
+             (unsigned)(tk.by_format[WL_GXC_CMPR] >> 10), (unsigned)tk.count_by_format[WL_GXC_CMPR],
+             (unsigned)(tk.by_format[WL_GXC_C8] >> 10), (unsigned)tk.count_by_format[WL_GXC_C8],
+             (unsigned)(tk.by_format[WL_GXC_RGB565] >> 10), (unsigned)tk.count_by_format[WL_GXC_RGB565],
+             (unsigned)(tk.by_format[WL_GXC_RGB5A3] >> 10), (unsigned)tk.count_by_format[WL_GXC_RGB5A3],
+             (unsigned)(tk.by_format[WL_GXC_IA8] >> 10), (unsigned)tk.count_by_format[WL_GXC_IA8],
+             (unsigned)(tk.by_format[WL_GXC_I8] >> 10), (unsigned)tk.count_by_format[WL_GXC_I8],
+             (unsigned)(tk.linear >> 10), (unsigned)(tk.source >> 10),
+             (unsigned)(tk.largest >> 10));
     if (wl_nv2a_vcache_on(wl_nv2a_gx_vertex_cache(g_gx))) {
         WlNv2aVCacheStats vs;
         wl_nv2a_vcache_stats(wl_nv2a_gx_vertex_cache(g_gx), &vs);

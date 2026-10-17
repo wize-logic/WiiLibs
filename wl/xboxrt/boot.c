@@ -37,13 +37,14 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     memset(cfg, 0, sizeof *cfg);
     cfg->xbe_name = "default.xbe";
     cfg->ram_mb = 64;
-    // the host side: caches, buffers, render targets (13 MB: real-Wii runs of a10, a30 and d40 used
-    // at most 9.9 MB of 14, the census's lowest free 4.1 MB; 3 MB stay for what a 10 s census misses,
-    // a shot's 1.2 MB and the freeze profile's 320 KB among them), and the GX textures converted from
-    // the guest's in an arena of their own (13 MB: a10 draws at most ~11.6 MB of them in a frame; an
-    // arena too small for a frame's textures converts them again in every frame)
-    cfg->keep_free_bytes = 13u << 20;
-    cfg->texture_bytes = 13u << 20;
+    // the host side: caches, buffers, render targets (12 MB: real-Wii runs of a10, a30 and d40 used
+    // at most 9.9 MB of 14, the kept frames' 2.4 MB among it, now gone; 4.5 MB stay for what a 10 s
+    // census misses, a shot's 1.2 MB and the freeze profile's 320 KB among them), and the GX
+    // textures converted from the guest's in an arena of their own (15 MB, the vertex arrays' 1 MB in its end: a10's opening
+    // draws up to 14.2 MB of them in a frame; an arena too small for a frame's textures keeps them
+    // smaller, or refuses them and the draws lose them)
+    cfg->keep_free_bytes = 12u << 20;
+    cfg->texture_bytes = 15u << 20;
     cfg->htab_bytes = 256u << 10;
 }
 
@@ -262,7 +263,7 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
         // threads' stacks, the GPU's and everyone's buffers: on the Wii all of it comes out of
         // keep_free_bytes, the frames and the textures' arena being had already) capped, so that a
         // run shows what would fail first. The host's own stand-ins (the software GX of the
-        // screenshots, the GX recorders) are not counted (mem_census.h). WL_XB_HEAP_MB=13 is the Wii's.
+        // screenshots, the GX recorders) are not counted (mem_census.h). WL_XB_HEAP_MB=12 is the Wii's.
         const char *mb = getenv("WL_XB_HEAP_MB");
         const char *kb = getenv("WL_XB_HEAP_KB");
         size_t cap = 0;
