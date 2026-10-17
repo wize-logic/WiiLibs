@@ -129,6 +129,12 @@ def main():
     later = [pg for pg in code if pg["last"] > pg["first"] or pg["seconds"] > 1]
     print("  (a) x86 code: %s MB in the XBE's code sections; %s MB touched in more than its load second "
           "(read as data: jump tables, the runtime's reads)" % (mb(len(code)), mb(len(later))))
+    for i, al in sorted(allocs.items()):
+        if al["kind"] in ("xbe_code", "xbe_data"):
+            sel = [pg for pg in pages if pg["alloc"] == i]
+            print("      section %-3s %-8s va %08x: %s MB, %s MB touched after its load second" % (
+                "hdr" if al["caller"] == 0xFFFFFFFF else al["caller"], al["kind"], al["va"], mb(len(sel)),
+                mb(sum(1 for pg in sel if pg["last"] > pg["first"] or pg["seconds"] > 1))))
     for name, bit in (("textures", 0x04), ("vertex arrays", 0x08)):
         sel = [pg for pg in pages if pg["use"] & bit]
         recent = [pg for pg in sel if pg["last"] >= a.lo and pg["first"] <= hi]
