@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/platform/gx_target.h"
 #include "wl/platform/mem_census.h"
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/devices.h"
@@ -345,8 +346,12 @@ static void census_targets(void *user, WlMemCensusReport *out) {
     size_t record, targets;
     unsigned count;
     wl_nv2a_gx_host_bytes(g_gx, &record, &targets, &count);
-    out->bytes = targets;
-    snprintf(out->note, sizeof out->note, "%u", count);
+    // and the back buffer's park (gx_target.c: its colour, as large as the picture, and the depth
+    // once a target has written over it)
+    WlGxTargetStats st;
+    wl_gx_target_stats(&st, false);
+    out->bytes = targets + st.held;
+    snprintf(out->note, sizeof out->note, "%u, park %u", count, (unsigned)((st.held + 512u) >> 10));
 }
 
 static void census_textures(void *user, WlMemCensusReport *out) {
