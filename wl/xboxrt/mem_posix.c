@@ -213,7 +213,8 @@ WlResult wl_xb_backend_page_fault(uint32_t ea) {
     uint32_t p = p1 - 1u;
     uint32_t a = ea >= WL_XB_EA_WINDOW ? 1u : 0u;
     if ((g_xb_pg_flags[p] & WL_XB_PG_IO) != 0) {
-        return WL_ERR_STATE;
+        // read back by a thread that gave the lock up: waited for, then the access runs again
+        return wl_xb_lock_held() ? wl_xb_pg_touch(p, 0) : WL_ERR_DENIED;
     }
     if (a == 0) {
         g_user_va[p] = ea & ~(WL_XB_PAGE - 1u); // (what map_user recorded; kept right whatever happened)
@@ -228,10 +229,9 @@ WlResult wl_xb_backend_page_fault(uint32_t ea) {
         if (f != 0) {
             wl_xb_mmu_frame_zero(p, f);
         } else {
-            WlResult r = wl_xb_pg_fault(p, 0);
-            if (r != WL_OK) {
-                return r;
-            }
+            // (a read back gives the lock up: the tables may have changed, so the access runs again
+            // and opens the page through a fault of its own)
+            return wl_xb_pg_touch(p, 0);
         }
     }
     uint8_t fl = g_xb_pg_flags[p];

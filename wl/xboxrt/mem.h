@@ -332,10 +332,15 @@ typedef struct {
     uint32_t swap_ins_spared;                  // swapped pages a file read overwrote whole: not read back
     uint32_t file_copies;                      // pages a file read filled whole, kept as the file's copy
     uint32_t file_evictions;                   // of the clean evictions, file copies: nothing written
-    uint32_t file_ins;                         // file copies read back from their file
+    uint32_t file_ins;                         // file copies read back from their file (reads)
+    uint32_t file_ahead;                       // copies after them that came in the same read
     uint32_t file_forgets, file_forget_ins;    // copies forgotten (the file changed or closed); read back first
     uint64_t swap_read_bytes, swap_write_bytes;
-    uint64_t swap_us;                          // time spent in swap file I/O
+    uint64_t swap_us;                          // time spent in paging's I/O (swap file and file copies)
+    uint64_t io_held_us;                       // of it, with the guest lock held (no other thread ran)
+    uint32_t io_held_max_us;                   // the longest such stretch
+    uint32_t io_unlocked;                      // transfers made with the guest lock given up
+    uint32_t transit_waits;                    // of those, pages another thread met and waited for
     uint32_t swap_slots, swap_slots_used;      // the swap file's pages
 } WlXbMemStats;
 void wl_xb_mem_stats(WlXbMemStats *out);

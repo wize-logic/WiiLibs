@@ -24,7 +24,11 @@
 // write to consecutive slots and their frames taken (a batch: the SD card is slow at small
 // writes). The fault's exception context (the Wii's DSI) only looks a bounded way ahead and never
 // writes or reads; a touch that needs I/O goes to the slow path, in normal context with the guest
-// lock held.
+// lock held. A read back there gives the guest lock up while the card works when the touch is the
+// thread's own (wl_xb_pg_touch, not inside a kernel call or a device's emulation): the page is in
+// transit meanwhile (below). One made with the lock kept takes the file copies after it at the
+// following offsets in the same read (up to RUN pages, with frames had without I/O): a device
+// walks a buffer page after page, and the card's time is mostly its seek.
 //
 // The write watch (mem.h, wl_xb_phys_watch) rides on the same C bits: each page has a write epoch,
 // set from a global count whenever a store to it is seen (a C bit harvested here or by the backend,
@@ -35,12 +39,15 @@
 //
 // Locking: the tables change with the guest lock held, and on the Wii inside wl_xb_mmu_lock
 // (interrupts off) for each step, so a DSI on another thread (the service thread's pinned
-// KeTickCount, a PTE reload) sees them whole; the I/O runs outside, its pages marked IO.
+// KeTickCount, a PTE reload) sees them whole; the I/O runs outside, its pages marked IO. Every
+// transfer on the swap file and the files is made under the card's lock (thread.h): the kernel's
+// reads, and a read back without the guest lock, may be on the same handle at once.
 #include <stdlib.h>
 #include <string.h>
 
 #include "wl/platform/platform.h"
 #include "wl/xboxrt/mem_internal.h"
+#include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/thread.h"
 
 #define TAG "xbpage"
@@ -50,6 +57,7 @@
 #define PAGE WL_XB_PAGE
 #define FILE_SLOT 0x8000u // in g_xb_pg_slot: a file copy, its source's index + 1 in the low bits
 #define SOURCES 32u       // files with copies at once
+#define RUN 8u            // file copies a read back with the guest lock kept takes at most (32 KB)
 
 uint8_t *g_xb_pg_flags;
 uint16_t *g_xb_pg_frame;
@@ -67,7 +75,8 @@ static uint32_t g_pinned;
 static WlPlatformFile *g_swap;
 static uint32_t *g_slot_used; // a bit per slot
 static uint32_t g_slots, g_slots_used, g_slot_cursor;
-static uint8_t *g_io;         // BATCH pages: the batch's bytes, a page read back
+static uint8_t *g_io; // BATCH pages: the batch's bytes (guest lock held)
+static uint8_t *g_in; // a page read back (the card's lock held): the page after g_io's
 static uint16_t g_batch[BATCH];
 static uint32_t g_batch_n;
 
@@ -81,9 +90,24 @@ static struct {
 static struct {
     uint32_t evictions, clean_evictions, fast_evictions;
     uint32_t swap_ins, swap_outs, swap_writes, zero_outs, discards;
-    uint32_t file_copies, file_evictions, file_ins, file_forgets, file_forget_ins;
-    uint64_t read_bytes, write_bytes, io_us;
+    uint32_t file_copies, file_evictions, file_ins, file_ahead, file_forgets, file_forget_ins;
+    uint64_t read_bytes, write_bytes, io_us, io_held_us;
+    uint32_t io_held_max_us, io_unlocked, transit_waits;
 } g_st;
+
+// A transfer of `us` microseconds ends: its time counted, and with `held` (the
+// guest lock kept through it) as time no other thread ran.
+static void io_done(uint64_t us, bool held) {
+    g_st.io_us += us;
+    if (held) {
+        g_st.io_held_us += us;
+        if (us > g_st.io_held_max_us) {
+            g_st.io_held_max_us = (uint32_t)(us > UINT32_MAX ? UINT32_MAX : us);
+        }
+    } else {
+        g_st.io_unlocked++;
+    }
+}
 
 // ---- Frames (exception-safe) --------------------------------------------------------------------
 
@@ -302,8 +326,10 @@ static WlResult batch_write(void) {
             break;
         }
         uint64_t t0 = wl_platform_time_us();
+        wl_xb_card_lock(); // (another thread's read back may be on the handle, outside the guest lock)
         WlResult r = wl_platform_fs_write_at(g_swap, (uint64_t)first * PAGE, g_io + done * PAGE, len * PAGE);
-        g_st.io_us += wl_platform_time_us() - t0;
+        wl_xb_card_unlock();
+        io_done(wl_platform_time_us() - t0, true); // (frame_slow: the guest lock held)
         if (r != WL_OK) {
             WL_LOG_E(TAG, "swap file write of %u pages at slot %u: %s", (unsigned)len, (unsigned)first,
                      wl_result_name(r));
@@ -359,12 +385,101 @@ static WlResult frame_slow(uint32_t keep, uint32_t *out) {
     return f != 0 ? WL_OK : WL_ERR_NOMEM;
 }
 
-WlResult wl_xb_pg_fault(uint32_t p, uint32_t keep) {
+// A page read back with the guest lock given up (wl_xb_pg_touch) is in transit: unmapped, marked
+// IO, its frame its own. Its record is taken and freed by its reader with the guest lock held;
+// `done` and `r` are set under the card's lock once its bytes are in the frame. Another thread that
+// meets the page (a touch, a free, a move, a pin, a forget: the guest lock held) waits for `done`
+// and ends the read for it (transit_wait): the page is read once and its frame handed out once.
+#define TRANSITS 8u // pages in transit at once (a thread each); with none free the lock is kept
+static struct {
+    uint32_t p1;        // the page + 1, 0: free
+    bool ended;         // its flags are a read page's (by its reader or a waiter)
+    volatile bool done; // (under the card's lock)
+    WlResult r;
+} g_transit[TRANSITS];
+static bool g_giving_up; // in wl_xb_block_begin for a read back (the lock holder's)
+
+static uint32_t transit_of(uint32_t p) {
+    for (uint32_t t = 0; t < TRANSITS; t++) {
+        if (g_transit[t].p1 == p + 1u && !g_transit[t].ended) {
+            return t + 1u;
+        }
+    }
+    return 0;
+}
+
+// Page p's read is over: its flags as a page just read (left as they are after a failure: a crash).
+static void read_end(uint32_t p, WlResult r) {
+    if (r != WL_OK) {
+        return;
+    }
+    uint32_t lv = wl_xb_mmu_lock();
+    g_xb_pg_flags[p] =
+        (uint8_t)((g_xb_pg_flags[p] & ~(WL_XB_PG_IO | WL_XB_PG_DIRTY)) | WL_XB_PG_REF);
+    wl_xb_mmu_unlock(lv);
+}
+
+// Waits for transit record t1 - 1's read and ends it, the guest lock kept: its reader needs only
+// the card's lock (and the one waiting may be a DPC, which cannot give the guest lock up).
+static WlResult transit_wait(uint32_t t1) {
+    uint32_t t = t1 - 1u;
+    for (;;) {
+        wl_xb_card_lock();
+        bool done = g_transit[t].done;
+        wl_xb_card_unlock();
+        if (done) {
+            break;
+        }
+        wl_platform_thread_sleep_ms(1); // its reader has not reached the card yet
+    }
+    g_st.transit_waits++;
+    if (!g_transit[t].ended) {
+        g_transit[t].ended = true;
+        read_end(g_transit[t].p1 - 1u, g_transit[t].r);
+    }
+    return g_transit[t].r != WL_OK ? WL_ERR_IO : WL_OK;
+}
+
+// A page in transit is waited for (guest lock held): its tables are the lock's again.
+static WlResult settle(uint32_t p) {
+    if ((g_xb_pg_flags[p] & WL_XB_PG_IO) == 0) {
+        return WL_OK;
+    }
+    uint32_t t1 = transit_of(p);
+    return t1 != 0 ? transit_wait(t1) : WL_ERR_STATE;
+}
+
+// The file copies after page p (slot `slot`) at the following offsets, at pages p + step, p +
+// 2 step, ...: given frames had without I/O and marked IO, up to RUN pages with p. Returns the
+// run's length (1: p alone). Guest lock held.
+static uint32_t read_ahead(uint32_t p, uint32_t slot, uint32_t step, uint32_t keep) {
+    uint32_t run = 1;
+    while (run < RUN) {
+        uint32_t q = p + run * step;
+        if (q >= g_xb_ram_pages || g_xb_pg_slot[q] != slot || g_foff[q] != g_foff[p] + run * PAGE ||
+            g_xb_pg_frame[q] != 0 || (g_xb_pg_flags[q] & (WL_XB_PG_IO | WL_XB_PG_PINNED)) != 0) {
+            break;
+        }
+        uint32_t lv = wl_xb_mmu_lock();
+        uint32_t fq = wl_xb_pg_frame_fast(q, keep);
+        if (fq != 0) {
+            g_xb_pg_flags[q] |= WL_XB_PG_IO;
+        }
+        wl_xb_mmu_unlock(lv);
+        if (fq == 0) {
+            break;
+        }
+        run++;
+    }
+    return run;
+}
+
+static WlResult fault(uint32_t p, uint32_t keep, bool give_up) {
     if (g_xb_pg_frames == 0 || p >= g_xb_ram_pages) {
         return WL_ERR_STATE;
     }
     if ((g_xb_pg_flags[p] & WL_XB_PG_IO) != 0) {
-        return WL_ERR_STATE;
+        return settle(p); // another thread reads it back
     }
     if (g_xb_pg_frame[p] != 0) {
         return WL_OK;
@@ -383,46 +498,128 @@ WlResult wl_xb_pg_fault(uint32_t p, uint32_t keep) {
     wl_xb_mmu_unlock(lv);
     if (slot == 0) {
         wl_xb_mmu_frame_zero(p, f);
-    } else {
-        uint64_t t0 = wl_platform_time_us();
-        bool file = (slot & FILE_SLOT) != 0;
-        if (file) {
-            wl_xb_card_lock(); // the kernel may read the same handle outside the guest lock
-            r = wl_platform_fs_read_at(g_src[(slot & ~FILE_SLOT) - 1u].file, g_foff[p], g_io, PAGE);
-            wl_xb_card_unlock();
-        } else {
-            r = wl_platform_fs_read_at(g_swap, (uint64_t)(slot - 1u) * PAGE, g_io, PAGE);
-        }
-        g_st.io_us += wl_platform_time_us() - t0;
-        if (r != WL_OK) {
-            if (file) {
-                WL_LOG_E(TAG, "file read of page %u (at %u): %s", (unsigned)p, (unsigned)g_foff[p], wl_result_name(r));
-            } else {
-                WL_LOG_E(TAG, "swap file read of slot %u: %s", (unsigned)(slot - 1u), wl_result_name(r));
-            }
-            return WL_ERR_IO;
-        }
-        memcpy(wl_xb_mmu_frame_ptr(p, f), g_io, PAGE);
-        if (file) {
-            g_st.file_ins++;
-        } else {
-            g_st.swap_ins++;
-            g_st.read_bytes += PAGE;
+        read_end(p, WL_OK);
+        return WL_OK;
+    }
+    bool file = (slot & FILE_SLOT) != 0;
+    WlPlatformFile *from = file ? g_src[(slot & ~FILE_SLOT) - 1u].file : g_swap;
+    uint64_t at = file ? g_foff[p] : (uint64_t)(slot - 1u) * PAGE;
+    // the card's work without the guest lock where it can be given up: the others run meanwhile
+    // (not inside a kernel call or a device's emulation: their C code expects the lock throughout)
+    WlXbThread *cur = wl_xb_current();
+    give_up =
+        give_up && !g_giving_up && cur != NULL && cur->kernel_depth == 0 && g_xb_mmio_depth == 0;
+    uint32_t t1 = 0;
+    for (uint32_t t = 0; give_up && t1 == 0 && t < TRANSITS; t++) {
+        if (g_transit[t].p1 == 0) {
+            t1 = t + 1u;
         }
     }
-    lv = wl_xb_mmu_lock();
-    g_xb_pg_flags[p] = (uint8_t)((g_xb_pg_flags[p] & ~(WL_XB_PG_IO | WL_XB_PG_DIRTY)) | WL_XB_PG_REF);
-    wl_xb_mmu_unlock(lv);
-    return WL_OK;
+    WlXbThread *self = NULL;
+    if (t1 != 0) {
+        g_transit[t1 - 1u].p1 = p + 1u;
+        g_transit[t1 - 1u].ended = false;
+        g_transit[t1 - 1u].done = false;
+        g_giving_up = true; // (its look at the IRQL reads the KPCR, which may fault: that read
+                            // keeps the lock)
+        self = wl_xb_block_begin();
+        g_giving_up = false;
+        if (self == NULL) {
+            g_transit[t1 - 1u].p1 = 0; // the lock kept (the deterministic mode, a raised IRQL)
+            t1 = 0;
+        }
+    }
+    // With the lock kept (a device's or the kernel's own access: the NV2A walks a buffer page after
+    // page), the file copies after it at the following offsets come in the same read, as far as
+    // frames are at hand without I/O: the card's time is mostly its seek, not its bytes.
+    // (the pages above it, or below it: a buffer's pages may come in either order)
+    uint32_t run = 1, step = 1;
+    for (uint32_t dir = 0; t1 == 0 && file && run == 1u && dir < 2u; dir++) {
+        step = dir == 0 ? 1u : (uint32_t)-1;
+        run = read_ahead(p, slot, step, keep);
+    }
+    // the card's lock: the kernel may read the same handle outside the guest lock, and g_in is one
+    // (g_io, for a run, is the lock holder's)
+    uint8_t *buf = run > 1u ? g_io : g_in;
+    uint64_t t0 =
+        wl_platform_time_us(); // (a wait for the card counts: with the lock kept, it was held)
+    wl_xb_card_lock();
+    r = wl_platform_fs_read_at(from, at, buf, run * PAGE);
+    uint64_t t9 = wl_platform_time_us();
+    if (r == WL_OK) {
+        // (its frames: no one else's while they are IO)
+        for (uint32_t k = 0; k < run; k++) {
+            uint32_t q = p + k * step;
+            memcpy(wl_xb_mmu_frame_ptr(q, g_xb_pg_frame[q]), buf + k * PAGE, PAGE);
+        }
+    }
+    if (t1 != 0) {
+        g_transit[t1 - 1u].r = r;
+        g_transit[t1 - 1u].done = true;
+    }
+    wl_xb_card_unlock();
+    wl_xb_block_end(self);
+    io_done(t9 - t0, self == NULL);
+    if (r != WL_OK) {
+        if (file) {
+            WL_LOG_E(TAG, "file read of page %u (at %u): %s", (unsigned)p, (unsigned)at,
+                     wl_result_name(r));
+        } else {
+            WL_LOG_E(TAG, "swap file read of slot %u: %s", (unsigned)(slot - 1u),
+                     wl_result_name(r));
+        }
+    } else if (file) {
+        g_st.file_ins++;
+        g_st.file_ahead += run - 1u;
+    } else {
+        g_st.swap_ins++;
+        g_st.read_bytes += PAGE;
+    }
+    if (t1 != 0) {
+        if (!g_transit[t1 - 1u].ended) {
+            g_transit[t1 - 1u].ended = true;
+            read_end(p, r);
+        }
+        g_transit[t1 - 1u].p1 = 0;
+    } else {
+        read_end(p, r);
+    }
+    if (run > 1u) {
+        // the pages read ahead: clean, and not used yet (the clock's first choice if they stay so);
+        // after a failure they go back to their file
+        lv = wl_xb_mmu_lock();
+        for (uint32_t k = 1; k < run; k++) {
+            uint32_t q = p + k * step;
+            g_xb_pg_flags[q] &= (uint8_t)~(WL_XB_PG_IO | WL_XB_PG_DIRTY | WL_XB_PG_REF);
+            if (r != WL_OK) {
+                uint32_t fq = g_xb_pg_frame[q];
+                g_xb_pg_frame[q] = 0;
+                give_free(fq);
+                wl_xb_mmu_frame_drop(q, fq);
+            }
+        }
+        wl_xb_mmu_unlock(lv);
+    }
+    return r != WL_OK ? WL_ERR_IO : WL_OK;
+}
+
+WlResult wl_xb_pg_fault(uint32_t p, uint32_t keep) {
+    return fault(p, keep, false);
+}
+
+WlResult wl_xb_pg_touch(uint32_t p, uint32_t keep) {
+    return fault(p, keep, true);
 }
 
 // ---- Bookkeeping ---------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------
 
 void wl_xb_pg_release(uint32_t p, uint32_t pages) {
     if (g_xb_pg_frames == 0) {
         return;
     }
     for (uint32_t k = p; k < p + pages && k < g_xb_ram_pages; k++) {
+        (void)settle(k); // a read back of it ends first (its frame goes with it)
         uint32_t lv = wl_xb_mmu_lock();
         uint32_t f = g_xb_pg_frame[k];
         if (f != 0) {
@@ -461,6 +658,7 @@ void wl_xb_pg_move(uint32_t from, uint32_t to) {
         return;
     }
     wl_xb_pg_release(to, 1); // a free page touched through the window may hold a frame
+    (void)settle(from);
     uint32_t lv = wl_xb_mmu_lock();
     wl_xb_mmu_unmap(from);
     uint32_t f = g_xb_pg_frame[from];
@@ -556,6 +754,9 @@ WlResult wl_xb_pg_forget(WlPlatformFile *file, uint64_t offset, uint64_t bytes) 
     for (uint32_t k = 0; k < g_xb_ram_pages && g_src[i].pages != 0; k++) {
         if (g_xb_pg_slot[k] != want || g_foff[k] + (uint64_t)PAGE <= offset || g_foff[k] >= end) {
             continue;
+        }
+        if (settle(k) != WL_OK) { // read back by another thread: its read ends first
+            r = WL_ERR_IO;
         }
         if (g_xb_pg_frame[k] == 0) {
             // read back from the file while it still holds the bytes (the clock may take another of
@@ -663,11 +864,16 @@ void wl_xb_pg_stats(WlXbMemStats *out) {
     out->file_copies = g_st.file_copies;
     out->file_evictions = g_st.file_evictions;
     out->file_ins = g_st.file_ins;
+    out->file_ahead = g_st.file_ahead;
     out->file_forgets = g_st.file_forgets;
     out->file_forget_ins = g_st.file_forget_ins;
     out->swap_read_bytes = g_st.read_bytes;
     out->swap_write_bytes = g_st.write_bytes;
     out->swap_us = g_st.io_us;
+    out->io_held_us = g_st.io_held_us;
+    out->io_held_max_us = g_st.io_held_max_us;
+    out->io_unlocked = g_st.io_unlocked;
+    out->transit_waits = g_st.transit_waits;
     out->swap_slots = g_slots;
     out->swap_slots_used = g_slots_used;
 }
@@ -686,7 +892,8 @@ static void swap_open(const WlXbMemConfig *cfg) {
         g_slots = FILE_SLOT - 1u; // slot + 1 is 15 bits (FILE_SLOT marks a file copy)
     }
     g_slot_used = calloc((g_slots + 31u) / 32u, sizeof *g_slot_used);
-    g_io = aligned_alloc(64, BATCH * PAGE);
+    g_io = aligned_alloc(64, (BATCH + 1u) * PAGE);
+    g_in = g_io != NULL ? g_io + BATCH * PAGE : NULL;
     WlPlatformFile *f = NULL;
     WlResult r = g_slot_used != NULL && g_io != NULL ? wl_platform_fs_open(cfg->swap_path, WL_FILE_READ_WRITE, &f)
                                                      : WL_ERR_NOMEM;
@@ -719,7 +926,8 @@ size_t wl_xb_pg_host_bytes(void) {
     return pages * (sizeof *g_xb_pg_flags + sizeof *g_xb_pg_frame + sizeof *g_xb_pg_slot + sizeof *g_xb_pg_wgen +
                     sizeof *g_foff) +
            (g_xb_pg_frames + 1u) * sizeof *g_owner + g_xb_pg_frames * sizeof *g_free +
-           (g_slot_used != NULL ? (g_slots + 31u) / 32u * sizeof *g_slot_used : 0u) + (g_io != NULL ? BATCH * PAGE : 0u);
+           (g_slot_used != NULL ? (g_slots + 31u) / 32u * sizeof *g_slot_used : 0u) +
+           (g_io != NULL ? (BATCH + 1u) * PAGE : 0u);
 }
 
 WlResult wl_xb_pg_init(const WlXbMemConfig *cfg, uint32_t frames) {

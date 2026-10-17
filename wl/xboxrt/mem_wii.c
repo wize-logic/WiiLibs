@@ -396,17 +396,21 @@ typedef struct {
     double fpr[14];
 } DsiFrame;
 
-// The slow path for guest RAM: page `ea`'s contents into a frame (paging.c, which may wait for the
-// swap file), then its PTE. Normal context, the guest lock held.
+// The slow path for guest RAM: page `ea`'s contents into a frame (paging.c, which may give the
+// guest lock up while the card works), then its PTE. Normal context, the guest lock held.
 static WlResult page_in(uint32_t ea, uint32_t keep) {
     uint32_t p1 = phys_of(ea);
     if (p1 == 0) {
         return WL_ERR_RANGE;
     }
     uint32_t p = p1 - 1u;
-    WlResult r = wl_xb_pg_fault(p, keep);
+    WlResult r = wl_xb_pg_touch(p, keep);
     if (r != WL_OK) {
         return r;
+    }
+    if (phys_of(ea) != p1) {
+        return WL_OK; // freed or moved while the card worked without the lock: the access runs
+                      // again
     }
     uint32_t level = IRQ_Disable();
     if (g_xb_pg_frame[p] != 0 && pte_of(p, ea >> 28) == NULL) {
