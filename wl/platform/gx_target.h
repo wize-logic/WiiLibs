@@ -49,6 +49,7 @@ typedef struct {
     uint32_t clears;    // wl_gx_target_clear quads
     uint32_t squeezes;  // wl_gx_target_squeeze: finished pictures narrowed
     uint32_t depths;    // back buffer depths parked (each park's, or with lazy depth only those a target wrote over)
+    size_t held;        // the bytes the park's blocks hold now, from the allocator (not reset: a census's)
 } WlGxTargetStats;
 
 // Whether a target can be resolved at all in a back buffer of `back_w` by `back_h` pixels, and the

@@ -348,6 +348,7 @@ bool wl_gx_target_squeeze(uint32_t x, uint32_t w) {
 
 void wl_gx_target_stats(WlGxTargetStats *out, bool reset) {
     *out = t.stats;
+    out->held = t.colour_bytes + t.depth_bytes;
     if (reset) {
         memset(&t.stats, 0, sizeof t.stats);
     }

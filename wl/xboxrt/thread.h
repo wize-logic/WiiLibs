@@ -84,8 +84,8 @@ typedef struct {
                                   // starved thread so; a busy-waiting holder would otherwise keep
                                   // lower-priority threads out for good): 30
     uint32_t host_stack_bytes;    // the most a guest thread's host stack gets (recompiled frames
-                                  // are C frames; each gets twice its guest stack, 192 KB at
-                                  // least): 1 MB
+                                  // are C frames; each gets twice its guest stack, 64 KB at
+                                  // least): 256 KB
     uint32_t default_stack_bytes; // a guest stack when the title asks for 0: 64 KB
     bool deterministic;           // the deterministic mode (below): off
     // what one safe point costs in the deterministic mode's clock (0: the defaults below)
@@ -299,7 +299,7 @@ void wl_xb_thread_log_guest_stacks(void);
 // records and host stacks; `deepest` is the most any host stack has been used, of `deepest_of`.
 void wl_xb_thread_host_memory(size_t *bytes, uint32_t *stacks, size_t *deepest, size_t *deepest_of);
 // Gives back the host stacks of the threads that ended (a title's entry thread often does, with
-// its stack of 1 MB) a little while after their host threads are done; returns how many. The
+// its stack of 256 KB) a little while after their host threads are done; returns how many. The
 // service thread calls it now and then.
 uint32_t wl_xb_thread_reap(void);
 // One INFO line: each thread's host stack, its size and the deepest it has been (KB), for sizing

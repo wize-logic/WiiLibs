@@ -217,8 +217,8 @@ every backward jump is a safe point that moves the virtual clock.
 
 ## Threads and the guest lock (`thread.h`)
 
-The Xbox has one CPU, and titles rely on it. Each guest thread is a host thread (an LWP with a 1 MB
-stack on the Wii, a pthread elsewhere: translated frames are C frames), and one guest lock, a baton
+The Xbox has one CPU, and titles rely on it. Each guest thread is a host thread (an LWP with a stack of
+twice its guest stack, 64-256 KB, on the Wii, a pthread elsewhere: translated frames are C frames), and one guest lock, a baton
 passed by hand, decides which runs guest code. The holder gives it up when it waits
 (`wl_xb_wait`), ends, or reaches a yield point (a kernel call, an `rdtsc`, a device access) while a
 thread of higher priority is ready, or one of equal priority and its 10 ms quantum is over. The

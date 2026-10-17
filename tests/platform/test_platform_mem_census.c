@@ -107,6 +107,17 @@ TEST heap_text(void) {
     ASSERT_STR_EQ("heap: 3072 KB in use, 2048 KB free (0 inside, 2048 above the top); 7168 KB of MEM1 out of "
                   "malloc's reach",
                   buf);
+    // the high-water marks: the least top only where there is one
+    h.stranded = 0;
+    h.peak_known = true;
+    h.peak = 9u << 20;
+    h.low_top = 3u << 20;
+    wl_mem_census_heap_text(&h, buf, sizeof buf);
+    ASSERT_STR_EQ("heap: 3072 KB in use, 2048 KB free (0 inside, 2048 above the top); peak +9216 KB, least top 3072 KB",
+                  buf);
+    h.low_top = SIZE_MAX;
+    wl_mem_census_heap_text(&h, buf, sizeof buf);
+    ASSERT(strstr(buf, "; peak +9216 KB") != NULL && strstr(buf, "least") == NULL);
     PASS();
 }
 
@@ -194,6 +205,49 @@ TEST cap_and_exempt(void) {
     PASS();
 }
 
+// (volatile: GCC may otherwise drop a malloc whose block is freed unused)
+static void *volatile g_block;
+
+TEST peak_marks(void) {
+    WlPlatformHeapInfo h;
+    wl_platform_heap_info(&h);
+    if (!h.peak_known) {
+        SKIPm("no high-water marks on this host");
+    }
+    wl_platform_heap_mark();
+    wl_platform_heap_info(&h);
+    ASSERT(h.peak < (64u << 10)); // (from the mark: nothing yet, or little)
+    // a block held and given back: the peak keeps it
+    g_block = malloc(3u << 20);
+    ASSERT(g_block != NULL);
+    memset(g_block, 1, 3u << 20);
+    free(g_block);
+    wl_platform_heap_info(&h);
+    ASSERT(h.peak >= (3u << 20));
+    // grown by realloc: the larger counts
+    g_block = malloc(1u << 20);
+    ASSERT(g_block != NULL);
+    g_block = realloc(g_block, 5u << 20);
+    ASSERT(g_block != NULL);
+    wl_platform_heap_info(&h);
+    ASSERT(h.peak >= (5u << 20) && h.peak < (8u << 20));
+    free(g_block);
+    // a mark starts again; the cap's least top follows its own peak
+    wl_platform_heap_mark();
+    wl_platform_heap_info(&h);
+    ASSERT(h.peak < (64u << 10));
+    if (wl_platform_heap_cap(4u << 20) == WL_OK) {
+        g_block = malloc(1u << 20);
+        ASSERT(g_block != NULL);
+        free(g_block);
+        wl_platform_heap_info(&h);
+        ASSERT(h.peak >= (1u << 20));
+        ASSERT(h.low_top <= (3u << 20) && h.low_top > (2u << 20));
+        ASSERT_EQ(WL_OK, wl_platform_heap_cap(0));
+    }
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -202,5 +256,6 @@ int main(int argc, char **argv) {
     RUN_TEST(heap_text);
     RUN_TEST(rows_fit_the_wii_log);
     RUN_TEST(cap_and_exempt);
+    RUN_TEST(peak_marks);
     GREATEST_MAIN_END();
 }
