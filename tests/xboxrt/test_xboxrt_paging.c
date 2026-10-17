@@ -471,6 +471,37 @@ TEST cleared_pages_go_out_as_zero(void) {
     PASS();
 }
 
+// Changed pages cleared again and then left alone go when the clock comes round, with nothing
+// written, rather than keeping their frames while clean pages are taken (by the exception-safe
+// path too: no batch is needed), and come back zero.
+TEST cold_cleared_pages_give_their_frames_back(void) {
+    up();
+    const uint32_t z = FRAMES / 2u, n = 4u * FRAMES;
+    uint32_t zva = alloc(z), rva = alloc(n);
+    ASSERT(zva != 0 && rva != 0);
+    for (uint32_t i = 0; i < z; i++) {
+        wl_xb_wr32(zva + i * PAGE + 256u, 0xA5A5A5A5u); // changed, then zero again: resident and dirty
+        wl_xb_wr32(zva + i * PAGE + 256u, 0u);
+    }
+    WlXbMemStats a = stats();
+    for (uint32_t i = 0; i < n; i++) {
+        ASSERT_EQ(0u, wl_xb_rd32(rva + i * PAGE + 64u)); // only clean pages to take besides them
+    }
+    WlXbMemStats b = stats();
+    ASSERT(b.zero_outs - a.zero_outs >= z - 8u); // gone with nothing written
+    ASSERT_EQ(a.swap_outs, b.swap_outs);
+    ASSERT(b.fast_evictions - a.fast_evictions >= z - 8u);
+    for (uint32_t i = 0; i < z; i++) {
+        ASSERT_EQ(0u, wl_xb_rd32(zva + i * PAGE + 256u));
+    }
+    WlXbMemStats c = stats();
+    ASSERT_EQ(b.swap_ins, c.swap_ins); // nothing to read back
+    ASSERT(c.returns - b.returns >= z - 8u); // back after losing their frames (the refault count)
+    ASSERT_EQ(WL_OK, wl_xb_va_release(zva, NULL));
+    ASSERT_EQ(WL_OK, wl_xb_va_release(rva, NULL));
+    PASS();
+}
+
 TEST file_reads_spare_swap_ins(void) {
     up();
     const uint32_t n = 2u * FRAMES;
@@ -808,6 +839,7 @@ SUITE(paging) {
     RUN_TEST(relocation_carries_swapped_pages);
     RUN_TEST(freed_pages_come_back_zero);
     RUN_TEST(cleared_pages_go_out_as_zero);
+    RUN_TEST(cold_cleared_pages_give_their_frames_back);
     RUN_TEST(file_reads_spare_swap_ins);
     RUN_TEST(file_pages_need_no_swap_out);
     RUN_TEST(file_pages_forget_their_file);

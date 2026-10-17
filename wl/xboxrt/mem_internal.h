@@ -54,6 +54,7 @@ WlResult wl_xb_backend_page_fault(uint32_t ea);
 #define WL_XB_PG_IO 0x08u     // its frame is being filled or written out: neither mapped nor taken
 #define WL_XB_PG_WATCH 0x10u  // a write watch covers it (wl_xb_pg_watch): its mappings see every store
                               // (the Wii: a PTE never carries C ahead of a store)
+#define WL_XB_PG_AHEAD 0x20u  // read ahead with another page and not used since (a diagnostic)
 
 extern uint8_t *g_xb_pg_flags;  // [ram pages]
 extern uint16_t *g_xb_pg_frame; // [ram pages] 1..frames, 0: none
@@ -126,6 +127,8 @@ WlResult wl_xb_pg_forget(struct WlPlatformFile *file, uint64_t offset, uint64_t 
 void wl_xb_pg_move(uint32_t from, uint32_t to);
 // Pins (with a frame now: normal context, lock held) or unpins page `p`.
 WlResult wl_xb_pg_pin(uint32_t p, bool pin);
+// A diagnostic (it reads every frame): the resident pages whose bytes are all zero, changed and not.
+void wl_xb_pg_zero_census(uint32_t *dirty_zero, uint32_t *clean_zero);
 // The paging fields of the statistics.
 void wl_xb_pg_stats(WlXbMemStats *out);
 // The write watch over pages [p, p + pages) (mem.h, wl_xb_phys_watch): armed, its stamp (0 when the
