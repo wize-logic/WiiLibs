@@ -32,6 +32,12 @@
 // following offsets in the same read (up to RUN pages, with frames had without I/O): a device
 // walks a buffer page after page, and the card's time is mostly its seek.
 //
+// The page cache (WlXbMemConfig.page_cache_bytes) is a share of the frames kept out of the pages:
+// a page that gives its frame back clean with a copy (its file, a slot: the clock's clean pages, a
+// batch's written ones) is packed into it too, and its next touch unpacks it instead of reading the
+// card. Most of a level's paging is pages coming back soon after they went (a10's opening at the
+// Wii's 24 MB: 89% of the pages read back), and their packed copies take about half a frame.
+//
 // The write watch (mem.h, wl_xb_phys_watch) rides on the same C bits: each page has a write epoch,
 // set from a global count whenever a store to it is seen (a C bit harvested here or by the backend,
 // the host's write fault) or its contents change otherwise (freed: zero; moved). Arming a watch
@@ -100,6 +106,7 @@ static struct {
     uint64_t read_bytes, write_bytes, io_us, io_held_us;
     uint32_t io_held_max_us, io_unlocked, transit_waits;
     uint32_t zero_evictions, returns, refaults_swap, refaults_file, refaults_zero, ahead_unused;
+    uint32_t z_puts, z_raw, z_hits;
 } g_st;
 
 // A transfer of `us` microseconds ends: its time counted, and with `held` (the
@@ -125,6 +132,101 @@ static uint32_t take_free(void) {
 static void give_free(uint32_t f) {
     g_owner[f] = 0;
     g_free[g_free_n++] = (uint16_t)f;
+}
+
+// ---- The page cache (exception-safe) --------------------------------------------------------------
+// Frames kept out of the pages hold a ring of packed pages (page_pack.c): a page that gives its
+// frame back clean with a copy elsewhere (its file, the swap file) is packed into it as well, and a
+// touch that finds it there unpacks it instead of reading the card. Each entry is a header word
+// (the page << 12 | its packed bytes) and the bytes, at a 4-byte boundary, across the frames' ends
+// if need be; the oldest go as new ones come. A page's entry stands for its copy: it goes with it
+// (copy_drop), and stays while the page is resident and clean (going again costs no packing).
+
+#define ZMAX (PAGE * 3u / 4u) // a page packed larger is not kept (a fourth saved at least)
+
+static uint8_t **g_zmem;       // [g_zframes] the cache's frames
+static uint32_t g_zframes;     // 0: no cache
+static uint32_t *g_zloc;       // [ram pages] its entry's place in the ring / 4 + 1, 0: none
+static uint32_t g_zhead, g_ztail, g_zused; // the ring's next entry, its oldest, its bytes in use
+static uint32_t g_zpages;                  // entries that stand for a page
+static uint64_t g_zbytes;                  // their packed bytes
+static uint8_t g_zpack[ZMAX];              // a page being packed (the MMU lock)
+static uint8_t g_zspan[ZMAX];              // a page's entry being unpacked (the guest lock)
+
+static uint32_t z_entry(uint32_t n) {
+    return (4u + n + 3u) & ~3u;
+}
+
+static uint32_t z_word(uint32_t at) {
+    uint32_t w;
+    memcpy(&w, g_zmem[at / PAGE] + at % PAGE, 4); // (4-byte aligned: never across a frame)
+    return w;
+}
+
+// Copies `n` bytes between the ring from `at` and `buf` (`out`: from the ring).
+static void z_copy(uint32_t at, uint8_t *buf, uint32_t n, bool out) {
+    uint32_t ring = g_zframes * PAGE;
+    while (n != 0) {
+        at %= ring;
+        uint32_t k = PAGE - at % PAGE;
+        k = k < n ? k : n;
+        uint8_t *z = g_zmem[at / PAGE] + at % PAGE;
+        memcpy(out ? buf : z, out ? z : buf, k);
+        buf += k;
+        at += k;
+        n -= k;
+    }
+}
+
+// Page `p` has no entry from now on (its bytes or its copy changed, or it went).
+static void z_forget(uint32_t p) {
+    uint32_t loc = g_zframes != 0 ? g_zloc[p] : 0u;
+    if (loc != 0) {
+        g_zloc[p] = 0;
+        g_zpages--;
+        g_zbytes -= z_word((loc - 1u) * 4u) & (PAGE - 1u);
+    }
+}
+
+// Clean page `p`, whose copy is elsewhere, gives its frame back: its bytes packed into the cache.
+static void z_put(uint32_t p, const uint8_t *bytes) {
+    if (g_zframes == 0 || g_zloc[p] != 0 || (g_xb_pg_flags[p] & WL_XB_PG_RAW) != 0) {
+        return; // no cache, already in it, or does not pack
+    }
+    uint32_t n = (uint32_t)wl_xb_page_pack(bytes, g_zpack, ZMAX);
+    if (n == 0) {
+        g_xb_pg_flags[p] |= WL_XB_PG_RAW;
+        g_st.z_raw++;
+        return;
+    }
+    uint32_t need = z_entry(n), ring = g_zframes * PAGE;
+    while (ring - g_zused < need) {
+        // the oldest entry goes
+        uint32_t w = z_word(g_ztail);
+        uint32_t q = w >> 12;
+        if (g_zloc[q] == g_ztail / 4u + 1u) {
+            z_forget(q);
+        }
+        g_zused -= z_entry(w & (PAGE - 1u));
+        g_ztail = (g_ztail + z_entry(w & (PAGE - 1u))) % ring;
+    }
+    uint32_t w = p << 12 | n;
+    memcpy(g_zmem[g_zhead / PAGE] + g_zhead % PAGE, &w, 4);
+    z_copy(g_zhead + 4u, g_zpack, n, false);
+    g_zloc[p] = g_zhead / 4u + 1u;
+    g_zhead = (g_zhead + need) % ring;
+    g_zused += need;
+    g_zpages++;
+    g_zbytes += n;
+    g_st.z_puts++;
+}
+
+// Page `p` stood for in the cache: its packed bytes into g_zspan (MMU lock held); their count.
+static uint32_t z_take(uint32_t p) {
+    uint32_t at = (g_zloc[p] - 1u) * 4u;
+    uint32_t n = z_word(at) & (PAGE - 1u);
+    z_copy(at + 4u, g_zspan, n, true);
+    return n;
 }
 
 // Page `p` lost its frame (its contents kept: a copy, or zero).
@@ -156,6 +258,9 @@ static void assign(uint32_t f, uint32_t p) {
 
 // A clean page `q` not used lately gives frame `f` back (q is unmapped).
 static void evict_clean(uint32_t q, uint32_t f) {
+    if (g_xb_pg_slot[q] != 0) {
+        z_put(q, wl_xb_mmu_frame_ptr(q, f)); // (before the host's frame drop lets its bytes go)
+    }
     g_xb_pg_frame[q] = 0;
     g_owner[f] = 0;
     g_xb_pg_flags[q] &= (uint8_t)~WL_XB_PG_REF;
@@ -275,6 +380,8 @@ static void slot_free(uint32_t s) {
 
 // Page `p` forgets its copy: its slot, or its file's bytes. Lock held.
 static void copy_drop(uint32_t p) {
+    z_forget(p);
+    g_xb_pg_flags[p] &= (uint8_t)~WL_XB_PG_RAW;
     uint32_t s = g_xb_pg_slot[p];
     if (s == 0) {
         return;
@@ -406,6 +513,7 @@ static WlResult batch_write(void) {
         uint32_t p = g_batch[i];
         uint32_t lv = wl_xb_mmu_lock();
         uint32_t f = g_xb_pg_frame[p];
+        z_put(p, wl_xb_mmu_frame_ptr(p, f)); // (clean now, its copy in the swap file)
         g_xb_pg_frame[p] = 0;
         g_xb_pg_flags[p] &= (uint8_t)~(WL_XB_PG_IO | WL_XB_PG_DIRTY | WL_XB_PG_REF);
         give_free(f);
@@ -559,11 +667,25 @@ static WlResult fault(uint32_t p, uint32_t keep, bool give_up) {
     if (slot != 0) {
         g_xb_pg_flags[p] |= WL_XB_PG_IO;
     }
+    // in the page cache: its entry copied out here (an eviction in exception context may write over
+    // it), unpacked below with the frame the page's own while it is IO
+    uint32_t zn = slot != 0 && g_zframes != 0 && g_zloc[p] != 0 ? z_take(p) : 0u;
     wl_xb_mmu_unlock(lv);
     if (slot == 0) {
         wl_xb_mmu_frame_zero(p, f);
         read_end(p, WL_OK);
         return WL_OK;
+    }
+    if (zn != 0) {
+        if (wl_xb_page_unpack(g_zspan, zn, wl_xb_mmu_frame_ptr(p, f))) {
+            g_st.z_hits++;
+            read_end(p, WL_OK);
+            return WL_OK;
+        }
+        WL_LOG_E(TAG, "page %u's entry in the page cache does not unpack: read instead", (unsigned)p);
+        lv = wl_xb_mmu_lock();
+        z_forget(p);
+        wl_xb_mmu_unlock(lv);
     }
     bool file = (slot & FILE_SLOT) != 0;
     WlPlatformFile *from = file ? g_src[(slot & ~FILE_SLOT) - 1u].file : g_swap;
@@ -727,6 +849,7 @@ void wl_xb_pg_move(uint32_t from, uint32_t to) {
     wl_xb_pg_release(to, 1); // a free page touched through the window may hold a frame
     (void)settle(from);
     uint32_t lv = wl_xb_mmu_lock();
+    z_forget(from); // (its entry's header names it)
     wl_xb_mmu_unmap(from);
     g_evstamp[to] = g_evstamp[from];
     g_evstamp[from] = 0;
@@ -966,6 +1089,12 @@ void wl_xb_pg_stats(WlXbMemStats *out) {
     out->refaults_file = g_st.refaults_file;
     out->refaults_zero = g_st.refaults_zero;
     out->ahead_unused = g_st.ahead_unused;
+    out->zcache_frames = g_zframes;
+    out->zcache_puts = g_st.z_puts;
+    out->zcache_raw = g_st.z_raw;
+    out->zcache_hits = g_st.z_hits;
+    out->zcache_pages = g_zpages;
+    out->zcache_bytes = g_zbytes;
     out->resident_dirty = out->resident_file = 0;
     for (uint32_t f = 1; f <= g_xb_pg_frames; f++) {
         uint32_t q1 = g_owner[f];
@@ -1025,7 +1154,8 @@ size_t wl_xb_pg_host_bytes(void) {
                     sizeof *g_foff + sizeof *g_evstamp) +
            (g_xb_pg_frames + 1u) * sizeof *g_owner + g_xb_pg_frames * sizeof *g_free +
            (g_slot_used != NULL ? (g_slots + 31u) / 32u * sizeof *g_slot_used : 0u) +
-           (g_io != NULL ? (BATCH + 1u) * PAGE : 0u);
+           (g_io != NULL ? (BATCH + 1u) * PAGE : 0u) +
+           (g_zframes != 0 ? pages * sizeof *g_zloc + g_zframes * sizeof *g_zmem : 0u);
 }
 
 WlResult wl_xb_pg_init(const WlXbMemConfig *cfg, uint32_t frames) {
@@ -1045,11 +1175,36 @@ WlResult wl_xb_pg_init(const WlXbMemConfig *cfg, uint32_t frames) {
         g_xb_pg_wgen == NULL || g_foff == NULL) {
         return WL_ERR_NOMEM;
     }
+    // the page cache's share: the last frames
+    uint32_t zbytes = cfg->page_cache_bytes;
+    const char *env = getenv("WL_XB_PAGE_CACHE_KB");
+    if (env != NULL && env[0] != '\0') {
+        zbytes = (uint32_t)strtoul(env, NULL, 10) << 10;
+    }
+    uint32_t z = zbytes == WL_XB_PAGE_CACHE_AUTO ? (frames >= (16u << 20) / PAGE ? frames / 12u : 0u) : zbytes / PAGE;
+    z = z < frames / 4u ? z : frames / 4u;
+    if (z != 0) {
+        g_zmem = calloc(z, sizeof *g_zmem);
+        g_zloc = calloc(pages, sizeof *g_zloc);
+        for (uint32_t i = 0; g_zmem != NULL && i < z; i++) {
+            g_zmem[i] = wl_xb_mmu_frame_ptr(WL_XB_PG_NO_PAGE, frames - z + 1u + i);
+            if (g_zmem[i] == NULL) {
+                free(g_zmem);
+                g_zmem = NULL;
+            }
+        }
+        if (g_zmem == NULL || g_zloc == NULL) {
+            return WL_ERR_NOMEM;
+        }
+        g_zframes = z;
+        frames -= z;
+    }
     for (uint32_t f = frames; f >= 1u; f--) {
         g_free[g_free_n++] = (uint16_t)f; // frame 1 comes first
     }
     swap_open(cfg);
     g_xb_pg_frames = frames;
-    WL_LOG_I(TAG, "demand paging over %u frames (%u KB)", (unsigned)frames, (unsigned)(frames * (PAGE >> 10)));
+    WL_LOG_I(TAG, "demand paging over %u frames (%u KB), a page cache of %u KB", (unsigned)frames,
+             (unsigned)(frames * (PAGE >> 10)), (unsigned)(z * (PAGE >> 10)));
     return WL_OK;
 }

@@ -152,6 +152,21 @@ void wl_xb_mmu_unmap(uint32_t p) {
 }
 
 uint8_t *wl_xb_mmu_frame_ptr(uint32_t p, uint32_t f) {
+    if (p == WL_XB_PG_NO_PAGE) {
+        // a frame the core keeps out of the pages: memory of its own (outside the heap a run
+        // imitates the Wii's with, as the Wii's comes from its pool), set aside on first use
+        static uint8_t *spare;
+        static uint32_t spare_pages;
+        if (spare == NULL) {
+            spare_pages = g_ram >> WL_XB_PAGE_SHIFT;
+            void *m = mmap(NULL, g_ram, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (m == MAP_FAILED) {
+                return NULL;
+            }
+            spare = m;
+        }
+        return f >= 1u && f <= spare_pages ? spare + ((size_t)(f - 1u) << WL_XB_PAGE_SHIFT) : NULL;
+    }
     (void)f;
     return g_door + ((size_t)p << WL_XB_PAGE_SHIFT);
 }

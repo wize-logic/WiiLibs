@@ -55,6 +55,7 @@ WlResult wl_xb_backend_page_fault(uint32_t ea);
 #define WL_XB_PG_WATCH 0x10u  // a write watch covers it (wl_xb_pg_watch): its mappings see every store
                               // (the Wii: a PTE never carries C ahead of a store)
 #define WL_XB_PG_AHEAD 0x20u  // read ahead with another page and not used since (a diagnostic)
+#define WL_XB_PG_RAW 0x40u    // its copy did not pack small enough for the page cache: not tried again until it changes
 
 extern uint8_t *g_xb_pg_flags;  // [ram pages]
 extern uint16_t *g_xb_pg_frame; // [ram pages] 1..frames, 0: none
@@ -137,14 +138,23 @@ void wl_xb_pg_stats(WlXbMemStats *out);
 uint32_t wl_xb_pg_watch(uint32_t p, uint32_t pages);
 bool wl_xb_pg_written(uint32_t p, uint32_t pages, uint32_t stamp);
 
+// A page packed small (page_pack.c): its 4 KB in at most `cap` bytes of `dst`, their count (0: it
+// does not fit); unpacked back into 4 KB (false: the bytes are not a packed page). One packer at a
+// time (the MMU lock: its table is static); exception-safe.
+size_t wl_xb_page_pack(const uint8_t *src, uint8_t *dst, size_t cap);
+bool wl_xb_page_unpack(const uint8_t *src, size_t n, uint8_t *dst);
+
 // The backend's MMU, for the core. On the Wii they run in exception context too: no locks, no I/O.
 // The R and C bits of `p`'s live mappings into its flags (WL_XB_PG_REF, WL_XB_PG_DIRTY); with
 // `clear_ref`, the mappings' R bits cleared too, so that the next use sets them again.
 void wl_xb_mmu_harvest(uint32_t p, bool clear_ref);
 // Every mapping of `p` gone (both EAs), its R and C bits harvested into its flags first.
 void wl_xb_mmu_unmap(uint32_t p);
-// The host pointer of frame `f`, which page `p` holds.
+// The host pointer of frame `f`, which page `p` holds. With WL_XB_PG_NO_PAGE (once, at the paging
+// core's start: frames it keeps out of the pages, for the page cache): the frame's own memory (the
+// Wii's pools), or memory set aside for it where frames are tied to pages (the host).
 uint8_t *wl_xb_mmu_frame_ptr(uint32_t p, uint32_t f);
+#define WL_XB_PG_NO_PAGE 0xFFFFFFFFu
 // Frame `f` was given to page `p` with nothing in it yet: zero it.
 void wl_xb_mmu_frame_zero(uint32_t p, uint32_t f);
 // Page `p` gives frame `f` back (unmapped): the host memory behind it may go.

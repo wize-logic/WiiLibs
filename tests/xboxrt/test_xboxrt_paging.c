@@ -32,6 +32,7 @@
 
 #define FRAMES 64u
 #define PAGE WL_XB_PAGE
+#define ZFRAMES 16u // the page cache's (WL_XBRT_PAGING_CACHE), beside the pool's FRAMES
 
 static bool g_up;
 static char g_dir[256];
@@ -51,6 +52,10 @@ static void up(void) {
     wl_xb_mem_config_default(&cfg);
     cfg.ram_bytes = 16u << 20;
     cfg.frame_limit_bytes = FRAMES * PAGE;
+#if defined(WL_XBRT_PAGING_CACHE)
+    cfg.frame_limit_bytes += ZFRAMES * PAGE; // (the pool keeps its FRAMES)
+    cfg.page_cache_bytes = ZFRAMES * PAGE;
+#endif
 #if defined(WL_XBRT_PAGING_NO_SWAP)
     cfg.swap_path = NULL;
 #else
@@ -67,6 +72,9 @@ static void cleanup(void) {
     unlink(path);
     rmdir(g_dir);
 }
+
+// Pages back from the swap file: read, or unpacked from the page cache.
+#define IN(st) ((st).swap_ins + (st).zcache_hits)
 
 static WlXbMemStats stats(void) {
     WlXbMemStats st;
@@ -301,7 +309,11 @@ TEST changed_pages_swap_out_and_back(void) {
     WlXbMemStats b = stats();
     ASSERT(b.frames <= FRAMES);
     ASSERT(b.swap_outs - a.swap_outs >= n - FRAMES);
-    ASSERT(b.swap_ins - a.swap_ins >= n - FRAMES);
+    ASSERT(IN(b) - IN(a) >= n - FRAMES);
+#if defined(WL_XBRT_PAGING_CACHE)
+    ASSERT(b.zcache_hits - a.zcache_hits >= n - FRAMES - ZFRAMES); // most from the cache
+    ASSERT(b.zcache_pages != 0);
+#endif
     ASSERT(b.swap_writes - a.swap_writes < (b.swap_outs - a.swap_outs) / 4u); // batched
     ASSERT_EQ((uint64_t)(b.swap_outs - a.swap_outs) * PAGE, b.swap_write_bytes - a.swap_write_bytes);
     ASSERT_EQ((uint64_t)(b.swap_ins - a.swap_ins) * PAGE, b.swap_read_bytes - a.swap_read_bytes);
@@ -309,6 +321,29 @@ TEST changed_pages_swap_out_and_back(void) {
     ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
     WlXbMemStats c = stats();
     ASSERT(c.swap_slots_used + n - FRAMES <= b.swap_slots_used + FRAMES); // the slots came back
+    PASS();
+}
+
+// Pages read back clean (copies in the swap file, and in the page cache when there is one), then
+// changed: their next return brings the new bytes, never the old copy's; and once more after that.
+TEST changed_pages_never_come_back_stale(void) {
+    up();
+    const uint32_t n = 3u * FRAMES;
+    uint32_t va = alloc(n);
+    ASSERT(va != 0);
+    fill(va, n, 40);
+    ASSERT(check(va, n, 40));
+    ASSERT(check(va, n, 40)); // clean copies, gone and back
+    for (uint32_t i = 0; i < n; i += 2u) {
+        wl_xb_wr32(va + i * PAGE + 2048u, 0x5EED0000u + i); // every other page changed (not zero)
+    }
+    for (uint32_t round = 0; round < 2u; round++) {
+        for (uint32_t i = 0; i < n; i++) {
+            ASSERT_EQ_FMT(i % 2u == 0 ? 0x5EED0000u + i : word(40, i, 2048u), wl_xb_rd32(va + i * PAGE + 2048u), "%08x");
+            ASSERT_EQ_FMT(word(40, i, 1024u), wl_xb_rd32(va + i * PAGE + 1024u), "%08x");
+        }
+    }
+    ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
     PASS();
 }
 
@@ -323,7 +358,7 @@ TEST clean_pages_read_back_go_for_nothing(void) {
     ASSERT(check(va, n, 2)); // only clean pages to take frames from: no write
     WlXbMemStats b = stats();
     ASSERT_EQ(a.swap_outs, b.swap_outs);
-    ASSERT(b.swap_ins - a.swap_ins >= n - FRAMES);
+    ASSERT(IN(b) - IN(a) >= n - FRAMES);
     ASSERT(b.clean_evictions - a.clean_evictions >= n - FRAMES);
     ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
     PASS();
@@ -517,7 +552,7 @@ TEST file_reads_spare_swap_ins(void) {
     wl_xb_copy_in(va + 100u, src, 3u * PAGE);
     WlXbMemStats b = stats();
     ASSERT_EQ(2u, b.swap_ins_spared - a.swap_ins_spared);
-    ASSERT_EQ(2u, b.swap_ins - a.swap_ins);
+    ASSERT_EQ(2u, IN(b) - IN(a));
     static uint8_t got[3u * PAGE];
     wl_xb_copy_out(got, va + 100u, sizeof got);
     ASSERT_MEM_EQ(src, got, sizeof got);
@@ -533,6 +568,10 @@ TEST file_reads_spare_swap_ins(void) {
 #if !defined(WL_XBRT_PAGING_NO_SWAP)
 // A file of `pages` pages of pattern `seed` as the guest reads it (little-endian words), open
 // read-write.
+// With g_noise, the bytes around the pattern's words are noise: pages that do not pack small (the
+// page cache keeps none of them, so their touches read the card).
+static bool g_noise;
+
 static WlPlatformFile *pattern_file(const char *path, uint32_t pages, uint32_t seed) {
     WlPlatformFile *f = NULL;
     if (wl_platform_fs_open(path, WL_FILE_READ_WRITE, &f) != WL_OK) {
@@ -541,6 +580,9 @@ static WlPlatformFile *pattern_file(const char *path, uint32_t pages, uint32_t s
     static uint8_t page[PAGE];
     for (uint32_t i = 0; i < pages; i++) {
         memset(page, 0, sizeof page);
+        for (uint32_t off = 0; g_noise && off < PAGE; off += 4u) {
+            wl_wr_le32(page + off, word(seed + 1000u, i, off) * 0x2545F491u);
+        }
         for (uint32_t off = 0; off < PAGE; off += 1024u) {
             wl_wr_le32(page + off, word(seed, i, off));
         }
@@ -582,7 +624,7 @@ TEST file_pages_need_no_swap_out(void) {
     WlXbMemStats c = stats();
     ASSERT_EQ(0u, c.swap_outs - b.swap_outs);
     ASSERT_EQ(0u, c.swap_ins - b.swap_ins);
-    ASSERT((c.file_ins + c.file_ahead) - (b.file_ins + b.file_ahead) >= n);
+    ASSERT((c.file_ins + c.file_ahead + c.zcache_hits) - (b.file_ins + b.file_ahead + b.zcache_hits) >= n);
     ASSERT(c.file_ahead > b.file_ahead); // read in order: the pages after each come in its read
     ASSERT(c.file_evictions - b.file_evictions >= n);
     // a read over pages that went: not read back from the file to be overwritten
@@ -645,7 +687,7 @@ TEST file_pages_forget_their_file(void) {
     ASSERT_EQ(0xC0FFEEu, wl_xb_rd32(va + 5u * PAGE + 8u));
     WlXbMemStats g = stats();
     ASSERT_EQ(e.file_ins, g.file_ins);
-    ASSERT(g.swap_ins > e.swap_ins);
+    ASSERT(IN(g) > IN(e));
     ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
     PASS();
 }
@@ -749,7 +791,9 @@ TEST read_back_gives_the_lock_up(void) {
     ASSERT_EQ(WL_OK, wl_xb_threads_init(&tc, &boot));
     ASSERT_EQ(WL_OK, wl_xb_thread_setup_guest(boot, 0x10000u, 0, 0, 0));
     const uint32_t n = 2u * FRAMES;
+    g_noise = true; // (a read of the card, with a page cache too)
     WlPlatformFile *f = pattern_file("sd:/transit.bin", n, 33);
+    g_noise = false;
     ASSERT(f != NULL);
     uint32_t va = alloc(n);
     ASSERT(va != 0);
@@ -834,6 +878,7 @@ SUITE(paging) {
 #if !defined(WL_XBRT_PAGING_NO_SWAP)
     RUN_TEST(changed_pages_swap_out_and_back);
     RUN_TEST(clean_pages_read_back_go_for_nothing);
+    RUN_TEST(changed_pages_never_come_back_stale);
     RUN_TEST(both_eas_see_one_page);
     RUN_TEST(pinned_pages_keep_their_frames);
     RUN_TEST(relocation_carries_swapped_pages);
