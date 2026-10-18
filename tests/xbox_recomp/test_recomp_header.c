@@ -249,6 +249,40 @@ TEST fp_pc24_slow_path_keeps_registers(void) {
     PASS();
 }
 
+#if RECOMP_FP_ROUND24_KEEP
+static uint32_t pc24_fpscr(void) {
+    union { double d; uint64_t u; } c;
+    __asm__ volatile("mffs %0" : "=f"(c.d));
+    return (uint32_t)c.u;
+}
+#endif
+
+// On PowerPC the fast path is frsp. and a branch on FPSCR[FX]: an overflow or an inexact underflow
+// takes the slow path, which clears FX, OX and UX; FX left set by other code (an overflow of its
+// own here) costs one slow path and never a wrong result.
+TEST fp_pc24_exception_summary(void) {
+    static const double seq[] = {1.5, 3.5e38, 0.1, 1e-40, 2.0 / 3.0, 5e-324, -7.25, -1e39, 1e-30, 0.0};
+    volatile double big = 1e300;
+    g_fp_control_word = 0x007F;   // PC = 24
+    for (int round = 0; round < 3; round++) {
+        if (round == 1) {
+            volatile float f = (float)big;   // an overflow outside the x87 path: FX, OX set
+            (void)f;
+        }
+        for (size_t i = 0; i < sizeof seq / sizeof seq[0]; i++) {
+            double x = seq[i] * (round == 2 ? -1.0 : 1.0);
+            double fast = RECOMP_FP_PC(x);
+#if RECOMP_FP_ROUND24_KEEP
+            __asm__ volatile("" : "+f"(fast));
+            ASSERT_EQ(0u, pc24_fpscr() & 0x18000000u);   // OX and UX never left set
+#endif
+            double slow = recomp_fp_round24(x);
+            ASSERT_MEM_EQ(&slow, &fast, sizeof fast);
+        }
+    }
+    PASS();
+}
+
 SUITE(recomp_header) {
     RUN_TEST(ea_transform);
     RUN_TEST(mem_reads_little_endian);
@@ -261,6 +295,7 @@ SUITE(recomp_header) {
     RUN_TEST(extended_80bit);
     RUN_TEST(fp_pc24_matches_the_slow_path);
     RUN_TEST(fp_pc24_slow_path_keeps_registers);
+    RUN_TEST(fp_pc24_exception_summary);
 }
 
 GREATEST_MAIN_DEFS();
