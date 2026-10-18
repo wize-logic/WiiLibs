@@ -1098,11 +1098,35 @@ static bool standin_hides(const WlNv2aKelvin *k) {
             destination == WL_NV2A_BLEND_SRC_ALPHA || destination == WL_NV2A_BLEND_ONE_MINUS_SRC_ALPHA);
 }
 
+// A stand-in's colour made neutral for whatever its texture holds (standin_bind): the average of
+// a picture tints a whole model or wall when the texture is not one (a mask, a ramp, a lookup
+// table, a normalization cube: a combiner reads its channels as weights or vectors; a red and
+// yellow ramp stood in as yellow, Halo's environments yellow and a Flood or an Elite in one
+// colour), so its light alone is kept, as grey; a normal map's average (blue, its red and green
+// about the middle) stands for its flat normal (0.5, 0.5, 1), and a signed map's (V16U16, the
+// bump offsets) for its zero
+static void standin_neutral(const WlNv2aTexture *t, uint8_t rgba[4]) {
+    uint32_t light;
+
+    if (t->signs != 0) {
+        rgba[0] = rgba[1] = 0;
+        rgba[2] = rgba[3] = 255;
+        return;
+    }
+    if (rgba[0] >= 104u && rgba[0] <= 152u && rgba[1] >= 104u && rgba[1] <= 152u && rgba[2] >= 208u) {
+        rgba[0] = rgba[1] = 128;
+        rgba[2] = 255;
+        return;
+    }
+    light = (77u * rgba[0] + 150u * rgba[1] + 29u * rgba[2] + 128u) >> 8;
+    rgba[0] = rgba[1] = rgba[2] = (uint8_t)light;
+}
+
 // What a stage binds for a texture the cache could not make (no memory for it, a format GX cannot
 // take, texels outside memory) in a draw drawn (standin_hides) so that it is not drawn untextured:
-// a 4 x 4 image of its average colour (grey when its texels cannot be read), made again when the
-// stage's texture changes (a multiplying pass, a detail map's, takes the average as well). The
-// entry is dynamic: the texture is looked up again at the next draw.
+// a 4 x 4 image of its average colour made neutral (standin_neutral; grey when its texels cannot be
+// read), made again when the stage's texture changes (a multiplying pass, a detail map's, takes
+// the average as well). The entry is dynamic: the texture is looked up again at the next draw.
 static const WlNv2aTexEntry *standin_bind(WlNv2aGx *gx, unsigned stage, const WlNv2aTexture *t) {
     WlNv2aTexEntry *e = &gx->standin_entries[stage];
     uint8_t *image = (uint8_t *)(((uintptr_t)gx->standin_memory + 31u) & ~(uintptr_t)31u) + stage * STANDIN_BYTES;
@@ -1121,6 +1145,7 @@ static const WlNv2aTexEntry *standin_bind(WlNv2aGx *gx, unsigned stage, const Wl
         if (src != NULL && !wl_nv2a_texture_average(t, src, palette, rgba)) {
             rgba[0] = rgba[1] = rgba[2] = 128, rgba[3] = 255;
         }
+        standin_neutral(t, rgba);
         value = (uint32_t)rgba[0] << 24 | (uint32_t)rgba[1] << 16 | (uint32_t)rgba[2] << 8 | rgba[3];
         if (!gx->standins[stage].made || value != gx->standins[stage].rgba) {
             for (i = 0; i < 16; i++) {
