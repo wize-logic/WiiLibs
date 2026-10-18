@@ -288,6 +288,9 @@ typedef struct {
     uint32_t yields, yields_lower; // NtYieldExecution calls; those that gave way to a lower priority
 } WlXbThreadStats;
 void wl_xb_thread_stats(WlXbThreadStats *out);
+// The service thread's longest wait for the guest lock since the last call, in ms (what the
+// interrupts were held off for), and the id of the thread that had the lock when it began; cleared.
+uint32_t wl_xb_thread_service_wait_max(uint32_t *holder);
 // A thread's time off the guest lock since it was made, in microseconds of wl_xb_time_us: queued
 // for its turn, in guest waits, in the card's I/O (a span still going on counts up to now). A title's
 // frame loop measures its own frame with it: what it waited for, and on what. Any thread.

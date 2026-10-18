@@ -198,6 +198,9 @@ static void log_guest_stack(const char *what, const WlXbThread *t, const WlXbThr
 // the lock at a raised IRQL (none: it ran without a safe point; many: it stays at DISPATCH_LEVEL or
 // above, where its own safe points run the interrupts and nothing else runs), its guest return
 // addresses, and where its host thread is (wl_xb_backend_probe). Nothing of this runs before.
+static uint64_t g_svc_wait_max_us; // the service thread's longest wait for the lock (g_m)
+static uint32_t g_svc_wait_holder;  // the thread that had the lock when that wait began
+
 static void take(WlXbThread *self) {
     if (g_owner == NULL && g_ready == NULL) {
         off_end(self, wl_xb_time_us());
@@ -205,6 +208,8 @@ static void take(WlXbThread *self) {
     } else {
         enqueue(self);
         uint64_t since = wl_platform_time_ms(), warned = 0;
+        const uint64_t since_us = self->is_service ? wl_platform_time_us() : 0;
+        const uint32_t holder0 = g_owner != NULL ? g_owner->id : 0u;
         uint32_t points0 = g_stats.safe_points, raised0 = g_stats.raised_holds;
         while (g_owner != self) {
             if (!self->is_service) {
@@ -233,6 +238,13 @@ static void take(WlXbThread *self) {
         }
         if (warned != 0) {
             wl_xb_backend_probe(0);
+        }
+        if (self->is_service) {
+            uint64_t us = wl_platform_time_us() - since_us;
+            if (us > g_svc_wait_max_us) {
+                g_svc_wait_max_us = us;
+                g_svc_wait_holder = holder0;
+            }
         }
     }
     g_quantum_start = wl_xb_time_us();
@@ -1297,6 +1309,16 @@ void wl_xb_thread_times(const WlXbThread *t, WlXbThreadTimes *out) {
         *(t->off_io ? &out->io_us : &out->waited_us) += now - t->off_since_us;
     }
     wl_platform_mutex_unlock(g_m);
+}
+
+uint32_t wl_xb_thread_service_wait_max(uint32_t *holder) {
+    wl_platform_mutex_lock(g_m);
+    uint32_t ms = (uint32_t)(g_svc_wait_max_us / 1000u);
+    *holder = g_svc_wait_holder;
+    g_svc_wait_max_us = 0;
+    g_svc_wait_holder = 0;
+    wl_platform_mutex_unlock(g_m);
+    return ms;
 }
 
 void wl_xb_thread_log_ready_waits(void) {

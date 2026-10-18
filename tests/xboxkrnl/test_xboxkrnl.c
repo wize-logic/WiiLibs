@@ -1067,6 +1067,34 @@ TEST vblanks_raised_together_all_run(void) {
     PASS();
 }
 
+// A backlog of vertical blanks (a thread kept the lock for a while) runs one a round, at most
+// MAX_ROUNDS (8) a service call: the calls that end with some still owed are counted, not reported
+// as interrupt lines that stay asserted, and every one runs.
+TEST vblank_backlog_runs_in_rounds(void) {
+    boot();
+    ASSERT(g_ready);
+    WlXbServiceStats s0, s1;
+    wl_xb_service_stats(&s0);
+    uint32_t before = wl_xb_vblank_count();
+    for (int i = 0; i < 20; i++) {
+        wl_xb_service_raise(WL_XB_SVC_VBLANK);
+    }
+    wl_xb_service_poll();
+    for (int i = 0; i < 200 && wl_xb_vblank_count() - before < 20u; i++) {
+        wl_xb_service_poll();
+        delay_ms(1);
+    }
+    ASSERT_EQ_FMT(20u, wl_xb_vblank_count() - before, "%u");
+    wl_xb_service_stats(&s1);
+    ASSERT_EQ_FMT(20u, s1.vblanks_raised - s0.vblanks_raised, "%u");
+    ASSERT_EQ_FMT(20u, s1.vblanks - s0.vblanks, "%u");
+    ASSERT_EQ_FMT(0u, s1.vblanks_dropped - s0.vblanks_dropped, "%u");
+    ASSERT(s1.services - s0.services >= 3u);         // 20 a round at a time: three calls at least
+    ASSERT(s1.services_full_owed - s0.services_full_owed >= 2u);
+    ASSERT_EQ_FMT(0u, s1.services_full_lines - s0.services_full_lines, "%u");
+    PASS();
+}
+
 // ---- A thread sleeps until the next vertical blank ------------------------------------------------
 // A title's frame loop that spins on a counter its vblank callback moves sleeps in wl_xb_vblank_wait
 // instead: woken by the next vertical blank's round, not before, every waiter at once, and a vertical
@@ -3081,6 +3109,7 @@ SUITE(kernel_suite) {
     RUN_TEST(no_yield_at_dispatch_level);
     RUN_TEST(yield_gives_way_to_a_lower_priority);
     RUN_TEST(vblanks_raised_together_all_run);
+    RUN_TEST(vblank_backlog_runs_in_rounds);
     RUN_TEST(vblank_wait_wakes_at_the_next_vblank);
     RUN_TEST(vblank_wait_wakes_every_waiter);
     RUN_TEST(vblank_raised_before_the_wait_is_not_lost);
