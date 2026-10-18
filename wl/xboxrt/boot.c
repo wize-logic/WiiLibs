@@ -408,7 +408,8 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
 
     // earlier behaviours put back, for a bisection on the console (read once, before the guest runs):
     // files "oldapc", "oldyield", "oldvblank" (thread.h's WL_XB_COMPAT_*) and "oldoccl" (occlusion
-    // queries counted by their area)
+    // queries counted by their area). The old APC and yield are the default (card run 12: the new two
+    // together crash a10's load, a read of guest 0x00007974); files "newapc" and "newyield" take them away.
     {
         static const struct {
             const char *name;
@@ -419,12 +420,22 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
                         {"oldoccl", 0u}};
         char in_force[64] = "";
         bool old_occl = false;
-        g_xb_compat = 0;
+        g_xb_compat = WL_XB_COMPAT_OLDAPC | WL_XB_COMPAT_OLDYIELD;
+        snprintf(flag, sizeof flag, "%s/newapc", cfg->title_dir);
+        if (wl_platform_fs_exists(flag)) {
+            g_xb_compat &= ~WL_XB_COMPAT_OLDAPC;
+        }
+        snprintf(flag, sizeof flag, "%s/newyield", cfg->title_dir);
+        if (wl_platform_fs_exists(flag)) {
+            g_xb_compat &= ~WL_XB_COMPAT_OLDYIELD;
+        }
         for (size_t i = 0; i < sizeof k_compat / sizeof k_compat[0]; i++) {
             snprintf(flag, sizeof flag, "%s/%s", cfg->title_dir, k_compat[i].name);
             if (wl_platform_fs_exists(flag)) {
                 g_xb_compat |= k_compat[i].bit;
                 old_occl = old_occl || k_compat[i].bit == 0u;
+            }
+            if (k_compat[i].bit != 0u ? (g_xb_compat & k_compat[i].bit) != 0u : old_occl) {
                 strncat(in_force, " ", sizeof in_force - strlen(in_force) - 1u);
                 strncat(in_force, k_compat[i].name, sizeof in_force - strlen(in_force) - 1u);
             }
