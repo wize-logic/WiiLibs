@@ -95,10 +95,24 @@ static uint32_t g_pinned;
 static WlPlatformFile *g_swap;
 static uint32_t *g_slot_used; // a bit per slot
 static uint32_t g_slots, g_slots_used, g_slot_cursor;
-static uint8_t *g_io; // BATCH pages: the batch's bytes (guest lock held)
+static uint8_t *g_io; // BATCH pages: the batch's bytes (guest lock held, or a write's in transit)
 static uint8_t *g_in; // a page read back (the card's lock held): the page after g_io's
 static uint16_t g_batch[BATCH];
 static uint32_t g_batch_n;
+// A batch's write is in transit from its slots' choice to its end (write_end): its pages unmapped,
+// marked IO, their frames theirs, g_batch and g_io its own (no batch is gathered, and a read keeps
+// to one page, meanwhile). Its writer may give the guest lock up while the card works (as a read
+// back does); a thread that meets one of its pages, or needs a frame and finds no clean page, waits
+// for `done` and ends the write for it (write_wait). `gen` tells the writer whether it was.
+static struct {
+    bool active;
+    volatile bool done; // (under the card's lock)
+    WlResult r;
+    uint32_t gen, n, runs;
+    uint16_t first[BATCH], len[BATCH]; // the slot runs written
+} g_wr;
+static bool g_giving_up; // in wl_xb_block_begin for a read back or a write (the lock holder's)
+static uint32_t phys_page(uint32_t va);
 
 static uint32_t *g_foff; // [ram pages] a file copy's offset in its file
 // The converted pages, oldest conversion first (g_conv[g_conv_head], g_conv_n of them); a page
@@ -518,9 +532,83 @@ static void batch_abandon(uint32_t from) {
     wl_xb_mmu_unlock(lv);
 }
 
+// The write in transit is over (guest lock held): its pages give their frames back, clean with their
+// copies in the swap file, except page `keep_p` - 1 (0: none: one a thread waited for), kept resident
+// and clean. After a failure they all stay resident and changed, without a copy.
+static void write_end(uint32_t keep_p) {
+    uint32_t n = g_wr.n, out = 0;
+    g_wr.active = false;
+    if (g_wr.r == WL_OK) {
+        g_st.swap_writes += g_wr.runs;
+        g_st.write_bytes += (uint64_t)n * PAGE;
+        for (uint32_t i = 0, k = 0; i < g_wr.runs; i++) {
+            for (uint32_t j = 0; j < g_wr.len[i]; j++, k++) {
+                wl_xb_census_io(WL_XB_CIO_SWAP_OUT, g_batch[k], j == 0);
+            }
+        }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t p = g_batch[i];
+        uint32_t lv = wl_xb_mmu_lock();
+        if (g_wr.r != WL_OK) {
+            copy_drop(p);
+            g_xb_pg_flags[p] &= (uint8_t)~WL_XB_PG_IO; // (still DIRTY)
+        } else if (p + 1u == keep_p) {
+            g_xb_pg_flags[p] = (uint8_t)((g_xb_pg_flags[p] & ~(WL_XB_PG_IO | WL_XB_PG_DIRTY)) | WL_XB_PG_REF);
+        } else {
+            uint32_t f = g_xb_pg_frame[p];
+            z_put(p, wl_xb_mmu_frame_ptr(p, f)); // (clean now, its copy in the swap file)
+            g_xb_pg_frame[p] = 0;
+            g_xb_pg_flags[p] &= (uint8_t)~(WL_XB_PG_IO | WL_XB_PG_DIRTY | WL_XB_PG_REF);
+            give_free(f);
+            wl_xb_mmu_frame_drop(p, f);
+            stamp_evicted(p);
+            out++;
+        }
+        wl_xb_mmu_unlock(lv);
+    }
+    g_st.swap_outs += out;
+    g_st.evictions += out;
+    g_batch_n = 0;
+}
+
+// Waits for the write in transit and ends it, the guest lock kept (its writer needs only the card's
+// lock, and the one waiting may be a DPC), keeping page `keep_p` - 1 resident (0: none).
+static WlResult write_wait(uint32_t keep_p) {
+    for (;;) {
+        wl_xb_card_lock();
+        bool done = g_wr.done;
+        wl_xb_card_unlock();
+        if (done) {
+            break;
+        }
+        wl_platform_thread_sleep_ms(1); // its writer has not reached the card yet
+    }
+    g_st.transit_waits++;
+    WlResult r = g_wr.r;
+    write_end(keep_p);
+    return r != WL_OK ? WL_ERR_IO : WL_OK;
+}
+
+// Whether page p is one the write in transit has.
+static bool in_write(uint32_t p) {
+    for (uint32_t i = 0; g_wr.active && i < g_wr.n; i++) {
+        if (g_batch[i] == p) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Writes the gathered dirty pages (unmapped, marked IO) to consecutive slots and takes their
-// frames. Lock not held.
-static WlResult batch_write(void) {
+// frames. Lock not held. With `give_up` the guest lock is given up while the card works (the write
+// in transit meanwhile), as a read back's is, under its conditions (fault) and one more: the lock is
+// kept when the thread's own KPCR page is in the batch or has no frame (wl_xb_block_begin reads the
+// IRQL there, and a fault there would wait for this write, which comes only after it).
+static WlResult batch_write(bool give_up) {
+    WlXbThread *cur = wl_xb_current();
+    give_up = give_up && !g_giving_up && cur != NULL && cur->kernel_depth == 0 && g_xb_mmio_depth == 0;
+    uint32_t kp1 = give_up ? phys_page(cur->kpcr) : 0u;
     uint32_t n = 0, zeroed = 0;
     for (uint32_t i = 0; i < g_batch_n; i++) {
         uint32_t p = g_batch[i];
@@ -547,7 +635,8 @@ static WlResult batch_write(void) {
     g_batch_n = n;
     g_st.zero_outs += zeroed;
     g_st.evictions += zeroed;
-    uint32_t done = 0;
+    // the slots, chosen before the card works (their table is the guest lock's)
+    uint32_t done = 0, runs = 0;
     while (done < n) {
         uint32_t first = 0;
         uint32_t lv = wl_xb_mmu_lock();
@@ -558,76 +647,99 @@ static WlResult batch_write(void) {
         wl_xb_mmu_unlock(lv);
         if (len == 0) {
             WL_LOG_E(TAG, "the swap file is full (%u pages)", (unsigned)g_slots);
-            batch_abandon(done); // what was written goes; the rest stays resident
+            batch_abandon(done); // what is written goes; the rest stays resident
             n = done;
             break;
         }
-        uint64_t t0 = wl_platform_time_us();
-        wl_xb_card_lock(); // (another thread's read back may be on the handle, outside the guest lock)
-        WlResult r = wl_platform_fs_write_at(g_swap, (uint64_t)first * PAGE, g_io + done * PAGE, len * PAGE);
-        wl_xb_card_unlock();
-        io_done(wl_platform_time_us() - t0, true); // (frame_slow: the guest lock held)
-        if (r != WL_OK) {
-            WL_LOG_E(TAG, "swap file write of %u pages at slot %u: %s", (unsigned)len, (unsigned)first,
-                     wl_result_name(r));
-            return WL_ERR_IO;
-        }
-        g_st.swap_writes++;
-        g_st.write_bytes += (uint64_t)len * PAGE;
-        for (uint32_t k = 0; k < len; k++) {
-            wl_xb_census_io(WL_XB_CIO_SWAP_OUT, g_batch[done + k], k == 0);
-        }
+        g_wr.first[runs] = (uint16_t)first;
+        g_wr.len[runs++] = (uint16_t)len;
         done += len;
     }
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t p = g_batch[i];
-        uint32_t lv = wl_xb_mmu_lock();
-        uint32_t f = g_xb_pg_frame[p];
-        z_put(p, wl_xb_mmu_frame_ptr(p, f)); // (clean now, its copy in the swap file)
-        g_xb_pg_frame[p] = 0;
-        g_xb_pg_flags[p] &= (uint8_t)~(WL_XB_PG_IO | WL_XB_PG_DIRTY | WL_XB_PG_REF);
-        give_free(f);
-        wl_xb_mmu_frame_drop(p, f);
-        stamp_evicted(p);
-        wl_xb_mmu_unlock(lv);
+    if (n == 0) {
+        g_batch_n = 0;
+        return zeroed != 0 ? WL_OK : WL_ERR_NOMEM;
     }
-    g_st.swap_outs += n;
-    g_st.evictions += n;
-    g_batch_n = 0;
-    return n + zeroed != 0 ? WL_OK : WL_ERR_NOMEM;
+    give_up = give_up && kp1 != 0 && g_xb_pg_frame[kp1 - 1u] != 0 && (g_xb_pg_flags[kp1 - 1u] & WL_XB_PG_IO) == 0;
+    g_wr.active = true;
+    g_wr.done = false;
+    g_wr.r = WL_OK;
+    g_wr.n = n;
+    g_wr.runs = runs;
+    uint32_t gen = ++g_wr.gen;
+    WlXbThread *self = NULL;
+    if (give_up) {
+        g_giving_up = true;
+        self = wl_xb_block_begin(); // (NULL: the lock kept: the deterministic mode, a raised IRQL)
+        g_giving_up = false;
+    }
+    uint64_t t0 = wl_platform_time_us(); // (a wait for the card counts: with the lock kept, it was held)
+    WlResult r = WL_OK;
+    for (uint32_t i = 0, at = 0; i < runs && r == WL_OK; at += g_wr.len[i++]) {
+        // (another thread's read back, or the kernel's I/O, may be on the card outside the guest lock)
+        wl_xb_card_lock();
+        r = wl_platform_fs_write_at(g_swap, (uint64_t)g_wr.first[i] * PAGE, g_io + at * PAGE,
+                                    (uint32_t)g_wr.len[i] * PAGE);
+        if (r != WL_OK || i + 1u == runs) {
+            g_wr.r = r;
+            g_wr.done = true;
+        }
+        wl_xb_card_unlock();
+    }
+    uint64_t t9 = wl_platform_time_us();
+    wl_xb_block_end(self);
+    io_done(t9 - t0, self == NULL);
+    if (r != WL_OK) {
+        WL_LOG_E(TAG, "swap file write of %u pages: %s", (unsigned)n, wl_result_name(r));
+    }
+    if (g_wr.active && g_wr.gen == gen) {
+        write_end(0); // (else a thread that met one of its pages, or needed a frame, ended it)
+    }
+    return r != WL_OK ? WL_ERR_IO : WL_OK;
 }
 
-// A frame for the slow path: a free one, a clean page's, or a batch written out. Lock not held.
-static WlResult frame_slow(uint32_t keep, uint32_t *out) {
-    uint32_t lv = wl_xb_mmu_lock();
-    uint32_t f = take_free();
-    if (f == 0 && g_conv_n != 0) {
-        f = conv_take(keep);
-    }
-    wl_xb_mmu_unlock(lv);
-    bool collect = g_swap != NULL;
-    // two rounds clear every R bit and come back to the pages not used since
-    for (uint32_t n = 0; f == 0 && n < 2u * g_xb_pg_frames + 2u; n++) {
-        lv = wl_xb_mmu_lock();
-        f = clock_step(keep, collect);
-        wl_xb_mmu_unlock(lv);
-        if (g_batch_n == BATCH) {
-            break;
+// A frame for the slow path: a free one, a clean page's, or a batch written out (the guest lock
+// given up meanwhile with `give_up`). Lock not held. With a write in transit (another thread's, the
+// lock given up) no batch is gathered: a clean page, else a wait for that write's frames.
+static WlResult frame_slow(uint32_t keep, bool give_up, uint32_t *out) {
+    for (uint32_t tries = 0; tries < 8u; tries++) {
+        uint32_t lv = wl_xb_mmu_lock();
+        uint32_t f = take_free();
+        if (f == 0 && g_conv_n != 0) {
+            f = conv_take(keep);
         }
-    }
-    if (f != 0) {
-        batch_abandon(0); // a clean page was had: nothing written
-    } else if (g_batch_n != 0) {
-        WlResult r = batch_write();
-        if (r == WL_ERR_IO) {
+        wl_xb_mmu_unlock(lv);
+        bool collect = g_swap != NULL && !g_wr.active;
+        // two rounds clear every R bit and come back to the pages not used since
+        for (uint32_t n = 0; f == 0 && n < 2u * g_xb_pg_frames + 2u; n++) {
+            lv = wl_xb_mmu_lock();
+            f = clock_step(keep, collect);
+            wl_xb_mmu_unlock(lv);
+            if (collect && g_batch_n == BATCH) {
+                break;
+            }
+        }
+        if (f != 0) {
+            if (collect) {
+                batch_abandon(0); // a clean page was had: nothing written
+            }
+            *out = f;
+            return WL_OK;
+        }
+        WlResult r = WL_ERR_NOMEM;
+        if (g_wr.active) {
+            r = write_wait(0); // its frames come free
+        } else if (g_batch_n != 0) {
+            r = batch_write(give_up && tries < 4u); // (then the lock kept: the frames are this thread's)
+        }
+        if (r != WL_OK) {
+            *out = 0;
             return r;
         }
-        lv = wl_xb_mmu_lock();
-        f = take_free();
-        wl_xb_mmu_unlock(lv);
+        // (the frames written out are free now, or went to other threads while the lock was given
+        // up: again)
     }
-    *out = f;
-    return f != 0 ? WL_OK : WL_ERR_NOMEM;
+    *out = 0;
+    return WL_ERR_NOMEM;
 }
 
 // A page read back with the guest lock given up (wl_xb_pg_touch) is in transit: unmapped, marked
@@ -642,7 +754,6 @@ static struct {
     volatile bool done; // (under the card's lock)
     WlResult r;
 } g_transit[TRANSITS];
-static bool g_giving_up; // in wl_xb_block_begin for a read back (the lock holder's)
 
 // The physical page under guest VA `va`, + 1 (0: none): user space through its table, the window
 // and its tiled alias as they are.
@@ -696,13 +807,17 @@ static WlResult transit_wait(uint32_t t1) {
     return g_transit[t].r != WL_OK ? WL_ERR_IO : WL_OK;
 }
 
-// A page in transit is waited for (guest lock held): its tables are the lock's again.
+// A page in transit (read back, or in a write) is waited for (guest lock held): its tables are the
+// lock's again, and it is resident.
 static WlResult settle(uint32_t p) {
     if ((g_xb_pg_flags[p] & WL_XB_PG_IO) == 0) {
         return WL_OK;
     }
     uint32_t t1 = transit_of(p);
-    return t1 != 0 ? transit_wait(t1) : WL_ERR_STATE;
+    if (t1 != 0) {
+        return transit_wait(t1);
+    }
+    return in_write(p) ? write_wait(p + 1u) : WL_ERR_STATE; // (written out: kept resident, clean)
 }
 
 // The file copies after page p (slot `slot`) at the following offsets, at pages p + step, p +
@@ -741,11 +856,17 @@ static WlResult fault(uint32_t p, uint32_t keep, bool give_up) {
         return WL_OK;
     }
     uint32_t f = 0;
-    WlResult r = frame_slow(keep, &f);
+    WlResult r = frame_slow(keep, give_up, &f);
     if (r != WL_OK) {
         return r;
     }
     uint32_t lv = wl_xb_mmu_lock();
+    if (g_xb_pg_frame[p] != 0 || (g_xb_pg_flags[p] & WL_XB_PG_IO) != 0) {
+        // brought in by another thread while a write gave the lock up (or in transit now)
+        give_free(f);
+        wl_xb_mmu_unlock(lv);
+        return settle(p);
+    }
     assign(f, p);
     uint32_t slot = g_xb_pg_slot[p];
     if (slot != 0) {
@@ -808,7 +929,7 @@ static WlResult fault(uint32_t p, uint32_t keep, bool give_up) {
     // frames are at hand without I/O: the card's time is mostly its seek, not its bytes.
     // (the pages above it, or below it: a buffer's pages may come in either order)
     uint32_t run = 1, step = 1;
-    for (uint32_t dir = 0; t1 == 0 && file && run == 1u && dir < 2u; dir++) {
+    for (uint32_t dir = 0; t1 == 0 && file && !g_wr.active && run == 1u && dir < 2u; dir++) {
         step = dir == 0 ? 1u : (uint32_t)-1;
         run = read_ahead(p, slot, step, keep);
     }

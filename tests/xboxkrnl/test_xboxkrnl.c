@@ -2471,6 +2471,79 @@ TEST own_kpcr_page_comes_back_from_swap(void) {
 #endif
 }
 
+// A thread's touch that needs a batch of changed pages written to the swap file gives the guest lock
+// up while the card works, as a read back does (paged): a host thread holding the card sees the
+// writer give the lock up while it waits (a write on a busy card kept every thread stopped up to a
+// second on the host). Each page's bytes come back as written.
+#if defined(WL_XK_TEST_PAGING)
+static volatile uint32_t g_swap_gave_up;
+
+static void *swap_card_holder(void *arg) {
+    (void)arg;
+    WlXbThreadStats ts0, ts;
+    wl_xb_card_lock();
+    wl_xb_thread_stats(&ts0);
+    g_card_state = 1;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 150u;) {
+        wl_platform_thread_sleep_ms(1);
+        wl_xb_thread_stats(&ts);
+        if (ts.io_blocks != ts0.io_blocks) {
+            g_swap_gave_up = 1; // (the stats are a snapshot: a word read from another thread)
+        }
+    }
+    g_card_state = 2;
+    wl_xb_card_unlock();
+    return NULL;
+}
+#endif
+
+TEST swap_write_gives_the_lock_up(void) {
+    boot();
+    ASSERT(g_ready);
+#if !defined(WL_XK_TEST_PAGING)
+    SKIPm("not paged");
+#else
+    if (wl_xb_deterministic()) {
+        SKIPm("the virtual clock: the card's I/O keeps the lock");
+    }
+    reset_scratch();
+    const uint32_t pages = 2u * PAGED_FRAMES;
+    uint32_t buf = 0;
+    ASSERT_EQ(WL_OK, wl_xb_va_alloc(&buf, pages * WL_XB_PAGE, 0x00400000u, WL_XB_PROT_READWRITE));
+    const WlXbThread *self = wl_xb_current();
+    ASSERT(self != NULL && self->kpcr != 0);
+    g_card_state = 0;
+    g_swap_gave_up = 0;
+    WlPlatformThread holder;
+    ASSERT_EQ(WL_OK, wl_platform_thread_create(&holder, swap_card_holder, NULL, g_card_stack, sizeof g_card_stack,
+                                               WL_THREAD_PRIO_MAIN));
+    while (g_card_state == 0) {
+        wl_platform_thread_sleep_ms(1);
+    }
+    WlXbMemStats m0, m1;
+    wl_xb_mem_stats(&m0);
+    // fresh pages, changed: no read back, and the frames run out into batches written out (the
+    // thread's KPCR looked at as its safe points do: in use, it keeps its frame)
+    for (uint32_t i = 0; i < pages; i++) {
+        (void)wl_xb_rd8(self->kpcr + 0x24u);
+        wl_xb_wr32(buf + i * WL_XB_PAGE, 0x53574150u + i);
+    }
+    wl_xb_mem_stats(&m1);
+    ASSERT_EQ(WL_OK, wl_platform_thread_join(holder, NULL));
+    ASSERT_EQ_FMT(2u, g_card_state, "%u"); // the first write waited for the card
+    ASSERT(m1.swap_writes > m0.swap_writes);
+    ASSERT_EQ_FMT(1u, g_swap_gave_up, "%u"); // the lock given up while the card was held
+    ASSERT(m1.io_unlocked > m0.io_unlocked);
+    for (uint32_t i = 0; i < pages; i++) {
+        if (wl_xb_rd32(buf + i * WL_XB_PAGE) != 0x53574150u + i) {
+            FAILm("a page written out came back changed");
+        }
+    }
+    ASSERT_EQ(WL_OK, wl_xb_va_release(buf, NULL));
+    PASS();
+#endif
+}
+
 // ---- Another thread in a transfer's gap ------------------------------------------------------------
 // A read or write gives the guest lock up while the card works (card_io_gives_the_lock_up): the other
 // threads run meanwhile, and may close, rename, cut, write or leave. Here a host thread holds the
@@ -3137,6 +3210,7 @@ SUITE(kernel_suite) {
     RUN_TEST(files_rename_moves_every_handle);
     RUN_TEST(files_pages_keep_what_was_read);
     RUN_TEST(own_kpcr_page_comes_back_from_swap);
+    RUN_TEST(swap_write_gives_the_lock_up);
     RUN_TEST(files_read_ahead_waits_without_the_lock);
     RUN_TEST(files_gap_changes_forget_the_read);
     RUN_TEST(files_gap_signals_the_event_it_was_given);
