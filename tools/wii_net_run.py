@@ -9,7 +9,7 @@ line, a failure pattern or a silence, and sends QUIT so that the program leaves 
 Channel and the next run can be loaded.
 
   tools/wii_net_run.py --wii 192.168.1.50 --dol halo.dol --name a30 \\
-      --arg 'play=replay:play/a30_peak.cap 5' --arg switch=overlap,profile --out ~/wl-work/netruns
+      --arg 'play=replay:play/a30_peak.cap 5' --arg switch=nooverlap,profile --out ~/wl-work/netruns
 
   tools/wii_net_run.py --wii 192.168.1.50 --runs runs.txt --out ~/wl-work/netruns
 
