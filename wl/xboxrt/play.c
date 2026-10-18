@@ -812,6 +812,12 @@ static void observe(void) {
     if (tick >= 0) {
         int64_t every = (int64_t)(PROGRESS_SECONDS * tick_rate());
         if (P.last_game_tick < 0 || strcmp(map, P.map) != 0 || tick - P.last_game_tick > TICK_JUMP) {
+            if (P.last_game_tick >= 0) {
+                // a checkpoint ahead or a new map in a game: the running step's time goes on from here,
+                // the jump not counted (until 2026-10-17 a step running across a checkpoint loaded 34000
+                // ticks ahead timed out at once)
+                P.started_played += tick - P.played;
+            }
             P.played = tick;
             P.progress_next = (tick / every + 1) * every;
         } else if (tick > P.last_game_tick) {
