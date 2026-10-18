@@ -615,7 +615,11 @@ freeze). A third names a holder that keeps interrupts waiting: **held off** (`in
 for N ms`, the service thread kept from the guest lock for a second): the holder's safe points
 meanwhile and how many of them kept the lock at a raised IRQL, its return addresses and IRQL
 (`held off:`), and where its host thread runs (the host: its PC and translated callers; the Wii: a
-0.2 s profile into the log, the first four times). While the service thread waits for the lock,
+0.2 s profile into the log, the first four times). The status line `interrupts held off for at
+most N ms` gives the longest such wait of each 10 s from 100 ms up, and `interrupt service:` its
+calls and rounds: a backlog of vertical blanks (owed after a hold) runs one a round, eight a call,
+and the calls that end with some still owed are counted there; `interrupt lines ... stay asserted`
+is only for lines still deliverable after the eighth round. While the service thread waits for the lock,
 the holder's safe points mark the devices' ticks due in its place, so the audio processor's frames
 go on. A kernel call that waits for the card gives the lock up meanwhile (`wl_xb_block_begin`), as
 an Xbox thread waits in its disk I/O: the real Wii's slow SD card held interrupts off for one to two

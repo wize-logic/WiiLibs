@@ -112,6 +112,10 @@ typedef struct {
     // vertical blanks raised (each runs, up to a second's worth owed); raised while one was still
     // pending; periods a late service thread raised at once; owed past the second's worth (lost)
     uint32_t vblanks_raised, vblanks_merged, vblanks_skipped, vblanks_dropped;
+    // service calls that ran the handler; of those, the ones that used every round (MAX_ROUNDS: the
+    // rest waits for the next call) with vertical blanks still owed, and with interrupt lines still
+    // deliverable (a line no ISR takes down); the most rounds in one call since the last status line
+    uint32_t services, services_full_owed, services_full_lines, rounds_max;
 } WlXbServiceStats;
 void wl_xb_service_stats(WlXbServiceStats *out);
 // More lines for the status report every 10 s (the kernel's I/O numbers); called on the service

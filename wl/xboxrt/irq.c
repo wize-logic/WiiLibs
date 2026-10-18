@@ -363,7 +363,8 @@ static void run_service(void) {
     // the work's guest stack: the service thread's, free whenever someone else runs the work (the
     // service thread runs guest code only in here, and this never nests)
     uint32_t work_esp = g_work_esp;
-    for (uint32_t round = 0; round < MAX_ROUNDS; round++) {
+    uint32_t round = 0;
+    for (; round < MAX_ROUNDS; round++) {
         uint32_t reasons = __atomic_exchange_n(&g_pending, 0u, __ATOMIC_SEQ_CST);
         uint64_t deadline = g_deadline;
         if (deadline != 0 && wl_xb_time_us() >= deadline) {
@@ -401,9 +402,20 @@ static void run_service(void) {
         }
         g_handler(g_handler_user, reasons);
         wl_xb_cpu_load(&saved);
-        if ((reasons & WL_XB_SVC_IRQ) && round + 1u == MAX_ROUNDS) {
-            WL_LOG_W(TAG, "interrupt lines 0x%08x stay asserted after %u rounds", (unsigned)wl_xb_irq_deliverable(),
-                     MAX_ROUNDS);
+    }
+    if (round != 0) {
+        g_stats.services++;
+        g_stats.rounds_max = round > g_stats.rounds_max ? round : g_stats.rounds_max;
+    }
+    if (round == MAX_ROUNDS) {
+        // every round used: what is left waits for the next call (the lock is given back first)
+        if (__atomic_load_n(&g_vblanks_owed, __ATOMIC_SEQ_CST) != 0u) {
+            g_stats.services_full_owed++; // a backlog of vertical blanks, one a round
+        }
+        uint32_t lines = wl_xb_irq_deliverable();
+        if (lines != 0u && g_stats.services_full_lines++ % 64u == 0u) {
+            WL_LOG_W(TAG, "interrupt lines 0x%08x stay asserted after %u rounds (%u times)", (unsigned)lines,
+                     MAX_ROUNDS, (unsigned)g_stats.services_full_lines);
         }
     }
     g_in_service = false;
@@ -589,7 +601,23 @@ static void status_report(void) {
              (unsigned)(g_stats.vblanks_merged - last.vblanks_merged),
              (unsigned)(g_stats.vblanks_skipped - last.vblanks_skipped),
              (unsigned)(g_stats.vblanks_dropped - last.vblanks_dropped));
+    if (g_stats.services != last.services) {
+        // the interrupt service's calls: rounds are handler runs (one owed vertical blank each)
+        WL_LOG_I(TAG,
+                 "interrupt service: %u calls, %u rounds (at most %u in one), %u ended with vblanks owed, %u with "
+                 "lines asserted (10 s)",
+                 (unsigned)(g_stats.services - last.services), (unsigned)(g_stats.handler_runs - last.handler_runs),
+                 (unsigned)g_stats.rounds_max, (unsigned)(g_stats.services_full_owed - last.services_full_owed),
+                 (unsigned)(g_stats.services_full_lines - last.services_full_lines));
+    }
+    g_stats.rounds_max = 0;
     last = g_stats;
+    uint32_t holder;
+    uint32_t held_ms = wl_xb_thread_service_wait_max(&holder);
+    if (held_ms >= 100u) {
+        WL_LOG_I(TAG, "interrupts held off for at most %u ms (thread %u had the lock) (10 s)", (unsigned)held_ms,
+                 (unsigned)holder);
+    }
     if (g_vblank_waits != 0) {
         // a title's frame loop waiting for its vblank asleep (wl_xb_vblank_wait) instead of spinning
         WL_LOG_I(TAG, "vblank waits: %u, %u ms asleep (10 s)", (unsigned)g_vblank_waits,
