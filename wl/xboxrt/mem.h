@@ -214,6 +214,9 @@ typedef struct {
     // 0: none; WL_XB_PAGE_CACHE_AUTO (wl_xb_mem_config_default): a twelfth of a pool of 16 MB or more,
     // none for a smaller one. The host's WL_XB_PAGE_CACHE_KB, when set, overrides it.
     uint32_t page_cache_bytes;
+    // Pages converted by a device (wl_xb_phys_converted) go no sooner than others: the clock alone
+    // (as before 2026-10-17; the title folder's "notexfirst", WL_XB_TEXFIRST=0 on the host).
+    bool converted_ordinary;
 } WlXbMemConfig;
 #define WL_XB_PAGE_CACHE_AUTO 0xFFFFFFFFu
 
@@ -327,6 +330,11 @@ bool wl_xb_mem_peek(uint32_t va, void *dst, uint32_t bytes);
 uint32_t wl_xb_phys_watch(uint32_t phys, uint32_t bytes);
 // Whether part of [phys, phys + bytes) may have been written since `stamp` was had (true for 0).
 bool wl_xb_phys_written(uint32_t phys, uint32_t bytes, uint32_t stamp);
+// [phys, phys + bytes) was just converted into a copy of the device's own (a texture under the
+// watch): where the guest is paged, its pages that are clean copies of a file are the first to give
+// their frames back (they are read again only when the copy is lost or they change, and then from
+// the file). Touches no guest memory.
+void wl_xb_phys_converted(uint32_t phys, uint32_t bytes);
 
 // ---- Diagnostics -------------------------------------------------------------------------------
 
@@ -347,6 +355,7 @@ typedef struct {
     uint32_t swap_ins_spared;                  // swapped pages a file read overwrote whole: not read back
     uint32_t file_copies;                      // pages a file read filled whole, kept as the file's copy
     uint32_t file_evictions;                   // of the clean evictions, file copies: nothing written
+    uint32_t converted_evictions;              // of those, converted pages taken before the clock (wl_xb_phys_converted)
     uint32_t file_ins;                         // file copies read back from their file (reads)
     uint32_t file_ahead;                       // copies after them that came in the same read
     uint32_t file_forgets, file_forget_ins;    // copies forgotten (the file changed or closed); read back first

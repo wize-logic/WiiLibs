@@ -678,6 +678,40 @@ TEST file_pages_need_no_swap_out(void) {
     PASS();
 }
 
+// Pages a device converted (wl_xb_phys_converted: the GPU's textures) give their frames back before
+// the clock's choice, used lately or not, while they are clean copies of their file.
+TEST converted_pages_go_first(void) {
+    up();
+    const uint32_t n = 16u;
+    WlPlatformFile *f = pattern_file("sd:/converted.bin", n, 23);
+    ASSERT(f != NULL);
+    uint32_t va = alloc(n), other = alloc(FRAMES);
+    ASSERT(va != 0 && other != 0);
+    file_read(va, f, 0, n);
+    ASSERT(check(va, n, 23)); // (used: the clock would pass them by once)
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t phys = 0;
+        ASSERT(wl_xb_va_to_phys(va + i * PAGE, &phys));
+        wl_xb_phys_converted(phys, PAGE);
+    }
+    wl_xb_wr32(va + 3u * PAGE + 8u, 0xC0FFEEu); // changed: an ordinary page again
+    WlXbMemStats a = stats();
+    fill(other, FRAMES, 24); // a pool's worth of new pages
+    WlXbMemStats b = stats();
+    ASSERT_EQ(n - 1u, b.converted_evictions - a.converted_evictions);
+    // they come back from their file
+    ASSERT_EQ(0xC0FFEEu, wl_xb_rd32(va + 3u * PAGE + 8u));
+    wl_xb_wr32(va + 3u * PAGE + 8u, word(23, 3, 8)); // (back to the pattern for the check)
+    ASSERT(check(va, n, 23));
+    ASSERT(check(other, FRAMES, 24));
+    ASSERT_EQ(WL_OK, wl_xb_va_release(va, NULL));
+    ASSERT_EQ(WL_OK, wl_xb_va_release(other, NULL));
+    ASSERT_EQ(WL_OK, wl_xb_file_forget(f, 0, UINT64_MAX));
+    wl_platform_fs_close(f);
+    wl_platform_fs_remove("sd:/converted.bin");
+    PASS();
+}
+
 TEST file_pages_forget_their_file(void) {
     up();
     const uint32_t n = 2u * FRAMES, half = FRAMES;
@@ -1004,6 +1038,7 @@ SUITE(paging) {
     RUN_TEST(file_reads_spare_swap_ins);
     RUN_TEST(file_pages_need_no_swap_out);
     RUN_TEST(file_pages_forget_their_file);
+    RUN_TEST(converted_pages_go_first);
     RUN_TEST(xbe_sections_stay_file_pages);
     RUN_TEST(across_pages_and_big_copies);
     RUN_TEST(files_written_from_paged_out_memory);

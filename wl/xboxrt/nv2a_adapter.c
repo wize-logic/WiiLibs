@@ -195,11 +195,16 @@ static void *phys_ptr(void *user, uint32_t phys, uint32_t bytes) {
     return wl_xb_phys_ptr(phys);
 }
 
-// the write watch (mem.h): a converted texture is only read again once its pages were stored to
+// the write watch (mem.h): a converted texture is only read again once its pages were stored to,
+// so its pages are the first to give their frames back (armed as it is converted)
 static uint32_t tex_watch(void *user, uint32_t phys, uint32_t bytes) {
     (void)user;
     wl_xb_census_phys(phys, bytes, WL_XB_CU_TEX);
-    return wl_xb_phys_watch(phys, bytes);
+    uint32_t stamp = wl_xb_phys_watch(phys, bytes);
+    if (stamp != 0) {
+        wl_xb_phys_converted(phys, bytes);
+    }
+    return stamp;
 }
 
 // (the same for a vertex array the cache converted)

@@ -939,6 +939,13 @@ bool wl_xb_phys_written(uint32_t phys, uint32_t bytes, uint32_t stamp) {
     return !phys_pages(phys, bytes, &first, &pages) || wl_xb_pg_written(first, pages, stamp);
 }
 
+void wl_xb_phys_converted(uint32_t phys, uint32_t bytes) {
+    uint32_t first, pages;
+    if (phys_pages(phys, bytes, &first, &pages)) {
+        wl_xb_pg_converted(first, pages);
+    }
+}
+
 void wl_xb_mem_counters_log(void) {
     static int counters = -1;
     if (counters < 0) {
@@ -954,11 +961,12 @@ void wl_xb_mem_counters_log(void) {
     uint32_t dz, cz;
     wl_xb_pg_zero_census(&dz, &cz);
     WL_LOG_I(TAG, "paging counters: ins %u swap %u file (+%u ahead); outs %u written %u zero %u clean (%u file, %u zero) "
-             "in %u fast; refaults %u swap %u file %u zero; returns %u; KB read %u written %u; ahead unused %u; "
+             "in %u fast, %u converted first; refaults %u swap %u file %u zero; returns %u; KB read %u written %u; ahead unused %u; "
              "resident %u dirty %u file; zero %u dirty %u clean; cache %u frames: put %u raw %u hits %u, holds %u (%u KB)",
              (unsigned)st.swap_ins, (unsigned)st.file_ins, (unsigned)st.file_ahead, (unsigned)st.swap_outs,
              (unsigned)st.zero_outs, (unsigned)st.clean_evictions, (unsigned)st.file_evictions,
-             (unsigned)st.zero_evictions, (unsigned)st.fast_evictions, (unsigned)st.refaults_swap,
+             (unsigned)st.zero_evictions, (unsigned)st.fast_evictions, (unsigned)st.converted_evictions,
+             (unsigned)st.refaults_swap,
              (unsigned)st.refaults_file, (unsigned)st.refaults_zero, (unsigned)st.returns,
              (unsigned)(st.swap_read_bytes >> 10), (unsigned)(st.swap_write_bytes >> 10), (unsigned)st.ahead_unused,
              (unsigned)st.resident_dirty, (unsigned)st.resident_file, (unsigned)dz, (unsigned)cz,

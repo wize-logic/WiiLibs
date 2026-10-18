@@ -56,6 +56,7 @@ WlResult wl_xb_backend_page_fault(uint32_t ea);
                               // (the Wii: a PTE never carries C ahead of a store)
 #define WL_XB_PG_AHEAD 0x20u  // read ahead with another page and not used since (a diagnostic)
 #define WL_XB_PG_RAW 0x40u    // its copy did not pack small enough for the page cache: not tried again until it changes
+#define WL_XB_PG_CONV 0x80u   // its bytes were converted (a texture) since it was last filled (wl_xb_pg_converted)
 
 extern uint8_t *g_xb_pg_flags;  // [ram pages]
 extern uint16_t *g_xb_pg_frame; // [ram pages] 1..frames, 0: none
@@ -137,6 +138,9 @@ void wl_xb_pg_stats(WlXbMemStats *out);
 // is looked at). Lock held; no I/O, the pages are not touched.
 uint32_t wl_xb_pg_watch(uint32_t p, uint32_t pages);
 bool wl_xb_pg_written(uint32_t p, uint32_t pages, uint32_t stamp);
+// Pages [p, p + pages) were converted (mem.h, wl_xb_phys_converted): the clean file copies among them
+// give their frames back first, oldest conversion first. Lock held; no I/O.
+void wl_xb_pg_converted(uint32_t p, uint32_t pages);
 
 // A page packed small (page_pack.c): its 4 KB in at most `cap` bytes of `dst`, their count (0: it
 // does not fit); unpacked back into 4 KB (false: the bytes are not a packed page). One packer at a
