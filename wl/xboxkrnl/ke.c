@@ -122,7 +122,7 @@ void k_KeDelayExecutionThread(void) {
         g_xk_stats.zero_delays++;
         // The console looks at the user APCs before the interval: SleepEx(0, TRUE) runs the
         // completion routines queued so far (Halo's reader calls it before each ReadFileEx)
-        if (k != NULL && alertable && user && k->apc_count > 0) {
+        if (k != NULL && alertable && user && k->apc_count > 0 && !(g_xb_compat & WL_XB_COMPAT_OLDAPC)) {
             g_xk_stats.zero_delays_with_apc++;
             xk_apc_deliver(self);
             RET(STATUS_USER_APC);

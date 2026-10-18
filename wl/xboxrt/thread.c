@@ -49,6 +49,7 @@ static uint32_t g_tls_data, g_tls_bytes, g_tls_zero;
 static WlXbThreadStats g_stats;
 static WlXbLatency g_ready_waits; // g_m held
 volatile uint32_t g_xb_attention;
+uint32_t g_xb_compat;
 volatile uint32_t g_xb_det_work;
 
 // The deterministic mode (thread.h). The virtual clock starts at 1 s, so that no deadline made

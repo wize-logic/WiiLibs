@@ -3165,7 +3165,7 @@ static uint32_t unwritten_count(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2
         }
     }
     gx->stats.unwritten_counted++;
-    counted = draw->count <= QUERY_VERTICES ? query_count(gx, k, draw->primitive, (const float (*)[3])query, draw->count)
+    counted = !gx->cfg.query_by_area && draw->count <= QUERY_VERTICES ? query_count(gx, k, draw->primitive, (const float (*)[3])query, draw->count)
                                             : -1.0f;
     if (counted >= 0.0f) {
         gx->stats.queries_tested++;

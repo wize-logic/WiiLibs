@@ -264,6 +264,9 @@ static void note_vblank(uint32_t skipped) {
     if (g_pending & WL_XB_SVC_VBLANK) {
         g_stats.vblanks_merged++;
     }
+    if (g_xb_compat & WL_XB_COMPAT_OLDVBLANK) {
+        return; // merged into the pending one: none owed
+    }
     uint32_t owed = __atomic_load_n(&g_vblanks_owed, __ATOMIC_SEQ_CST);
     if (owed + n > VBLANKS_OWED_MAX) {
         g_stats.vblanks_dropped += owed + n - VBLANKS_OWED_MAX;

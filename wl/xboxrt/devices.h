@@ -134,6 +134,8 @@ void wl_xb_gpu_set_transform_unit(bool on);
 // title's folder (and WL_XB_OVERLAP on the host). Call it
 // before wl_xb_gpu_attach_nv2a.
 void wl_xb_gpu_set_frame_overlap(bool on);
+// Occlusion queries counted by their area alone, as before their depth test (before the GPU attaches).
+void wl_xb_gpu_set_query_by_area(bool on);
 // The GX backend's vertex arrays kept for GX to read by index (wl/xbox/nv2a_vcache.h: a level's
 // static geometry converted once, its draws through the transform unit sending indices alone), in
 // `arena` (`bytes`, 32-byte aligned; NULL: the end of the textures' arena when that leaves them 8 MB,

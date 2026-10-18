@@ -153,6 +153,11 @@ void k_KeSuspendThread(void) {
 // NTSTATUS NtYieldExecution(VOID): the processor to the best ready thread, whatever its priority
 // (SwitchToThread spins let a lower-priority loader run); STATUS_NO_YIELD_PERFORMED when none ran.
 void k_NtYieldExecution(void) {
+    if (g_xb_compat & WL_XB_COMPAT_OLDYIELD) {
+        wl_xb_yield();
+        RET(STATUS_SUCCESS);
+        return;
+    }
     RET(wl_xb_yield_any() ? STATUS_SUCCESS : 0x40000024u);
 }
 

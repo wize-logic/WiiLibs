@@ -214,6 +214,12 @@ void wl_xb_safe_point(void);
 // lock). Generated code may test it at loop back edges, where a spin on plain guest memory has no
 // other safe point: if (g_xb_attention) wl_xb_safe_point();
 extern volatile uint32_t g_xb_attention;
+// Earlier behaviours put back for a bisection on the console (boot.c reads them from the title's
+// folder once, before the guest runs): files "oldapc", "oldyield", "oldvblank".
+#define WL_XB_COMPAT_OLDAPC 1u    // SleepEx(0, TRUE) runs no queued APC (it yields, as before 52f29e2)
+#define WL_XB_COMPAT_OLDYIELD 2u  // NtYieldExecution gives way to equal or higher priorities only
+#define WL_XB_COMPAT_OLDVBLANK 4u // vblanks raised while one is pending merge into it (none owed)
+extern uint32_t g_xb_compat;
 // The safe point of a device access once the device has answered (fault_posix.c, mem_wii.c): what
 // wl_xb_safe_point does, at a device access's cost in the deterministic mode's clock.
 void wl_xb_device_safe_point(void);

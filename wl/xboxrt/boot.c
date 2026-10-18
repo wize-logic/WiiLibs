@@ -406,6 +406,33 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
     uint32_t vcache_kb = 1024u;
     WlPlatformFile *vf = NULL;
 
+    // earlier behaviours put back, for a bisection on the console (read once, before the guest runs):
+    // files "oldapc", "oldyield", "oldvblank" (thread.h's WL_XB_COMPAT_*) and "oldoccl" (occlusion
+    // queries counted by their area)
+    {
+        static const struct {
+            const char *name;
+            uint32_t bit;
+        } k_compat[] = {{"oldapc", WL_XB_COMPAT_OLDAPC},
+                        {"oldyield", WL_XB_COMPAT_OLDYIELD},
+                        {"oldvblank", WL_XB_COMPAT_OLDVBLANK},
+                        {"oldoccl", 0u}};
+        char in_force[64] = "";
+        bool old_occl = false;
+        g_xb_compat = 0;
+        for (size_t i = 0; i < sizeof k_compat / sizeof k_compat[0]; i++) {
+            snprintf(flag, sizeof flag, "%s/%s", cfg->title_dir, k_compat[i].name);
+            if (wl_platform_fs_exists(flag)) {
+                g_xb_compat |= k_compat[i].bit;
+                old_occl = old_occl || k_compat[i].bit == 0u;
+                strncat(in_force, " ", sizeof in_force - strlen(in_force) - 1u);
+                strncat(in_force, k_compat[i].name, sizeof in_force - strlen(in_force) - 1u);
+            }
+        }
+        wl_xb_gpu_set_query_by_area(old_occl);
+        WL_LOG_I(TAG, "old behaviours in force:%s", in_force[0] != '\0' ? in_force : " none");
+    }
+
     snprintf(flag, sizeof flag, "%s/noxf", cfg->title_dir);
     no_xf = wl_platform_fs_exists(flag);
 #if !defined(__wii__)

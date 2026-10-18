@@ -82,6 +82,8 @@ typedef struct WlNv2aGxConfig {
     // each perspective draw's depth a + b / w checked against the program's own depth at every vertex
     // (wl_nv2a_gx_last_depth_check): a diagnostic, the program run twice for a draw's positions
     bool depth_check;
+    // an occlusion query counted by its area alone (no GX sync, no EFB reads): as before the depth test
+    bool query_by_area;
 } WlNv2aGxConfig;
 
 // Where a draw's vertices were transformed, and why not further on (WlNv2aGxStats.xf_why_*)

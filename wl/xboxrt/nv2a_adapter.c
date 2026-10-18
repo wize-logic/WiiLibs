@@ -348,6 +348,12 @@ void wl_xb_gpu_set_frame_overlap(bool on) {
     g_no_overlap = !on;
 }
 
+static bool g_query_by_area;
+
+void wl_xb_gpu_set_query_by_area(bool on) {
+    g_query_by_area = on;
+}
+
 static void *g_vcache_arena;
 static uint32_t g_vcache_bytes;
 static bool g_vcache_carved; // the vertex arrays' arena is the end of the boot's textures' arena (of the heap)
@@ -443,6 +449,7 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
             gcfg.textures.budget = bytes;
         }
         gcfg.textures.watch = tex_watch;
+        gcfg.query_by_area = g_query_by_area;
         gcfg.textures.written = tex_written;
         if (g_vcache_bytes != 0) {
             if (g_vcache_arena != NULL) {
