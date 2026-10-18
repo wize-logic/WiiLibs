@@ -707,6 +707,69 @@ TEST cache_watched_and_in_an_arena(void) {
     PASS();
 }
 
+// Under the watch, an arena that must make room gives back first an image whose texels were stored
+// to (its next use reads them again either way), not the least recently drawn one whose texels are
+// as they were (its next use would read them only to make the same image again); and the cache says
+// which guest bytes it holds converted and unchanged.
+TEST cache_arena_gives_back_written_first(void) {
+    static WlNv2aTexCache cache;
+    static uint8_t arena[4096 + 32];
+    TGuest g;
+    WlNv2aTexCacheConfig cfg;
+    WlNv2aTexture t, other[4];
+    WlNv2aTexCacheStats s;
+    bool made;
+    unsigned i;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    memset(&g_w, 0, sizeof g_w);
+    g_w.epoch = 1;
+    set_texture(&g, 0, 0x100000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 4, 4, 1, false)); // (1 KiB)
+    t_kick(&g);
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 0, &t));
+    memset(&cfg, 0, sizeof cfg);
+    cfg.arena = arena;
+    cfg.arena_bytes = sizeof arena;
+    cfg.watch = w_watch;
+    cfg.written = w_written;
+    wl_nv2a_texcache_init(&cache, &cfg);
+    for (i = 0; i < 4; i++) {
+        other[i] = t;
+        other[i].phys = 0x100000 + 0x1000 * i;
+        other[i].format_word ^= i << 28; // (another key)
+    }
+    ASSERT_FALSE(wl_nv2a_texcache_converted(&cache, 0x100000, 0x4000));
+    // three images, one a frame: 0 the least recently drawn
+    for (i = 0; i < 3; i++) {
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made) != NULL);
+        wl_nv2a_texcache_frame_done(&cache);
+    }
+    ASSERT(wl_nv2a_texcache_converted(&cache, 0x100000, 4096));
+    ASSERT(wl_nv2a_texcache_converted(&cache, 0x102000 + 100, 1));
+    ASSERT_FALSE(wl_nv2a_texcache_converted(&cache, 0x103000, 4096)); // (nothing there)
+    // 2's texels stored to: not converted and unchanged any more, and the first to go for room
+    w_store(&g, 0x102000 + 8, 0x55);
+    ASSERT_FALSE(wl_nv2a_texcache_converted(&cache, 0x102000, 4096));
+    ASSERT_FALSE(wl_nv2a_texcache_converted(&cache, 0x100000, 0x3000)); // (part of the range)
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[3], false, &made) != NULL);
+    ASSERT(made);
+    wl_nv2a_texcache_frame_done(&cache);
+    // 0 and 1 kept: their next use reads nothing
+    for (i = 0; i < 2; i++) {
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &other[i], false, &made) != NULL);
+        ASSERT_FALSE(made);
+    }
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(1u, s.evicted);
+    ASSERT_EQ(4u, s.converted);
+    ASSERT(wl_nv2a_texcache_converted(&cache, 0x100000, 0x2000));
+    ASSERT(wl_heap_check(&cache.heap));
+    wl_nv2a_texcache_clear(&cache);
+    ASSERT_FALSE(wl_nv2a_texcache_converted(&cache, 0x100000, 0x4000));
+    t_destroy(&g);
+    PASS();
+}
+
 // An arena in pieces: a large image empties the window of images beside a gap whose newest was drawn
 // longest ago, not every image by age until one happens to fit.
 TEST cache_arena_window(void) {
@@ -1098,6 +1161,7 @@ SUITE(texture_suite) {
     RUN_TEST(cache_keeps_finds_changes_and_evicts);
     RUN_TEST(cache_watched_and_in_an_arena);
     RUN_TEST(cache_arena_window);
+    RUN_TEST(cache_arena_gives_back_written_first);
     RUN_TEST(cache_keeps_smaller_for_want_of_memory);
     RUN_TEST(cache_smaller_kept_without_reading);
     RUN_TEST(cache_overlapped_restores_and_waits);
