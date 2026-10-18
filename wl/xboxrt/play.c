@@ -1298,10 +1298,17 @@ static void script_frame(void) {
             break;
         }
         case K_TICKS:
-            if (P.started_tick < 0) {
-                P.started_tick = P.tick; // from the first tick seen, when it began outside a game
+            // the ticks the game moved on, frame by frame (P.scratch): a revert to a checkpoint behind, a
+            // checkpoint ahead or a new map (the tick back, or a jump) counts none, and the count goes on
+            // from there (until 2026-10-17 the tick less the first one: after a revert behind it, never
+            // reached)
+            if (P.tick >= 0) {
+                if (P.started_tick >= 0 && P.tick > P.started_tick && P.tick - P.started_tick <= TICK_JUMP) {
+                    P.scratch += P.tick - P.started_tick;
+                }
+                P.started_tick = P.tick; // (from the first tick seen, when it began outside a game)
             }
-            if (P.tick < 0 || (double)(P.tick - P.started_tick) < s->sticks[0]) {
+            if (P.tick < 0 || (double)P.scratch < s->sticks[0]) {
                 if (P.clock - P.started_clock >= s->number && s->number != DEFAULT_TIMEOUT) {
                     stop("timed out");
                 }

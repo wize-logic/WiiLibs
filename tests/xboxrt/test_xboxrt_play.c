@@ -107,6 +107,14 @@ static WlResult t_load(void *user, const char *arg) {
     return WL_OK;
 }
 
+// "revert": the pretend game goes back 400 ticks, as to a checkpoint behind
+static WlResult t_revert(void *user, const char *arg) {
+    (void)user;
+    (void)arg;
+    T.tick = T.tick > 400 ? T.tick - 400 : 0;
+    return WL_OK;
+}
+
 static bool t_level(void *user, const char *arg, bool first, int64_t *scratch) {
     (void)user;
     (void)first;
@@ -157,6 +165,8 @@ static const char k_script[] =
     "log twice\n"
     "end\n"
     "ticks 2000\n"
+    "do revert\n" // the game goes back to a checkpoint behind: the wait still counts its ticks
+    "ticks 30\n"
     "log done\n";
 
 static char g_root[256];
@@ -231,6 +241,7 @@ TEST script_runs(void) {
     wl_xb_play_register_number("tick", t_tick, NULL);
     wl_xb_play_register_number("checkpoints", t_checkpoints, NULL);
     wl_xb_play_register_action("load", t_load, NULL);
+    wl_xb_play_register_action("revert", t_revert, NULL);
     wl_xb_play_register_predicate("level", t_level, NULL);
     WlXbPlayStepType walk = {walk_begin, walk_frame, NULL, 60.0};
     ASSERT_EQ(WL_OK, wl_xb_play_register_step("walkto", &walk, NULL));
@@ -306,6 +317,20 @@ TEST script_runs(void) {
         }
     }
     ASSERT_EQ(1, progress);
+    // after the revert, "ticks 30" ended 30 ticks on (a frame's 40 at most), not back at the tick it began at
+    long long back_from = -1, back_to = -1, done_at = -1;
+    for (int i = 0; i < T.log_count; i++) {
+        const char *at = strstr(T.log[i], "test_input: the game went back from tick ");
+        if (at != NULL) {
+            sscanf(at, "test_input: the game went back from tick %lld to %lld", &back_from, &back_to);
+        }
+        at = strstr(T.log[i], "test_input: done (tick ");
+        if (at != NULL) {
+            sscanf(at, "test_input: done (tick %lld)", &done_at);
+        }
+    }
+    ASSERT(back_to >= 0 && back_from > back_to);
+    ASSERT(done_at >= back_to + 30 && done_at < back_from);
     ASSERT(lines >= 25);
     // the capture step waits for its frames; with no GPU to take them (still armed here) it gives
     // up after 5 s and a second a frame, says so, and the script goes on
