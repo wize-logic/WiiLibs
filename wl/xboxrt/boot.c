@@ -425,6 +425,7 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
     // files "oldapc", "oldyield", "oldvblank" (thread.h's WL_XB_COMPAT_*) and "oldoccl" (occlusion
     // queries counted by their area). The old yield is the default ("newyield" takes it away): card run 13
     // showed no read gained by the new one. The new APC is (card run 13: Halo's reads over 100 ms 354 -> 47).
+    // The old vblanks are too (card run 13: the smoothest a10, 14.6 fps against 12.5); "newvblank" owes them again.
     {
         static const struct {
             const char *name;
@@ -435,7 +436,11 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
                         {"oldoccl", 0u}};
         char in_force[64] = "";
         bool old_occl = false;
-        g_xb_compat = WL_XB_COMPAT_OLDYIELD;
+        g_xb_compat = WL_XB_COMPAT_OLDYIELD | WL_XB_COMPAT_OLDVBLANK;
+        snprintf(flag, sizeof flag, "%s/newvblank", cfg->title_dir);
+        if (wl_platform_fs_exists(flag)) {
+            g_xb_compat &= ~WL_XB_COMPAT_OLDVBLANK;
+        }
         snprintf(flag, sizeof flag, "%s/newyield", cfg->title_dir);
         if (wl_platform_fs_exists(flag)) {
             g_xb_compat &= ~WL_XB_COMPAT_OLDYIELD;
