@@ -38,6 +38,15 @@
 // card. Most of a level's paging is pages coming back soon after they went (a10's opening at the
 // Wii's 24 MB: 89% of the pages read back), and their packed copies take about half a frame.
 //
+// Converted pages go first (mem.h, wl_xb_phys_converted): a device that keeps a converted copy of
+// guest bytes under the write watch (the GPU's textures) reads them again only when its copy is lost
+// or they change. Those that are clean copies of a file are remembered in a ring in the order they
+// were converted (again: to the ring's end), and a frame is taken from the oldest still clean and
+// resident before the clock looks at all; their R bits are not looked at (the converter's own reads
+// set them). b30 at the Wii's memory (a census simulated, frames 34.7 MB, the textures' arena 18 MB):
+// card reads in play 2288 by the clock alone, 817 this way; with the old arena (15 MB, frames 37.7 MB)
+// 1625 by the clock.
+//
 // The write watch (mem.h, wl_xb_phys_watch) rides on the same C bits: each page has a write epoch,
 // set from a global count whenever a store to it is seen (a C bit harvested here or by the backend,
 // the host's write fault) or its contents change otherwise (freed: zero; moved). Arming a watch
@@ -67,6 +76,8 @@
 #define FILE_SLOT 0x8000u // in g_xb_pg_slot: a file copy, its source's index + 1 in the low bits
 #define SOURCES 32u       // files with copies at once
 #define RUN 8u            // file copies a read back with the guest lock kept takes at most (32 KB)
+#define CONV_RING 4096u   // converted pages remembered at once (16 MB of them)
+#define CONV_LOOK 64u     // ring entries a search for a frame passes at most
 
 uint8_t *g_xb_pg_flags;
 uint16_t *g_xb_pg_frame;
@@ -90,6 +101,11 @@ static uint16_t g_batch[BATCH];
 static uint32_t g_batch_n;
 
 static uint32_t *g_foff; // [ram pages] a file copy's offset in its file
+// The converted pages, oldest conversion first (g_conv[g_conv_head], g_conv_n of them); a page
+// converted again has another entry nearer the end, and only its last entry counts
+static uint16_t g_conv[CONV_RING];
+static uint32_t g_conv_head, g_conv_n;
+static uint8_t *g_conv_count; // [ram pages] each page's entries in the ring; NULL: converted pages are ordinary
 // A diagnostic: the eviction count (its low 16 bits, 0 skipped) when each page last lost its frame, 0
 // once it has one again or its contents went (a stamp from 65536 evictions back reads as recent)
 static uint16_t *g_evstamp; // [ram pages]
@@ -108,6 +124,7 @@ static struct {
     uint32_t io_held_max_us, io_unlocked, transit_waits;
     uint32_t zero_evictions, returns, refaults_swap, refaults_file, refaults_zero, ahead_unused;
     uint32_t z_puts, z_raw, z_hits;
+    uint32_t conv_evictions;
 } g_st;
 
 // A transfer of `us` microseconds ends: its time counted, and with `held` (the
@@ -356,8 +373,55 @@ static uint32_t clock_step(uint32_t keep, bool collect) {
     return f;
 }
 
+// The oldest entry of the converted ring leaves it: its page when that was the page's last entry
+// and the page is still marked converted (the mark goes), else WL_XB_PG_NO_PAGE.
+static uint32_t conv_pop(void) {
+    uint32_t q = g_conv[g_conv_head];
+    g_conv_head = (g_conv_head + 1u) % CONV_RING;
+    g_conv_n--;
+    if (--g_conv_count[q] != 0 || (g_xb_pg_flags[q] & WL_XB_PG_CONV) == 0) {
+        return WL_XB_PG_NO_PAGE;
+    }
+    g_xb_pg_flags[q] &= (uint8_t)~WL_XB_PG_CONV;
+    return q;
+}
+
+// A frame from the oldest converted page still resident and a clean file copy (not `keep` - 1,
+// pinned or in I/O), or 0 (exception-safe).
+static uint32_t conv_take(uint32_t keep) {
+    for (uint32_t n = 0; n < CONV_LOOK && g_conv_n != 0; n++) {
+        uint32_t q = conv_pop();
+        if (q == WL_XB_PG_NO_PAGE) {
+            continue;
+        }
+        uint32_t f = g_xb_pg_frame[q];
+        if (f == 0 || q + 1u == keep || (g_xb_pg_slot[q] & FILE_SLOT) == 0 ||
+            (g_xb_pg_flags[q] & (WL_XB_PG_PINNED | WL_XB_PG_IO)) != 0) {
+            continue;
+        }
+        wl_xb_mmu_harvest(q, false);
+        if ((g_xb_pg_flags[q] & WL_XB_PG_DIRTY) != 0) {
+            continue;
+        }
+        wl_xb_mmu_unmap(q);
+        if ((g_xb_pg_flags[q] & WL_XB_PG_DIRTY) != 0) {
+            continue; // changed after all (the unmap harvested a C bit): the clock's
+        }
+        evict_clean(q, f);
+        g_st.conv_evictions++;
+        return f;
+    }
+    return 0;
+}
+
 uint32_t wl_xb_pg_frame_fast(uint32_t p, uint32_t keep) {
     uint32_t f = take_free();
+    if (f == 0 && g_conv_n != 0) {
+        f = conv_take(keep);
+        if (f != 0) {
+            g_st.fast_evictions++;
+        }
+    }
     for (uint32_t n = 0; f == 0 && n < FAST_LOOK; n++) {
         f = clock_step(keep, false);
         if (f != 0) {
@@ -537,6 +601,9 @@ static WlResult batch_write(void) {
 static WlResult frame_slow(uint32_t keep, uint32_t *out) {
     uint32_t lv = wl_xb_mmu_lock();
     uint32_t f = take_free();
+    if (f == 0 && g_conv_n != 0) {
+        f = conv_take(keep);
+    }
     wl_xb_mmu_unlock(lv);
     bool collect = g_swap != NULL;
     // two rounds clear every R bit and come back to the pages not used since
@@ -888,7 +955,7 @@ void wl_xb_pg_move(uint32_t from, uint32_t to) {
     g_xb_pg_slot[to] = g_xb_pg_slot[from];
     g_xb_pg_slot[from] = 0;
     g_foff[to] = g_foff[from];
-    g_xb_pg_flags[to] = g_xb_pg_flags[from];
+    g_xb_pg_flags[to] = (uint8_t)(g_xb_pg_flags[from] & ~WL_XB_PG_CONV); // (the ring names `from`)
     g_xb_pg_flags[from] = 0;
     wl_xb_pg_wrote(from);
     wl_xb_pg_wrote(to);
@@ -933,7 +1000,7 @@ void wl_xb_pg_filed(uint32_t p, uint32_t source, uint32_t offset) {
             wl_xb_mmu_unmap(p); // the copy's stores harvested; the next store is seen
         }
         copy_drop(p);
-        g_xb_pg_flags[p] &= (uint8_t)~WL_XB_PG_DIRTY;
+        g_xb_pg_flags[p] &= (uint8_t)~(WL_XB_PG_DIRTY | WL_XB_PG_CONV); // (new bytes: not converted yet)
         g_xb_pg_slot[p] = (uint16_t)(FILE_SLOT | source);
         g_foff[p] = offset;
         g_src[source - 1u].pages++;
@@ -1054,6 +1121,26 @@ uint32_t wl_xb_pg_watch(uint32_t p, uint32_t pages) {
     return seen ? stamp : 0u;
 }
 
+void wl_xb_pg_converted(uint32_t p, uint32_t pages) {
+    if (g_xb_pg_frames == 0 || g_conv_count == NULL || pages == 0 || p >= g_xb_ram_pages || pages > g_xb_ram_pages - p) {
+        return;
+    }
+    uint32_t lv = wl_xb_mmu_lock();
+    for (uint32_t k = p; k < p + pages; k++) {
+        if ((g_xb_pg_slot[k] & FILE_SLOT) == 0 || g_conv_count[k] == UINT8_MAX) {
+            continue; // (only a file's copies go first: the card has them)
+        }
+        if (g_conv_n == CONV_RING) {
+            (void)conv_pop(); // the oldest is forgotten: an ordinary page again
+        }
+        g_xb_pg_flags[k] |= WL_XB_PG_CONV;
+        g_conv[(g_conv_head + g_conv_n) % CONV_RING] = (uint16_t)k;
+        g_conv_n++;
+        g_conv_count[k]++;
+    }
+    wl_xb_mmu_unlock(lv);
+}
+
 bool wl_xb_pg_written(uint32_t p, uint32_t pages, uint32_t stamp) {
     if (stamp == 0 || g_xb_pg_frames == 0 || pages == 0 || p >= g_xb_ram_pages || pages > g_xb_ram_pages - p) {
         return true;
@@ -1097,6 +1184,7 @@ void wl_xb_pg_stats(WlXbMemStats *out) {
     out->swap_ins_spared = g_st.discards;
     out->file_copies = g_st.file_copies;
     out->file_evictions = g_st.file_evictions;
+    out->converted_evictions = g_st.conv_evictions;
     out->file_ins = g_st.file_ins;
     out->file_ahead = g_st.file_ahead;
     out->file_forgets = g_st.file_forgets;
@@ -1178,7 +1266,7 @@ size_t wl_xb_pg_host_bytes(void) {
     }
     size_t pages = g_xb_ram_pages;
     return pages * (sizeof *g_xb_pg_flags + sizeof *g_xb_pg_frame + sizeof *g_xb_pg_slot + sizeof *g_xb_pg_wgen +
-                    sizeof *g_foff + sizeof *g_evstamp) +
+                    sizeof *g_foff + sizeof *g_evstamp + (g_conv_count != NULL ? sizeof *g_conv_count : 0u)) +
            (g_xb_pg_frames + 1u) * sizeof *g_owner + g_xb_pg_frames * sizeof *g_free +
            (g_slot_used != NULL ? (g_slots + 31u) / 32u * sizeof *g_slot_used : 0u) +
            (g_io != NULL ? (BATCH + 1u) * PAGE : 0u) +
@@ -1201,6 +1289,12 @@ WlResult wl_xb_pg_init(const WlXbMemConfig *cfg, uint32_t frames) {
     if (g_evstamp == NULL || g_xb_pg_flags == NULL || g_xb_pg_frame == NULL || g_xb_pg_slot == NULL || g_owner == NULL || g_free == NULL ||
         g_xb_pg_wgen == NULL || g_foff == NULL) {
         return WL_ERR_NOMEM;
+    }
+    if (!cfg->converted_ordinary) {
+        g_conv_count = calloc(pages, sizeof *g_conv_count);
+        if (g_conv_count == NULL) {
+            return WL_ERR_NOMEM;
+        }
     }
     // the page cache's share: the last frames
     uint32_t zbytes = cfg->page_cache_bytes;

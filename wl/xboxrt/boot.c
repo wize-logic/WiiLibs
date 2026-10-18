@@ -41,11 +41,12 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     // +N KB", was 6.7 MB in a real-Wii run of a10's opening, shots included, and 6.7-6.8 MB on the
     // host in a10, b30 and four level loads; 2 MB stay over it for levels not measured, more render
     // targets, fragmentation and the freeze profile's 320 KB; the rest goes to the guest's frames), and the GX
-    // textures converted from the guest's in an arena of their own (15 MB, the vertex arrays' 1 MB in its end: a10's opening
+    // textures converted from the guest's in an arena of their own (18 MB, the vertex arrays' 1 MB in its end: a10's opening
     // draws up to 14.2 MB of them in a frame; an arena too small for a frame's textures keeps them
-    // smaller, or refuses them and the draws lose them)
+    // smaller, or refuses them and the draws lose them; 18 rather than 15 holds b30's textures, whose
+    // guest pages then give their frames back first: half the card reads, frames 3 MB fewer)
     cfg->keep_free_bytes = 9u << 20;
-    cfg->texture_bytes = 15u << 20;
+    cfg->texture_bytes = 18u << 20;
     cfg->htab_bytes = 256u << 10;
 }
 
@@ -164,6 +165,19 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
     snprintf(swap_path, sizeof swap_path, "%s/pagefile.sys", data_dir);
     mc.swap_path = cfg->swap_path != NULL ? cfg->swap_path : swap_path;
     mc.swap_bytes = cfg->swap_bytes;
+    // the pages of converted textures give their frames back first ("notexfirst": the clock alone)
+    char flag[WL_FS_PATH_MAX];
+    snprintf(flag, sizeof flag, "%s/notexfirst", cfg->title_dir);
+    mc.converted_ordinary = wl_platform_fs_exists(flag);
+#if !defined(__wii__)
+    const char *tf = getenv("WL_XB_TEXFIRST");
+    if (tf != NULL && tf[0] != '\0') {
+        mc.converted_ordinary = tf[0] == '0';
+    }
+#endif
+    if (mc.converted_ordinary) {
+        WL_LOG_I(TAG, "converted textures' pages: no sooner than others (notexfirst)");
+    }
 #if !defined(__wii__)
     {
         // a frame limit: the host pages as the Wii does (for a title run at the Wii's size)
