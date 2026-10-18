@@ -20,7 +20,9 @@ image sits), then:
 Outputs (the return value and the program's out[] words) must match for every seed. Each program is
 lifted three times: with the x87 state in memory at every operation, with --x87-locals (the lifter's
 x87_locals.py: the stack, control word and compare result in C locals inside a function), and with
---x87-locals --reg-locals (the integer registers in locals too).
+--x87-locals --reg-locals (the integer registers in locals too); and a fourth time with
+--keep-preserved as well (preserve.py: after a call to a function proven to give back ebx, esi and
+edi, the caller keeps them in its locals).
 
     e2e.py --build DIR [--target ppc-be|host|both] [-k NAME]
 
@@ -55,6 +57,8 @@ PROGRAMS = {
     # assembly: x87 depth through branches, calls made with values live on the stack, joins at
     # different depths, rounding modes, compares, precision control 24
     "prog_x87_paths": dict(src="prog_x87_paths.S", flags=[], nout=62),
+    # assembly: ebx/esi/edi across callees that keep the convention and callees that break it
+    "prog_preserve": dict(src="prog_preserve.S", flags=[], nout=20),
 }
 SEEDS = [1, 12345, 0xDEADBEEF, 7, 0x80000000, 0x0F0F0F0F]
 # Programs (and why) that may not match on a target. Keep empty unless understood.
@@ -141,10 +145,10 @@ def build_image(name, spec, work: Path):
     return syms, funcs
 
 
-def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False):
+def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False, keep=False):
     """Lift every function with the patched pipeline's FunctionTranslator; write gen/."""
-    from tools.recomp import config
-    from tools.recomp.translator import FunctionTranslator
+    from tools.recomp import config, preserve
+    from tools.recomp.translator import FunctionTranslator, Pending
     image = (work / f"{name}.bin").read_bytes()
     text_end = max(a + s for a, s, _ in funcs)
     data_start = text_end  # .rodata follows .text directly (a jump table may sit at text_end + 3)
@@ -165,10 +169,11 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False
     # the register-locals mode is the title's: displacements apart, the stack's without the map
     ft.mem_disp = reg_locals
     ft.stack_disp = reg_locals
+    ft.keep_preserved = keep
     # as tools.recomp does last: a called address inside a body gets a function of its own
     ft.discover_interior_entries()
     db = {a: info for a, info in ft.func_db.items() if a not in ft.owned_function_starts}
-    mode = "_regl" if reg_locals else "_x87l" if x87_locals else ""
+    mode = "_keep" if keep else "_regl" if reg_locals else "_x87l" if x87_locals else ""
     gen = work / f"{name}{mode}_gen"
     gen.mkdir(exist_ok=True)
     chunks, protos = [], []
@@ -178,6 +183,11 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False
             raise RuntimeError(f"{name}: the lifter failed on 0x{a:08X}")
         chunks.append(code)
         protos.append(f"void sub_{a:08X}(void);")
+    pending = {f"sub_{a:08X}": c.lines for a, c in zip(sorted(db), chunks) if isinstance(c, Pending)}
+    if pending:  # as BatchTranslator.finish_pending: the whole program first
+        ft.kept = preserve.preserved_by_name(preserve.analyse(pending))
+        chunks = [ft.finish_function(c.lines, c.has_fpu) if isinstance(c, Pending) else c for c in chunks]
+        ft.x87_stats["kept across calls"] = sum(c.count("kept across the call") for c in chunks)
     unimpl = {k: len(v) for k, v in ft.lifter.unimplemented.items()}
     (gen / "recomp_funcs.h").write_text("#ifndef RECOMP_FUNCS_H\n#define RECOMP_FUNCS_H\n"
                                         '#include "recomp_types.h"\n' + "\n".join(protos) + "\n#endif\n")
@@ -230,12 +240,14 @@ def main(argv=None) -> int:
             entry, out = syms["run"], syms["out"]
             natives = {s: run([str(work / "loader"), f"{name}.bin", hex(entry), hex(out), str(spec["nout"]), hex(s)],
                               cwd=work) for s in SEEDS}
-            for x87_locals, reg_locals in ((False, False), (True, False), (True, True)):
-                gen, unimpl, x87 = lift(name, work, funcs, pipe, x87_locals, reg_locals)
+            for x87_locals, reg_locals, keep in ((False, False, False), (True, False, False),
+                                                 (True, True, False), (True, True, True)):
+                gen, unimpl, x87 = lift(name, work, funcs, pipe, x87_locals, reg_locals, keep)
                 if x87_locals and not reg_locals and not x87:
                     continue  # no x87 code: the same C as the memory model
-                mode = "_regl" if reg_locals else "_x87l" if x87_locals else ""
-                label = (f"{name} (x87 and register locals: {x87})" if reg_locals else
+                mode = "_keep" if keep else "_regl" if reg_locals else "_x87l" if x87_locals else ""
+                label = (f"{name} (x87 and register locals, kept across calls: {x87})" if keep else
+                         f"{name} (x87 and register locals: {x87})" if reg_locals else
                          f"{name} (x87 locals: {x87})" if x87_locals else name)
                 code_hi = max(a + s for a, s, _ in funcs)
                 rt = (RUNTIME.replace("@BASE@", f"0x{BASE:X}").replace("@ENTRY@", f"sub_{entry:08X}")

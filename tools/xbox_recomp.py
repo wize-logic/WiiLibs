@@ -41,6 +41,9 @@ compiler reload them). A title's config can turn either off ("x87_locals": false
 accesses through it ("mem_disp": false turns it off), and an access at esp + a small constant as
 MEMxx_SP(esp, disp) (--stack-disp, patch 0023), which the header addresses without the map: every
 guest stack is below 0x10000000, where it is the identity ("stack_disp": false turns it off).
+With --reg-locals it also passes --keep-preserved (patch 0024): a call to a function proven to give
+back ebx, esi and edi (the whole program is read for it) leaves those in the caller's locals
+instead of loading them again ("keep_preserved": false turns it off).
 
 A title's own knowledge is data, passed with --config (JSON; relative paths are relative to it):
 
@@ -76,6 +79,9 @@ A title's own knowledge is data, passed with --config (JSON; relative paths are 
                                              small displacement apart: MEM32_D(esi, 0x8), patch 0021)
       "stack_disp": false,                   esp-based accesses through the address map too (the
                                              default true writes MEMxx_SP(esp, disp), patch 0023)
+      "keep_preserved": false,               load ebx, esi and edi again after every call (the
+                                             default true keeps them in the caller's locals after a
+                                             call to a function proven to give them back, patch 0024)
       "hot_functions": "hot.txt" or ["sub_00052520", "0x00088B80"],   the functions compiled at
                                              -O2 (tu/recomp_tu_hot.c); a file is read for its
                                              sub_XXXXXXXX names and 0x addresses (a profile report
@@ -345,6 +351,8 @@ class Run:
             rcmd.append("--mem-disp")
         if c.get("stack_disp", True):
             rcmd.append("--stack-disp")
+        if c.get("keep_preserved", True) and c.get("reg_locals", True):
+            rcmd.append("--keep-preserved")
         rin = [self.xbe, functions, disasm / "labels.json", func_id / "identified_functions.json", abi]
         if c.get("icall_sites"):
             rcmd += ["--icall-sites", str(self.cfg_path(c["icall_sites"]))]
@@ -573,7 +581,7 @@ def load_config(path):
     known = {"name", "seed_functions", "extra_sections", "text_only", "manual_functions",
              "coalesce_functions", "trace_functions", "split", "disasm_args", "func_id_args",
              "abi_args", "recomp_args", "icall_sites", "patches", "comment", "vertex_programs", "x87_locals",
-             "reg_locals", "mem_disp", "stack_disp", "hot_functions"}
+             "reg_locals", "mem_disp", "stack_disp", "keep_preserved", "hot_functions"}
     unknown = sorted(set(cfg) - known)
     if unknown:
         raise Failure(f"{path}: unknown keys {unknown} (known: {sorted(known)})")
