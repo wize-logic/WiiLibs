@@ -539,7 +539,7 @@ so it takes the lock too, or each concurrent run has a copy of its own (AGENTS.m
 | `novcache` | turns the vertex arrays' cache off (beats `vcache`) |
 | `noprefetch` | no `dcbt` ahead of the guest's vertex data and push buffer (an A/B of the prefetch; PowerPC builds only have it) |
 | `gxnotex`, `gxnotlut`, `gxtlutmem1`, `gxmaxdraws`, `gxnoquad`, `gxnozrestore`, `gxnocopy`, `gxtexgap`, `gxlatez`, `gxvtxinv` | the Wii only: work left out of what GX gets, to find what hangs a console's GPU by halving (`wl/platform/gx_direct.h`, `WlGxBisect`): every texture one fixed 4x4 texture; the C4/C8 ones only (no TLUT loads); the TLUTs loaded from copies in MEM1; a frame's first N primitives only (`gxmaxdraws=N`); no quad of the targets; the back buffer put back without its Z texture; no texture copy out of the EFB; the vertex's texture coordinates in the descriptor's slots of their own names, gaps and all (TEX0, TEX2, TEX3: the layout that hung a console's GPU, now sent in the first slots); the depth test never early (no `GX_SetZCompLoc(GX_TRUE)`); GX's vertex cache invalidated before every primitive. The boot logs the ones on |
-| `overlap` | the processor goes on with the next frame while GX draws (by default each frame's end waits for GX to finish it: the caches' frame-late reuse still shows stale content in some frames); `WL_XB_OVERLAP` on the host |
+| `nooverlap` | each frame's end waits for GX to finish the frame (by default the processor goes on with the next frame while GX draws, at most one frame behind; the caches keep what GX may still read one frame longer), for an A/B; `WL_XB_NOOVERLAP` on the host. A file `overlap` is still read and does nothing |
 | `noaudio` | the idle APU and AC'97 (DirectSound fails, the title runs silent), for an A/B; `WL_XB_AUDIO=0` on the host |
 | `noreadahead` | no host thread reads ahead of a file the title reads from start to end (a map being inflated into a Z: cache slot: 512 KB read while the title inflates the last 128 KB), for an A/B of a level's first load; `WL_XB_NO_READAHEAD` on the host |
 | `deterministic` | the virtual clock (`thread.h`'s deterministic mode), so a run of a script on the Wii is the same game as the host's with `WL_XB_DETERMINISTIC=1`: guest RAM (the play step `dump`) and captures compare byte for byte; `WL_XB_DETERMINISTIC` on the host |
@@ -555,7 +555,7 @@ card. Each argument is one option:
 | Option | Effect |
 |---|---|
 | `play=<setting>` | the play setting, as the first line of `play.cfg` (`script:`, `bot:`, `look:`, `replay:<capture> <runs>`) |
-| `switch=a,b,c=v` | flag files of the title folder, as if they were there: `noxf`, `novcache`, `noaudio`, `deterministic`, `vcache=2048` (the text after `=` is the file's), `profile` and `hwcount` (profile.txt and hwcount.txt with the defaults), and any switch a build reads, such as `overlap` or `noskin` |
+| `switch=a,b,c=v` | flag files of the title folder, as if they were there: `noxf`, `novcache`, `noaudio`, `deterministic`, `vcache=2048` (the text after `=` is the file's), `profile` and `hwcount` (profile.txt and hwcount.txt with the defaults), and any switch a build reads, such as `nooverlap` or `noskin` |
 | `file=<name>:<text>` | a file of the title folder with this text, `;` for a line end: `file=profile.txt:after 30;seconds 10;repeat 2` |
 | `net=<spec>` | the remote log: `<pc ip>:<port>` (the Wii connects) or `listen:<port>` (the PC connects to the Wii) |
 | `run=<name>` | the run's name in the remote log's first line |
@@ -570,7 +570,7 @@ doing; and a stop screen (a crash) leaves by itself after 10 s. All of it is `to
 
 ```sh
 tools/wii_net_run.py --wii <wii ip> --dol halo.dol --name a30 --out ~/wl-work/netruns \
-    --arg 'play=replay:play/a30_peak.cap 5' --arg switch=overlap,profile
+    --arg 'play=replay:play/a30_peak.cap 5' --arg switch=nooverlap,profile
 ```
 
 Once per setup: the Wii's IP (the Homebrew Channel's network screen shows it) and the title folder staged on
