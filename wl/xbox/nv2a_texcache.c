@@ -194,12 +194,48 @@ void wl_nv2a_texcache_frame_done(WlNv2aTexCache *cache) {
     cache->stats.frame_reduced = smaller;
     if (drawn > cache->stats.peak_frame_bytes) {
         cache->stats.peak_frame_bytes = drawn;
+        memset(cache->stats.peak_by_format, 0, sizeof cache->stats.peak_by_format);
+        cache->stats.peak_alpha = 0;
+        for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
+            const WlNv2aTexEntry *e = &cache->entries[i];
+
+            if (e->image != NULL && e->used_frame == cache->frame) {
+                if ((unsigned)e->layout.format < WL_GXC_FORMAT_COUNT) {
+                    cache->stats.peak_by_format[e->layout.format] += e->layout.total_bytes;
+                }
+                cache->stats.peak_alpha += e->layout.alpha_bytes;
+            }
+        }
     }
     cache->frame++;
 }
 
 void wl_nv2a_texcache_stats(const WlNv2aTexCache *cache, WlNv2aTexCacheStats *out) {
     *out = cache->stats;
+}
+
+bool wl_nv2a_texcache_converted(const WlNv2aTexCache *cache, uint32_t phys, uint32_t bytes) {
+    uint64_t end = (uint64_t)phys + bytes;
+    bool held = false;
+    unsigned i;
+
+    if (cache->cfg.watch == NULL || bytes == 0) {
+        return false;
+    }
+    for (i = 0; i < WL_NV2A_TEXCACHE_ENTRIES; i++) {
+        const WlNv2aTexEntry *e = &cache->entries[i];
+
+        // (a texture whose texels overlap the range: the palette's pages are not answered for)
+        if (e->image == NULL || e->phys >= end || (uint64_t)e->phys + e->source_bytes <= phys) {
+            continue;
+        }
+        if (e->stamp == 0 || e->reduced != 0 ||
+            cache->cfg.written(cache->cfg.user, e->phys, e->source_bytes, e->stamp)) {
+            return false; // (its next check, or its being made whole, reads the texels)
+        }
+        held = true;
+    }
+    return held;
 }
 
 void wl_nv2a_texcache_memory(const WlNv2aTexCache *cache, WlNv2aTexCacheMemory *out) {
@@ -364,6 +400,13 @@ static bool watch_written(WlNv2aTexCache *cache, const WlNv2aTexEntry *e, const 
             cache->cfg.written(cache->cfg.user, t->palette_phys, 4u * t->palette_entries, e->stamp));
 }
 
+// Whether the entry's texels may have been stored to since it was checked: the watch's answer,
+// without reading them (false without one).
+static bool written_since(WlNv2aTexCache *cache, const WlNv2aTexEntry *e) {
+    return e->stamp != 0 && cache->cfg.written != NULL &&
+           cache->cfg.written(cache->cfg.user, e->phys, e->source_bytes, e->stamp);
+}
+
 // ---- entries ------------------------------------------------------------------------------------
 
 // The image rectangle only sizes a linear texture: a swizzled one's register may hold anything (the
@@ -496,7 +539,10 @@ static bool arena_block(void *user, const WlHeapLive *live) {
 
         if (e != w->keep && !gpu_reads(cache, e->used_frame)) {
             b->entry = (uint16_t)(w->by_image[w->next] + 1u);
-            b->used_frame = e->used_frame;
+            // (one whose texels were stored to since it was checked goes as if never drawn: its next
+            // use reads them again whether it is kept or not, while evicting one whose texels are as
+            // they were has its next use read them again only to make the same image)
+            b->used_frame = written_since(cache, e) ? 0u : e->used_frame;
         }
     }
     return true;
