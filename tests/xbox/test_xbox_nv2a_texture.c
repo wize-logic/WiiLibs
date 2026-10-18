@@ -1107,6 +1107,64 @@ TEST cache_overlapped_restores_and_waits(void) {
     PASS();
 }
 
+// The frame budget: once a frame has made its bytes, new textures are put off (NULL, listed once),
+// made by wl_nv2a_texcache_work while the GPU draws, and the list forgotten at the frame's end (a
+// texture not made then is made at its lookup in the next frame, whose budget is new).
+TEST cache_frame_budget_puts_off(void) {
+    static WlNv2aTexCache cache;
+    TGuest g;
+    WlNv2aTexCacheConfig cfg;
+    WlNv2aTexture t, tex[6];
+    bool made;
+    unsigned i;
+    ASSERT(t_create(&g, NULL) != NULL);
+    t_setup_3d(&g);
+    set_texture(&g, 0, 0x100000, tex_format(WL_NV2A_TEX_SZ_A8R8G8B8, 4, 4, 1, false));
+    t_kick(&g);
+    ASSERT(wl_nv2a_texture(wl_nv2a_kelvin(g.dev), 0, &t));
+    for (i = 0; i < 6; i++) {
+        tex[i] = t;
+        tex[i].phys = 0x100000 + 0x1000 * i;
+    }
+    memset(&cfg, 0, sizeof cfg);
+    cfg.frame_budget = 2 * t.total_bytes; // (two 16x16 a frame)
+    wl_nv2a_texcache_init(&cache, &cfg);
+    for (i = 0; i < 5; i++) {
+        const WlNv2aTexEntry *e = wl_nv2a_texcache_get(&cache, g.dev, &tex[i], false, &made);
+        ASSERT_EQ(i < 2, e != NULL);
+        ASSERT_EQ(i < 2, made);
+    }
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &tex[2], false, &made) == NULL);
+    ASSERT_EQ(4u, cache.stats.deferred);
+    ASSERT_EQ(3u, cache.deferred_count);
+    // (made while the GPU draws, in the order the draws wanted them)
+    ASSERT(wl_nv2a_texcache_work(&cache, g.dev, &made) && made);
+    ASSERT(wl_nv2a_texcache_work(&cache, g.dev, &made) && made);
+    ASSERT(!wl_nv2a_texcache_work(&cache, g.dev, &made) && made);
+    ASSERT(!wl_nv2a_texcache_work(&cache, g.dev, &made) && !made);
+    ASSERT_EQ(3u, cache.stats.made_early);
+    ASSERT_EQ(5u, cache.stats.converted);
+    for (i = 0; i < 5; i++) {
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &tex[i], false, &made) != NULL && !made);
+    }
+    // put off and not made by the frame's end: made in the next frame
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &tex[5], false, &made) == NULL);
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT_EQ(0u, cache.deferred_count);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &tex[5], false, &made) != NULL && made);
+    // no budget: nothing put off
+    wl_nv2a_texcache_clear(&cache);
+    cfg.frame_budget = 0;
+    wl_nv2a_texcache_init(&cache, &cfg);
+    for (i = 0; i < 6; i++) {
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &tex[i], false, &made) != NULL && made);
+    }
+    ASSERT_EQ(0u, cache.stats.deferred);
+    wl_nv2a_texcache_clear(&cache);
+    t_destroy(&g);
+    PASS();
+}
+
 static WlResult sink_count(void *user, const void *data, uint32_t bytes) {
     (void)data;
     *(uint32_t *)user += bytes;
@@ -1165,6 +1223,7 @@ SUITE(texture_suite) {
     RUN_TEST(cache_keeps_smaller_for_want_of_memory);
     RUN_TEST(cache_smaller_kept_without_reading);
     RUN_TEST(cache_overlapped_restores_and_waits);
+    RUN_TEST(cache_frame_budget_puts_off);
     RUN_TEST(cache_reads_again_when_a_capture_begins);
 }
 

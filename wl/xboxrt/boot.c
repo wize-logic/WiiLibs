@@ -10,17 +10,22 @@
 #endif
 
 #include "wl/base/endian.h"
+#include "wl/platform/fs.h"
+#include "wl/platform/heap_sites.h"
 #include "wl/platform/mem.h"
 #include "wl/platform/mem_census.h"
+#include "wl/platform/memfast.h"
 #include "wl/platform/net_stream.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/gx_direct.h"
 #include "wl/platform/hwcount.h"
 #include "wl/platform/profile_arm.h"
+#include "wl/xbox/nv2a_gx.h"
 #include "wl/xboxkrnl/xboxkrnl.h"
 #include "wl/xboxrt/bench.h"
 #include "wl/xboxrt/boot.h"
 #include "wl/xboxrt/devices.h"
+#include "wl/xboxrt/frame_loan.h"
 #include "wl/xboxrt/input.h"
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
@@ -46,6 +51,10 @@ void wl_xb_title_config_default(WlXbTitleConfig *cfg) {
     // smaller, or refuses them and the draws lose them; 18 rather than 15 holds b30's textures, whose
     // guest pages then give their frames back first: half the card reads, frames 3 MB fewer)
     cfg->keep_free_bytes = 9u << 20;
+    // 5 of those 9 MB lent to the guest's frames while the host side does not use them (a10's
+    // opening on the card: the heap's exact peak +6.7 MB, its idle use about 1.2 MB under that), and
+    // given back, 256 KB at a time, when an allocation would fail (frame_loan.h)
+    cfg->loan_bytes = 5u << 20;
     cfg->texture_bytes = 18u << 20;
     cfg->htab_bytes = 256u << 10;
 }
@@ -150,6 +159,37 @@ static void *largest_block(size_t room, uint32_t *bytes) {
 }
 #endif
 
+// The heap's lent frames (frame_loan.h): the block (the Wii) and the frames it still lends.
+#if defined(__wii__)
+static void *g_loan_block;
+#endif
+static uint32_t g_loan_left;
+// a file "bigstacks" in the title's folder: the host stacks of before 2026-10-18 (256 KB, not 128)
+static bool g_big_stacks;
+
+// The loan now lends `left` frames: the rest of it is the heap's again.
+static void loan_give(void *user, uint32_t left) {
+    (void)user;
+    uint32_t bytes = (g_loan_left - left) * WL_XB_PAGE;
+    g_loan_left = left;
+#if defined(__wii__)
+    if (left == 0) {
+        free(g_loan_block);
+        g_loan_block = NULL;
+    } else {
+        void *q = realloc(g_loan_block, left * WL_XB_PAGE); // a shrink: in place, its tail freed
+        if (q != g_loan_block) {
+            WL_LOG_E(TAG, "guest frames: the heap moved the loan's block (%p -> %p)", g_loan_block, q);
+        }
+    }
+    wl_xb_backend_frames_given(bytes);
+#else
+    (void)wl_platform_heap_cap_add(bytes);
+#endif
+    WL_LOG_I(TAG, "guest frames: %u KB given back to the heap (%u KB still lent)", (unsigned)(bytes >> 10),
+             (unsigned)(left * (WL_XB_PAGE >> 10)));
+}
+
 // Guest memory (the Wii's frames from the heap), the GPU's textures' arena (when `want_textures`)
 // and the guest threads with the calling thread as the boot thread, holding the guest lock: what
 // the title and the capture bench both need.
@@ -165,8 +205,42 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
     snprintf(swap_path, sizeof swap_path, "%s/pagefile.sys", data_dir);
     mc.swap_path = cfg->swap_path != NULL ? cfg->swap_path : swap_path;
     mc.swap_bytes = cfg->swap_bytes;
-    // the pages of converted textures give their frames back first ("notexfirst": the clock alone)
     char flag[WL_FS_PATH_MAX];
+    // guest frames lent by the heap ("oldreserve": none, keep_free_bytes all the heap's)
+    snprintf(flag, sizeof flag, "%s/oldreserve", cfg->title_dir);
+    uint32_t loan_bytes = wl_platform_fs_exists(flag) ? 0 : cfg->loan_bytes;
+#if defined(__wii__)
+    loan_bytes = loan_bytes < cfg->keep_free_bytes ? loan_bytes : cfg->keep_free_bytes;
+#else
+    {
+        const char *mb = getenv("WL_XB_LOAN_MB");
+        const char *kb = getenv("WL_XB_LOAN_KB");
+        loan_bytes = 0; // (the host's own setting: the Wii's frame limit and cap are the run's)
+        if (kb != NULL && kb[0] != '\0') {
+            loan_bytes = (uint32_t)strtoul(kb, NULL, 10) << 10;
+        } else if (mb != NULL && mb[0] != '\0') {
+            loan_bytes = (uint32_t)strtoul(mb, NULL, 10) << 20;
+        }
+        if (wl_platform_fs_exists(flag)) {
+            loan_bytes = 0;
+        }
+    }
+#endif
+    loan_bytes &= ~(WL_XB_PAGE * WL_XB_LOAN_STEP - 1u);
+    if (loan_bytes != 0 && !wl_platform_heap_reclaims()) {
+        WL_LOG_W(TAG, "guest frames: none lent by the heap (its allocator gives nothing back)");
+        loan_bytes = 0;
+    }
+    if (loan_bytes == 0 && wl_platform_fs_exists(flag)) {
+        WL_LOG_I(TAG, "guest frames: none lent by the heap (oldreserve)");
+    }
+    // a PTE looked for in its slot first ("ptescan": its whole group, as before)
+    snprintf(flag, sizeof flag, "%s/ptescan", cfg->title_dir);
+    mc.pte_scan = wl_platform_fs_exists(flag);
+    if (mc.pte_scan) {
+        WL_LOG_I(TAG, "page table: a PTE is looked for in its whole group (ptescan)");
+    }
+    // the pages of converted textures give their frames back first ("notexfirst": the clock alone)
     snprintf(flag, sizeof flag, "%s/notexfirst", cfg->title_dir);
     mc.converted_ordinary = wl_platform_fs_exists(flag);
 #if !defined(__wii__)
@@ -272,6 +346,36 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
     }
     *arena = texture_arena;
     *arena_bytes = texture_bytes;
+    uint32_t loan_first = 0;
+#if defined(__wii__)
+    if (loan_bytes != 0) {
+        // the heap's lent frames: had last, above the textures' arena (a tail given back joins the
+        // heap's free top, or the free block above it), a pool after MEM1's (before the last pool)
+        // so that they are paging frames, not the page cache's (the last ones)
+        void *loan = memalign(WL_XB_PAGE, loan_bytes);
+        if (loan == NULL) {
+            WL_LOG_W(TAG, "guest frames: no %u KB for the heap's loan", (unsigned)(loan_bytes >> 10));
+            loan_bytes = 0;
+        } else {
+            unsigned at = mc.frame_pools[1].bytes != 0 ? 1u : 0u; // (one pool: before it)
+            memmove(&mc.frame_pools[at + 1u], &mc.frame_pools[at],
+                    (WL_XB_MAX_FRAME_POOLS - 1u - at) * sizeof mc.frame_pools[0]);
+            mc.frame_pools[at].base = loan;
+            mc.frame_pools[at].bytes = loan_bytes;
+            loan_first = 1u + (at != 0 ? mc.frame_pools[0].bytes / WL_XB_PAGE : 0u);
+            g_loan_block = loan;
+            WL_LOG_I(TAG, "guest frames: %u KB at %p lent by the heap (given back as it needs them)",
+                     (unsigned)(loan_bytes >> 10), loan);
+        }
+    }
+#else
+    if (loan_bytes != 0 && mc.frame_limit_bytes > loan_bytes) {
+        WL_LOG_I(TAG, "guest frames: %u KB of them lent by the heap (given back as it needs them)",
+                 (unsigned)(loan_bytes >> 10));
+    } else {
+        loan_bytes = 0;
+    }
+#endif
 #if !defined(__wii__)
     {
         // the Wii's heap on the host: what is allocated from here on (the guest memory's tables, the
@@ -292,12 +396,29 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
             WL_LOG_I(TAG, "host heap: %u KB from here on, as the Wii's (%s)", (unsigned)(cap >> 10),
                      capped == WL_OK ? "capped" : wl_result_name(capped));
         }
+        // who holds it, by call site, now and at its peak (WL_XB_HEAP_SITES=<KB>: blocks of at
+        // least that by their callers, the smaller ones by size), in the exit's census
+        const char *sites = getenv("WL_XB_HEAP_SITES");
+        if (sites != NULL && sites[0] != '\0') {
+            static uint64_t storage[(1024u * sizeof(WlHeapSite) + 65536u * sizeof(WlHeapSiteBlock)) / 8u + 1u];
+            WlResult tracked =
+                wl_platform_heap_track_sites(storage, sizeof storage, 1024u, (size_t)strtoul(sites, NULL, 10) << 10);
+            WL_LOG_I(TAG, "host heap: by call site from here on (%s)", wl_result_name(tracked));
+        }
     }
 #endif
     // the heap's high-water marks from here on (mem_census.h): the host side's own use, which
     // keep_free_bytes holds on the Wii, exact (the census and the exit print them)
     wl_platform_heap_mark();
     WlResult r = wl_xb_mem_init(&mc);
+    if (r == WL_OK && loan_bytes != 0) {
+        g_loan_left = loan_bytes / WL_XB_PAGE;
+        WlResult lr = wl_xb_loan_start(loan_first, g_loan_left, loan_give, NULL);
+        if (lr != WL_OK) {
+            // (the frames stay the guest's: a reserve that much smaller)
+            WL_LOG_W(TAG, "guest frames: the heap's loan not started (%s): kept as frames", wl_result_name(lr));
+        }
+    }
     if (r == WL_OK) {
         r = wl_xb_fault_install();
     }
@@ -309,6 +430,22 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
         char det_flag[WL_FS_PATH_MAX];
         snprintf(det_flag, sizeof det_flag, "%s/deterministic", cfg->title_dir);
         tc.deterministic = cfg->deterministic || wl_platform_fs_exists(det_flag);
+        // a file "nopreempt" (WL_XB_NOPREEMPT on the host): the turns of e9aab85 (thread.h's preempt)
+        snprintf(det_flag, sizeof det_flag, "%s/nopreempt", cfg->title_dir);
+        tc.preempt = !wl_platform_fs_exists(det_flag);
+#if !defined(__wii__)
+        tc.preempt = tc.preempt && getenv("WL_XB_NOPREEMPT") == NULL;
+#endif
+        if (!tc.preempt) {
+            WL_LOG_I(TAG, "nopreempt: no hand-off to a thread back from the card or after a quantum's wait");
+        }
+        // a file "bigstacks": the host stacks of before 2026-10-18 (256 KB at most, not 128)
+        snprintf(det_flag, sizeof det_flag, "%s/bigstacks", cfg->title_dir);
+        g_big_stacks = wl_platform_fs_exists(det_flag);
+        if (g_big_stacks) {
+            tc.host_stack_bytes = 256u << 10;
+            WL_LOG_I(TAG, "host stacks: 256 KB at most (bigstacks)");
+        }
 #if !defined(__wii__)
         // the deterministic mode's costs: WL_XB_DET_NS=<backward jump>,<kernel call>,<device access>
         const char *det_ns = getenv("WL_XB_DET_NS");
@@ -396,6 +533,25 @@ static void gx_bisect_options(const WlXbTitleConfig *cfg) {
     b.texcoord_gaps = title_flag(cfg, "gxtexgap", NULL);
     b.late_z = title_flag(cfg, "gxlatez", NULL);
     b.vtx_inval = title_flag(cfg, "gxvtxinv", NULL);
+    // (the old ways, for an A/B: "gxpipe32" a vertex's words a word a store, "gxcopyfilter" the copy filter
+    // written around each texture copy, "gxrestorewhole" (or WL_XB_RESTORE_WHOLE) the whole park put back)
+    b.pipe32 = title_flag(cfg, "gxpipe32", NULL);
+    b.copy_filter = title_flag(cfg, "gxcopyfilter", NULL);
+    b.restore_whole = title_flag(cfg, "gxrestorewhole", NULL) || getenv("WL_XB_RESTORE_WHOLE") != NULL;
+    // ("gxtlutall" a TLUT loaded at each colour-indexed bind, "gxregions" libogc's 32K texture cache regions)
+    b.tlut_always = title_flag(cfg, "gxtlutall", NULL) || getenv("WL_XB_TLUT_ALL") != NULL;
+    b.regions_libogc = title_flag(cfg, "gxregions", NULL) || getenv("WL_XB_GX_REGIONS") != NULL;
+    // ("gxtexload" each texture bind that changes anything GX_LoadTexObj's whole load, "gxarrayall" GX_SetArray
+    // at each call)
+    b.tex_whole = title_flag(cfg, "gxtexload", NULL) || getenv("WL_XB_TEX_WHOLE") != NULL;
+    b.arrays_always = title_flag(cfg, "gxarrayall", NULL) || getenv("WL_XB_ARRAYS_ALL") != NULL;
+    if (b.pipe32 || b.copy_filter || b.restore_whole || b.tlut_always || b.regions_libogc || b.tex_whole ||
+        b.arrays_always) {
+        WL_LOG_I(TAG, "GX the old ways:%s%s%s%s%s%s%s", b.pipe32 ? " gxpipe32" : "",
+                 b.copy_filter ? " gxcopyfilter" : "", b.restore_whole ? " gxrestorewhole" : "",
+                 b.tlut_always ? " gxtlutall" : "", b.regions_libogc ? " gxregions" : "",
+                 b.tex_whole ? " gxtexload" : "", b.arrays_always ? " gxarrayall" : "");
+    }
     if (b.no_textures || b.no_tlut || b.tlut_mem1 || b.max_draws != 0 || b.no_quads || b.no_z_restore ||
         b.no_copies || b.texcoord_gaps || b.late_z || b.vtx_inval) {
         WL_LOG_W(TAG, "GX bisection:%s%s%s max draws %u%s%s%s%s%s%s", b.no_textures ? " gxnotex" : "",
@@ -457,6 +613,13 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
             }
         }
         wl_xb_gpu_set_query_by_area(old_occl);
+        // the render targets and the park in the textures' arena's free pieces first ("heaptargets":
+        // the heap's alone, as before)
+        snprintf(flag, sizeof flag, "%s/heaptargets", cfg->title_dir);
+        if (wl_platform_fs_exists(flag)) {
+            wl_xb_gpu_set_targets_on_heap(true);
+            strncat(in_force, " heaptargets", sizeof in_force - strlen(in_force) - 1u);
+        }
         WL_LOG_I(TAG, "old behaviours in force:%s", in_force[0] != '\0' ? in_force : " none");
     }
 
@@ -466,6 +629,35 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
     no_xf = no_xf || getenv("WL_XB_NO_XF") != NULL;
 #endif
     wl_xb_gpu_set_transform_unit(!no_xf);
+    // (a file "noxflight", or WL_XB_NO_XF_LIGHT on the host: the colours that are a light's dot
+    // product made by the processor, the rest still on GX's transform unit; d40's shadows on the console)
+    snprintf(flag, sizeof flag, "%s/noxflight", cfg->title_dir);
+    no_xf = wl_platform_fs_exists(flag);
+#if !defined(__wii__)
+    no_xf = no_xf || getenv("WL_XB_NO_XF_LIGHT") != NULL;
+#endif
+    wl_xb_gpu_set_transform_unit_light(!no_xf);
+    // (a file "noxfskin", or WL_XB_NO_XF_SKIN on the host: a skinned model's d0 made by the processor,
+    // not lit by GX from the normal its lit fused form sends; an A/B of GX's lighting on the console)
+    snprintf(flag, sizeof flag, "%s/noxfskin", cfg->title_dir);
+    no_xf = wl_platform_fs_exists(flag);
+#if !defined(__wii__)
+    no_xf = no_xf || getenv("WL_XB_NO_XF_SKIN") != NULL;
+#endif
+    wl_xb_gpu_set_transform_unit_skin(!no_xf);
+    // (a file "nofusedxf", or WL_XB_NO_FUSED_XF on the host: a draw whose position is GX's transform
+    // unit's made the general way, not by its program's fused "x" form)
+    snprintf(flag, sizeof flag, "%s/nofusedxf", cfg->title_dir);
+    no_xf = wl_platform_fs_exists(flag);
+#if !defined(__wii__)
+    no_xf = no_xf || getenv("WL_XB_NO_FUSED_XF") != NULL;
+#endif
+    wl_xb_gpu_set_fused_xf(!no_xf);
+    // (a file "nodrawcuts", or WL_XB_NODRAWCUTS on the host: the GX backend's draw path without its cuts
+    // of 2026-10-18, wl/xbox/nv2a_gx.h's wl_nv2a_gx_set_draw_cuts)
+    snprintf(flag, sizeof flag, "%s/nodrawcuts", cfg->title_dir);
+    wl_nv2a_gx_set_draw_cuts(!wl_platform_fs_exists(flag));
+    wl_nv2a_gx_set_switches(cfg->title_dir); // (nv2a_gx.h: "novcwait", ...)
     snprintf(flag, sizeof flag, "%s/nooverlap", cfg->title_dir);
     overlap = !wl_platform_fs_exists(flag);
 #if !defined(__wii__)
@@ -497,7 +689,22 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
     // (a file "noprefetch": no dcbt ahead of the vertex data and push buffer, for an A/B on the console)
     snprintf(flag, sizeof flag, "%s/noprefetch", cfg->title_dir);
     wl_xb_gpu_set_prefetch(!wl_platform_fs_exists(flag));
+    wl_xb_gpu_set_old_push(title_flag(cfg, "oldpush", NULL)); // (a file "oldpush": the pusher's loop as before)
+    // (a file "holdgxlock": the guest lock kept through GX's waits, as before)
+    bool hold_gx_lock = title_flag(cfg, "holdgxlock", NULL);
+#if !defined(__wii__)
+    hold_gx_lock = hold_gx_lock || getenv("WL_XB_HOLD_GX_LOCK") != NULL;
+#endif
+    wl_xb_gpu_set_hold_gx_lock(hold_gx_lock);
+    // (a file "lazytex": every texture converted at its first draw, the old way, for an A/B on the console)
+    snprintf(flag, sizeof flag, "%s/lazytex", cfg->title_dir);
+    bool lazy_textures = wl_platform_fs_exists(flag);
+#if !defined(__wii__)
+    lazy_textures = lazy_textures || getenv("WL_XB_LAZYTEX") != NULL;
+#endif
+    wl_xb_gpu_set_texture_budget(lazy_textures ? 0u : (uint32_t)WL_XB_TEXTURE_FRAME_BUDGET);
     gx_bisect_options(cfg);
+    wl_memfast_options(cfg->title_dir); // (a file "oldcopy": newlib's memcpy & co., wl/platform/memfast.h)
 }
 
 // The capture bench (bench.h) in place of the title: guest memory and the GPU as the title has
@@ -525,6 +732,21 @@ static int bench_boot(const WlXbTitleConfig *cfg, const char *data_dir, const ch
     wl_platform_log_flush();
 #endif
     return code;
+}
+
+// The play setting "sdspeed:<file>" (in the title folder, or a path with its device): the SD card's
+// reads through libfat against reads straight from the card (wl_fs_speed_compare), in the log; no title.
+static int sd_speed_boot(const char *title_dir, const char *file) {
+    char path[WL_FS_PATH_MAX];
+    snprintf(path, sizeof path, strchr(file, ':') != NULL ? "%s%s" : "%s/%s", strchr(file, ':') != NULL ? "" : title_dir,
+             file);
+    WlFsSpeedCompare c;
+    WlResult r = wl_fs_speed_compare(path, &c);
+    WL_LOG_I(TAG, "the SD speed test ended: %s", wl_result_name(r));
+#if defined(__wii__)
+    wl_platform_log_flush();
+#endif
+    return r == WL_OK ? 0 : 1;
 }
 
 int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
@@ -560,6 +782,7 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
         tags[WL_TAG_ASSET].budget = 0;
         tags[WL_TAG_AUDIO_BANK].budget = 0;
         tags[WL_TAG_IO].budget = 0;
+        // (the GX FIFO keeps its 1 MB: card runs filled it to 1000 KB at a frame's end, logs 2, 3, 6)
         WlMemConfig mcfg;
         wl_mem_config_default(&mcfg);
         mcfg.tags = tags;
@@ -608,6 +831,14 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
         WL_LOG_I(TAG, "run options: %u files, play \"%s\"", (unsigned)run.virtual_files, run.play);
     }
     const char *play = run.play[0] != '\0' ? run.play : play_setting(cfg);
+    // the SD card's files read through libfat alone, as before 2026-10-18 (platform.h): "oldsd"
+    if (title_flag(cfg, "oldsd", NULL)) {
+        wl_platform_fs_fast_set(false);
+        WL_LOG_I(TAG, "oldsd: the SD card's files read through libfat alone");
+    }
+    if (play != NULL && strncmp(play, "sdspeed:", 8) == 0) {
+        return sd_speed_boot(cfg->title_dir, play + 8);
+    }
     if (wl_xb_bench_setting(play)) {
         return bench_boot(cfg, data_dir, play);
     }
@@ -743,6 +974,9 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     }
     WlXbServiceConfig sc;
     wl_xb_service_config_default(&sc);
+    if (g_big_stacks) {
+        sc.host_stack_bytes = 256u << 10;
+    }
     r = wl_xb_service_start(&sc);
     if (r != WL_OK) {
         return r;
@@ -783,6 +1017,9 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     int code = wl_xb_process_wait();
     WL_LOG_I(TAG, "the title left with %d", code);
     wl_mem_census_log(TAG, false); // (the heap's peak over the whole run, and who holds it now)
+#if !defined(__wii__)
+    wl_platform_heap_log_sites(24);
+#endif
     // the guest stopped before the platform winds down: its other threads (and the service
     // thread's interrupts and vertical blanks) would go on running the title's code while the
     // card is unmounted and the audio and video are stopped. The service thread first (it may be

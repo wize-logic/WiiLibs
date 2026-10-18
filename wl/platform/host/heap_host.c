@@ -22,7 +22,11 @@
 #include "wl/platform/mem_census.h"
 
 #if defined(__GLIBC__) && !defined(WL_HEAP_HOST_STATIC)
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <malloc.h>
+
+#include "wl/platform/heap_sites.h"
 
 void *__libc_malloc(size_t size);
 void *__libc_calloc(size_t count, size_t size);
@@ -40,6 +44,40 @@ static uint32_t g_refused;    // requests the cap refused
 static size_t g_largest_refused;
 static long g_mark;           // g_live at wl_platform_heap_mark (0: the process's start)
 static long g_peak;           // the most g_live reached since the mark
+
+// ---- who holds it (wl_platform_heap_track_sites): the blocks by call site ----
+static WlHeapSites g_site_table;
+static WlHeapSites *g_sites;
+static uintptr_t g_program_base; // the callers are kept from here: offsets for addr2line
+static __thread int t_in_sites;  // (backtrace may allocate: not counted by site)
+
+// The block `p` made, by the two callers above the allocator's entry (counted's caller's).
+static __attribute__((noinline)) void sites_alloc(void *p) {
+    WlHeapSites *s = __atomic_load_n(&g_sites, __ATOMIC_ACQUIRE);
+    if (s == NULL || t_in_sites != 0) {
+        return;
+    }
+    size_t size = malloc_usable_size(p);
+    uintptr_t c0 = 0, c1 = 0;
+    if (size >= s->min_tracked) {
+        // frames: this function, counted (which the entry point, malloc or another, tail-calls), the
+        // entry point's caller, the next
+        void *frames[4];
+        t_in_sites = 1;
+        int n = backtrace(frames, 4);
+        t_in_sites = 0;
+        c0 = n > 2 ? (uintptr_t)frames[2] - g_program_base : 0u;
+        c1 = n > 3 ? (uintptr_t)frames[3] - g_program_base : 0u;
+    }
+    wl_heap_sites_alloc(s, p, size, c0, c1);
+}
+
+static void sites_free(void *p) {
+    WlHeapSites *s = __atomic_load_n(&g_sites, __ATOMIC_ACQUIRE);
+    if (s != NULL) {
+        wl_heap_sites_free(s, p, malloc_usable_size(p));
+    }
+}
 
 static long live_add(long delta) {
     return __atomic_add_fetch(&g_live, delta, __ATOMIC_RELAXED);
@@ -127,9 +165,17 @@ static int admit(size_t more) {
     if (cap == 0) {
         return 1;
     }
-    long used = __atomic_load_n(&g_live, __ATOMIC_RELAXED) - __atomic_load_n(&g_base, __ATOMIC_RELAXED);
-    if (more <= (size_t)LONG_MAX && used + (long)more <= cap) {
-        return 1;
+    for (;;) {
+        long used = __atomic_load_n(&g_live, __ATOMIC_RELAXED) - __atomic_load_n(&g_base, __ATOMIC_RELAXED);
+        cap = __atomic_load_n(&g_cap, __ATOMIC_RELAXED);
+        if (more <= (size_t)LONG_MAX && used + (long)more <= cap) {
+            return 1;
+        }
+        // memory the program keeps for itself given back (mem_census.h), as the Wii's heap is
+        // given it: the cap grows or blocks are freed
+        if (wl_platform_heap_reclaim(more) == 0) {
+            break;
+        }
     }
     __atomic_add_fetch(&g_refused, 1u, __ATOMIC_RELAXED);
     size_t seen = __atomic_load_n(&g_largest_refused, __ATOMIC_RELAXED);
@@ -140,11 +186,12 @@ static int admit(size_t more) {
     return 0;
 }
 
-static void *counted(void *p) {
+static __attribute__((noinline)) void *counted(void *p) {
     if (p != NULL && t_exempt > 0 && exempt_add(p)) {
         return p;
     }
     if (p != NULL) {
+        sites_alloc(p);
         long now = live_add((long)malloc_usable_size(p));
         long high = __atomic_load_n(&g_peak, __ATOMIC_RELAXED);
         while (now > high &&
@@ -180,6 +227,7 @@ void *calloc(size_t count, size_t size) {
 void free(void *ptr) {
     if (ptr != NULL) {
         if (!exempt_take(ptr)) {
+            sites_free(ptr);
             live_add(-(long)malloc_usable_size(ptr));
         }
         __libc_free(ptr);
@@ -213,6 +261,11 @@ void *realloc(void *ptr, size_t size) {
         // (no room in the set: counted from now on)
     } else {
         live_add(-(long)old);
+        WlHeapSites *sites = __atomic_load_n(&g_sites, __ATOMIC_ACQUIRE);
+        if (sites != NULL) {
+            // (the old block, moved or kept: off its site by the size it was counted for)
+            wl_heap_sites_free(sites, ptr, old);
+        }
     }
     return counted(q);
 }
@@ -278,6 +331,45 @@ void wl_platform_heap_mark(void) {
     __atomic_store_n(&g_peak, now, __ATOMIC_RELAXED);
 }
 
+WlResult wl_platform_heap_cap_add(size_t bytes) {
+    if (__atomic_load_n(&g_cap, __ATOMIC_RELAXED) == 0) {
+        return WL_ERR_STATE;
+    }
+    if (bytes > (size_t)LONG_MAX / 2) {
+        return WL_ERR_ARG;
+    }
+    __atomic_add_fetch(&g_cap, (long)bytes, __ATOMIC_RELAXED);
+    return WL_OK;
+}
+
+bool wl_platform_heap_reclaims(void) {
+    return true;
+}
+
+WlResult wl_platform_heap_track_sites(void *storage, size_t bytes, uint32_t sites, size_t min_tracked) {
+    if (g_sites != NULL) {
+        return WL_ERR_STATE;
+    }
+    Dl_info info;
+    if (dladdr((void *)&wl_platform_heap_track_sites, &info) != 0) {
+        g_program_base = (uintptr_t)info.dli_fbase;
+    }
+    void *frames[2];
+    (void)backtrace(frames, 2); // (its first call loads the unwinder, which allocates)
+    WlResult r = wl_heap_sites_init(&g_site_table, storage, bytes, sites, min_tracked);
+    if (r == WL_OK) {
+        __atomic_store_n(&g_sites, &g_site_table, __ATOMIC_RELEASE);
+    }
+    return r;
+}
+
+void wl_platform_heap_log_sites(size_t count) {
+    WlHeapSites *s = __atomic_load_n(&g_sites, __ATOMIC_ACQUIRE);
+    if (s != NULL) {
+        wl_heap_sites_log(s, count);
+    }
+}
+
 WlResult wl_platform_heap_cap(size_t bytes) {
     if (bytes > (size_t)LONG_MAX) {
         return WL_ERR_ARG;
@@ -318,6 +410,27 @@ void wl_platform_heap_info(WlPlatformHeapInfo *out) {
     memset(out, 0, sizeof *out);
 }
 #endif
+
+WlResult wl_platform_heap_cap_add(size_t bytes) {
+    (void)bytes;
+    return WL_ERR_UNSUPPORTED;
+}
+
+bool wl_platform_heap_reclaims(void) {
+    return false;
+}
+
+WlResult wl_platform_heap_track_sites(void *storage, size_t bytes, uint32_t sites, size_t min_tracked) {
+    (void)storage;
+    (void)bytes;
+    (void)sites;
+    (void)min_tracked;
+    return WL_ERR_UNSUPPORTED;
+}
+
+void wl_platform_heap_log_sites(size_t count) {
+    (void)count;
+}
 
 WlResult wl_platform_heap_cap(size_t bytes) {
     (void)bytes;

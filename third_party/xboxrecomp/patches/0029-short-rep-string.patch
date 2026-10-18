@@ -1,0 +1,497 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Sun, 18 Oct 2026 13:11:48 -0400
+Subject: [PATCH] recomp: short rep movs, stos and cmps inline
+
+MSVC's memcpy is `rep movsd` for the dwords and `rep movsb` for the 0..3
+bytes left, so every copy lifted to two memcpy calls with their range
+checks, the second of 0..3 bytes, and a copy or fill of a few dwords paid
+for the call too (in Halo, about 500 such calls a frame).
+
+rep movs and rep stos now move or store up to 3 elements in the element
+loop, one by one as the hardware does (each a guest access, so an MMIO
+window and an overlapping copy see what they saw), with no call;
+only longer or backward runs reach the general form. The instruction
+before one in its block says more: after `and ecx, n` (n <= 3) the
+general form is left out, after `mov ecx, n` (n <= 4) the
+elements are moved with no test at all. A rep compare after `mov ecx, n`
+(n <= 4; a GUID is `mov ecx, 4; repe cmpsd`) is unrolled forwards.
+
+Two fixes on the way: rep stosb's memset ran over whatever edi pointed
+at, MMIO and a range wrapping the address space included (now checked
+as rep stosd and rep movs check it), and a rep compare that computes CF
+read each element twice (two volatile reads of a device register).
+---
+ tools/recomp/lifter.py                        | 141 +++++++++++++++---
+ tools/recomp/test_lifter_rep_compare_flags.py |   4 +-
+ tools/recomp/test_rep_compare_short.py        |  79 ++++++++++
+ tools/recomp/test_rep_movs_mmio.py            |   2 +-
+ tools/recomp/test_rep_short.py                | 115 ++++++++++++++
+ tools/recomp/test_rep_stosd_fill.py           |   2 +-
+ 6 files changed, 316 insertions(+), 27 deletions(-)
+ create mode 100644 tools/recomp/test_rep_compare_short.py
+ create mode 100644 tools/recomp/test_rep_short.py
+
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index 02fe199..fd9a883 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -3177,9 +3177,15 @@ class Lifter:
+ 
+         Validate the entire guest range in 64 bits before the host fast path,
+         including a range crossing into MMIO or wrapping the 32-bit address.
++
++        A zero count does nothing, and 1..3 elements forwards are moved one
++        by one as the hardware moves them (each a guest access, MMIO and
++        overlap included), so neither reaches memcpy: MSVC's memcpy is
++        `rep movsd` for the dwords and `rep movsb` for the 0..3 bytes left,
++        and in a title most of those calls had 0 or a few bytes to copy.
+         """
+         mem = f"MEM{size*8}"
+-        return [
++        big = [
+             "{ uint64_t _n = (uint64_t)ecx * %du;" % size,
+             "if (!g_df && esi < 0xFD000000u && edi < 0xFD000000u"
+             " && (uint64_t)esi + _n <= 0xFD000000u"
+@@ -3191,8 +3197,40 @@ class Lifter:
+             f"else {{ uint32_t _i; int32_t _st = RECOMP_DF_STEP({size});",
+             f"  for (_i = 0; _i < ecx; _i++) {mem}(edi + _i*_st) = {mem}(esi + _i*_st);",
+             "  esi += ecx * _st; edi += ecx * _st; }",
+-            f"ecx = 0; }} /* {m} */",
++            "}",
+         ]
++        back = [f"{{ uint32_t _i; int32_t _st = RECOMP_DF_STEP({size});"
++                f" for (_i = 0; _i < ecx; _i++) {mem}(edi + _i*_st) = {mem}(esi + _i*_st);"
++                " esi += ecx * _st; edi += ecx * _st; }"]
++        return self._rep_short(m, size, big, back,
++                               lambda k: f"{mem}(edi{_rep_at(k, size)}) = {mem}(esi{_rep_at(k, size)});",
++                               ("esi", "edi"))
++
++    def _rep_short(self, m, size, big, back, element, regs):
++        """The rep store or copy around its general form `big`: up to three
++        elements (none included) go through `back`, the element loop alone,
++        one guest access an element and no call; `element(k)` is element k
++        forwards, for a count the instruction before states.
++
++        rep_count, set by lift_basic_block from the instruction before this
++        one in its block, says what ecx holds: ("exact", n) after `mov ecx,
++        n`, ("max", n) after `and ecx, n`. An exact count of 1..4 is moved
++        without a test (the element loop for DF=1), and a count of at most
++        3 is the element loop alone.
++        """
++        hint = getattr(self, "rep_count", None)
++        kind, n = hint if hint else (None, None)
++        step = lambda c: " ".join(f"{r} += {c};" for r in regs)
++        if kind == "exact" and n == 0:
++            return [f"/* {m}: ecx is 0, nothing moves */"]
++        if kind == "exact" and n <= 4:
++            moves = " ".join(element(k) for k in range(n))
++            return ([f"if (!g_df) {{ {moves} {step(f'{n * size}u')} ecx = 0; }} /* {m}: ecx = {n} */",
++                     "else {"] + back + ["ecx = 0; }"])
++        if kind == "max" and n <= 3:
++            return [f"{{ /* {m}: ecx <= {n} */"] + back + ["ecx = 0; }"]
++        # the long run first: it pays one test for the element loop
++        return ([f"if (ecx > 3u) {{ /* {m} */"] + big + ["} else"] + back + ["ecx = 0;"])
+ 
+     def _lift_rep_string(self, insn, m):
+         # Every one of these steps by RECOMP_DF_STEP(size) rather than a
+@@ -3223,32 +3261,39 @@ class Lifter:
+         if "movsw" in m:
+             return self._lift_rep_movs(2, m)
+         if "stosb" in m:
+-            return ["if (!g_df) { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
+-                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+-                    " MEM8(edi - _i) = LO8(eax); edi -= ecx; }",
+-                    "ecx = 0; /* rep stosb */"]
++            # memset only over ordinary memory, the range checked as rep movs
++            # checks it: it used to memset whatever edi pointed at, MMIO and
++            # a range wrapping the 32-bit address included.
++            return self._rep_short(m, 1, [
++                "{ if (!g_df && edi < 0xFD000000u && (uint64_t)edi + ecx <= 0xFD000000u) {",
++                "  memset((void*)XBOX_PTR(edi), (int)(eax & 0xFFu), (size_t)ecx); edi += ecx; }",
++                "else { uint32_t _i; int32_t _st = RECOMP_DF_STEP(1);"
++                " for (_i = 0; _i < ecx; _i++) MEM8(edi + _i*_st) = LO8(eax);"
++                " edi += ecx * _st; } }",
++            ], _rep_fill_loop(1, "MEM8", "LO8(eax)"),
++               lambda k: f"MEM8(edi{_rep_at(k, 1)}) = LO8(eax);", ("edi",))
+         if "stosd" in m:
+             # Forwards, over ordinary memory, with a value whose four bytes
+             # are the same (zero, -1: nearly every fill), the bytes memset
+             # writes are the ones the loop writes; the range is checked as
+             # rep movs checks it. Anything else stays the element loop.
+-            return [
++            return self._rep_short(m, 4, [
+                 "{ uint64_t _n = (uint64_t)ecx * 4u;",
+                 "if (!g_df && eax == (eax & 0xFFu) * 0x01010101u && edi < 0xFD000000u"
+                 " && (uint64_t)edi + _n <= 0xFD000000u) {",
+                 "  memset((void*)XBOX_PTR(edi), (int)(eax & 0xFFu), (size_t)_n); edi += ecx * 4u; }",
+                 "else { uint32_t _i; int32_t _st = RECOMP_DF_STEP(4);"
+                 " for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*_st) = eax;"
+-                " edi += ecx * _st; }",
+-                "ecx = 0; } /* rep stosd */"
+-            ]
++                " edi += ecx * _st; } }",
++            ], _rep_fill_loop(4, "MEM32", "eax"),
++               lambda k: f"MEM32(edi{_rep_at(k, 4)}) = eax;", ("edi",))
+         if "stosw" in m:
+-            return [
++            return self._rep_short(m, 2, [
+                 "{ uint32_t _i; int32_t _st = RECOMP_DF_STEP(2);"
+                 " for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*_st) = LO16(eax);"
+                 " edi += ecx * _st; }",
+-                "ecx = 0; /* rep stosw */"
+-            ]
++            ], _rep_fill_loop(2, "MEM16", "LO16(eax)"),
++               lambda k: f"MEM16(edi{_rep_at(k, 2)}) = LO16(eax);", ("edi",))
+         if "cmpsb" in m:
+             return self._rep_compare(m, "MEM8(esi)", "MEM8(edi)", 1, True)
+         if "scasb" in m:
+@@ -3289,24 +3334,41 @@ class Lifter:
+         A zero count leaves the flags as they were. _cf does that by itself
+         (only an iteration writes it); for _flags, lift_basic_block loads
+         the incoming ZF before this loop when a tracked setter provides it.
++
++        Each element is read once (the operands are volatile guest accesses:
++        ZF and CF came from two reads of each, and a device register read
++        twice). After `mov ecx, n` with n of 1 to 4 (rep_count: MSVC
++        compares a GUID, 16 bytes, as `mov ecx, 4; repe cmpsd`) the forward
++        compare is unrolled: no count test, no loop.
+         """
+         continue_on_equal = "repne" not in m and "repnz" not in m
+         stop_condition = "!_flags" if continue_on_equal else "_flags"
+-        advance = ("esi += _st; edi += _st; ecx--;" if uses_esi
+-                   else "edi += _st; ecx--;")
+-        lines = [
++        go_on = "_flags" if continue_on_equal else "!_flags"
++        regs = ("esi", "edi") if uses_esi else ("edi",)
++
++        def element(st):
++            if self.needs_cf:
++                body = (f"{{ uint32_t _ca = {first}, _cb = {second};"
++                        " _flags = (_ca == _cb); _cf = (_ca < _cb); }")
++            else:
++                body = f"_flags = ({first} == {second});"
++            return body + " " + " ".join(f"{r} += {st};" for r in regs) + " ecx--;"
++
++        loop = [
+             f"{{ int32_t _st = RECOMP_DF_STEP({step});",
+             "while (ecx != 0) {",
+-            f"    _flags = ({first} == {second});",
+-        ]
+-        if self.needs_cf:
+-            lines.append(f"    _cf = ({first} < {second});")
+-        lines += [
+-            f"    {advance}",
++            f"    {element('_st')}",
+             f"    if ({stop_condition}) break;",
+             f"}} }} /* {m} */",
+         ]
+-        return lines
++        hint = getattr(self, "rep_count", None)
++        if hint and hint[0] == "exact" and 1 <= hint[1] <= 4:
++            n = hint[1]
++            chain = element(f"{step}u")
++            for _ in range(n - 1):
++                chain = element(f"{step}u") + f" if ({go_on}) {{ " + chain + " }"
++            return ([f"if (!g_df) {{ {chain} }} /* {m}: ecx = {n} */", "else"] + loop)
++        return loop
+ 
+     def _lift_string_op(self, insn, m):
+         # Unprefixed forms; direction still comes from EFLAGS.DF.
+@@ -4271,6 +4333,36 @@ class Lifter:
+         return [f"/* FPU: {m} {insn.op_str} */"]
+ 
+ 
++def _rep_at(k, size):
++    """The displacement of element k of a forward rep op, as an address tail."""
++    return f" + {k * size}u" if k else ""
++
++
++def _rep_fill_loop(size, mem, value):
++    """rep stos as its element loop, either direction."""
++    return [f"{{ uint32_t _i; int32_t _st = RECOMP_DF_STEP({size});"
++            f" for (_i = 0; _i < ecx; _i++) {mem}(edi + _i*_st) = {value};"
++            " edi += ecx * _st; }"]
++
++
++def _rep_count_hint(insns, i):
++    """What the instruction before insns[i] in its block says about ecx:
++    ("exact", n) after `mov ecx, n`, ("max", n) after `and ecx, n`, else None.
++    The block has one entry, so that instruction always runs just before."""
++    if i == 0:
++        return None
++    prev = insns[i - 1]
++    ops = prev.operands
++    if (len(ops) == 2 and ops[0].type == "reg" and ops[0].reg == "ecx"
++            and ops[1].type == "imm" and ops[1].imm is not None):
++        n = ops[1].imm & 0xFFFFFFFF
++        if prev.mnemonic == "mov":
++            return ("exact", n)
++        if prev.mnemonic == "and":
++            return ("max", n)
++    return None
++
++
+ def _is_rep_compare(insn):
+     """REPE/REPNE CMPS or SCAS -- the prefixed forms that write `_flags`."""
+     if not insn.mnemonic.startswith("rep"):
+@@ -4443,8 +4535,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
+                 zf = _make_condition("je", last_flag_setter, last_flag_ops)
+                 sf = _make_condition("js", last_flag_setter, last_flag_ops)
+                 lifter.shift_flags_in = (zf[0], sf[0]) if zf and sf else None
++            lifter.rep_count = (_rep_count_hint(insns, i)
++                                if curr.mnemonic.startswith("rep") else None)
+             results = lifter.lift_instruction(insns[i])
+             lifter.shift_flags_in = None
++            lifter.rep_count = None
+             # A REPE/REPNE compare whose count is zero leaves EFLAGS alone,
+             # but `_flags` would keep whatever it last held -- 0 on entry --
+             # so the je after it read "not equal" where the hardware reads
+diff --git a/tools/recomp/test_lifter_rep_compare_flags.py b/tools/recomp/test_lifter_rep_compare_flags.py
+index a908933..407d84c 100644
+--- a/tools/recomp/test_lifter_rep_compare_flags.py
++++ b/tools/recomp/test_lifter_rep_compare_flags.py
+@@ -171,9 +171,9 @@ def test_rep_compare_matches_x86_for_every_count_and_order():
+ 
+ 
+ def test_negative_control_without_cf_the_order_is_lost():
+-    srcs = {n: re.sub(r"\n\s*_cf = \(M[^\n]*;", "", s)
++    srcs = {n: re.sub(r"\n\s*_cf = \(M[^\n]*;| _cf = \(_ca < _cb\);", "", s)
+             for n, s in _generated().items()}
+-    assert all("_cf = (M" not in s for s in srcs.values())
++    assert all("_cf = (M" not in s and "_cf = (_ca" not in s for s in srcs.values())
+     ran = _build_and_run(srcs)
+     assert ran.returncode == 1, "dropping CF should make a -1 come out +1"
+     assert "want -1" in ran.stderr, ran.stderr
+diff --git a/tools/recomp/test_rep_compare_short.py b/tools/recomp/test_rep_compare_short.py
+new file mode 100644
+index 0000000..b63c6b9
+--- /dev/null
++++ b/tools/recomp/test_rep_compare_short.py
+@@ -0,0 +1,79 @@
++"""repe/repne cmps and scas after `mov ecx, n` (n = 1..4): the unrolled forward compare gives what
++the element loop gives -- ZF, CF, esi, edi and ecx -- for a mismatch at every position and none,
++both directions, at every element width, with and without CF, and reads each element once.
++"""
++from tools.recomp.lifter import Lifter
++from tools.recomp.disasm import Instruction
++from tools.recomp.test_rep_movs_mmio import _build_and_run
++
++_OPS = ["repe cmpsb", "repe cmpsw", "repe cmpsd", "repne cmpsb", "repne cmpsd",
++        "repe scasb", "repne scasb", "repe scasd", "repne scasw"]
++
++
++def _lift(m, hint, cf):
++    lifter = Lifter()
++    lifter.needs_cf = cf
++    lifter.rep_count = hint
++    return "".join(lifter.lift_instruction(Instruction(0, 2, m, "", "")))
++
++
++def test_unrolled_compare_matches_the_loop():
++    prelude = r'''
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++uint32_t eax,esi,edi,ecx;
++int g_df, _flags, _cf;
++unsigned accesses;
++uint8_t mem[65536];
++void* touch(uint32_t a){accesses++;return mem+(a&0xffffu);}
++#define MEM8(a) (*(volatile uint8_t*)touch(a))
++#define MEM16(a) (*(volatile uint16_t*)touch(a))
++#define MEM32(a) (*(volatile uint32_t*)touch(a))
++#define LO8(x) ((uint8_t)(x))
++#define LO16(x) ((uint16_t)(x))
++#define RECOMP_DF_STEP(s) (g_df?-(s):(s))
++typedef void (*fn)(void);
++'''
++    funcs, table = [], []
++    for k, m in enumerate(_OPS):
++        for cf in (0, 1):
++            for n in range(1, 5):
++                for form, hint in (("u", ("exact", n)), ("l", None)):
++                    funcs.append(f"void f{k}_{cf}_{n}_{form}(void){{{_lift(m, hint, bool(cf))}}}")
++                table.append(f'{{f{k}_{cf}_{n}_u,f{k}_{cf}_{n}_l,"{m}",{cf},{n}}}')
++    main = r'''
++struct { fn u, l; const char *name; int cf; unsigned n; } cases[] = {''' + ",".join(table) + r'''};
++int main(void){
++    for(unsigned c=0;c<sizeof cases/sizeof cases[0];c++) for(int df=0;df<2;df++)
++    for(unsigned miss=0;miss<=cases[c].n;miss++) for(unsigned lower=0;lower<2;lower++){
++        uint32_t r[2][6]; unsigned acc[2];
++        for(int v=0;v<2;v++){
++            for(unsigned i=0;i<sizeof mem;i++)mem[i]=(uint8_t)(i>=0x800?i-0x800:i)*7;
++            /* elements of the second range equal the first's but the one at index miss */
++            uint32_t s=df?0x40C:0x400, d=s+0x800, z=4;
++            if(miss<cases[c].n){uint32_t at=d+(df?-(int)(miss*z):(int)(miss*z));
++                for(unsigned b=0;b<4;b++) mem[(at+b)&0xffff]+=lower?1:-1;}
++            eax=*(uint32_t*)(mem+0x400+(df?0x0C:0)); /* scas: the first element */
++            esi=s;edi=d;ecx=cases[c].n;g_df=df;_flags=7;_cf=7;accesses=0;
++            (v?cases[c].l:cases[c].u)();
++            r[v][0]=esi;r[v][1]=edi;r[v][2]=ecx;r[v][3]=_flags;r[v][4]=cases[c].cf?_cf:0;r[v][5]=eax;acc[v]=accesses;
++        }
++        if(memcmp(r[0],r[1],sizeof r[0]) || acc[0]>acc[1]){
++            printf("%s cf %d n %u df %d miss %u: esi %x/%x edi %x/%x ecx %u/%u zf %u/%u cf %u/%u acc %u/%u\n",
++                cases[c].name,cases[c].cf,cases[c].n,df,miss,r[0][0],r[1][0],r[0][1],r[1][1],r[0][2],r[1][2],
++                r[0][3],r[1][3],r[0][4],r[1][4],acc[0],acc[1]);
++            return 1;
++        }
++    }
++    return 0;
++}
++'''
++    ran = _build_and_run(prelude + "\n".join(funcs) + main)
++    assert ran.returncode == 0, ran.stdout + ran.stderr
++
++
++def test_with_cf_each_element_is_read_once():
++    text = _lift("repe cmpsd", None, True)
++    assert text.count("MEM32(esi)") == 1 and text.count("MEM32(edi)") == 1, text
++    assert "/* repe cmpsd: ecx = 4 */" in _lift("repe cmpsd", ("exact", 4), False)
+diff --git a/tools/recomp/test_rep_movs_mmio.py b/tools/recomp/test_rep_movs_mmio.py
+index 0aca1c5..f041d8d 100644
+--- a/tools/recomp/test_rep_movs_mmio.py
++++ b/tools/recomp/test_rep_movs_mmio.py
+@@ -55,7 +55,7 @@ int main(void){
+         int fast=!df && s<0xFD000000u && d<0xFD000000u
+                 && (uint64_t)s+n*z<=0xFD000000u && (uint64_t)d+n*z<=0xFD000000u
+                 && ((uint64_t)d+n*z<=s || (uint64_t)s+n*z<=d);
+-        if(memcmp(mem,refmem,sizeof mem) || esi!=rs || edi!=rd || ecx!=0 || accesses!=(fast?0:2*n)){
++        if(memcmp(mem,refmem,sizeof mem) || esi!=rs || edi!=rd || ecx!=0 || accesses!=(fast && n>=4?0:2*n)){
+             printf("size %u mode %u count %u access %u\n",z,mode,n,accesses);return 1;
+         }
+     }
+diff --git a/tools/recomp/test_rep_short.py b/tools/recomp/test_rep_short.py
+new file mode 100644
+index 0000000..189062d
+--- /dev/null
++++ b/tools/recomp/test_rep_short.py
+@@ -0,0 +1,115 @@
++"""rep movs and rep stos with a zero count or one to three elements, and with the count the
++instruction before them states (`mov ecx, n`, `and ecx, n`).
++
++Each emitted block runs against an access-counting guest-memory fixture, at every element width,
++for every count the hint allows, over ordinary memory, an overlapping forward copy, the backward
++direction and the hardware aperture: the bytes, esi, edi and ecx are the instruction's, a zero count
++touches nothing, and the short forms make one guest access per element read or written (so an MMIO
++window sees each element, as the hardware's) and never reach memcpy or memset.
++"""
++from tools.recomp.lifter import Lifter, lift_basic_block
++from tools.recomp.disasm import BasicBlock, Instruction, Operand
++from tools.recomp.test_rep_movs_mmio import _build_and_run
++
++_NAMES = {("movs", 1): "rep movsb", ("movs", 2): "rep movsw", ("movs", 4): "rep movsd",
++          ("stos", 1): "rep stosb", ("stos", 2): "rep stosw", ("stos", 4): "rep stosd"}
++# (C name, hint for the lifter, counts the hint allows)
++_HINTS = [("any", None, range(0, 10)), ("max3", ("max", 3), range(0, 4)),
++          ("max1", ("max", 1), range(0, 2))] + [
++          (f"exact{n}", ("exact", n), (n,)) for n in range(0, 6)]
++
++
++def _lift(op, size, hint):
++    lifter = Lifter()
++    lifter.rep_count = hint
++    return "".join(lifter.lift_instruction(Instruction(0, 2, _NAMES[op, size], "", "")))
++
++
++def test_rep_short_forms_match_the_instruction():
++    prelude = r'''
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++uint32_t eax,esi,edi,ecx;
++int g_df;
++unsigned accesses, calls;
++uint8_t mem[131076],refmem[131076];
++unsigned slot(uint32_t a){return (a&0xffffu)+(a>=0xFD000000u?65536u:0u);}
++void* touch(uint32_t a){accesses++;return mem+slot(a);}
++#define XBOX_PTR(a) (mem+slot(a))
++#define MEM8(a) (*(volatile uint8_t*)touch(a))
++#define MEM16(a) (*(volatile uint16_t*)touch(a))
++#define MEM32(a) (*(volatile uint32_t*)touch(a))
++#define LO8(x) ((uint8_t)(x))
++#define LO16(x) ((uint16_t)(x))
++#define RECOMP_DF_STEP(s) (g_df?-(s):(s))
++static void *count_memcpy(void *d, const void *s, size_t n){calls++;return memcpy(d,s,n);}
++static void *count_memset(void *d, int v, size_t n){calls++;return memset(d,v,n);}
++#define memcpy count_memcpy
++#define memset count_memset
++typedef void (*fn)(void);
++'''
++    funcs, table = [], []
++    for op in ("movs", "stos"):
++        for size in (1, 2, 4):
++            for name, hint, counts in _HINTS:
++                f = f"{op}{size}_{name}"
++                funcs.append(f"void {f}(void){{{_lift(op, size, hint)}}}")
++                table.append(f'{{{f},"{f}",{1 if op == "movs" else 0},{size},'
++                             f'{min(counts)},{max(counts)}}}')
++    main = r'''
++#undef memcpy
++#undef memset
++struct { fn f; const char *name; int movs; unsigned z, lo, hi; } cases[] = {''' + ",".join(table) + r'''};
++int main(void){
++    for(unsigned c=0;c<sizeof cases/sizeof cases[0];c++) for(unsigned mode=0;mode<5;mode++)
++    for(unsigned n=cases[c].lo;n<=cases[c].hi;n++){
++        unsigned z=cases[c].z; int movs=cases[c].movs;
++        uint32_t s=0x100,d=0x400,v=0x9A8B7C6Du; int df=0;
++        if(mode==1)d=s+z;                    /* forward overlap: the pattern propagates */
++        if(mode==2){s+=8*z;d=s-z;df=1;}     /* backwards */
++        if(mode==3)d=0xFD000400;            /* hardware */
++        if(mode==4)s=0xFD000100;
++        for(unsigned i=0;i<sizeof mem;i++)mem[i]=refmem[i]=(uint8_t)(i*37+13);
++        uint32_t rs=s,rd=d;
++        for(unsigned i=0;i<n;i++){
++            uint8_t e[4];
++            if(movs)memcpy(e,refmem+slot(rs),z); else memcpy(e,&v,z);
++            memcpy(refmem+slot(rd),e,z);
++            rs+=df?-(int)z:z;rd+=df?-(int)z:z;
++        }
++        if(!movs)rs=s;
++        eax=v;esi=s;edi=d;ecx=n;g_df=df;accesses=0;calls=0;cases[c].f();
++        unsigned want=(movs?2:1)*n;
++        int shortform=n<4 && !df;
++        if(memcmp(mem,refmem,sizeof mem) || esi!=rs || edi!=rd || ecx!=0 || eax!=v
++           || (n==0 && (accesses||calls)) || (shortform && (accesses!=want || calls))){
++            printf("%s mode %u count %u access %u calls %u\n",cases[c].name,mode,n,accesses,calls);
++            return 1;
++        }
++    }
++    return 0;
++}
++'''
++    ran = _build_and_run(prelude + "\n".join(funcs) + main)
++    assert ran.returncode == 0, ran.stdout + ran.stderr
++
++
++def _ecx_op(mnemonic, n):
++    return Instruction(0x100, 3, mnemonic, f"ecx, {n}", "",
++                       operands=[Operand(type="reg", reg="ecx"), Operand(type="imm", imm=n)])
++
++
++def test_the_instruction_before_sets_the_hint():
++    rep = Instruction(0x103, 2, "rep movsb", "", "")
++    for before, want in ((_ecx_op("and", 3), "/* rep movsb: ecx <= 3 */"),
++                         (_ecx_op("mov", 2), "/* rep movsb: ecx = 2 */")):
++        stmts, _ = lift_basic_block(Lifter(), BasicBlock(0x100, [before, rep]))
++        text = "\n".join(stmts)
++        assert want in text, text
++        assert "memcpy" not in text, text
++    # an unrelated instruction before: the general form, memcpy included
++    other = Instruction(0x100, 2, "mov", "edx, 3", "",
++                        operands=[Operand(type="reg", reg="edx"), Operand(type="imm", imm=3)])
++    stmts, _ = lift_basic_block(Lifter(), BasicBlock(0x100, [other, rep]))
++    assert "memcpy" in "\n".join(stmts)
+diff --git a/tools/recomp/test_rep_stosd_fill.py b/tools/recomp/test_rep_stosd_fill.py
+index e18b999..1ce0184 100644
+--- a/tools/recomp/test_rep_stosd_fill.py
++++ b/tools/recomp/test_rep_stosd_fill.py
+@@ -41,7 +41,7 @@ int main(void){
+         eax=values[v];edi=d;ecx=n;g_df=df;accesses=0;fill();
+         uint32_t x=values[v];
+         int fast=!df && x==(x&0xFFu)*0x01010101u && d<0xFD000000u && (uint64_t)d+n*4<=0xFD000000u;
+-        if(memcmp(mem,refmem,sizeof mem) || edi!=rd || ecx!=0 || eax!=x || accesses!=(fast?0:n)){
++        if(memcmp(mem,refmem,sizeof mem) || edi!=rd || ecx!=0 || eax!=x || accesses!=(fast && n>=4?0:n)){
+             printf("value %08x mode %u count %u access %u\n",x,mode,n,accesses);return 1;
+         }
+     }

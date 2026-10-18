@@ -37,7 +37,8 @@ written back to the g_fp_* globals only where control leaves the function (--x87
 identical), and its integer registers too (--reg-locals, patch 0014: every guest store made the
 compiler reload them). A title's config can turn either off ("x87_locals": false,
 "reg_locals": false). It writes a guest access's small constant displacement apart from its base
-(--mem-disp, patch 0021: MEM32_D(esi, 0x8)), so the PowerPC header maps the base once for the
+(--mem-disp, patch 0021: MEM32_D(esi, 0x8); patch 0025: the float stores and the SSE and MMX
+accesses too, MEMF_SET_D(esi, 0x8, v)), so the PowerPC header maps the base once for the
 accesses through it ("mem_disp": false turns it off), and an access at esp + a small constant as
 MEMxx_SP(esp, disp) (--stack-disp, patch 0023), which the header addresses without the map: every
 guest stack is below 0x10000000, where it is the identity ("stack_disp": false turns it off).

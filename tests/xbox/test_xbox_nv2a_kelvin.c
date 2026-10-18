@@ -682,8 +682,9 @@ TEST fetch_plan_matches_the_fetch_of_each_vertex(void) {
 
 // random headers (increasing and not) over plain methods, the program and constant windows, their
 // load slots, the viewport and the program's start and mode, kicked at random words (runs cut at
-// PUT): the pusher's runs leave the 3D state as wl_nv2a_kelvin_method given each word alone does
-TEST pushed_runs_match_a_method_at_a_time(void) {
+// PUT): the pusher's runs leave the 3D state as wl_nv2a_kelvin_method given each word alone does (the
+// pusher's loop of now, and as it was before: wl_nv2a_set_old_push)
+static enum greatest_test_res pushed_runs_compared(void) {
     static const struct {
         uint16_t base, words;
     } ranges[] = {
@@ -692,6 +693,8 @@ TEST pushed_runs_match_a_method_at_a_time(void) {
         {0x1720, 32}, {0x1B00, 64}, {0x1E40, 16},        {WL_NV2A_K_SET_TRANSFORM_EXECUTION_MODE, 1},
         {WL_NV2A_K_SET_TRANSFORM_PROGRAM_LOAD, 1},       {WL_NV2A_K_SET_TRANSFORM_PROGRAM_START, 1},
         {WL_NV2A_K_SET_TRANSFORM_CONSTANT_LOAD, 1},
+        // (plain methods into the program's window, the program's into the constants', immediate ones)
+        {0x0AF0, 8},  {0x0B70, 8},  {0x1500, 16},
     };
     static const uint32_t some[] = {0, 1, 0x3F800000u, 0xFFFFFFFFu};
     TGuest a, b;
@@ -736,6 +739,17 @@ TEST pushed_runs_match_a_method_at_a_time(void) {
     PASS();
 }
 
+// (the old loop switched off again however the comparison ends, a failed assert included, so the
+// tests after it run the pusher of now)
+TEST pushed_runs_match_a_method_at_a_time(bool old_push) {
+    enum greatest_test_res result;
+
+    wl_nv2a_set_old_push(old_push);
+    result = pushed_runs_compared();
+    wl_nv2a_set_old_push(false);
+    return result;
+}
+
 SUITE(kelvin_suite) {
     RUN_TEST(every_array_format_decodes);
     RUN_TEST(draw_arrays_and_elements);
@@ -749,7 +763,8 @@ SUITE(kelvin_suite) {
     RUN_TEST(every_input_of_the_pixel_program_dirties_it);
     RUN_TEST(surface_decoded);
     RUN_TEST(fetch_plan_matches_the_fetch_of_each_vertex);
-    RUN_TEST(pushed_runs_match_a_method_at_a_time);
+    RUN_TEST1(pushed_runs_match_a_method_at_a_time, false);
+    RUN_TEST1(pushed_runs_match_a_method_at_a_time, true);
 }
 
 GREATEST_MAIN_DEFS();

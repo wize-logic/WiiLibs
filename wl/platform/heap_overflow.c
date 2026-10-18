@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // The spill-over heap's portable core (see heap_overflow.h).
 #include "wl/platform/heap_overflow.h"
+#include "wl/platform/mem_census.h"
 
 #include <string.h>
 
@@ -76,6 +77,16 @@ static Header *header_of(const WlOverflow *o, void *ptr) {
         return NULL;
     }
     return h;
+}
+
+// The primary's answer, asked again while a reclaimer gives memory back to the heap (mem_census.h):
+// memory the program keeps for itself when idle comes before the overflow heap.
+static void *primary_alloc(const WlOverflowPrimary *p, size_t align, size_t size) {
+    void *ptr = p->alloc(p->ctx, align, size);
+    while (ptr == NULL && size != 0u && wl_platform_heap_reclaim(size + align) != 0u) {
+        ptr = p->alloc(p->ctx, align, size);
+    }
+    return ptr;
 }
 
 // ---- the overflow heap ------------------------------------------------------------------------
@@ -173,7 +184,7 @@ void wl_overflow_failed(WlOverflow *o, const char *what, size_t size, size_t ali
 // ---- the entry points -------------------------------------------------------------------------
 
 void *wl_overflow_malloc(WlOverflow *o, const WlOverflowPrimary *p, size_t size) {
-    void *ptr = p->alloc(p->ctx, 0u, size);
+    void *ptr = primary_alloc(p, 0u, size);
     if (ptr == NULL && size != 0u) {
         ptr = wl_overflow_alloc(o, 0u, size);
         if (ptr == NULL) {
@@ -191,8 +202,11 @@ void *wl_overflow_calloc(WlOverflow *o, const WlOverflowPrimary *p, size_t count
     void *ptr;
     if (p->calloc != NULL) {
         ptr = p->calloc(p->ctx, count, size);
+        while (ptr == NULL && total != 0u && wl_platform_heap_reclaim(total) != 0u) {
+            ptr = p->calloc(p->ctx, count, size);
+        }
     } else {
-        ptr = p->alloc(p->ctx, 0u, total);
+        ptr = primary_alloc(p, 0u, total);
         if (ptr != NULL) {
             memset(ptr, 0, total);
         }
@@ -212,7 +226,7 @@ void *wl_overflow_memalign(WlOverflow *o, const WlOverflowPrimary *p, size_t ali
     if (align == 0u) {
         return wl_overflow_malloc(o, p, size);
     }
-    void *ptr = p->alloc(p->ctx, align, size);
+    void *ptr = primary_alloc(p, align, size);
     if (ptr == NULL && size != 0u) {
         ptr = wl_overflow_alloc(o, align, size);
         if (ptr == NULL) {
@@ -272,7 +286,7 @@ void *wl_overflow_realloc(WlOverflow *o, const WlOverflowPrimary *p, void *ptr, 
         }
         old_size = h->size;
         // it must grow: the primary heap first (memory freed there is used again), then this one
-        moved = p->alloc(p->ctx, 0u, size);
+        moved = primary_alloc(p, 0u, size);
         if (moved == NULL) {
             moved = wl_overflow_alloc(o, 0u, size);
         }
@@ -289,11 +303,14 @@ void *wl_overflow_realloc(WlOverflow *o, const WlOverflowPrimary *p, void *ptr, 
     }
     if (p->realloc != NULL) {
         moved = p->realloc(p->ctx, ptr, size);
+        while (moved == NULL && wl_platform_heap_reclaim(size) != 0u) {
+            moved = p->realloc(p->ctx, ptr, size);
+        }
         if (moved != NULL) {
             return moved;
         }
     } else {
-        moved = p->alloc(p->ctx, 0u, size);
+        moved = primary_alloc(p, 0u, size);
         if (moved != NULL) {
             size_t have = p->usable_size(p->ctx, ptr);
             memcpy(moved, ptr, have < size ? have : size);

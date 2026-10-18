@@ -19,7 +19,7 @@
 // once.
 //
 // usage: xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] [--no-pairs]
-//            [--fused forms.txt] microcode.inc output.c [table]
+//            [--spill] [--no-forward] [--fused forms.txt] microcode.inc output.c [table]
 //   (table: the name of the table, default xbox_vsh_natives, and of its count, <table>_count;
 //   --if-exists: a microcode file that is not there has no programs, an empty table; --accessor:
 //   also a function of that name, const WlXboxVshNative *name(unsigned long *count), that gives
@@ -30,7 +30,9 @@
 //   is not paying for code it never runs; --no-pairs: no whole-program assembly, the Wii's batches
 //   per instruction as before; --fused: for each form the file names, "<hash> <form> ...", as
 //   xbox_nv2a_replay --fused-forms prints them, the Wii's loop that reads the arrays, runs the
-//   program and writes GX's words))
+//   program and writes GX's words; a skinned form whose registers run out with its blend kept in
+//   them keeps it in memory, or makes it at each vertex; --spill: in memory always, the tests';
+//   --no-forward: a fused loop's inputs stored by its prologue and loaded back, as before))
 
 #include "../wl/xbox/vsh.c"
 
@@ -1251,6 +1253,141 @@ static int reuse_prefix(const WlXboxVshProgram *program, ReusePrefix *prefix) {
     return 1;
 }
 
+/* An instruction the prefix may take (reuse_prefix's tests), for prefix_first */
+static int prefix_takes(const WlXboxVshInstruction *instruction) {
+    int reads[3], which, writes_a0;
+    unsigned writes_now[13];
+    int output = instruction->output_mask && instruction->output_is_register &&
+                 (instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0;
+
+    operands_read(instruction, reads);
+    instruction_writes(instruction, writes_now, &writes_a0);
+    if (instruction->captures_clip || (output && instruction->output_address == _output_position) ||
+        writes_now[12] || (instruction->output_mask && !instruction->output_is_register))
+        return 0;
+    if (output) {
+        const WlXboxVshOperand *from = &instruction->operands[instruction->output_from_ilu ? 2 : 0];
+
+        if (instruction->output_from_ilu ? instruction->ilu != _ilu_mov : instruction->mac != _mac_mov)
+            return 0;
+        if (from->mux == _mux_temporary || (from->mux == _mux_constant && instruction->relative))
+            return 0;
+    }
+    for (which = 0; which < 3; which++) {
+        const WlXboxVshOperand *operand = &instruction->operands[which];
+
+        if (!reads[which])
+            continue;
+        if ((operand->mux == _mux_input && instruction->input == 0) ||
+            (operand->mux == _mux_temporary && operand->index == 12))
+            return 0;
+    }
+    return 1;
+}
+
+/* what an instruction reads and writes, for prefix_first: the temporaries
+(bit n: r[n], 12 the position), a0, an output register (bit n: its address),
+the constants it writes and the inputs it makes temporaries from */
+typedef struct PrefixAccess {
+    unsigned long feeds; /* the input registers that make its temporaries or a0 (reuse_prefix's inputs) */
+    unsigned reads, writes, output_writes;
+    int reads_a0, writes_a0, writes_constant;
+} PrefixAccess;
+
+static void prefix_access(const WlXboxVshInstruction *instruction, PrefixAccess *access) {
+    int reads[3], which, temporary;
+    unsigned writes_now[13];
+
+    memset(access, 0, sizeof(*access));
+    operands_read(instruction, reads);
+    instruction_writes(instruction, writes_now, &access->writes_a0);
+    for (temporary = 0; temporary < 13; temporary++)
+        if (writes_now[temporary])
+            access->writes |= 1u << temporary;
+    for (which = 0; which < 3; which++) {
+        const WlXboxVshOperand *operand = &instruction->operands[which];
+
+        if (!reads[which])
+            continue;
+        if (operand->mux == _mux_temporary)
+            access->reads |= 1u << (operand->index < 12 ? operand->index : 12);
+        if (operand->mux == _mux_constant && instruction->relative)
+            access->reads_a0 = 1;
+    }
+    /* (the clip-space capture reads the position) */
+    if (instruction->captures_clip)
+        access->reads |= 1u << 12;
+    if (instruction->output_mask && instruction->output_is_register &&
+        (instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0)
+        access->output_writes = 1u << (instruction->output_address & 31);
+    access->writes_constant = instruction->output_mask && !instruction->output_is_register;
+    {
+        int mac_t = instruction->mac != _mac_nop && (instruction->mac == _mac_arl || instruction->mac_mask);
+        int ilu_t = instruction->ilu != _ilu_nop && instruction->ilu_mask;
+        int feeds[3];
+
+        feeds[0] = mac_t && reads[0];
+        feeds[1] = mac_t && reads[1];
+        feeds[2] = reads[2] && (ilu_t || (mac_t && (instruction->mac == _mac_add || instruction->mac == _mac_mad)));
+        for (which = 0; which < 3; which++)
+            if (feeds[which] && instruction->operands[which].mux == _mux_input)
+                access->feeds |= 1UL << (instruction->input & 15);
+    }
+}
+
+/* The instructions the prefix may take moved ahead of those it may not, where
+nothing between depends on them nor they on it (a skinned program that works
+out a texture coordinate between its node matrices' blends, say): each
+instruction still reads what it read, so the results are the same to the bit,
+and reuse_prefix then finds the whole blend. Only a program the prefix is worth
+it for is changed (reuse_prefix says so before and after) */
+static void prefix_first(WlXboxVshProgram *program) {
+    static WlXboxVshInstruction moved[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+    static PrefixAccess deferred_access[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+    static unsigned long deferred[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+    unsigned long index, taken = 0, deferred_count = 0, d;
+    ReusePrefix before, after;
+
+    if (!reuse_prefix(program, &before))
+        return;
+    for (index = 0; index < program->count; index++) {
+        const WlXboxVshInstruction *instruction = &program->instructions[index];
+        PrefixAccess access;
+        int free = prefix_takes(instruction);
+
+        prefix_access(instruction, &access);
+        /* (no input the prefix did not compare already: v4's texture coordinate, say) */
+        if (access.feeds & ~before.inputs)
+            free = 0;
+        for (d = 0; free && d < deferred_count; d++) {
+            const PrefixAccess *earlier = &deferred_access[d];
+
+            if ((access.reads & earlier->writes) || (access.writes & (earlier->reads | earlier->writes)) ||
+                (access.reads_a0 && earlier->writes_a0) ||
+                (access.writes_a0 && (earlier->reads_a0 || earlier->writes_a0)) ||
+                (access.output_writes & earlier->output_writes) || access.writes_constant ||
+                earlier->writes_constant)
+                free = 0;
+        }
+        if (free) {
+            moved[taken++] = *instruction;
+        } else {
+            deferred_access[deferred_count] = access;
+            deferred[deferred_count++] = index;
+        }
+    }
+    for (d = 0; d < deferred_count; d++)
+        moved[taken + d] = program->instructions[deferred[d]];
+    {
+        WlXboxVshInstruction original[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+
+        memcpy(original, program->instructions, program->count * sizeof(original[0]));
+        memcpy(program->instructions, moved, program->count * sizeof(moved[0]));
+        if (!reuse_prefix(program, &after) || after.end <= before.end)
+            memcpy(program->instructions, original, program->count * sizeof(original[0]));
+    }
+}
+
 /* the prefix's code in a batch function: made, or taken from the vertex before */
 static void reuse_code(FILE *out, const WlXboxVshProgram *program, const ReusePrefix *prefix,
                        const unsigned *needs) {
@@ -1301,6 +1438,25 @@ static void reuse_code(FILE *out, const WlXboxVshProgram *program, const ReusePr
 
 #include "xbox_vsh_pairs.c"
 
+/* a fused form's asm (pr_program with pr_fuse set): the prefix kept in registers from one vertex to
+the next, else (too few registers) kept in the slot, else made at each vertex (*reused cleared) */
+static int g_spill_first;
+
+static int fused_program(const WlXboxVshProgram *program, const unsigned *needs, int *reused,
+                         const ReusePrefix *prefix) {
+    pr_spill = 0;
+    if (!(g_spill_first && *reused) && pr_program(program, needs, *reused, prefix))
+        return 1;
+    if (!*reused)
+        return 0;
+    pr_spill = 1;
+    if (pr_program(program, needs, *reused, prefix))
+        return 1;
+    pr_spill = 0;
+    *reused = 0;
+    return pr_program(program, needs, 0, prefix);
+}
+
 /* the fused forms asked for (--fused): a program's hash and its form */
 enum { MAXIMUM_FORMS = 256, MAXIMUM_FUSED = 8 };
 static struct {
@@ -1330,6 +1486,23 @@ static int read_forms(const char *path) {
         }
     }
     fclose(in);
+    /* (a form and its interleaved twin: the twin alone, which the draws that have the form run. A
+    file may keep both, so that a generator that does not read "I" still writes the form) */
+    {
+        int n, k, kept = 0;
+
+        for (n = 0; n < g_form_count; n++) {
+            WlXboxVshFusedKey twin = g_forms[n].key;
+
+            twin.interleaved = 1;
+            for (k = 0; !g_forms[n].key.interleaved && k < g_form_count; k++)
+                if (g_forms[k].hash == g_forms[n].hash && memcmp(&g_forms[k].key, &twin, sizeof(twin)) == 0)
+                    break;
+            if (g_forms[n].key.interleaved || k == g_form_count)
+                g_forms[kept++] = g_forms[n];
+        }
+        g_form_count = kept;
+    }
     return 1;
 }
 
@@ -1340,7 +1513,7 @@ int main(int argc, char **argv) {
     static WlXboxVshProgram program;
     static unsigned needs[WL_XBOX_VSH_MAX_INSTRUCTIONS];
     ReusePrefix prefix;
-    int reused, paired;
+    int reused, paired, fused_reused;
     unsigned long word_count = 0, position, program_count = 0, index;
     char line[512];
     FILE *in, *out;
@@ -1353,6 +1526,10 @@ int main(int argc, char **argv) {
             if_exists = 1;
         } else if (strcmp(argv[1], "--no-pairs") == 0) {
             no_pairs = 1;
+        } else if (strcmp(argv[1], "--spill") == 0) {
+            g_spill_first = 1;
+        } else if (strcmp(argv[1], "--no-forward") == 0) {
+            pr_fetched_off = 1;
         } else if (strcmp(argv[1], "--colors-positions") == 0) {
             colors_positions = 1;
         } else if (strcmp(argv[1], "--accessor") == 0 && argc > 2) {
@@ -1373,7 +1550,7 @@ int main(int argc, char **argv) {
     if (argc != 3 && argc != 4) {
         fprintf(stderr,
                 "usage: xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] "
-                "[--no-pairs] [--fused forms.txt] microcode.inc output.c [table]\n");
+                "[--no-pairs] [--spill] [--no-forward] [--fused forms.txt] microcode.inc output.c [table]\n");
         return 2;
     }
     if (argc == 4)
@@ -1465,6 +1642,7 @@ int main(int argc, char **argv) {
         checks[program_count] = wl_xbox_vsh_check(instructions, count);
         program_count++;
         wl_xbox_vsh_compile(instructions, count, NULL, 0, &program);
+        prefix_first(&program);
         dependencies_comment(out, &program);
         constant_free_comment(out, &program);
         /* (its colours and fog alone, when asked for) */
@@ -1561,13 +1739,52 @@ int main(int argc, char **argv) {
             if (g_forms[index].hash != hash)
                 continue;
             pr_fuse = &g_forms[index].key;
-            if (pr_program(&program, needs, reused, &prefix)) {
+            if (pr_fuse->lit) {
+                /* (a lit form: the program without d0's r, g and b, which GX's lighting makes) */
+                static WlXboxVshProgram unlit;
+                static unsigned unlit_needs[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+                ReusePrefix unlit_prefix;
+                int unlit_reused, made_lit;
+
+                if (!program.light.count) {
+                    fprintf(stderr, "xbox_vsh_codegen: %08lx's fused form %d is lit, but its d0 has no light shape\n",
+                            hash, (int)index);
+                    pr_fuse = NULL;
+                    continue;
+                }
+                wl_xbox_vsh_light_unlit(&program, &unlit);
+                wl_xbox_vsh_live_needs(&unlit, unlit_needs);
+                unlit_reused = reuse_prefix(&unlit, &unlit_prefix);
+                made_lit = fused_program(&unlit, unlit_needs, &unlit_reused, &unlit_prefix);
+                if (made_lit) {
+                    fprintf(out, "#if WL_XBOX_VSH_PS\n");
+                    fprintf(out,
+                            "static void program_%08lx_fused_%d(const float (*c)[4], WlXboxVshFused *fused, "
+                            "unsigned count, unsigned live)\n{\n",
+                            hash, made);
+                    pr_print(out, unlit_reused);
+                    pr_spill = 0;
+                    fprintf(out, "}\n#endif\n\n");
+                    fused_index[program_count - 1][made] = (int)index;
+                    fused[program_count - 1] = made + 1;
+                } else {
+                    fprintf(stderr, "xbox_vsh_codegen: %08lx's fused form %d not written (registers)\n", hash,
+                            (int)index);
+                }
+                pr_fuse = NULL;
+                if (fused[program_count - 1] >= MAXIMUM_FUSED)
+                    break;
+                continue;
+            }
+            fused_reused = reused;
+            if (fused_program(&program, needs, &fused_reused, &prefix)) {
                 fprintf(out, "#if WL_XBOX_VSH_PS\n");
                 fprintf(out,
                         "static void program_%08lx_fused_%d(const float (*c)[4], WlXboxVshFused *fused, unsigned count, "
                         "unsigned live)\n{\n",
                         hash, made);
-                pr_print(out, reused);
+                pr_print(out, fused_reused);
+                pr_spill = 0;
                 fprintf(out, "}\n#endif\n\n");
                 fused_index[program_count - 1][made] = (int)index;
                 fused[program_count - 1] = made + 1;
@@ -1589,9 +1806,9 @@ int main(int argc, char **argv) {
                 fprintf(out, "\t{ { 0x%x, {", key->live);
                 for (c = 0; c < 16; c++)
                     fprintf(out, " %u%s", key->format[c], c < 15 ? "," : "");
-                fprintf(out, " }, %u, %u, %u, %u, { %u, %u, %u, %u } }, program_%08lx_fused_%d },\n", key->perspective,
-                        key->colors, key->channels, key->stage_count, key->stages[0], key->stages[1], key->stages[2],
-                        key->stages[3], hash, f);
+                fprintf(out, " }, %u, %u, %u, %u, { %u, %u, %u, %u }, %u, %u }, program_%08lx_fused_%d },\n",
+                        key->perspective, key->colors, key->channels, key->stage_count, key->stages[0], key->stages[1],
+                        key->stages[2], key->stages[3], key->lit, key->interleaved, hash, f);
             }
             fprintf(out, "};\n#endif\n\n");
         }

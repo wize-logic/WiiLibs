@@ -332,6 +332,14 @@ void wl_gx_set_frame_overlap(bool on) {
     g_overlap = on;
 }
 
+void wl_gx_set_wait_work(WlGxWaitWorkFn work, void *user) {
+    (void)work, (void)user; // (the host's GPU is done when it is given a command: no wait to fill)
+}
+
+void wl_gx_set_wait_idle(WlGxWaitIdleFn idle, void *user) {
+    (void)idle, (void)user; // (the same)
+}
+
 uint32_t wl_gx_frame_index(void) {
     return g_frames_ended;
 }
@@ -349,6 +357,7 @@ bool wl_gx_frame_wait(uint32_t index) {
 
 void wl_gx_invalidate_shadow(void) {
     wl_gx_shadow_forget();
+    wl_gx_shadow_texture_forget(0xFFu); // (the console's: its maps too)
 }
 
 void wl_gx_reset_state(void) {
@@ -749,6 +758,7 @@ void wl_gx_tex_bind_ex(const WlGxTexObj *tex, const WlGxSampler *sampler, const 
         return;
     }
     const WlGxSampler *sm = sampler != NULL ? sampler : &tex->sampler;
+    wl_gx_shadow_texture_forget(1u); // (map 0, behind the direct layer's shadow as on the console)
     wl_gx_resolve_filters(sm, tex->mips, s.filter_override, &s.tex_min, &s.tex_mag);
     s.tex_wrap_s = sm->wrap_s;
     s.tex_wrap_t = sm->wrap_t;

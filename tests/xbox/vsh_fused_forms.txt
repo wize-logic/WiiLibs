@@ -1,3 +1,11 @@
 # The fused forms test_xbox_vsh_fused.c runs (xbox_vsh_codegen --fused): vsh_programs.inc's first
 # program (a transform) with its position and its t0 (v9 as given) made a sphere map's coordinates
 9aee98b6 21 o 0 0 0S 0:F3,9:F3
+# and its two-node blend (683e337f): the prefix kept while the nodes' and weights' bytes are the
+# vertex before's
+683e337f 3 o 1 1 - 0:F3,1:F3,5:UB.2,6:S1.1
+# and the lit program (4fd1043b): its form, and its lit form (GX lights d0's r, g and b from the normal sent)
+4fd1043b 23 o 1 1 0P 0:F3,1:F3,4:F2
+4fd1043b 23 o 1 1L 0P 0:F3,1:F3,4:F2
+# and its form for a draw whose position is GX's transform unit's (x: v0 sent as fetched, the program's position not made)
+4fd1043b 22 x 1 1 0P 0:F3,1:F3,4:F2

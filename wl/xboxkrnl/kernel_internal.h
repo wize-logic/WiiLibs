@@ -219,6 +219,10 @@ void xk_apc_queue(WlXbThread *t, uint32_t routine, uint32_t context, uint32_t ar
 uint32_t xk_read_issued(void);
 // The kernel's lines in the status report every 10 s.
 void xk_status_report(void);
+// A read of `bytes` from the card for the guest (its reads and the read-ahead's) that took `us`; and
+// the line of the card's reads (MB, MB/s: the guest's, and the rest's: the paging's) since the last.
+void xk_card_read_note(uint32_t bytes, uint64_t us);
+void xk_card_read_report(void);
 bool xk_apc_deliver(WlXbThread *t);
 // The current system time (100 ns since 1601) and the conversions of a timeout.
 uint64_t xk_system_time(void);

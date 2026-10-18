@@ -85,4 +85,16 @@ if(Python3_FOUND)
         VERBATIM)
     set_source_files_properties(${vsh_fused_emulated} PROPERTIES COMPILE_OPTIONS "-w;-ffp-contract=off")
     wl_add_test(test_xbox_vsh_fused SOURCES test_xbox_vsh_fused.c ${vsh_fused_emulated} LIBS wl_xbox LABELS unit be)
+    # (and with --spill: a skinned form's kept blend in memory, as the forms whose registers run out)
+    set(vsh_spill_generated ${CMAKE_CURRENT_BINARY_DIR}/vsh_spill_programs.c)
+    set(vsh_spill_emulated ${CMAKE_CURRENT_BINARY_DIR}/vsh_spill_emulated.c)
+    add_custom_command(OUTPUT ${vsh_spill_emulated}
+        COMMAND xbox_vsh_codegen --spill --fused ${CMAKE_CURRENT_SOURCE_DIR}/vsh_fused_forms.txt
+            ${CMAKE_CURRENT_SOURCE_DIR}/vsh_programs.inc ${vsh_spill_generated} test_vsh_fused_natives
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/vsh_ps_emulate.py ${vsh_spill_generated} ${vsh_spill_emulated}
+        DEPENDS xbox_vsh_codegen ${CMAKE_CURRENT_SOURCE_DIR}/vsh_programs.inc ${CMAKE_CURRENT_SOURCE_DIR}/vsh_fused_forms.txt
+            ${CMAKE_CURRENT_SOURCE_DIR}/vsh_ps_emulate.py
+        VERBATIM)
+    set_source_files_properties(${vsh_spill_emulated} PROPERTIES COMPILE_OPTIONS "-w;-ffp-contract=off")
+    wl_add_test(test_xbox_vsh_fused_spill SOURCES test_xbox_vsh_fused.c ${vsh_spill_emulated} LIBS wl_xbox LABELS unit be)
 endif()

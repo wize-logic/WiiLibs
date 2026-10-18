@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "wl/platform/gx_direct.h"
 #include "wl/platform/gx_shadow.h"
 #include "wl/platform/gx_target_internal.h"
 #include "wl/platform/hwcount.h"
@@ -190,12 +191,21 @@ static GXColor unpack(uint32_t rgba) {
 
 // ---- setup ------------------------------------------------------------------------------------
 
+// The copy filter GX has: the display's (1), the texture copies' (0), or not known (-1). The texture copies
+// set theirs and leave it; the display's is put back right before a display copy (display_filter).
+static int g_copy_filter = -1;
+// the video mode GX was set up for (VIDEO_GetPreferredMode reads the console's settings at each call)
+static GXRModeObj *g_mode;
+
+static void display_filter(void);
+
 static void setup_copy(GXRModeObj *rm) {
     f32 ys = GX_GetYScaleFactor(rm->efbHeight, rm->xfbHeight);
     u32 xfb_h = GX_SetDispCopyYScale(ys);
     GX_SetDispCopySrc(0, 0, rm->fbWidth, rm->efbHeight);
     GX_SetDispCopyDst(rm->fbWidth, (u16)xfb_h);
     GX_SetCopyFilter(rm->aa, rm->sample_pattern, GX_TRUE, rm->vfilter);
+    g_copy_filter = 1;
     GX_SetFieldMode(rm->field_rendering, (rm->viHeight == 2 * rm->xfbHeight) ? GX_ENABLE : GX_DISABLE);
     GX_SetPixelFmt(rm->aa ? GX_PF_RGB565_Z16 : g.efb_alpha ? GX_PF_RGBA6_Z24 : GX_PF_RGB8_Z24, GX_ZC_LINEAR);
     GX_SetDispCopyGamma(GX_GM_1_0);
@@ -204,7 +214,7 @@ static void setup_copy(GXRModeObj *rm) {
 void wl_gx_set_efb_alpha(bool on) {
     g.efb_alpha = on;
     if (g.ready) {
-        GXRModeObj *rm = VIDEO_GetPreferredMode(NULL);
+        GXRModeObj *rm = g_mode;
         if (rm != NULL && !rm->aa)
             GX_SetPixelFmt(on ? GX_PF_RGBA6_Z24 : GX_PF_RGB8_Z24, GX_ZC_LINEAR);
     }
@@ -250,9 +260,12 @@ WlResult wl_gx_init(void) {
     }
 
     GX_Init(fifo, fifo_bytes);
+    wl_gx_shadow_tlut_forget(TLUT_SLOTS);
+    wl_gx_wii_regions_apply();
     // The mode object is the one video init selected (a pure function of SYSCONF).
     GXRModeObj *rm = VIDEO_GetPreferredMode(NULL);
     WL_ASSERT(rm != NULL && rm->fbWidth == vi.fb_width && rm->efbHeight == vi.efb_height);
+    g_mode = rm;
     setup_copy(rm);
 
     // Vertex layouts are applied on demand (wl_gx_set_layout, VAT format 0). Channel 0 is configured by the
@@ -356,20 +369,47 @@ void wl_gx_wii_own_thread(void) {
     }
 }
 
+static WlGxWaitWorkFn g_wait_work;
+static void *g_wait_work_user;
+static bool g_in_wait_work;
+
+void wl_gx_set_wait_work(WlGxWaitWorkFn work, void *user) {
+    g_wait_work = work;
+    g_wait_work_user = user;
+}
+
+static WlGxWaitIdleFn g_wait_idle;
+static void *g_wait_idle_user;
+
+void wl_gx_set_wait_idle(WlGxWaitIdleFn idle, void *user) {
+    g_wait_idle = idle;
+    g_wait_idle_user = user;
+}
+
 static bool wait_token(uint32_t t) {
     uint64_t t0 = now_us();
     bool ok = true;
+    bool working = g_wait_work != NULL && !g_in_wait_work;
     g.stats.gpu_waits++;
     wl_hwcount_wait_begin(WL_HWWAIT_GPU); // (the processor's counters leave the wait out)
     // (the first token after init is waited for exactly: the register held anything before it)
     while (g.token == 1u ? GX_GetDrawSync() != 1u : !token_passed(t)) {
+        if (working) {
+            // (the caller's work while the GPU draws: a wait inside it only waits)
+            g_in_wait_work = true;
+            working = g_wait_work(g_wait_work_user);
+            g_in_wait_work = false;
+            continue;
+        }
         if (now_us() - t0 > WAIT_TIMEOUT_US) {
             ok = false;
             g.stats.gpu_timeouts++;
             WL_LOG_E(TAG, "GPU did not reach token %u within %u us", (unsigned)(t & 0xFFFFu), WAIT_TIMEOUT_US);
             break;
         }
+        if (g_wait_idle != NULL && !g_in_wait_work) { g_wait_idle(g_wait_idle_user, false); } // (the runtime: lock given up)
     }
+    if (g_wait_idle != NULL && !g_in_wait_work) { g_wait_idle(g_wait_idle_user, true); } // (the runtime: lock back)
     note_wait(t0);
     wl_hwcount_wait_end(WL_HWWAIT_GPU);
     return ok;
@@ -417,6 +457,7 @@ bool wl_gx_frame_wait(uint32_t index) {
 
 static void clear_efb(uint32_t rgba) {
     GX_SetCopyClear(unpack(rgba), MAX_Z24);
+    display_filter();
     GX_CopyDisp(wl_platform_video_back_buffer(), GX_TRUE); // the copy is overwritten by end_frame
     g.clear_next = rgba;
     g.dirty = true;
@@ -508,6 +549,7 @@ uint32_t wl_gx_end_frame(void) {
     // given all the frame's draws first, to work on meanwhile)
     GX_Flush();
     void *xfb = wl_platform_video_back_buffer();
+    display_filter();
     GX_CopyDisp(xfb, GX_TRUE); // clears the EFB for the next frame
     g.clear_next = g.clear_frame;
     // The copy's token: the display queue shows the XFB once the GPU has passed it (polled at each
@@ -586,7 +628,7 @@ static void copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexForma
     GX_CopyTex(dst, clear ? GX_TRUE : GX_FALSE);
     GX_PixModeSync();
     wl_gx_wii_hang_event('C', (uint32_t)(uintptr_t)dst, (uint32_t)w << 16 | (uint32_t)h);
-    wl_gx_wii_copy_filter(true);
+    wl_gx_wii_copy_filter(true); // (the display's again before the display copy: display_filter)
     GX_InvalidateTexAll();
     g.stats.efb_copies++;
     g.dirty = true;
@@ -600,14 +642,31 @@ void wl_gx_copy_efb_texture_again(int x, int y, int w, int h, void *dst, WlGxTex
     copy_efb_texture(x, y, w, h, dst, fmt, clear, false);
 }
 
-// The copies to textures are unfiltered: the display copy's vertical (deflicker) filter, which stays set for it,
-// would blur them.
-void wl_gx_wii_copy_filter(bool display) {
-    GXRModeObj *rm = VIDEO_GetPreferredMode(NULL);
+// The copies to textures are unfiltered: the display copy's vertical (deflicker) filter would blur them.
+// Each filter is written only when GX has the other (six BP writes, 30 bytes): a run of texture copies
+// sets the unfiltered one once, and the display's goes back right before the display copy (display_filter),
+// not after each texture copy. The switch copy_filter (gxcopyfilter) writes it at every call, as before.
+static void write_copy_filter(bool display) {
+    GXRModeObj *rm = g_mode;
     if (display && rm != NULL) {
         GX_SetCopyFilter(rm->aa, rm->sample_pattern, GX_TRUE, rm->vfilter);
     } else {
         GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+    }
+    g_copy_filter = display ? 1 : 0;
+}
+
+void wl_gx_wii_copy_filter(bool display) {
+    if (wl_gx_bisect()->copy_filter) {
+        write_copy_filter(display);
+    } else if (!display && g_copy_filter != 0) {
+        write_copy_filter(false);
+    }
+}
+
+static void display_filter(void) {
+    if (g_copy_filter != 1) {
+        write_copy_filter(true);
     }
 }
 
@@ -1045,6 +1104,7 @@ void wl_gx_set_array(WlGxArray which, const void *base, uint32_t stride, uint32_
     g.array_set[which] = true;
     g.array_count[which] = count;
     GX_SetArray(attr[which], (void *)base, (u8)stride);
+    wl_gx_shadow_array_forget(); // (the direct layer's arrays: set behind it)
     GX_InvVtxCache(); // the array's contents may have changed since it was last used
     g.dirty = true;
 }
@@ -1062,6 +1122,7 @@ void wl_gx_set_vertex_array(const WlGxVertex *verts, uint32_t count) {
     GX_SetArray(GX_VA_POS, (void *)verts, stride);
     GX_SetArray(GX_VA_CLR0, (u8 *)verts + offsetof(WlGxVertex, rgba), stride);
     GX_SetArray(GX_VA_TEX0, (u8 *)verts + offsetof(WlGxVertex, u), stride);
+    wl_gx_shadow_array_forget();
     GX_InvVtxCache();
     g.user_layout = k_std_direct; // the WlGxVertex arrays are the STD layout
     g.dirty = true;
@@ -1220,6 +1281,7 @@ void wl_gx_tlut_load(const WlGxTlut *tlut, uint32_t slot) {
     GXTlutObj obj;
     memcpy(&obj, tlut->opaque, sizeof obj);
     GX_LoadTlut(&obj, slot);
+    wl_gx_shadow_tlut_forget(slot); // (the direct layer's palette of the slot: loaded behind it)
     s->data = tlut->entries;
     s->count = tlut->count;
     s->format = tlut->format;
@@ -1231,6 +1293,13 @@ void wl_gx_tlut_load(const WlGxTlut *tlut, uint32_t slot) {
 
 void wl_gx_tlut_invalidate(void) {
     memset(g.tlut, 0, sizeof g.tlut);
+    wl_gx_shadow_tlut_forget(TLUT_SLOTS);
+}
+
+void wl_gx_wii_tlut_forget(uint32_t slot) {
+    if (slot < TLUT_SLOTS) {
+        g.tlut[slot].valid = false;
+    }
 }
 
 void wl_gx_tex_bind_ex(const WlGxTexObj *tex, const WlGxSampler *sampler, const WlGxTlut *tlut) {

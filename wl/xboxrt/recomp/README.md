@@ -22,6 +22,9 @@ a little-endian one:
   the packed float arithmetic copies the lanes to host order first and is always inline, and
   `XMM_SHUFFLE` moves lanes as bytes; `XMM_SHUFFLE`, `XMM_SCALAR` and the SIMD loads and stores
   (`XMM_MEM`, `XMM_STORE`, the movlps/movhps halves, `MMX_MEM`, `MMX_STORE`) are always inline too;
+  the MMX loads and stores move the 8 bytes through a `uint64_t` and a byte swap
+  (`RECOMP_MMX_LE64`), which keeps the register in registers (a copy of the union itself went
+  through the stack at every access);
 - `lock xadd`/`lock cmpxchg` (`RECOMP_ATOMIC_ADD32/CAS32`) byte-swap around a compare-and-swap loop;
 - `RECOMP_TLS` is empty: the registers are plain globals;
 - `RECOMP_FP_PC` (x87 precision control at 24 bits) rounds inline when the result is a normal float
@@ -35,6 +38,27 @@ a little-endian one:
   `g_esp` (every direct call's return address) calls one small function per unit,
   `recomp_push32_esp`, instead of eight inline instructions: 348 KB less of Halo's DOL;
   `RECOMP_NO_PUSH32_CALL` keeps it inline;
+- in the same code a loop's safe point (`RECOMP_BACKEDGE`) is a call of `recomp_backedge`, and an
+  indirect call or jump (`RECOMP_ICALL*`, `RECOMP_ITAIL`: range check, lookup, tail call, failure
+  paths) a call of `recomp_icall_pop`, `recomp_icall_to` or `recomp_itail`, when no trace, feedback,
+  ABI check or call profile is on: 248 KB less of Halo's DOL; `RECOMP_NO_BACKEDGE_CALL` and
+  `RECOMP_NO_ICALL_CALL` keep them inline;
+- on PowerPC, in the same code, a guest address that is not a constant goes through a branch to a
+  stub for the register pair, `wl_xb_ea_<d>_<s>` (the transform's two instructions and a `blr`, one
+  copy in the program), and a constant pushed onto `g_esp` is a data word after a branch to
+  `recomp_push32_word`: about 400 KB less of Halo's DOL together; `RECOMP_NO_EA_STUB` and
+  `RECOMP_NO_PUSH32_WORD` turn them off;
+- the guest stack's integer accesses (`MEMxx_SP`, so `PUSH32` and `POP32`) are not `volatile`: GCC
+  forwards a value stored to a stack slot to its reload and loads a slot once where nothing between
+  can change it (a guest stack is its own thread's, and the guest lock changes hands only in a call
+  or at a device access or page-in, where no other thread's code touches the running frame): 1.1%
+  of the instructions of Halo's hot unit; `RECOMP_STACK_VOLATILE` makes them volatile again;
+- the SSE loads and stores (`XMM_MEM`, `XMM_STORE`, the movlps/movhps halves) map their address once
+  and add the lanes' offsets on the host side, and the `--mem-disp` forms patch 0025 writes for the
+  float stores and the SSE and MMX accesses (`MEMF_SET_D`, `MEMD_SET_D`, `XMM_MEM_D`, `XMM_STORE_D`,
+  `XMM_LOAD_LOW_D`/`HIGH_D`, `XMM_STORE_LOW_D`/`HIGH_D`, `MMX_MEM_D`, `MMX_STORE_D`) map the base
+  once and add the displacement there too, as `MEMxx_D` (an MMX copy loop of Halo's 13% fewer
+  instructions);
 - GCC only: `#error` when the compiler lacks `scalar_storage_order` (clang ignores it).
 
 The header is **generated**: `gen_recomp_types.py` patches the vendored pipeline in a scratch

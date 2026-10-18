@@ -63,6 +63,7 @@
 #include <string.h>
 
 #include "wl/platform/platform.h"
+#include "wl/xboxrt/frame_loan.h"
 #include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/page_census.h"
@@ -1339,6 +1340,116 @@ void wl_xb_pg_stats(WlXbMemStats *out) {
             out->resident_file += (g_xb_pg_slot[q1 - 1u] & FILE_SLOT) != 0;
         }
     }
+}
+
+// ---- Frames leaving the paging (frame_loan.h) ----------------------------------------------------
+// A retired frame is no page's and not in the free stack: nothing finds it again (the clock passes a
+// frame without a page). A changed page in the run is moved to a frame had as a fault has one.
+
+static bool retiring(uint32_t f, uint32_t first, uint32_t count) {
+    return f >= first && f - first < count;
+}
+
+// Frame `f` taken out of the free stack, if it is there.
+static bool free_take(uint32_t f) {
+    for (uint32_t i = 0; i < g_free_n; i++) {
+        if (g_free[i] == f) {
+            g_free[i] = g_free[--g_free_n];
+            return true;
+        }
+    }
+    return false;
+}
+
+bool wl_xb_pg_retire(uint32_t first, uint32_t count, uint32_t *moved) {
+    if (count == 0 || count > WL_XB_RETIRE_MAX || first == 0 || first > g_xb_pg_frames ||
+        count > g_xb_pg_frames - first + 1u || g_wr.active || g_batch_n != 0 || g_giving_up) {
+        return false;
+    }
+    bool out[WL_XB_RETIRE_MAX] = {false}; // the run's frames out of the paging so far
+    uint32_t n_moved = 0;
+    bool ok = true;
+    for (uint32_t i = 0; i < count && ok; i++) {
+        uint32_t f = first + i;
+        if (out[i]) {
+            continue;
+        }
+        uint32_t lv = wl_xb_mmu_lock();
+        uint32_t q1 = g_owner[f];
+        if (q1 == 0) {
+            ok = free_take(f); // else in a fault's hands: had, not yet given
+            out[i] = ok;
+            wl_xb_mmu_unlock(lv);
+            continue;
+        }
+        uint32_t q = q1 - 1u;
+        if ((g_xb_pg_flags[q] & (WL_XB_PG_PINNED | WL_XB_PG_IO)) != 0) {
+            wl_xb_mmu_unlock(lv);
+            ok = false;
+            break;
+        }
+        wl_xb_mmu_unmap(q);
+        if ((g_xb_pg_flags[q] & WL_XB_PG_DIRTY) == 0) {
+            evict_clean(q, f); // its copy (file, slot) or its zeros stand for it
+            out[i] = true;
+        } else if (page_is_zero(wl_xb_mmu_frame_ptr(q, f))) {
+            evict_zero(q, f);
+            out[i] = true;
+        }
+        wl_xb_mmu_unlock(lv);
+        if (out[i]) {
+            continue;
+        }
+        // a changed page: another frame for it, outside the run (one of the run's that the search
+        // frees on the way is out too)
+        uint32_t g = 0;
+        while (ok && g == 0) {
+            ok = frame_slow(q1, false, &g) == WL_OK && g != 0;
+            if (ok && retiring(g, first, count)) {
+                out[g - first] = true;
+                g = 0;
+            }
+        }
+        if (!ok) {
+            break;
+        }
+        lv = wl_xb_mmu_lock();
+        if (g_xb_pg_frame[q] == f && (g_xb_pg_flags[q] & (WL_XB_PG_PINNED | WL_XB_PG_IO)) == 0) {
+            wl_xb_mmu_unmap(q); // (mapped again by a touch meanwhile)
+            uint8_t *from = wl_xb_mmu_frame_ptr(q, f), *to = wl_xb_mmu_frame_ptr(q, g);
+            if (from != to) {
+                memcpy(to, from, PAGE); // (the host's frames are the pages': nothing to copy)
+            }
+            g_owner[f] = 0;
+            g_owner[g] = (uint16_t)q1;
+            g_xb_pg_frame[q] = (uint16_t)g;
+            n_moved++;
+        } else if (g_xb_pg_frame[q] != f) {
+            give_free(g); // (it went meanwhile: f is free or another's, looked at again)
+            i--;
+            wl_xb_mmu_unlock(lv);
+            continue;
+        } else {
+            give_free(g);
+            ok = false;
+        }
+        out[i] = ok;
+        wl_xb_mmu_unlock(lv);
+    }
+    if (!ok) {
+        uint32_t lv = wl_xb_mmu_lock();
+        for (uint32_t i = 0; i < count; i++) {
+            if (out[i]) {
+                give_free(first + i);
+            }
+        }
+        wl_xb_mmu_unlock(lv);
+        return false;
+    }
+    if (moved != NULL) {
+        *moved += n_moved;
+    }
+    return true;
 }
 
 // ---- Set-up ------------------------------------------------------------------------------------

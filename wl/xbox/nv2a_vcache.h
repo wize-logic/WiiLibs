@@ -61,6 +61,9 @@ typedef struct WlNv2aVCacheConfig {
     // wl_gx_set_frame_overlap; 0: each frame drawn by its end): an array drawn in one of them is
     // neither given back nor rewritten in place until the GPU is past it
     uint8_t gpu_lag;
+    // optional: waits until the GPU has drawn everything sent (wl_gx_sync), so that the arrays given
+    // back pending go at once when there is no room otherwise (NULL: they wait for the frame's end)
+    void (*gpu_wait)(void);
 } WlNv2aVCacheConfig;
 
 typedef struct WlNv2aVCacheEntry {
@@ -85,6 +88,7 @@ typedef struct WlNv2aVCacheStats {
     uint32_t lookups, hits, converted, reconverted, refused, evicted, failed;
     uint32_t checks, watched, hashed; // checks (an array's first use in a frame), by the watch, hashed
     uint64_t hashed_bytes, converted_elements;
+    uint32_t gpu_waits;               // the GPU waited for to free pending arrays (cfg.gpu_wait)
     size_t bytes, peak_bytes;         // arrays kept now, at most
     size_t frame_bytes, peak_frame_bytes; // of those, drawn in the last frame finished, at most
 } WlNv2aVCacheStats;
@@ -96,6 +100,7 @@ typedef struct WlNv2aVCache {
     void *pending[WL_NV2A_VCACHE_PENDING];
     uint32_t pending_frame[WL_NV2A_VCACHE_PENDING]; // the frame each was given back in
     unsigned pending_count;
+    unsigned waits_frame; // cfg.gpu_wait's calls in this frame
     WlHeap heap; // over the arena, when there is one
     uint32_t frame;
     bool made;      // an array made since wl_nv2a_vcache_made last said so

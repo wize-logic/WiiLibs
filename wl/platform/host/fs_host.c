@@ -109,4 +109,17 @@ static WlResult fs_resolve(const char *path, char *out, size_t cap) {
     return (n > 0 && (size_t)n < cap) ? WL_OK : WL_ERR_ARG;
 }
 
+// The host reads through the C library alone (the Wii's own reads of the SD card: fs_wii.c).
+static WlResult fs_fast_read(WlPlatformFile *file, uint64_t offset, void *dst, uint32_t size) {
+    (void)file;
+    (void)offset;
+    (void)dst;
+    (void)size;
+    return WL_ERR_UNSUPPORTED;
+}
+
+static void fs_fast_forget(WlPlatformFile *file) {
+    (void)file;
+}
+
 #include "wl/platform/fs_posix.inc"

@@ -62,11 +62,14 @@
 #define PI_WRITE 0x14u
 
 typedef struct {
-    uint8_t kind;
     uint32_t a, b;
-    // the PI's FIFO write pointer as the event began (its address; 0: an event that sends no commands)
-    uint32_t write;
+    // the kind (the top byte) and the PI's FIFO write pointer as the event began (its address, which
+    // the gather pipe moves by 32 bytes, in 32-byte units; 0: an event that sends no commands): 12
+    // bytes an event, the ring 192 KB
+    uint32_t kind_write;
 } Event;
+#define EVENT_KIND(e) ((uint8_t)((e)->kind_write >> 24))
+#define EVENT_WRITE(e) (((e)->kind_write & 0x00FFFFFFu) << 5)
 
 static struct {
     bool up;
@@ -105,12 +108,12 @@ void wl_gx_wii_hang_event(char kind, uint32_t a, uint32_t b) {
     }
     e = &h.ring[h.head % RING];
 
-    e->kind = (uint8_t)kind;
     e->a = a;
     e->b = b;
-    e->write = kind == 'P' || kind == 'Q' || kind == 'C' || kind == 'X' || kind == 'S' || kind == 'E'
-                   ? PI_REG(PI_WRITE) & 0x03FFFFFFu
-                   : 0u;
+    e->kind_write = (uint32_t)(uint8_t)kind << 24 |
+                    (kind == 'P' || kind == 'Q' || kind == 'C' || kind == 'X' || kind == 'S' || kind == 'E'
+                         ? (PI_REG(PI_WRITE) & 0x03FFFFFFu) >> 5
+                         : 0u);
     h.head++;
 }
 
@@ -214,8 +217,8 @@ static void hex_line(const char *what, uint32_t phys, const uint8_t *bytes) {
 static void log_event(uint32_t i, const char *mark) {
     const Event *e = &h.ring[i % RING];
 
-    WL_LOG_E(TAG, "%s%c %08x %08x @%08x  %s", mark, e->kind, (unsigned)e->a, (unsigned)e->b, (unsigned)e->write,
-             event_name(e->kind));
+    WL_LOG_E(TAG, "%s%c %08x %08x @%08x  %s", mark, EVENT_KIND(e), (unsigned)e->a, (unsigned)e->b,
+             (unsigned)EVENT_WRITE(e), event_name(EVENT_KIND(e)));
 }
 
 // the event the GPU stopped after: walking back from the newest, the commands each event's write
@@ -235,11 +238,11 @@ static void stopped_after(void) {
     for (i = h.head; i != oldest; i--) {
         const Event *e = &h.ring[(i - 1u) % RING];
 
-        if (e->write == 0) {
+        if (EVENT_WRITE(e) == 0) {
             continue;
         }
-        behind += (prev + size - e->write) % size;
-        prev = e->write;
+        behind += (prev + size - EVENT_WRITE(e)) % size;
+        prev = EVENT_WRITE(e);
         if (behind >= backlog) {
             stuck = i - 1u;
             found = true;
@@ -268,7 +271,7 @@ static void stopped_after(void) {
              (unsigned)backlog, (unsigned)(h.head - 1u - stuck), (unsigned)(behind - backlog));
     // (what it drew with: the layout and each map's texture last sent before it)
     for (i = stuck + 1u; i != oldest; i--) {
-        if (h.ring[(i - 1u) % RING].kind == 'L') {
+        if (EVENT_KIND(&h.ring[(i - 1u) % RING]) == 'L') {
             log_event(i - 1u, "  its layout: ");
             break;
         }
@@ -277,7 +280,7 @@ static void stopped_after(void) {
         for (i = stuck + 1u; i != oldest; i--) {
             const Event *e = &h.ring[(i - 1u) % RING];
 
-            if (e->kind == 'T' && (e->b >> 28) == n) {
+            if (EVENT_KIND(e) == 'T' && (e->b >> 28) == n) {
                 log_event(i - 1u, "  its map: ");
                 break;
             }

@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Sun, 18 Oct 2026 12:04:51 -0400
+Subject: [PATCH] recomp: --reg-locals keeps SIMD registers in their locals
+ round a loop, written back after it
+
+---
+ tools/recomp/test_reg_locals.py | 30 ++++++++++++++++++++++++++++++
+ tools/recomp/x87_locals.py      | 16 ++++++++++++----
+ 2 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/tools/recomp/test_reg_locals.py b/tools/recomp/test_reg_locals.py
+index 23c9c12..634ff27 100644
+--- a/tools/recomp/test_reg_locals.py
++++ b/tools/recomp/test_reg_locals.py
+@@ -203,6 +203,36 @@ def test_a_simd_register_whose_address_is_taken_runs_on_memory():
+     assert text.index("_LOCALS_LOAD();", i) < text.index("_r_xmm1 = XMM_ADD(_r_xmm1, _r_xmm0);"), text
+ 
+ 
++def test_simd_registers_go_round_a_loop_in_their_locals():
++    # an MMX copy loop: the registers go back to memory after it, not on every pass
++    out, why = _localise(["    ecx = 4;",
++                          "loc_00001000: ;",
++                          "    mm0 = MMX_MEM(esi);", "    mm1 = MMX_MEM(esi + 8);",
++                          "    MMX_STORE(edi, mm0);", "    MMX_STORE(edi + 8, mm1);",
++                          "    esi = esi + 16;", "    edi = edi + 16;", "    ecx--;",
++                          "    if (ecx != 0) { RECOMP_BACKEDGE(); goto loc_00001000; }",
++                          "loc_00001020: ;",
++                          "    eax = 1;",
++                          "loc_00001030: ;",
++                          "    sub_00002000();", "    return;"], x87=False)
++    assert why is None, why
++    text = "\n".join(out)
++    latch = text.index("goto loc_00001000;")
++    assert "g_mm0 = " not in text[:latch], text
++    # written back at the end of the run after the loop, before the call
++    after = text[latch:text.index("sub_00002000();")]
++    assert "g_mm0 = _r_mm0; g_mm1 = _r_mm1; /* SIMD registers to memory */" in after, text
++    # a run that ends before a forward branch still writes them back there
++    out, why = _localise(["    mm0 = MMX_MEM(esi);", "    MMX_STORE(edi, mm0);",
++                          "    if (ecx != 0) goto loc_00001010;",
++                          "    eax = 2;",
++                          "loc_00001010: ;",
++                          "    return;"], x87=False)
++    assert why is None, why
++    text = "\n".join(out)
++    assert text.index("g_mm0 = _r_mm0; /* SIMD registers to memory */") < text.index("goto loc_00001010;"), text
++
++
+ if __name__ == "__main__":
+     for name, fn in sorted(globals().items()):
+         if name.startswith("test_"):
+diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
+index b11e048..39a1e7c 100644
+--- a/tools/recomp/x87_locals.py
++++ b/tools/recomp/x87_locals.py
+@@ -753,18 +753,26 @@ _SIMD_GLOBALS = frozenset("g_" + r for r in _SIMD_REGS)
+ _REG_KEPT = frozenset(("g_ebx", "g_esi", "g_edi"))  # the registers a call may give back
+ 
+ 
+-def _block_ends(nodes):
++def _block_ends(nodes, labels):
+     """The statements that end a straight run of code: the next node is a
+     label or branches. A SIMD register written in the run is written back
+     there, not held to the next call or return: a few SSE operations inside a
+     scalar loop otherwise kept the lanes of every register they wrote live
+     around the whole loop (spilled), and the next write of the register is
+-    usually a whole one, which needs nothing of the old value."""
++    usually a whole one, which needs nothing of the old value.
++
++    Not before a jump back (a loop's latch): there the registers the loop
++    body wrote go on round the loop in their locals and are written back at
++    the next end of a run, or the call or return, after the loop. An MMX copy
++    loop wrote all eight registers to memory on every pass, two stores each.
++    The flush is only ever moved later along a path, never removed: memory is
++    written before anything that can read it (a call, a return)."""
+     ends = set()
+     for x, n in enumerate(nodes[:-1]):
+         nxt = nodes[x + 1]
+         if (n.kind in ("fp", "rregion", "plain") and not n.gotos and not n.terminal
+-                and (nxt.kind == "label" or nxt.gotos)):
++                and (nxt.kind == "label" or nxt.gotos)
++                and not any(labels[g] <= x for g in nxt.gotos)):
+             ends.add(x)
+     return ends
+ 
+@@ -776,7 +784,7 @@ def _flow(nodes, labels, plan, x87=True, regs=False, skip=frozenset()):
+     rewrites, positions, scalars = {}, set(), set()
+     end_state = [None]
+     work = []
+-    block_ends, flushes = _block_ends(nodes), {}
++    block_ends, flushes = _block_ends(nodes, labels), {}
+     if nodes:
+         state_in[0] = _edge_state(MEM, 0, plan)  # function entry: memory is the truth
+         work.append(0)

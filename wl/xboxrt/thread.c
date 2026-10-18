@@ -48,6 +48,8 @@ static uint32_t g_live; // guest threads started and not ended
 static uint32_t g_tls_data, g_tls_bytes, g_tls_zero;
 static WlXbThreadStats g_stats;
 static WlXbLatency g_ready_waits; // g_m held
+static WlXbLatency g_gpu_backs;   // a GPU wait's end to the lock back (g_m held)
+static uint64_t g_gpu_off_us;     // the GPU waits' time off the lock (g_m held)
 volatile uint32_t g_xb_attention;
 uint32_t g_xb_compat;
 volatile uint32_t g_xb_det_work;
@@ -56,6 +58,7 @@ volatile uint32_t g_xb_det_work;
 // from it is 0 (none); it is written only by the lock's holder.
 #define DET_START_NS 1000000000ull
 static bool g_det;
+static bool g_preempt; // WlXbThreadConfig.preempt, never in the deterministic mode
 static volatile uint64_t g_vt_ns = DET_START_NS;
 static uint64_t g_det_next_us;          // the holder looks at the clock's events from then on
 static uint32_t g_det_backedge_ns, g_det_call_ns, g_det_device_ns;
@@ -66,12 +69,13 @@ static void census_threads(void *user, WlMemCensusReport *out);
 void wl_xb_thread_config_default(WlXbThreadConfig *cfg) {
     cfg->quantum_ms = 10;
     cfg->starve_ms = 30;
-    cfg->host_stack_bytes = 256u << 10;
+    cfg->host_stack_bytes = 128u << 10;
     cfg->default_stack_bytes = 64u << 10;
     cfg->deterministic = false;
     cfg->det_backedge_ns = 40;
     cfg->det_call_ns = 400;
     cfg->det_device_ns = 400;
+    cfg->preempt = true;
 }
 
 bool wl_xb_deterministic(void) {
@@ -111,18 +115,22 @@ bool wl_xb_lock_held(void) {
 // ---- Ready queue (g_m held) ------------------------------------------------------------------
 
 // A wait or a card transfer begins / ends: its time to the thread's (g_m held).
-static void off_begin(WlXbThread *t, bool io) {
+static uint64_t *off_time(WlXbThread *t, uint8_t kind) {
+    return kind == WL_XB_OFF_IO ? &t->io_us : kind == WL_XB_OFF_GPU ? &t->gpu_us : &t->waited_us;
+}
+
+static void off_begin(WlXbThread *t, uint8_t kind) {
     t->off_since_us = wl_xb_time_us();
-    t->off_io = io;
+    t->off_kind = kind;
 }
 
 static void off_end(WlXbThread *t, uint64_t now) {
     if (t->off_since_us != 0) {
         uint64_t us = now > t->off_since_us ? now - t->off_since_us : 0u;
-        if (t->off_io) {
-            t->io_us += us;
-        } else {
-            t->waited_us += us;
+        *off_time(t, t->off_kind) += us;
+        if (t->off_kind == WL_XB_OFF_GPU) {
+            g_gpu_off_us += us;
+            g_stats.gpu_off_ms = (uint32_t)(g_gpu_off_us / 1000u);
         }
         t->off_since_us = 0;
     }
@@ -130,8 +138,17 @@ static void off_end(WlXbThread *t, uint64_t now) {
 
 static void enqueue(WlXbThread *t) {
     WlXbThread *volatile *pp = &g_ready;
-    while (*pp != NULL && (*pp)->priority >= t->priority) {
-        pp = &(*pp)->next_ready;
+    if (t->io_back && g_preempt) {
+        // back from the card: first after the service thread and the others back before it, as the
+        // console completes an I/O at its interrupt (the holder hands over at its next safe point)
+        while (*pp != NULL && ((*pp)->is_service || (*pp)->io_back)) {
+            pp = &(*pp)->next_ready;
+        }
+    } else {
+        t->io_back = false;
+        while (*pp != NULL && (*pp)->priority >= t->priority) {
+            pp = &(*pp)->next_ready;
+        }
     }
     t->next_ready = *pp;
     *pp = t;
@@ -143,10 +160,15 @@ static void enqueue(WlXbThread *t) {
 
 // `t` leaves the ready queue for the lock: how long it waited (g_m held).
 static void note_ready_wait(WlXbThread *t) {
+    t->io_back = false;
     uint64_t us = wl_xb_time_us() - t->ready_since_us;
     t->ready_us += us;
     if (!t->is_service) {
         wl_xb_latency_add(&g_ready_waits, us);
+    }
+    if (t->gpu_back) {
+        t->gpu_back = false;
+        wl_xb_latency_add(&g_gpu_backs, us);
     }
 }
 
@@ -171,6 +193,7 @@ static void unqueue(WlXbThread *t) {
         *pp = t->next_ready;
         t->next_ready = NULL;
         t->ready = false;
+        t->io_back = false;
     }
 }
 
@@ -205,6 +228,11 @@ static uint32_t g_svc_wait_holder;  // the thread that had the lock when that wa
 static void take(WlXbThread *self) {
     if (g_owner == NULL && g_ready == NULL) {
         off_end(self, wl_xb_time_us());
+        self->io_back = false;
+        if (self->gpu_back) {
+            self->gpu_back = false;
+            wl_xb_latency_add(&g_gpu_backs, 0); // (the lock free: at once)
+        }
         g_owner = self;
     } else {
         enqueue(self);
@@ -295,7 +323,7 @@ static bool det_wait(WlXbThread *self, uint32_t timeout_ms) {
     g_cur = NULL;
     wl_platform_mutex_lock(g_m);
     g_stats.waits++;
-    off_begin(self, false);
+    off_begin(self, WL_XB_OFF_WAIT);
     if (self->woken || timeout_ms == 0) {
         enqueue(self); // a wake came first, or no time to wait: only a yield
     } else {
@@ -345,7 +373,7 @@ bool wl_xb_wait(WlXbThread *self, uint32_t timeout_ms) {
     g_cur = NULL;
     wl_platform_mutex_lock(g_m);
     g_stats.waits++;
-    off_begin(self, false);
+    off_begin(self, WL_XB_OFF_WAIT);
     hand_off();
     uint64_t start = wl_platform_time_ms();
     while (!self->woken) {
@@ -454,8 +482,35 @@ static bool yield_if_due(WlXbThread *self) {
         return false; // a starved thread keeps the lock for one quantum, as NT's boost gives it
     }
     g_boosted = NULL;
+    const uint64_t quantum_us = (uint64_t)g_cfg.quantum_ms * 1000u;
+    if (g_preempt && head->io_back) {
+        // back from the card (enqueue put it first): the rest of its kernel call, and its guest code
+        // up to its next wait, for a quantum whatever the priorities (a reader's completion routine
+        // runs then, not when a busy holder of higher priority next waits)
+        wl_platform_mutex_lock(g_m);
+        WlXbThread *back = g_ready;
+        if (back != NULL && back->io_back && back != self) {
+            g_ready = back->next_ready;
+            back->next_ready = NULL;
+            back->ready = false;
+            g_stats.io_handoffs++;
+            give_to(self, back);
+            return true;
+        }
+        wl_platform_mutex_unlock(g_m);
+        head = g_ready;
+        if (head == NULL) {
+            return false;
+        }
+    }
     if (head->priority > self->priority ||
-        (head->priority == self->priority && now - g_quantum_start >= (uint64_t)g_cfg.quantum_ms * 1000u)) {
+        (head->priority == self->priority && now - g_quantum_start >= quantum_us)) {
+        requeue(self);
+        return true;
+    }
+    if (g_preempt && head->priority == self->priority && now - head->ready_since_us >= quantum_us) {
+        // its own quantum's wait: the holder's restarts at every interrupt the service took the lock for
+        g_stats.tie_handoffs++;
         requeue(self);
         return true;
     }
@@ -464,10 +519,16 @@ static bool yield_if_due(WlXbThread *self) {
     // title's frame throttle does, while a loader thread below it never runs). The waiter's time
     // alone decides: the holder's quantum restarts after every interrupt, which the service
     // thread takes the lock for, so a holder interrupted each vertical blank never finishes one.
-    if (g_cfg.starve_ms != 0) {
+    // With the console's preemption a quantum's wait is enough (a reader below a busy holder that
+    // spins on SwitchToThread gets in after one, not after starve_ms).
+    uint64_t starve_us = (uint64_t)g_cfg.starve_ms * 1000u;
+    if (g_preempt && starve_us > quantum_us) {
+        starve_us = quantum_us;
+    }
+    if (starve_us != 0) {
         wl_platform_mutex_lock(g_m);
         WlXbThread *volatile *pp = &g_ready;
-        while (*pp != NULL && now - (*pp)->ready_since_us < (uint64_t)g_cfg.starve_ms * 1000u) {
+        while (*pp != NULL && now - (*pp)->ready_since_us < starve_us) {
             pp = &(*pp)->next_ready;
         }
         WlXbThread *starved = *pp;
@@ -638,24 +699,61 @@ void wl_xb_yield(void) {
     requeue(self);
 }
 
-WlXbThread *wl_xb_block_begin(void) {
+static WlXbThread *give_up(uint8_t kind) {
     WlXbThread *self = g_cur;
     if (g_det || !g_ready_init || self == NULL || self->is_service || wl_xb_in_service() ||
         self->host_tid != wl_platform_thread_self_id() || irql_raised(self)) {
         return NULL;
     }
-    g_stats.io_blocks++;
     wl_platform_mutex_lock(g_m);
-    off_begin(self, true);
+    off_begin(self, kind);
+    if (kind == WL_XB_OFF_GPU) {
+        g_stats.gpu_blocks++;
+    } else {
+        g_stats.io_blocks++;
+    }
     wl_platform_mutex_unlock(g_m);
     wl_xb_unlock(self);
     return self;
 }
 
+WlXbThread *wl_xb_block_begin(void) {
+    return give_up(WL_XB_OFF_IO);
+}
+
 void wl_xb_block_end(WlXbThread *self) {
     if (self != NULL) {
+        self->io_back = g_preempt; // (enqueue reads it under g_m)
         wl_xb_lock(self);
     }
+}
+
+// The poll's sleep: the GPU's end is seen at most this late (a frame's wait is 1-20 ms on the Wii);
+// each look costs two thread switches.
+#define GPU_POLL_US 200u
+
+WlXbThread *wl_xb_gpu_wait_begin(void) {
+    // (raised first: the thread handed the lock may run at once, and this one must still get its looks)
+    wl_platform_thread_set_own_priority(WL_THREAD_PRIO_NET);
+    WlXbThread *self = give_up(WL_XB_OFF_GPU);
+    if (self == NULL) {
+        wl_platform_thread_set_own_priority(WL_THREAD_PRIO_MAIN);
+        return NULL;
+    }
+    return self;
+}
+
+void wl_xb_gpu_wait_poll(void) {
+    wl_platform_thread_sleep_us(GPU_POLL_US);
+}
+
+void wl_xb_gpu_wait_end(WlXbThread *self) {
+    if (self == NULL) {
+        return;
+    }
+    self->gpu_back = true; // (its wait for the lock is logged apart: note_ready_wait, take)
+    wl_xb_block_end(self);
+    wl_platform_thread_set_own_priority(WL_THREAD_PRIO_MAIN);
 }
 
 void wl_xb_card_lock(void) {
@@ -752,6 +850,7 @@ WlResult wl_xb_threads_init(const WlXbThreadConfig *cfg, WlXbThread **out) {
         g_card_made = true;
     }
     g_det = g_cfg.deterministic;
+    g_preempt = g_cfg.preempt && !g_det;
     if (g_det) {
         g_det_backedge_ns = g_cfg.det_backedge_ns != 0 ? g_cfg.det_backedge_ns : 40u;
         g_det_call_ns = g_cfg.det_call_ns != 0 ? g_cfg.det_call_ns : 400u;
@@ -962,7 +1061,9 @@ WlResult wl_xb_thread_create(uint32_t routine, uint32_t ctx1, uint32_t ctx2, uin
     // the Wii's host side has. Real-Wii and Dolphin runs of Halo's levels (2026-10, ~5400 census
     // reports of each size) used at most 14 KB of the main thread's 1 MB and 4 KB of a worker's
     // 192 KB: the main thread's 256 KB and a worker's 64 KB are still 16 times that, and give
-    // 1.25 MB back to the host side's heap (the census warns past three quarters of a stack)
+    // 1.25 MB back to the host side's heap (the census warns past three quarters of a stack).
+    // Card runs 11-13 (2026-10-17): still 14 KB at most, so the main thread's is 128 KB since
+    // 2026-10-18 (9 times that; "bigstacks" in the title's folder: 256 KB)
     size_t host = (size_t)(stack_bytes != 0 ? stack_bytes : g_cfg.default_stack_bytes) * 2u;
     if (host < (64u << 10)) {
         host = 64u << 10;
@@ -1045,7 +1146,7 @@ WlResult wl_xb_thread_create_host(const char *name, WlXbHostThreadFn fn, void *u
         free(start);
         return r;
     }
-    size_t host = 256u << 10;
+    size_t host = g_cfg.host_stack_bytes; // (the play harness's used at most 3 KB on the card)
     t->host_stack = aligned_alloc(64, host);
     if (t->host_stack == NULL) {
         free(start);
@@ -1306,8 +1407,10 @@ void wl_xb_thread_times(const WlXbThread *t, WlXbThreadTimes *out) {
     out->ready_us = t->ready_us + (t->ready ? now - t->ready_since_us : 0u);
     out->waited_us = t->waited_us;
     out->io_us = t->io_us;
+    out->gpu_us = t->gpu_us;
     if (t->off_since_us != 0 && now > t->off_since_us) {
-        *(t->off_io ? &out->io_us : &out->waited_us) += now - t->off_since_us;
+        uint64_t us = now - t->off_since_us;
+        *(t->off_kind == WL_XB_OFF_IO ? &out->io_us : t->off_kind == WL_XB_OFF_GPU ? &out->gpu_us : &out->waited_us) += us;
     }
     wl_platform_mutex_unlock(g_m);
 }
@@ -1324,17 +1427,30 @@ uint32_t wl_xb_thread_service_wait_max(uint32_t *holder) {
 
 void wl_xb_thread_log_ready_waits(void) {
     wl_platform_mutex_lock(g_m);
-    WlXbLatency c = g_ready_waits;
+    WlXbLatency c = g_ready_waits, backs = g_gpu_backs;
     memset(&g_ready_waits, 0, sizeof g_ready_waits);
+    memset(&g_gpu_backs, 0, sizeof g_gpu_backs);
     WlXbThreadStats st = g_stats;
     wl_platform_mutex_unlock(g_m);
-    static uint32_t last_starved, last_lower;
+    static uint32_t last_starved, last_lower, last_io, last_tie, last_gpu, last_gpu_ms;
+    if (backs.count != 0) {
+        WL_LOG_I(TAG, "GPU waits: %u gave the guest lock up, %u ms off it, since the last line",
+                 (unsigned)(st.gpu_blocks - last_gpu), (unsigned)(st.gpu_off_ms - last_gpu_ms));
+    }
+    last_gpu = st.gpu_blocks;
+    last_gpu_ms = st.gpu_off_ms;
+    wl_xb_latency_log(TAG, "GPU waits' lock back", &backs);
     if (c.count != 0) {
-        WL_LOG_I(TAG, "ready waits: %u starved hand-offs, %u yields to a lower priority since the last line",
-                 (unsigned)(st.starved_handoffs - last_starved), (unsigned)(st.yields_lower - last_lower));
+        WL_LOG_I(TAG,
+                 "ready waits: %u starved hand-offs, %u yields to a lower priority, %u hand-offs to a thread back "
+                 "from the card, %u to one of equal priority after its quantum since the last line",
+                 (unsigned)(st.starved_handoffs - last_starved), (unsigned)(st.yields_lower - last_lower),
+                 (unsigned)(st.io_handoffs - last_io), (unsigned)(st.tie_handoffs - last_tie));
     }
     last_starved = st.starved_handoffs;
     last_lower = st.yields_lower;
+    last_io = st.io_handoffs;
+    last_tie = st.tie_handoffs;
     wl_xb_latency_log(TAG, "ready waits", &c);
 }
 
@@ -1424,9 +1540,10 @@ void wl_xb_thread_stall_check(uint32_t paging) {
              owner != NULL ? owner->name : "nobody's", owner != NULL ? (unsigned)owner->id : 0u,
              g_ready != NULL ? g_ready->name : "(empty)");
     for (WlXbThread *t = g_all; t != NULL; t = t->next_all) {
-        WL_LOG_W(TAG, "stall: %u %s prio %d%s%s%s%s susp %u kdepth %u esp %08x eax %08x", (unsigned)t->id, t->name,
+        WL_LOG_W(TAG, "stall: %u %s prio %d%s%s%s%s%s susp %u kdepth %u esp %08x eax %08x", (unsigned)t->id, t->name,
                  t->priority, t->ready ? " ready" : "", t->woken ? " woken" : "", t->terminated ? " ended" : "",
-                 t->running_guest ? " running" : "", (unsigned)t->suspend_count, (unsigned)t->kernel_depth,
+                 t->running_guest ? " running" : "",
+                 t->off_since_us != 0 ? (t->off_kind == WL_XB_OFF_GPU ? " in a GPU wait" : t->off_kind == WL_XB_OFF_IO ? " in I/O" : "") : "", (unsigned)t->suspend_count, (unsigned)t->kernel_depth,
                  (unsigned)t->cpu.g_esp, (unsigned)t->cpu.g_eax);
     }
     wl_platform_mutex_unlock(g_m);

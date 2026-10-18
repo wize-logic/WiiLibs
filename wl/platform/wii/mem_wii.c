@@ -227,6 +227,21 @@ WlResult wl_platform_heap_cap(size_t bytes) {
     return WL_ERR_UNSUPPORTED;
 }
 
+WlResult wl_platform_heap_cap_add(size_t bytes) {
+    (void)bytes;
+    return WL_ERR_UNSUPPORTED;
+}
+
+// The reclaimer is called by the wrap (heap_wrap_wii.c), when it is linked in: its malloc, weak
+// here so that asking does not pull it in
+void *__wrap_malloc(size_t size) __attribute__((weak));
+
+bool wl_platform_heap_reclaims(void) {
+    void *(*wrap)(size_t) = __wrap_malloc;
+    __asm__("" : "+r"(wrap)); // not folded: weak, so it may be null
+    return wrap != NULL;
+}
+
 void wl_platform_heap_exempt(bool on) {
     (void)on;
 }

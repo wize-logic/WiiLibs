@@ -217,6 +217,9 @@ typedef struct {
     // Pages converted by a device (wl_xb_phys_converted) go no sooner than others: the clock alone
     // (as before 2026-10-17; the title folder's "notexfirst", WL_XB_TEXFIRST=0 on the host).
     bool converted_ordinary;
+    // Wii only: a page's PTE is looked for in its whole group, as before 2026-10-18, not first in
+    // the slot it was put in (the title folder's "ptescan").
+    bool pte_scan;
 } WlXbMemConfig;
 #define WL_XB_PAGE_CACHE_AUTO 0xFFFFFFFFu
 

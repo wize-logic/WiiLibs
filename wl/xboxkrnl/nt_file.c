@@ -18,6 +18,7 @@
 // Every file and folder open under a mount has one XkFcb, as NT's file control block: its handles,
 // a sparse file's size, and a delete asked for (FILE_DELETE_ON_CLOSE, FileDispositionInformation,
 // NtDeleteFile of an open file), done when the last handle closes.
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -73,6 +74,10 @@
 
 static uint8_t *g_bounce;
 static bool g_ahead_on;
+// The card's reads for the guest (xk_card_read_note): 32-bit counters, modulo 2^32
+static atomic_uint g_card_reads, g_card_bytes, g_card_us;
+// A guest read's time on the card (the card's part of an NtReadFile), since the last report
+static WlXbLatency g_card_lat;
 static char g_data_dir[192];
 static uint32_t g_files_open;
 // The title has left (wl_xk_files_stop): no transfer reaches the card again. Under the card's lock.
@@ -737,16 +742,20 @@ static bool ahead_wanted(const XkFile *f, uint64_t off) {
 // before a failure, or `len`. (`held`: the guest lock kept through it, for the page census's counts)
 static uint32_t card_read(XkFile *f, uint64_t at, uint8_t *dst, uint32_t len, uint64_t phys, bool held) {
     uint32_t done = 0;
+    // (read straight from the card, a piece is a few transfers of whole runs: the span at once)
+    uint32_t piece = wl_platform_fs_fast() ? XK_SPAN : BOUNCE;
     while (done < len) {
-        uint32_t chunk = len - done < BOUNCE ? len - done : BOUNCE;
+        uint32_t chunk = len - done < piece ? len - done : piece;
         uint32_t got = 0;
         if (at + done < phys) {
             uint64_t left = phys - (at + done);
             uint32_t want = left < chunk ? (uint32_t)left : chunk;
             wl_xb_card_lock();
+            uint64_t t0 = wl_platform_time_us();
             WlResult r = g_card_stopped ? WL_ERR_STATE // (the title left meanwhile: the card is going)
                          : f->pf != NULL ? wl_platform_fs_read_some_at(f->pf, at + done, dst + done, want, &got)
                                          : WL_ERR_STATE; // (its reopen after a rename failed)
+            xk_card_read_note(got, wl_platform_time_us() - t0);
             wl_xb_card_unlock();
             wl_xb_census_card(held ? WL_XB_CCARD_READ_HELD : WL_XB_CCARD_READ, strstr(f->name, ".map") != NULL,
                               got); // (a diagnostic)
@@ -780,7 +789,8 @@ static bool card_write(XkFile *f, uint64_t at, const uint8_t *src, uint32_t len)
 
 // The buffer of an I/O of `len` bytes on `f`: a regular file's has its own (up to XK_SPAN bytes: *own
 // true), so that the guest lock can be given up around the card's part; another's is g_bounce, the
-// lock kept (BOUNCE bytes).
+// lock kept (BOUNCE bytes). Its own has 32 bytes more: a read starts at the file offset's alignment
+// (io_at), which the platform's reads straight from the card need to move nothing.
 static uint8_t *io_buffer(const XkFile *f, uint32_t len, uint32_t *cap, bool *own) {
     *own = false;
     *cap = BOUNCE;
@@ -788,13 +798,18 @@ static uint8_t *io_buffer(const XkFile *f, uint32_t len, uint32_t *cap, bool *ow
         return g_bounce;
     }
     uint32_t bytes = len < XK_SPAN ? len : XK_SPAN;
-    uint8_t *p = aligned_alloc(64, (bytes + 63u) & ~63u);
+    uint8_t *p = aligned_alloc(64, (bytes + 32u + 63u) & ~63u);
     if (p == NULL) {
         return g_bounce;
     }
     *own = true;
     *cap = bytes;
     return p;
+}
+
+// Where a read at file offset `at` starts in the buffer `io` (its own: at the offset's alignment).
+static uint8_t *io_at(uint8_t *io, bool own, uint64_t at) {
+    return own ? io + (at & 31u) : io;
 }
 
 // Whether a transfer of `len` bytes into its own buffer gives the guest lock up: a large one always,
@@ -826,6 +841,7 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
     uint32_t changes = f->fcb != NULL ? f->fcb->changes : 0u;
     bool ahead = f->kind == XK_FILE_REGULAR && xk_ahead_owned(f);
     uint32_t cap = 0, status = STATUS_SUCCESS;
+    uint64_t card_us = 0;
     bool span = false;
     uint8_t *io = NULL; // made at the card's first part (none when the read-ahead serves it all)
     while (*done < n) {
@@ -848,19 +864,21 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
         }
         uint32_t chunk = n - *done < cap ? n - *done : cap;
         uint32_t got = chunk;
+        uint8_t *to = io_at(io, span, at);
         if (f->kind == XK_FILE_PARTITION) {
-            xk_raw_read(f->partition, at, io, chunk);
+            xk_raw_read(f->partition, at, to, chunk);
         } else if (f->kind == XK_FILE_CDROM) {
-            memset(io, 0, chunk);
+            memset(to, 0, chunk);
         } else {
             WlXbThread *self = card_begin(span, n);
             uint64_t t0 = wl_platform_time_us();
             // (held: as card_begin decides on the Wii, whatever the deterministic mode does here)
-            got = card_read(f, at, io, chunk, phys, n < XK_BLOCK_MIN && !wl_xb_card_busy());
+            got = card_read(f, at, to, chunk, phys, n < XK_BLOCK_MIN && !wl_xb_card_busy());
+            card_us += wl_platform_time_us() - t0;
             wl_xb_block_end(self);
             io_held(f, self, t0);
         }
-        wl_xb_copy_in(buf + *done, io, got);
+        wl_xb_copy_in(buf + *done, to, got);
         *done += got;
         if (got < chunk) {
             status = *done > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
@@ -869,6 +887,9 @@ static uint32_t do_read(XkFile *f, uint64_t off, uint32_t buf, uint32_t len, uin
     }
     if (span) {
         free(io);
+    }
+    if (io != NULL && f->kind == XK_FILE_REGULAR) {
+        wl_xb_latency_add(&g_card_lat, card_us);
     }
     if (*done < n) {
         return status;
@@ -1005,6 +1026,53 @@ static void io_turn_take(XkFile *f) {
         wl_xb_block_end(self);
     }
     f->io_busy = true;
+}
+
+void xk_card_read_note(uint32_t bytes, uint64_t us) {
+    atomic_fetch_add(&g_card_reads, 1u);
+    atomic_fetch_add(&g_card_bytes, bytes);
+    atomic_fetch_add(&g_card_us, (unsigned)us);
+}
+
+// MB with one decimal, and MB/s of `bytes` in `us`, for a log line
+static unsigned mb10(uint32_t bytes) {
+    return (unsigned)(((uint64_t)bytes * 10u + (1u << 19)) >> 20);
+}
+
+static unsigned mbps10(uint32_t bytes, uint32_t us) {
+    return us != 0u ? (unsigned)((uint64_t)bytes * 10u * 1000000u / ((uint64_t)us << 20)) : 0u;
+}
+
+void xk_card_read_report(void) {
+    static uint32_t last_reads, last_bytes, last_us;
+    static WlPlatformFsReads last_all;
+    static uint64_t last_t;
+    uint64_t now = wl_platform_time_us();
+    uint32_t reads = atomic_load(&g_card_reads), bytes = atomic_load(&g_card_bytes), us = atomic_load(&g_card_us);
+    WlPlatformFsReads all;
+    wl_platform_fs_reads(&all);
+    uint32_t g_n = reads - last_reads, g_b = bytes - last_bytes, g_us = us - last_us;
+    uint32_t a_n = all.calls - last_all.calls, a_b = all.bytes - last_all.bytes, a_us = all.us - last_all.us;
+    // the rest of the platform's reads: the paging's (its file copies and the swap file), the boot's
+    uint32_t o_n = a_n > g_n ? a_n - g_n : 0u, o_b = a_b > g_b ? a_b - g_b : 0u, o_us = a_us > g_us ? a_us - g_us : 0u;
+    uint32_t f_b = all.fast_bytes - last_all.fast_bytes, f_us = all.fast_us - last_all.fast_us;
+    uint32_t f_t = all.transfers - last_all.transfers, f_n = all.fast_calls - last_all.fast_calls;
+    uint32_t wall = last_t != 0u ? (uint32_t)(now - last_t) : 0u;
+    if (a_n != 0u || g_n != 0u) {
+        WL_LOG_I(XK_TAG,
+                 "card reads: guest %u.%u MB in %u reads (%u.%u MB/s on the card, %u.%u MB/s of the time), "
+                 "paging and the rest %u.%u MB in %u reads (%u.%u MB/s on the card); straight from the card %u.%u MB "
+                 "in %u reads, %u transfers (%u.%u MB/s), %s",
+                 mb10(g_b) / 10u, mb10(g_b) % 10u, (unsigned)g_n, mbps10(g_b, g_us) / 10u, mbps10(g_b, g_us) % 10u,
+                 mbps10(g_b, wall) / 10u, mbps10(g_b, wall) % 10u, mb10(o_b) / 10u, mb10(o_b) % 10u, (unsigned)o_n,
+                 mbps10(o_b, o_us) / 10u, mbps10(o_b, o_us) % 10u, mb10(f_b) / 10u, mb10(f_b) % 10u, (unsigned)f_n,
+                 (unsigned)f_t, mbps10(f_b, f_us) / 10u, mbps10(f_b, f_us) % 10u,
+                 wl_platform_fs_fast() ? "on" : "off (oldsd)");
+    }
+    wl_xb_latency_log(XK_TAG, "guest reads' time on the card", &g_card_lat);
+    last_reads = reads, last_bytes = bytes, last_us = us;
+    last_all = all;
+    last_t = now;
 }
 
 // NtReadFile and NtWriteFile.

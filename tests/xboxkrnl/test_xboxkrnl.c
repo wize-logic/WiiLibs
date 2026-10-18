@@ -922,6 +922,35 @@ static WlXbThread *created_thread(uint32_t id_out) {
     return wl_xb_thread_by_id(wl_xb_rd32(id_out));
 }
 
+// A new thread's host thread queued for the lock, the caller keeping it (a host sleep has no safe
+// point): a fixed sleep was too short on a loaded host. The deterministic mode queues it at once.
+static bool await_queued(uint32_t id_out) {
+    WlXbThread *t = created_thread(id_out);
+    for (int i = 0; t != NULL && i < 5000; i++) {
+        WlXbThreadTimes tt;
+        wl_xb_thread_times(t, &tt);
+        if (tt.ready_us != 0 || wl_xb_deterministic()) {
+            return true;
+        }
+        wl_platform_thread_sleep_ms(1);
+    }
+    return false;
+}
+
+// Kernel delays (the lock given up) until the thread is in a guest wait.
+static bool await_waiting(uint32_t id_out) {
+    WlXbThread *t = created_thread(id_out);
+    for (int i = 0; t != NULL && i < 5000; i++) {
+        WlXbThreadTimes tt;
+        wl_xb_thread_times(t, &tt);
+        if (tt.waited_us != 0) {
+            return true;
+        }
+        delay_ms(1);
+    }
+    return false;
+}
+
 TEST a_signal_satisfies_the_waiter_at_once(void) {
     boot();
     ASSERT(g_ready);
@@ -986,12 +1015,10 @@ TEST no_yield_at_dispatch_level(void) {
     ASSERT(g_ready);
     reset_scratch();
     g_ran = 0;
-    uint32_t hp = gmem(4), tp0 = gmem(8);
+    uint32_t hp = gmem(4), idp = gmem(4), tp0 = gmem(8);
     ASSERT_EQ_FMT(0u, K0(S_KE_RAISE_TO_DPC), "%u");
-    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 1, 0, 0, 0, guest_fn(8, mark_routine)), "%08x");
-    if (!wl_xb_deterministic()) {
-        wl_platform_thread_sleep_ms(20); // (its host thread queued for the lock)
-    }
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, idp, 1, 0, 0, 0, guest_fn(8, mark_routine)), "%08x");
+    ASSERT(await_queued(idp));
     for (int i = 0; i < 10; i++) {
         K0(S_NT_YIELD);
         KN(S_KE_DELAY, 0, 0, tp0); // 0: a yield
@@ -1020,11 +1047,9 @@ TEST yield_gives_way_to_a_lower_priority(void) {
     WlXbThread *self = wl_xb_current();
     int prio = self->priority;
     wl_xb_thread_set_priority(self, prio + 2); // the spinner above the worker, as Halo's main thread
-    uint32_t hp = gmem(4);
-    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 1, 0, 0, 0, guest_fn(8, mark_routine)), "%08x");
-    if (!wl_xb_deterministic()) {
-        wl_platform_thread_sleep_ms(20); // (its host thread queued for the lock)
-    }
+    uint32_t hp = gmem(4), idp = gmem(4), tp = gmem(8);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, idp, 1, 0, 0, 0, guest_fn(8, mark_routine)), "%08x");
+    ASSERT(await_queued(idp));
     uint64_t start = now_ms();
     uint32_t yields = 0, status = 0;
     while (g_ran == 0 && yields < 1000u) {
@@ -1036,9 +1061,134 @@ TEST yield_gives_way_to_a_lower_priority(void) {
     if (!wl_xb_deterministic()) {
         ASSERT(now_ms() - start < 20u); // at once, not after the starvation hand-off (30 ms)
     }
-    delay_ms(5); // the worker ends
-    ASSERT_EQ_FMT(0x40000024u, K0(S_NT_YIELD), "%08x"); // no one ready: STATUS_NO_YIELD_PERFORMED
+    wl_xb_wr64(tp, (uint64_t)(int64_t)-50000000); // 5 s
+    ASSERT_EQ_FMT(0u, KN(S_NT_WAIT1, wl_xb_rd32(hp), 0, tp), "%08x"); // the worker ends
+    // no one ready: STATUS_NO_YIELD_PERFORMED (the service thread may be queued for a moment: a
+    // yield that gave way to it is tried again)
+    status = 0;
+    for (int i = 0; i < 100 && status == 0; i++) {
+        status = K0(S_NT_YIELD);
+    }
+    ASSERT_EQ_FMT(0x40000024u, status, "%08x");
     wl_xb_thread_set_priority(self, prio);
+    KN(S_NT_CLOSE, wl_xb_rd32(hp));
+    PASS();
+}
+
+// ---- A thread back from the card gets the lock at the next safe point ----------------------------
+// The console completes an I/O at its interrupt whatever runs: a reader below a busy holder gets its
+// completion at once, not after the starvation hand-off (30 ms) nor when the holder next waits.
+
+static volatile uint64_t g_iob_back_ms;
+static volatile uint32_t g_iob_in_io, g_iob_go;
+
+static void io_back_routine(void) {
+    // stdcall SystemRoutine(ctx1, ctx2): the card's I/O outside the lock, over once the holder is
+    // busy (a fixed 20 ms could end before the holder had the lock back on a loaded host), then
+    // the time it is back
+    WlXbThread *b = wl_xb_block_begin();
+    g_iob_in_io = 1;
+    for (int i = 0; i < 5000 && g_iob_go == 0; i++) {
+        wl_platform_thread_sleep_ms(1);
+    }
+    wl_platform_thread_sleep_ms(2);
+    wl_xb_block_end(b);
+    g_iob_back_ms = now_ms();
+    guest_ret(8);
+}
+
+TEST io_back_gets_the_lock_at_the_next_safe_point(void) {
+    boot();
+    ASSERT(g_ready);
+    if (wl_xb_deterministic()) {
+        PASS(); // (no card I/O outside the lock there)
+    }
+    reset_scratch();
+    g_iob_back_ms = 0;
+    g_iob_in_io = g_iob_go = 0;
+    WlXbThread *self = wl_xb_current();
+    int prio = self->priority;
+    wl_xb_thread_set_priority(self, prio + 2); // the busy holder above the reader, as Halo's main thread
+    uint32_t hp = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(8, io_back_routine)), "%08x");
+    for (int i = 0; i < 5000 && g_iob_in_io == 0; i++) {
+        delay_ms(1); // the reader runs into its I/O
+    }
+    ASSERT(g_iob_in_io != 0);
+    WlXbThreadStats ts0, ts1;
+    wl_xb_thread_stats(&ts0);
+    g_iob_go = 1;
+    uint64_t start = now_ms();
+    while (g_iob_back_ms == 0 && now_ms() - start < 5000u) {
+        wl_xb_safe_point(); // busy in guest code: a back edge's safe points only
+    }
+    wl_xb_thread_stats(&ts1);
+    ASSERT(g_iob_back_ms != 0); // back while the holder never waits
+    // handed the lock as a thread back from the card (at the holder's safe point, or after the
+    // service thread's turn when it was queued too), not by the starvation hand-off; how soon its
+    // host thread runs then is the host's (a bound of 15 ms failed under load)
+    ASSERT_EQ_FMT(ts0.starved_handoffs, ts1.starved_handoffs, "%u");
+    wl_xb_thread_set_priority(self, prio);
+    delay_ms(5); // the reader ends
+    KN(S_NT_CLOSE, wl_xb_rd32(hp));
+    PASS();
+}
+
+// ---- A wait for the GPU gives the lock to a ready thread -------------------------------------------
+// The holder waiting for GX (gx_wii.c's waits, through nv2a_adapter.c) lets a ready thread run, and
+// gets the lock back at that thread's next safe point once the GPU is done: it is not starved by it.
+
+static volatile uint32_t g_gpw_points, g_gpw_stop;
+
+static void gpu_wait_busy_routine(void) {
+    // stdcall SystemRoutine(ctx1, ctx2): busy in guest code (a back edge's safe points only)
+    uint64_t start = now_ms();
+    while (!g_gpw_stop && now_ms() - start < 2000u) {
+        g_gpw_points++;
+        wl_xb_safe_point();
+    }
+    guest_ret(8);
+}
+
+TEST gpu_wait_lets_a_ready_thread_run(void) {
+    boot();
+    ASSERT(g_ready);
+    if (wl_xb_deterministic()) {
+        ASSERT(wl_xb_gpu_wait_begin() == NULL); // (the lock kept: the virtual clock)
+        PASS();
+    }
+    reset_scratch();
+    g_gpw_points = g_gpw_stop = 0;
+    uint32_t hp = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hp, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(8, gpu_wait_busy_routine)), "%08x");
+    WlXbThreadStats st0;
+    wl_xb_thread_stats(&st0);
+    WlXbThread *self = wl_xb_current();
+    WlXbThreadTimes t0;
+    wl_xb_thread_times(self, &t0);
+    // the GPU's 20 ms: the busy thread gets the lock meanwhile
+    WlXbThread *w = wl_xb_gpu_wait_begin();
+    ASSERT(w == self);
+    uint64_t start = now_ms();
+    while (now_ms() - start < 20u) {
+        wl_xb_gpu_wait_poll();
+    }
+    uint32_t points = g_gpw_points;
+    uint64_t done = now_ms();
+    wl_xb_gpu_wait_end(w);
+    uint64_t back = now_ms();
+    ASSERT(wl_xb_lock_held());
+    ASSERT(points > 0u);       // it ran while this one waited
+    ASSERT(back - done < 15u); // and gave the lock back at its next safe point
+    WlXbThreadStats st;
+    wl_xb_thread_stats(&st);
+    ASSERT_EQ(st0.gpu_blocks + 1u, st.gpu_blocks);
+    WlXbThreadTimes t;
+    wl_xb_thread_times(self, &t);
+    ASSERT(t.gpu_us - t0.gpu_us >= 15000u); // (the wait's time is the GPU's, not the card's)
+    ASSERT_EQ(t0.io_us, t.io_us);
+    g_gpw_stop = 1;
+    delay_ms(5); // the busy thread ends
     KN(S_NT_CLOSE, wl_xb_rd32(hp));
     PASS();
 }
@@ -1391,15 +1541,11 @@ TEST a_priority_change_resorts_the_queue(void) {
     // A, then B, queued at the base priority; the holder above them meanwhile, so the kernel
     // calls' yield points do not let them run
     wl_xb_thread_set_priority(self, prio + 4);
-    uint32_t ha = gmem(4), hb = gmem(4), idb = gmem(4);
-    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, ha, 0, 0x4000, 0, 0, 0xA, 0, 0, 0, guest_fn(11, order_routine)), "%08x");
-    if (!wl_xb_deterministic()) {
-        wl_platform_thread_sleep_ms(30); // (its host thread queued for the lock)
-    }
+    uint32_t ha = gmem(4), hb = gmem(4), ida = gmem(4), idb = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, ha, 0, 0x4000, 0, ida, 0xA, 0, 0, 0, guest_fn(11, order_routine)), "%08x");
+    ASSERT(await_queued(ida));
     ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, hb, 0, 0x4000, 0, idb, 0xB, 0, 0, 0, guest_fn(11, order_routine)), "%08x");
-    if (!wl_xb_deterministic()) {
-        wl_platform_thread_sleep_ms(30);
-    }
+    ASSERT(await_queued(idb));
     ASSERT_EQ_FMT(0u, g_order_n, "%u");
     WlXbThread *b = created_thread(idb);
     ASSERT(b != NULL);
@@ -1694,10 +1840,17 @@ static bool ahead_file(const char *name, uint32_t size, char *path, size_t cap) 
     if (fp == NULL) {
         return false;
     }
-    for (uint32_t i = 0; i < size; i++) {
-        fputc(ahead_byte(i), fp);
+    // (in blocks: a byte at a time held the guest lock for seconds under qemu on a loaded host)
+    uint8_t block[4096];
+    bool ok = true;
+    for (uint32_t at = 0; at < size && ok; at += (uint32_t)sizeof block) {
+        uint32_t n = size - at < (uint32_t)sizeof block ? size - at : (uint32_t)sizeof block;
+        for (uint32_t i = 0; i < n; i++) {
+            block[i] = ahead_byte(at + i);
+        }
+        ok = fwrite(block, 1, n, fp) == n;
     }
-    return fclose(fp) == 0;
+    return fclose(fp) == 0 && ok;
 }
 
 // Reads [at, to) in requests of n, checked against ahead_byte(); the next offset.
@@ -2954,10 +3107,9 @@ TEST a_wait_keeps_its_object(void) {
     g_wait_done = gmem(20);
     KN(S_KE_INIT_SEMAPHORE, g_wait_done, 0, 1);
     g_wait_status = 0xFFFFFFFFu;
-    uint32_t th = gmem(4);
-    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, th, 0, 0x4000, 0, 0, 0, 0, 0, 0, guest_fn(4, waiter_routine)), "%08x");
-    wl_xb_wr64(tp, (uint64_t)(int64_t)-100000); // 10 ms: the waiter starts its wait
-    KN(S_KE_DELAY, 0, 0, tp);
+    uint32_t th = gmem(4), tid = gmem(4);
+    ASSERT_EQ_FMT(0u, KN(S_PS_CREATE, th, 0, 0x4000, 0, tid, 0, 0, 0, 0, guest_fn(4, waiter_routine)), "%08x");
+    ASSERT(await_waiting(tid)); // the waiter in its wait
     ASSERT_EQ_FMT(0xFFFFFFFFu, g_wait_status, "%08x");
     KN(S_NT_CLOSE, g_wait_handle); // the last handle, closed under the waiter
     ASSERT_EQ_FMT(0x4C504C57u, wl_xb_rd32(body - 16u), "%08x"); // still a pool block ("WLPL")
@@ -3181,6 +3333,8 @@ SUITE(kernel_suite) {
     RUN_TEST(a_signal_satisfies_the_waiter_at_once);
     RUN_TEST(no_yield_at_dispatch_level);
     RUN_TEST(yield_gives_way_to_a_lower_priority);
+    RUN_TEST(io_back_gets_the_lock_at_the_next_safe_point);
+    RUN_TEST(gpu_wait_lets_a_ready_thread_run);
     RUN_TEST(vblanks_raised_together_all_run);
     RUN_TEST(vblank_backlog_runs_in_rounds);
     RUN_TEST(vblank_wait_wakes_at_the_next_vblank);

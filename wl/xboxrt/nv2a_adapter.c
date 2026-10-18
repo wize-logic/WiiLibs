@@ -21,12 +21,14 @@
 #include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/mem.h"
+#include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/thread.h"
 
 #include "wl/xbox/nv2a.h"
 #include "wl/xbox/nv2a_capture.h"
 #include "wl/xbox/nv2a_kelvin.h"
 #include "wl/xbox/nv2a_gx.h"
+#include "wl/xbox/nv2a_regs.h"
 
 #define TAG "xbgpu"
 
@@ -225,12 +227,182 @@ static uint64_t gpu_time_ns(void *user) {
     return wl_xb_time_ns();
 }
 
+// ---- GX's waits outside the guest lock -------------------------------------------------------------
+//
+// The holder that waits for GX (a frame's end, a token, a copy: gx_wii.c's waits, through
+// wl_gx_set_wait_idle) gives the guest lock up once the wait's own work (the put-off textures) is
+// done and someone else wants the lock, as the Xbox's other threads run while its GPU draws, and
+// takes it back when GX is done (thread.h's wl_xb_gpu_wait_begin/end: at the next holder's next safe
+// point). It waits in the middle of the model (a method's flip, a kick's draws), which is not made to
+// be entered twice, nor GX to be given another thread's commands in the middle of a frame's end. So
+// meanwhile the others' accesses that run the pusher or a flip (a channel's PUT, PGRAPH's FIFO access
+// and interrupt acknowledge, PCRTC's START) and the vertical blank (which tries the stopped channels
+// again) wait outside the lock for the waiter to leave the model, or, from a thread that cannot give
+// the lock up (the service thread, a raised IRQL), queue for it in order: the waiter runs them once it
+// is out. The GPU's interrupt is held off as long, so its ISR does not run again and again on an
+// acknowledge that queued. Their other accesses (status reads, the interrupt registers' enables, the
+// timer) go through: the model is at rest between two of its calls in the waiter.
+// Off (a file "holdgxlock", WL_XB_HOLD_GX_LOCK on the host): the lock kept through every wait.
+
+// how long a wait spins with the lock before it gives the lock up (a short sync costs less than two
+// hand-offs), and only when another thread or interrupt work wants it (g_xb_attention)
+#define GX_SPIN_US 100u
+#define GX_QUEUE 64u
+#define GX_VBLANK 0xFFFFFFFFu // a queued vertical blank's offset
+
+static bool g_hold_gx_lock;
+static uint32_t g_gpu_depth;        // the holder's calls into the model under way
+static volatile bool g_gx_given_up; // a waiter in the model is off the lock (read by the others)
+static struct {
+    WlXbThread *self;    // off the lock (NULL: holding it)
+    uint64_t t0;         // this wait's first look (0: none yet)
+    bool kept;           // this wait keeps the lock
+    uint32_t mmio_depth; // mmio.c's, put back (zero meanwhile: the others' faults may give the lock up)
+} g_gw;
+static struct {
+    uint32_t offset, value;
+    uint8_t size;
+} g_queue[GX_QUEUE];
+static uint32_t g_queue_n;
+static struct {
+    uint32_t given_up, queued, vblanks, waited, overflow, irq_held;
+} g_gxl;
+
+void wl_xb_gpu_set_hold_gx_lock(bool on) {
+    g_hold_gx_lock = on;
+}
+
+static void gx_wait_idle(void *user, bool done) {
+    (void)user;
+    if (done) {
+        if (g_gw.self != NULL) {
+            WlXbThread *self = g_gw.self;
+            g_gw.self = NULL;
+            wl_xb_gpu_wait_end(self);
+            g_xb_mmio_depth = g_gw.mmio_depth;
+            g_gx_given_up = false;
+        }
+        g_gw.t0 = 0;
+        g_gw.kept = false;
+        return;
+    }
+    if (g_gw.self != NULL) {
+        wl_xb_gpu_wait_poll();
+        return;
+    }
+    if (g_gw.kept) {
+        return;
+    }
+    uint64_t now = wl_platform_time_us();
+    if (g_gw.t0 == 0) {
+        g_gw.t0 = now | 1u;
+        return;
+    }
+    if (now - g_gw.t0 < GX_SPIN_US || g_xb_attention == 0) {
+        return;
+    }
+    if (g_hold_gx_lock || g_gpu_depth == 0 || g_gx_given_up || !wl_xb_lock_held()) {
+        g_gw.kept = true; // (a wait outside the model's calls, or not the holder's: nothing to keep apart)
+        return;
+    }
+    g_gx_given_up = true; // (before the lock goes: the next holder sees it)
+    g_gw.mmio_depth = g_xb_mmio_depth;
+    g_xb_mmio_depth = 0;
+    g_gw.self = wl_xb_gpu_wait_begin();
+    if (g_gw.self == NULL) {
+        g_gx_given_up = false; // kept (the deterministic mode, a raised IRQL, the service's work)
+        g_xb_mmio_depth = g_gw.mmio_depth;
+        g_gw.kept = true;
+        return;
+    }
+    g_gxl.given_up++;
+}
+
+// Whether an access runs the pusher or a flip (see above).
+static bool runs_gx(uint32_t offset) {
+    offset &= WL_NV2A_MMIO_SIZE - 1u;
+    if (offset >= WL_NV2A_USER) {
+        return (offset & 0x1FFCu) == WL_NV2A_USER_DMA_PUT;
+    }
+    switch (offset & ~3u) {
+    case WL_NV2A_PGRAPH_INTR:
+    case WL_NV2A_PGRAPH_FIFO:
+    case WL_NV2A_PCRTC_START:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Another thread's access, while the waiter is off the lock, that must not enter the model now: it
+// waits outside the lock until the waiter is out (true: go on), or queues (false: done).
+static bool wait_for_waiter(uint32_t offset, uint32_t value, unsigned size) {
+    WlXbThread *self = offset != GX_VBLANK ? wl_xb_block_begin() : NULL;
+    if (self != NULL) {
+        g_gxl.waited++;
+        while (g_gx_given_up) {
+            wl_xb_gpu_wait_poll();
+        }
+        wl_xb_block_end(self); // (at the waiter's next safe point: out of the model)
+        return true;
+    }
+    if (g_queue_n == GX_QUEUE) {
+        g_gxl.overflow++; // (a few acknowledges and kicks a wait: not seen)
+        return true;
+    }
+    if (offset != GX_VBLANK && g_queue_n != 0 && g_queue[g_queue_n - 1u].offset == offset &&
+        (offset & (WL_NV2A_MMIO_SIZE - 1u)) >= WL_NV2A_USER) {
+        g_queue[g_queue_n - 1u].value = value; // (a channel's PUT again: the later one)
+        return false;
+    }
+    g_queue[g_queue_n].offset = offset;
+    g_queue[g_queue_n].value = value;
+    g_queue[g_queue_n].size = (uint8_t)size;
+    g_queue_n++;
+    if (offset == GX_VBLANK) {
+        g_gxl.vblanks++;
+    } else {
+        g_gxl.queued++;
+    }
+    return false;
+}
+
+static void vblank_now(void *gpu);
+
+// The waiter is out of the model: what the others queued meanwhile, in order (a wait in one of them
+// may give the lock up again: what queues then runs in this loop too).
+static void run_queued(void *gpu) {
+    for (uint32_t i = 0; i < g_queue_n; i++) {
+        uint32_t offset = g_queue[i].offset;
+        g_gpu_depth++;
+        if (offset == GX_VBLANK) {
+            vblank_now(gpu);
+        } else {
+            wl_nv2a_mmio_write(gpu, offset, g_queue[i].value, g_queue[i].size);
+        }
+        g_gpu_depth--;
+    }
+    g_queue_n = 0;
+}
+
 static uint32_t a_read(void *gpu, uint32_t offset, unsigned size) {
     return wl_nv2a_mmio_read(gpu, offset, size);
 }
 
 static void a_write(void *gpu, uint32_t offset, uint32_t value, unsigned size) {
+    while (g_gx_given_up && runs_gx(offset)) {
+        if (!wait_for_waiter(offset, value, size)) {
+            return;
+        }
+        if (g_queue_n == GX_QUEUE) {
+            break; // (the queue full: in at once, as before)
+        }
+    }
+    g_gpu_depth++;
     wl_nv2a_mmio_write(gpu, offset, value, size);
+    if (--g_gpu_depth == 0 && g_queue_n != 0) {
+        run_queued(gpu);
+    }
 }
 
 // every 10 s (600 vertical blanks): what the GPU did, for the log
@@ -247,6 +419,12 @@ static void gpu_status(void) {
                  "frames, %u vblanks, %u notifies, %u semaphores", (unsigned)ns.kicks, (unsigned)ns.words,
                  (unsigned)ns.methods, (unsigned)ns.pusher_errors, (unsigned)ns.acquires_unmet, (unsigned)ns.flips,
                  (unsigned)ns.frames, (unsigned)ns.vblanks, (unsigned)ns.notifies, (unsigned)ns.semaphores);
+    }
+    if (g_gxl.given_up != 0) {
+        WL_LOG_I(TAG, "status: GX waits gave the guest lock up %u times; behind them %u accesses and %u vertical "
+                 "blanks queued, %u threads waited, %u queue overflows, %u interrupt polls held off",
+                 (unsigned)g_gxl.given_up, (unsigned)g_gxl.queued, (unsigned)g_gxl.vblanks, (unsigned)g_gxl.waited,
+                 (unsigned)g_gxl.overflow, (unsigned)g_gxl.irq_held);
     }
     WlNv2aGxStats gs;
     wl_nv2a_gx_stats(g_gx, &gs);
@@ -303,6 +481,15 @@ static void gpu_status(void) {
              (unsigned)gs.textures_stood_in, (unsigned)gs.standin_hidden, (unsigned)gs.textures_unread,
              (unsigned)gs.textures_disabled,
              (unsigned)gs.textures_unsampled, (unsigned)ts.mip_shared, (unsigned)ts.mip_replaced);
+    // (the frame budget: textures put off, and the frames' time; spikes are what it is for)
+    WL_LOG_I(TAG, "status: textures put off %u times in %u frames (%u in a row at most; %u made while GX drew); a frame's texture work at most %u ms "
+             "(%u KB made), %u frames over 20 ms, %u over 50 ms; frames ms <34:%u <67:%u <100:%u <150:%u <250:%u "
+             "more:%u max %u", (unsigned)ts.deferred, (unsigned)ts.frames_deferred,
+             (unsigned)ts.deferred_run, (unsigned)ts.made_early, (unsigned)(ts.worst_frame_us / 1000u),
+             (unsigned)(ts.worst_frame_made >> 10), (unsigned)ts.frames_over_20ms, (unsigned)ts.frames_over_50ms,
+             (unsigned)gs.frames_by_time[0], (unsigned)gs.frames_by_time[1], (unsigned)gs.frames_by_time[2],
+             (unsigned)gs.frames_by_time[3], (unsigned)gs.frames_by_time[4], (unsigned)gs.frames_by_time[5],
+             (unsigned)(gs.frame_us_worst / 1000u));
     if (wl_nv2a_vcache_on(wl_nv2a_gx_vertex_cache(g_gx))) {
         WlNv2aVCacheStats vs;
         wl_nv2a_vcache_stats(wl_nv2a_gx_vertex_cache(g_gx), &vs);
@@ -317,6 +504,19 @@ static void gpu_status(void) {
 }
 
 static void a_vblank(void *gpu) {
+    if (g_gx_given_up) {
+        // (the service's or a holder's interrupt work, which keeps the lock: owed to the waiter)
+        (void)wait_for_waiter(GX_VBLANK, 0, 0);
+        return;
+    }
+    g_gpu_depth++;
+    vblank_now(gpu);
+    if (--g_gpu_depth == 0 && g_queue_n != 0) {
+        run_queued(gpu);
+    }
+}
+
+static void vblank_now(void *gpu) {
     wl_nv2a_vblank(gpu);
     static uint32_t vblanks;
     if (++vblanks % 600u == 0) {
@@ -341,6 +541,10 @@ static void a_vblank(void *gpu) {
 }
 
 static bool a_irq(const void *gpu) {
+    if (g_gx_given_up) {
+        g_gxl.irq_held++;
+        return false; // (held off until the waiter is out: an acknowledge would only queue)
+    }
     return wl_nv2a_irq_pending(gpu);
 }
 
@@ -350,17 +554,38 @@ WlNv2aGx *wl_xb_gpu_nv2a_gx(void) {
     return g_gx;
 }
 
-static bool g_no_xf, g_no_overlap;
+static bool g_no_xf, g_no_xf_light, g_no_xf_skin, g_no_fused_xf, g_no_overlap;
 
 void wl_xb_gpu_set_transform_unit(bool on) {
     g_no_xf = !on;
+}
+
+void wl_xb_gpu_set_transform_unit_light(bool on) {
+    g_no_xf_light = !on;
+}
+
+void wl_xb_gpu_set_transform_unit_skin(bool on) {
+    g_no_xf_skin = !on;
+}
+
+void wl_xb_gpu_set_fused_xf(bool on) {
+    g_no_fused_xf = !on;
 }
 
 void wl_xb_gpu_set_frame_overlap(bool on) {
     g_no_overlap = !on;
 }
 
-static bool g_query_by_area;
+static bool g_query_by_area, g_targets_on_heap;
+static uint32_t g_texture_budget = WL_XB_TEXTURE_FRAME_BUDGET;
+
+void wl_xb_gpu_set_targets_on_heap(bool on) {
+    g_targets_on_heap = on;
+}
+
+void wl_xb_gpu_set_texture_budget(uint32_t bytes) {
+    g_texture_budget = bytes;
+}
 
 void wl_xb_gpu_set_query_by_area(bool on) {
     g_query_by_area = on;
@@ -379,6 +604,16 @@ void wl_xb_gpu_set_prefetch(bool on) {
     wl_nv2a_set_prefetch(on);
 }
 
+void wl_xb_gpu_set_old_push(bool on) {
+#if !defined(__wii__)
+    on = on || getenv("WL_XB_OLDPUSH") != NULL;
+#endif
+    if (on) {
+        WL_LOG_I(TAG, "push buffer: the header loop as before the method table's run kinds (oldpush)");
+    }
+    wl_nv2a_set_old_push(on);
+}
+
 // What the GPU holds of the host's heap (mem_census.h): the device and the backend's records, the
 // render targets' images, the texture decoders' scratch, and the textures' arena (the boot's, of the
 // heap too) or, without one, the images kept on the heap.
@@ -392,16 +627,53 @@ static void census_gpu(void *user, WlMemCensusReport *out) {
     out->bytes = record + (g_gpu != NULL ? wl_nv2a_host_bytes(g_gpu) : 0u);
 }
 
+// The back buffer's park (gx_target.c: its colour, as large as the picture, and the depth once a
+// target has written over it) in a free piece of the textures' arena when it has one, as the render
+// targets (nv2a_gx.h targets_on_heap: "heaptargets" in the title's folder, both of the heap). Its
+// pieces in the arena, for the census (the heap's figures leave them out).
+#define PARK_PIECES 4
+static void *g_park_piece[PARK_PIECES];
+static size_t g_park_piece_bytes[PARK_PIECES];
+
+static void *park_alloc(size_t bytes) {
+    void *p = g_gx != NULL ? wl_nv2a_gx_spare_alloc(g_gx, bytes) : NULL;
+    if (p != NULL) {
+        for (unsigned i = 0; i < PARK_PIECES; i++) {
+            if (g_park_piece[i] == NULL) {
+                g_park_piece[i] = p;
+                g_park_piece_bytes[i] = bytes;
+                return p;
+            }
+        }
+        (void)wl_nv2a_gx_spare_free(g_gx, p); // (no room to note it: the heap's)
+    }
+    return aligned_alloc(32, (bytes + 31u) & ~(size_t)31u);
+}
+
+static void park_free(void *memory) {
+    for (unsigned i = 0; i < PARK_PIECES; i++) {
+        if (memory != NULL && g_park_piece[i] == memory) {
+            g_park_piece[i] = NULL;
+            g_park_piece_bytes[i] = 0;
+            (void)wl_nv2a_gx_spare_free(g_gx, memory);
+            return;
+        }
+    }
+    free(memory);
+}
+
 static void census_targets(void *user, WlMemCensusReport *out) {
     (void)user;
-    size_t record, targets;
+    size_t record, targets, park_arena = 0;
     unsigned count;
     wl_nv2a_gx_host_bytes(g_gx, &record, &targets, &count);
-    // and the back buffer's park (gx_target.c: its colour, as large as the picture, and the depth
-    // once a target has written over it)
     WlGxTargetStats st;
     wl_gx_target_stats(&st, false);
-    out->bytes = targets + st.held;
+    for (unsigned i = 0; i < PARK_PIECES; i++) {
+        park_arena += g_park_piece_bytes[i];
+    }
+    park_arena = park_arena < st.held ? park_arena : st.held;
+    out->bytes = targets + st.held - park_arena;
     snprintf(out->note, sizeof out->note, "%u, park %u", count, (unsigned)((st.held + 512u) >> 10));
 }
 
@@ -461,7 +733,9 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
             gcfg.textures.budget = bytes;
         }
         gcfg.textures.watch = tex_watch;
+        gcfg.textures.frame_budget = g_texture_budget;
         gcfg.query_by_area = g_query_by_area;
+        gcfg.targets_on_heap = g_targets_on_heap;
         gcfg.textures.written = tex_written;
         if (g_vcache_bytes != 0) {
             if (g_vcache_arena != NULL) {
@@ -481,16 +755,30 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
         }
         gcfg.program_decoded = program_decoded;
         gcfg.no_xf = g_no_xf;
+        gcfg.no_xf_light = g_no_xf_light;
+        gcfg.no_xf_skin = g_no_xf_skin;
+        gcfg.no_fused_xf = g_no_fused_xf;
         gcfg.overlap = !g_no_overlap;
         if (g_no_overlap) {
             WL_LOG_I(TAG, "frames not overlapped: each frame's end waits for GX to finish it");
         }
         if (g_no_xf) {
             WL_LOG_I(TAG, "GX's transform unit not used: every vertex through the program on the processor");
+        } else if (g_no_xf_light) {
+            WL_LOG_I(TAG, "GX's transform unit lights no colour: a light's dot product made by the processor");
+        }
+        if (!g_no_xf && g_no_xf_skin) {
+            WL_LOG_I(TAG, "GX's transform unit lights no skinned model: d0 made by the processor");
         }
         g_gx = wl_nv2a_gx_create(&gcfg);
         WL_LOG_I(TAG, "textures: %u KB %s; checked through the write watch where the guest is paged",
                  (unsigned)(bytes >> 10), texture_arena != NULL ? "in an arena of their own" : "of the heap");
+        if (g_texture_budget != 0) {
+            WL_LOG_I(TAG, "textures: %u KB of new ones made a frame at its draws, the rest while GX draws or "
+                     "in a later frame", (unsigned)(g_texture_budget >> 10));
+        } else {
+            WL_LOG_I(TAG, "textures: every one made at its first draw (lazytex)");
+        }
         if (g_gx != NULL) {
             wl_nv2a_gx_backend(g_gx, &backend);
         }
@@ -507,6 +795,9 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
     }
     if (g_gx != NULL) {
         wl_nv2a_gx_attach(g_gx, g_gpu);
+        if (!g_targets_on_heap) {
+            wl_gx_target_set_allocator(park_alloc, park_free);
+        }
         (void)wl_mem_census_add("targets", census_targets, NULL);
         (void)wl_mem_census_add("textures", census_textures, NULL);
         (void)wl_mem_census_add("tex scratch", census_scratch, NULL);
@@ -530,5 +821,10 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
         wl_xb_gpu_capture(path, frames, after);
     }
 #endif
+    if (!g_hold_gx_lock) {
+        wl_gx_set_wait_idle(gx_wait_idle, NULL);
+    } else {
+        WL_LOG_I(TAG, "holdgxlock: the guest lock kept through GX's waits");
+    }
     return wl_xb_gpu_attach(&k_ops, g_gpu);
 }

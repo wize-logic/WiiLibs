@@ -15,7 +15,7 @@
 #include "wl/xbox/psh.h"
 #include "wl/xbox/vsh.h"
 
-enum { WL_NV2A_PIPELINE_PROGRAMS = 16 };
+enum { WL_NV2A_PIPELINE_PROGRAMS = 16, WL_NV2A_PIPELINE_INPUTS = 4 };
 
 typedef struct WlNv2aPipeline {
     // vertex programs compiled ahead of time (tools/xbox_vsh_codegen.c), or NULL
@@ -39,10 +39,15 @@ typedef struct WlNv2aPipeline {
     // the natives: a title's programs listed for compiling ahead of time (NULL: none)
     void (*decoded)(void *user, const uint32_t *words, unsigned long count, bool native);
     void *decoded_user;
-    // the last answer of wl_nv2a_pipeline_inputs: for this program (and compile count) and live set
-    const WlXboxVshProgram *inputs_program;
-    uint32_t inputs_compiled, inputs;
-    unsigned inputs_live;
+    // the last answers of wl_nv2a_pipeline_inputs: for a program (and compile count) and live set
+    // (a draw asks for its position's alone, for its fit, and for all its outputs: a few kept, each
+    // draw's then found)
+    struct {
+        const WlXboxVshProgram *program;
+        uint32_t compiled, inputs;
+        unsigned live;
+    } inputs_kept[WL_NV2A_PIPELINE_INPUTS];
+    unsigned inputs_next;
 } WlNv2aPipeline;
 
 void wl_nv2a_pipeline_init(WlNv2aPipeline *p, const WlXboxVshNative *natives, unsigned long native_count);

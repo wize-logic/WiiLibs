@@ -176,6 +176,13 @@ def emu_line(line, immediates):
         return "{ float t; memcpy(&t, %s, 4); f_set(&%s, t); }" % (address, F(a[0]))
     if op == "sth":
         return "{ uint16_t t = (uint16_t)%s; memcpy(%s, &t, 2); }" % (emu_gpr(a[0]), emu_memory(a[1], immediates))
+    # (lhz and lbz in the host's order: what sth and stb then write back are the bytes read)
+    if op == "lhz":
+        return "{ uint16_t t; memcpy(&t, %s, 2); %s = t; }" % (emu_memory(a[1], immediates), emu_gpr(a[0]))
+    if op == "lbz":
+        return "{ uint8_t t; memcpy(&t, %s, 1); %s = t; }" % (emu_memory(a[1], immediates), emu_gpr(a[0]))
+    if op == "stb":
+        return "{ uint8_t t = (uint8_t)%s; memcpy(%s, &t, 1); }" % (emu_gpr(a[0]), emu_memory(a[1], immediates))
     if op == "lfd":
         return "{ double t; memcpy(&t, %s, 8); f_double(&%s, t); }" % (emu_memory(a[1], immediates), F(a[0]))
     if op == "mullw":

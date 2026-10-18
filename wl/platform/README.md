@@ -19,13 +19,16 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `mem.h`, `mem.c` | budgeted memory system: one heap per tag over MEM1/MEM2, double-buffered frame arena, scene arena stack, leak reports |
 | `mem_heap.h`, `mem_heap.c` | the tagged-heap core (first fit, coalescing, 32-byte headers, deterministic) |
 | `heap_overflow.h`, `heap_overflow.c` | the overflow heap's portable core: an allocator that is tried first, and a `wl_mem` heap that takes what it cannot hold (ownership by address, realloc between the two, any alignment); see "malloc that spills into MEM2" |
-| `heap_sites.h`, `heap_sites.c` | who holds the heap: live blocks counted by the two return addresses that asked for them (the small ones by size), for the wrapped `malloc`'s report; see "malloc that spills into MEM2" |
+| `heap_sites.h`, `heap_sites.c` | who holds the heap: live blocks counted by the two return addresses that asked for them (the small ones by size), with the sites that held the most at the peak of the bytes live, for the wrapped `malloc`'s report and the host's (`wl_platform_heap_track_sites`); see "malloc that spills into MEM2" |
+| `memfast.h`, `wii/memfast_wii.c` | memcpy, memmove, memset and memcmp for Broadway: a cache line a loop in 8 word loads and stores, dcbz on each whole destination line, misaligned sources at the aligned speed, up to 64 bytes without a loop; every Wii program's through `--wrap` (see "memcpy & co. on Broadway") |
 | `mem_census.h`, `mem_census.c` | who holds the host's heap: the heap's own figures (`wl_platform_heap_info`: arena, in use, free inside, free above the top, on the Wii counting what is left above sbrk's top and MEM2's arena) and a registry of reporters that subsystems add (`wl_mem_census_add`), asked only when a census is taken (`wl_mem_census_log`); on the host `wl_platform_heap_cap(bytes)` refuses allocations beyond a cap so a run shows what would fail first on the Wii (`wl_platform_heap_exempt` leaves the host's own stand-ins out of the count; glibc only). wl/xboxrt logs it (`WL_XB_HEAP_MB`) |
 | `ring.h`, `ring.c` | lock-free single-producer/single-consumer ring (C11 atomics) |
 | `present.h`, `present.c` | the display queue: which XFB is drawn, which wait for the GPU or their retrace, which is shown; a portable state machine that `wii/video_wii.c` drives from the retrace interrupt; see "Video" |
 | `io.h`, `io.c` | the IO thread: a job ring in, a completion ring out |
 | `fs.h`, `fs.c` | asynchronous file reads over the IO thread, read-speed measurement |
-| `fs_posix.inc` | the file half of `platform.h` on unbuffered POSIX fds, shared by both backends |
+| `fs_posix.inc` | the file half of `platform.h` on unbuffered POSIX fds, shared by both backends; a backend's own read of a file (`fs_fast_read`: the Wii's straight from the SD card) comes first |
+| `fat_map.h`, `fat_map.c` | a FAT16/32 volume's geometry (found as FatFs finds it: sector 0 or the MBR's first FAT partition) and a file's clusters as runs of sectors; `wl_fat_read` reads a mapped file in transfers of whole runs straight into the caller's buffer (a part sector through a bounce, an unaligned buffer by a shift). Reads through a function; tests: `test_platform_fat_map` (synthetic volumes made as they are read) |
+| `fs_speed.c` | `wl_fs_speed_compare` (`fs.h`): the SD card's reads through libfat against reads straight from the card on one big file (sequential, 64 KB anywhere, 4 KB pages anywhere), logged |
 | `file_replace.h`, `file_replace.c` | `wl_file_replace`: replace a file with a copy written beside it (`<file>.wtmp`, synced by the caller), so that a cut leaves the old file or the new one whole; where rename cannot replace a file (FAT) the old one goes aside as `<file>.wold` for the moment between the two renames (`wl_file_replace_aside`, which a host test calls directly). `wl_file_recover(root, depth, fn, user)`: the sweep for the next start, which puts a `.wold` back where its file is missing, drops it where it is not, and drops half-written `.wtmp` copies. POSIX paths, any directory (`sd:/...` under libfat too); tests: `test_platform_file_replace` |
 | `dircache.h`, `dircache.c` | `WlDirCache`: directory listings read once, for resolving a name written in another case than the file system has it (`wl_dircache_spelling`: the entry written as it is, else the first that differs in the case only, else as written). Up to 64 folders of 512 entries; a folder not there stays not there, one too large is never kept (the caller looks into it); a file made or removed since the listing was read is answered as the case of a letter only. Thread-safe; the lister is replaceable. Tests: `test_platform_dircache` |
 | `posix.h`, `posix.c` | `wl_posix_pread`, `wl_posix_pwrite` (a seek, the transfer and a seek back under one lock, so the descriptor's position is left alone), `WlPlacedReader` (`wl_posix_placed_open`, `_pread`, `_release`, `_close`: a descriptor read at offsets that remembers where it stands, so that a read that starts where the last ended is one `read` with no seek, where `wl_posix_pread` is three, each of which on FAT follows the file's chain of clusters) and `wl_posix_pause`: the POSIX calls devkitPPC's newlib declares and does not define; `wl_posix_sysconf`, sysconf's memory and processor answers for the console; `wl_posix_thread_set_priority` and `wl_posix_thread_set_relative_priority`, a pthread's priority (devkitPPC's `pthread_create` starts every thread at libogc's lowest, 127, and ignores attributes; the definitions are `wii/thread_wii.c`'s and `host/thread_host.c`'s). `wii/posix_wii.c` defines the C library's `pread`, `pwrite`, `pause` and `sysconf` over them, as weak symbols (a newlib that gains them wins), so a program calls them by their own names |
@@ -47,7 +50,7 @@ Target `wl_platform` (alias `WiiLibs::platform`), depends on `wl_base`.
 | `net_stream.h`, `net_stream.c` | the remote log: every log line and the files a run writes sent over one TCP connection to `tools/wii_net_run.py`, off the program's threads and free when off; see "The remote log" |
 | `net.h`, `net.c`, `net_internal.h` | IPv4 TCP and UDP sockets over IOS (libogc) or the host: addresses as host-order values, errors as results, poll for select, the network started in the background; `net.c` has the errno mapping and the address text; see below |
 | `gx_common.c` | GX helpers needing no hardware: texture sizes, sampler filter resolution, the ramp texture's image |
-| `gx_direct.h` | GX driven directly, for a renderer beyond `wl_gx`'s recipes and its one vertex layout (an emulated GPU's: `wl/xbox`'s NV2A backend): up to two colours and eight texture coordinates a vertex, drawn at once or a vertex at a time into the FIFO (or as the FIFO's own words, `wl_gx_direct_vertex_words`: the position's floats, each colour as 0xRRGGBBAA, the texture coordinates' floats, written as they are on the Wii; a batch of them in one call, `wl_gx_direct_vertices_words`), the transform unit's position matrix and 2x4 texture coordinate generators from a coordinate or the position (`wl_gx_direct_position_matrix`, `wl_gx_direct_texgen`; a layout's `texcoords_generated` for coordinates made from the position, not sent), projective coordinates divided at each pixel (a layout's `texcoords_projected`: up to three (s, t, q) sent after the position as the normal, binormal and tangent, each through a 3x4 generator), colour and alpha channels lit by the transform unit from the vertex's normal (a layout's `lit`, `wl_gx_direct_lighting`: the normal matrix, one light at infinity a channel, the signed dot product plus an ambient register, the host stub computing the same per vertex), any blend factors, its own projection, depth, alpha compare, cull, colour updates, textures on any map; it bypasses and invalidates `wl_gx`'s shadow. The first draw after `wl_gx_direct_begin` or `wl_gx_direct_flush_after` is preceded by eight vertices of zeros in its own format, the remedy for GX's transform unit hanging on a clipped primitive after an EFB copy, a token or a draw-done (libogc's `GX_Begin` sends nothing for `GX_MT_XF_FLUSH`; OpenCE-Wii's finding). Attributes can be indexed (`WlGxDirectLayout.indexed`): the vertex sends a 16-bit index (`wl_gx_direct_vertex_index`, or a draw's in one call, `wl_gx_direct_vertices_index`) and GX reads the position, normal, colour or texture coordinate from an array set with `wl_gx_direct_array` (big-endian floats and colour bytes, 32-byte aligned, written back from the cache), which geometry converted once costs the processor two bytes an attribute a vertex; `wl_gx_direct_arrays_changed` says memory an array came from has changed. A renderer that sets its own vertex descriptors and formats (indexed arrays, matrix indices: a Direct3D device's, OpenCE-Wii's) keeps the flush through `wl_gx_direct_vertex_format` (each direct attribute's size remembered) and `wl_gx_direct_flush_pending` / `wl_gx_direct_begin_format` (the strip sized by libogc's descriptor), and asks `wl_gx_direct_vertex_shape_ok` whether GX reads its vertices right (`gx_vertex.c` the sizes; `wii/gx_flush_wii.c`, libogc's GX alone, so a host harness over a stand-in links it). `wii/gx_direct_wii.c` (its stores into the write-gather pipe are the loops of `gx_pipe_words.h`: the pointer read once, a vertex of a known size without a loop counter, two indices as one 32-bit store; `test_platform_gx_pipe` checks every byte sent against the plain loops, `bench_gx_pipe` counts their instructions under `tools/qemu_icount.py`); `host/gx_direct_host.c` records what was asked (`host/gx_direct_host.h`) |
+| `gx_direct.h` | GX driven directly, for a renderer beyond `wl_gx`'s recipes and its one vertex layout (an emulated GPU's: `wl/xbox`'s NV2A backend): up to two colours and eight texture coordinates a vertex, drawn at once or a vertex at a time into the FIFO (or as the FIFO's own words, `wl_gx_direct_vertex_words`: the position's floats, each colour as 0xRRGGBBAA, the texture coordinates' floats, written as they are on the Wii; a batch of them in one call, `wl_gx_direct_vertices_words`), the transform unit's position matrix and 2x4 texture coordinate generators from a coordinate or the position (`wl_gx_direct_position_matrix`, `wl_gx_direct_texgen`; a layout's `texcoords_generated` for coordinates made from the position, not sent), projective coordinates divided at each pixel (a layout's `texcoords_projected`: up to three (s, t, q) sent after the position as the normal, binormal and tangent, each through a 3x4 generator; of them, `texcoords_sphere`'s are a sphere map's direction of unit length, which the transform unit moves by (0, 0, 1), normalizes and halves about 1/2 with its second matrix), colour and alpha channels lit by the transform unit from the vertex's normal (a layout's `lit`, `wl_gx_direct_lighting`: the normal matrix, one light at infinity a channel, the signed dot product plus an ambient register, the host stub computing the same per vertex; sent first of the normal, binormal and tangent beside projected coordinates), any blend factors, its own projection, depth, alpha compare, cull, colour updates, textures on any map; it bypasses and invalidates `wl_gx`'s shadow. The first draw after `wl_gx_direct_begin` or `wl_gx_direct_flush_after` is preceded by eight vertices of zeros in its own format, the remedy for GX's transform unit hanging on a clipped primitive after an EFB copy, a token or a draw-done (libogc's `GX_Begin` sends nothing for `GX_MT_XF_FLUSH`; OpenCE-Wii's finding). Attributes can be indexed (`WlGxDirectLayout.indexed`): the vertex sends a 16-bit index (`wl_gx_direct_vertex_index`, or a draw's in one call, `wl_gx_direct_vertices_index`) and GX reads the position, normal, colour or texture coordinate from an array set with `wl_gx_direct_array` (big-endian floats and colour bytes, 32-byte aligned, written back from the cache), which geometry converted once costs the processor two bytes an attribute a vertex; `wl_gx_direct_arrays_changed` says memory an array came from has changed. A renderer that sets its own vertex descriptors and formats (indexed arrays, matrix indices: a Direct3D device's, OpenCE-Wii's) keeps the flush through `wl_gx_direct_vertex_format` (each direct attribute's size remembered) and `wl_gx_direct_flush_pending` / `wl_gx_direct_begin_format` (the strip sized by libogc's descriptor), and asks `wl_gx_direct_vertex_shape_ok` whether GX reads its vertices right (`gx_vertex.c` the sizes; `wii/gx_flush_wii.c`, libogc's GX alone, so a host harness over a stand-in links it). `wii/gx_direct_wii.c` (its stores into the write-gather pipe are the loops of `gx_pipe_words.h`: the pointer read once, a vertex of a known size without a loop counter, two indices as one 32-bit store; `test_platform_gx_pipe` checks every byte sent against the plain loops, `bench_gx_pipe` counts their instructions under `tools/qemu_icount.py`); `host/gx_direct_host.c` records what was asked (`host/gx_direct_host.h`) |
 | `gx_target.h`, `gx_target.c`, `gx_target_internal.h` | render targets on GX's one EFB: who owns it, parking and putting back the back buffer, resolving a target into its memory, clear quads; the portable bookkeeping over a small backend (`gx_target_internal.h`: `wii/gx_target_wii.c`, `host/gx_target_host.c`); see "Render targets" |
 | `shutdown.c`, `shutdown_internal.h` | leaving the program: the shutdown hooks (`wl_platform_shutdown_hook`), the wind-down every `wl_platform_exit` starts with (hooks newest first, the audio output and the motors stopped), and the system watcher, the thread that serves the reset and power buttons (`wl_platform_system_watch_start`); see "Leaving the program" |
 | `gx_fifo.c` | `wl_gx_fifo_bytes`: the GX command FIFO's size, from the budget of `WL_TAG_GXFIFO` |
@@ -610,6 +613,53 @@ wl_heap_overflow_log_sites(12);   // "812 KiB in 12 blocks (peak 900 KiB, 40 mad
   the host, under sanitizers and on `ppc-be`. The console runner links with the wrappers and mallocs
   past MEM1 (`ctest -L dolphin`; "WLT SUITE heap_overflow" in its log).
 
+## memcpy & co. on Broadway (`memfast.h`)
+
+devkitPPC's newlib has the generic C string functions: memcpy moves 16 bytes a loop only when both
+pointers are word aligned and a byte at a time otherwise, memcmp compares a byte at a time unless
+both are, memset stores a word a loop. On the Wii, wl_platform's link interface passes
+`--wrap=memcpy,memmove,memset,memcmp` (and `-u __wrap_memcpy`), so every call in a program that links
+it (its own, the libraries', libogc's and newlib's) reaches `wii/memfast_wii.c`:
+- a cache line a loop: 8 word loads, dcbz of the destination line, 8 word stores (the loop in
+  assembly, 21 instructions a line with a dcbt two lines ahead); the head is a 32-byte store over
+  the first bytes and the tail a 16-byte one over the last, so no byte loop is left at either end;
+- a source that is not word aligned is read with misaligned word loads (the 750 does them in
+  hardware), so it costs what an aligned copy does, not newlib's byte loop;
+- dcbz only where the RAM is cached: MEM1 and MEM2 through the BATs (0x80000000.., 0x90000000..),
+  and page-table EAs below 0x1C000000 (the Xbox runtime's guest RAM; its devices are above, and an
+  emulated access cannot be a dcbz). A zero fill is dcbz alone, 3 instructions a line;
+- overlapping ranges are copied as memmove copies them, by memcpy too;
+- memcmp returns the difference of the first unequal bytes, as newlib does;
+- no floating-point register (an interrupt handler may call them; libogc saves no FPRs there).
+
+`WL_MEMFAST_WRAP` (CMake, ON for the Wii) turns the link off; `wl_memfast_set_enabled(false)`
+sends the calls back to the C library's at run time, and `wl_memfast_options(dir)` does that for a
+file `oldcopy` in a folder (the Xbox runtime reads the title's folder at boot; `WL_XB_OLDCOPY` on the
+host, where a build with `-DWL_MEMFAST_WRAP=ON` uses them in place of glibc's). `WL_MEMFAST_HIST`
+counts the calls by operation, length and alignment (`wl_memfast_hist_write`; a host run writes them
+to `$WL_MEMFAST_HIST_OUT` at exit).
+
+Instructions a call, ppc-be at the Wii's flags (`tests/platform/bench_memfast.c`, `tools/qemu_icount.py`,
+about 23 of each figure the bench's own loop), newlib's objects from devkitPPC against these:
+
+| operation | dst, src offset | 16 bytes | 64 | 256 | 4096 (a byte) |
+|---|---|---|---|---|---|
+| copy | 0,0 | 57 -> 37 | 90 -> 75 | 222 -> 222 | 0.70 -> 0.67 |
+| copy | 0,1 | 100 -> 37 | 292 -> 75 | 1060 -> 222 | 4.01 -> 0.67 |
+| copy | 3,1 | 100 -> 37 | 292 -> 75 | 1060 -> 238 | 4.01 -> 0.67 |
+| fill | 0,0 | 52 -> 31 | 69 -> 46 | 135 -> 128 | 0.36 -> 0.35 |
+| fill | 3,1 | 71 -> 31 | 104 -> 46 | 170 -> 135 | 0.36 -> 0.36 |
+| zero | 0,0 | 54 -> 33 | 71 -> 48 | 137 -> 81 | 0.36 -> 0.09 |
+| zero | 3,1 | 73 -> 33 | 106 -> 48 | 172 -> 88 | 0.36 -> 0.09 |
+| compare | 0,0 | 62 -> 56 | 140 -> 108 | 452 -> 324 | 1.63 -> 1.13 |
+| compare | 0,1 | 140 -> 56 | 452 -> 108 | 1700 -> 324 | 6.51 -> 1.13 |
+| compare | 3,1 | 140 -> 56 | 452 -> 108 | 1700 -> 324 | 6.51 -> 1.13 |
+
+The test (`test_platform_memfast`) compares all four with the C library at every length 0..300, every
+destination offset in a line and source offset in a double word, overlaps of every distance up to 40,
+and the whole buffer around the range; `test_platform_memfast_wrap` does it again through the wrapped
+names with the switch on and off.
+
 ## Frame overlay (`overlay.h`) and audio fade
 
 **Frame overlay.** `wl_gx_set_overlay(fn, user)` hangs a function on the end of every frame:
@@ -901,7 +951,18 @@ with a stack of the caller's size, filled so `wl_platform_stack_used` reports ho
 when needed and must run before WPAD, sockets and mounts. SD is `fatMountSimple("sd",
 &__io_wiisd)`, USB `fatMountSimple("usb", &__io_usbstorage)`; libfat is initialised nowhere else.
 Files use unbuffered fds because stdio's 1 KiB buffer would split large reads into many SD
-transfers; read in multiples of 512 bytes. FAT cannot rename over a file (the target is removed
+transfers; read in multiples of 512 bytes. libfat (FatFs under libdvm) still reads at most one
+cluster a transfer, through its cache of four 32 KB pages whenever a transfer is not aligned to a
+page, and finds an offset's cluster by following the FAT from the file's start at each jump back.
+So the SD is mounted as `fatMountSimple` mounts it but `fs_wii.c` keeps its disc, reads the FAT
+volume once (logged: cluster size, and whether the data starts on a cache page), and reads a file
+straight from the card (`wl_platform_fs_fast_set`, on by default): its clusters mapped once from
+the FAT (`fat_map.h`, its first cluster from libfat's open file, the bytes at its last cluster
+compared with libfat's once), a run of contiguous sectors one transfer of up to 128 KB into the
+caller's buffer (aligned to 32 bytes at the file offset's alignment it moves nothing). A handle that
+writes the file reads through libfat's cache (which may hold what it wrote; a part sector it wrote
+is flushed first); a file another handle has open for writing, and reads under 4 KB of files up to
+1 MB, are read through libfat. `wl_platform_fs_reads` counts the reads both ways. FAT cannot rename over a file (the target is removed
 first). Expect 4-9 MiB/s from SD cards and 15-25 MiB/s from USB drives; Dolphin's virtual SD says
 nothing about hardware speed.
 

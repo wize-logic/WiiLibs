@@ -346,6 +346,22 @@
    "notes": "patch 0015 (sahf reads AH) updates the expected text"
   },
   {
+   "upstream": "tools/recomp/test_lifter_rep_compare_flags.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/"
+   ],
+   "notes": "patch 0029 (a compare that computes CF reads each element once) updates the negative control's pattern"
+  },
+  {
+   "upstream": "tools/recomp/test_rep_movs_mmio.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/"
+   ],
+   "notes": "patch 0029 (1..3 elements are moved as guest accesses) updates the expected access count"
+  },
+  {
    "upstream": "tools/recomp/**",
    "kind": "vendored",
    "wl": [

@@ -218,6 +218,12 @@ static void on_fail(void *user, const char *what, size_t size, size_t align) {
 #define on_fail NULL
 #endif
 
+// who asked is logged from the start, before the overflow heap is armed (if ever): an allocation
+// that fails with the reclaimer's memory given back too (mem_census.h)
+__attribute__((constructor)) static void hook_failures(void) {
+    wl_overflow_set_fail_hook(&g_overflow, on_fail, NULL);
+}
+
 // ---- the accounting by call site --------------------------------------------------------------
 
 // The return addresses into the wrapper's caller and into that one's caller. On the Wii, from the

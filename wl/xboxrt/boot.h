@@ -36,6 +36,11 @@ typedef struct {
                                  // (WL_XB_FRAME_MB or WL_XB_FRAME_KB in the environment win)
     uint32_t keep_free_bytes;    // the Wii: the host side's memory besides the textures' arena,
                                  // 9 MB by default (demand paging covers the guest)
+    uint32_t loan_bytes;         // the Wii: of keep_free_bytes, what serves as guest frames while
+                                 // the heap does not need it (frame_loan.h: given back when an
+                                 // allocation would fail), 5 MB by default; a file "oldreserve" in
+                                 // the title's folder: none. The host: WL_XB_LOAN_MB/KB, the top of
+                                 // the frame limit, the heap's cap growing as it is given back
     uint32_t texture_bytes;      // the GPU's converted textures: an arena of their own (15 MB by
                                  // default; the Wii takes it from the frames, beside
                                  // keep_free_bytes; the host: WL_XB_TEXTURE_MB wins)

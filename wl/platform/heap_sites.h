@@ -24,6 +24,9 @@
 
 // The size classes of the small blocks: under 64, 256 and 1024 bytes, then up to `min_tracked`.
 #define WL_HEAP_SITES_CLASSES 4
+// The sites kept at the peak of the bytes live, and how far the peak moves before they are kept again.
+#define WL_HEAP_SITES_AT_PEAK 12
+#define WL_HEAP_SITES_PEAK_STEP (64u * 1024u)
 
 typedef struct {
     uintptr_t caller[2]; // the return addresses: into the allocator's caller, then into its caller
@@ -54,6 +57,13 @@ typedef struct {
     // blocks of at least min_tracked that had no room: in the site table or the block table
     uint32_t untracked;
     size_t untracked_bytes;
+    // the bytes live in all (every block seen made and not yet seen freed) and, at their peak,
+    // the sites holding the most then (kept again each time the peak passes the last one kept by
+    // WL_HEAP_SITES_PEAK_STEP: within that of the true peak)
+    size_t live;
+    size_t peak_live; // live when at_peak was kept
+    uint32_t at_peak_count;
+    WlHeapSite at_peak[WL_HEAP_SITES_AT_PEAK];
 } WlHeapSites;
 
 // Bytes of storage for `sites` call sites and `blocks` live blocks.
@@ -86,5 +96,6 @@ typedef struct {
 
 void wl_heap_sites_totals(WlHeapSites *s, WlHeapSitesTotals *out);
 
-// The totals and the `count` sites holding the most, one INFO line each (tag "heap").
+// The totals and the `count` sites holding the most, one INFO line each (tag "heap"), then the
+// bytes live at the peak and the sites that held the most then.
 void wl_heap_sites_log(WlHeapSites *s, size_t count);

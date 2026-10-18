@@ -224,6 +224,8 @@ enum {
 };
 extern bool wl_nv2a_prefetch_on;
 void wl_nv2a_set_prefetch(bool on);
+// the pusher's header loop as before the method table's run kinds (true), for an A/B on the console
+void wl_nv2a_set_old_push(bool on);
 static inline bool wl_nv2a_prefetching(void) {
     return WL_NV2A_PREFETCHES && wl_nv2a_prefetch_on;
 }

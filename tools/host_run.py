@@ -6,8 +6,10 @@ The host's version of dolphin_run.py's --fail and --idle. The program's output g
 stdout). The run ends:
 - --fail-grace seconds after a line that matches --fail (by default the runtime's crash, stall and
   freeze reports and a stopped play script; the grace lets the freeze watch's report reach the log);
-- when the number --progress captures (by default the play harness's `tick N`) has not grown for
-  --stall seconds: a hang, or a script that no longer moves the game;
+- when the number --progress captures (by default the play harness's `tick N`) has shown no value
+  it had not shown before for --stall seconds: a hang, or a script that no longer moves the game.
+  A new value is progress even when it is smaller: the next level's ticks start again near 0 (until
+  2026-10-18 only growth counted, and a run that went on into the next level ended as stalled);
 - after --limit seconds in all.
 
 Ending is SIGINT to the program's process group, then SIGKILL 10 s later. The last line, in the log
@@ -32,14 +34,16 @@ EXIT_FAIL, EXIT_STALL, EXIT_LIMIT = 3, 4, 5
 
 
 class Watch:
-    """what the program's lines say so far: the first --fail line's time and the progress number's best"""
+    """what the program's lines say so far: the first --fail line's time, and the progress numbers seen
+    (a value repeated, or one seen before, is no progress)"""
 
     def __init__(self, fail: str, progress: str, started: float):
         self.fail = re.compile(fail) if fail else None
         self.progress = re.compile(progress) if progress else None
         self.failed_at = None
         self.fail_line = ""
-        self.best = None
+        self.seen = set()
+        self.last = None
         self.moved_at = started
         self.lock = threading.Lock()
 
@@ -51,8 +55,9 @@ class Watch:
             if self.progress is not None:
                 for match in self.progress.finditer(text):
                     value = int(match.group(1))
-                    if self.best is None or value > self.best:
-                        self.best = value
+                    self.last = value
+                    if value not in self.seen:
+                        self.seen.add(value)
                         self.moved_at = now
 
     def verdict(self, now: float, started: float, grace: float, stall: float, limit: float):
@@ -61,9 +66,9 @@ class Watch:
             if self.failed_at is not None and now - self.failed_at >= grace:
                 return EXIT_FAIL, f"failed: {self.fail_line}"
             if self.progress is not None and stall > 0 and now - self.moved_at >= stall:
-                return EXIT_STALL, f"no progress for {int(now - self.moved_at)} s (last {self.best})"
+                return EXIT_STALL, f"no progress for {int(now - self.moved_at)} s (last {self.last})"
             if limit > 0 and now - started >= limit:
-                return EXIT_LIMIT, f"limit of {int(limit)} s reached (progress {self.best})"
+                return EXIT_LIMIT, f"limit of {int(limit)} s reached (progress {self.last})"
         return None
 
 
@@ -121,10 +126,10 @@ def main(argv=None) -> int:
     parser.add_argument("--fail-grace", type=float, default=15.0,
                         help="seconds the run goes on after a --fail line (default 15)")
     parser.add_argument("--progress", default=PROGRESS,
-                        help="a regular expression whose group 1 is a number that grows while the run gets "
-                             "somewhere (default: the play harness's 'tick N'; '' for none)")
+                        help="a regular expression whose group 1 is a number that takes new values while the "
+                             "run gets somewhere (default: the play harness's 'tick N'; '' for none)")
     parser.add_argument("--stall", type=float, default=300.0,
-                        help="end the run when the progress number has not grown for this many seconds "
+                        help="end the run when the progress number has shown no new value for this many seconds "
                              "(default 300; 0 never)")
     parser.add_argument("--limit", type=float, default=2700.0,
                         help="the longest a run lasts in seconds (default 2700, 45 min; 0 none)")

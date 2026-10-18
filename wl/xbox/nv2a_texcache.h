@@ -19,6 +19,15 @@
 // to WL_NV2A_TEXCACHE_REDUCE_MAX) rather than not at all, and made whole again at its first use in
 // a later frame (one in WL_NV2A_TEXCACHE_RESTORE_FRAMES) when there is room for it: free memory, or
 // the images of textures not drawn for as many frames given back (never one the frames draw now).
+//
+// Time. With a frame budget (the configuration's `frame_budget`), a frame makes at most that many
+// guest bytes of textures at their lookups: a texture new to the cache looked up once the frame
+// has made as many is put off (the lookup answers NULL, the backend stands in for it) and kept in a
+// short list, made when the processor would only wait for the GPU (wl_nv2a_texcache_work, from the
+// backend's end of frame) or else at its first lookup in a later frame, so that a burst of new
+// textures (a level's area, a cutscene) is spread over frames instead of stalling one. A texture
+// rewritten or kept smaller is never put off (its old image is drawn meanwhile); a capture puts off
+// nothing.
 #pragma once
 
 #include <stdbool.h>
@@ -41,7 +50,9 @@ enum {
     // a texture kept smaller for want of memory: levels left out at most, and how often it tries
     // to be made whole again
     WL_NV2A_TEXCACHE_REDUCE_MAX = 3,
-    WL_NV2A_TEXCACHE_RESTORE_FRAMES = 60
+    WL_NV2A_TEXCACHE_RESTORE_FRAMES = 60,
+    // textures put off by the frame budget, kept to be made while the processor waits
+    WL_NV2A_TEXCACHE_DEFERRED = 64
 };
 
 typedef struct WlNv2aTexCacheConfig {
@@ -77,6 +88,10 @@ typedef struct WlNv2aTexCacheConfig {
     // hold the memory (a level's first frames): the images only those frames drew go back then,
     // instead of the new texture being kept smaller.
     void (*gpu_wait)(void);
+    // optional: the guest bytes of textures a frame makes at its lookups before new textures are
+    // put off to a later frame or the GPU's wait (wl_nv2a_texcache_work); 0: no limit. The texture
+    // that crosses it is made whole, so a frame always makes one.
+    size_t frame_budget;
 } WlNv2aTexCacheConfig;
 
 typedef struct WlNv2aTexEntry {
@@ -115,6 +130,12 @@ typedef struct WlNv2aTexCacheStats {
     uint32_t reduced;     // textures kept smaller for want of memory (converted or made again so)
     uint32_t restored;    // of those, made whole again later
     uint32_t gpu_waits;   // frames whose images waited for the GPU (cfg.gpu_wait) to find room
+    uint32_t deferred;    // lookups of a new texture put off by the frame budget (the backend stood in)
+    uint32_t made_early;  // of the textures put off, made by wl_nv2a_texcache_work (while the GPU drew)
+    uint32_t frames_deferred, deferred_run; // frames that put a texture off, and the most of them in a row
+    // the texture work of a frame at its lookups (checks, hashes, conversions; the processor's
+    // clock): the longest, its guest bytes made, and the frames that took 20 and 50 ms or more
+    uint32_t worst_frame_us, worst_frame_made, frames_over_20ms, frames_over_50ms;
     uint64_t hashed_bytes;
     size_t bytes;         // images kept now
     size_t frame_bytes;   // of those, drawn in the last frame finished
@@ -144,6 +165,18 @@ typedef struct WlNv2aTexCache {
     uint32_t waited_frame; // the frame cfg.gpu_wait was last called in (the GPU past every frame before it)
     bool capturing; // a capture ran at the last lookup
     WlNv2aTexCacheStats stats;
+    // the frame budget's: guest bytes made in this frame, the texture work's time, and the textures
+    // put off (made by wl_nv2a_texcache_work, or forgotten at the frame's end)
+    size_t frame_made;
+    uint32_t frame_us;
+    struct {
+        WlNv2aTexture texture;
+        bool mipmaps;
+    } deferred[WL_NV2A_TEXCACHE_DEFERRED];
+    unsigned deferred_count;
+    bool frame_deferred;  // a texture put off in this frame
+    uint32_t deferred_run; // frames in a row that put one off, this one's before it
+    bool working; // in wl_nv2a_texcache_work: nothing put off, and no wait for the GPU
     // the decoders' scratch (grown as needed)
     void *scratch;
     size_t scratch_bytes;
@@ -165,6 +198,11 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
 // and the next frame checks each texture again.
 void wl_nv2a_texcache_frame_done(WlNv2aTexCache *cache);
 void wl_nv2a_texcache_stats(const WlNv2aTexCache *cache, WlNv2aTexCacheStats *out);
+// Makes the next texture the frame budget put off in this frame (between lookups, before
+// wl_nv2a_texcache_frame_done: the backend calls it while it waits for the GPU at the frame's end).
+// *made true when it made an image (the GPU's texture cache must be invalidated before the next
+// draw). Returns whether more are left.
+bool wl_nv2a_texcache_work(WlNv2aTexCache *cache, WlNv2a *dev, bool *made);
 // Whether guest-physical [phys, phys + bytes) is converted and unchanged: the texels of a texture
 // the cache keeps lie on part of it, and every texture kept whose texels lie on part of it is
 // under the write watch with no store to its pages since it was checked (and is not kept smaller,
@@ -184,6 +222,16 @@ typedef struct WlNv2aTexCacheMemory {
     size_t arena_largest; // its largest free block (the largest image that fits without evicting)
 } WlNv2aTexCacheMemory;
 void wl_nv2a_texcache_memory(const WlNv2aTexCache *cache, WlNv2aTexCacheMemory *out);
+
+// Memory for the GPU's other pictures (render targets, the back buffer's park) from a free piece of
+// the arena, 32-aligned, no image evicted for it: NULL without an arena or a free piece that large.
+// The piece stays the caller's until wl_nv2a_texcache_spare_free (an image that wants room later
+// goes around it). The arena is the GPU thread's, as the cache's other calls.
+void *wl_nv2a_texcache_spare_alloc(WlNv2aTexCache *cache, size_t bytes);
+// Whether `memory` is a piece of the arena (wl_nv2a_texcache_spare_alloc's).
+bool wl_nv2a_texcache_spare_owns(const WlNv2aTexCache *cache, const void *memory);
+// Gives a piece back; false (nothing done) when `memory` is not the arena's: the caller frees it.
+bool wl_nv2a_texcache_spare_free(WlNv2aTexCache *cache, void *memory);
 
 // What the images kept are, for a census of the arena: bytes and count by GX format (a C8's TLUT
 // and a DXT3/5's alpha included), the bytes of linear textures (pictures of the screen's size

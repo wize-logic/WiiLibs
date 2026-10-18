@@ -36,6 +36,7 @@
 
 #include "wl/platform/profile.h"
 #include "wl/xboxrt/crash.h"
+#include "wl/xboxrt/frame_loan.h"
 #include "wl/xboxrt/mem_internal.h"
 #include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/ppc_decode.h"
@@ -63,7 +64,10 @@ typedef struct {
 static volatile uint32_t *g_htab;
 static uint32_t g_pteg_mask;
 static Pool g_pools[WL_XB_MAX_FRAME_POOLS];
-static uint16_t *g_hint[2]; // [ram pages] the PTE group (+ 1) of the page's user / window PTE
+// [ram pages] where the page's user / window PTE was put last (+ 1): its group x 8 + its slot when
+// the table has at most 4096 groups (g_slot_hint: the slot is read first), else its group
+static uint16_t *g_hint[2];
+static bool g_slot_hint;
 static size_t g_hint_bytes, g_htab_bytes, g_pool_bytes; // what they hold of the heap (the census)
 static uint32_t g_faults, g_pte_evictions, g_evict_rr;
 // Whether the MMU records R and C in the table (the 750CL does; an emulator might not): measured
@@ -143,8 +147,25 @@ static inline uint32_t pteg_index(volatile uint32_t *w0p) {
 
 // Page `p`'s PTE for its user (a = 0) or window (a = 1) EA, or NULL: a valid entry of the group its
 // hint names, in that segment, mapping p's frame. (A page has at most one PTE per EA; the hint is
-// set at each insert, so a PTE elsewhere cannot exist, and a stale hint finds nothing.)
-static volatile uint32_t *pte_of(uint32_t p, uint32_t a) {
+// set at each insert, so a PTE elsewhere cannot exist, and a stale hint finds nothing.) The slot
+// the hint names is read first (a PTE never moves): the group is searched only when it holds
+// another page's entry now.
+static inline bool pte_is(volatile uint32_t *e, uint32_t vsid, uint32_t rpn) {
+    uint32_t w0 = e[0];
+    return (w0 & 0x80000000u) != 0 && ((w0 >> 7) & 0xFFFFFFu) == vsid && (e[1] & 0xFFFFF000u) == rpn;
+}
+
+static __attribute__((noinline)) volatile uint32_t *pte_search(uint32_t group, uint32_t vsid, uint32_t rpn) {
+    volatile uint32_t *g = g_htab + (group << 4);
+    for (uint32_t i = 0; i < 8; i++) {
+        if (pte_is(&g[2 * i], vsid, rpn)) {
+            return &g[2 * i];
+        }
+    }
+    return NULL;
+}
+
+static inline volatile uint32_t *pte_of(uint32_t p, uint32_t a) {
     uint32_t h = g_hint[a][p];
     uint32_t f = g_xb_pg_frame[p];
     if (h == 0 || f == 0) {
@@ -152,14 +173,11 @@ static volatile uint32_t *pte_of(uint32_t p, uint32_t a) {
     }
     uint32_t rpn = rpn_of(f) << 12;
     uint32_t vsid = VSID_BASE + a;
-    volatile uint32_t *g = g_htab + ((h - 1u) << 4);
-    for (uint32_t i = 0; i < 8; i++) {
-        uint32_t w0 = g[2 * i];
-        if ((w0 & 0x80000000u) != 0 && ((w0 >> 7) & 0xFFFFFFu) == vsid && (g[2 * i + 1] & 0xFFFFF000u) == rpn) {
-            return &g[2 * i];
-        }
+    if (!g_slot_hint) {
+        return pte_search(h - 1u, vsid, rpn);
     }
-    return NULL;
+    volatile uint32_t *e = g_htab + ((h - 1u) << 1);
+    return pte_is(e, vsid, rpn) ? e : pte_search((h - 1u) >> 3, vsid, rpn);
 }
 
 // A valid PTE's R and C bits as page flags (R only when the hardware records it).
@@ -191,6 +209,11 @@ static void pte_drop(volatile uint32_t *w0p, uint32_t ea) {
     tlbie(ea);
 }
 
+// The hint (g_hint) of a PTE put in slot `i` of group `index`.
+static inline uint16_t hint_of(uint32_t index, uint32_t i) {
+    return (uint16_t)((g_slot_hint ? (index << 3) | i : index) + 1u);
+}
+
 // A PTE for `ea` (page `p`) mapping `frame`, with R and C as `rc` has them (PTE_R, PTE_C).
 static void pte_insert(uint32_t ea, uint32_t frame, uint32_t p, uint32_t rc) {
     uint32_t hash = primary_hash(ea);
@@ -205,7 +228,7 @@ static void pte_insert(uint32_t ea, uint32_t frame, uint32_t p, uint32_t rc) {
                 __asm__ volatile("eieio" ::: "memory");
                 g[2 * i] = pte_w0(ea, h);
                 __asm__ volatile("sync" ::: "memory");
-                g_hint[a][p] = (uint16_t)(index + 1u);
+                g_hint[a][p] = hint_of(index, i);
                 return;
             }
         }
@@ -220,7 +243,7 @@ static void pte_insert(uint32_t ea, uint32_t frame, uint32_t p, uint32_t rc) {
     __asm__ volatile("eieio" ::: "memory");
     g[2 * i] = pte_w0(ea, 0);
     __asm__ volatile("sync" ::: "memory");
-    g_hint[a][p] = (uint16_t)(index + 1u);
+    g_hint[a][p] = hint_of(index, i);
 }
 
 // The PTE for a touch of page `p` at `ea`: R set (it is being used now), C when the page is known
@@ -573,6 +596,7 @@ WlResult wl_xb_backend_init(const WlXbMemConfig *cfg, uintptr_t *base_out) {
     g_htab_bytes = htab;
     g_pool_bytes = total;
     g_pteg_mask = (htab >> 6) - 1u; // PTEGs of 64 bytes
+    g_slot_hint = !cfg->pte_scan && (g_pteg_mask + 1u) * 8u <= 0xFFFFu;
     uint32_t sdr1 = ((uint32_t)(uintptr_t)t - 0x80000000u) | ((htab >> 16) - 1u);
 
     uint32_t level = IRQ_Disable();
@@ -675,6 +699,10 @@ void wl_xb_backend_probe(uintptr_t handle) {
 
 WlResult wl_xb_fault_install(void) {
     return WL_OK; // the DSI handler is part of wl_xb_backend_init
+}
+
+void wl_xb_backend_frames_given(uint32_t bytes) {
+    g_pool_bytes = g_pool_bytes > bytes ? g_pool_bytes - bytes : 0;
 }
 
 void wl_xb_backend_host_bytes(size_t *tables, size_t *frames) {

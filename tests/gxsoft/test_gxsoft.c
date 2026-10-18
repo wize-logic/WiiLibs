@@ -82,7 +82,7 @@ static void end(void) {
 }
 
 static void layout(uint8_t colors, uint8_t texcoords) {
-    WlGxDirectLayout l = {colors, texcoords, 0, 0, 0, 0, 0};
+    WlGxDirectLayout l = {colors, texcoords, 0, 0, 0, 0, 0, 0, 0};
     wl_gx_direct_layout(&l);
 }
 

@@ -94,8 +94,10 @@ endfunction()
 # functions in wl/platform/wii/heap_wrap_wii.c. Call wl_heap_overflow_enable(tag) after
 # wl_mem_init to arm it. Wii only; elsewhere it does nothing. A build without CMake passes
 # --wrap=<name> for each name in WL_HEAP_OVERFLOW_WRAPS and -u __wrap_malloc itself.
+# (a cache entry: a title project calls the function from its own scope, as with WL_CMAKE_DIR)
 set(WL_HEAP_OVERFLOW_WRAPS malloc calloc realloc free memalign aligned_alloc malloc_usable_size
-    _malloc_r _calloc_r _realloc_r _free_r _memalign_r _malloc_usable_size_r)
+    _malloc_r _calloc_r _realloc_r _free_r _memalign_r _malloc_usable_size_r
+    CACHE INTERNAL "the names wl_platform_heap_overflow wraps")
 function(wl_platform_heap_overflow target)
     if(WL_PLATFORM STREQUAL "wii")
         set(flags "")
@@ -448,6 +450,12 @@ function(wl_add_xbox_title target)
     endif()
     wl_gfx_wrap_sqrtf(${target})
     wl_gfx_wrap_sqrt(${target})
+    # malloc through the wrap (heap_wrap_wii.c; its overflow heap left unarmed): an allocation that
+    # would fail first has the guest frames the heap lent given back (frame_loan.h). With WiiLibs'
+    # runtime only (a stand-in runtime may not link wl_platform, which holds the wrap)
+    if(NOT A_RUNTIME OR A_RUNTIME MATCHES "xboxrt")
+        wl_platform_heap_overflow(${target})
+    endif()
     # the title's vertex programs compiled ahead of time
     set(vsh_list "")
     if(A_TITLE_CONFIG)

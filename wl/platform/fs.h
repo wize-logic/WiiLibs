@@ -70,6 +70,19 @@ WlResult wl_fs_measure_read(const char *path, void *scratch, uint32_t scratch_si
 // The most recent measurement of `device` (what the debug overlay prints). False when none yet.
 bool wl_fs_last_speed(WlDevice device, WlFsSpeed *out);
 
+// The SD card's reads through libfat against reads straight from the card (wl_platform_fs_fast_set)
+// on one big file, each logged: 16 MB from its start in 256 KB reads, 100 reads of 64 KB at offsets
+// anywhere, 200 reads of a 4 KB page anywhere (the same offsets both ways, the bytes compared). KiB/s
+// [0] through libfat, [1] straight from the card (on the host both read through the C library). The
+// setting is as it was afterwards. About half a minute on a slow card.
+typedef struct {
+    uint32_t seq_kib_s[2], big_kib_s[2], page_kib_s[2];
+    uint32_t map_us; // the first read straight from the card, which maps the file
+    bool direct;     // reads went straight to the card
+    bool same;       // the bytes read both ways were the same
+} WlFsSpeedCompare;
+WlResult wl_fs_speed_compare(const char *path, WlFsSpeedCompare *out);
+
 typedef struct {
     uint32_t reads;  // completed read jobs (async or sync)
     uint32_t errors; // ...that failed

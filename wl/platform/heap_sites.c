@@ -88,6 +88,47 @@ static uint16_t site_of(WlHeapSites *s, uintptr_t caller0, uintptr_t caller1) {
     return (uint16_t)s->site_count++;
 }
 
+// The `count` sites holding the most into `out`, most first (the lock held); returns how many.
+static size_t top_locked(const WlHeapSites *s, WlHeapSite *out, size_t count) {
+    size_t n = 0;
+    uint32_t i;
+    for (i = 0; i < s->site_count; i++) {
+        const WlHeapSite *site = &s->sites[i];
+        size_t at;
+        if (site->bytes == 0u && site->blocks == 0u) {
+            continue;
+        }
+        // insertion into the sorted list (most bytes first), the last dropped when full
+        if (n == count) {
+            if (count == 0u || out[count - 1u].bytes >= site->bytes) {
+                continue;
+            }
+            n--;
+        }
+        at = n;
+        while (at > 0u && out[at - 1u].bytes < site->bytes) {
+            out[at] = out[at - 1u];
+            at--;
+        }
+        out[at] = *site;
+        n++;
+    }
+    return n;
+}
+
+// The bytes live grew by `size` (the lock held): past the peak kept by a step, the sites now kept.
+static void live_grew(WlHeapSites *s, size_t size) {
+    s->live += size;
+    if (s->live >= s->peak_live + WL_HEAP_SITES_PEAK_STEP) {
+        s->peak_live = s->live;
+        s->at_peak_count = (uint32_t)top_locked(s, s->at_peak, WL_HEAP_SITES_AT_PEAK);
+    }
+}
+
+static void live_shrank(WlHeapSites *s, size_t size) {
+    s->live -= size <= s->live ? size : s->live;
+}
+
 void wl_heap_sites_alloc(WlHeapSites *s, const void *ptr, size_t size, uintptr_t caller0,
                          uintptr_t caller1) {
     if (s == NULL || ptr == NULL) {
@@ -102,6 +143,7 @@ void wl_heap_sites_alloc(WlHeapSites *s, const void *ptr, size_t size, uintptr_t
         unsigned c = class_of(size);
         s->small_bytes[c] += size;
         s->small_blocks[c]++;
+        live_grew(s, size);
         wl_platform_mem_unlock();
         return;
     }
@@ -112,6 +154,7 @@ void wl_heap_sites_alloc(WlHeapSites *s, const void *ptr, size_t size, uintptr_t
     if (site == NO_SITE || size > 0xFFFFFFFFu) {
         s->untracked++;
         s->untracked_bytes += size;
+        live_grew(s, size);
         wl_platform_mem_unlock();
         return;
     }
@@ -124,6 +167,7 @@ void wl_heap_sites_alloc(WlHeapSites *s, const void *ptr, size_t size, uintptr_t
         WlHeapSite *old = &s->sites[s->blocks[slot].site];
         old->bytes -= s->blocks[slot].size;
         old->blocks--;
+        live_shrank(s, s->blocks[slot].size);
     } else {
         s->block_count++;
     }
@@ -137,6 +181,7 @@ void wl_heap_sites_alloc(WlHeapSites *s, const void *ptr, size_t size, uintptr_t
     if (record->bytes > record->peak_bytes) {
         record->peak_bytes = record->bytes;
     }
+    live_grew(s, size);
     wl_platform_mem_unlock();
 }
 
@@ -153,6 +198,7 @@ void wl_heap_sites_free(WlHeapSites *s, const void *ptr, size_t size) {
         unsigned c = class_of(size);
         s->small_bytes[c] -= size <= s->small_bytes[c] ? size : s->small_bytes[c];
         s->small_blocks[c] -= s->small_blocks[c] != 0u;
+        live_shrank(s, size);
         wl_platform_mem_unlock();
         return;
     }
@@ -170,6 +216,7 @@ void wl_heap_sites_free(WlHeapSites *s, const void *ptr, size_t size) {
     record->bytes -= s->blocks[slot].size;
     record->blocks--;
     s->block_count--;
+    live_shrank(s, s->blocks[slot].size);
     // backward-shift deletion: each following entry of the run moves into the hole if its home
     // slot is not between the hole and it
     uint32_t hole = slot;
@@ -194,28 +241,7 @@ size_t wl_heap_sites_top(WlHeapSites *s, WlHeapSite *out, size_t count) {
     }
     wl_platform_mem_lock();
     if (s->ready) {
-        uint32_t i;
-        for (i = 0; i < s->site_count; i++) {
-            const WlHeapSite *site = &s->sites[i];
-            size_t at;
-            if (site->bytes == 0u && site->blocks == 0u) {
-                continue;
-            }
-            // insertion into the sorted list (most bytes first), the last dropped when full
-            if (n == count) {
-                if (count == 0u || out[count - 1u].bytes >= site->bytes) {
-                    continue;
-                }
-                n--;
-            }
-            at = n;
-            while (at > 0u && out[at - 1u].bytes < site->bytes) {
-                out[at] = out[at - 1u];
-                at--;
-            }
-            out[at] = *site;
-            n++;
-        }
+        n = top_locked(s, out, count);
     }
     wl_platform_mem_unlock();
     return n;
@@ -270,5 +296,21 @@ void wl_heap_sites_log(WlHeapSites *s, size_t count) {
                  (unsigned)(top[i].bytes / 1024u), (unsigned)top[i].blocks,
                  (unsigned)(top[i].peak_bytes / 1024u), (unsigned)top[i].allocs,
                  (unsigned long)top[i].caller[0], (unsigned long)top[i].caller[1]);
+    }
+    // (copied out under the lock: the snapshot changes while the program runs)
+    WlHeapSite at_peak[WL_HEAP_SITES_AT_PEAK];
+    size_t live, peak_live;
+    wl_platform_mem_lock();
+    live = s->live;
+    peak_live = s->peak_live;
+    n = s->at_peak_count;
+    memcpy(at_peak, s->at_peak, n * sizeof at_peak[0]);
+    wl_platform_mem_unlock();
+    WL_LOG_I(LOG_TAG, "at the peak: %u KiB live (now %u KiB); the sites holding the most then:",
+             (unsigned)(peak_live / 1024u), (unsigned)(live / 1024u));
+    for (i = 0; i < n; i++) {
+        WL_LOG_I(LOG_TAG, "%6u KiB in %4u blocks at the peak from %08lx %08lx", (unsigned)(at_peak[i].bytes / 1024u),
+                 (unsigned)at_peak[i].blocks, (unsigned long)at_peak[i].caller[0],
+                 (unsigned long)at_peak[i].caller[1]);
     }
 }

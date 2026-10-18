@@ -43,7 +43,8 @@ typedef struct {
 
 typedef struct {
     uint32_t parks;     // back buffers parked
-    uint32_t restores;  // ...and put back (a restore with nothing parked is not counted)
+    uint32_t restores;  // ...and put back (a restore with nothing parked, or nothing drawn over, is not counted)
+    uint64_t restored_pixels; // the pixels the restores put back (the parts the targets drew over)
     uint32_t resolves;  // targets copied into their memory
     uint32_t skipped;   // targets left without a copy (no memory, a format or size that has none)
     uint32_t clears;    // wl_gx_target_clear quads

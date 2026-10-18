@@ -100,6 +100,11 @@ void wl_platform_thread_sleep_ms(uint32_t ms) {
     nanosleep(&ts, NULL); // libogc blocks only the calling thread (timed LWP sleep)
 }
 
+void wl_platform_thread_sleep_us(uint32_t us) {
+    struct timespec ts = {(time_t)(us / 1000000u), (long)(us % 1000000u) * 1000L};
+    nanosleep(&ts, NULL);
+}
+
 WlResult wl_platform_sem_create(WlPlatformSemaphore *out, uint32_t initial, uint32_t max) {
     if (out == NULL || max == 0 || initial > max) {
         return WL_ERR_ARG;
@@ -199,6 +204,12 @@ void wl_platform_thread_exit(void *result) {
 
 uint32_t wl_platform_thread_self_id(void) {
     return LWP_GetSelf();
+}
+
+void wl_platform_thread_set_own_priority(WlThreadPriority priority) {
+    if ((unsigned)priority < WL_ARRAY_COUNT(k_lwp_prio)) {
+        LWP_SetThreadPriority(LWP_GetSelf(), k_lwp_prio[priority]);
+    }
 }
 
 WlResult wl_platform_thread_set_priority(WlPlatformThread thread, WlThreadPriority priority) {

@@ -434,7 +434,7 @@ static inline double reciprocal_root(double x) {
 // (x / m + 1/2 with d normalized and m = 2 |d + (0, 0, 1)| is x k + 1/2 with k = 1 / (2 sqrt(2 L (L +
 // z))), L = |d|: two reciprocal roots, no division, for the 2-3% of a frame the five divisions and two
 // exact roots cost on the Wii)
-void wl_nv2a_sphere_coordinates(const float direction[3], float st[2]) {
+void wl_nv2a_sphere_coordinates_double(const float direction[3], float st[2]) {
     double x = direction[0], y = direction[1], z = direction[2];
     double length2 = x * x + y * y + z * z, length, q;
 
@@ -453,6 +453,10 @@ void wl_nv2a_sphere_coordinates(const float direction[3], float st[2]) {
     q = 0.5 * reciprocal_root(q);
     st[0] = (float)(x * q + 0.5);
     st[1] = (float)(y * q + 0.5);
+}
+
+void wl_nv2a_sphere_coordinates(const float direction[3], float st[2]) {
+    wl_nv2a_sphere_coordinates_inline(direction, st);
 }
 
 void wl_nv2a_sphere_direction(float s, float t, float direction[3]) {

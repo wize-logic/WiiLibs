@@ -82,9 +82,11 @@ static void *ahead_main(void *arg) {
 
         uint32_t got = 0;
         wl_xb_card_lock();
+        uint64_t t0 = wl_platform_time_us();
         if (wl_platform_fs_read_some_at(pf, off, dst, want, &got) != WL_OK) {
             got = 0;
         }
+        xk_card_read_note(got, wl_platform_time_us() - t0);
         wl_xb_card_unlock();
         wl_xb_census_card(WL_XB_CCARD_AHEAD, map, got); // (the page census: a diagnostic)
 

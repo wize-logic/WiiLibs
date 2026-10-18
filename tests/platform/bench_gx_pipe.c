@@ -4,7 +4,9 @@
 // one word of memory. tools/qemu_icount.py counts them on ppc-be, a cost per vertex by the
 // difference of two sizes:
 //   qemu_icount.py --per 4096 --base "./bench_gx_pipe new_words 6 4096" ./bench_gx_pipe new_words 6 8192
-// usage: bench_gx_pipe <old_words|new_words|old_index|new_index|old_index_all|new_index_all> <words> <vertices>
+// usage: bench_gx_pipe <old_words|new_words|old_index|new_index|old_index_all|new_index_all|wide_words|wide_index|
+//                      wide_index_all> <words> <vertices>
+// ("wide": the 64 forms, two words a move; the index_all modes take `words` as the indices a vertex, 1 to 3, else 3)
 // (`words` is a vertex's words, or the colour words of an indexed vertex: order 0, words, 0)
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +20,9 @@
 #define WL_PIPE_T BenchPipe *
 #define WL_PIPE_W32(pipe, v) ((pipe)->U32 = (v))
 #define WL_PIPE_W16(pipe, v) ((pipe)->U16 = (v))
+#if defined(__powerpc__) && !defined(__powerpc64__)
+#define WL_PIPE_PPC_FP64 // (lfd and stfd, as the Wii)
+#endif
 #include "wl/platform/gx_pipe_words.h"
 
 static uint32_t storage[BATCH][WORDS];
@@ -77,7 +82,8 @@ static void old_index(const uint8_t *order, unsigned order_count, const uint32_t
 
 int main(int argc, char **argv) {
     static const uint8_t mixed[3] = {0, 8, 0}, all[3] = {0, 0, 0};
-    static const char *const modes[] = {"old_words", "new_words", "old_index", "new_index", "old_index_all", "new_index_all"};
+    static const char *const modes[] = {"old_words", "new_words", "old_index", "new_index", "old_index_all", "new_index_all",
+                                        "wide_words", "wide_index", "wide_index_all"};
     unsigned words, vertices, v, i, done, mode;
 
     if (argc != 4) {
@@ -118,10 +124,20 @@ int main(int argc, char **argv) {
             wl_gx_pipe_vertices_index(bench_pipe, mixed, 3, indices, 4000, n, storage[0], words);
             break;
         case 4:
-            old_index(all, 3, indices, 4000, n, storage[0], 0);
+            old_index(all, words - 1u < 3u ? words : 3u, indices, 4000, n, storage[0], 0);
+            break;
+        case 5:
+            wl_gx_pipe_vertices_index(bench_pipe, all, words - 1u < 3u ? words : 3u, indices, 4000, n, storage[0], 0);
+            break;
+        case 6:
+            wl_gx_pipe_vertices64(bench_pipe, batch, n, words);
+            break;
+        case 7:
+            wl_gx_pipe_vertices_index64(bench_pipe, mixed, 3, indices, 4000, n, storage[0], words);
             break;
         default:
-            wl_gx_pipe_vertices_index(bench_pipe, all, 3, indices, 4000, n, storage[0], 0);
+            // (`words` here: the indices a vertex, all of it indexed)
+            wl_gx_pipe_vertices_index64(bench_pipe, all, words - 1u < 3u ? words : 3u, indices, 4000, n, storage[0], 0);
             break;
         }
     }

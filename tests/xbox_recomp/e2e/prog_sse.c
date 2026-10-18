@@ -60,6 +60,57 @@ __attribute__((noinline)) u32 mmx(void) {
     _mm_empty();
     return lo * 31 + hi + (u32)_mm_movemask_pi8(c);
 }
+static u32 cps[64], cpd[64];
+/* An MMX copy loop (movq in, movq out, a backward jump), the registers read after it, and rep stosl
+ * fills of zero and of -1 (memset) and of another value (the element loop). */
+__attribute__((noinline)) u32 mmx_copy(u32 seed) {
+    u32 i, n = 1 + (seed & 3), r, *s = cps, *d = cpd;
+    for (i = 0; i < 64; i++) { cps[i] = seed * 0x9E3779B9u + i * 0x01000193u; cpd[i] = i; }
+    __asm__ volatile("1: movq (%0), %%mm0\n\tmovq 8(%0), %%mm1\n\tmovq 16(%0), %%mm2\n\tmovq 24(%0), %%mm3\n\t"
+                     "movq %%mm0, (%1)\n\tmovq %%mm1, 8(%1)\n\tmovq %%mm2, 16(%1)\n\tmovq %%mm3, 24(%1)\n\t"
+                     "addl $32, %0\n\taddl $32, %1\n\tdecl %2\n\tjnz 1b\n\t"
+                     "paddd %%mm3, %%mm0\n\tmovd %%mm0, %3\n\temms"
+                     : "+r"(s), "+r"(d), "+r"(n), "=r"(r) :: "memory", "cc", "mm0", "mm1", "mm2", "mm3");
+    u32 *f = cpd + 33, m = (seed >> 2) & 7, v = 0;
+    __asm__ volatile("cld; rep stosl" : "+D"(f), "+c"(m) : "a"(v) : "memory");
+    f = cpd + 41 + (seed & 1); m = (seed >> 5) & 7; v = 0xFFFFFFFFu;
+    __asm__ volatile("rep stosl" : "+D"(f), "+c"(m) : "a"(v) : "memory");
+    f = cpd + 51; m = (seed >> 8) & 7; v = 0x00FF00FFu;
+    __asm__ volatile("rep stosl" : "+D"(f), "+c"(m) : "a"(v) : "memory");
+    for (i = 0; i < 64; i++) r = r * 33 + cpd[i];
+    return r + (u32)(f - cpd);
+}
+static u8 cb[96];
+/* MSVC's memcpy (rep movsd for the dwords, `and ecx, 3; rep movsb` for the bytes left) at every length
+ * 0..19, apart and overlapping forwards; rep movsd and rep stosd after `mov ecx, n`, rep stosb after
+ * `and ecx, 3`; and the GUID compare, `mov ecx, 4; repe cmpsd`, equal or not. */
+__attribute__((noinline)) u32 msvc_copy(u32 seed) {
+    u32 h = 0, len, i;
+    for (len = 0; len < 20; len++) {
+        for (i = 0; i < 96; i++) cb[i] = (u8)(seed * 7u + i * 13u);
+        u8 *s = cb + (seed & 3), *d = cb + 40 + ((seed >> 2) & 3);
+        if (len & 1) d = s + 1 + (seed & 1);
+        __asm__ volatile("movl %2, %%ecx\n\tshrl $2, %%ecx\n\trep movsl\n\tmovl %2, %%ecx\n\tandl $3, %%ecx\n\trep movsb"
+                         : "+S"(s), "+D"(d) : "r"(len) : "ecx", "memory");
+        h = h * 31u + (u32)(s - cb) * 7u + (u32)(d - cb);
+        for (i = 0; i < 96; i++) h = h * 33u + cb[i];
+    }
+    u32 *a = (u32 *)cb, *b = (u32 *)(cb + 48), v = seed * 0x01000193u;
+    __asm__ volatile("movl $3, %%ecx\n\trep movsl" : "+S"(a), "+D"(b) :: "ecx", "memory");
+    u8 *f = cb + 5;
+    __asm__ volatile("movl %2, %%ecx\n\tandl $3, %%ecx\n\trep stosb" : "+D"(f) : "a"(v), "r"(seed >> 3) : "ecx", "memory");
+    u32 *g = (u32 *)(cb + 60);
+    __asm__ volatile("movl $2, %%ecx\n\trep stosl" : "+D"(g) : "a"(v) : "ecx", "memory");
+    for (i = 0; i < 16; i++) cb[48 + i] = cb[i];
+    if (seed & 4) cb[48 + ((seed >> 4) & 15)] ^= (u8)(1u << ((seed >> 8) & 7));
+    u32 *p = (u32 *)cb, *q = (u32 *)(cb + 48), c;
+    u8 eq;
+    __asm__ volatile("movl $4, %%ecx\n\trepe cmpsl\n\tsete %0\n\tmovl %%ecx, %3"
+                     : "=q"(eq), "+S"(p), "+D"(q), "=r"(c) :: "ecx", "cc", "memory");
+    for (i = 0; i < 96; i++) h = h * 33u + cb[i];
+    return h + (u32)(a - (u32 *)cb) + (u32)(f - cb) * 3u + (u32)(g - (u32 *)cb) * 5u
+           + eq * 1000u + c * 100u + (u32)((u8 *)p - cb) * 7u + (u32)((u8 *)q - cb);
+}
 __attribute__((noinline)) u32 sse_packed(void) {
     __m128 a = _mm_loadu_ps(&fv[0]), b = _mm_loadu_ps(&fv[4]);
     __m128 r = _mm_add_ps(_mm_mul_ps(a, b), _mm_shuffle_ps(a, b, 0x1B));
@@ -96,6 +147,8 @@ u32 run(u32 seed) {
     out[73] = bsfr(seed | 0x10);
     out[74] = atom(seed & 15);
     out[75] = rep_ops();
+    out[77] = mmx_copy(seed);
+    out[78] = msvc_copy(seed);
     union { float f; u32 u; } c;
     c.f = sse_scalar((float)(seed & 1023) * 0.25f, 1.5f);
     out[76] = c.u;

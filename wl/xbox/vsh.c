@@ -121,6 +121,11 @@ void wl_xbox_vsh_live_needs(const WlXboxVshProgram *program, unsigned *needs) {
     /* (the position is p as the program ends) */
     for (component = 0; component < 4; component++)
         need[12][component] = WL_XBOX_VSH_LIVE_POSITION;
+    /* (a lit program's normal, x, y and z as it ends, is d0's: GX lights it in
+    a lit form, whose unlit copy writes none of d0's r, g and b) */
+    if (program->light.count)
+        for (component = 0; component < 3; component++)
+            need[temporary_index(program->light.normal)][component] = WL_XBOX_VSH_LIVE_D0;
     for (index = (long)program->count - 1; index >= 0; index--) {
         const WlXboxVshInstruction *instruction = &program->instructions[index];
         unsigned reaches = 0, kills[13] = {0};
@@ -374,7 +379,9 @@ void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction
         if (field(word, 3, 0, 1))
             break;
     }
+    memset(&program->light, 0, sizeof program->light);
     steps_make(program);
+    wl_xbox_vsh_light_shape(program, &program->light);
     program->native = NULL;
     program->native_colors = NULL;
     program->native_positions = NULL;
@@ -1447,17 +1454,281 @@ int wl_xbox_vsh_run_positions(const WlXboxVshProgram *program, const float (*con
     return 1;
 }
 
+/* ---------- d0's light shape (wl_xbox_vsh_light_shape)
+
+A walk back from the instructions that write d0's r, g and b through the
+values they read, each a MAC's result at one component (a dot product's the
+same at all four) */
+
+typedef struct {
+    long at;
+    unsigned component;
+} LightValue;
+
+/* the instruction before `before` whose MAC writes temporary t's component
+(-1: none; -2: the ILU wrote it last, which the walk does not follow) */
+static long light_writer(const WlXboxVshProgram *program, long before, unsigned t, unsigned component) {
+    long index;
+
+    for (index = before - 1; index >= 0; index--) {
+        const WlXboxVshInstruction *in = &program->instructions[index];
+        unsigned bit = 8u >> component;
+
+        if (in->ilu != _ilu_nop && (in->ilu_mask & bit) && (in->mac != _mac_nop ? 1u : in->temporary) == t)
+            return -2;
+        if (in->mac != _mac_nop && in->mac != _mac_arl && (in->mac_mask & bit) && in->temporary == t)
+            return index;
+    }
+    return -1;
+}
+
+/* operand `which` of the instruction at `at`, for its result's component:
+1 a temporary's MAC value (*value), 2 an input, 3 a constant (*index, and
+*read the component read), 0 what the walk does not take; *negate its sign */
+static int light_operand(const WlXboxVshProgram *program, long at, unsigned which, unsigned component,
+                         LightValue *value, unsigned *index, unsigned *read, int *negate) {
+    const WlXboxVshInstruction *in = &program->instructions[at];
+    const WlXboxVshOperand *o = &in->operands[which];
+
+    *negate = o->negate != 0;
+    *read = o->swizzle[component];
+    switch (o->mux) {
+    case _mux_temporary:
+        if (o->index >= 12)
+            return 0;
+        value->component = *read;
+        value->at = light_writer(program, at, o->index, *read);
+        *index = o->index;
+        return value->at >= 0 ? 1 : 0;
+    case _mux_input:
+        *index = in->input;
+        return 2;
+    case _mux_constant:
+        if (in->relative)
+            return 0;
+        *index = in->constant;
+        return 3;
+    default:
+        return 0;
+    }
+}
+
+/* a dot product of the normal and a constant's xyz at `at`: into *light,
+the normal's temporary checked (or set) */
+static int light_dot(const WlXboxVshProgram *program, long at, WlXboxVshLightShape *shape, WlXboxVshLight *light) {
+    const WlXboxVshInstruction *in = &program->instructions[at];
+    unsigned which, c;
+
+    if (in->mac != _mac_dp3 || in->relative)
+        return 0;
+    for (which = 0; which < 2; which++) {
+        const WlXboxVshOperand *n = &in->operands[which], *d = &in->operands[1 - which];
+
+        if (n->mux != _mux_temporary || n->negate || n->index >= 12 || d->mux != _mux_constant)
+            continue;
+        for (c = 0; c < 3; c++)
+            if (n->swizzle[c] != c || d->swizzle[c] != c)
+                break;
+        if (c < 3)
+            continue;
+        /* (the normal as the program ends: its writers the last ones) */
+        for (c = 0; c < 3; c++) {
+            long writer = light_writer(program, at, n->index, c);
+
+            if (writer < 0 || writer != light_writer(program, (long)program->count, n->index, c))
+                return 0;
+        }
+        if (shape->normal != 0xFF && shape->normal != n->index)
+            return 0;
+        shape->normal = n->index;
+        light->direction = in->constant;
+        light->direction_negate = d->negate != 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* one light's term at a value: max(t, zero) of a dot product, or of the
+maximum of one and its multiple by a constant (a back term) */
+static int light_term(const WlXboxVshProgram *program, LightValue value, WlXboxVshLightShape *shape,
+                      WlXboxVshLight *light) {
+    const WlXboxVshInstruction *in = &program->instructions[value.at];
+    LightValue v[2];
+    unsigned index[2], read[2], which;
+    int kind[2], negate[2];
+
+    if (in->mac != _mac_max)
+        return 0;
+    for (which = 0; which < 2; which++)
+        kind[which] = light_operand(program, value.at, which, value.component, &v[which], &index[which], &read[which],
+                                    &negate[which]);
+    for (which = 0; which < 2; which++) {
+        const WlXboxVshInstruction *t;
+
+        if (kind[1 - which] != 2 || negate[1 - which] || read[1 - which] > 2 || kind[which] != 1 || negate[which])
+            continue;
+        if (shape->zero != 0xFF && (shape->zero != index[1 - which] || shape->zero_component != read[1 - which]))
+            return 0;
+        shape->zero = (unsigned char)index[1 - which];
+        shape->zero_component = (unsigned char)read[1 - which];
+        light->has_back = 0;
+        if (light_dot(program, v[which].at, shape, light))
+            return 1;
+        /* (max(d, b d): the dot product one operand, the other its multiple by a constant) */
+        t = &program->instructions[v[which].at];
+        if (t->mac == _mac_max) {
+            LightValue u[2], w[2];
+            unsigned ui[2], ur[2], wi[2], wr[2], j, m;
+            int uk[2], un[2], wk[2], wn[2];
+
+            for (j = 0; j < 2; j++)
+                uk[j] = light_operand(program, v[which].at, j, v[which].component, &u[j], &ui[j], &ur[j], &un[j]);
+            for (j = 0; j < 2; j++) {
+                const WlXboxVshInstruction *mul;
+
+                if (uk[j] != 1 || uk[1 - j] != 1 || un[j] || !light_dot(program, u[j].at, shape, light))
+                    continue;
+                mul = &program->instructions[u[1 - j].at];
+                if (mul->mac != _mac_mul)
+                    return 0;
+                for (m = 0; m < 2; m++)
+                    wk[m] = light_operand(program, u[1 - j].at, m, u[1 - j].component, &w[m], &wi[m], &wr[m], &wn[m]);
+                for (m = 0; m < 2; m++) {
+                    if (wk[m] == 1 && w[m].at == u[j].at && wk[1 - m] == 3) {
+                        light->has_back = 1;
+                        light->back = (unsigned char)wi[1 - m];
+                        light->back_component = (unsigned char)wr[1 - m];
+                        light->back_negate = (unsigned char)((un[1 - j] + wn[0] + wn[1]) & 1);
+                        return 1;
+                    }
+                }
+                return 0;
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+/* d0's component (0..2) at value: the ambient, and each term a colour's
+component times a light's term */
+static int light_sum(const WlXboxVshProgram *program, LightValue value, unsigned component, WlXboxVshLightShape *shape,
+                     WlXboxVshLight *lights, unsigned *count, int *ambient) {
+    for (;;) {
+        const WlXboxVshInstruction *in = &program->instructions[value.at];
+        LightValue v[3];
+        unsigned index[3], read[3], which;
+        int kind[3], negate[3];
+
+        for (which = 0; which < 3; which++)
+            kind[which] = light_operand(program, value.at, which, value.component, &v[which], &index[which],
+                                        &read[which], &negate[which]);
+        if (in->mac == _mac_mov) {
+            if (kind[0] == 3 && !negate[0] && read[0] == component) {
+                *ambient = (int)index[0];
+                return 1;
+            }
+            if (kind[0] != 1 || negate[0])
+                return 0;
+            value = v[0];
+            continue;
+        }
+        if (in->mac != _mac_mad || *count >= WL_XBOX_VSH_LIGHTS)
+            return 0;
+        for (which = 0; which < 2; which++) {
+            if (kind[which] == 3 && !negate[which] && read[which] == component && kind[1 - which] == 1 &&
+                !negate[1 - which])
+                break;
+        }
+        if (which == 2)
+            return 0;
+        memset(&lights[*count], 0, sizeof lights[*count]);
+        lights[*count].color = (unsigned char)index[which];
+        if (!light_term(program, v[1 - which], shape, &lights[*count]))
+            return 0;
+        (*count)++;
+        if (kind[2] == 3 && !negate[2] && read[2] == component) {
+            *ambient = (int)index[2];
+            return 1;
+        }
+        if (kind[2] != 1 || negate[2])
+            return 0;
+        value = v[2];
+    }
+}
+
+int wl_xbox_vsh_light_shape(const WlXboxVshProgram *program, WlXboxVshLightShape *shape) {
+    WlXboxVshLight lights[3][WL_XBOX_VSH_LIGHTS];
+    unsigned counts[3], component, n;
+    int ambients[3];
+
+    memset(shape, 0, sizeof *shape);
+    memset(lights, 0, sizeof lights);
+    shape->normal = shape->zero = 0xFF;
+    for (component = 0; component < 3; component++) {
+        LightValue value = {-1, component};
+        long index;
+
+        /* (the last instruction to write d0's component: a MAC's result) */
+        for (index = (long)program->count - 1; index >= 0; index--) {
+            const WlXboxVshInstruction *in = &program->instructions[index];
+
+            if (in->output_mask && in->output_is_register && in->output_address == _output_d0 &&
+                (in->output_mask & (8u >> component)) && (in->output_from_ilu ? in->ilu : in->mac) != 0) {
+                if (!in->output_from_ilu)
+                    value.at = index;
+                break;
+            }
+        }
+        counts[component] = 0;
+        ambients[component] = -1;
+        if (value.at < 0 || !light_sum(program, value, component, shape, lights[component], &counts[component],
+                                       &ambients[component]))
+            goto none;
+    }
+    /* (the same lights and ambient for r, g and b) */
+    for (component = 1; component < 3; component++) {
+        if (counts[component] != counts[0] || ambients[component] != ambients[0])
+            goto none;
+        for (n = 0; n < counts[0]; n++)
+            if (memcmp(&lights[component][n], &lights[0][n], sizeof lights[0][n]) != 0)
+                goto none;
+    }
+    if (counts[0] == 0 || shape->normal == 0xFF || shape->zero == 0xFF)
+        goto none;
+    shape->count = (unsigned char)counts[0];
+    shape->ambient = (unsigned char)ambients[0];
+    memcpy(shape->lights, lights[0], sizeof shape->lights);
+    return 1;
+none:
+    memset(shape, 0, sizeof *shape);
+    return 0;
+}
+
+void wl_xbox_vsh_light_unlit(const WlXboxVshProgram *program, WlXboxVshProgram *unlit) {
+    unsigned long index;
+
+    *unlit = *program;
+    for (index = 0; index < unlit->count; index++) {
+        WlXboxVshInstruction *in = &unlit->instructions[index];
+
+        if (in->output_is_register && in->output_address == _output_d0)
+            in->output_mask &= 1u;
+    }
+    steps_make(unlit);
+}
+
 /* ---------- fused forms as text */
 
-static const char g_fused_kinds[] = "NLPQS";
+static const char g_fused_kinds[] = "NLPQSGHU";
 
 static const char *fused_format_name(unsigned format, char name[8]) {
     static const char *const names[] = {"-", "F1", "F2", "F3", "F4", "D3D", "CMP"};
 
     if (format < WL_XBOX_VSH_FUSED_S1)
         return names[format];
-    name[0] = format < WL_XBOX_VSH_FUSED_UB ? 'S' : 'U';
-    name[1] = format < WL_XBOX_VSH_FUSED_UB ? '1' : 'B';
+    name[0] = format < WL_XBOX_VSH_FUSED_UB || format >= WL_XBOX_VSH_FUSED_S32K ? 'S' : 'U';
+    name[1] = format < WL_XBOX_VSH_FUSED_UB ? '1' : format < WL_XBOX_VSH_FUSED_S32K ? 'B' : 'K';
     name[2] = '.';
     name[3] = (char)('1' + (format - WL_XBOX_VSH_FUSED_S1) % 4u);
     name[4] = 0;
@@ -1470,14 +1741,15 @@ int wl_xbox_vsh_fused_text(const WlXboxVshFusedKey *key, char *text, unsigned lo
 
     for (n = 0; n < key->stage_count && n < 4; n++)
         at += (unsigned)snprintf(stages + at, sizeof(stages) - at, "%s%u%c", n ? "," : "", key->stages[n] & 3u,
-                                 g_fused_kinds[(key->stages[n] >> 2) % 5u]);
+                                 g_fused_kinds[(key->stages[n] >> 2) % 8u]);
     at = 0;
     for (n = 0; n < 16; n++)
         if (key->format[n] != WL_XBOX_VSH_FUSED_NONE)
             at += (unsigned)snprintf(formats + at, sizeof(formats) - at, "%s%u:%s", at ? "," : "", n,
                                      fused_format_name(key->format[n] % WL_XBOX_VSH_FUSED_FORMATS, name));
-    return snprintf(text, size, "%x %c %u %u %s %s", key->live, key->perspective ? 'p' : 'o', key->colors,
-                    key->channels, stages, formats);
+    return snprintf(text, size, "%x %c %u %u%s%s %s %s", key->live,
+                    key->perspective == WL_XBOX_VSH_FUSED_XF ? 'x' : key->perspective ? 'p' : 'o', key->colors,
+                    key->channels, key->lit ? "L" : "", key->interleaved ? "I" : "", stages, formats);
 }
 
 /* a number at *p (base 10 or 16), past it */
@@ -1511,16 +1783,25 @@ int wl_xbox_vsh_fused_parse(const char *text, WlXboxVshFusedKey *key) {
     char name[8];
 
     memset(key, 0, sizeof(*key));
-    if (!fused_number(&p, 16, &live) || live > 0xFFFFu || p[0] != ' ' || (p[1] != 'p' && p[1] != 'o'))
+    if (!fused_number(&p, 16, &live) || live > 0xFFFFu || p[0] != ' ' || (p[1] != 'p' && p[1] != 'o' && p[1] != 'x'))
         return 0;
     key->live = (unsigned short)live;
-    key->perspective = p[1] == 'p';
+    key->perspective = p[1] == 'x' ? WL_XBOX_VSH_FUSED_XF : p[1] == 'p';
     p += 2;
-    if (!fused_number(&p, 10, &colors) || colors > 2 || !fused_number(&p, 10, &channels) || channels > 3 ||
-        *p++ != ' ')
+    if (!fused_number(&p, 10, &colors) || colors > 2 || !fused_number(&p, 10, &channels) || channels > 3)
         return 0;
     key->colors = (unsigned char)colors;
     key->channels = (unsigned char)channels;
+    if (*p == 'L') {
+        key->lit = 1;
+        p++;
+    }
+    if (*p == 'I') {
+        key->interleaved = 1;
+        p++;
+    }
+    if (*p++ != ' ')
+        return 0;
     if (*p == '-') {
         p++;
     } else {

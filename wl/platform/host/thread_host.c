@@ -194,6 +194,11 @@ void wl_platform_thread_sleep_ms(uint32_t ms) {
     nanosleep(&ts, NULL);
 }
 
+void wl_platform_thread_sleep_us(uint32_t us) {
+    struct timespec ts = {(time_t)(us / 1000000u), (long)(us % 1000000u) * 1000L};
+    nanosleep(&ts, NULL);
+}
+
 WlResult wl_platform_sem_create(WlPlatformSemaphore *out, uint32_t initial, uint32_t max) {
     if (out == NULL || max == 0 || initial > max) {
         return WL_ERR_ARG;
@@ -327,6 +332,10 @@ uint32_t wl_platform_thread_self_id(void) {
         t_id = atomic_fetch_add(&g_next_id, 1u);
     }
     return t_id;
+}
+
+void wl_platform_thread_set_own_priority(WlThreadPriority priority) {
+    (void)priority; // (the host's threads keep the kernel's priority)
 }
 
 WlResult wl_platform_thread_set_priority(WlPlatformThread thread, WlThreadPriority priority) {

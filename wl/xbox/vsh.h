@@ -72,9 +72,10 @@ typedef void (*WlXboxVshFusedProc)(const float (*constants)[4], WlXboxVshFused *
 as the fetch reads it; NONE: no array, the register keeps its start value),
 the outputs read, and GX's vertex: its position (perspective: x w, y w, -w
 where the program captured the clip-space position, else the screen-space
-position and depth), its colours (count, and bit n: the program gives dn,
-else 0), its texture coordinates in order (stage | WL_XBOX_VSH_FUSED_STAGE_...
-<< 2). A batch whose draw has another form (or fog, projected coordinates,
+position and depth; WL_XBOX_VSH_FUSED_XF: v0's floats as fetched, which GX's
+transform unit transforms, the program's position not made), a lit form's normal, its colours (count, and bit n: the
+program gives dn, else 0), its texture coordinates in order (stage |
+WL_XBOX_VSH_FUSED_STAGE_... << 2). A batch whose draw has another form (or fog, projected coordinates,
 landings) runs the general way. */
 enum {
     WL_XBOX_VSH_FUSED_NONE,
@@ -84,23 +85,46 @@ enum {
     WL_XBOX_VSH_FUSED_F4,
     WL_XBOX_VSH_FUSED_D3DCOLOR,
     WL_XBOX_VSH_FUSED_CMP,
-    /* (normalized shorts and bytes: 1 to 4 of them) */
+    /* (normalized shorts and bytes, then shorts as they are: 1 to 4 of them) */
     WL_XBOX_VSH_FUSED_S1 = 7,
     WL_XBOX_VSH_FUSED_UB = 11,
-    WL_XBOX_VSH_FUSED_FORMATS = 15
+    WL_XBOX_VSH_FUSED_S32K = 15,
+    WL_XBOX_VSH_FUSED_FORMATS = 19
 };
+/* (perspective: 0 the screen's position, 1 perspective's, WL_XBOX_VSH_FUSED_XF the transform unit's: "o", "p"
+and "x" in a form's text) */
+enum { WL_XBOX_VSH_FUSED_XF = 2 };
 enum {
     WL_XBOX_VSH_FUSED_STAGE_PLAIN,
     WL_XBOX_VSH_FUSED_STAGE_LINEAR,
     WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE,
     WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR,
-    WL_XBOX_VSH_FUSED_STAGE_SPHERE
+    WL_XBOX_VSH_FUSED_STAGE_SPHERE,
+    /* (projected: (s, t, q) undivided, for GX to divide at each pixel, sent first after the position
+    as GX's normal, binormal and tangent: three words for one, nine for two or three, the unused zero;
+    "G", and "H" for a linear texture's) */
+    WL_XBOX_VSH_FUSED_STAGE_PROJECTED,
+    WL_XBOX_VSH_FUSED_STAGE_PROJECTED_LINEAR,
+    /* (a sphere map's made by GX's transform unit from the direction of unit length the form sends,
+    as a projected coordinate's (s, t, q) are, after a lit form's normal: WlGxDirectLayout's
+    texcoords_sphere; "U") */
+    WL_XBOX_VSH_FUSED_STAGE_SPHERE_XF
 };
+/* (a build whose forms may have sphere maps made by GX: its fused key's) */
+#define WL_XBOX_VSH_FUSED_SPHERE_XF 1
 typedef struct WlXboxVshFusedKey {
     unsigned short live;
     unsigned char format[16];
     unsigned char perspective, colors, channels, stage_count;
     unsigned char stages[4];
+    /* d0's r, g and b lit by GX's transform unit (the program's light shape,
+    wl_xbox_vsh_light_shape): its normal's three floats sent after the
+    position, d0's word then its alpha alone (its r, g and b unread) */
+    unsigned char lit;
+    /* every array one stride (one vertex buffer's attributes): the element's offset made once, not
+    once an array ("I" in a form's text). A draw of such arrays runs a form without it when it has none
+    with it */
+    unsigned char interleaved;
 } WlXboxVshFusedKey;
 typedef struct WlXboxVshFusedForm {
     WlXboxVshFusedKey key;
@@ -188,6 +212,27 @@ typedef struct WlXboxVshStep {
     WlXboxVshStepOperand operands[3];
 } WlXboxVshStep;
 
+/* A d0 GX's lighting can make (wl_xbox_vsh_light_shape): its r, g and b the
+ambient c[ambient].xyz plus, for each light, c[color].xyz times
+max(dot(n, s c[direction].xyz), 0) (s -1 where direction_negate), or with a
+back term max(dot, b dot, 0), b = c[back].component (negated where
+back_negate); n the xyz of temporary `normal` as the program ends (no
+instruction writes it after the dot products read it), and the 0 of the
+maximum an input's component no array gives (v[zero].zero_component, 0 at
+every vertex where the register's array has fewer components: a draw's to
+check). Constants by their register index (c[n - 96] in Direct3D's terms). */
+enum { WL_XBOX_VSH_LIGHTS = 4 };
+typedef struct WlXboxVshLight {
+    unsigned char direction, direction_negate, color;
+    unsigned char back, back_negate, back_component, has_back;
+} WlXboxVshLight;
+typedef struct WlXboxVshLightShape {
+    /* the lights (0: d0 is not of the shape) */
+    unsigned char count;
+    unsigned char normal, ambient, zero, zero_component;
+    WlXboxVshLight lights[WL_XBOX_VSH_LIGHTS];
+} WlXboxVshLightShape;
+
 typedef struct WlXboxVshProgram {
     unsigned long count;
     /* (wl_xbox_vsh_hash: the generated programs' names) */
@@ -213,6 +258,8 @@ typedef struct WlXboxVshProgram {
     /* an instruction captures the clip-space position (the run of any
     vertex for its position sets clip_captured) */
     unsigned char captures_clip;
+    /* its d0's light shape, as wl_xbox_vsh_light_shape finds it */
+    WlXboxVshLightShape light;
     WlXboxVshInstruction instructions[WL_XBOX_VSH_MAX_INSTRUCTIONS];
     WlXboxVshStep steps[WL_XBOX_VSH_MAX_INSTRUCTIONS];
 } WlXboxVshProgram;
@@ -326,10 +373,18 @@ unsigned long wl_xbox_vsh_hash(const uint32_t *instructions, unsigned long instr
 FNV-1a), which a compiled function's table entry carries too */
 unsigned long wl_xbox_vsh_check(const uint32_t *instructions, unsigned long instruction_count);
 
+/* the light shape of a program's d0 (WlXboxVshLightShape): 1 and *shape
+filled, or 0 (shape->count 0) */
+int wl_xbox_vsh_light_shape(const WlXboxVshProgram *program, WlXboxVshLightShape *shape);
+/* a copy of the program whose d0's r, g and b no instruction writes (the
+form that leaves them to GX's lighting: the instructions that made them then
+reach nothing) */
+void wl_xbox_vsh_light_unlit(const WlXboxVshProgram *program, WlXboxVshProgram *unlit);
+
 /* a fused form as text, as tools/xbox_vsh_codegen.c's --fused file lists them
-after the program's hash: "<live, hex> <p or o> <colours> <channels> <stages>
-<formats>", the stages "-" or each "<n><N, L, P, Q or S>" (plain, linear,
-projective, both, sphere), the formats "-" or each "<register>:<F1 ... F4,
+after the program's hash: "<live, hex> <p or o> <colours> <channels>[L]
+<stages> <formats>" (L: lit), the stages "-" or each "<n><N, L, P, Q, S, G, H or U>" (plain, linear,
+projective, both, sphere, projected, linear projected, sphere by GX), the formats "-" or each "<register>:<F1 ... F4,
 D3D, CMP, S1.n, UB.n>", comma-separated. _text gives the length (snprintf's),
 _parse the characters read (0: not a form; the key's every byte set) */
 int wl_xbox_vsh_fused_text(const WlXboxVshFusedKey *key, char *text, unsigned long size);

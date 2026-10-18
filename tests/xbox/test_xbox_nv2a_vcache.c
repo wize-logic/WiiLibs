@@ -351,7 +351,89 @@ TEST a_rewrite_without_room_is_not_answered_stale(void) {
     PASS();
 }
 
+// wl_nv2a_color_byte_paired_model (the Wii's paired singles: ps_mul, ps_add, ps_sel, the u8 store's
+// clamp and cut) gives wl_nv2a_color_byte's byte: every float from 2^-9 (below it both give 0) to just
+// past 1 (from 1 on both give 255), and a spread of every sign, exponent and mantissa (all 2^32 floats
+// checked once by hand, on the host and on ppc-be)
+TEST the_paired_colour_byte_is_the_generic_one(void) {
+    const uint64_t dense_lo = 0x3B000000u, dense_hi = 0x3F800100u, step = 4093;
+    uint64_t i;
+
+    for (i = dense_lo; i < dense_hi; i++) {
+        uint32_t u = (uint32_t)i;
+        float f;
+
+        memcpy(&f, &u, sizeof f);
+        if (wl_nv2a_color_byte_paired_model(f) != wl_nv2a_color_byte(f)) {
+            FAILm("a float's paired byte differs");
+        }
+    }
+    for (i = 0; i < 0x100000000ull; i += step) {
+        uint32_t u = (uint32_t)i;
+        float f;
+
+        memcpy(&f, &u, sizeof f);
+        if (wl_nv2a_color_byte_paired_model(f) != wl_nv2a_color_byte(f)) {
+            FAILm("a float's paired byte differs");
+        }
+    }
+    PASS();
+}
+
+static unsigned g_gpu_waits;
+
+static void gpu_wait(void) {
+    g_gpu_waits++;
+}
+
+// A model met range by range in one frame (each range over the one before: their union made again,
+// the copy before pending while the GPU may read it) in an arena too small for every copy: without
+// cfg.gpu_wait a lookup fails; with it, the GPU waited for and the pending copies freed, none fails
+TEST pending_copies_freed_by_waiting_for_the_gpu(void) {
+    static uint8_t arena[4096] __attribute__((aligned(32)));
+    WlNv2aVCache *cache = calloc(1, sizeof *cache);
+    WlNv2aVCacheConfig cfg;
+    WlNv2aVCacheStats s;
+    WlNv2aAttrib position = attrib(0, 0, WL_NV2A_VTX_F, 3);
+    unsigned pass, last, failed;
+
+    ASSERT(cache != NULL && guest() != NULL);
+    for (pass = 0; pass < 2; pass++) {
+        memset(&cfg, 0, sizeof cfg);
+        cfg.arena = arena;
+        cfg.arena_bytes = sizeof arena;
+        cfg.gpu_lag = 1;
+        cfg.gpu_wait = pass == 1 ? gpu_wait : NULL;
+        g_gpu_waits = 0;
+        wl_nv2a_vcache_init(cache, &cfg);
+        failed = 0;
+        for (last = 3; last < 64; last += 4) {
+            const uint8_t *p = wl_nv2a_vcache_get(cache, g_guest.dev, &position, 0, last, WL_NV2A_VCACHE_POSITION);
+
+            failed += p == NULL;
+            if (p != NULL) {
+                ASSERT_EQ(bits((float)last * 1.25f - 7.0f), be(p + 12 * last));
+            }
+        }
+        wl_nv2a_vcache_stats(cache, &s);
+        if (pass == 0) {
+            ASSERT(failed != 0);
+            ASSERT_EQ(0u, g_gpu_waits);
+        } else {
+            ASSERT_EQ(0u, failed);
+            ASSERT(g_gpu_waits >= 1u && g_gpu_waits <= 4u);
+            ASSERT_EQ(g_gpu_waits, s.gpu_waits);
+        }
+        wl_nv2a_vcache_clear(cache);
+    }
+    t_destroy(&g_guest);
+    free(cache);
+    PASS();
+}
+
 SUITE(vcache_suite) {
+    RUN_TEST(the_paired_colour_byte_is_the_generic_one);
+    RUN_TEST(pending_copies_freed_by_waiting_for_the_gpu);
     RUN_TEST(each_kind_converted_as_the_fetch_widens_it);
     RUN_TEST(a_colour_word_is_its_components_bytes);
     RUN_TEST(found_again_checked_once_a_frame_rewritten_twice_not_kept);

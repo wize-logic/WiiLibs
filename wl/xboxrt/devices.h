@@ -128,6 +128,18 @@ void wl_xb_gpu_set_program_list(const char *path);
 // The boot code turns it off for a file "noxf" in the title's folder (and WL_XB_NO_XF on the host).
 // Call it before wl_xb_gpu_attach_nv2a.
 void wl_xb_gpu_set_transform_unit(bool on);
+// Whether a colour that is a light's dot product may be lit by GX's transform unit (nv2a_gx.h's
+// no_xf_light; on by default): off, the processor makes it and the rest of the draw stays on the
+// unit. The boot code turns it off for a file "noxflight" (and WL_XB_NO_XF_LIGHT on the host).
+void wl_xb_gpu_set_transform_unit_light(bool on);
+// Whether a skinned model's d0 may be lit by GX's transform unit from the normal its program's lit
+// fused form sends (nv2a_gx.h's no_xf_skin; on by default): off, the processor makes it. The boot
+// code turns it off for a file "noxfskin" (and WL_XB_NO_XF_SKIN on the host).
+void wl_xb_gpu_set_transform_unit_skin(bool on);
+// Whether a draw whose position is GX's transform unit's may have its other outputs made by the
+// program's fused form for it ("x", nv2a_gx.h's no_fused_xf; on by default): off, the general way
+// (fetched, run, packed). The boot code turns it off for a file "nofusedxf" (WL_XB_NO_FUSED_XF on the host).
+void wl_xb_gpu_set_fused_xf(bool on);
 // Whether the processor goes on with the next frame while GX draws this one (wl/xbox/nv2a_gx.h's
 // overlap; on by default): off, each frame's end waits for GX to finish it. The boot code turns it off
 // for a file "nooverlap" in the title's folder (and WL_XB_NOOVERLAP on the host). Call it
@@ -135,6 +147,10 @@ void wl_xb_gpu_set_transform_unit(bool on);
 void wl_xb_gpu_set_frame_overlap(bool on);
 // Occlusion queries counted by their area alone, as before their depth test (before the GPU attaches).
 void wl_xb_gpu_set_query_by_area(bool on);
+// The render targets and the back buffer's park always of the heap (on: as before 2026-10-18), not a
+// free piece of the textures' arena first (wl/xbox/nv2a_gx.h's targets_on_heap). The boot code turns
+// it on for a file "heaptargets" in the title's folder. Before wl_xb_gpu_attach_nv2a.
+void wl_xb_gpu_set_targets_on_heap(bool on);
 // The GX backend's vertex arrays kept for GX to read by index (wl/xbox/nv2a_vcache.h: a level's
 // static geometry converted once, its draws through the transform unit sending indices alone), in
 // `arena` (`bytes`, 32-byte aligned; NULL: the end of the textures' arena when that leaves them 8 MB,
@@ -146,6 +162,20 @@ void wl_xb_gpu_set_vertex_cache(void *arena, uint32_t bytes);
 // wl_nv2a_set_prefetch; on by default, PowerPC only). The boot code turns it off for a file
 // "noprefetch" in the title's folder, for an A/B on the console.
 void wl_xb_gpu_set_prefetch(bool on);
+// The pusher's header loop as it was before the method table's run kinds (wl/xbox/nv2a_kelvin.h's
+// wl_nv2a_set_old_push): a file "oldpush" in the title's folder (or WL_XB_OLDPUSH on the host), for
+// an A/B on the console.
+void wl_xb_gpu_set_old_push(bool on);
+// The guest lock kept through GX's waits (a file "holdgxlock" in the title's folder, WL_XB_HOLD_GX_LOCK
+// on the host), as before 2026-10-18: by default a wait gives it up to the other threads once its work
+// is done (nv2a_adapter.c, thread.h's wl_xb_gpu_wait_begin). Call it before wl_xb_gpu_attach_nv2a.
+void wl_xb_gpu_set_hold_gx_lock(bool on);
+// The guest bytes of new textures a frame converts at its draws before the rest are put off (made
+// while the processor waits for GX at the frame's end, or in a later frame; wl/xbox/nv2a_texcache.h's
+// frame_budget): WL_XB_TEXTURE_FRAME_BUDGET by default, 0 for none. The boot code sets 0 for a file
+// "lazytex" in the title's folder (and WL_XB_LAZYTEX on the host). Call it before wl_xb_gpu_attach_nv2a.
+enum { WL_XB_TEXTURE_FRAME_BUDGET = 1024 * 1024 };
+void wl_xb_gpu_set_texture_budget(uint32_t bytes);
 
 #ifdef __cplusplus
 }

@@ -176,7 +176,30 @@ static WlNv2aVCacheEntry *eviction_candidate(WlNv2aVCache *cache, const WlNv2aVC
     return best;
 }
 
-// memory for an array of `bytes`, the least recently drawn evicted for it (within the budget)
+// No room while arrays given back wait for the GPU to be past them: the GPU waited for, and every one
+// of them freed (no draw sent from here on reads one: their entries are gone or moved). A frame that
+// meets a model's ranges one by one makes the union of those met so far again at each, the copies
+// before it pending (d40's first frame: 500-700 KB pending, 188 lookups failed and their draws sent
+// whole). At most VCACHE_WAITS a frame; cfg.gpu_wait NULL: never.
+enum { VCACHE_WAITS = 4 };
+
+static bool wait_for_gpu(WlNv2aVCache *cache) {
+    // (an arena's room alone: a budget counts the arrays kept, not those pending)
+    if (cache->cfg.gpu_wait == NULL || cache->cfg.arena == NULL || cache->pending_count == 0 ||
+        cache->waits_frame >= VCACHE_WAITS) {
+        return false;
+    }
+    cache->cfg.gpu_wait();
+    cache->waits_frame++;
+    cache->stats.gpu_waits++;
+    while (cache->pending_count != 0) {
+        array_free(cache, cache->pending[--cache->pending_count]);
+    }
+    return true;
+}
+
+// memory for an array of `bytes`, the least recently drawn evicted for it (within the budget), the
+// GPU waited for when what it may still read holds the room (wait_for_gpu)
 static void *room(WlNv2aVCache *cache, size_t bytes, const WlNv2aVCacheEntry *spare) {
     for (;;) {
         void *array = NULL;
@@ -190,7 +213,9 @@ static void *room(WlNv2aVCache *cache, size_t bytes, const WlNv2aVCacheEntry *sp
         }
         victim = eviction_candidate(cache, spare);
         if (victim == NULL || !evict(cache, victim)) {
-            return NULL;
+            if (!wait_for_gpu(cache)) {
+                return NULL;
+            }
         }
     }
 }
@@ -256,6 +281,7 @@ void wl_nv2a_vcache_frame_done(WlNv2aVCache *cache) {
             drawn += e->bytes;
         }
     }
+    cache->waits_frame = 0;
     cache->stats.frame_bytes = drawn;
     if (drawn > cache->stats.peak_frame_bytes) {
         cache->stats.peak_frame_bytes = drawn;
@@ -484,7 +510,10 @@ const void *wl_nv2a_vcache_get(WlNv2aVCache *cache, WlNv2a *dev, const WlNv2aAtt
             cache->stats.failed++;
             return NULL;
         }
-    } else if (e->checked_frame != cache->frame) {
+    } else if (e->checked_frame != cache->frame || (e->stamp != 0 && watching(cache, dev))) {
+        // (checked once a frame, and under the write watch at every use, which costs a page's look:
+        // an array the guest writes again within a frame, a ring of quads drawn range by range, is
+        // otherwise drawn as it was at the frame's first check, a30's decals lost)
         const uint8_t *src = NULL;
         uint64_t hash = 0;
 

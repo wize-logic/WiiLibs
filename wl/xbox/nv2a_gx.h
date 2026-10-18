@@ -67,14 +67,24 @@ typedef struct WlNv2aGxConfig {
     // a colour affine in one input but not passed as it is (a directional light's dot product) left
     // to the processor, not lit by GX from the input as a normal
     bool no_xf_light;
+    // a skinned model's d0 (a program of the light shape whose position stays on the processor: its
+    // lit fused form, WlXboxVshFusedKey.lit) made by the processor, not lit by GX from the normal the
+    // form sends
+    bool no_xf_skin;
     // the processor does not wait for GX at the end of a frame (wl_gx_set_frame_overlap): it goes on
     // with the next one while GX draws this one; the caches keep what GX may still read one frame
     // longer
     bool overlap;
+    // the render targets always of the heap (textures.alloc), never a free piece of the textures'
+    // arena (wl_nv2a_texcache_spare_alloc), which they otherwise take first when it has one
+    bool targets_on_heap;
     // the processor's vertices made the general way (fetched, run and packed one after another), not
     // fused where the program has the draw's form (the arrays read, the program run and GX's words
     // written in one loop: WlXboxVshFusedProc, the Wii's)
     bool no_fused;
+    // a draw whose position is the transform unit's (the program run for the rest) made the general way,
+    // not by its program's fused form for it (WL_XBOX_VSH_FUSED_XF: v0 sent as fetched)
+    bool no_fused_xf;
     // called for each batch of a draw that could run fused (the program's hash, the form, the vertices
     // made, whether its program had the form), to list the forms a title draws (NULL: none)
     void (*fused_seen)(void *user, unsigned long hash, const WlXboxVshFusedKey *key, unsigned vertices, bool fused);
@@ -128,6 +138,10 @@ typedef struct WlNv2aGxStats {
     uint32_t textures_unsampled;  // ...a stage program that samples none (pass-through, clip plane, DOT_ZW, dot product)
     uint32_t textures_stood_in;   // stage textures that could not be made, bound as a stand-in of their average colour
     uint32_t standin_hidden;      // draws not drawn: a texture could not be made and they blend onto the picture
+    // the time from one present to the next (the processor's clock): the longest, and the frames by
+    // their time, under 34, 67, 100, 150 and 250 ms and longer
+    uint32_t frame_us_worst;
+    uint32_t frames_by_time[6];
     uint32_t programs_unusable;   // draws whose combiners GX cannot hold (texture 0 times colour)
     uint32_t approximations;      // draws whose combiners or blending were approximated
     uint32_t vertices_reused;     // vertices of indexed draws taken from the ones already run
@@ -135,10 +149,14 @@ typedef struct WlNv2aGxStats {
     uint32_t perspective_draws;   // draws through the perspective projection
     uint32_t fits_made;           // ...whose depth a + b / w was fitted for a transform not seen
     uint32_t fits_shared;         // ...that used the fit kept for their transform
+    uint32_t fits_memo;           // ...of them, kept for their transform in the frame: their vertices not run
     uint32_t xf_draws;            // draws whose vertices GX's transform unit transformed
     uint32_t xf_vertices;         // ...and their vertices
     uint32_t xf_position_draws;   // draws whose positions alone it transformed (the rest the program's)
     uint32_t xf_lit_draws;        // of the xf draws, those whose colours GX lit from a normal
+    // of the processor's draws, those whose d0 GX lit from the normal a lit fused form sent, and
+    // their vertices (no_xf_skin)
+    uint32_t skin_lit_draws, skin_lit_vertices;
     uint32_t projected_draws;     // draws with a projective coordinate whose q varies: divided by GX per pixel
     uint32_t unwritten_counted;   // draws that write nothing (no colour, no depth) counting pixels: counted, not drawn
     uint32_t unwritten_skipped;   // ...and not counting: skipped
@@ -153,7 +171,28 @@ typedef struct WlNv2aGxStats {
     uint32_t programs_unbiased;   // programs whose signed sums were made unsigned (psh_bias.h)
     uint32_t xf_why_draws[WL_NV2A_GX_XF_WHYS];    // draws by where their vertices were transformed
     uint32_t xf_why_vertices[WL_NV2A_GX_XF_WHYS]; // ...and their vertices
+    uint64_t xf_why_bytes[WL_NV2A_GX_XF_WHYS];    // ...and their vertices' bytes in the FIFO (the console's)
+    // position-alone draws whose positions GX read from the vertex cache's arrays, and their vertices
+    uint32_t position_indexed_draws, position_indexed_vertices;
+    uint32_t probes_kept;         // the program's outputs for fixed inputs kept from a draw before (draw cuts)
 } WlNv2aGxStats;
+
+// The draw path's cuts of 2026-10-18 (on by default): the program's outputs for fixed inputs kept
+// from draw to draw while the program and its constants are the same. Off, every draw makes them
+// as before: the boot code turns them off for a file "nodrawcuts" in the title's folder (and
+// WL_XB_NODRAWCUTS on the host, read when a backend is made). For every backend; call it before
+// wl_nv2a_gx_create.
+void wl_nv2a_gx_set_draw_cuts(bool on);
+// The draw path's second round of cuts (on by default), each turned off by an empty file in the
+// title's folder (and WL_XB_<NAME> on the host, read when a backend is made): "novcwait" (the vertex
+// arrays' copies given back wait for the frame's end, not for the GPU when there is no room),
+// "nopscolor" (the Wii's colours a component at a time), "nofitmemo" (every perspective draw's
+// projection fitted from its own vertices, no fit kept for its transform within the frame),
+// "nocolorreg" (an indexed draw's constant colour sent with each vertex, not GX's channel register),
+// "noposindex" (a draw with its position alone on GX's transform unit sends the position's floats,
+// not an index into the vertex cache's array of them). Call it
+// before wl_nv2a_gx_create.
+void wl_nv2a_gx_set_switches(const char *title_dir);
 
 // A backend over GX, which must be up (wl_gx_init). NULL when there is no memory. The device it
 // reads guest memory through is attached afterwards (the device is made with the backend).
@@ -170,8 +209,14 @@ void wl_nv2a_gx_psh_counts(const WlNv2aGx *gx, WlXboxPshCacheCounts *out);
 const WlNv2aTexCache *wl_nv2a_gx_textures(const WlNv2aGx *gx);
 const WlNv2aVCache *wl_nv2a_gx_vertex_cache(const WlNv2aGx *gx);
 // The host memory the backend holds besides its textures' (wl_nv2a_texcache_memory): its record
-// (the caches of pixel programs, fits and vertices are in it) and its render targets' images.
+// (the caches of pixel programs, fits and vertices are in it) and its render targets' images
+// (`targets`: those of the heap; `target_count`: all).
 void wl_nv2a_gx_host_bytes(const WlNv2aGx *gx, size_t *record, size_t *targets, unsigned *target_count);
+// A free piece of the textures' arena for a picture of the GPU's own (the back buffer's park:
+// wl_gx_target_set_allocator), NULL when it has none (or targets_on_heap); given back with
+// wl_nv2a_gx_spare_free, which says false for memory not the arena's (the caller frees it).
+void *wl_nv2a_gx_spare_alloc(WlNv2aGx *gx, size_t bytes);
+bool wl_nv2a_gx_spare_free(WlNv2aGx *gx, void *memory);
 // The pixel program the last draw was made with (psh's: its reason when it is beyond GX, what it
 // approximated), and whether it was used (false: texture 0 times the colour instead); NULL before
 // the first draw. Valid until the next draw. For logs and tools.

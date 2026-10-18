@@ -91,6 +91,69 @@ static inline uint32_t wl_nv2a_color_word_with(const float c[4], const WlNv2aCol
     return (uint32_t)bits;
 }
 
+// wl_nv2a_color_byte as the Gekko's paired singles make it (wl_nv2a_color_words_paired): y = value *
+// 255 + 0.5 in two roundings (ps_mul, ps_add, as the plain C's fmuls and fadds), a NaN or y below 0
+// made 0 (ps_sel), then the quantized store's u8: clamped to [0, 255] and cut down. The same byte as
+// wl_nv2a_color_byte for every float (the unit test checks them all): y below 1 cuts down to 0, and
+// from 255 on the clamp gives 255. Plain C, the model the console's code is checked by.
+static inline uint32_t wl_nv2a_color_byte_paired_model(float value) {
+    float y = value * 255.0f + 0.5f;
+    float z = y >= 0.0f ? y : 0.0f; // (ps_sel: a NaN fails the test)
+
+    z = z > 255.0f ? 255.0f : z;
+    return (uint32_t)z;
+}
+
+#if defined(__wii__)
+#define WL_NV2A_COLOR_PAIRED 1
+// The colours of `count` vertices as GX's words, 0xRRGGBBAA, each from four floats at `src` (the
+// next `stride` bytes on) into the word at byte `offset` of the vertex `out[n]` points to: two pairs
+// of paired singles a colour, their bytes stored by GQR6 set to u8 (saved and restored, as the fused
+// forms do; GQR0 the floats' own). About 15 instructions a colour against wl_nv2a_color_word's 45.
+// (f1-f5 named: a callee-saved FPR's second slot is not saved by the prologue's stfd)
+static inline void wl_nv2a_color_words_paired(const void *src, uint32_t stride, void *const *out, uint32_t offset,
+                                              uint32_t count) {
+    static const float k[6] __attribute__((aligned(8))) = {255.0f, 255.0f, 0.5f, 0.5f, 0.0f, 0.0f};
+    uint32_t saved, at;
+
+    if (count == 0) {
+        return;
+    }
+    __asm__ volatile("mfspr %[saved], 918\n\t"
+                     "lis %[at], 4\n\t"
+                     "ori %[at], %[at], 4\n\t"
+                     "mtspr 918, %[at]\n\t"
+                     "isync\n\t"
+                     "psq_l 1, 0(%[k]), 0, 0\n\t"
+                     "psq_l 2, 8(%[k]), 0, 0\n\t"
+                     "psq_l 3, 16(%[k]), 0, 0\n\t"
+                     "mtctr %[count]\n"
+                     "1:\n\t"
+                     "lwz %[at], 0(%[out])\n\t"
+                     "psq_l 4, 0(%[src]), 0, 0\n\t"
+                     "psq_l 5, 8(%[src]), 0, 0\n\t"
+                     "addi %[out], %[out], 4\n\t"
+                     "add %[src], %[src], %[stride]\n\t"
+                     "ps_mul 4, 4, 1\n\t"
+                     "ps_mul 5, 5, 1\n\t"
+                     "ps_add 4, 4, 2\n\t"
+                     "ps_add 5, 5, 2\n\t"
+                     "ps_sel 4, 4, 4, 3\n\t"
+                     "ps_sel 5, 5, 5, 3\n\t"
+                     "add %[at], %[at], %[offset]\n\t"
+                     "psq_st 4, 0(%[at]), 0, 6\n\t"
+                     "psq_st 5, 2(%[at]), 0, 6\n\t"
+                     "bdnz 1b\n\t"
+                     "mtspr 918, %[saved]\n\t"
+                     "isync"
+                     : [saved] "=&r"(saved), [at] "=&b"(at), [src] "+b"(src), [out] "+b"(out)
+                     : [k] "b"(k), [count] "r"(count), [stride] "r"(stride), [offset] "r"(offset)
+                     : "fr1", "fr2", "fr3", "fr4", "fr5", "ctr", "memory");
+}
+#else
+#define WL_NV2A_COLOR_PAIRED 0
+#endif
+
 static inline uint32_t wl_nv2a_color_word(const float c[4]) {
     const WlNv2aColorConstants k = { 255.0f, 0.5f, 0.0f, -0.5 + 0x1p-30, 0x1.8p52, 256.0 };
 

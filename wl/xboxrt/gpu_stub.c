@@ -194,12 +194,28 @@ void wl_xb_gpu_set_transform_unit(bool on) {
     (void)on;
 }
 
+void wl_xb_gpu_set_transform_unit_light(bool on) {
+    (void)on;
+}
+
+void wl_xb_gpu_set_transform_unit_skin(bool on) {
+    (void)on;
+}
+
 void wl_xb_gpu_set_vertex_cache(void *arena, uint32_t bytes) {
     (void)arena;
     (void)bytes;
 }
 
 void wl_xb_gpu_set_prefetch(bool on) {
+    (void)on;
+}
+
+void wl_xb_gpu_set_old_push(bool on) {
+    (void)on;
+}
+
+void wl_xb_gpu_set_hold_gx_lock(bool on) {
     (void)on;
 }
 #endif

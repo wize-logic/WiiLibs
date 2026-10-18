@@ -46,6 +46,14 @@ static void put_le_float(unsigned char *p, float x) {
     p[3] = (unsigned char)(bits >> 24);
 }
 
+static float get_le_float(const unsigned char *p) {
+    uint32_t bits = (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+    float x;
+
+    memcpy(&x, &bits, 4);
+    return x;
+}
+
 // the coordinates in double without the cancellation: 1 + z is r / (L (L - z)) for z < 0
 static void sphere_exact(const float d[3], double st[2]) {
     double x = d[0], y = d[1], z = d[2], r = x * x + y * y, length = sqrt(r + z * z);
@@ -185,8 +193,270 @@ TEST fused_sphere_stage_is_close_to_the_general_path(void) {
     PASS();
 }
 
+// a form of the two-node blend (683e337f), whose prefix (the blended rows) a vertex takes from
+// the vertex before when its node indices' and weight's bytes are the same
+static const WlXboxVshFusedForm *blend_form(void) {
+    unsigned long i;
+
+    for (i = 0; i < test_vsh_fused_natives_count; i++) {
+        if (test_vsh_fused_natives[i].hash == 0x683e337fUL && test_vsh_fused_natives[i].fused_count == 1u) {
+            return &test_vsh_fused_natives[i].fused[0];
+        }
+    }
+    return NULL;
+}
+
+// a batch's words, the same to the bit as each vertex run alone (its prefix always made): runs of
+// vertices sharing nodes and weights, a new weight under the same nodes, and the shorts -32768 and
+// -32767 (other bytes, the same float)
+TEST fused_blend_kept_from_the_vertex_before_is_the_same(void) {
+    static float constants[192][4];
+    static WlXboxVshFused fused;
+    static unsigned char positions[VERTICES * 12], normals[VERTICES * 12], nodes[VERTICES * 2],
+        weights[VERTICES * 2];
+    static uint32_t elements[VERTICES], batch[VERTICES][WORDS], alone[VERTICES][WORDS];
+    static uint32_t *words_made[VERTICES];
+    const WlXboxVshFusedForm *form = blend_form();
+    unsigned round, v, r, differing = 0;
+    char detail[160] = "";
+
+    ASSERT(form != NULL);
+    for (r = 0; r < 192; r++) {
+        unsigned c;
+
+        for (c = 0; c < 4; c++) {
+            constants[r][c] = random_component();
+        }
+    }
+    constants[7][3] = 765.0f;
+    memset(&fused, 0, sizeof fused);
+    fused.pack[WL_XBOX_VSH_FUSED_TO_SAMPLES] = fused.pack[WL_XBOX_VSH_FUSED_TO_SAMPLES + 1] = 1.0f;
+    fused.pack[WL_XBOX_VSH_FUSED_HALF] = fused.pack[WL_XBOX_VSH_FUSED_HALF + 1] = 0.5f;
+    fused.pack[WL_XBOX_VSH_FUSED_DEPTH] = fused.pack[WL_XBOX_VSH_FUSED_DEPTH + 1] = 1.0f;
+    fused.pack[WL_XBOX_VSH_FUSED_ONES] = fused.pack[WL_XBOX_VSH_FUSED_ONES + 1] = 1.0f;
+    fused.pack[WL_XBOX_VSH_FUSED_SHORT] = fused.pack[WL_XBOX_VSH_FUSED_SHORT + 1] = 1.0f / 32767.0f;
+    fused.pack[WL_XBOX_VSH_FUSED_BYTE] = fused.pack[WL_XBOX_VSH_FUSED_BYTE + 1] = 1.0f / 255.0f;
+    fused.pack[WL_XBOX_VSH_FUSED_NEGATIVE] = fused.pack[WL_XBOX_VSH_FUSED_NEGATIVE + 1] = -1.0f;
+    fused.data[0] = positions;
+    fused.stride[0] = 12;
+    fused.data[1] = normals;
+    fused.stride[1] = 12;
+    fused.data[5] = nodes;
+    fused.stride[5] = 2;
+    fused.data[6] = weights;
+    fused.stride[6] = 2;
+    fused.elements = elements;
+    for (round = 0; round < ROUNDS; round++) {
+        for (v = 0; v < VERTICES; v++) {
+            int weight = (int)(next_random() % 65535u) - 32767;
+
+            for (r = 0; r < 3; r++) {
+                put_le_float(&positions[12 * v + 4 * r], random_component());
+                put_le_float(&normals[12 * v + 4 * r], random_component());
+            }
+            if (v % 4u != 0u) {
+                // (mostly the vertex before's nodes and weight)
+                memcpy(&nodes[2 * v], &nodes[2 * (v - 1u)], 2);
+                if (v % 8u != 3u) {
+                    memcpy(&weights[2 * v], &weights[2 * (v - 1u)], 2);
+                    weight = 0x10000;
+                }
+            } else {
+                nodes[2 * v] = (unsigned char)(next_random() % 44u);
+                nodes[2 * v + 1] = (unsigned char)(next_random() % 44u);
+            }
+            if (v % 16u == 6u) {
+                weight = -32768;
+            } else if (v % 16u == 7u) {
+                weight = -32767;
+            }
+            if (weight != 0x10000) {
+                weights[2 * v] = (unsigned char)weight;
+                weights[2 * v + 1] = (unsigned char)((unsigned)weight >> 8);
+            }
+            elements[v] = v;
+        }
+        for (r = 0; r < 2; r++) {
+            for (v = 0; v < 16; v++) {
+                memset(fused.inputs[r][v], 0, sizeof fused.inputs[r][v]);
+                fused.inputs[r][v][3] = 1.0f;
+            }
+        }
+        for (v = 0; v < VERTICES; v++) {
+            words_made[v] = batch[v];
+        }
+        fused.words = words_made;
+        memset(batch, 0, sizeof batch);
+        form->run((const float (*)[4])constants, &fused, VERTICES, form->key.live);
+        memset(alone, 0, sizeof alone);
+        for (v = 0; v < VERTICES; v++) {
+            uint32_t *one = alone[v];
+
+            fused.elements = &elements[v];
+            fused.words = &one;
+            form->run((const float (*)[4])constants, &fused, 1, form->key.live);
+        }
+        fused.elements = elements;
+        for (v = 0; v < VERTICES; v++) {
+            if (memcmp(batch[v], alone[v], sizeof batch[v]) != 0 && differing++ == 0) {
+                snprintf(detail, sizeof detail, "round %u vertex %u: batch %08x %08x %08x %08x, alone %08x %08x %08x %08x",
+                         round, v, (unsigned)batch[v][0], (unsigned)batch[v][1], (unsigned)batch[v][2],
+                         (unsigned)batch[v][3], (unsigned)alone[v][0], (unsigned)alone[v][1],
+                         (unsigned)alone[v][2], (unsigned)alone[v][3]);
+            }
+        }
+    }
+    if (differing != 0) {
+        printf("  %u vertices differ; the first %s\n", differing, detail);
+    }
+    ASSERT_EQ(0u, differing);
+    PASS();
+}
+
+// the lit program's forms (4fd1043b): lit 0 its own, 1 the one GX lights (perspective 0, the screen's);
+// x: the one whose position is GX's transform unit's
+static const WlXboxVshFusedForm *lit_form_of(unsigned lit, unsigned perspective) {
+    unsigned long i, f;
+
+    for (i = 0; i < test_vsh_fused_natives_count; i++) {
+        if (test_vsh_fused_natives[i].hash == 0x4fd1043bUL) {
+            for (f = 0; f < test_vsh_fused_natives[i].fused_count; f++) {
+                if (test_vsh_fused_natives[i].fused[f].key.lit == lit &&
+                    test_vsh_fused_natives[i].fused[f].key.perspective == perspective) {
+                    return &test_vsh_fused_natives[i].fused[f];
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static const WlXboxVshFusedForm *lit_form(unsigned lit) {
+    return lit_form_of(lit, 0);
+}
+
+// the lit form's words: its form's position, then the normal (the program's r11, v1 times c[12].w,
+// to the bit), d0's alpha byte as its form packs it, and the texture coordinate
+TEST fused_lit_form_sends_the_normal(void) {
+    static float constants[192][4];
+    static WlXboxVshFused fused;
+    static unsigned char positions[VERTICES * 12], normals[VERTICES * 12], coordinates[VERTICES * 8];
+    static uint32_t elements[VERTICES], plain[VERTICES][8], lit[VERTICES][10], xf[VERTICES][8];
+    static uint32_t *words_made[VERTICES];
+    const WlXboxVshFusedForm *form = lit_form(0), *lit_one = lit_form(1),
+                             *xf_one = lit_form_of(0, WL_XBOX_VSH_FUSED_XF);
+    unsigned v, r, c;
+
+    ASSERT(form != NULL);
+    ASSERT(lit_one != NULL);
+    ASSERT(xf_one != NULL);
+    ASSERT_EQ(0u, xf_one->key.live & WL_XBOX_VSH_LIVE_POSITION);
+    for (r = 0; r < 192; r++) {
+        for (c = 0; c < 4; c++) {
+            constants[r][c] = random_component();
+        }
+    }
+    constants[96 + 36][0] = 0.625f;
+    memset(&fused, 0, sizeof fused);
+    fused.pack[WL_XBOX_VSH_FUSED_SCALE] = fused.pack[WL_XBOX_VSH_FUSED_SCALE + 1] = 1.0f;
+    fused.pack[WL_XBOX_VSH_FUSED_TO_SAMPLES] = fused.pack[WL_XBOX_VSH_FUSED_TO_SAMPLES + 1] = 1.0f;
+    fused.pack[WL_XBOX_VSH_FUSED_HALF] = fused.pack[WL_XBOX_VSH_FUSED_HALF + 1] = 0.5f;
+    fused.pack[WL_XBOX_VSH_FUSED_255] = fused.pack[WL_XBOX_VSH_FUSED_255 + 1] = 255.0f;
+    fused.pack[WL_XBOX_VSH_FUSED_DEPTH] = fused.pack[WL_XBOX_VSH_FUSED_DEPTH + 1] = 1.0f;
+    fused.pack[WL_XBOX_VSH_FUSED_ONES] = fused.pack[WL_XBOX_VSH_FUSED_ONES + 1] = 1.0f;
+    fused.data[0] = positions;
+    fused.stride[0] = 12;
+    fused.data[1] = normals;
+    fused.stride[1] = 12;
+    fused.data[4] = coordinates;
+    fused.stride[4] = 8;
+    fused.elements = elements;
+    fused.words = words_made;
+    for (v = 0; v < VERTICES; v++) {
+        for (r = 0; r < 3; r++) {
+            put_le_float(&positions[12 * v + 4 * r], random_component());
+            put_le_float(&normals[12 * v + 4 * r], random_component());
+        }
+        put_le_float(&coordinates[8 * v], random_component());
+        put_le_float(&coordinates[8 * v + 4], random_component());
+        elements[v] = v;
+    }
+    for (r = 0; r < 2; r++) {
+        for (v = 0; v < 16; v++) {
+            fused.inputs[r][v][3] = 1.0f;
+        }
+    }
+    for (v = 0; v < VERTICES; v++) {
+        words_made[v] = plain[v];
+    }
+    form->run((const float (*)[4])constants, &fused, VERTICES, form->key.live);
+    for (v = 0; v < VERTICES; v++) {
+        words_made[v] = lit[v];
+    }
+    lit_one->run((const float (*)[4])constants, &fused, VERTICES, lit_one->key.live);
+    for (v = 0; v < VERTICES; v++) {
+        words_made[v] = xf[v];
+    }
+    xf_one->run((const float (*)[4])constants, &fused, VERTICES, xf_one->key.live);
+    for (v = 0; v < VERTICES; v++) {
+        // (x: the position's words v0's as the arrays hold it, the rest the form's own)
+        for (r = 0; r < 3; r++) {
+            ASSERT_EQ(float_bits(get_le_float(&positions[12 * v + 4 * r])), xf[v][r]);
+        }
+        for (r = 3; r < 6; r++) {
+            ASSERT_EQ(plain[v][r], xf[v][r]);
+        }
+    }
+    for (v = 0; v < VERTICES; v++) {
+        for (r = 0; r < 3; r++) {
+            float n;
+
+            n = get_le_float(&normals[12 * v + 4 * r]);
+            ASSERT_EQ(plain[v][r], lit[v][r]);
+            ASSERT_EQ(float_bits(n * constants[96 + 12][3]), lit[v][3 + r]);
+        }
+        // (d0's alpha byte, 0.625 * 255 + 1/2, alone: GX lights its r, g and b)
+        for (c = 0, r = 0; c < 4; c++) {
+            if (((const unsigned char *)&lit[v][6])[c] != 0) {
+                ASSERT_EQ(159, ((const unsigned char *)&lit[v][6])[c]);
+                ASSERT_EQ(159, ((const unsigned char *)&plain[v][3])[c]);
+                r++;
+            }
+        }
+        ASSERT_EQ(1u, r);
+        ASSERT_EQ(plain[v][4], lit[v][7]);
+        ASSERT_EQ(plain[v][5], lit[v][8]);
+    }
+    PASS();
+}
+
+// a form's text read back the same: interleaved arrays ("I"), projected stages ("G", "H"), sphere maps
+// GX makes ("U") and shorts as they are ("SK")
+TEST fused_form_text_round_trips(void) {
+    static const char *const texts[] = {"23 p 1 1I 0G,1P 0:UB.3,8:SK.1,9:UB.3",
+                                        "1e7 p 2 3LI 2H,0P,1P,3S 0:F3,1:CMP,4:S1.2,5:UB.2,6:SK.4",
+                                        "1e7 x 2 3LI 0P,1U,3U 0:F3,1:CMP,4:S1.2"};
+    WlXboxVshFusedKey key;
+    char text[200];
+    unsigned n;
+
+    for (n = 0; n < sizeof texts / sizeof texts[0]; n++) {
+        ASSERT(wl_xbox_vsh_fused_parse(texts[n], &key) > 0);
+        ASSERT_EQ(1u, key.interleaved);
+        wl_xbox_vsh_fused_text(&key, text, sizeof text);
+        ASSERT_STR_EQ(texts[n], text);
+    }
+    ASSERT(wl_xbox_vsh_fused_parse(texts[0], &key) > 0);
+    ASSERT_EQ(WL_XBOX_VSH_FUSED_STAGE_PROJECTED, key.stages[0] >> 2);
+    ASSERT_EQ(WL_XBOX_VSH_FUSED_S32K, key.format[8]);
+    PASS();
+}
+
 SUITE(xbox_vsh_fused) {
+    RUN_TEST(fused_form_text_round_trips);
     RUN_TEST(fused_sphere_stage_is_close_to_the_general_path);
+    RUN_TEST(fused_blend_kept_from_the_vertex_before_is_the_same);
+    RUN_TEST(fused_lit_form_sends_the_normal);
 }
 
 GREATEST_MAIN_DEFS();

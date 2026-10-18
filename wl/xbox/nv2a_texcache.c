@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/platform/platform.h"
 #include "wl/xbox/nv2a_capture.h"
 
 #define TAG "nv2a"
@@ -118,7 +119,8 @@ static bool release_image(WlNv2aTexCache *cache, void *image, bool used_now) {
 static bool wait_for_gpu(WlNv2aTexCache *cache) {
     unsigned i, kept = 0;
 
-    if (cache->cfg.gpu_lag == 0 || cache->cfg.gpu_wait == NULL || cache->waited_frame == cache->frame) {
+    if (cache->cfg.gpu_lag == 0 || cache->cfg.gpu_wait == NULL || cache->waited_frame == cache->frame ||
+        cache->working) {
         return false;
     }
     cache->cfg.gpu_wait();
@@ -192,6 +194,25 @@ void wl_nv2a_texcache_frame_done(WlNv2aTexCache *cache) {
     }
     cache->stats.frame_bytes = drawn;
     cache->stats.frame_reduced = smaller;
+    if (cache->frame_us > cache->stats.worst_frame_us) {
+        cache->stats.worst_frame_us = cache->frame_us;
+        cache->stats.worst_frame_made = (uint32_t)cache->frame_made;
+    }
+    cache->stats.frames_over_20ms += cache->frame_us >= 20000u;
+    cache->stats.frames_over_50ms += cache->frame_us >= 50000u;
+    cache->frame_us = 0;
+    cache->frame_made = 0;
+    // (those not made while the GPU drew: looked up again in the next frame)
+    cache->deferred_count = 0;
+    if (cache->frame_deferred) {
+        cache->stats.frames_deferred++;
+        if (++cache->deferred_run > cache->stats.deferred_run) {
+            cache->stats.deferred_run = cache->deferred_run;
+        }
+    } else {
+        cache->deferred_run = 0;
+    }
+    cache->frame_deferred = false;
     if (drawn > cache->stats.peak_frame_bytes) {
         cache->stats.peak_frame_bytes = drawn;
         memset(cache->stats.peak_by_format, 0, sizeof cache->stats.peak_by_format);
@@ -236,6 +257,25 @@ bool wl_nv2a_texcache_converted(const WlNv2aTexCache *cache, uint32_t phys, uint
         held = true;
     }
     return held;
+}
+
+void *wl_nv2a_texcache_spare_alloc(WlNv2aTexCache *cache, size_t bytes) {
+    if (cache->cfg.arena == NULL || bytes == 0u) {
+        return NULL;
+    }
+    return wl_heap_alloc(&cache->heap, (bytes + 31u) & ~(size_t)31u, 32, TAG, 0, 0);
+}
+
+bool wl_nv2a_texcache_spare_owns(const WlNv2aTexCache *cache, const void *memory) {
+    return memory != NULL && cache->cfg.arena != NULL && wl_heap_owns(&cache->heap, memory);
+}
+
+bool wl_nv2a_texcache_spare_free(WlNv2aTexCache *cache, void *memory) {
+    if (!wl_nv2a_texcache_spare_owns(cache, memory)) {
+        return false;
+    }
+    wl_heap_free(&cache->heap, memory);
+    return true;
 }
 
 void wl_nv2a_texcache_memory(const WlNv2aTexCache *cache, WlNv2aTexCacheMemory *out) {
@@ -786,6 +826,37 @@ static bool stale_image(WlNv2aTexCache *cache, const WlNv2aTexEntry *keep) {
     return e != NULL && cache->frame - e->used_frame >= WL_NV2A_TEXCACHE_RESTORE_FRAMES;
 }
 
+// ---- the frame budget -----------------------------------------------------------------------------
+
+// whether the frame has made its budget of textures (never while a capture runs: it must see every
+// texture its draws read, nor in wl_nv2a_texcache_work)
+static bool over_budget(const WlNv2aTexCache *cache, const WlNv2a *dev) {
+    return cache->cfg.frame_budget != 0 && cache->frame_made >= cache->cfg.frame_budget && !cache->working &&
+           !wl_nv2a_capture_active(dev);
+}
+
+// a new texture put off to wl_nv2a_texcache_work (once: its other lookups in the frame find it listed)
+static void defer(WlNv2aTexCache *cache, const WlNv2aTexture *t, bool mipmaps) {
+    unsigned i;
+
+    cache->stats.deferred++;
+    cache->frame_deferred = true;
+    for (i = 0; i < cache->deferred_count; i++) {
+        const WlNv2aTexture *d = &cache->deferred[i].texture;
+
+        if (d->phys == t->phys && d->format_word == t->format_word && rect_of(d) == rect_of(t) &&
+            d->palette_phys == t->palette_phys && d->signs == t->signs) {
+            cache->deferred[i].mipmaps = cache->deferred[i].mipmaps || mipmaps;
+            return;
+        }
+    }
+    if (cache->deferred_count < WL_NV2A_TEXCACHE_DEFERRED) {
+        cache->deferred[cache->deferred_count].texture = *t;
+        cache->deferred[cache->deferred_count].mipmaps = mipmaps;
+        cache->deferred_count++;
+    }
+}
+
 // A texture kept smaller for want of memory, as it was: made whole again when there is room for it
 // (image_stale; with its smaller image given back first when only that may make the room, and put
 // back as it was where it does not: copied, its texels not read again), tried at its first use in a frame (the GPU has finished with the
@@ -799,8 +870,9 @@ static bool restore(WlNv2aTexCache *cache, WlNv2a *dev, WlNv2aTexEntry *e, const
     WlNv2aGxLayout whole, small = e->layout;
     void *image;
 
-    if (e->reduced == 0 || cache->frame - e->restore_frame < WL_NV2A_TEXCACHE_RESTORE_FRAMES) {
-        return true;
+    if (e->reduced == 0 || cache->frame - e->restore_frame < WL_NV2A_TEXCACHE_RESTORE_FRAMES ||
+        over_budget(cache, dev)) {
+        return true; // (the frame budget spent: tried at a later frame's first use)
     }
     e->restore_frame = cache->frame;
     if (!wl_nv2a_texture_layout(t, e->mipmaps != 0, &whole)) {
@@ -886,6 +958,7 @@ static bool restore(WlNv2aTexCache *cache, WlNv2a *dev, WlNv2aTexEntry *e, const
     }
     e->reduced = 0;
     cache->stats.restored++;
+    cache->frame_made += t->total_bytes;
     return true;
 }
 
@@ -902,9 +975,9 @@ static void unknown_note(WlNv2aTexCache *cache, const WlNv2aTexture *t) {
     }
 }
 
-const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, const WlNv2aTexture *t,
-                                           bool mipmaps, bool *made) {
-    WlNv2aTexEntry *e;
+// a lookup that checks the texture (`e` its entry, NULL: none), and makes it when it must
+static const WlNv2aTexEntry *lookup(WlNv2aTexCache *cache, WlNv2a *dev, const WlNv2aTexture *t, bool mipmaps,
+                                   WlNv2aTexEntry *e, bool *made) {
     const uint8_t *src, *palette = NULL;
     uint64_t hash = 0, palette_hash = 0;
     uint32_t stamp;
@@ -912,18 +985,6 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     bool large;
     uint32_t reduced;
 
-    if (made != NULL) {
-        *made = false;
-    }
-    cache->stats.lookups++;
-    mipmaps = mipmaps && t->levels > 1; // (one level: the same image either way)
-    capture_note(cache, dev);
-    e = find(cache, t, mipmaps);
-    if (e != NULL && e->checked_frame == cache->frame && !e->dynamic) {
-        e->used_frame = cache->frame;
-        cache->stats.hits++;
-        return e;
-    }
     cache->stats.checks++;
     if (e != NULL && e->stamp != 0 && watching(cache, dev) && !watch_written(cache, e, t)) {
         // no store to its pages since it was checked: as it was
@@ -940,6 +1001,17 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     if (e == NULL && refused_now(cache, t)) {
         cache->stats.refused_again++;
         cache->stats.failed++;
+        return NULL;
+    }
+    if (e == NULL && over_budget(cache, dev)) {
+        // (the frame has made its textures: this one is made while the GPU draws, or in a later frame;
+        // meanwhile the texture without mip-maps, if it is kept, rather than a stand-in)
+        defer(cache, t, mipmaps);
+        e = mipmaps ? find_exact(cache, t, false) : NULL;
+        if (e != NULL && e->checked_frame == cache->frame && !e->dynamic) {
+            e->used_frame = cache->frame;
+            return e;
+        }
         return NULL;
     }
     src = wl_nv2a_phys(dev, t->phys, t->total_bytes);
@@ -1003,6 +1075,7 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
             return NULL;
         }
         cache->stats.reconverted++;
+        cache->frame_made += t->total_bytes;
         if (made != NULL) {
             *made = true;
         }
@@ -1075,6 +1148,7 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
     link_entry(cache, e);
     cache->stats.bytes += layout.total_bytes;
     cache->stats.converted++;
+    cache->frame_made += t->total_bytes;
     if (mipmaps) {
         // (the texture without mip-maps, not drawn in this frame, given back: this one answers for it)
         WlNv2aTexEntry *plain = find_exact(cache, t, false);
@@ -1087,4 +1161,53 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
         *made = true;
     }
     return e;
+}
+
+const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, const WlNv2aTexture *t,
+                                           bool mipmaps, bool *made) {
+    const WlNv2aTexEntry *found;
+    WlNv2aTexEntry *e;
+    uint64_t t0;
+
+    if (made != NULL) {
+        *made = false;
+    }
+    cache->stats.lookups++;
+    mipmaps = mipmaps && t->levels > 1; // (one level: the same image either way)
+    capture_note(cache, dev);
+    e = find(cache, t, mipmaps);
+    if (e != NULL && e->checked_frame == cache->frame && !e->dynamic) {
+        e->used_frame = cache->frame;
+        cache->stats.hits++;
+        return e;
+    }
+    // (a check: the frame's texture work timed)
+    t0 = wl_platform_time_us();
+    found = lookup(cache, dev, t, mipmaps, e, made);
+    cache->frame_us += (uint32_t)(wl_platform_time_us() - t0);
+    return found;
+}
+
+bool wl_nv2a_texcache_work(WlNv2aTexCache *cache, WlNv2a *dev, bool *made) {
+    bool mipmaps;
+    WlNv2aTexture t;
+
+    *made = false;
+    if (cache->deferred_count == 0) {
+        return false;
+    }
+    // (in the order the frame's draws wanted them)
+    t = cache->deferred[0].texture;
+    mipmaps = cache->deferred[0].mipmaps && t.levels > 1;
+    cache->deferred_count--;
+    memmove(&cache->deferred[0], &cache->deferred[1], cache->deferred_count * sizeof cache->deferred[0]);
+    if (find(cache, &t, mipmaps) == NULL) {
+        bool got;
+
+        cache->working = true;
+        got = lookup(cache, dev, &t, mipmaps, NULL, made) != NULL;
+        cache->working = false;
+        cache->stats.made_early += got && *made;
+    }
+    return cache->deferred_count != 0;
 }

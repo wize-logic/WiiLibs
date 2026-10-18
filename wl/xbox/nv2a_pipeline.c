@@ -148,18 +148,25 @@ void wl_nv2a_pipeline_vertices(WlNv2aPipeline *p, const WlNv2aKelvin *k, const f
 }
 
 uint32_t wl_nv2a_pipeline_inputs(WlNv2aPipeline *p, unsigned live) {
+    unsigned i;
+
     if (p->program == NULL) {
         // (the fixed function's: the position, the colours, the fog coordinate, the texture coordinates)
         return 1u << 0 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 9 | 1u << 10 | 1u << 11 | 1u << 12;
     }
     // (the same program, not replaced since, and the same outputs: the same answer)
-    if (p->program != p->inputs_program || p->compiled != p->inputs_compiled || live != p->inputs_live) {
-        p->inputs_program = p->program;
-        p->inputs_compiled = p->compiled;
-        p->inputs_live = live;
-        p->inputs = (uint32_t)wl_xbox_vsh_inputs_read(p->program, live);
+    for (i = 0; i < WL_NV2A_PIPELINE_INPUTS; i++) {
+        if (p->inputs_kept[i].program == p->program && p->inputs_kept[i].compiled == p->compiled &&
+            p->inputs_kept[i].live == live) {
+            return p->inputs_kept[i].inputs;
+        }
     }
-    return p->inputs;
+    i = p->inputs_next++ % WL_NV2A_PIPELINE_INPUTS;
+    p->inputs_kept[i].program = p->program;
+    p->inputs_kept[i].compiled = p->compiled;
+    p->inputs_kept[i].live = live;
+    p->inputs_kept[i].inputs = (uint32_t)wl_xbox_vsh_inputs_read(p->program, live);
+    return p->inputs_kept[i].inputs;
 }
 
 float wl_nv2a_fog_factor(const WlNv2aKelvin *k, float coordinate) {

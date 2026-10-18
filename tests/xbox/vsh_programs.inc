@@ -197,3 +197,37 @@
 	0x00000000, 0x0020001B, 0x8436006C, 0x0000F858,
 	/* mov oFog.x, r7.z */
 	0x00000000, 0x002000AA, 0x7436006C, 0x00008829,
+/* lit: an ambient and two directional lights' clamped dot products with a normal it makes, one with a back term, the 0 of the maxima v3.z (wl_xbox_vsh_light_shape; its lit fused form sends the normal) */
+	0x00102078,
+	/* mul r11.xyz, v1, c[12].w */
+	0x00000000, 0x004D821B, 0x09FE186C, 0x0EB00000,
+	/* dp4 oPos.x, v0, c[0] */
+	0x00000000, 0x00EC001B, 0x0836186C, 0x00008800,
+	/* dp4 oPos.y, v0, c[1] */
+	0x00000000, 0x00EC201B, 0x0836186C, 0x00004800,
+	/* dp4 oPos.z, v0, c[2] */
+	0x00000000, 0x00EC401B, 0x0836186C, 0x00002800,
+	/* dp4 oPos.w, v0, c[3] */
+	0x00000000, 0x00EC601B, 0x0836186C, 0x00001800,
+	/* dp3 r1.x, r11, c[30] */
+	0x00000000, 0x00AFC01B, 0xB436186C, 0x08100000,
+	/* dp3 r1.y, r11, -c[31] */
+	0x00000000, 0x00AFE01B, 0xB636186C, 0x04100000,
+	/* mul r1.z, r1.x, -c[32].y */
+	0x00000000, 0x00500000, 0x16AA186C, 0x02100000,
+	/* max r2.z, r1.z, r1.x */
+	0x00000000, 0x014000AA, 0x1400286C, 0x02200000,
+	/* max r3.x, r2.z, v3.z */
+	0x00000000, 0x014006AA, 0x2554106C, 0x08300000,
+	/* max r3.y, v3.z, r1.y */
+	0x00000000, 0x014006AA, 0x08AA286C, 0x04300000,
+	/* mov r5.xyz, c[33] */
+	0x00000000, 0x0030201B, 0x0C36006C, 0x0E500000,
+	/* mad r4.xyz, r3.y, c[34], r5 */
+	0x00000000, 0x00904055, 0x3436186D, 0x5E400000,
+	/* mad oD0.xyz, c[35], r3.x, r4 */
+	0x00000000, 0x0090601B, 0x0C00686D, 0x1000E818,
+	/* mov oD0.w, c[36].x */
+	0x00000000, 0x00308000, 0x0C36006C, 0x00001818,
+	/* mov oT0.xy, v4 */
+	0x00000000, 0x0020081B, 0x0836006C, 0x0000C849,

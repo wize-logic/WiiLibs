@@ -162,6 +162,7 @@ void xk_status_report(void) {
     }
     last = s;
     wl_xb_latency_log(XK_TAG, "reads issued to completion routine", &g_read_apc_lat);
+    xk_card_read_report();
 }
 
 bool xk_apc_deliver(WlXbThread *t) {

@@ -128,10 +128,20 @@ whose pairs never leave it (floats in and out), beside the plain C every other m
 fused multiply-adds and the pairs' order of adding change the last bits, so the Wii's functions match
 the interpreter within a tolerance (`tests/xbox/suite_vsh_ps.c`, in the console runner; on the host
 the same code emulated in C by `tests/xbox/vsh_ps_emulate.py`), and the host's and ppc-be's, the
-plain C, to the bit. Halo's three busiest programs run 8 to 18% fewer instructions a vertex.
+plain C, to the bit. Halo's three busiest programs run 8 to 18% fewer instructions a vertex. A skinned
+fused form whose registers run out with its blended matrices kept in them from one vertex to the next
+keeps them in memory instead (stored where they are made, loaded at each vertex), and only when that
+does not fit either makes them at each vertex (`--spill`: in memory always, the tests'). A fused
+loop reads the inputs its prologue makes (packed normals, shorts, bytes, a D3DCOLOR) from their
+registers, not stored and loaded back (`--no-forward`: as before, for a comparison); the components
+an array does not give are constants. Its forms also take a projective stage GX divides at each pixel
+(`G`, `H` linear: (s, t, q) sent first after the position, as `vertices_pack` sends it), shorts as
+they are (`SK.n`), and arrays of one stride (`I` after the channels: the element's offset made once;
+a draw of such arrays runs a form without `I` when it has none with it, and a file that lists a form
+and its `I` twin gets the twin alone, so that an older generator still writes the form).
 
 ```sh
-xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] microcode.inc programs.c [table]
+xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] [--no-pairs] [--spill] [--no-forward] [--fused forms.txt] microcode.inc programs.c [table]
 ```
 
 A recompiled title gets this without writing anything: the runtime appends each program it draws
@@ -253,7 +263,7 @@ even, so its winding holds).
   replay's `--no-xf-light` leaves it to the processor; counted as `xf_lit_draws`), a texture coordinate from one input of two components or from the position, no fog,
   no sphere map, a projected stage's q 1), the program is not run at all: the coordinates come from
   the transform unit's generators. Not to the bit (`no_xf` in `WlNv2aGxConfig` keeps every vertex on
-  the processor; the runtime's `noxf` file). A projective stage's coordinate is divided by its q at
+  the processor; the runtime's `noxf` file). A skinned model's program (its position blended by bones, so made by the processor) whose d0 is an ambient plus directional lights' clamped dot products with a normal it makes (`wl_xbox_vsh_light_shape`; a back term the light the other way) has that d0 lit by GX where it has the draw's lit fused form (`L` in a forms list): the form sends the normal after the position and leaves d0's r, g and b unmade (`no_xf_skin`, the runtime's `noxfskin` file, the replay's `--no-xf-skin`; counted as `skin_lit_draws`). A draw whose position is the transform unit's (the program run for its other outputs) has its fused form too (`x` in a forms list, `WL_XBOX_VSH_FUSED_XF`): the form sends v0 as fetched and leaves the program's position unmade, the words those of the general way (`no_fused_xf`, the runtime's `nofusedxf` file, the replay's `--no-fused-xf`). A sphere map's coordinates (a cube map drawn as its sphere map) are the transform unit's: the processor sends the direction of unit length as a projected coordinate's three numbers, after a lit form's normal, and GX's generator makes the disc's coordinates (`texcoords_sphere`, `wl/platform/gx_direct.h`), for a program with a fused form that does so (`U` in a forms list) or none at all (the general way too); two at most, never beside projected coordinates (the runtime's `nospherexf` file, `WL_XB_NOSPHEREXF` on the host and for the replay). A projective stage's coordinate is divided by its q at
   the vertex while q is the same at every vertex of the draw's first batch; one whose q varies there
   (a projected shadow, a flashlight) is sent as (s, t, q) for GX to divide at each pixel, as the
   NV2A does (up to three a draw, as GX's normal, binormal and tangent through 3x4 generators;

@@ -493,7 +493,10 @@ the host's frame limit, if any; the swap file `<hard disk folder>/pagefile.sys`)
 textures' arena (`texture_bytes`, 15 MB, the vertex arrays' cache in its end; `WL_XB_TEXTURE_MB` on the host); threads; the
 image; the kernel (`wl/xboxkrnl`); the thunks; the MCPX devices and the GPU (wl/xbox's model when
 it is built in, else the stub); the service thread; then the entry point on a guest thread of its
-own. It returns the process's exit code. A play setting `replay:...` runs the capture bench instead,
+own. It returns the process's exit code. A play setting `sdspeed:<file>` (a file in the title folder, such as
+`sdspeed:maps/a10.map`, or a path with its device) runs no title: the SD card's reads through libfat against
+reads straight from the card (`wl_fs_speed_compare`, `wl/platform/fs.h`), MB/s and ms a read in the log, and
+the run ends. A play setting `replay:...` runs the capture bench instead,
 after guest memory and the GPU (above). `wl_xboxrt_main` is a `main`: on the host
 `prog <title folder> [hdd folder]` (`WL_XB_TRACE=1` logs every kernel call; `WL_XB_PLAY`,
 `WL_XB_PLAY_OUT` start the play harness), on the Wii `sd:/xbox/<WL_XB_TITLE_NAME>`; it calls
@@ -535,12 +538,25 @@ so it takes the lock too, or each concurrent run has a copy of its own (AGENTS.m
 | `profile.txt` | arms the sampling profiler (`wl/platform/README.md`, "Arming it from a file"): `after` counts seconds since the entry point started, a profile follows every `seconds` for `repeat` runs, the dumps are `profile<N>.txt` in the title folder (and in the log with `log 1`); symbolize with `tools/wl_profile.py <elf> <dump or log>` |
 | `hwcount.txt` | arms the hardware counters (`wl/platform/README.md`, "Hardware counters") |
 | `noxf` | GX's transform unit is kept out of the vertices (every vertex through the program on the processor), for an A/B; `WL_XB_NO_XF` on the host |
+| `noxflight` | GX's transform unit lights no colour (a light's dot product made by the processor, the rest of the draw still on the unit), for an A/B of Halo's shadows; `WL_XB_NO_XF_LIGHT` on the host |
+| `noxfskin` | a skinned model's colour made by the processor, not lit by GX's transform unit from the normal its program's lit fused form sends (`wl/xbox/README.md`), for an A/B; `WL_XB_NO_XF_SKIN` on the host |
+| `nofusedxf` | a draw whose position is GX's transform unit's made the general way (fetched, run, packed), not by its program's fused `x` form (`wl/xbox/README.md`), for an A/B; `WL_XB_NO_FUSED_XF` on the host |
+| `nospherexf` | a sphere map's coordinates made by the processor (`wl_nv2a_sphere_coordinates`), not by GX's transform unit from the direction (`U` forms, `wl/xbox/README.md`), for an A/B; `WL_XB_NOSPHEREXF` on the host |
 | `vcache` | the vertex arrays' cache size in KB, its text (1024 when empty); the default is 1 MB, kept in the end of the textures' arena |
 | `novcache` | turns the vertex arrays' cache off (beats `vcache`) |
 | `noprefetch` | no `dcbt` ahead of the guest's vertex data and push buffer (an A/B of the prefetch; PowerPC builds only have it) |
+| `oldpush` | the pusher's header loop as before the method table's run kinds (`WL_XB_OLDPUSH` on the host; an A/B of the pusher) |
 | `gxnotex`, `gxnotlut`, `gxtlutmem1`, `gxmaxdraws`, `gxnoquad`, `gxnozrestore`, `gxnocopy`, `gxtexgap`, `gxlatez`, `gxvtxinv` | the Wii only: work left out of what GX gets, to find what hangs a console's GPU by halving (`wl/platform/gx_direct.h`, `WlGxBisect`): every texture one fixed 4x4 texture; the C4/C8 ones only (no TLUT loads); the TLUTs loaded from copies in MEM1; a frame's first N primitives only (`gxmaxdraws=N`); no quad of the targets; the back buffer put back without its Z texture; no texture copy out of the EFB; the vertex's texture coordinates in the descriptor's slots of their own names, gaps and all (TEX0, TEX2, TEX3: the layout that hung a console's GPU, now sent in the first slots); the depth test never early (no `GX_SetZCompLoc(GX_TRUE)`); GX's vertex cache invalidated before every primitive. The boot logs the ones on |
+| `lazytex` | every texture converted at its first draw, however many a frame meets (by default a frame converts 1 MB of the guest's new textures at its draws, stands in for the rest and converts them while the processor waits for GX at its end, or at a later frame's draws: a burst spread over frames), for an A/B; `WL_XB_LAZYTEX` on the host |
 | `nooverlap` | each frame's end waits for GX to finish the frame (by default the processor goes on with the next frame while GX draws, at most one frame behind; the caches keep what GX may still read one frame longer), for an A/B; `WL_XB_NOOVERLAP` on the host. A file `overlap` is still read and does nothing |
+| `nopreempt` | the scheduler's turns as before 2026-10-18 (`thread.h`'s `preempt`): no hand-off at the holder's next safe point to a thread back from the card's I/O, none to a thread of equal priority after a quantum of its own wait, and starve_ms (30 ms, not a quantum) for a lower priority; `WL_XB_NOPREEMPT` on the host |
+| `holdgxlock` | the guest lock kept through GX's waits, as before 2026-10-18 (by default a wait for GX, once its put-off textures are made, gives the lock to the other threads when one wants it and takes it back when GX is done, at their next safe point; their kicks, flips and vertical blanks wait for it meanwhile: `nv2a_adapter.c`); `WL_XB_HOLD_GX_LOCK` on the host |
+| `oldreserve` | none of the heap's reserve lent to the guest's frames (`frame_loan.h`; by default 5 of its 9 MB, given back 256 KB at a time when an allocation would fail); `WL_XB_LOAN_MB` sets the loan on the host |
+| `heaptargets` | the render targets and the back buffer's park of the heap alone, as before 2026-10-18 (by default they take a free piece of the textures' arena first, no texture evicted for them, so the heap keeps its loan) |
+| `bigstacks` | host stacks of 256 KB at most (the main thread's, the host threads' and the service thread's), as before 2026-10-18; by default 128 KB (card runs: 14 KB at most used) |
+| `ptescan` | the Wii only: a page's PTE looked for in its whole group of the page table, as before 2026-10-18 (by default the slot it was put in is read first: the write watch's, the clock's and the faults' probes) |
 | `noaudio` | the idle APU and AC'97 (DirectSound fails, the title runs silent), for an A/B; `WL_XB_AUDIO=0` on the host |
+| `oldsd` | the SD card's files read through libfat alone, as before 2026-10-18 (by default a read goes straight to the card in runs of whole sectors: `wl/platform/README.md`, "Files"), for an A/B; the kernel's line `card reads` every 10 s says MB and MB/s for the guest's reads and the rest's (the paging's) |
 | `noreadahead` | no host thread reads ahead of a file the title reads from start to end (a map being inflated into a Z: cache slot: 512 KB read while the title inflates the last 128 KB), for an A/B of a level's first load; `WL_XB_NO_READAHEAD` on the host |
 | `deterministic` | the virtual clock (`thread.h`'s deterministic mode), so a run of a script on the Wii is the same game as the host's with `WL_XB_DETERMINISTIC=1`: guest RAM (the play step `dump`) and captures compare byte for byte; `WL_XB_DETERMINISTIC` on the host |
 | `netrun.txt` | options in the command line's form, one a line (`#` comments), for a run started without arguments (Dolphin): `net=127.0.0.1:7777`, `switch=...`, `play=...`; the command line wins (below) |
@@ -591,7 +607,8 @@ small files). With `netrun.txt` and no PC command line, a Dolphin run sends its 
 | `WL_XB_FRAME_MB`, `WL_XB_FRAME_KB` | a frame limit for guest memory, paged as the Wii pages (KB wins) |
 | `WL_XB_TEXTURE_MB` | the textures' arena (the Wii's is `texture_bytes`) |
 | `WL_XB_HEAP_MB`, `WL_XB_HEAP_KB` | caps the host's heap from the guest memory's creation on, as the Wii's is (`14` imitates it; the software GX and recorders are not counted) |
-| `WL_XB_NO_XF`, `WL_XB_VCACHE_KB` | as the files `noxf` and `vcache` (`0` turns the cache off) |
+| `WL_XB_HEAP_SITES` | `<KB>`: who holds the host's heap, by call site (`mem_census.h`, `wl_platform_heap_track_sites`): at the exit, the sites holding the most now and at the heap's peak, as offsets for `addr2line -f -e <program>` (blocks under that many KB counted by size) |
+| `WL_XB_NO_XF`, `WL_XB_NO_XF_LIGHT`, `WL_XB_VCACHE_KB` | as the files `noxf`, `noxflight` and `vcache` (`0` turns the cache off) |
 | `WL_XB_CAPTURE` | `path[,frames[,after]]`: a GPU capture of `frames` frames (2) starting `after` vertical blanks in (600) |
 | `WL_XB_AUDIO`, `_WAV`, `_TRACE`, `_HASH` | see "The GPU and the MCPX" |
 | `WL_XB_PAGE_CENSUS` | `path` (with a frame limit): the page census (`page_census.h`): each guest page's allocation, what used it (the GPU's textures and vertex arrays, the APU, a map file) and the working set each second; `tools/xb_page_census.py path` makes the tables |

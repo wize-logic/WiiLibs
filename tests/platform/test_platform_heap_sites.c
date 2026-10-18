@@ -77,6 +77,26 @@ TEST blocks_are_counted_by_site_and_small_ones_by_size(void) {
     PASS();
 }
 
+TEST the_sites_at_the_peak_are_kept(void) {
+    WlHeapSites s;
+    ASSERT_EQ(WL_OK, wl_heap_sites_init(&s, g_storage, sizeof g_storage, 16u, 1024u));
+    // a peak held by site A (96 KB) and B (64 KB, then freed); later A alone, below the peak
+    wl_heap_sites_alloc(&s, (void *)fake(1), 96u * 1024u, 0x80001000u, 0u);
+    wl_heap_sites_alloc(&s, (void *)fake(2), 64u * 1024u, 0x80002000u, 0u);
+    wl_heap_sites_alloc(&s, (void *)fake(3), 100u, 0x80003000u, 0u); // (small: counted in live)
+    ASSERT_EQ(160u * 1024u + 100u, s.live);
+    wl_heap_sites_free(&s, (void *)fake(2), 64u * 1024u);
+    wl_heap_sites_alloc(&s, (void *)fake(4), 32u * 1024u, 0x80004000u, 0u);
+    ASSERT_EQ(128u * 1024u + 100u, s.live);
+    ASSERT_EQ(160u * 1024u, s.peak_live); // (kept at the step past 128 KB: B's block made it)
+    ASSERT_EQ(2u, s.at_peak_count);
+    ASSERT_EQ(0x80001000u, s.at_peak[0].caller[0]);
+    ASSERT_EQ(96u * 1024u, s.at_peak[0].bytes);
+    ASSERT_EQ(0x80002000u, s.at_peak[1].caller[0]);
+    ASSERT_EQ(64u * 1024u, s.at_peak[1].bytes);
+    PASS();
+}
+
 TEST a_full_table_counts_what_it_cannot_hold(void) {
     WlHeapSites s;
     WlHeapSitesTotals t;
@@ -163,6 +183,7 @@ TEST a_long_random_run_matches_a_plain_model(void) {
 SUITE(heap_sites_suite) {
     RUN_TEST(init_lays_out_the_tables);
     RUN_TEST(blocks_are_counted_by_site_and_small_ones_by_size);
+    RUN_TEST(the_sites_at_the_peak_are_kept);
     RUN_TEST(a_full_table_counts_what_it_cannot_hold);
     RUN_TEST(a_long_random_run_matches_a_plain_model);
 }

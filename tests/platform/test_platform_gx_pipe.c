@@ -68,6 +68,9 @@ TEST vertices_words_match_the_plain_loop(void) {
             }
             ASSERT_EQ_FMT(4u * n * count, got.count, "%u");
             ASSERT(same(&got, &want));
+            memset(&got, 0, sizeof got);
+            wl_gx_pipe_vertices64(&got, vertex_ptr, n, count);
+            ASSERT(same(&got, &want));
         }
     }
     PASS();
@@ -85,6 +88,9 @@ TEST one_vertex_matches_the_plain_loop(void) {
         for (i = 0; i < count; i++) {
             rec_push(&want, 4, vertex_words[3][i]);
         }
+        ASSERT(same(&got, &want));
+        memset(&got, 0, sizeof got);
+        wl_gx_pipe_words64(&got, vertex_words[3], count);
         ASSERT(same(&got, &want));
     }
     PASS();
@@ -138,6 +144,9 @@ TEST indexed_vertices_match_the_plain_loop(void) {
                     wl_gx_pipe_vertices_index(&got, shapes[s], shape_len[s], ix, base, n, vertex_words[2], count);
                     reference_index(&want, shapes[s], shape_len[s], ix, base, n, vertex_words[2], count);
                     ASSERT(same(&got, &want));
+                    memset(&got, 0, sizeof got);
+                    wl_gx_pipe_vertices_index64(&got, shapes[s], shape_len[s], ix, base, n, vertex_words[2], count);
+                    ASSERT(same(&got, &want));
                 }
             }
         }
@@ -175,6 +184,15 @@ TEST indexed_vertices_of_every_small_shape(void) {
                     wl_gx_pipe_vertices_index(&got, order, order_count, indices, 70, 5, vertex_words[4], count);
                     reference_index(&want, order, order_count, indices, 70, 5, vertex_words[4], count);
                     ASSERT(same(&got, &want));
+                    memset(&got, 0, sizeof got);
+                    wl_gx_pipe_vertices_index64(&got, order, order_count, indices, 70, 5, vertex_words[4], count);
+                    ASSERT(same(&got, &want));
+                    // (and an even number of vertices, and none: the pairs of lone indices)
+                    memset(&got, 0, sizeof got);
+                    memset(&want, 0, sizeof want);
+                    wl_gx_pipe_vertices_index64(&got, order, order_count, indices, 70, 4, vertex_words[4], count);
+                    reference_index(&want, order, order_count, indices, 70, 4, vertex_words[4], count);
+                    ASSERT(same(&got, &want));
                 }
             }
         }
@@ -198,6 +216,9 @@ TEST indexed_vertex_of_many_items_is_walked(void) {
     wl_gx_pipe_vertices_index(&got, order, 12, indices, 5, 3, vertex_words[1], 48);
     reference_index(&want, order, 12, indices, 5, 3, vertex_words[1], 48);
     ASSERT(got.count > 4u * WL_PIPE_ITEMS_MAX);
+    ASSERT(same(&got, &want));
+    memset(&got, 0, sizeof got);
+    wl_gx_pipe_vertices_index64(&got, order, 12, indices, 5, 3, vertex_words[1], 48);
     ASSERT(same(&got, &want));
     PASS();
 }

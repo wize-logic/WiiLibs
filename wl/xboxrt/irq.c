@@ -30,7 +30,7 @@ static struct {
 static uint32_t g_tick_count;
 static WlXbServiceConfig g_cfg;
 #define MAX_VBLANK_HOOKS 8u
-#define SVC_STACK (256u << 10)  // the service thread's host stack
+static size_t g_svc_stack_bytes;   // the service thread's host stack (WlXbServiceConfig)
 #define RELAY_STACK (16u << 10) // the retrace relay's (the Wii)
 static struct {
     WlXbVblankFn fn;
@@ -89,6 +89,7 @@ void wl_xb_service_config_default(WlXbServiceConfig *cfg) {
     cfg->tick_ms = 1;
 #endif
     cfg->vblank = true;
+    cfg->host_stack_bytes = 128u << 10;
 }
 
 void wl_xb_service_set_handler(WlXbServiceFn fn, void *user) {
@@ -508,11 +509,11 @@ static void mem_tags_log(void) {
 
 static void census_service(void *user, WlMemCensusReport *out) {
     (void)user;
-    out->bytes = sizeof *g_svc + SVC_STACK + (g_relay_stack != NULL ? RELAY_STACK : 0u);
-    size_t deepest = wl_platform_stack_used(g_svc_stack, SVC_STACK);
+    out->bytes = sizeof *g_svc + g_svc_stack_bytes + (g_relay_stack != NULL ? RELAY_STACK : 0u);
+    size_t deepest = wl_platform_stack_used(g_svc_stack, g_svc_stack_bytes);
     if (deepest != 0) {
         snprintf(out->note, sizeof out->note, "deepest %u of %u KB", (unsigned)(deepest >> 10),
-                 (unsigned)(SVC_STACK >> 10));
+                 (unsigned)(g_svc_stack_bytes >> 10));
     } else {
         snprintf(out->note, sizeof out->note, "stack not used here"); // (the host's threads have their own)
     }
@@ -821,7 +822,9 @@ WlResult wl_xb_service_start(const WlXbServiceConfig *cfg) {
     if (wl_xb_deterministic()) {
         wl_xb_det_set_idle(g_svc);
     }
-    const size_t host_stack = SVC_STACK;
+    // (64 KB at least, a multiple of 64)
+    const size_t host_stack = cfg->host_stack_bytes > (64u << 10) ? (cfg->host_stack_bytes + 63u) & ~(size_t)63u : 64u << 10;
+    g_svc_stack_bytes = host_stack;
     g_svc_stack = aligned_alloc(64, host_stack);
     if (g_svc_stack == NULL) {
         return WL_ERR_NOMEM;

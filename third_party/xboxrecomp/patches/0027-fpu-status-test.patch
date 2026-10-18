@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Sun, 18 Oct 2026 12:05:03 -0400
+Subject: [PATCH] recomp: fcom; fnstsw ax; test ah, imm; jcc branches on the
+ compare's outcome
+
+---
+ tools/recomp/lifter.py               | 66 ++++++++++++++++++-
+ tools/recomp/test_fpu_status_test.py | 96 ++++++++++++++++++++++++++++
+ 2 files changed, 160 insertions(+), 2 deletions(-)
+ create mode 100644 tools/recomp/test_fpu_status_test.py
+
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index afb6217..a8a23b6 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -1179,6 +1179,67 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
+     return f"if ({cond_expr}) goto loc_{target:08X}; /* {jcc}: {desc} */"
+ 
+ 
++# The x87 compares whose condition codes `fnstsw ax` puts in AH: C0 (AH bit 0)
++# on less, C3 (bit 6) on equal, all of C3, C2 (bit 2) and C0 unordered, none on
++# greater -- g_fp_cc is RECOMP_FCMP_CC(g_fp_cmp) after each of them.
++_FPU_STATUS_COMPARES = frozenset(("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp", "ftst"))
++_FPU_CMP_AH = {-1: 0x01, 0: 0x40, 1: 0x00, 2: 0x45}
++
++
++def _fpu_status_test_condition(insns, idx, jcc):
++    """`fcom...; fnstsw ax; test ah, MASK; jcc`, the pre-SSE float branch, as
++    one test of g_fp_cmp. The lift computes the condition codes, the status
++    word into AX and the flags of the test from it; but straight after a
++    compare, (AH & MASK) is one of four values -- one per outcome of the
++    compare -- so the branch is taken for a set of outcomes, and the C names
++    that set. Everything the three instructions write is still written (a
++    later reader of AX or the condition codes sees the same values); only the
++    branch stops recomputing them. Not when MASK reads TOP (AH bits 3-5,
++    which depend on the stack depth), or when anything comes between."""
++    if idx < 2:
++        return None
++    test, sw, cmp = insns[idx], insns[idx - 1], insns[idx - 2]
++    ops = test.operands
++    if (test.mnemonic != "test" or len(ops) != 2 or ops[0].type != "reg" or ops[0].reg != "ah"
++            or ops[1].type != "imm" or sw.mnemonic != "fnstsw" or sw.op_str.strip() != "ax"
++            or cmp.mnemonic not in _FPU_STATUS_COMPARES):
++        return None
++    mask = ops[1].imm & 0xFF
++    if mask & 0x38:
++        return None
++    taken = []
++    for c, ah in sorted(_FPU_CMP_AH.items()):
++        v = ah & mask
++        zf, sf, pf = v == 0, bool(v & 0x80), bin(v).count("1") % 2 == 0
++        # test clears CF and OF
++        conds = {"je": zf, "jz": zf, "jne": not zf, "jnz": not zf, "js": sf, "jns": not sf,
++                 "jp": pf, "jpe": pf, "jnp": not pf, "jpo": not pf,
++                 "jb": False, "jc": False, "jnae": False, "jae": True, "jnb": True, "jnc": True,
++                 "jbe": zf, "jna": zf, "ja": not zf, "jnbe": not zf, "jo": False, "jno": True,
++                 "jl": sf, "jnge": sf, "jge": not sf, "jnl": not sf,
++                 "jle": zf or sf, "jng": zf or sf, "jg": not zf and not sf, "jnle": not zf and not sf}
++        if jcc not in conds:
++            return None
++        if conds[jcc]:
++            taken.append(c)
++
++    def one(c, eq):
++        if c == -1:
++            return "g_fp_cmp < 0" if eq else "g_fp_cmp >= 0"
++        return f"g_fp_cmp {'==' if eq else '!='} {c}"
++    if not taken:
++        expr = "0"
++    elif len(taken) == 4:
++        expr = "1"
++    elif len(taken) == 1:
++        expr = f"({one(taken[0], True)})"
++    elif len(taken) == 3:
++        expr = f"({one(next(c for c in _FPU_CMP_AH if c not in taken), False)})"
++    else:
++        expr = f"({one(taken[0], True)} || {one(taken[1], True)})"
++    return expr, f"fnstsw; test ah, 0x{mask:02X}: the {cmp.mnemonic}'s outcome"
++
++
+ def try_match_cmp_jcc(insns, idx, lifter=None):
+     """
+     Try to match a cmp/test + jcc pattern starting at insns[idx].
+@@ -1197,8 +1258,9 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
+         return None
+ 
+     # Same normalised form the snapshot and the recorded state use.
+-    result = _make_condition(second.mnemonic,
+-                             *normalise_zero_test(first.mnemonic, first.operands))
++    result = (_fpu_status_test_condition(insns, idx, second.mnemonic)
++              or _make_condition(second.mnemonic,
++                                 *normalise_zero_test(first.mnemonic, first.operands)))
+     if not result:
+         return None
+ 
+diff --git a/tools/recomp/test_fpu_status_test.py b/tools/recomp/test_fpu_status_test.py
+new file mode 100644
+index 0000000..1964d8f
+--- /dev/null
++++ b/tools/recomp/test_fpu_status_test.py
+@@ -0,0 +1,96 @@
++"""
++`fcom; fnstsw ax; test ah, mask; jcc` as one test of g_fp_cmp.
++
++Run: python3 -m pytest tools/recomp/test_fpu_status_test.py
++
++The branch reads (AH & mask), and straight after a compare AH is one of four
++values, one per outcome. The fused condition must take the jump for exactly
++the outcomes the hardware takes it for: checked here against a model of the
++instructions themselves (the status word's condition codes, test's flags and
++the jcc's predicate), for every mask without TOP's bits and every jcc.
++"""
++
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
++
++from tools.recomp.lifter import _fpu_status_test_condition, try_match_cmp_jcc  # noqa: E402
++
++
++class _Op:
++    def __init__(self, type, reg=None, imm=0):
++        self.type, self.reg, self.imm = type, reg, imm
++        self.mem_size, self.size = 0, 1
++
++
++class _Insn:
++    def __init__(self, mnemonic, operands=(), op_str="", target=None):
++        self.mnemonic, self.operands, self.op_str = mnemonic, list(operands), op_str
++        self.is_cond_jump = mnemonic.startswith("j") and mnemonic != "jmp"
++        self.is_call = self.is_ret = self.is_jump = False
++        self.call_target, self.jump_target = None, target
++
++
++# C3 C2 C0 after a compare (x86 manual, FCOM): greater 000, less 001, equal 100, unordered 111
++_CC = {1: (0, 0, 0), -1: (0, 0, 1), 0: (1, 0, 0), 2: (1, 1, 1)}
++
++
++def _hardware_takes(cmp, mask, jcc):
++    c3, c2, c0 = _CC[cmp]
++    ah = c3 << 6 | c2 << 2 | c0
++    v = ah & mask
++    zf, sf, pf, cf, of = v == 0, bool(v & 0x80), bin(v).count("1") % 2 == 0, False, False
++    return {
++        "je": zf, "jne": not zf, "js": sf, "jns": not sf, "jp": pf, "jnp": not pf,
++        "jb": cf, "jae": not cf, "jbe": cf or zf, "ja": not cf and not zf, "jo": of, "jno": not of,
++        "jl": sf != of, "jge": sf == of, "jle": zf or sf != of, "jg": not zf and sf == of,
++    }[jcc]
++
++
++def _seq(mask, jcc, cmp="fcomp"):
++    return [_Insn(cmp, [], ""), _Insn("fnstsw", [_Op("reg", "ax")], "ax"),
++            _Insn("test", [_Op("reg", "ah"), _Op("imm", imm=mask)], f"ah, 0x{mask:x}"),
++            _Insn(jcc, [], "", target=0x1000)]
++
++
++def _eval(expr, cmp):
++    return bool(eval(expr.replace("||", " or ").replace("g_fp_cmp", str(cmp))))
++
++
++JCCS = ("je", "jne", "js", "jns", "jp", "jnp", "jb", "jae", "jbe", "ja", "jo", "jno", "jl", "jge", "jle", "jg")
++
++
++def test_fused_condition_matches_the_hardware():
++    masks = [m for m in range(256) if not m & 0x38]
++    for mask in masks:
++        for jcc in JCCS:
++            got = _fpu_status_test_condition(_seq(mask, jcc), 2, jcc)
++            assert got is not None, (mask, jcc)
++            for cmp in _CC:
++                assert _eval(got[0], cmp) == _hardware_takes(cmp, mask, jcc), (mask, jcc, cmp, got[0])
++
++
++def test_the_usual_idioms():
++    # test ah, 0x41; jne: less, equal or unordered; test ah, 5; jnp: less (one bit set) only
++    assert _fpu_status_test_condition(_seq(0x41, "jne"), 2, "jne")[0] == "(g_fp_cmp != 1)"
++    assert _fpu_status_test_condition(_seq(0x05, "jnp"), 2, "jnp")[0] == "(g_fp_cmp < 0)"
++    assert _fpu_status_test_condition(_seq(0x01, "je"), 2, "je")[0] == "(g_fp_cmp == 0 || g_fp_cmp == 1)"
++    stmt, n = try_match_cmp_jcc(_seq(0x41, "jne"), 2)
++    assert n == 2 and stmt.startswith("if ((g_fp_cmp != 1)) goto loc_00001000;"), stmt
++
++
++def test_not_fused():
++    # TOP's bits depend on the stack depth
++    assert _fpu_status_test_condition(_seq(0x08, "jne"), 2, "jne") is None
++    # the status word after something other than a compare (fxam, fprem: other codes)
++    assert _fpu_status_test_condition(_seq(0x41, "jne", cmp="fxam"), 2, "jne") is None
++    assert _fpu_status_test_condition(_seq(0x41, "jne", cmp="fprem"), 2, "jne") is None
++    # another register, or something between
++    seq = _seq(0x41, "jne")
++    seq[2].operands[0].reg = "al"
++    assert _fpu_status_test_condition(seq, 2, "jne") is None
++    seq = _seq(0x41, "jne")
++    seq.insert(2, _Insn("nop"))
++    assert _fpu_status_test_condition(seq, 3, "jne") is None
++    assert _fpu_status_test_condition(_seq(0x41, "jne")[1:], 1, "jne") is None

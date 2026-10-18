@@ -480,6 +480,18 @@ bool wl_gx_frame_retired(uint32_t index);
 bool wl_gx_frame_wait(uint32_t index);
 // Flush the FIFO and wait for the GPU to finish everything submitted. False on timeout.
 bool wl_gx_sync(void);
+// Work for the processor while it waits for the GPU (end_frame's, wl_gx_sync's, a frame's wait):
+// `work` is called again and again while the GPU has not arrived, until it returns false (nothing
+// left for this wait); each call a short piece of work. A wait inside the work only waits. NULL:
+// none. On the host, whose GPU never makes the processor wait, it is never called.
+typedef bool (*WlGxWaitWorkFn)(void *user);
+void wl_gx_set_wait_work(WlGxWaitWorkFn work, void *user);
+// The rest of such a wait, once the work is done: `idle(user, false)` again and again while the GPU
+// has not arrived (the caller may give the processor to other threads meanwhile: a recompiled
+// title's runtime gives up its guest lock), then `idle(user, true)` once when the wait ends (or times
+// out). Not called for a wait inside the work. NULL: none. The host never calls it.
+typedef void (*WlGxWaitIdleFn)(void *user, bool done);
+void wl_gx_set_wait_idle(WlGxWaitIdleFn idle, void *user);
 // What the program is at, for the GPU hang report: slot 0..3 a name (a string that lives on) and a
 // number (a frame, a draw), two stores. On the Wii, when the GPU has read no command for 10 s while
 // it has work, the report logs these, the command processor's FIFO registers and the bytes at its
@@ -683,6 +695,8 @@ WlResult wl_platform_thread_join(WlPlatformThread thread, void **out_result);
 void wl_platform_thread_yield(void);
 // Blocks the calling thread (not the whole system) for about `ms` milliseconds.
 void wl_platform_thread_sleep_ms(uint32_t ms);
+// The same for about `us` microseconds (the console: a timed LWP sleep, to the timebase's tick).
+void wl_platform_thread_sleep_us(uint32_t us);
 // POSIX sched_yield on the console: devkitPPC's is a stub that returns ENOSYS and yields nothing,
 // so portable code spinning on it (or on something built over it) starves the threads of its own
 // priority. thread_wii.c defines __wrap_sched_yield as wl_platform_thread_yield; wl_platform's
@@ -773,6 +787,8 @@ WL_NORETURN void wl_platform_thread_exit(void *result);
 uint32_t wl_platform_thread_self_id(void);
 // Moves a thread to another of the roles' priorities (the console; the host checks and ignores).
 WlResult wl_platform_thread_set_priority(WlPlatformThread thread, WlThreadPriority priority);
+// The same for the calling thread, whoever made it (a program's main thread too).
+void wl_platform_thread_set_own_priority(WlThreadPriority priority);
 
 // ---------------------------------------------------------------------------------------------
 // Files (SD and USB through libfat). Blocking: call from an IO thread (fs.h does), except small
@@ -871,6 +887,26 @@ WlResult wl_platform_fs_read_some_at(WlPlatformFile *file, uint64_t offset, void
                                      uint32_t *got);
 // Sets the file's length: cut, or grown with zeros (FAT allocates the clusters).
 WlResult wl_platform_fs_truncate(WlPlatformFile *file, uint64_t size);
+
+// ---- Reads straight from the SD card ----
+// On the Wii a read of a file on the SD card goes to the card itself: the file's clusters are
+// mapped once (fat_map.h) and each run of contiguous sectors is one transfer into the buffer (one
+// aligned to 32 bytes at the file offset's own alignment, offset % 32, needs no move). libfat reads
+// one cluster a transfer, through its cache when a transfer is not aligned to its 32 KB pages, and
+// follows the FAT from the file's start at each jump back. A file another handle has open for
+// writing is read through libfat. On by default; off reads through libfat alone (as before
+// 2026-10-18). The host reads through the C library either way.
+void wl_platform_fs_fast_set(bool on);
+bool wl_platform_fs_fast(void);
+// Counters of the reads through this API (read_at and read_some_at) since the start, each modulo
+// 2^32 (take differences): calls, bytes, microseconds in them; the same for the reads that went
+// straight to the card; and the card transfers those made.
+typedef struct {
+    uint32_t calls, bytes, us;
+    uint32_t fast_calls, fast_bytes, fast_us;
+    uint32_t transfers;
+} WlPlatformFsReads;
+void wl_platform_fs_reads(WlPlatformFsReads *out);
 
 typedef struct {
     uint64_t size;     // bytes (0 for a directory)

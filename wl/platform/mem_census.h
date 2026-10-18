@@ -75,6 +75,42 @@ WlResult wl_platform_heap_cap(size_t bytes);
 // recorders), so that the cap imitates what the Wii's heap holds.
 void wl_platform_heap_exempt(bool on);
 
+// Host only (WL_ERR_UNSUPPORTED elsewhere, and where wl_platform_heap_cap is): the cap grows by
+// `bytes`, its counts kept (memory a reclaimer gave the heap back, below, as the Wii's would).
+WlResult wl_platform_heap_cap_add(size_t bytes);
+
+// Host only (glibc, not a static link; WL_ERR_UNSUPPORTED elsewhere): who holds the heap from now
+// on, by call site (heap_sites.h: the two callers above malloc, as offsets into the program for
+// addr2line), in the caller's `storage`; blocks under `min_tracked` bytes counted by size only.
+// The report (wl_platform_heap_log_sites) gives the sites holding the most now and at the peak.
+WlResult wl_platform_heap_track_sites(void *storage, size_t bytes, uint32_t sites, size_t min_tracked);
+void wl_platform_heap_log_sites(size_t count);
+
+// ---- giving memory back on demand ------------------------------------------------------------
+// A program that keeps memory of the heap's for itself while it is idle (xboxrt's guest frames
+// lent by the heap) registers a reclaimer: when an allocation would fail (newlib's heap has no
+// room on the Wii; the host's cap would be passed), the allocator calls it with the bytes wanted,
+// and tries again while it gives something. It frees what it can (whole blocks or a block's tail)
+// and returns the bytes it gave back, 0 when it has nothing more or cannot now. One call at a time:
+// a failure while one runs (its own allocations, another thread's) is not reclaimed for.
+// The allocators that call it: the host's (glibc, not a static link: heap_host.c) and the Wii's with
+// the wrap linked in (wl_platform_heap_overflow in CMake: heap_wrap_wii.c).
+typedef size_t (*WlHeapReclaimFn)(void *user, size_t want);
+// NULL removes it. Returns whether this program's allocator calls it.
+bool wl_platform_heap_set_reclaim(WlHeapReclaimFn fn, void *user);
+// Whether this program's allocator calls a reclaimer (the platform's answer).
+bool wl_platform_heap_reclaims(void);
+// For the allocators: the reclaimer's answer for `want` bytes, 0 without one or while it runs.
+size_t wl_platform_heap_reclaim(size_t want);
+typedef struct {
+    uint32_t calls;    // times an allocation asked
+    uint32_t gave;     // of those, times it gave something
+    uint32_t busy;     // asked while it ran (not called)
+    size_t bytes;      // given back in all
+    size_t largest_want;
+} WlHeapReclaimStats;
+void wl_platform_heap_reclaim_stats(WlHeapReclaimStats *out);
+
 // ---- the registry ---------------------------------------------------------------------------
 
 #define WL_MEM_CENSUS_MAX 24u

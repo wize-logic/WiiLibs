@@ -60,9 +60,12 @@ struct WlXbThread {
     uint64_t ready_us;         // in the ready queue (its turn not come: another thread had the lock)
     uint64_t waited_us;        // in wl_xb_wait (a guest wait: an event, a sleep, a semaphore)
     uint64_t io_us;            // outside the lock in a kernel call's card I/O (wl_xb_block_begin)
-    uint64_t off_since_us;     // when the wait or the I/O began (0: neither)
-    bool off_io;               // ...which of the two
+    uint64_t gpu_us;           // outside the lock in a wait for the GPU (wl_xb_gpu_wait_begin)
+    uint64_t off_since_us;     // when the wait, the I/O or the GPU wait began (0: none)
+    uint8_t off_kind;          // ...which of the three (WL_XB_OFF_*)
     bool woken;                // a wake arrived while it slept (wl_xb_wake)
+    bool io_back;              // queued back from the card's I/O (wl_xb_block_end): it goes first
+    bool gpu_back;             // ...from a wait for the GPU (wl_xb_gpu_wait_end): its wait is logged apart
     bool det_created;          // its host thread exists (wl_xb_thread_create): a resume queues it
     bool det_waiting;          // the deterministic mode: in wl_xb_wait, not queued
     uint64_t det_deadline_us;  // its timeout in the virtual clock (0: none)
@@ -91,13 +94,19 @@ typedef struct {
                                   // lower-priority threads out for good): 30
     uint32_t host_stack_bytes;    // the most a guest thread's host stack gets (recompiled frames
                                   // are C frames; each gets twice its guest stack, 64 KB at
-                                  // least): 256 KB
+                                  // least; host threads get it whole): 128 KB
     uint32_t default_stack_bytes; // a guest stack when the title asks for 0: 64 KB
     bool deterministic;           // the deterministic mode (below): off
     // what one safe point costs in the deterministic mode's clock (0: the defaults below)
     uint32_t det_backedge_ns;     // a backward jump: 40 ns
     uint32_t det_call_ns;         // a kernel call or an rdtsc: 400 ns
     uint32_t det_device_ns;       // a device register access: 400 ns
+    // the console's preemption (off in the deterministic mode, whose turns stay as they were): a
+    // thread that comes back from the card's I/O gets the lock at the holder's next safe point for a
+    // quantum, as the console's I/O completes at its interrupt whatever runs; one of equal priority
+    // gets it once it has waited a quantum itself (the holder's quantum restarts at every interrupt
+    // the service thread takes the lock for). Off (a file "nopreempt"): the turns of e9aab85: true
+    bool preempt;
 } WlXbThreadConfig;
 void wl_xb_thread_config_default(WlXbThreadConfig *cfg);
 
@@ -186,6 +195,19 @@ void wl_xb_yield(void);
 // no state the lock guards; wl_xb_block_end(the result) takes the lock back (NULL: nothing).
 WlXbThread *wl_xb_block_begin(void);
 void wl_xb_block_end(WlXbThread *self);
+// A wait for the GPU outside the lock (the platform's GX waits: wl_gx_set_wait_idle), as the Xbox's
+// other threads run while its GPU draws: wl_xb_gpu_wait_begin gives the lock up as wl_xb_block_begin
+// does (NULL: kept, for the same reasons) and raises the caller's host priority above the guest
+// threads', so that its looks at the GPU (each after wl_xb_gpu_wait_poll's short sleep) come between
+// the others' work whatever they do; wl_xb_gpu_wait_end takes the lock back as a thread back from the
+// card does (preempt: at the holder's next safe point) and puts the priority back. The caller keeps
+// the device it waits in from the others meanwhile (nv2a_adapter.c). Off: wl_xb_gpu_set_hold_gx_lock.
+WlXbThread *wl_xb_gpu_wait_begin(void);
+void wl_xb_gpu_wait_poll(void);
+void wl_xb_gpu_wait_end(WlXbThread *self);
+#define WL_XB_OFF_WAIT 0u
+#define WL_XB_OFF_IO 1u
+#define WL_XB_OFF_GPU 2u
 // The card's lock: a host file's transfer at an offset (a seek, then the read or write, on one
 // handle) that may run outside the guest lock is made under it (the kernel's file I/O after
 // wl_xb_block_begin), and so is every other transfer on a handle such a one may use (the paging's
@@ -293,16 +315,21 @@ typedef struct {
     uint32_t kernel_calls;
     uint32_t io_blocks; // kernel calls that gave the lock up for the card (wl_xb_block_begin)
     uint32_t yields, yields_lower; // NtYieldExecution calls; those that gave way to a lower priority
+    uint32_t io_handoffs;   // the lock given at a safe point to a thread back from the card (preempt)
+    uint32_t tie_handoffs;  // the lock given to a thread of equal priority that waited a quantum (preempt)
+    uint32_t gpu_blocks;    // waits for the GPU that gave the lock up (wl_xb_gpu_wait_begin)
+    uint32_t gpu_off_ms;    // their time off the lock
 } WlXbThreadStats;
 void wl_xb_thread_stats(WlXbThreadStats *out);
 // The service thread's longest wait for the guest lock since the last call, in ms (what the
 // interrupts were held off for), and the id of the thread that had the lock when it began; cleared.
 uint32_t wl_xb_thread_service_wait_max(uint32_t *holder);
 // A thread's time off the guest lock since it was made, in microseconds of wl_xb_time_us: queued
-// for its turn, in guest waits, in the card's I/O (a span still going on counts up to now). A title's
+// for its turn, in guest waits, in the card's I/O, in waits for the GPU (a span still going on counts
+// up to now). A title's
 // frame loop measures its own frame with it: what it waited for, and on what. Any thread.
 typedef struct {
-    uint64_t ready_us, waited_us, io_us;
+    uint64_t ready_us, waited_us, io_us, gpu_us;
 } WlXbThreadTimes;
 void wl_xb_thread_times(const WlXbThread *t, WlXbThreadTimes *out);
 // What the stall watch counts as the guest moving on: hand-offs, safe points, waits, wakes,
@@ -331,7 +358,8 @@ void wl_xb_latency_add(WlXbLatency *h, uint64_t us);
 // One log line ("<what>: <count>, ms <1:a <2:b ... max M"), and the histogram starts again; nothing
 // when it is empty.
 void wl_xb_latency_log(const char *tag, const char *what, WlXbLatency *h);
-// The time guest threads spent in the ready queue (enqueued to handed the lock), since the last log.
+// The time guest threads spent in the ready queue (enqueued to handed the lock), since the last log,
+// and the GPU waits' given up the lock (how long a waiter took to get it back once the GPU was done).
 void wl_xb_thread_log_ready_waits(void);
 // Each guest thread's stack scanned for return addresses into the image, for a frozen title.
 void wl_xb_thread_log_guest_stacks(void);

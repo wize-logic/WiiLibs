@@ -66,6 +66,7 @@ typedef struct {
     uint32_t vblank_hz_milli; // the host's vblank rate: 59940 (the Wii follows the display)
     uint32_t tick_ms;         // how often KeTickCount moves on the service thread: 1 (host), 2 (Wii)
     bool vblank;              // make vertical blanks at all (tests turn it off)
+    uint32_t host_stack_bytes; // the service thread's host stack: 128 KB (card runs: 14 KB at most)
 } WlXbServiceConfig;
 void wl_xb_service_config_default(WlXbServiceConfig *cfg);
 

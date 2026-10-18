@@ -18,6 +18,11 @@ void wl_gx_wii_texmaps_forget(uint32_t maps);
 // Texture maps given a texture behind its back (forgotten, as above, and counted as loaded by
 // WL_GX_CHECK's empty-map finding).
 void wl_gx_wii_texmaps_loaded(uint32_t maps);
+// TLUT slot `slot` loaded behind wl_gx_tlut_load's back (by the direct layer): its next load sends.
+void wl_gx_wii_tlut_forget(uint32_t slot);
+// The texture memory's cache and TLUT regions set up as WlGxBisect.regions_libogc says (after GX_Init and
+// whenever the switch changes): texture maps and TLUT slots forgotten, GX's texture cache invalidated.
+void wl_gx_wii_regions_apply(void);
 // A frame begun: the bisection's count of primitives (WlGxBisect.max_draws) starts again.
 void wl_gx_wii_bisect_frame(void);
 // A draw-sync token sent into the FIFO now (0 before wl_gx_init): hwcount.h's marks.

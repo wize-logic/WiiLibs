@@ -83,6 +83,7 @@ typedef struct WlGxSoftConfig {
 typedef struct WlGxSoftStats {
     uint32_t frames, draws, triangles, culled, clipped, pixels, written;
     uint32_t copies, restores, clears;
+    uint32_t restored; // pixels the restores wrote (within the scissor): the EFB traffic of putting the back buffer back
     uint32_t issue_draws[WL_GXSOFT_ISSUES]; // draws with each issue, by bit number
     uint32_t textures_decoded;              // texture images decoded (again when their bytes changed)
 } WlGxSoftStats;

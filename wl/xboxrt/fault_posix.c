@@ -20,6 +20,7 @@
 #include <string.h>
 #include <ucontext.h>
 
+#include "wl/platform/backtrace.h"
 #include "wl/xboxrt/crash.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/mem_internal.h"
@@ -64,6 +65,7 @@ static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *p
 }
 #elif defined(__powerpc__) && !defined(__powerpc64__)
 #define PPC_NIP 32
+#define PPC_LNK 36
 static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *pc) {
     unsigned long *g = uc->uc_mcontext.uc_regs->gregs;
     uint32_t nip = (uint32_t)g[PPC_NIP];
@@ -190,7 +192,23 @@ static void on_probe(int sig, siginfo_t *si, void *ctx) {
     } else {
         WL_LOG_W("xbthread", "  it runs at host PC %p (not in a translated function)", (void *)pc);
     }
-#if defined(__GLIBC__)
+#if defined(__powerpc__) && !defined(__powerpc64__)
+    // the translated callers above it (the loop is often a caller of a small function), up the
+    // interrupted code's back chain, which needs no unwind tables: glibc's unwinder, started here,
+    // faulted on ppc-be when the signal came in the middle of a libc function (the process ended
+    // by that SIGSEGV: test_xboxkrnl_paging under load, the holder in fputc)
+    const unsigned long *g = ((const ucontext_t *)ctx)->uc_mcontext.uc_regs->gregs;
+    uint32_t frames[24];
+    uint32_t n = wl_platform_backtrace_from((uint32_t)g[1], (uint32_t)g[PPC_LNK], frames, 24);
+    int shown = 0;
+    for (uint32_t i = 0; i < n && shown < 6; i++) {
+        uintptr_t ra = frames[i];
+        if (ra != pc && wl_xb_symbolize(ra, &sym) && ra - sym.host < 0x20000u) {
+            WL_LOG_W("xbthread", "    called from sub_%08X+0x%x", (unsigned)sym.guest_va, (unsigned)(ra - sym.host));
+            shown++;
+        }
+    }
+#elif defined(__GLIBC__)
     // the translated callers above it (the loop is often a caller of a small function)
     void *frames[24];
     int n = backtrace(frames, 24);
@@ -216,6 +234,12 @@ void wl_xb_backend_probe(uintptr_t handle) {
         if (sigaction(SIGURG, &sa, NULL) != 0) {
             return;
         }
+#if defined(__GLIBC__) && !(defined(__powerpc__) && !defined(__powerpc64__))
+        // the unwinder's first call loads it, which allocates: here, not in the handler, which may
+        // have stopped its thread inside malloc
+        void *prime[2];
+        (void)backtrace(prime, 2);
+#endif
         installed = true;
     }
     if (handle != 0) {

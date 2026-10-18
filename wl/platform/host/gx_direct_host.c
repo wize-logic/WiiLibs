@@ -11,6 +11,12 @@
 
 static WlHostGxDirect s;
 static bool g_flush_due, g_flush_off, g_layout_known;
+// the console's commands counted alike (gx_shadow.h): the position matrix as loaded (identity or not),
+// a vertex's bytes in the layout
+static bool g_position_identity = true;
+static uint32_t g_vertex_bytes;
+// the channels' material registers (wl_gx_direct_material), the colours a layout takes from them
+static uint8_t g_material[2][4], g_material_known;
 // a renderer's own vertex formats: the sizes set, and the descriptor a test gives
 static uint8_t g_format_bytes[8][WL_GX_VA_ATTRIBUTES];
 static WlGxVtxDesc g_descriptor[WL_GX_VA_ATTRIBUTES + 1];
@@ -42,11 +48,13 @@ void wl_gx_direct_begin(void) {
     wl_gx_invalidate_shadow();
     s.begins++;
     s.position_matrix_set = false;
+    g_position_identity = true;
     for (n = 0; n < 8; n++) {
         s.texgen[n].set = false;
     }
     g_flush_due = true;
     g_layout_known = false;
+    g_material_known = 0;
 }
 
 void wl_gx_direct_flush_after(void) {
@@ -80,6 +88,13 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
     }
     g_layout_known = true;
     s.stats.layouts++;
+    {
+        uint32_t chans, texgens;
+
+        wl_gx_direct_layout_outputs(layout, &chans, &texgens);
+        g_vertex_bytes = wl_gx_shadow_layout_vertex_bytes(layout);
+        wl_gx_shadow_fifo(WL_GX_FIFO_LAYOUT, wl_gx_shadow_layout_bytes(texgens, chans, layout->lit != 0));
+    }
 }
 
 void wl_platform_heap_exempt(bool on) __attribute__((weak));
@@ -113,6 +128,7 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     }
     g_flush_due = false;
     g_in_primitive = true;
+    wl_gx_shadow_fifo(WL_GX_FIFO_VERTEX, 3u + count * g_vertex_bytes);
     g_expected = count;
     g_received = 0;
     s.prim = prim;
@@ -139,16 +155,28 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
 // normal (through the normal matrix) and the light's direction, times the light's colour, clamped
 static uint8_t lit_component(const float normal[3], unsigned channel, unsigned component) {
     const WlGxDirectLighting *l = &s.lighting;
-    float dot = 0.0f, value;
-    unsigned r;
+    float value = (float)l->ambient[channel / 2u][component] / 255.0f, n[3];
+    unsigned r, k;
 
     for (r = 0; r < 3; r++) {
-        dot += (l->normal_matrix[r][0] * normal[0] + l->normal_matrix[r][1] * normal[1] +
-                l->normal_matrix[r][2] * normal[2]) *
-               l->direction[channel][r];
+        n[r] = l->normal_matrix[r][0] * normal[0] + l->normal_matrix[r][1] * normal[1] +
+               l->normal_matrix[r][2] * normal[2];
     }
-    value = (float)l->ambient[channel / 2u][component] / 255.0f +
-            dot * ((float)l->color[channel][component] / 255.0f);
+    // (its own light, then its extras: light 4 + k)
+    for (k = 0; k < 5u; k++) {
+        const float *direction = k == 0 ? l->direction[channel] : l->extra_direction[k - 1u];
+        const uint8_t *color = k == 0 ? l->color[channel] : l->extra_color[k - 1u];
+        float dot;
+
+        if (k != 0 && !(l->extra[channel] & (1u << (k - 1u)))) {
+            continue;
+        }
+        dot = n[0] * direction[0] + n[1] * direction[1] + n[2] * direction[2];
+        if ((l->clamped & (1u << channel)) && !(dot > 0.0f)) {
+            dot = 0.0f;
+        }
+        value += dot * ((float)color[component] / 255.0f);
+    }
     value = value > 1.0f ? 1.0f : value > 0.0f ? value : 0.0f;
     return (uint8_t)(value * 255.0f + 0.5f);
 }
@@ -195,9 +223,12 @@ static uint32_t wire_bytes(const WlGxDirectLayout *layout, bool *describable, ui
     for (n = 0; n < 8; n++) {
         projected += (layout->texcoords_projected >> n) & 1u;
     }
-    // (one normal attribute: a lit layout's normal and projected coordinates cannot both be sent,
-    // nor more projected coordinates than the normal, binormal and tangent hold)
-    *describable = !(layout->lit && projected != 0) && projected <= WL_GX_DIRECT_PROJECTED;
+    // (a lit layout's normal and the projected coordinates: no more than the normal, binormal and
+    // tangent hold, the normal not indexed beside projected ones; a sphere map's a projected one)
+    *describable = (layout->texcoords_sphere & (uint8_t)~layout->texcoords_projected) == 0 &&
+                   !(layout->lit && projected != 0 && (layout->indexed & (1u << WL_GX_DIRECT_ARRAY_NORMAL))) &&
+                   projected + (layout->lit ? 1u : 0u) <= WL_GX_DIRECT_PROJECTED;
+    projected += layout->lit && projected != 0 ? 1u : 0u;
     if (projected == 1u) {
         bytes += 12u;
     } else if (projected > 1u) {
@@ -206,7 +237,7 @@ static uint32_t wire_bytes(const WlGxDirectLayout *layout, bool *describable, ui
         bytes += WL_WIRE_INDEXED(WL_GX_DIRECT_ARRAY_NORMAL) ? 2u : 12u;
     }
     for (n = 0; n < layout->colors && n < 2u; n++) {
-        bytes += WL_WIRE_INDEXED(WL_GX_DIRECT_ARRAY_COLOR0 + n) ? 2u : 4u;
+        bytes += (layout->colors_register & (1u << n)) ? 0u : WL_WIRE_INDEXED(WL_GX_DIRECT_ARRAY_COLOR0 + n) ? 2u : 4u;
     }
     for (n = 0; n < 8; n++) {
         if (layout->texcoords & (1u << n)) {
@@ -252,7 +283,7 @@ void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
         i += 3u;
     }
     if (s.layout.texcoords_projected) {
-        unsigned projected = 0, k;
+        unsigned projected = s.layout.lit ? 1u : 0u, k;
 
         // (the projected coordinates' (s, t, q), as the normal or normal, binormal and tangent)
         for (n = 0; n < 8; n++) {
@@ -268,11 +299,17 @@ void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
             i += 3u;
         }
     }
-    for (n = 0; n < s.layout.colors && n < 2 && i < count; n++, i++) {
-        v.color[n][0] = (uint8_t)(words[i] >> 24);
-        v.color[n][1] = (uint8_t)(words[i] >> 16);
-        v.color[n][2] = (uint8_t)(words[i] >> 8);
-        v.color[n][3] = (uint8_t)words[i];
+    for (n = 0; n < s.layout.colors && n < 2; n++) {
+        if (s.layout.colors_register & (1u << n)) {
+            // (GX's channel reads the register: the colour every vertex would have sent)
+            memcpy(v.color[n], g_material[n], 4);
+        } else if (i < count) {
+            v.color[n][0] = (uint8_t)(words[i] >> 24);
+            v.color[n][1] = (uint8_t)(words[i] >> 16);
+            v.color[n][2] = (uint8_t)(words[i] >> 8);
+            v.color[n][3] = (uint8_t)words[i];
+            i++;
+        }
     }
     for (n = 0; n < 8; n++) {
         if (!(s.layout.texcoords & (1u << n))) {
@@ -306,6 +343,9 @@ void wl_gx_direct_vertices_index(const uint32_t *indices, uint32_t base, uint32_
 }
 
 void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride) {
+    if (attribute <= WL_GX_DIRECT_ARRAY_NORMAL) {
+        (void)wl_gx_shadow_array(attribute, data, stride, g_bisect.arrays_always); // (counted)
+    }
     if (attribute < 12u) {
         s.arrays[attribute] = data;
         s.array_strides[attribute] = stride;
@@ -365,7 +405,9 @@ void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t c
         }
     }
     for (n = 0; n < s.layout.colors && n < 2; n++) {
-        if (s.layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_COLOR0 + n))) {
+        if (s.layout.colors_register & (1u << n)) {
+            memcpy(v.color[n], g_material[n], 4);
+        } else if (s.layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_COLOR0 + n))) {
             if ((e = element(WL_GX_DIRECT_ARRAY_COLOR0 + n, index)) != NULL) {
                 memcpy(v.color[n], e, 4);
             }
@@ -401,6 +443,27 @@ void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t c
         s.indexed_vertices++;
     }
     wl_gx_direct_vertex(&v);
+}
+
+void wl_gx_direct_material(unsigned c, uint32_t rgba) {
+    const uint8_t bytes[4] = {(uint8_t)(rgba >> 24), (uint8_t)(rgba >> 16), (uint8_t)(rgba >> 8), (uint8_t)rgba};
+
+    if (c > 1u || ((g_material_known & (1u << c)) && memcmp(g_material[c], bytes, 4) == 0)) {
+        return;
+    }
+    memcpy(g_material[c], bytes, 4);
+    g_material_known |= (uint8_t)(1u << c);
+    wl_gx_shadow_fifo(WL_GX_FIFO_STATE, WL_GX_FIFO_MATERIAL_BYTES);
+}
+
+void wl_gx_direct_vertices_position_index(const uint32_t *indices, uint32_t base, uint32_t first, uint32_t n,
+                                          const uint32_t *const *vertices, uint32_t skip, uint32_t count) {
+    uint32_t v;
+
+    for (v = 0; v < n; v++) {
+        wl_gx_direct_vertex_index((uint16_t)(indices != NULL ? indices[first + v] - base : first + v), vertices[v] + skip,
+                                  count);
+    }
 }
 
 void wl_gx_direct_arrays_changed(void) {
@@ -439,9 +502,16 @@ void wl_gx_direct_draw(WlGxDirectPrim prim, const WlGxDirectVertex *vertices, ui
 
 void wl_gx_direct_lighting(const WlGxDirectLighting *lighting) {
     s.lighting = *lighting;
+    g_material_known = 0; // (the Wii's lighting sets the materials white)
 }
 
 void wl_gx_direct_position_matrix(const float m[3][4]) {
+    // (the console's load counted: sent unless GX holds it)
+    if (m == NULL ? !g_position_identity
+                  : g_position_identity || memcmp(s.position_matrix, m, sizeof s.position_matrix) != 0) {
+        wl_gx_shadow_fifo(WL_GX_FIFO_MATRIX, WL_GX_FIFO_POSITION_BYTES);
+    }
+    g_position_identity = m == NULL;
     s.position_matrix_set = m != NULL;
     if (m != NULL) {
         memcpy(s.position_matrix, m, sizeof s.position_matrix);
@@ -451,6 +521,13 @@ void wl_gx_direct_position_matrix(const float m[3][4]) {
 void wl_gx_direct_texgen(unsigned n, WlGxDirectTexSource source, const float m[2][4]) {
     if (n >= 8) {
         return;
+    }
+    // (the console's loads counted: a matrix and its generator, or the generator back to the identity)
+    if (m == NULL) {
+        wl_gx_shadow_fifo(WL_GX_FIFO_MATRIX, s.texgen[n].set ? WL_GX_FIFO_TEXGEN_BYTES : 0u);
+    } else if (!s.texgen[n].set || s.texgen[n].source != (uint8_t)source ||
+               memcmp(s.texgen[n].m, m, sizeof s.texgen[n].m) != 0) {
+        wl_gx_shadow_fifo(WL_GX_FIFO_MATRIX, WL_GX_FIFO_TEXMTX_BYTES + WL_GX_FIFO_TEXGEN_BYTES);
     }
     s.texgen[n].set = m != NULL;
     s.texgen[n].source = (uint8_t)source;
@@ -547,10 +624,30 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
     s.map_kind[map] = WL_HOST_GX_MAP_TEXTURE;
     s.map_objects[map] = *tex;
     s.map_objects[map].sampler = s.samplers[map];
+    {
+        // (the console's registers counted, gx_shadow.h: the wraps and filters as the Wii binds them)
+        const WlGxSampler *sm = &s.samplers[map];
+        bool pow2 = (tex->width & (tex->width - 1u)) == 0 && (tex->height & (tex->height - 1u)) == 0;
+        uint32_t regs[WL_GX_TEXREGS], minf = sm->min_filter;
+        bool ci = tex->format == WL_GX_TEX_C4 || tex->format == WL_GX_TEX_C8;
+
+        if (tex->mips <= 1u && minf >= WL_GX_FILTER_NEAREST_MIP_NEAREST) {
+            minf = (minf & 1u) != 0 ? WL_GX_FILTER_LINEAR : WL_GX_FILTER_NEAREST;
+        }
+        wl_gx_shadow_texture_model(regs, (uintptr_t)wl_host_gx_tex_image(tex), tex->format, tex->width, tex->height,
+                                   tex->mips, pow2 ? sm->wrap_s : WL_GX_WRAP_CLAMP, pow2 ? sm->wrap_t : WL_GX_WRAP_CLAMP,
+                                   minf, sm->mag_filter, tex->mips > 1u ? sm->lod_bias : tex->sampler.lod_bias,
+                                   tex->tlut, wl_gx_shadow_texture_region(tex->format, tex->mips, g_bisect.regions_libogc));
+        if (wl_gx_shadow_texture(map, regs, ci ? 7u : 6u, g_bisect.tex_whole) == 0) {
+            s.stats.textures_kept++;
+        }
+    }
     if (tlut != NULL && (tex->format == WL_GX_TEX_C4 || tex->format == WL_GX_TEX_C8)) {
-        // (a TLUT slot holds the last palette loaded into it, whichever map's object reads it)
+        // (a TLUT slot holds the last palette loaded into it, whichever map's object reads it; the
+        // loads the Wii would send counted, gx_shadow.h)
         unsigned other;
 
+        (void)wl_gx_shadow_tlut_differs(tex->tlut, tlut->entries, (uint32_t)tlut->count * 2u, tlut->format);
         for (other = 0; other < 8; other++) {
             if (s.map_kind[other] == WL_HOST_GX_MAP_TEXTURE && s.map_objects[other].tlut == tex->tlut) {
                 s.tluts[other] = *tlut;
@@ -563,6 +660,7 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
 
 void wl_host_gx_direct_ramp(uint32_t map) {
     if (map < 8) {
+        wl_gx_shadow_texture_forget(1u << map); // (loaded behind the shadow, as on the console)
         s.map_kind[map] = WL_HOST_GX_MAP_RAMP;
         s.textures[map] = NULL;
     }
@@ -579,7 +677,7 @@ void wl_gx_direct_texture_invalidate(void) {
 
 void wl_gx_direct_stats(WlGxDirectStats *out) {
     *out = s.stats;
-    wl_gx_shadow_counts(&out->state_calls, &out->state_sent);
+    wl_gx_shadow_stats(out);
 }
 
 // ---- a renderer's own vertex formats ---------------------------------------------------------------

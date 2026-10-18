@@ -7,12 +7,14 @@
 // nv2a_texcache.h.
 #pragma once
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "wl/codec/gx_tex.h"
 #include "wl/codec/xbox_tex.h"
+#include "wl/gfx/gfx_sqrt.h"
 #include "wl/xbox/nv2a_kelvin.h"
 
 enum {
@@ -121,6 +123,61 @@ void wl_nv2a_texture_spot(const WlNv2aTexture *t, WlNv2aGxLayout *layout, const 
 void wl_nv2a_spot_coordinates(const float direction[3], unsigned spot, float st[2]);
 
 // A direction's place on the sphere map a cube map becomes (the mirror ball's mapping: x / m + 1/2,
-// y / m + 1/2 with m = 2 |d + (0, 0, 1)|, d normalized), and its inverse.
+// y / m + 1/2 with m = 2 |d + (0, 0, 1)|, d normalized), and its inverse. The coordinates are a
+// float's worth (within 2^-22 of the exact ones, the disc's centre for a direction too short or too
+// long and its edge straight behind), made as the Wii's fused batches make them
+// (wl_nv2a_sphere_coordinates_inline); _double is the double-precision way before it (three Newton's
+// steps for each of two roots, its L + z cancelling nearly straight behind), kept for an A/B.
 void wl_nv2a_sphere_coordinates(const float direction[3], float st[2]);
+void wl_nv2a_sphere_coordinates_double(const float direction[3], float st[2]);
 void wl_nv2a_sphere_direction(float s, float t, float direction[3]);
+
+// (a * b + c in one rounding where the processor has it: PowerPC's fmadds)
+static inline float wl_nv2a_madd(float a, float b, float c) {
+#if defined(__PPC__) || defined(__powerpc__)
+    return __builtin_fmaf(a, b, c);
+#else
+    return a * b + c;
+#endif
+}
+
+// 1 / sqrt(x) for x > 0 (half_x = x / 2): the estimate and two Newton's steps in single precision, as
+// tools/xbox_vsh_pairs.c's pr_fused_root
+static inline float wl_nv2a_sphere_root(float x, float half_x) {
+    float y = (float)wl_rsqrt_estimate(x);
+
+    y = y * wl_nv2a_madd(-half_x, y * y, 1.5f);
+    y = y * wl_nv2a_madd(-half_x, y * y, 1.5f);
+    return y;
+}
+
+// With n = d / |d|: x k + 1/2, y k + 1/2 for k = 1 / (2 sqrt(2 (1 + z))). Toward the back (z < 0), 1 +
+// z is r / (1 - z), r = x x + y y, which cancels nothing: k is a / 2 / sqrt(2 r a) there, a = 1 + |z|,
+// and 1 / 2 / sqrt(2 a) in front. Single precision, two roots of two steps each, no division: the
+// fused batches' arithmetic (the same bits where the compiler keeps the same roundings), in place of
+// the double precision's three steps a root (4% of a10's time on the Wii)
+static inline void wl_nv2a_sphere_coordinates_inline(const float direction[3], float st[2]) {
+    float x = direction[0], y = direction[1], z = direction[2];
+    float across = x * x + y * y, length2 = wl_nv2a_madd(z, z, across), root, a, s, u, k, nx, ny, nz;
+
+    if (!(length2 > 1.0e-24f && length2 <= 3.4028235e38f)) {
+        st[0] = st[1] = 0.5f;
+        return;
+    }
+    root = wl_nv2a_sphere_root(length2, length2 * 0.5f);
+    nx = x * root;
+    ny = y * root;
+    nz = z * root;
+    a = 1.0f + fabsf(nz);
+    s = nz >= 0.0f ? 1.0f : across * (root * root);
+    if (!(s > 2.5e-13f)) {
+        // (straight behind: the disc's edge)
+        st[0] = 0.5f;
+        st[1] = 1.0f;
+        return;
+    }
+    u = a * s;
+    k = wl_nv2a_sphere_root(u + u, u) * (nz >= 0.0f ? 0.5f : a * 0.5f);
+    st[0] = wl_nv2a_madd(nx, k, 0.5f);
+    st[1] = wl_nv2a_madd(ny, k, 0.5f);
+}

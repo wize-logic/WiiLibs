@@ -17,6 +17,7 @@
 
 #include "wl/base/hash.h"
 #include "wl/platform/gx_direct.h"
+#include "wl/platform/gx_shadow.h"
 #include "wl/platform/gx_target.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/tev.h"
@@ -50,6 +51,8 @@ enum {
     FIT_WAYS = 2,
     // the inputs a draw's program is also run with for its transform's signature
     CANONICAL_POINTS = 4,
+    // ...and for its transform unit's matrices (xf_prepare)
+    XF_PROBES = 8,
     // programs whose analyses are kept
     XF_ANALYSES = 8,
     // a stand-in texture's image: 4 x 4 RGBA8, one GX tile
@@ -98,9 +101,10 @@ typedef struct Projection {
 
 // a vertex as GX takes it from the FIFO in the draw's layout (wl_gx_direct_vertex_words: the
 // position's three floats, the colours as 0xRRGGBBAA, the texture coordinates' floats; at most
-// 3 + 2 + 4 * 2 + 1 words, the fog's coordinate last), and where it lands in EFB pixels. (The words
+// 3 + 2 + 4 * 2 + 1 words, the fog's coordinate last, or 3 + 9 + 2 + 3 * 2 for a lit form's normal
+// beside a sphere map's direction: sphere_xf_plan), and where it lands in EFB pixels. (The words
 // first: a pointer to them is one to the vertex.)
-enum { PACKED_WORDS = 14 };
+enum { PACKED_WORDS = 20 };
 typedef struct PackedVertex {
     uint32_t w[PACKED_WORDS];
     float x, y;
@@ -128,6 +132,7 @@ struct WlNv2aGx {
     uint32_t displays[4];
     unsigned display_next;
     uint32_t frame;
+    uint64_t presented_us; // the clock at the last present (0: none yet)
     // the GX mode that culls triangles of positive area in the screen's coordinates (y down)
     WlGxCull cull_positive;
     bool cull_measured;
@@ -174,8 +179,38 @@ struct WlNv2aGx {
         float a, b;
         uint32_t used;
         bool narrow; // (made with the camera's slope: shared within NARROW_TOLERANCE only)
+        uint32_t made; // (the fit's stamp: signature_made when it was written)
+        // (the draw of this frame that last shared or made it: its depth range, target and viewport;
+        // fit_slot_holds)
+        uint32_t held_frame, held_target;
+        float held_depth_max, held_viewport[2][4];
+        bool held;
     } signatures[FIT_SETS][FIT_WAYS];
-    uint32_t signature_use;
+    uint32_t signature_use, signature_made;
+    // the last draw's fit, kept for the next draws of the same program, constants, depth range and
+    // target in this frame (fit_memo): its transform is theirs, so is its fit
+    struct FitMemo {
+        const WlNv2aKelvin *k;
+        const WlXboxVshProgram *program;
+        uint32_t serial, constants, target, frame, made;
+        float depth_max, point_size, a, b;
+        struct FitSignature *slot;
+        bool valid;
+    } fit_memo;
+    // the program's outputs for fixed inputs (xf_prepare's probes, projection_fit's canonical points),
+    // kept with what they are a function of: the program (its serial: another compiled in its place is
+    // another), the constants (the tracker's generation, which moves at every change), the outputs asked
+    // for and the point size. Most draws keep the draw before's program and constants (a10's 72%, d40's
+    // 57%), whose probes are then not run again. device_state forgets them (draw_cuts false: never kept)
+    struct ProbeKey {
+        const WlNv2aKelvin *k;
+        const WlXboxVshProgram *program;
+        uint32_t serial, constants;
+        unsigned live;
+        float point_size;
+        bool valid;
+    } xf_probe_key, fit_probe_key;
+    WlXboxVshOutput xf_probe_out[XF_PROBES], fit_probe_out[CANONICAL_POINTS];
     bool last_shared;
     // (the last draw's fit made with the camera's slope, made or kept; its depth_check)
     bool last_narrow;
@@ -243,7 +278,17 @@ struct WlNv2aGx {
     // what of the bound textures the last pixel program was made from (texture_pixel_inputs), so
     // that a draw whose combiners, fog and these are as they were keeps it without a lookup
     uint32_t pixel_textures[WL_NV2A_TEXTURES];
+    // the last draw's layout and its vertex's FIFO bytes (draw_bytes)
+    WlGxDirectLayout bytes_layout;
+    uint32_t layout_bytes;
 };
+
+// the draw path's cuts (wl_nv2a_gx_set_draw_cuts)
+static bool g_draw_cuts = true;
+
+void wl_nv2a_gx_set_draw_cuts(bool on) {
+    g_draw_cuts = on;
+}
 
 // ---- creation -----------------------------------------------------------------------------------
 
@@ -256,14 +301,84 @@ static void gpu_wait(void) {
     (void)wl_gx_sync();
 }
 
+// The draw path's switches of its second round (wl_nv2a_gx_set_switches): each turns one cut off.
+enum {
+    SWITCH_NO_VCACHE_WAIT = 1u << 0, // "novcwait": the vertex arrays' pending copies wait for the frame's end
+    SWITCH_NO_PAIRED_COLOR = 1u << 1, // "nopscolor": the Wii's colours a component at a time (wl_nv2a_color_word)
+    SWITCH_NO_FIT_MEMO = 1u << 2, // "nofitmemo": every draw's projection fitted from its vertices (fit_memo)
+    SWITCH_NO_COLOR_REGISTER = 1u << 3, // "nocolorreg": an indexed draw's constant colour sent with each vertex
+    SWITCH_NO_POSITION_INDEX = 1u << 4, // "noposindex": a position-alone draw's positions sent with each vertex
+    SWITCH_NO_SPHERE_XF = 1u << 5, // "nospherexf": a sphere map's coordinates the processor's (sphere_xf_plan)
+};
+
+static const struct {
+    const char *file, *env;
+    unsigned bit;
+} k_switches[] = {
+    {"novcwait", "WL_XB_NOVCWAIT", SWITCH_NO_VCACHE_WAIT},
+    {"nopscolor", "WL_XB_NOPSCOLOR", SWITCH_NO_PAIRED_COLOR},
+    {"nofitmemo", "WL_XB_NOFITMEMO", SWITCH_NO_FIT_MEMO},
+    {"nocolorreg", "WL_XB_NOCOLORREG", SWITCH_NO_COLOR_REGISTER},
+    {"noposindex", "WL_XB_NOPOSINDEX", SWITCH_NO_POSITION_INDEX},
+    {"nospherexf", "WL_XB_NOSPHEREXF", SWITCH_NO_SPHERE_XF},
+};
+
+static unsigned g_switches_off;
+// (WL_XB_FITVERIFY on the host: projection_fit's kept fits checked against the vertices' at each use)
+static bool g_fit_verify;
+
+void wl_nv2a_gx_set_switches(const char *title_dir) {
+    char path[WL_FS_PATH_MAX];
+
+    g_switches_off = 0;
+    for (size_t i = 0; i < sizeof k_switches / sizeof k_switches[0]; i++) {
+        snprintf(path, sizeof path, "%s/%s", title_dir, k_switches[i].file);
+        if (wl_platform_fs_exists(path)) {
+            g_switches_off |= k_switches[i].bit;
+            WL_LOG_I(TAG, "draw path: %s (a cut off)", k_switches[i].file);
+        }
+    }
+}
+
+static bool switched_on(unsigned bit) {
+    return (g_switches_off & bit) == 0;
+}
+
+// A render target's image: a free piece of the textures' arena when it has one (no texture evicted
+// for it: the heap, short during a level, keeps what it would have lent), else the heap's
+// (targets_on_heap: always the heap's).
+static void *target_alloc(WlNv2aGx *gx, size_t bytes) {
+    void *p = wl_nv2a_gx_spare_alloc(gx, bytes);
+    return p != NULL ? p : gx->textures.cfg.alloc(gx->textures.cfg.user, bytes);
+}
+
+static void target_release(WlNv2aGx *gx, void *memory) {
+    if (!wl_nv2a_texcache_spare_free(&gx->textures, memory)) {
+        gx->textures.cfg.release(gx->textures.cfg.user, memory);
+    }
+}
+
 WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     WlNv2aGx *gx = calloc(1, sizeof *gx);
     WlNv2aTexCacheConfig textures;
     WlNv2aVCacheConfig vertices;
 
+#if !defined(__wii__)
+    g_fit_verify = getenv("WL_XB_FITVERIFY") != NULL;
+    if (getenv("WL_XB_NODRAWCUTS") != NULL) {
+        g_draw_cuts = false;
+    }
+    for (size_t i = 0; i < sizeof k_switches / sizeof k_switches[0]; i++) {
+        if (getenv(k_switches[i].env) != NULL) {
+            g_switches_off |= k_switches[i].bit;
+        }
+    }
+#endif
+
     if (gx == NULL) {
         return NULL;
     }
+    gx->layout_bytes = wl_gx_shadow_layout_vertex_bytes(&gx->bytes_layout);
     if (cfg != NULL) {
         gx->cfg = *cfg;
     }
@@ -290,6 +405,9 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     vertices.gpu_lag = textures.gpu_lag;
     if (vertices.flush == NULL) {
         vertices.flush = commit;
+    }
+    if (vertices.gpu_wait == NULL && switched_on(SWITCH_NO_VCACHE_WAIT)) {
+        vertices.gpu_wait = gpu_wait;
     }
     wl_nv2a_vcache_init(&gx->vertices, &vertices);
     wl_nv2a_pipeline_init(&gx->pipeline, gx->cfg.natives, gx->cfg.native_count);
@@ -324,7 +442,7 @@ void wl_nv2a_gx_destroy(WlNv2aGx *gx) {
     wl_nv2a_vcache_clear(&gx->vertices);
     for (i = 0; i < TARGETS; i++) {
         if (gx->targets[i].memory != NULL) {
-            gx->textures.cfg.release(gx->textures.cfg.user, gx->targets[i].memory);
+            target_release(gx, gx->targets[i].memory);
         }
     }
     free(gx);
@@ -338,10 +456,20 @@ void wl_nv2a_gx_host_bytes(const WlNv2aGx *gx, size_t *record, size_t *targets, 
     *target_count = 0;
     for (i = 0; i < TARGETS; i++) {
         if (gx->targets[i].memory != NULL) {
-            *targets += gx->targets[i].bytes;
+            if (!wl_nv2a_texcache_spare_owns(&gx->textures, gx->targets[i].memory)) {
+                *targets += gx->targets[i].bytes;
+            }
             ++*target_count;
         }
     }
+}
+
+void *wl_nv2a_gx_spare_alloc(WlNv2aGx *gx, size_t bytes) {
+    return gx->cfg.targets_on_heap ? NULL : wl_nv2a_texcache_spare_alloc(&gx->textures, bytes);
+}
+
+bool wl_nv2a_gx_spare_free(WlNv2aGx *gx, void *memory) {
+    return wl_nv2a_texcache_spare_free(&gx->textures, memory);
 }
 
 void wl_nv2a_gx_attach(WlNv2aGx *gx, WlNv2a *dev) {
@@ -404,6 +532,29 @@ static void device_state(WlNv2aGx *gx) {
     gx->projection_loaded = false;
     gx->xf_position = false;
     gx->xf_texgens = 0;
+    gx->xf_probe_key.valid = gx->fit_probe_key.valid = false;
+    gx->fit_memo.valid = false;
+}
+
+// whether the program's outputs kept under `key` are those it gives now for `live` (and, false, the key
+// set for the outputs about to be made)
+static bool probes_kept(WlNv2aGx *gx, struct ProbeKey *key, const WlNv2aKelvin *k, unsigned live) {
+    const WlXboxVshProgram *program = gx->pipeline.program;
+
+    if (key->valid && key->k == k && key->program == program && key->serial == program->serial &&
+        key->constants == k->constants_generation && key->live == live &&
+        key->point_size == gx->pipeline.point_size) {
+        gx->stats.probes_kept++;
+        return true;
+    }
+    key->k = k;
+    key->program = program;
+    key->serial = program->serial;
+    key->constants = k->constants_generation;
+    key->live = live;
+    key->point_size = gx->pipeline.point_size;
+    key->valid = g_draw_cuts;
+    return false;
 }
 
 static void cull_measure(WlNv2aGx *gx, uint32_t clear_rgba);
@@ -467,10 +618,41 @@ static void targets_idle(WlNv2aGx *gx) {
         RenderTarget *r = &gx->targets[i];
 
         if (r->memory != NULL && r != gx->owner && gx->frame - r->used_frame > TARGET_IDLE_FRAMES) {
-            gx->textures.cfg.release(gx->textures.cfg.user, r->memory);
+            target_release(gx, r->memory);
             memset(r, 0, sizeof *r);
         }
     }
+}
+
+// While the processor waits for the GPU at the frame's end: a texture the frame budget put off made
+// (wl_nv2a_texcache_work), so that the next frame finds it.
+static bool textures_work(void *user) {
+    WlNv2aGx *gx = user;
+    bool made, more = wl_nv2a_texcache_work(&gx->textures, gx->dev, &made);
+
+    if (made) {
+        gx->texture_memory_changed = true;
+    }
+    return more;
+}
+
+// the frame's time, from the last present to this one
+static void frame_time(WlNv2aGx *gx) {
+    static const uint32_t bounds[5] = {34000u, 67000u, 100000u, 150000u, 250000u};
+    uint64_t now = wl_platform_time_us();
+    uint32_t us;
+    unsigned i;
+
+    if (gx->presented_us != 0) {
+        us = (uint32_t)(now - gx->presented_us);
+        for (i = 0; i < 5 && us >= bounds[i]; i++) {
+        }
+        gx->stats.frames_by_time[i]++;
+        if (us > gx->stats.frame_us_worst) {
+            gx->stats.frame_us_worst = us;
+        }
+    }
+    gx->presented_us = now;
 }
 
 void wl_nv2a_gx_present(WlNv2aGx *gx) {
@@ -480,7 +662,12 @@ void wl_nv2a_gx_present(WlNv2aGx *gx) {
     use_back_buffer(gx);
     frame_keep(gx);
     wl_gx_invalidate_shadow();
+    if (gx->textures.deferred_count != 0) {
+        wl_gx_set_wait_work(textures_work, gx);
+    }
     wl_gx_end_frame();
+    wl_gx_set_wait_work(NULL, NULL);
+    frame_time(gx);
     gx->frame_open = false;
     gx->back_drawn = false;
     gx->frame++;
@@ -546,11 +733,11 @@ static RenderTarget *slot_for(WlNv2aGx *gx, uint32_t phys, uint32_t w, uint32_t 
             // image's at once)
             (void)wl_gx_sync();
         }
-        gx->textures.cfg.release(gx->textures.cfg.user, slot->memory);
+        target_release(gx, slot->memory);
     }
     memset(slot, 0, sizeof *slot);
     slot->bytes = wl_gx_tex_bytes((WlGxTexFormat)format, w, h);
-    slot->memory = gx->textures.cfg.alloc(gx->textures.cfg.user, slot->bytes);
+    slot->memory = target_alloc(gx, slot->bytes);
     if (slot->memory == NULL) {
         return NULL;
     }
@@ -730,7 +917,7 @@ static bool states_apply(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aSurfac
 // cull_measure: GX's names for its windings are not the screen's).
 static void cull_measure(WlNv2aGx *gx, uint32_t clear_rgba) {
     static const float corners[3][2] = {{0.0f, 0.0f}, {16.0f, 0.0f}, {0.0f, 16.0f}};
-    WlGxDirectLayout layout = {1, 0, 0, 0, 0, 0, 0};
+    WlGxDirectLayout layout = {1, 0, 0, 0, 0, 0, 0, 0, 0};
     WlTevProgram tev;
     float m[4][4];
     unsigned pass, v;
@@ -793,7 +980,7 @@ static void clear_channels(WlNv2aGx *gx, uint32_t flags, uint32_t rgba, uint32_t
     const float corners[4][2] = {{(float)x0, (float)y0}, {(float)x1, (float)y0}, {(float)x0, (float)y1},
                                  {(float)x1, (float)y1}};
     static const uint8_t order[6] = {0, 1, 2, 2, 1, 3};
-    WlGxDirectLayout layout = {1, 0, 0, 0, 0, 0, 0};
+    WlGxDirectLayout layout = {1, 0, 0, 0, 0, 0, 0, 0, 0};
     WlGxDirectVertex vertices[6];
     WlTevProgram tev;
     float m[4][4];
@@ -1465,6 +1652,89 @@ static uint32_t fit_target(const WlNv2aGx *gx, const WlNv2aSurface *s) {
     return surface_is_screen(gx, s) ? 0u : s->color_phys;
 }
 
+// the set of a signature: wl_fnv1a64's of its bytes modulo FIT_SETS, which only its low bits make, the
+// same in 32 bits (the 64-bit prime's low word 0x1B3; the 2^40 term never reaches them)
+static uint32_t signature_set(const uint32_t clip[CANONICAL_POINTS][4]) {
+    const uint8_t *p = (const uint8_t *)clip;
+    uint32_t hash = (uint32_t)WL_FNV1A64_INIT;
+    unsigned i;
+
+    _Static_assert((FIT_SETS & (FIT_SETS - 1)) == 0, "FIT_SETS a power of two");
+    for (i = 0; i < CANONICAL_POINTS * 4u * 4u; i++) {
+        hash = (hash ^ p[i]) * 0x1B3u;
+    }
+    return hash % FIT_SETS;
+}
+
+// (the fits kept, fit_memo_keep, and their use, fit_memo_holds and fit_slot_holds: g_fit_unkept while
+// projection_fit checks one)
+static bool g_fit_unkept;
+static bool fit_memo_on(void) {
+    return g_draw_cuts && switched_on(SWITCH_NO_FIT_MEMO);
+}
+
+// The fit kept from the last draw (projection_fit) for this one: the same program and constants, so the
+// same transform and signature (the canonical points' outputs are a function of them alone), its
+// fit still the one in the signature's slot, the same depth range and target, in the same frame, and
+// the camera's slope already what this draw would keep (the slope of that fit, this frame, this
+// target and range: wl_nv2a_gx_slope_keep would write it as it is). A fit made with the camera's
+// slope is never kept (it holds only as near as its own vertices), nor one that saw no vertex in
+// front of the eye. The draw's vertices are then not run: they would find its fit shared (their
+// depths a + b / w of the same transform).
+static bool fit_memo_holds(WlNv2aGx *gx, const WlNv2aKelvin *k, float depth_max, uint32_t target) {
+    const struct FitMemo *m = &gx->fit_memo;
+    const WlXboxVshProgram *program = gx->pipeline.program;
+    const WlNv2aGxSlope *s = &gx->slope;
+
+    return m->valid && !g_fit_unkept && m->k == k && m->program == program && m->serial == program->serial &&
+           m->constants == k->constants_generation && m->point_size == gx->pipeline.point_size &&
+           m->depth_max == depth_max && m->target == target && m->frame == gx->frame && m->slot->made == m->made &&
+           s->known && s->frame == gx->frame && s->target == target && s->depth_max == depth_max && s->b == m->b;
+}
+
+// The same for a draw of another program or constants whose transform has the signature of a fit
+// shared or made by a draw of this frame (the signature is what tells a transform, the draws that
+// share it share its fit): that draw's depth range, target and viewport (the program's mapping to
+// the screen, which the signature's clip-space positions leave out), and the camera's slope already
+// what this draw would keep.
+static bool fit_slot_holds(const WlNv2aGx *gx, const WlNv2aKelvin *k, const struct FitSignature *slot,
+                           float depth_max, uint32_t target) {
+    const WlNv2aGxSlope *s = &gx->slope;
+
+    return slot->held && !g_fit_unkept && slot->held_frame == gx->frame && slot->held_target == target &&
+           slot->held_depth_max == depth_max && !slot->narrow &&
+           memcmp(slot->held_viewport, k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE], sizeof slot->held_viewport) == 0 &&
+           s->known && s->frame == gx->frame && s->target == target && s->depth_max == depth_max && s->b == slot->b;
+}
+
+// the fit p of this draw, from its signature's slot, kept for the next draws (fit_memo_holds,
+// fit_slot_holds)
+static void fit_memo_keep(WlNv2aGx *gx, const WlNv2aKelvin *k, float depth_max, uint32_t target,
+                          struct FitSignature *slot) {
+    struct FitMemo *m = &gx->fit_memo;
+
+    _Static_assert(WL_NV2A_CONSTANT_VIEWPORT_OFFSET == WL_NV2A_CONSTANT_VIEWPORT_SCALE + 1, "viewport constants");
+    slot->held_frame = gx->frame;
+    slot->held_target = target;
+    slot->held_depth_max = depth_max;
+    memcpy(slot->held_viewport, k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE], sizeof slot->held_viewport);
+    slot->held = true;
+
+    m->k = k;
+    m->program = gx->pipeline.program;
+    m->serial = gx->pipeline.program->serial;
+    m->constants = k->constants_generation;
+    m->point_size = gx->pipeline.point_size;
+    m->depth_max = depth_max;
+    m->target = target;
+    m->frame = gx->frame;
+    m->slot = slot;
+    m->made = slot->made;
+    m->a = slot->a;
+    m->b = slot->b;
+    m->valid = fit_memo_on();
+}
+
 // The projection of a draw: a few of its vertices, for their w and depth (OpenCE-Wii's
 // projection_fit). A program that captures its clip-space position (divides by w) is drawn through
 // the perspective projection, its depth a + b / w; vertices all at w 1 are screen space.
@@ -1483,8 +1753,100 @@ static uint32_t fit_target(const WlNv2aGx *gx, const WlNv2aSurface *s) {
 // a + b / w everywhere). The points that count are those within the depth range (between the near
 // and far planes: what GX draws), the draw's first 24 of them among its first 128 vertices; a draw
 // with none uses its transform's fit as it is.
+//
+// The fit a draw of this frame shared or made (not with the camera's slope) is kept for the next
+// draws of its transform, whose vertices are then not run (fit_memo_holds: the last draw's program and
+// constants; fit_slot_holds: its signature, from the canonical points): a10's draws 2.2 thousand
+// instructions each (ppc-be), d40's skinned ones more. A cut ("nofitmemo"); WL_XB_FITVERIFY checks it.
+static Projection projection_fit_full(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, float depth_max,
+                                      uint32_t target);
+
+static Projection projection_fit_memo(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw,
+                                      float depth_max, uint32_t target);
+
+// WL_XB_FITVERIFY: the draw's projection with the fits kept, then again from the backend's state before
+// it without them (the one used), any difference told
+static Projection projection_fit_verify(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw,
+                                        float depth_max, uint32_t target) {
+    static struct FitSignature signatures[FIT_SETS][FIT_WAYS];
+    const WlNv2aGxSlope slope = gx->slope;
+    const struct FitMemo memo = gx->fit_memo;
+    const struct ProbeKey key = gx->fit_probe_key;
+    const WlNv2aGxStats stats = gx->stats;
+    const uint32_t use = gx->signature_use, made = gx->signature_made;
+    const float fit_a = gx->fit_a, fit_b = gx->fit_b;
+    WlNv2aGxSlope kept_slope;
+    Projection kept, p;
+    uint32_t used;
+    bool shared, narrow;
+
+    memcpy(signatures, gx->signatures, sizeof signatures);
+    kept = projection_fit_memo(gx, k, draw, depth_max, target);
+    shared = gx->last_shared;
+    narrow = gx->last_narrow;
+    kept_slope = gx->slope;
+    used = gx->stats.fits_memo - stats.fits_memo;
+    memcpy(gx->signatures, signatures, sizeof signatures);
+    gx->slope = slope;
+    gx->fit_memo = memo;
+    gx->fit_probe_key = key;
+    gx->stats = stats;
+    gx->signature_use = use;
+    gx->signature_made = made;
+    gx->fit_a = fit_a;
+    gx->fit_b = fit_b;
+    g_fit_unkept = true;
+    p = projection_fit_memo(gx, k, draw, depth_max, target);
+    g_fit_unkept = false;
+    gx->stats.fits_memo += used;
+    if (kept.perspective != p.perspective || (p.perspective && (kept.a != p.a || kept.b != p.b)) ||
+        shared != gx->last_shared || narrow != gx->last_narrow || memcmp(&kept_slope, &gx->slope, sizeof slope) != 0) {
+        // (to stderr: the log has no sink under qemu-ppc)
+        fprintf(stderr, "fit check: draw %u (%s) gave %d %.9g %.9g shared %d narrow %d, its vertices %d %.9g %.9g "
+                        "shared %d narrow %d\n",
+                (unsigned)gx->stats.draws, used ? "kept" : "made", kept.perspective, (double)kept.a,
+                (double)kept.b, shared, narrow, p.perspective, (double)p.a, (double)p.b, gx->last_shared,
+                gx->last_narrow);
+    }
+    return p;
+}
+
 static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, float depth_max,
                                  uint32_t target) {
+    return g_fit_verify ? projection_fit_verify(gx, k, draw, depth_max, target)
+                        : projection_fit_memo(gx, k, draw, depth_max, target);
+}
+
+static Projection projection_fit_memo(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw,
+                                      float depth_max, uint32_t target) {
+    Projection p = {false, gx->fit_a, gx->fit_b};
+
+    gx->last_shared = false;
+    gx->last_narrow = false;
+    // (a program that never converts its position to the screen leaves no clip-space position)
+    if (gx->pipeline.program == NULL || !gx->pipeline.program->captures_clip) {
+        gx->fit_memo.valid = false;
+        return p;
+    }
+    // (the last draw's fit, when it is this one's)
+    if (draw->count != 0 && fit_memo_holds(gx, k, depth_max, target)) {
+        gx->signature_use++;
+        gx->fit_memo.slot->used = gx->signature_use;
+        p.perspective = true;
+        p.a = gx->fit_a = gx->fit_memo.a;
+        p.b = gx->fit_b = gx->fit_memo.b;
+        gx->last_shared = true;
+        gx->stats.probes_kept++;
+        gx->stats.fits_shared++;
+        gx->stats.fits_memo++;
+        return p;
+    }
+    gx->fit_memo.valid = false;
+    return projection_fit_full(gx, k, draw, depth_max, target);
+}
+
+static Projection projection_fit_full(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, float depth_max,
+                                      uint32_t target) {
     Projection p = {false, gx->fit_a, gx->fit_b};
     float inverse_w[FIT_PROBES + CANONICAL_POINTS], depth[FIT_PROBES + CANONICAL_POINTS];
     uint32_t clip[CANONICAL_POINTS][4];
@@ -1496,20 +1858,53 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
     WlNv2aFetchPlan fetch;
     uint32_t numbers[FIT_BATCH];
 
-    gx->last_shared = false;
-    gx->last_narrow = false;
-    // (a program that never converts its position to the screen leaves no clip-space position)
-    if (gx->pipeline.program == NULL || !gx->pipeline.program->captures_clip) {
-        return p;
-    }
-    // the vertices' positions, FIT_BATCH at a time (the program run for them together)
     attributes = wl_nv2a_pipeline_inputs(&gx->pipeline, WL_XBOX_VSH_LIVE_POSITION);
+    // the transform's signature first (each canonical point in the input registers the position
+    // reads, as the draw's fetch fills only those; kept from the last draw of the same program and
+    // constants: probes_kept)
+    if (!probes_kept(gx, &gx->fit_probe_key, k, WL_XBOX_VSH_LIVE_POSITION)) {
+        for (i = 0; i < CANONICAL_POINTS; i++) {
+            for (v = 0; v < WL_NV2A_ATTRIBS; v++) {
+                if (attributes & (1u << v)) {
+                    memcpy(gx->batch.inputs[i][v], canonical_points[i], sizeof gx->batch.inputs[i][v]);
+                }
+            }
+        }
+        wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs,
+                                  CANONICAL_POINTS, WL_XBOX_VSH_LIVE_POSITION, gx->fit_probe_out, &gx->batch.work);
+    }
+    for (i = 0; i < CANONICAL_POINTS; i++) {
+        memcpy(clip[i], gx->fit_probe_out[i].clip, sizeof clip[i]);
+    }
+    set = gx->signatures[signature_set(clip)];
+    // (a transform whose fit a draw of this frame shared or made: its vertices are not run, as for the
+    // last draw's fit, fit_memo_holds)
+    for (i = 0; i < FIT_WAYS && draw->count != 0 && fit_memo_on() && !g_fit_unkept; i++) {
+        if (set[i].used != 0 && memcmp(set[i].clip, clip, sizeof clip) == 0) {
+            if (fit_slot_holds(gx, k, &set[i], depth_max, target)) {
+                gx->signature_use++;
+                set[i].used = gx->signature_use;
+                p.perspective = true;
+                p.a = gx->fit_a = set[i].a;
+                p.b = gx->fit_b = set[i].b;
+                gx->last_shared = true;
+                gx->stats.fits_shared++;
+                gx->stats.fits_memo++;
+                fit_memo_keep(gx, k, depth_max, target, &set[i]);
+                return p;
+            }
+            break;
+        }
+    }
+    // the vertices' positions, FIT_BATCH at a time (the program run for them together; the first run
+    // FIT_ENOUGH, which are enough when they spread in depth)
     // (the fetch decided once for the draw, as the draw's own: wl_nv2a_draw_fetch_some's values)
     wl_nv2a_fetch_plan(draw, attributes, &fetch);
     wl_nv2a_fetch_constants(&fetch, k, gx->batch.inputs, FIT_BATCH);
-    draw_prefetch(&fetch, draw, 0, probes < FIT_BATCH ? probes : FIT_BATCH);
+    draw_prefetch(&fetch, draw, 0, probes < FIT_ENOUGH ? probes : FIT_ENOUGH);
     for (v = 0; v < probes && n < FIT_PROBES && !enough; v += run) {
-        run = probes - v < FIT_BATCH ? probes - v : FIT_BATCH;
+        run = v == 0 ? FIT_ENOUGH : FIT_BATCH;
+        run = probes - v < run ? probes - v : run;
         for (i = 0; i < run; i++) {
             numbers[i] = v + i;
         }
@@ -1556,22 +1951,11 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
         p.perspective = false;
         return p;
     }
-    // the transform's signature, and the canonical points' w and depth (each point in the input
-    // registers the position reads, as the draw's fetch fills only those)
-    for (i = 0; i < CANONICAL_POINTS; i++) {
-        for (v = 0; v < WL_NV2A_ATTRIBS; v++) {
-            if (attributes & (1u << v)) {
-                memcpy(gx->batch.inputs[i][v], canonical_points[i], sizeof gx->batch.inputs[i][v]);
-            }
-        }
-    }
-    wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs,
-                              CANONICAL_POINTS, WL_XBOX_VSH_LIVE_POSITION, outputs, &gx->batch.work);
+    // the canonical points' w and depth
     c = n;
     for (i = 0; i < CANONICAL_POINTS; i++) {
-        const WlXboxVshOutput *out = &outputs[i];
+        const WlXboxVshOutput *out = &gx->fit_probe_out[i];
 
-        memcpy(clip[i], out->clip, sizeof clip[i]);
         d = out->position[2] / depth_max;
         if (out->clip[3] > 1.0e-4f && d >= 0.0f && d <= 1.0f) {
             inverse_w[c] = 1.0f / out->clip[3];
@@ -1580,7 +1964,6 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
         }
     }
     gx->signature_use++;
-    set = gx->signatures[wl_fnv1a64(clip, sizeof clip) % FIT_SETS];
     for (i = 0; i < FIT_WAYS; i++) {
         if (set[i].used != 0 && memcmp(set[i].clip, clip, sizeof clip) == 0) {
             // (no vertex in front of the eye among those looked at: the transform's fit as it is)
@@ -1600,6 +1983,9 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
                 gx->last_shared = true;
                 gx->last_narrow = set[i].narrow;
                 gx->stats.fits_shared++;
+                if (n != 0 && !set[i].narrow) {
+                    fit_memo_keep(gx, k, depth_max, target, &set[i]);
+                }
                 return p;
             }
             // (the same signature, another projection: made again)
@@ -1633,7 +2019,12 @@ static Projection projection_fit(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv
     set[slot].b = b;
     set[slot].used = gx->signature_use;
     set[slot].narrow = narrow;
+    set[slot].made = ++gx->signature_made;
+    set[slot].held = false;
     gx->last_narrow = narrow;
+    if (n != 0 && !narrow) {
+        fit_memo_keep(gx, k, depth_max, target, &set[slot]);
+    }
     p.a = gx->fit_a = a;
     p.b = gx->fit_b = b;
     return p;
@@ -1749,6 +2140,8 @@ static void projection_load(WlNv2aGx *gx, const WlNv2aKelvin *k, const Projectio
 typedef struct StagePlan {
     const WlNv2aTexEntry *entry;
     bool sphere, projective, linear;
+    // a sphere map's made by GX from the direction sent (sphere_xf_plan)
+    bool sphere_xf;
     // a cube map made a light's spot (entry->layout.spot: its face), not a sphere map
     uint8_t spot;
     float to_s, to_t; // (a linear texture's texels to a fraction: 1 / its width, height)
@@ -1771,11 +2164,17 @@ typedef struct DrawPlan {
     // three words for one, nine for two or three), the others divided here
     unsigned stage_count, stage_list[WL_NV2A_TEXTURES];
     unsigned projected_count, projected_list[WL_GX_DIRECT_PROJECTED];
+    // the stages (bit n: stage n) whose sphere map GX makes from the direction sent (sphere_xf_plan),
+    // never beside projected ones
+    unsigned sphere_xf;
     // the transform unit's draw (NULL: the processor's)
     const struct XfPlan *xf;
     // the program's fused form for the draw (fused_known: decided; NULL: none)
     bool fused_known;
     const WlXboxVshFusedForm *fused;
+    // d0's r, g and b lit by GX's transform unit from the normal the program's lit form sends
+    // (skin_lit), and whether the draw could be (lit_wanted: the form the forms list asks for)
+    bool lit, lit_wanted;
 } DrawPlan;
 
 // ---- the transform unit's draws ----------------------------------------------------------------------
@@ -1788,7 +2187,7 @@ typedef struct DrawPlan {
 // 1), (0, 1, 0, 1), (0, 0, 1, 1)): an output affine in its register r is then known everywhere r's w
 // is 1. Not to the bit: the transform unit's arithmetic is its own.
 
-enum { XF_PROBES = 8, XF_MIN_VERTICES = 1 };
+enum { XF_MIN_VERTICES = 1 };
 
 typedef struct XfPlan {
     // every live output the transform unit's (the program not run), or the position alone (the
@@ -1864,8 +2263,10 @@ static inline void stage_texcoord(const StagePlan *s, const float t[4], float st
 
         if (s->spot) {
             wl_nv2a_spot_coordinates(t, s->spot, made);
+        } else if (g_draw_cuts) {
+            wl_nv2a_sphere_coordinates_inline(t, made);
         } else {
-            wl_nv2a_sphere_coordinates(t, made);
+            wl_nv2a_sphere_coordinates_double(t, made);
         }
         st[0] = made[0];
         st[1] = made[1];
@@ -1952,6 +2353,22 @@ static inline __attribute__((always_inline)) void positions_pack(const WlNv2aGx 
 // draw's choices for it are the same for every vertex, so each loop is made for its choices and
 // keeps them in registers (a float store may alias the plan, which would otherwise be read again
 // after each).
+// a sphere map's direction for GX (sphere_xf_plan): d / |d| as the fused forms make it (one root of two
+// steps, single precision), 0 for a direction too short or too long (GX's disc centre, as
+// wl_nv2a_sphere_coordinates')
+static inline void sphere_direction(const float t[4], float d[3]) {
+    float across = t[0] * t[0] + t[1] * t[1], length2 = wl_nv2a_madd(t[2], t[2], across), root;
+
+    if (!(length2 > 1.0e-24f && length2 <= 3.4028235e38f)) {
+        d[0] = d[1] = d[2] = 0.0f;
+        return;
+    }
+    root = wl_nv2a_sphere_root(length2, length2 * 0.5f);
+    d[0] = t[0] * root;
+    d[1] = t[1] * root;
+    d[2] = t[2] * root;
+}
+
 static void vertices_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawPlan *plan, unsigned runs) {
     PackedVertex *const *made = gx->batch.run_vertices;
     const WlXboxVshOutput *o = gx->batch.outputs;
@@ -2002,6 +2419,32 @@ static void vertices_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawP
                 made[r]->w[i] = made[r]->w[i + 1] = made[r]->w[i + 2] = 0;
             }
         }
+    } else if (plan->sphere_xf != 0) {
+        // (the sphere maps GX makes: each one's direction of unit length, in the same places)
+        unsigned sent = 0;
+
+        for (stage = 0; stage < stage_count; stage++) {
+            unsigned n = plan->stage_list[stage];
+
+            if (!(plan->sphere_xf & (1u << n))) {
+                continue;
+            }
+            for (r = 0; r < runs; r++) {
+                float d[3];
+
+                sphere_direction(o[r].t[n], d);
+                put_float(&made[r]->w[i], d[0]);
+                put_float(&made[r]->w[i + 1], d[1]);
+                put_float(&made[r]->w[i + 2], d[2]);
+            }
+            i += 3;
+            sent++;
+        }
+        for (; sent > 1u && sent < WL_GX_DIRECT_PROJECTED; sent++, i += 3) {
+            for (r = 0; r < runs; r++) {
+                made[r]->w[i] = made[r]->w[i + 1] = made[r]->w[i + 2] = 0;
+            }
+        }
     }
     if (colors != 0) {
         const WlNv2aColorConstants color_k = wl_nv2a_color_constants();
@@ -2011,6 +2454,13 @@ static void vertices_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawP
             if (channels & (1u << c)) {
                 size_t from = c == 0 ? offsetof(WlXboxVshOutput, d0) : offsetof(WlXboxVshOutput, d1);
 
+#if WL_NV2A_COLOR_PAIRED
+                if (switched_on(SWITCH_NO_PAIRED_COLOR)) {
+                    wl_nv2a_color_words_paired((const char *)o + from, (uint32_t)sizeof o[0], (void *const *)made,
+                                               (uint32_t)(offsetof(PackedVertex, w) + i * sizeof(uint32_t)), runs);
+                    continue;
+                }
+#endif
                 for (r = 0; r < runs; r++) {
                     made[r]->w[i] = wl_nv2a_color_word_with((const float *)((const char *)&o[r] + from), &color_k);
                 }
@@ -2025,7 +2475,18 @@ static void vertices_pack(const WlNv2aGx *gx, const WlNv2aKelvin *k, const DrawP
         unsigned n = plan->stage_list[stage];
         const StagePlan *sp = &plan->stages[n];
 
-        if (sp->sphere) {
+        if (sp->sphere_xf) {
+            i -= 2;
+        } else if (sp->sphere && !sp->spot && g_draw_cuts) {
+            // (stage_texcoord's, inline: its constants kept in registers from vertex to vertex)
+            for (r = 0; r < runs; r++) {
+                float st[2];
+
+                wl_nv2a_sphere_coordinates_inline(o[r].t[n], st);
+                put_float(&made[r]->w[i], st[0]);
+                put_float(&made[r]->w[i + 1], st[1]);
+            }
+        } else if (sp->sphere) {
             for (r = 0; r < runs; r++) {
                 float st[2];
 
@@ -2133,19 +2594,34 @@ static bool fused_key(const WlNv2aGx *gx, const DrawPlan *plan, WlXboxVshFusedKe
     unsigned n;
 
     memset(key, 0, sizeof *key);
-    if (plan->xf != NULL || plan->landing || plan->projected_count != 0 || plan->to_sx == 0.0f ||
-        plan->to_sy == 0.0f || (plan->texcoords & (1u << WL_XBOX_PSH_FOG_TEXCOORD)) ||
-        fetch->source == WL_NV2A_SOURCE_IMMEDIATE || plan->stage_count > 4u || plan->colors > 2u) {
+    // (the transform unit's position, the program run for the rest: WL_XBOX_VSH_FUSED_XF, v0 sent as fetched)
+    if ((plan->xf != NULL && (plan->xf->full || gx->cfg.no_fused_xf)) ||
+        (plan->xf == NULL && (plan->landing || plan->to_sx == 0.0f || plan->to_sy == 0.0f)) ||
+        (plan->texcoords & (1u << WL_XBOX_PSH_FOG_TEXCOORD)) || fetch->source == WL_NV2A_SOURCE_IMMEDIATE ||
+        plan->stage_count + plan->projected_count > 4u || plan->colors > 2u) {
         return false;
     }
-    key->live = (unsigned short)plan->live;
-    key->perspective = gx->projection.perspective;
+    key->live = (unsigned short)(plan->xf != NULL ? plan->live & ~(unsigned)WL_XBOX_VSH_LIVE_POSITION : plan->live);
+    key->lit = plan->xf == NULL && plan->lit ? 1u : 0u;
+    key->perspective = plan->xf != NULL ? WL_XBOX_VSH_FUSED_XF : gx->projection.perspective;
     key->colors = (unsigned char)plan->colors;
     key->channels = (unsigned char)(plan->channels & ((1u << plan->colors) - 1u));
-    key->stage_count = (unsigned char)plan->stage_count;
+    // (the projected coordinates first, as vertices_pack writes them: WL_XBOX_VSH_FUSED_STAGE_PROJECTED)
+    for (n = 0; n < plan->projected_count; n++) {
+        const StagePlan *sp = &plan->stages[plan->projected_list[n]];
+
+        if (sp->spot || plan->projected_list[n] > 3u) {
+            return false;
+        }
+        key->stages[key->stage_count++] =
+            (unsigned char)(plan->projected_list[n] | (sp->linear ? (unsigned)WL_XBOX_VSH_FUSED_STAGE_PROJECTED_LINEAR
+                                                                  : (unsigned)WL_XBOX_VSH_FUSED_STAGE_PROJECTED)
+                                                          << 2);
+    }
     for (n = 0; n < plan->stage_count; n++) {
         const StagePlan *sp = &plan->stages[plan->stage_list[n]];
-        unsigned kind = sp->sphere       ? WL_XBOX_VSH_FUSED_STAGE_SPHERE
+        unsigned kind = sp->sphere_xf    ? WL_XBOX_VSH_FUSED_STAGE_SPHERE_XF
+                        : sp->sphere     ? WL_XBOX_VSH_FUSED_STAGE_SPHERE
                         : sp->projective ? (sp->linear ? WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR
                                                        : WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE)
                         : sp->linear     ? WL_XBOX_VSH_FUSED_STAGE_LINEAR
@@ -2154,7 +2630,7 @@ static bool fused_key(const WlNv2aGx *gx, const DrawPlan *plan, WlXboxVshFusedKe
         if (sp->spot || plan->stage_list[n] > 3u) {
             return false;
         }
-        key->stages[n] = (unsigned char)(plan->stage_list[n] | kind << 2);
+        key->stages[key->stage_count++] = (unsigned char)(plan->stage_list[n] | kind << 2);
     }
     for (n = 0; n < fetch->count; n++) {
         unsigned format = wl_nv2a_fetch_fused_format(fetch, n);
@@ -2164,7 +2640,31 @@ static bool fused_key(const WlNv2aGx *gx, const DrawPlan *plan, WlXboxVshFusedKe
         }
         key->format[fetch->streamed[n].attribute] = (unsigned char)format;
     }
+    // (one stride for every array: fused_find takes a form without it too)
+    key->interleaved = fetch->count > 1u ? 1u : 0u;
+    for (n = 1; n < fetch->count; n++) {
+        if (fetch->streamed[n].stride != fetch->streamed[0].stride) {
+            key->interleaved = 0;
+        }
+    }
     return true;
+}
+
+// the program's fused form for the key (NULL: none); an interleaved draw's, else one that is not
+static const WlXboxVshFusedForm *fused_find(const WlXboxVshProgram *program, WlXboxVshFusedKey *key) {
+    unsigned n;
+
+    for (;;) {
+        for (n = 0; n < program->native_fused_count; n++) {
+            if (memcmp(&program->native_fused[n].key, key, sizeof *key) == 0) {
+                return &program->native_fused[n];
+            }
+        }
+        if (!key->interleaved) {
+            return NULL;
+        }
+        key->interleaved = 0;
+    }
 }
 
 // the draw's fused form (NULL: none), and the fused batches' state for it
@@ -2180,12 +2680,7 @@ static const WlXboxVshFusedForm *fused_form(WlNv2aGx *gx, const DrawPlan *plan) 
         !fused_key(gx, plan, &key)) {
         return NULL;
     }
-    for (n = 0; n < program->native_fused_count; n++) {
-        if (memcmp(&program->native_fused[n].key, &key, sizeof key) == 0) {
-            form = &program->native_fused[n];
-            break;
-        }
-    }
+    form = fused_find(program, &key);
     if (form == NULL) {
         return NULL;
     }
@@ -2252,6 +2747,7 @@ static const WlXboxVshFusedForm *fused_for(WlNv2aGx *gx, DrawPlan *plan, const W
         if (plan->fused != NULL) {
             gx->cfg.fused_seen(gx->cfg.fused_user, gx->pipeline.program->hash, &plan->fused->key, runs, true);
         } else if (!gx->cfg.no_fused && fused_key(gx, plan, &key)) {
+            key.lit = plan->lit_wanted ? 1u : 0u;
             gx->cfg.fused_seen(gx->cfg.fused_user, gx->pipeline.program->hash, &key, runs, false);
         }
     }
@@ -2269,7 +2765,8 @@ static unsigned fused_check_bytes(unsigned format) {
     return format >= WL_XBOX_VSH_FUSED_F1 && format <= WL_XBOX_VSH_FUSED_F4 ? 4u * (format - WL_XBOX_VSH_FUSED_F1 + 1u)
            : format == WL_XBOX_VSH_FUSED_D3DCOLOR || format == WL_XBOX_VSH_FUSED_CMP ? 4u
            : format >= WL_XBOX_VSH_FUSED_S1 && format < WL_XBOX_VSH_FUSED_UB       ? 2u * (format - WL_XBOX_VSH_FUSED_S1 + 1u)
-           : format >= WL_XBOX_VSH_FUSED_UB && format < WL_XBOX_VSH_FUSED_FORMATS  ? format - WL_XBOX_VSH_FUSED_UB + 1u
+           : format >= WL_XBOX_VSH_FUSED_UB && format < WL_XBOX_VSH_FUSED_S32K    ? format - WL_XBOX_VSH_FUSED_UB + 1u
+           : format >= WL_XBOX_VSH_FUSED_S32K && format < WL_XBOX_VSH_FUSED_FORMATS ? 2u * (format - WL_XBOX_VSH_FUSED_S32K + 1u)
                                                                                    : 0u;
 }
 
@@ -2283,6 +2780,10 @@ static void fused_check(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *d
     const unsigned words = 3u + plan->colors + 2u * plan->stage_count;
     unsigned r, n, w;
 
+    // (a lit form's words are not the general path's: its normal, d0's alpha alone)
+    if (plan->lit) {
+        return;
+    }
     for (r = 0; r < runs; r++) {
         fused[r] = *gx->batch.run_vertices[r];
     }
@@ -2400,7 +2901,7 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
         runs = count;
     }
     gx->stats.vertices_reused += count - runs;
-    if (plan->xf == NULL && runs != 0) {
+    if ((plan->xf == NULL || !plan->xf->full) && runs != 0) {
         const WlXboxVshFusedForm *form = fused_for(gx, plan, layout, runs);
 
         if (form != NULL) {
@@ -2647,7 +3148,7 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         {0.0f, 0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f},
         {0.0f, 0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 1.0f, 1.0f}};
     const WlXboxVshDependencies *d = &gx->xf_dependencies;
-    const WlXboxVshOutput *o = gx->batch.outputs;
+    const WlXboxVshOutput *o = gx->xf_probe_out;
     unsigned n, a, stage, c, row;
     uint32_t reads;
     float rows[4][4], lit_scale[4][4] = {{0.0f}};
@@ -2673,16 +3174,19 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
         return false;
     }
     // (each probe in the input registers the draw's outputs read, as the draw's fetch fills only those)
-    reads = wl_nv2a_pipeline_inputs(&gx->pipeline, plan->live);
-    for (n = 0; n < XF_PROBES; n++) {
-        for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
-            if (reads & (1u << a)) {
-                memcpy(gx->batch.inputs[n][a], probe[n], sizeof probe[n]);
+    // (kept from the last draw of the same program and constants: probes_kept)
+    if (!probes_kept(gx, &gx->xf_probe_key, k, plan->live)) {
+        reads = wl_nv2a_pipeline_inputs(&gx->pipeline, plan->live);
+        for (n = 0; n < XF_PROBES; n++) {
+            for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
+                if (reads & (1u << a)) {
+                    memcpy(gx->batch.inputs[n][a], probe[n], sizeof probe[n]);
+                }
             }
         }
+        wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs,
+                                  XF_PROBES, plan->live, gx->xf_probe_out, &gx->batch.work);
     }
-    wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, XF_PROBES,
-                              plan->live, gx->batch.outputs, &gx->batch.work);
     memset(xf, 0, sizeof *xf);
     xf->attributes = 1u;
     if (gx->projection.perspective) {
@@ -2784,6 +3288,15 @@ static bool xf_prepare(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *dr
             }
             xf->color_source[c] = -1;
             xf->attributes |= source;
+            continue;
+        }
+        if (!(draw->streamed & source) && g_draw_cuts) {
+            // (passed as it is from an input the draw does not stream: the attribute's current
+            // value at every vertex, wl_nv2a_fetch_constants', a constant word. As an array, the
+            // vertex cache has none to keep for it, and the whole draw was sent: d40's 141 draws a
+            // frame)
+            xf->color_source[c] = -1;
+            xf->color_word[c] = wl_nv2a_color_word(k->current[bit_index(source)]);
             continue;
         }
         xf->color_source[c] = (int)bit_index(source);
@@ -3285,6 +3798,216 @@ static bool projected_plan(WlNv2aGx *gx, DrawPlan *plan, WlGxDirectLayout *layou
     return true;
 }
 
+// ---- skinned models lit by the transform unit -----------------------------------------------------
+// A program whose position stays on the processor (a skinned model's, its normal blended by bones)
+// whose d0 has the light shape (WlXboxVshLightShape: an ambient plus directional lights' clamped dot
+// products with a temporary as the normal, one with a back term) leaves d0's r, g and b to GX's
+// lighting where the program has the draw's lit form (WlXboxVshFusedKey.lit): the form sends the
+// normal after the position, and COLOR0 is lit by up to five lights (light 0 and the extra ones),
+// the dot products clamped at 0. A back term max(d, q d, 0), q <= 0, is a light of its own the other
+// way, of colour -q times the light's; 0 <= q <= 1 is none. The directions made of unit length (their
+// length into the colour), the colours times 1 / s and the normal matrix s (s the largest colour
+// component, as lit_finish: the colours' bytes their most precise). Not to the bit: the colours and
+// the ambient are bytes; no_xf_skin (and no_xf) leave d0 to the processor.
+
+// the number of components an array of the fused format gives (0: none)
+static unsigned fused_components(unsigned format) {
+    if (format >= WL_XBOX_VSH_FUSED_F1 && format <= WL_XBOX_VSH_FUSED_F4) {
+        return format - WL_XBOX_VSH_FUSED_F1 + 1u;
+    }
+    if (format == WL_XBOX_VSH_FUSED_D3DCOLOR) {
+        return 4u;
+    }
+    if (format == WL_XBOX_VSH_FUSED_CMP) {
+        return 3u;
+    }
+    if (format >= WL_XBOX_VSH_FUSED_S1 && format < WL_XBOX_VSH_FUSED_FORMATS) {
+        return (format - WL_XBOX_VSH_FUSED_S1) % 4u + 1u;
+    }
+    return 0u;
+}
+
+// the draw's lighting and its lit form (plan->lit, plan->fused), or false (plan->lit_wanted when only
+// the form is missing)
+static bool skin_lit(WlNv2aGx *gx, const WlNv2aKelvin *k, DrawPlan *plan, WlGxDirectLighting *lighting) {
+    const WlXboxVshProgram *program = gx->pipeline.program;
+    const WlXboxVshLightShape *shape = program != NULL ? &program->light : NULL;
+    const float(*c)[4] = (const float(*)[4])k->constants;
+    WlXboxVshFusedKey key;
+    float directions[5][3], colors[5][3], most = 0.0f;
+    unsigned count = 0, n, i;
+    const WlXboxVshFusedForm *form = NULL;
+
+    if (shape == NULL || shape->count == 0 || gx->cfg.no_xf_skin || gx->cfg.no_xf || gx->cfg.no_fused ||
+        plan->colors < 1u || !(plan->channels & 1u) || projected_possible(gx, plan) || !fused_key(gx, plan, &key)) {
+        return false;
+    }
+    // (the maximum's 0: the zero input's component no array gives, or a current value of 0)
+    if (key.format[shape->zero] != WL_XBOX_VSH_FUSED_NONE
+            ? fused_components(key.format[shape->zero]) > shape->zero_component
+            : gx->batch.inputs[0][shape->zero][shape->zero_component] != 0.0f) {
+        return false;
+    }
+    for (n = 0; n < shape->count; n++) {
+        const WlXboxVshLight *light = &shape->lights[n];
+        float sign = light->direction_negate ? -1.0f : 1.0f, length = 0.0f, q = 0.0f;
+
+        for (i = 0; i < 3; i++) {
+            length += c[light->direction][i] * c[light->direction][i];
+        }
+        length = sqrtf(length);
+        if (light->has_back) {
+            q = c[light->back][light->back_component] * (light->back_negate ? -1.0f : 1.0f);
+            if (!(q <= 1.0f)) {
+                return false;
+            }
+        }
+        if (!(length > 0.0f)) {
+            // (a dot product of 0: no term)
+            continue;
+        }
+        for (i = 0; i < 3; i++) {
+            directions[count][i] = sign * c[light->direction][i] / length;
+            colors[count][i] = c[light->color][i] * length;
+            if (!(colors[count][i] >= 0.0f) || colors[count][i] > 1.0e6f) {
+                return false;
+            }
+        }
+        count++;
+        if (q < 0.0f) {
+            if (count >= 5u) {
+                return false;
+            }
+            for (i = 0; i < 3; i++) {
+                directions[count][i] = -directions[count - 1u][i];
+                colors[count][i] = -q * colors[count - 1u][i];
+            }
+            count++;
+        }
+        if (count > 5u) {
+            return false;
+        }
+    }
+    for (i = 0; i < 3; i++) {
+        if (!(c[shape->ambient][i] >= 0.0f)) {
+            return false;
+        }
+    }
+    plan->lit_wanted = true;
+    key.lit = 1u;
+    form = fused_find(program, &key);
+    if (form == NULL) {
+        return false;
+    }
+    plan->lit = true;
+    plan->fused_known = true;
+    plan->fused = fused_form(gx, plan);
+    if (plan->fused != form) {
+        plan->lit = false;
+        plan->fused_known = false;
+        plan->fused = NULL;
+        return false;
+    }
+    memset(lighting, 0, sizeof *lighting);
+    for (n = 0; n < count; n++) {
+        for (i = 0; i < 3; i++) {
+            if (colors[n][i] > most) {
+                most = colors[n][i];
+            }
+        }
+    }
+    if (!(most > 0.0f)) {
+        most = 1.0f;
+    }
+    for (i = 0; i < 3; i++) {
+        lighting->normal_matrix[i][i] = most;
+        lighting->ambient[0][i] =
+            (uint8_t)(wl_nv2a_color_word((const float[4]){c[shape->ambient][i], 0.0f, 0.0f, 0.0f}) >> 24);
+    }
+    for (n = 0; n < count; n++) {
+        float *direction = n == 0 ? lighting->direction[0] : lighting->extra_direction[n - 1u];
+        uint8_t *color = n == 0 ? lighting->color[0] : lighting->extra_color[n - 1u];
+
+        for (i = 0; i < 3; i++) {
+            float v = colors[n][i] / most * 255.0f + 0.5f;
+
+            direction[i] = directions[n][i];
+            color[i] = (uint8_t)(v > 255.0f ? 255.0f : v);
+        }
+        if (n != 0) {
+            lighting->extra[0] |= (uint8_t)(1u << (n - 1u));
+        }
+    }
+    lighting->clamped = 1u;
+    return true;
+}
+
+// a draw's vertex bytes as the console's FIFO takes them (gx_shadow.h's model), counted by its way
+static void draw_bytes(WlNv2aGx *gx, const WlGxDirectLayout *layout, uint32_t count) {
+    if (memcmp(&gx->bytes_layout, layout, sizeof *layout) != 0) {
+        gx->bytes_layout = *layout;
+        gx->layout_bytes = wl_gx_shadow_layout_vertex_bytes(layout);
+    }
+    gx->stats.xf_why_bytes[gx->xf_why] += (uint64_t)count * gx->layout_bytes;
+}
+
+// ---- sphere maps made by the transform unit ------------------------------------------------------
+// A sphere map's coordinates (wl_nv2a_sphere_coordinates: two roots, a division's worth of work a
+// vertex) are GX's: the processor sends the direction of unit length (one root) as a projected
+// coordinate's three numbers, after a lit form's normal, and GX's generator makes (x, y, z + 1),
+// normalizes it and halves it about 1/2 (WlGxDirectLayout.texcoords_sphere). Not beside projected
+// coordinates, two at most (a lit form's normal the third), and only for a program with no fused forms
+// or with one of them (a "U" stage): an older forms list keeps its "S" forms. The switch "nospherexf"
+// (WL_XB_NOSPHEREXF) leaves them to the processor.
+
+// a lit form's normal's words beside `count` such directions (the normal, binormal and tangent's)
+static unsigned sphere_lit_words(unsigned count) {
+    return count == 0u ? 3u : count == 1u ? 6u : 0u;
+}
+
+static void sphere_xf_plan(WlNv2aGx *gx, DrawPlan *plan, WlGxDirectLayout *layout) {
+    const WlXboxVshProgram *program = gx->pipeline.program;
+    unsigned n, count = 0, words;
+    bool forms = program != NULL && program->native_fused_count == 0;
+
+    plan->sphere_xf = 0;
+    if (!switched_on(SWITCH_NO_SPHERE_XF) || program == NULL || plan->stage_count == 0) {
+        return;
+    }
+    for (n = 0; !forms && n < program->native_fused_count; n++) {
+        const WlXboxVshFusedKey *key = &program->native_fused[n].key;
+        unsigned i;
+
+        for (i = 0; i < key->stage_count; i++) {
+            forms = forms || (key->stages[i] >> 2) == WL_XBOX_VSH_FUSED_STAGE_SPHERE_XF;
+        }
+    }
+    for (n = 0; forms && n < plan->stage_count; n++) {
+        count += plan->stages[plan->stage_list[n]].sphere && !plan->stages[plan->stage_list[n]].spot ? 1u : 0u;
+    }
+    if (count == 0 || count > 2u || projected_possible(gx, plan)) {
+        return;
+    }
+    // (a vertex's words within PACKED_WORDS, a lit form's normal counted)
+    words = plan->words - 2u * count + (count == 1u ? 3u : 9u) + sphere_lit_words(count);
+    if (words > PACKED_WORDS) {
+        return;
+    }
+    for (n = 0; n < plan->stage_count; n++) {
+        unsigned stage = plan->stage_list[n];
+        StagePlan *sp = &plan->stages[stage];
+
+        if (sp->sphere && !sp->spot) {
+            sp->sphere_xf = true;
+            plan->sphere_xf |= 1u << stage;
+        }
+    }
+    layout->texcoords &= (uint8_t)~plan->sphere_xf;
+    layout->texcoords_projected = (uint8_t)plan->sphere_xf;
+    layout->texcoords_sphere = (uint8_t)plan->sphere_xf;
+    plan->words += (count == 1u ? 3u : 9u) - 2u * count;
+}
+
 static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
     WlNv2aGx *gx = user;
     WlNv2aSurface surface;
@@ -3416,6 +4139,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     plan.scale = k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE];
     plan.offset = k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET];
 
+    sphere_xf_plan(gx, &plan, &layout);
     gx->projection = projection_fit(gx, k, draw, plan.depth_max, fit_target(gx, &surface));
     if (gx->cfg.depth_check) {
         projection_check(gx, k, draw, &gx->projection, plan.depth_max);
@@ -3428,9 +4152,30 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     // the transform unit's draw, or the processor's (the transform unit's matrices then the identity)
     xf_ok = xf_prepare(gx, k, draw, &plan, count_pixels, &xf);
     if (xf_ok && !xf.full) {
-        // (the position alone: the layout and the coordinates as the processor makes them)
+        // (the position alone: the layout and the coordinates as the processor makes them. The
+        // position GX reads from the vertex cache's array of it, the same floats, where it has one:
+        // an index of two bytes a vertex for its twelve; the other passes of the same geometry have
+        // it already)
+        const void *positions = NULL;
+
         plan.xf = &xf;
+        if (switched_on(SWITCH_NO_POSITION_INDEX) && plan.sphere_xf == 0 && plan.words > 3u && draw->source == WL_NV2A_SOURCE_ARRAYS &&
+            (draw->streamed & 1u) && wl_nv2a_vcache_on(&gx->vertices) &&
+            draw->index_last - draw->index_base < WL_NV2A_VCACHE_SPAN) {
+            positions = wl_nv2a_vcache_get(&gx->vertices, gx->dev, &draw->attribs[0], draw->index_base,
+                                           draw->index_last, WL_NV2A_VCACHE_POSITION);
+            layout.indexed = positions != NULL ? (uint16_t)(1u << WL_GX_DIRECT_ARRAY_POSITION) : 0u;
+        }
         wl_gx_direct_layout(&layout);
+        if (positions != NULL) {
+            wl_gx_direct_array(WL_GX_DIRECT_ARRAY_POSITION, positions,
+                               wl_nv2a_vcache_element_bytes(WL_NV2A_VCACHE_POSITION));
+            if (wl_nv2a_vcache_made(&gx->vertices)) {
+                wl_gx_direct_arrays_changed();
+            }
+            gx->stats.position_indexed_draws++;
+            gx->stats.position_indexed_vertices += draw->count;
+        }
         wl_gx_direct_position_matrix((const float (*)[4])xf.position);
         gx->xf_position = true;
         for (stage = 0; gx->xf_texgens != 0 && stage < 8; stage++) {
@@ -3457,6 +4202,17 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
         indexed = xf_arrays(gx, draw, &plan, &xf, &layout, arrays);
         if (indexed) {
             gx->xf_why = WL_NV2A_GX_XF_INDEXED;
+            if (switched_on(SWITCH_NO_COLOR_REGISTER)) {
+                // (a constant colour, which every vertex would send as the same word, GX's channel
+                // register instead: four bytes a vertex fewer)
+                unsigned c;
+
+                for (c = 0; c < plan.colors && c < 2u; c++) {
+                    if (xf.color_source[c] < 0) {
+                        layout.colors_register |= (uint8_t)(1u << c);
+                    }
+                }
+            }
         }
         wl_gx_direct_layout(&layout);
         if (xf.lit != 0) {
@@ -3465,6 +4221,20 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
             if (indexed) {
                 wl_gx_direct_array(WL_GX_DIRECT_ARRAY_NORMAL, arrays[WL_GX_DIRECT_ARRAY_NORMAL],
                                    wl_nv2a_vcache_element_bytes(WL_NV2A_VCACHE_NORMAL));
+            }
+        }
+        if (layout.colors_register != 0) {
+            // (the register is also a lit channel's material, white: a lit colour channel keeps its
+            // red, green and blue at 255, a lit alpha channel its alpha, and the unlit one of the
+            // pair reads the vertex's constant colour)
+            unsigned c;
+
+            for (c = 0; c < 2u; c++) {
+                if (layout.colors_register & (1u << c)) {
+                    uint32_t lit = (xf.lit >> (2u * c)) & 3u;
+
+                    wl_gx_direct_material(c, xf.color_word[c] | ((lit & 1u) ? 0xFFFFFF00u : 0u) | ((lit & 2u) ? 0xFFu : 0u));
+                }
             }
         }
         for (stage = 0; indexed && stage < WL_GX_DIRECT_ARRAY_TEXCOORD0 + WL_NV2A_TEXTURES; stage++) {
@@ -3492,8 +4262,8 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
         gx->stats.xf_draws++;
         gx->stats.xf_vertices += draw->count;
     } else {
+        // (the layout set once the fetch is planned: skin_lit may light d0)
         memset(&xf, 0, sizeof xf);
-        wl_gx_direct_layout(&layout);
         if (gx->xf_position) {
             wl_gx_direct_position_matrix(NULL);
             gx->xf_position = false;
@@ -3514,10 +4284,11 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
         unsigned colors = 0, c;
 
         for (c = 0; c < plan.colors && c < 2u; c++) {
-            if (!(layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_COLOR0 + c)))) {
+            if (!(layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_COLOR0 + c))) && !(layout.colors_register & (1u << c))) {
                 words[colors++] = xf.color_word[c];
             }
         }
+        draw_bytes(gx, &layout, draw->count);
         wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
         wl_gx_direct_vertices_index(draw->indices, draw->index_base, draw->count, words, colors);
         wl_gx_direct_primitive_end();
@@ -3533,14 +4304,32 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
                                    : wl_nv2a_pipeline_inputs(&gx->pipeline, plan.live) | 1u;
     wl_nv2a_fetch_plan(draw, attributes, &gx->fetch);
     wl_nv2a_fetch_constants(&gx->fetch, k, gx->batch.inputs, WL_XBOX_VSH_BATCH);
+    plan.lit = plan.lit_wanted = false;
+    if (plan.xf == NULL) {
+        WlGxDirectLighting lighting;
+
+        if (skin_lit(gx, k, &plan, &lighting)) {
+            layout.lit = 1u;
+            plan.words += sphere_lit_words((unsigned)__builtin_popcount(plan.sphere_xf));
+            wl_gx_direct_layout(&layout);
+            wl_gx_direct_lighting(&lighting);
+            gx->stats.skin_lit_draws++;
+            gx->stats.skin_lit_vertices += draw->count;
+        } else {
+            wl_gx_direct_layout(&layout);
+        }
+    }
     // (the first two batches' vertices asked for, then each batch the next one's: wl_nv2a_fetch_prefetch)
     draw_prefetch(&gx->fetch, draw, 0, 2u * WL_XBOX_VSH_BATCH);
     // (the first batch, which finds the projective coordinates GX is to divide at each pixel)
     if (draw->count != 0 &&
         vertices_make(gx, k, draw, 0, draw->count < WL_XBOX_VSH_BATCH ? draw->count : WL_XBOX_VSH_BATCH, &plan,
                       &layout)) {
+        // (projected coordinates: the position sent, as the other attributes are)
+        layout.indexed = layout.texcoords_projected != 0 ? 0u : layout.indexed;
         wl_gx_direct_layout(&layout);
     }
+    draw_bytes(gx, &layout, draw->count);
     wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
     for (first = 0; first < draw->count; first += run) {
         run = draw->count - first < WL_XBOX_VSH_BATCH ? draw->count - first : WL_XBOX_VSH_BATCH;
@@ -3549,7 +4338,12 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
             vertices_make(gx, k, draw, first, run, &plan, NULL);
         }
         // (the batch's vertices into the FIFO in one call)
-        wl_gx_direct_vertices_words(gx->batch.words, run, plan.words);
+        if (layout.indexed != 0) {
+            wl_gx_direct_vertices_position_index(draw->indices, draw->index_base, first, run, gx->batch.words, 3u,
+                                                 plan.words - 3u);
+        } else {
+            wl_gx_direct_vertices_words(gx->batch.words, run, plan.words);
+        }
         for (v = 0; count_pixels && v < run; v++) {
             landing_area(draw->primitive, batch_vertex(gx, v), &seen, corners, &area);
         }

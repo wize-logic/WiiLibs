@@ -83,6 +83,8 @@ static void quad_state(uint32_t back_w, uint32_t back_h, bool colour, bool alpha
     wl_gx_direct_color_update(colour, alpha);
     wl_gx_direct_zmode(z_test, WL_GX_ALWAYS, z_write);
     wl_gx_direct_zcompare_early(true);
+    // (the console's quad sets GX behind the shadow and then forgets it: counted alike)
+    wl_gx_invalidate_shadow();
 }
 
 void wl_gx_target_be_copy_end(void) {
@@ -95,6 +97,7 @@ void wl_gx_target_be_scissor(uint32_t w, uint32_t h) {
     op->h = h;
     // (GX has one scissor: the direct layer's)
     wl_gx_direct_scissor(0, 0, w, h);
+    wl_gx_invalidate_shadow(); // (as the console's)
 }
 
 void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, uint32_t h, uint32_t back_w,

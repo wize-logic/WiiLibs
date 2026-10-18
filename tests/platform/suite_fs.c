@@ -470,6 +470,76 @@ static void check_offsets(void) {
     wlt_check("fs_rmdir", ok, "empty directories are removed");
 }
 
+// The reads straight from the card (platform.h, wl_platform_fs_fast_set) give libfat's bytes: at every
+// alignment of offset, length and buffer, from a handle that writes the file (a part sector it wrote
+// included), from one while another writes it, and after that one closed; the speed comparison too.
+// (The host reads through the C library both ways; the Wii's straight reads are counted.)
+static void check_fast(void) {
+    const char *p = "sd:/" DIR_NAME "/fs/fast.bin";
+    const uint32_t n = 3u * 1024u * 1024u + 1000u;
+    static uint8_t buf[WRITE_CHUNK + 64u] __attribute__((aligned(32)));
+    WlPlatformFile *w = NULL, *r = NULL;
+    bool ok = wl_platform_fs_open(p, WL_FILE_WRITE_NEW, &w) == WL_OK;
+    for (uint32_t at = 0; ok && at < n; at += WRITE_CHUNK) {
+        uint32_t k = n - at < WRITE_CHUNK ? n - at : WRITE_CHUNK;
+        fill(buf, at, k);
+        ok = wl_platform_fs_write(w, buf, k) == WL_OK;
+    }
+    wl_platform_fs_close(w);
+    wlt_check("fs_fast_fixture", ok, "3 MB file written");
+    WlPlatformFsReads before, after;
+    wl_platform_fs_reads(&before);
+    bool same = ok && wl_platform_fs_open(p, WL_FILE_READ, &r) == WL_OK;
+    uint32_t seed = 99;
+    for (int i = 0; same && i < 120; i++) {
+        seed = seed * 1103515245u + 12345u;
+        uint32_t at = (seed >> 4) % n, len = (seed >> 7) % WRITE_CHUNK + 1u, shift = (seed >> 11) % 32u;
+        if (i % 3 == 0) {
+            at &= ~511u;
+            shift = at & 31u; // (as the kernel gives it)
+        }
+        len = at + len > n ? n - at : len;
+        wl_platform_fs_fast_set(i % 2 == 0);
+        memset(buf, 0xEE, sizeof buf);
+        same = wl_platform_fs_read_at(r, at, buf + shift, len) == WL_OK && matches(buf + shift, at, len) &&
+               buf[shift + len] == 0xEE && (shift == 0u || buf[shift - 1u] == 0xEE);
+    }
+    wl_platform_fs_fast_set(true);
+    wl_platform_fs_reads(&after);
+    wlt_check("fs_fast_reads", same, "reads at every alignment, both ways, give the file's bytes");
+    wlt_report("INFO fs_fast %u of %u reads straight from the card, %u transfers",
+               (unsigned)(after.fast_calls - before.fast_calls), (unsigned)(after.calls - before.calls),
+               (unsigned)(after.transfers - before.transfers));
+    // a handle that writes it: a part sector in the middle, read back through it, then through the
+    // reader while the writer is open, and after it closed
+    static const uint8_t mark[7] = {1, 2, 3, 4, 5, 6, 7};
+    bool wrote = wl_platform_fs_open(p, WL_FILE_READ_WRITE, &w) == WL_OK &&
+                 wl_platform_fs_write_at(w, 1000003u, mark, sizeof mark) == WL_OK &&
+                 wl_platform_fs_read_at(w, 1000000u - 300u, buf, 8192u) == WL_OK &&
+                 memcmp(buf + 303, mark, sizeof mark) == 0 && matches(buf, 1000000u - 300u, 303u);
+    wlt_check("fs_fast_own_write", wrote, "a handle reads back the part sector it wrote");
+    bool other = r != NULL && wl_platform_fs_read_at(r, 1000000u - 300u, buf, 8192u) == WL_OK &&
+                 memcmp(buf + 303, mark, sizeof mark) == 0;
+    wlt_check("fs_fast_other_writer", other, "a reader sees what another open handle wrote");
+    // the file grown by the writer, then closed: the reader's next read sees it all
+    fill(buf, n, 5000u);
+    bool grown = w != NULL && wl_platform_fs_write_at(w, n, buf, 5000u) == WL_OK;
+    wl_platform_fs_close(w);
+    wl_platform_fs_close(r);
+    grown = grown && wl_platform_fs_open(p, WL_FILE_READ, &r) == WL_OK && wl_platform_fs_size(r) == n + 5000u &&
+            wl_platform_fs_read_at(r, n - 100u, buf, 5100u) == WL_OK && matches(buf, n - 100u, 5100u) &&
+            wl_platform_fs_read_at(r, 1000000u, buf, 4096u) == WL_OK && memcmp(buf + 3, mark, sizeof mark) == 0;
+    wl_platform_fs_close(r);
+    wlt_check("fs_fast_after_writer", grown, "the file as written and grown, read after the writer closed");
+    WlFsSpeedCompare c;
+    wlt_check("fs_fast_speed_compare", wl_fs_speed_compare(p, &c) == WL_OK && c.same,
+              "the speed comparison reads the same bytes both ways");
+    wlt_report("INFO fs_fast_speed seq %u/%u KiB/s, 64 KB anywhere %u/%u, 4 KB pages %u/%u (libfat/straight)",
+               (unsigned)c.seq_kib_s[0], (unsigned)c.seq_kib_s[1], (unsigned)c.big_kib_s[0], (unsigned)c.big_kib_s[1],
+               (unsigned)c.page_kib_s[0], (unsigned)c.page_kib_s[1]);
+    wl_platform_fs_remove(p);
+}
+
 void wlt_suite_fs(void);
 
 void wlt_suite_fs(void) {
@@ -506,6 +576,7 @@ void wlt_suite_fs(void) {
     check_basic();
     check_offsets();
     check_async();
+    check_fast();
     check_speed(WL_DEVICE_SD);
     if (usb) {
         check_speed(WL_DEVICE_USB);

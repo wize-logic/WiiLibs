@@ -289,6 +289,33 @@ compares:
         jae     .Lco_4
         or      ebx, 0x1000000
 .Lco_4:
+        /* fcom, fnstsw ax, test ah and a jump straight after each (the lifter's one test of the
+           compare's outcome), for the masks a compiler uses */
+        fld     qword ptr [esp+8]
+        fcom    qword ptr [esp+16]
+        fnstsw  ax
+        test    ah, 0x41
+        jne     .Lco_5
+        or      ebx, 0x2000000
+.Lco_5:
+        fcom    qword ptr [esp+16]
+        fnstsw  ax
+        test    ah, 0x05
+        jp      .Lco_6
+        or      ebx, 0x4000000
+.Lco_6:
+        fcom    qword ptr [esp+16]
+        fnstsw  ax
+        test    ah, 0x01
+        je      .Lco_7
+        or      ebx, 0x8000000
+.Lco_7:
+        fcomp   qword ptr [esp+16]
+        fnstsw  ax
+        test    ah, 0x40
+        jnz     .Lco_8
+        or      ebx, 0x10000000
+.Lco_8:
         mov     [edx+4], ebx
         /* ftst and fxam: the condition codes */
         fld     qword ptr [esp+8]

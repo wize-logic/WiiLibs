@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Sun, 18 Oct 2026 11:13:18 -0400
+Subject: [PATCH] recomp: --mem-disp splits the address of float stores and
+ SSE/MMX accesses too
+
+--mem-disp wrote MEMxx(base + disp) as MEMxx_D(base, disp) so that a
+runtime whose guest-to-host map is not a plain addition maps base once.
+The accesses whose address is one argument among others were left
+whole: MEMF_SET/MEMD_SET (every fstp and SSE scalar store; only the
+esp-based ones were split, by --stack-disp), and the SSE and MMX loads
+and stores (XMM_MEM, XMM_STORE, the movlps/movhps halves, MMX_MEM,
+MMX_STORE). A 4x3 matrix product stores its results at eax + 4, eax + 8,
+...; an MMX copy loop reads esi + 8 .. esi + 0x38: each address cost the
+whole map again.
+
+They are now split the same way, the base and the displacement in the
+address's place: MEMF_SET_D(base, disp, v), XMM_MEM_D(base, disp),
+XMM_STORE_D(base, disp, v), XMM_LOAD_HIGH_D(dst, base, disp), and so on.
+The template header defines each as the macro with the address put back
+together (#ifndef, so a runtime may define its own first): the same
+access, and the same code where the map is an addition.
+---
+ templates/runtime/recomp_types.h | 26 +++++++++++++++
+ tools/recomp/mem_disp.py         | 57 ++++++++++++++++++++++++++++----
+ tools/recomp/test_mem_disp.py    | 27 +++++++++++++--
+ 3 files changed, 102 insertions(+), 8 deletions(-)
+
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index 7f59ae2..13bba38 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -537,6 +537,13 @@ void recomp_trace_esp(const char *name, const char *tag);
+ #ifndef MEMD_SET_SP
+ #define MEMD_SET_SP(b, d, v) MEMD_SET((b) + (d), v)
+ #endif
++/* The stores at base + disp, a small constant (--mem-disp). */
++#ifndef MEMF_SET_D
++#define MEMF_SET_D(b, d, v) MEMF_SET((b) + (d), v)
++#endif
++#ifndef MEMD_SET_D
++#define MEMD_SET_D(b, d, v) MEMD_SET((b) + (d), v)
++#endif
+ 
+ /** x87 80-bit extended memory operands: fld m80 and fstp m80.
+  *
+@@ -675,6 +682,19 @@ static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
+ #define XMM_STORE_LOW(addr, src)  recomp_xmm_store_half((addr), (src), 0)
+ #define XMM_STORE_HIGH(addr, src) recomp_xmm_store_half((addr), (src), 1)
+ 
++/* The same at base + disp, a small constant (recomp --mem-disp writes them
++ * for an address base + disp): here exactly the access at base + disp. A
++ * runtime whose address map is not a plain addition may define its own
++ * first, mapping base once and adding disp on the host side. */
++#ifndef XMM_MEM_D
++#define XMM_MEM_D(b, d)             XMM_MEM((b) + (d))
++#define XMM_STORE_D(b, d, v)        XMM_STORE((b) + (d), v)
++#define XMM_LOAD_LOW_D(dst, b, d)   XMM_LOAD_LOW(dst, (b) + (d))
++#define XMM_LOAD_HIGH_D(dst, b, d)  XMM_LOAD_HIGH(dst, (b) + (d))
++#define XMM_STORE_LOW_D(b, d, src)  XMM_STORE_LOW((b) + (d), src)
++#define XMM_STORE_HIGH_D(b, d, src) XMM_STORE_HIGH((b) + (d), src)
++#endif
++
+ static inline void recomp_xmm_load_half(RecompXmm *dst, uint32_t addr,
+                                         int high) {
+     dst->u[high * 2]     = MEM32(addr);
+@@ -1381,6 +1401,12 @@ static inline void MMX_STORE(uint32_t addr, RecompMmx v) {
+     memcpy((void *)XBOX_PTR(addr), &v, 8);
+ }
+ 
++/* The same at base + disp (--mem-disp), as XMM_MEM_D. */
++#ifndef MMX_MEM_D
++#define MMX_MEM_D(b, d)      MMX_MEM((b) + (d))
++#define MMX_STORE_D(b, d, v) MMX_STORE((b) + (d), v)
++#endif
++
+ static inline RecompMmx MMX_FROM32(uint32_t v) {
+     RecompMmx r; r.q = 0; r.ud[0] = v; return r;
+ }
+diff --git a/tools/recomp/mem_disp.py b/tools/recomp/mem_disp.py
+index 35df2e3..7904e12 100644
+--- a/tools/recomp/mem_disp.py
++++ b/tools/recomp/mem_disp.py
+@@ -25,6 +25,17 @@ then address the stack as esp + disp with no map at all; about half of a
+ lifted function's accesses are to its stack, and esp changes at every
+ push, pop and call, so each new esp cost the whole map again. The template
+ header defines MEMxx_SP(b, d) as MEMxx_D(b, d): the same access.
++
++The accesses whose address is one argument among others are split the same
++way, the base and the displacement in the address's place: the float and
++double stores MEMF_SET(base + disp, v) as MEMF_SET_D(base, disp, v), and the
++SSE and MMX loads and stores, XMM_MEM(base + disp) as XMM_MEM_D(base, disp),
++XMM_STORE, XMM_STORE_LOW/HIGH and MMX_STORE(base + disp, v) as
++NAME_D(base, disp, v), XMM_LOAD_LOW/HIGH(dst, base + disp) as
++NAME_D(dst, base, disp), MMX_MEM like XMM_MEM. An SSE or MMX operand at
++esp + disp is split the same way (the stack's own _SP forms are the integer
++and float ones). The template header defines each NAME_D as NAME with the
++address put back together: the same access.
+ """
+ 
+ import re
+@@ -35,7 +46,12 @@ _TAIL = re.compile(r"^(?P<base>.*\S)\s*(?P<op>[+-])\s*(?P<disp>0x[0-9A-Fa-f]+|\d
+ LIMIT = 0x8000
+ # --stack-disp: the stack pointer's names in a body (the global's macro, and --reg-locals' local copy)
+ _STACK = ("esp", "_r_esp")
+-_SET = re.compile(r"\b(MEMF_SET|MEMD_SET)\(")
++# The accesses whose address is one argument among others: that argument's index
++_ARG_ADDR = {"MEMF_SET": 0, "MEMD_SET": 0, "XMM_MEM": 0, "MMX_MEM": 0, "XMM_STORE": 0,
++             "XMM_STORE_LOW": 0, "XMM_STORE_HIGH": 0, "MMX_STORE": 0,
++             "XMM_LOAD_LOW": 1, "XMM_LOAD_HIGH": 1}
++_ARGS = re.compile(r"\b(" + "|".join(sorted(_ARG_ADDR, key=len, reverse=True)) + r")\(")
++_SET = ("MEMF_SET", "MEMD_SET")
+ 
+ 
+ def _split(arg):
+@@ -105,13 +121,43 @@ def _top_comma(s):
+     return -1
+ 
+ 
++def _top_args(s):
++    """s split at its commas outside parentheses."""
++    parts = []
++    while True:
++        k = _top_comma(s)
++        if k < 0:
++            return parts + [s]
++        parts.append(s[:k])
++        s = s[k + 1:]
++
++
++def _split_arg(name, args, stack):
++    """NAME(args) with its address argument split (NAME_SP or NAME_D), or None."""
++    parts = _top_args(args)
++    a = _ARG_ADDR[name]
++    if len(parts) < 2 and name not in ("XMM_MEM", "MMX_MEM") or len(parts) <= a:
++        return None
++    addr = parts[a]
++    lead = addr[:len(addr) - len(addr.lstrip())]
++    sp = _stack_split(addr) if stack and name in _SET else None
++    if sp:
++        parts[a] = f"{lead}{sp[0]}, {_fmt_disp(sp[1])}"
++        return f"{name}_SP({','.join(parts)})"
++    split = _split(addr.strip())
++    if not split:
++        return None
++    parts[a] = f"{lead}{split[0]}, {_fmt_disp(split[1])}"
++    return f"{name}_D({','.join(parts)})"
++
++
+ def rewrite(text, stack=False):
+     """The function's text with every eligible access split; (text, accesses split).
+     stack: esp-based accesses become MEMxx_SP / MEMF_SET_SP (--stack-disp)."""
+     out, i, hits = [], 0, 0
+     while True:
+         m = _CALL.search(text, i)
+-        s = _SET.search(text, i) if stack else None
++        s = _ARGS.search(text, i)
+         if s and (not m or s.start() < m.start()):
+             j = _close(text, s.end())
+             if j is None:
+@@ -120,10 +166,9 @@ def rewrite(text, stack=False):
+             out.append(text[i:s.start()])
+             args, n = rewrite(text[s.end():j - 1], stack)
+             hits += n
+-            k = _top_comma(args)
+-            parts = _stack_split(args[:k]) if k > 0 else None
+-            if parts:
+-                out.append(f"{s.group(1)}_SP({parts[0]}, {_fmt_disp(parts[1])},{args[k + 1:]})")
++            split = _split_arg(s.group(1), args, stack)
++            if split:
++                out.append(split)
+                 hits += 1
+             else:
+                 out.append(f"{s.group(1)}({args})")
+diff --git a/tools/recomp/test_mem_disp.py b/tools/recomp/test_mem_disp.py
+index 482a045..a0e2694 100644
+--- a/tools/recomp/test_mem_disp.py
++++ b/tools/recomp/test_mem_disp.py
+@@ -50,7 +50,7 @@ def test_stack():
+     check("MEM32(esp) = MEM32(esp + - 0x4);", "MEM32_SP(esp, 0x0) = MEM32_SP(esp, -0x4);", 2, True)
+     check("MEMF_SET(_r_esp + 0x14, (float)_x87sm1);", "MEMF_SET_SP(_r_esp, 0x14, (float)_x87sm1);", 1, True)
+     check("MEMD_SET(esp, f(a, b));", "MEMD_SET_SP(esp, 0x0, f(a, b));", 1, True)
+-    check("MEMF_SET(eax + 4, MEMF(esp + 8));", "MEMF_SET(eax + 4, MEMF_SP(esp, 0x8));", 1, True)
++    check("MEMF_SET(eax + 4, MEMF(esp + 8));", "MEMF_SET_D(eax, 0x4, MEMF_SP(esp, 0x8));", 2, True)
+     check("MEM32(MEM32(_r_esp + 4) + 8)", "MEM32_D(MEM32_SP(_r_esp, 0x4), 0x8)", 2, True)
+     for src in ("MEM32(_r_esp + _r_eax * 4 + 0x10)",  # indexed: an ordinary base
+                 "MEM32(esp + 0x8000)",                 # past the small range
+@@ -59,7 +59,30 @@ def test_stack():
+         want, n = rewrite(src)
+         check(src, want, n, True)
+     # without the option the stack is an ordinary base
+-    check("MEMF_SET(esp + 4, v); MEM32(esp)", "MEMF_SET(esp + 4, v); MEM32(esp)", 0)
++    check("MEMF_SET(esp + 4, v); MEM32(esp)", "MEMF_SET_D(esp, 0x4, v); MEM32(esp)", 1)
++
++
++def test_address_arguments():
++    """The float stores and the SSE/MMX accesses: the address argument split in its place."""
++    check("MEMF_SET(_r_eax + 0xC, (float)_x87sm1);", "MEMF_SET_D(_r_eax, 0xC, (float)_x87sm1);", 1)
++    check("MEMD_SET(ebp - 8, MEMD(esi + 4));", "MEMD_SET_D(ebp, -0x8, MEMD_D(esi, 0x4));", 2)
++    check("_r_mm1 = MMX_MEM(_r_esi + 4);", "_r_mm1 = MMX_MEM_D(_r_esi, 0x4);", 1)
++    check("MMX_STORE(_r_edi + 0x38, _r_mm7);", "MMX_STORE_D(_r_edi, 0x38, _r_mm7);", 1)
++    check("xmm0 = XMM_MEM(esi + eax * 4 + 0x10);", "xmm0 = XMM_MEM_D(esi + eax * 4, 0x10);", 1)
++    check("XMM_STORE(MEM32(eax + 4) + 8, xmm1);", "XMM_STORE_D(MEM32_D(eax, 0x4), 0x8, xmm1);", 2)
++    check("XMM_LOAD_HIGH(_r_xmm2, _r_ecx + 0x18);", "XMM_LOAD_HIGH_D(_r_xmm2, _r_ecx, 0x18);", 1)
++    check("XMM_LOAD_LOW(xmm2, f(a, b) + 8);", "XMM_LOAD_LOW_D(xmm2, f(a, b), 0x8);", 1)
++    check("XMM_STORE_HIGH(_r_eax + 4, _r_xmm3);", "XMM_STORE_HIGH_D(_r_eax, 0x4, _r_xmm3);", 1)
++    check("XMM_STORE_LOW(eax - 0x10, xmm3);", "XMM_STORE_LOW_D(eax, -0x10, xmm3);", 1)
++    # stack: the float stores take the stack's form, the SIMD accesses the ordinary one
++    check("MEMF_SET(_r_esp + 0x14, x); xmm0 = XMM_MEM(esp + 0x10);",
++          "MEMF_SET_SP(_r_esp, 0x14, x); xmm0 = XMM_MEM_D(esp, 0x10);", 2, True)
++    for src in ("MMX_STORE(_r_edi, _r_mm7);",        # no displacement
++                "XMM_MEM(eax * 4 + 0x80123456)",      # a table
++                "XMM_STORE(eax + 0x8000, xmm0)",      # past the small range
++                "XMM_LOAD_HIGH(xmm0 + 4)",            # not the macro's shape
++                "MMX_MEMORY(eax + 4)", "XMM_MEMX(eax + 4)"):
++        check(src, src, 0)
+ 
+ 
+ if __name__ == "__main__":

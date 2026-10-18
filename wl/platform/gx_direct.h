@@ -85,8 +85,19 @@ typedef struct WlGxDirectLayout {
     uint8_t texcoords_projected;
     // bit n: channel n lit by the transform unit from the vertex's normal (0 COLOR0, 1 ALPHA0,
     // 2 COLOR1, 3 ALPHA1; wl_gx_direct_lighting), its vertex colour unread. The normal (three
-    // floats) is then sent after the position; not with projected coordinates.
+    // floats) is then sent after the position, and a layout's projected coordinates after it, in the
+    // binormal and tangent (the normal's and theirs at most WL_GX_DIRECT_PROJECTED in all).
     uint8_t lit;
+    // bit c: colour c (one of the layout's colours) is the same for every vertex and not sent: its
+    // unlit channels' material is the register wl_gx_direct_material set (GX_SRC_REG, the value GX
+    // would interpolate from equal vertex colours). A lit channel's material is the same register:
+    // its components there white.
+    uint8_t colors_register;
+    // of texcoords_projected, bit n: a sphere map's coordinate, its three numbers not (s, t, q) but a
+    // direction d of unit length (0 for none), from which the transform unit makes (s, t) =
+    // normalize(d + (0, 0, 1)).xy / 2 + 1/2 (its normalize and second matrix), q 1: the processor's
+    // wl_nv2a_sphere_coordinates for d's direction, in the GX's arithmetic
+    uint8_t texcoords_sphere;
 } WlGxDirectLayout;
 
 // projected coordinates a layout may have
@@ -105,15 +116,25 @@ enum {
 // The lit channels' light (WlGxDirectLayout.lit): channel n's value is
 // clamp(ambient + dot(normal_matrix * normal, direction[n]) * color[n], 0, 1) for each component it
 // has (a colour channel r, g, b, an alpha channel a; ambient that of COLOR0A0 or COLOR1A1), the dot
-// product signed (GX_DF_SIGNED) and the direction of unit length (a light at infinity).
+// product signed (GX_DF_SIGNED) and the direction of unit length (a light at infinity). A channel
+// may add more lights to its own, each a term of the same sum (extra[n]'s bit k: light 4 + k,
+// extra_direction[k] and extra_color[k]), and take each dot product's maximum with 0 rather than
+// the signed one (bit n of clamped: GX_DF_CLAMP), as a model lit by several lights is.
 typedef struct WlGxDirectLighting {
     float normal_matrix[3][3];
     float direction[4][3];
     uint8_t color[4][4];
     uint8_t ambient[2][4];
+    float extra_direction[4][3];
+    uint8_t extra_color[4][4];
+    uint8_t extra[4];
+    uint8_t clamped;
 } WlGxDirectLighting;
 // The light of the lit channels, for the draws that follow (set after the layout).
 void wl_gx_direct_lighting(const WlGxDirectLighting *lighting);
+// The colour (0xRRGGBBAA) of colour c of a layout that takes it from the register
+// (WlGxDirectLayout.colors_register), for the draws that follow (set after the layout and the lighting).
+void wl_gx_direct_material(unsigned c, uint32_t rgba);
 
 // what a texture coordinate is generated from (wl_gx_direct_texgen)
 typedef enum {
@@ -153,6 +174,11 @@ void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t c
 // words for each
 void wl_gx_direct_vertices_index(const uint32_t *indices, uint32_t base, uint32_t n, const uint32_t *words,
                                  uint32_t count);
+// `n` vertices of a layout whose position alone is indexed: vertex v's position index
+// indices[first + v] - base (indices NULL: first + v), then `count` words of its own from
+// vertices[v] + skip, as wl_gx_direct_vertices_words takes them (the position's words left out).
+void wl_gx_direct_vertices_position_index(const uint32_t *indices, uint32_t base, uint32_t first, uint32_t n,
+                                          const uint32_t *const *vertices, uint32_t skip, uint32_t count);
 // Memory an array was read from has changed: GX's vertex cache emptied.
 void wl_gx_direct_arrays_changed(void);
 // A raster state change (an EFB copy, a token, a draw-done): the next draw is flushed first.
@@ -177,6 +203,14 @@ typedef struct {
     // the depth on a console (a10's light beams and characters through walls, the Wii only):
     bool late_z;    // the depth test always after texturing (GX_SetZCompLoc(GX_FALSE): no early Z)
     bool vtx_inval; // GX's vertex cache invalidated before every primitive (stale indexed vertices)
+    // the old ways, for an A/B on the console (the same bytes reach GX either way):
+    bool pipe32;      // a vertex's words put in the FIFO a word a store (not two a move: lfd, stfd)
+    bool copy_filter; // the copy filter written around each texture copy out of the EFB (not only when it changes)
+    bool restore_whole; // the back buffer's restore puts back all it parked (not only what targets drew over)
+    bool tlut_always;   // a colour-indexed texture's TLUT loaded at each bind (not only when its slot holds other bytes)
+    bool regions_libogc; // libogc's texture cache regions (32K + 32K a map; not 128K + 128K for maps 0-2)
+    bool tex_whole;      // a bind that changes anything is GX_LoadTexObj's whole load (not only its registers that differ)
+    bool arrays_always;  // GX_SetArray at each call (not only when its base or stride differs)
 } WlGxBisect;
 void wl_gx_bisect_set(const WlGxBisect *bisect);
 // The switches set (all off before wl_gx_bisect_set).
@@ -218,6 +252,16 @@ typedef struct WlGxDirectStats {
     // GX calls the state setters and wl_tev_apply asked for, and of those the ones sent (the rest
     // GX held already: gx_shadow.h; counted alike on the host)
     uint32_t state_calls, state_sent;
+    // TLUT (palette) loads the colour-indexed textures asked for, and of those the ones sent (the rest
+    // found their slot holding the same bytes: gx_shadow.h; counted alike on the host)
+    uint32_t tlut_calls, tlut_sent;
+    // texture binds asked for, the ones that wrote something, of those the whole loads (GX_LoadTexObj),
+    // and the BP writes they made (gx_shadow.h; counted alike on the host)
+    uint32_t tex_binds, tex_changed, tex_loads, tex_writes;
+    // GX_SetArray calls asked for and sent
+    uint32_t array_calls, array_sent;
+    // the FIFO's bytes by kind (WlGxFifoKind: a model, gx_shadow.h)
+    uint64_t fifo[8];
 } WlGxDirectStats;
 void wl_gx_direct_stats(WlGxDirectStats *out);
 

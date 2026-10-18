@@ -149,3 +149,42 @@ void wl_mem_census_log(const char *tag, bool heap_only) {
     }
     WL_LOG_I(tag, "census KB: %s", line);
 }
+
+// ---- the reclaimer --------------------------------------------------------------------------
+
+static WlHeapReclaimFn g_reclaim_fn;
+static void *g_reclaim_user;
+static uint32_t g_reclaim_busy; // 1 while it runs
+static WlHeapReclaimStats g_reclaim_st; // (written by the one caller at a time; busy atomically)
+
+bool wl_platform_heap_set_reclaim(WlHeapReclaimFn fn, void *user) {
+    __atomic_store_n(&g_reclaim_fn, NULL, __ATOMIC_RELEASE);
+    g_reclaim_user = user;
+    __atomic_store_n(&g_reclaim_fn, fn, __ATOMIC_RELEASE); // last: a caller sees its user too
+    return wl_platform_heap_reclaims();
+}
+
+size_t wl_platform_heap_reclaim(size_t want) {
+    WlHeapReclaimFn fn = __atomic_load_n(&g_reclaim_fn, __ATOMIC_ACQUIRE);
+    if (fn == NULL) {
+        return 0;
+    }
+    if (__atomic_exchange_n(&g_reclaim_busy, 1u, __ATOMIC_ACQUIRE) != 0) {
+        __atomic_add_fetch(&g_reclaim_st.busy, 1u, __ATOMIC_RELAXED);
+        return 0;
+    }
+    size_t got = fn(g_reclaim_user, want);
+    g_reclaim_st.calls++;
+    g_reclaim_st.gave += got != 0;
+    g_reclaim_st.bytes += got;
+    if (want > g_reclaim_st.largest_want) {
+        g_reclaim_st.largest_want = want;
+    }
+    __atomic_store_n(&g_reclaim_busy, 0u, __ATOMIC_RELEASE);
+    return got;
+}
+
+void wl_platform_heap_reclaim_stats(WlHeapReclaimStats *out) {
+    *out = g_reclaim_st;
+    out->busy = __atomic_load_n(&g_reclaim_st.busy, __ATOMIC_RELAXED);
+}

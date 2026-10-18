@@ -18,6 +18,7 @@ wl_add_test(test_platform_posix SOURCES test_platform_posix.c suite_posix.c LIBS
 # Crash-safe file replacement and the sweep after a cut one; the directory listing cache (POSIX paths, a temp folder).
 wl_add_test(test_platform_file_replace SOURCES test_platform_file_replace.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_dircache SOURCES test_platform_dircache.c LIBS wl_platform LABELS unit be)
+wl_add_test(test_platform_fat_map SOURCES test_platform_fat_map.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_random SOURCES test_platform_random.c LIBS wl_platform LABELS unit be)
 # The time base's conversions (timebase.h) against a bit-by-bit division: edges, wrap, random counts.
 wl_add_test(test_platform_timebase SOURCES test_platform_timebase.c LIBS wl_platform LABELS unit be)
@@ -28,6 +29,8 @@ wl_add_test(test_platform_thread SOURCES test_platform_thread.c suite_threads.c 
 
 # TEV programs: the builder, validator and evaluator (portable, also on ppc-be) ...
 wl_add_test(test_platform_tev SOURCES test_platform_tev.c LIBS wl_platform LABELS unit be)
+# The shadow of the texture maps' registers and the vertex arrays (gx_shadow.c), shared by both backends.
+wl_add_test(test_platform_gx_shadow SOURCES test_platform_gx_shadow.c LIBS wl_platform LABELS unit be)
 
 # ... and the Wii apply step (wii/tev_wii.c) compiled against a recording stand-in for libogc's GX.
 # It must not link wl_platform, whose host backend has its own wl_tev_apply_unchecked.
@@ -108,3 +111,18 @@ wl_add_test(test_platform_audio_fade SOURCES test_platform_audio_fade.c LIBS wl_
 wl_add_test(test_platform_home_menu SOURCES test_platform_home_menu.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_strap_screen SOURCES test_platform_strap_screen.c LIBS wl_platform LABELS unit be)
 wl_add_test(test_platform_home_shell SOURCES test_platform_home_shell.c LIBS wl_platform LABELS unit be)
+# The Broadway block operations (memfast.h) against the C library at every length 0..300 and
+# alignment, plain and as the program's memcpy & co. through --wrap (the file compiled in, with the
+# switch off and on); bench_memfast counts them under qemu (tools/qemu_icount.py).
+wl_add_test(test_platform_memfast SOURCES test_platform_memfast.c LIBS wl_platform LABELS unit be)
+wl_add_test(test_platform_memfast_wrap SOURCES test_platform_memfast.c ${PROJECT_SOURCE_DIR}/wl/platform/wii/memfast_wii.c
+            LIBS wl_platform LABELS unit be)
+target_compile_definitions(test_platform_memfast_wrap PRIVATE WL_MEMFAST_WRAP=1 WL_MEMFAST_HIST=1)
+target_link_options(test_platform_memfast_wrap PRIVATE "LINKER:--wrap=memcpy,--wrap=memmove,--wrap=memset,--wrap=memcmp")
+set_source_files_properties(${PROJECT_SOURCE_DIR}/wl/platform/wii/memfast_wii.c PROPERTIES
+                            COMPILE_OPTIONS "-fno-builtin;-fno-tree-loop-distribute-patterns")
+add_executable(bench_memfast bench_memfast.c)
+wl_target_defaults(bench_memfast)
+target_link_libraries(bench_memfast PRIVATE wl_platform)
+add_test(NAME bench_memfast_runs COMMAND bench_memfast copy fast 300 3 1 10)
+set_tests_properties(bench_memfast_runs PROPERTIES LABELS "unit;be")

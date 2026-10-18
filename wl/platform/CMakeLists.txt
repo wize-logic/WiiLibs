@@ -6,8 +6,8 @@
 #   ppc-be - the host stubs too (big-endian Linux under qemu, for tests)
 add_library(wl_platform STATIC
     mem_heap.c mem.c mem_census.c heap_overflow.c heap_sites.c ring.c io.c fs.c gx_common.c gx_shadow.c gx_target.c gx_vertex.c stack.c tev.c backtrace.c net.c net_stream.c
-    posix.c present.c video_mode.c profile.c profile_arm.c hwcount.c hwcount_app.c stop.c input_shape.c input_reports.c input_gesture.c shutdown.c gx_fifo.c audio_gain.c overlay.c file_replace.c dircache.c
-    home_menu.c home_menu_draw.c strap_screen.c strap_screen_draw.c home_shell.c)
+    posix.c fat_map.c fs_speed.c present.c video_mode.c profile.c profile_arm.c hwcount.c hwcount_app.c stop.c input_shape.c input_reports.c input_gesture.c shutdown.c gx_fifo.c audio_gain.c overlay.c file_replace.c dircache.c
+    home_menu.c home_menu_draw.c strap_screen.c strap_screen_draw.c home_shell.c wii/memfast_wii.c)
 wl_target_defaults(wl_platform)
 wl_gpu_path(wl_platform)
 target_link_libraries(wl_platform PUBLIC wl_base m)
@@ -31,6 +31,28 @@ else()
     endif()
 endif()
 add_library(WiiLibs::platform ALIAS wl_platform)
+# memcpy, memmove, memset and memcmp tuned for Broadway (memfast.h): the same C on every target for
+# the tests; the loops in it must not become calls of the functions it replaces.
+set_source_files_properties(wii/memfast_wii.c PROPERTIES COMPILE_OPTIONS "-fno-builtin;-fno-tree-loop-distribute-patterns")
+# On the Wii every program that links wl_platform has them as its memcpy & co. (the libraries' and
+# libogc's and newlib's calls too) through the linker's --wrap; -u pulls the wrappers out of the
+# archive even when only libc's objects call them. On the host it is for a run that proves them in a
+# title (dynamic glibc keeps its own internal calls). WL_MEMFAST_HIST counts the calls by length.
+if(WL_PLATFORM STREQUAL "wii")
+    set(WL_MEMFAST_WRAP_DEFAULT ON)
+else()
+    set(WL_MEMFAST_WRAP_DEFAULT OFF)
+endif()
+option(WL_MEMFAST_WRAP "memcpy, memmove, memset and memcmp are wl/platform/memfast.h's (--wrap)" ${WL_MEMFAST_WRAP_DEFAULT})
+option(WL_MEMFAST_HIST "Count memcpy, memmove, memset and memcmp calls by length (wl_memfast_hist_write)" OFF)
+if(WL_MEMFAST_WRAP)
+    target_compile_definitions(wl_platform PRIVATE WL_MEMFAST_WRAP=1)
+    target_link_options(wl_platform INTERFACE
+        "LINKER:--wrap=memcpy,--wrap=memmove,--wrap=memset,--wrap=memcmp" "LINKER:-u,__wrap_memcpy")
+endif()
+if(WL_MEMFAST_HIST)
+    target_compile_definitions(wl_platform PRIVATE WL_MEMFAST_HIST=1)
+endif()
 # Each direct-layer draw's GX state checked on the Wii (gx_direct.h, wl_gx_check_draw): findings
 # logged under [GXCHECK]. Off: no cost.
 option(WL_GX_CHECK "Check each GX draw's state on the Wii and log what the console's GPU cannot draw" OFF)

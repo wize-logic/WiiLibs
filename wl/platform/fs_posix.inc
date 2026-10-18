@@ -6,7 +6,11 @@
 //   static WlResult fs_resolve(const char *path, char *out, size_t cap);
 // which checks the device prefix and mount state and writes the path to hand to the C library.
 // Unbuffered fds are used on purpose: stdio's 1 KiB default buffer would split large reads into
-// many small SD transfers.
+// many small SD transfers. The including file also defines
+//   static WlResult fs_fast_read(WlPlatformFile *file, uint64_t offset, void *dst, uint32_t size);
+//   static void fs_fast_forget(WlPlatformFile *file);
+// the device's own read of a file's bytes, past the C library (WL_ERR_UNSUPPORTED: read through
+// it), and the end of what it keeps for a handle (its `fast`).
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -14,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -26,9 +31,98 @@ struct WlPlatformFile {
     const uint8_t *virt;        // a virtual file's bytes (fd is -1): read-only, see wl_platform_fs_virtual_set
     bool dirty;                 // something was written through this handle
     char wpath[WL_FS_PATH_MAX]; // the path of a file opened for writing while a written hook is set
+    char path[WL_FS_PATH_MAX];  // as opened (the device's own reads: who else writes it)
+    bool writer;                // opened for writing
+    bool partial;               // written in part of a sector since its last flush
+    atomic_bool stale;          // its clusters may have changed: the device's own reads map it again
+    void *fast;                 // the backend's (fs_fast_read)
 };
 
 static WlPlatformFile g_files[WL_FS_MAX_FILES];
+static atomic_bool g_fast_on = true;
+
+// The reads' counters (wl_platform_fs_reads): 32-bit atomics, modulo 2^32
+static atomic_uint g_rd_calls, g_rd_bytes, g_rd_us, g_rd_fast_calls, g_rd_fast_bytes, g_rd_fast_us, g_rd_transfers;
+
+void wl_platform_fs_fast_set(bool on) {
+    atomic_store(&g_fast_on, on);
+}
+
+bool wl_platform_fs_fast(void) {
+    return atomic_load(&g_fast_on);
+}
+
+void wl_platform_fs_reads(WlPlatformFsReads *out) {
+    if (out != NULL) {
+        out->calls = atomic_load(&g_rd_calls);
+        out->bytes = atomic_load(&g_rd_bytes);
+        out->us = atomic_load(&g_rd_us);
+        out->fast_calls = atomic_load(&g_rd_fast_calls);
+        out->fast_bytes = atomic_load(&g_rd_fast_bytes);
+        out->fast_us = atomic_load(&g_rd_fast_us);
+        out->transfers = atomic_load(&g_rd_transfers);
+    }
+}
+
+static inline void fs_count_transfers(uint32_t n) {
+    atomic_fetch_add(&g_rd_transfers, n);
+}
+
+static void fs_count_read(bool fast, uint32_t bytes, uint64_t us) {
+    atomic_fetch_add(&g_rd_calls, 1u);
+    atomic_fetch_add(&g_rd_bytes, bytes);
+    atomic_fetch_add(&g_rd_us, (unsigned)us);
+    if (fast) {
+        atomic_fetch_add(&g_rd_fast_calls, 1u);
+        atomic_fetch_add(&g_rd_fast_bytes, bytes);
+        atomic_fetch_add(&g_rd_fast_us, (unsigned)us);
+    }
+}
+
+// Every open handle of `path` (FAT folds case) told its clusters may have changed, but `except`.
+static void fs_path_changed(const char *path, const WlPlatformFile *except) {
+    for (uint32_t i = 0; i < WL_FS_MAX_FILES; i++) {
+        WlPlatformFile *o = &g_files[i];
+        if (o != except && atomic_load(&o->busy) && o->fd >= 0 && strcasecmp(o->path, path) == 0) {
+            atomic_store(&o->stale, true);
+        }
+    }
+}
+
+// Whether another open handle writes `file`'s file: its bytes may be in libfat's buffers only.
+static bool fs_other_writer(const WlPlatformFile *file) {
+    for (uint32_t i = 0; i < WL_FS_MAX_FILES; i++) {
+        const WlPlatformFile *o = &g_files[i];
+        if (o != file && atomic_load(&o->busy) && o->writer && o->fd >= 0 && strcasecmp(o->path, file->path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A write of [offset, offset + size) through `file`: a part sector waits in libfat's buffer until a
+// flush, and clusters added past the end change the file's chain (every handle's map, its own too).
+static void fs_note_write(WlPlatformFile *file, uint64_t offset, uint32_t size, uint64_t old_size) {
+    if ((offset | size) % 512u != 0u) {
+        file->partial = true;
+    }
+    if (offset + size > old_size) {
+        fs_path_changed(file->path, NULL);
+    }
+}
+
+// The device's own read of the whole request, when it can: WL_ERR_UNSUPPORTED else.
+static WlResult fs_read_fast(WlPlatformFile *file, uint64_t offset, void *dst, uint32_t size) {
+    if (!atomic_load(&g_fast_on) || file->fd < 0 || fs_other_writer(file)) {
+        return WL_ERR_UNSUPPORTED;
+    }
+    uint64_t t0 = wl_platform_fs_clock_us();
+    WlResult r = fs_fast_read(file, offset, dst, size);
+    if (r != WL_ERR_UNSUPPORTED) {
+        fs_count_read(true, r == WL_OK ? size : 0u, wl_platform_fs_clock_us() - t0);
+    }
+    return r;
+}
 
 // ---- virtual files and the written hook (platform.h) ---------------------------------------------
 
@@ -134,6 +228,10 @@ WlResult wl_platform_fs_open(const char *path, WlPlatformFileMode mode, WlPlatfo
             vf->virt = bytes;
             vf->dirty = false;
             vf->wpath[0] = '\0';
+            vf->path[0] = '\0';
+            vf->writer = false;
+            vf->partial = false;
+            vf->fast = NULL;
             *out = vf;
             return WL_OK;
         }
@@ -172,12 +270,22 @@ WlResult wl_platform_fs_open(const char *path, WlPlatformFileMode mode, WlPlatfo
     f->virt = NULL;
     f->dirty = false;
     f->wpath[0] = '\0';
+    snprintf(f->path, sizeof f->path, "%s", path);
+    f->writer = mode != WL_FILE_READ;
+    f->partial = false;
+    f->fast = NULL;
+    atomic_store(&f->stale, true);
+    if (f->writer) {
+        fs_path_changed(path, f); // (WRITE_NEW truncated it: the others' maps are old)
+    }
     if (mode != WL_FILE_READ && g_written_fn != NULL) {
         snprintf(f->wpath, sizeof f->wpath, "%s", path);
     }
     *out = f;
     return WL_OK;
 }
+
+static WlResult fs_read_c(WlPlatformFile *file, uint64_t offset, void *dst, uint32_t size);
 
 WlResult wl_platform_fs_read_at(WlPlatformFile *file, uint64_t offset, void *dst, uint32_t size) {
     if (file == NULL || (dst == NULL && size > 0)) {
@@ -196,6 +304,18 @@ WlResult wl_platform_fs_read_at(WlPlatformFile *file, uint64_t offset, void *dst
         memcpy(dst, file->virt + offset, size);
         return WL_OK;
     }
+    WlResult fr = fs_read_fast(file, offset, dst, size);
+    if (fr != WL_ERR_UNSUPPORTED) {
+        return fr;
+    }
+    uint64_t t0 = wl_platform_fs_clock_us();
+    WlResult r = fs_read_c(file, offset, dst, size);
+    fs_count_read(false, r == WL_OK ? size : 0u, wl_platform_fs_clock_us() - t0);
+    return r;
+}
+
+// The C library's read of all `size` bytes at `offset`.
+static WlResult fs_read_c(WlPlatformFile *file, uint64_t offset, void *dst, uint32_t size) {
     if (lseek(file->fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
         return WL_ERR_IO;
     }
@@ -226,6 +346,8 @@ WlResult wl_platform_fs_write(WlPlatformFile *file, const void *src, uint32_t si
         return WL_ERR_DENIED;
     }
     file->dirty = true;
+    off_t start = lseek(file->fd, 0, SEEK_CUR);
+    fs_note_write(file, start >= 0 ? (uint64_t)start : 0u, size, start >= 0 ? file->size : 0u);
     const uint8_t *p = src;
     uint32_t left = size;
     while (left > 0) {
@@ -253,7 +375,14 @@ WlResult wl_platform_fs_flush(WlPlatformFile *file) {
     if (file == NULL) {
         return WL_ERR_ARG;
     }
-    return file->virt != NULL || fsync(file->fd) == 0 ? WL_OK : WL_ERR_IO;
+    if (file->virt != NULL) {
+        return WL_OK;
+    }
+    if (fsync(file->fd) != 0) {
+        return WL_ERR_IO;
+    }
+    file->partial = false;
+    return WL_OK;
 }
 
 uint64_t wl_platform_fs_size(const WlPlatformFile *file) {
@@ -269,13 +398,19 @@ void wl_platform_fs_close(WlPlatformFile *file) {
     if (notify) {
         memcpy(written, file->wpath, sizeof written);
     }
+    fs_fast_forget(file);
     if (file->fd >= 0) {
         close(file->fd);
+        if (file->writer) {
+            fs_path_changed(file->path, file); // (closed: what it wrote is on the device)
+        }
     }
     file->fd = -1;
     file->virt = NULL;
     file->dirty = false;
     file->wpath[0] = '\0';
+    file->path[0] = '\0';
+    file->writer = false;
     atomic_store(&file->busy, false);
     if (notify) {
         wl_platform_fs_notify_written(written);
@@ -375,6 +510,7 @@ WlResult wl_platform_fs_write_at(WlPlatformFile *file, uint64_t offset, const vo
         return WL_ERR_DENIED;
     }
     file->dirty = true;
+    fs_note_write(file, offset, size, file->size);
     if (lseek(file->fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
         return WL_ERR_IO;
     }
@@ -402,6 +538,12 @@ WlResult wl_platform_fs_read_some_at(WlPlatformFile *file, uint64_t offset, void
         *got = size;
         return WL_OK;
     }
+    WlResult fr = fs_read_fast(file, offset, dst, size);
+    if (fr != WL_ERR_UNSUPPORTED) {
+        *got = fr == WL_OK ? size : 0u;
+        return fr;
+    }
+    uint64_t t0 = wl_platform_fs_clock_us();
     if (lseek(file->fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
         return WL_ERR_IO;
     }
@@ -419,6 +561,7 @@ WlResult wl_platform_fs_read_some_at(WlPlatformFile *file, uint64_t offset, void
         }
         *got += (uint32_t)n;
     }
+    fs_count_read(false, *got, wl_platform_fs_clock_us() - t0);
     return WL_OK;
 }
 
@@ -433,6 +576,7 @@ WlResult wl_platform_fs_truncate(WlPlatformFile *file, uint64_t size) {
         return WL_ERR_DENIED;
     }
     file->dirty = true;
+    fs_path_changed(file->path, NULL); // (clusters freed or added)
     if (ftruncate(file->fd, (off_t)size) != 0) {
         return WL_ERR_IO;
     }

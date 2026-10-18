@@ -367,7 +367,9 @@ unsigned wl_nv2a_fetch_fused_format(const WlNv2aFetchPlan *plan, unsigned i) {
     case FETCH_CMP: return WL_XBOX_VSH_FUSED_CMP;
     case FETCH_S1: return size >= 1u && size <= 4u ? WL_XBOX_VSH_FUSED_S1 + size - 1u : WL_XBOX_VSH_FUSED_FORMATS;
     case FETCH_UB: return size >= 1u && size <= 4u ? WL_XBOX_VSH_FUSED_UB + size - 1u : WL_XBOX_VSH_FUSED_FORMATS;
-    default: return WL_XBOX_VSH_FUSED_FORMATS;
+    default:
+        return plan->streamed[i].type == WL_NV2A_VTX_S32K && size >= 1u && size <= 4u ? WL_XBOX_VSH_FUSED_S32K + size - 1u
+                                                                                      : WL_XBOX_VSH_FUSED_FORMATS;
     }
 }
 
@@ -678,10 +680,22 @@ void wl_nv2a_kelvin_init(WlNv2a *dev) {
     k->dirty = WL_NV2A_DIRTY_ALL;
 }
 
+// the transform program's and constants' windows (0xB00-0xBFC): their own storage, the slot moving on
+// after the fourth word
+#define WINDOWS_SIZE (WL_NV2A_K_SET_TRANSFORM_CONSTANT + 0x80u - WL_NV2A_K_SET_TRANSFORM_PROGRAM)
+
 // what each method is, decided once (the dispatch's tests per method, from a table): known, an
 // immediate vertex method, plain (a value kept and nothing else: no window, no case of
-// wl_nv2a_kelvin_method's switch), and its dirty group
-enum { METHOD_KNOWN = 0x8000u, METHOD_IMMEDIATE = 0x4000u, METHOD_PLAIN = 0x2000u, METHOD_DIRTY = 0x1FFFu };
+// wl_nv2a_kelvin_method's switch), and its dirty group; for the pusher, a method a run may start at
+// (wl_nv2a_bulk_method's own tests), or in a window
+enum {
+    METHOD_KNOWN = 0x8000u,
+    METHOD_IMMEDIATE = 0x4000u,
+    METHOD_PLAIN = 0x2000u,
+    METHOD_BULK = 0x1000u,
+    METHOD_WINDOW = 0x0800u,
+    METHOD_DIRTY = 0x03FFu
+};
 static uint16_t g_method_info[WL_NV2A_K_METHODS / 4];
 
 static uint32_t dirty_group(uint32_t method) {
@@ -777,8 +791,13 @@ static void method_info_make(void) {
     for (m = 0; m < WL_NV2A_K_METHODS; m += 4) {
         bool known = known_method(m);
 
+        bool bulk = m >= 0x100u && m != WL_NV2A_K_NO_OPERATION &&
+                    !(m >= WL_NV2A_PULLER_HANDLE_FIRST && m <= WL_NV2A_PULLER_HANDLE_LAST);
+        bool window = m - WL_NV2A_K_SET_TRANSFORM_PROGRAM < WINDOWS_SIZE;
+
         g_method_info[m >> 2] = (uint16_t)((known ? METHOD_KNOWN : 0u) | (immediate_range(m) ? METHOD_IMMEDIATE : 0u) |
-                                           (known && !special_method(m) ? METHOD_PLAIN : 0u) | dirty_group(m));
+                                           (known && !special_method(m) ? METHOD_PLAIN : 0u) |
+                                           (bulk ? METHOD_BULK : 0u) | (window ? METHOD_WINDOW : 0u) | dirty_group(m));
     }
 }
 
@@ -1405,10 +1424,6 @@ static bool immediate_range(uint32_t method) {
 
 // ---- the dispatch -----------------------------------------------------------------------------
 
-// the transform program's and constants' windows (0xB00-0xBFC): their own storage, the slot moving on
-// after the fourth word
-#define WINDOWS_SIZE (WL_NV2A_K_SET_TRANSFORM_CONSTANT + 0x80u - WL_NV2A_K_SET_TRANSFORM_PROGRAM)
-
 static inline void window_word(WlNv2aKelvin *k, uint32_t method, uint32_t param) {
     unsigned word = (method >> 2) & 3u;
 
@@ -1603,31 +1618,68 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
     }
 }
 
+// (a slot's words read and written as words, whether they are a program's or a constant's floats)
+typedef uint32_t __attribute__((may_alias)) SlotWord;
+
+// one slot's four words from the push buffer at `w` into `slot` (a program's words, or a constant's
+// bits): the words that change counted, as window_word counts them one by one
+static inline __attribute__((always_inline)) uint32_t slot_words(void *slot, const uint8_t *w) {
+    SlotWord *s = slot;
+    uint32_t a = wl_rd_le32(w), b = wl_rd_le32(w + 4), c = wl_rd_le32(w + 8), d = wl_rd_le32(w + 12);
+    uint32_t changes = (uint32_t)(s[0] != a) + (uint32_t)(s[1] != b) + (uint32_t)(s[2] != c) + (uint32_t)(s[3] != d);
+
+    s[0] = a;
+    s[1] = b;
+    s[2] = c;
+    s[3] = d;
+    return changes;
+}
+
 // an increasing run inside one of the windows (wl_nv2a_kelvin_push: `method` and the run's last word
-// in the same window): what window_word makes of each word, the slot and its bound kept here
+// in the same window): what window_word makes of each word, the slot and its bound kept here; the
+// slots the run fills whole, four words at once
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-shrink-wrap-separate")))
+#endif
 static __attribute__((noinline)) void window_run(WlNv2aKelvin *k, uint32_t method, const uint8_t *words,
                                                  uint32_t count) {
+    bool program = method < WL_NV2A_K_SET_TRANSFORM_CONSTANT;
     unsigned word = (method >> 2) & 3u, last = word;
-    uint32_t n, changes = 0;
+    uint32_t load = program ? k->program_load : k->constant_load;
+    uint32_t bound = program ? WL_NV2A_PROGRAM_SLOTS : WL_NV2A_CONSTANTS;
+    uint32_t n = 0, changes = 0;
 
-    if (method < WL_NV2A_K_SET_TRANSFORM_CONSTANT) {
-        uint32_t load = k->program_load;
+    while (n < count) {
+        if (word == 0 && count - n >= 4u && load < bound) {
+            void *slot = program ? (void *)k->program[load] : (void *)k->constants[load];
 
-        for (n = 0; n < count; n++) {
-            uint32_t param = wl_rd_le32(words + 4u * n);
+            changes += slot_words(slot, words + 4u * n);
+            n += 4u;
+            load++;
+            last = 3;
+            continue;
+        }
+        if (load < bound) {
+            uint32_t param = wl_rd_le32(words + 4u * n), old;
+            void *at = program ? (void *)&k->program[load][word] : (void *)&k->constants[load][word];
 
-            if (load < WL_NV2A_PROGRAM_SLOTS && k->program[load][word] != param) {
-                k->program[load][word] = param;
+            // (the bits compared, as window_word's memcmp)
+            memcpy(&old, at, sizeof old);
+            if (old != param) {
+                memcpy(at, &param, sizeof param);
                 changes++;
             }
-            last = word;
-            if (word == 3) {
-                load++;
-                word = 0;
-            } else {
-                word++;
-            }
         }
+        n++;
+        last = word;
+        if (word == 3) {
+            load++;
+            word = 0;
+        } else {
+            word++;
+        }
+    }
+    if (program) {
         if (changes != 0) {
             k->program_generation += changes;
             k->dirty |= WL_NV2A_DIRTY_PROGRAM;
@@ -1636,35 +1688,12 @@ static __attribute__((noinline)) void window_run(WlNv2aKelvin *k, uint32_t metho
         k->program_word = last;
         return;
     }
-    {
-        uint32_t load = k->constant_load;
-
-        for (n = 0; n < count; n++) {
-            uint32_t param = wl_rd_le32(words + 4u * n), old;
-
-            if (load < WL_NV2A_CONSTANTS) {
-                // (the bits compared, as window_word's memcmp)
-                memcpy(&old, &k->constants[load][word], sizeof old);
-                if (old != param) {
-                    memcpy(&k->constants[load][word], &param, sizeof param);
-                    changes++;
-                }
-            }
-            last = word;
-            if (word == 3) {
-                load++;
-                word = 0;
-            } else {
-                word++;
-            }
-        }
-        if (changes != 0) {
-            k->constants_generation += changes;
-            k->dirty |= WL_NV2A_DIRTY_CONSTANTS;
-        }
-        k->constant_load = load;
-        k->constant_word = last;
+    if (changes != 0) {
+        k->constants_generation += changes;
+        k->dirty |= WL_NV2A_DIRTY_CONSTANTS;
     }
+    k->constant_load = load;
+    k->constant_word = last;
 }
 
 // how many of a run's `left` words at `w` to read before asking for the next line: to the end of
@@ -1782,19 +1811,25 @@ uint32_t wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, c
                        increasing, words, count);
 }
 
+// the pusher's header loop as it was before (wl_nv2a_set_old_push: a file "oldpush" in the title's
+// folder, for an A/B on the console)
+static bool g_old_push;
+
+void wl_nv2a_set_old_push(bool on) {
+    g_old_push = on;
+}
+
 // (GCC saved and restored the registers the runs take around each header, inside the loop: once, at
 // the entry, they cost a tenth of the pusher's instructions less)
 #if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("no-shrink-wrap-separate")))
 #endif
-uint32_t wl_nv2a_kelvin_push(WlNv2a *dev, WlNv2aChannel *ch, const uint8_t *words, uint32_t avail) {
+static __attribute__((noinline)) uint32_t push_old(WlNv2a *dev, WlNv2aChannel *ch, const uint8_t *words,
+                                                   uint32_t avail) {
     uint32_t taken = 0, last_method = 0;
     unsigned last_subchannel = 0;
     bool last_non_increasing = false;
 
-    if (g_method_info[0] == 0) {
-        method_info_make();
-    }
     while (avail - taken >= 2u && !ch->suspended) {
         uint32_t header = wl_rd_le32(words + 4u * taken), type = header & WL_NV2A_CMD_TYPE_MASK;
         uint32_t method, count, run, done;
@@ -1840,6 +1875,162 @@ uint32_t wl_nv2a_kelvin_push(WlNv2a *dev, WlNv2aChannel *ch, const uint8_t *word
         ch->subchannel = (uint8_t)last_subchannel;
         ch->count = 0;
         ch->non_increasing = last_non_increasing;
+    }
+    return taken;
+}
+
+// an increasing run of `count` words from `method` on, inside the methods' space: a plain method's
+// word kept (its dirty groups gathered here and stored once, before any other method's work and at
+// the end), any other through what methods_run makes of it; the words taken (fewer when a method
+// stops the channel)
+static inline __attribute__((always_inline)) uint32_t increasing_run(WlNv2a *dev, const WlNv2aChannel *ch,
+                                                                     uint32_t method, const uint8_t *words,
+                                                                     uint32_t count) {
+    WlNv2aKelvin *k = &dev->kelvin;
+    const uint16_t *infos = &g_method_info[method >> 2];
+    uint32_t *raw = &k->raw[method >> 2];
+    uint32_t dirty = 0, n;
+
+    for (n = 0; n < count; n++) {
+        uint32_t param = wl_rd_le32(words + 4u * n), info = infos[n], m;
+
+        if (info & METHOD_PLAIN) {
+            if (raw[n] != param) {
+                raw[n] = param;
+                dirty |= info;
+            }
+            continue;
+        }
+        k->dirty |= dirty & METHOD_DIRTY;
+        dirty = 0;
+        m = method + 4u * n;
+        if (info & METHOD_IMMEDIATE) {
+            raw[n] = param;
+            immediate_method(dev, m, param);
+            continue;
+        }
+        if (info & METHOD_WINDOW) {
+            window_word(k, m, param);
+            continue;
+        }
+        wl_nv2a_kelvin_method(dev, m, param);
+        if (ch->suspended) {
+            // (a method stopped the channel: the rest of the run after it)
+            return n + 1u;
+        }
+    }
+    k->dirty |= dirty & METHOD_DIRTY;
+    return count;
+}
+// (as push_old, with the header's tests from the method table, a header of one word to a plain
+// method on a path of its own (most of a title's headers: its render states), each kind of run to a
+// loop of its own, the dirty groups and the methods gathered here: the channel is looked at for a
+// stop only after a method that may stop it, and the subchannels bound to the 3D object once, as no
+// method a run takes binds one)
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-shrink-wrap-separate")))
+#endif
+uint32_t wl_nv2a_kelvin_push(WlNv2a *dev, WlNv2aChannel *ch, const uint8_t *words, uint32_t avail) {
+    WlNv2aKelvin *k = &dev->kelvin;
+    uint32_t taken = 0, methods = 0, last_header = 0, dirty = 0, kelvin = 0;
+    unsigned s;
+    bool prefetch;
+
+    if (g_method_info[0] == 0) {
+        method_info_make();
+    }
+    if (g_old_push) {
+        return push_old(dev, ch, words, avail);
+    }
+    prefetch = wl_nv2a_prefetching();
+    for (s = 0; s < WL_NV2A_SUBCHANNELS; s++) {
+        kelvin |= (uint32_t)(ch->subchannel_class[s] == WL_NV2A_CLASS_KELVIN) << s;
+    }
+    while (avail - taken >= 2u) {
+        const uint8_t *at = words + 4u * taken;
+        uint32_t header = wl_rd_le32(at), method, count, run, done, info;
+
+        if (prefetch) {
+            // (the headers and short runs that follow: the line WL_NV2A_PUSH_AHEAD on asked for)
+            WL_NV2A_PREFETCH(at + WL_NV2A_PUSH_AHEAD);
+        }
+        // (a header, increasing or not, to the 3D object: what the pusher takes it for when it is not
+        // a jump, a call or a return, which never match these bits)
+        if ((header & (WL_NV2A_CMD_TYPE_MASK & ~WL_NV2A_CMD_NON_INCREASING)) != 0 ||
+            !((kelvin >> ((header >> WL_NV2A_CMD_SUBCH_SHIFT) & 7u)) & 1u)) {
+            break;
+        }
+        method = header & WL_NV2A_CMD_METHOD_MASK;
+        info = g_method_info[method >> 2];
+        if ((header & (WL_NV2A_CMD_NON_INCREASING | WL_NV2A_CMD_COUNT_MASK << WL_NV2A_CMD_COUNT_SHIFT)) ==
+                1u << WL_NV2A_CMD_COUNT_SHIFT &&
+            (info & (METHOD_PLAIN | METHOD_BULK)) == (METHOD_PLAIN | METHOD_BULK)) {
+            // (one word to a plain method: its value kept, as increasing_run keeps it)
+            uint32_t param = wl_rd_le32(at + 4), *raw = &k->raw[method >> 2];
+
+            if (*raw != param) {
+                *raw = param;
+                dirty |= info;
+            }
+            methods++;
+            taken += 2u;
+            last_header = header;
+            continue;
+        }
+        count = (header >> WL_NV2A_CMD_COUNT_SHIFT) & WL_NV2A_CMD_COUNT_MASK;
+        // (wl_nv2a_bulk_method's tests: the method's in the table, a run up to the handles' here)
+        if (count == 0 || !(info & METHOD_BULK) ||
+            (!(header & WL_NV2A_CMD_NON_INCREASING) && method < WL_NV2A_PULLER_HANDLE_FIRST &&
+             method + 4u * count > WL_NV2A_PULLER_HANDLE_FIRST)) {
+            break;
+        }
+        // (the dirty groups stored before any other method's work)
+        k->dirty |= dirty & METHOD_DIRTY;
+        dirty = 0;
+        run = avail - taken - 1u < count ? avail - taken - 1u : count;
+        at += 4;
+        if (header & WL_NV2A_CMD_NON_INCREASING) {
+            done = methods_run(dev, ch, method, false, at, run);
+        } else if ((info & METHOD_WINDOW) && ((method + 4u * (run - 1u)) ^ method) < 0x80u) {
+            // (a run inside one window: its words stored without each one's dispatch)
+            window_run(k, method, at, run);
+            done = run;
+        } else if (method + 4u * run <= WL_NV2A_K_METHODS) {
+            done = increasing_run(dev, ch, method, at, run);
+        } else {
+            done = methods_run(dev, ch, method, true, at, run); // (past the last method: wrapped)
+        }
+        methods += done;
+        taken += 1u + done;
+        if (done < count) {
+            // (a run cut short: the rest left in the header state, for the pusher)
+            bool non_increasing = (header & WL_NV2A_CMD_NON_INCREASING) != 0;
+
+            dev->stats.methods += methods;
+            ch->method = non_increasing ? method : method + 4u * done;
+            ch->subchannel = (uint8_t)((header >> WL_NV2A_CMD_SUBCH_SHIFT) & 7u);
+            ch->count = count - done;
+            ch->non_increasing = non_increasing;
+            return taken;
+        }
+        last_header = header;
+        if (ch->suspended) {
+            break;
+        }
+    }
+    k->dirty |= dirty & METHOD_DIRTY;
+    dev->stats.methods += methods;
+    if (taken != 0) {
+        // (the last header's state when its run is done, as the pusher leaves it)
+        uint32_t method = last_header & WL_NV2A_CMD_METHOD_MASK;
+        bool non_increasing = (last_header & WL_NV2A_CMD_NON_INCREASING) != 0;
+
+        ch->method = non_increasing
+                         ? method
+                         : method + 4u * ((last_header >> WL_NV2A_CMD_COUNT_SHIFT) & WL_NV2A_CMD_COUNT_MASK);
+        ch->subchannel = (uint8_t)((last_header >> WL_NV2A_CMD_SUBCH_SHIFT) & 7u);
+        ch->count = 0;
+        ch->non_increasing = non_increasing;
     }
     return taken;
 }

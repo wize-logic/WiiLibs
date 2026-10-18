@@ -609,6 +609,14 @@ static void vertex_transform(const Plan *plan, const WlGxDirectVertex *v, float 
             }
             t[0] = m[0][0] * in[0] + m[0][1] * in[1] + m[0][2] * in[2] + m[0][3] * in[3];
             t[1] = m[1][0] * in[0] + m[1][1] * in[1] + m[1][2] * in[2] + m[1][3] * in[3];
+        } else if (plan->st->layout.texcoords_sphere & plan->st->layout.texcoords_projected & (1u << n)) {
+            // (a sphere map's, from its direction: (x, y, z + 1) normalized, halved and moved by 1/2, q 1)
+            float dx = v->texcoord[n][0], dy = v->texcoord[n][1], dz = v->texcoord_q[n] + 1.0f;
+            float length2 = dx * dx + dy * dy + dz * dz, k = length2 > 0.0f ? 0.5f / sqrtf(length2) : 0.0f;
+
+            // (straight behind, the disc's edge, as wl_nv2a_sphere_coordinates)
+            t[0] = dx * k + 0.5f;
+            t[1] = length2 > 0.0f ? dy * k + 0.5f : 1.0f;
         } else if (plan->st->layout.texcoords_projected & (1u << n)) {
             // (a projected coordinate, through its 3x4 identity: s and t divided by q at each pixel)
             t[0] = v->texcoord[n][0];
@@ -1236,6 +1244,7 @@ static void on_restore(void *user, const void *colour, const void *depth, uint32
             if (x < st->scissor[0] || y < st->scissor[1] || x >= sx1 || y >= sy1) {
                 continue;
             }
+            g.stats.restored++;
             px[3] = c[o + k * 2u];
             px[0] = c[o + k * 2u + 1u];
             px[1] = c[o + 32u + k * 2u];

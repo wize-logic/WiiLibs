@@ -453,6 +453,92 @@ TEST the_analysis_finds_what_is_not_affine(void) {
     PASS();
 }
 
+// ---- d0's light shape --------------------------------------------------------------------------
+
+// d0's r, g and b as the shape says they are made, from the normal n
+static void shape_color(const WlXboxVshLightShape *shape, const float n[3], float color[3]) {
+    unsigned l, c;
+
+    for (c = 0; c < 3; c++) {
+        color[c] = g_constants[shape->ambient][c];
+    }
+    for (l = 0; l < shape->count; l++) {
+        const WlXboxVshLight *light = &shape->lights[l];
+        float sign = light->direction_negate ? -1.0f : 1.0f, d = 0.0f, term;
+
+        for (c = 0; c < 3; c++) {
+            d += n[c] * (sign * g_constants[light->direction][c]);
+        }
+        term = d;
+        if (light->has_back) {
+            float back = g_constants[light->back][light->back_component] * (light->back_negate ? -1.0f : 1.0f);
+
+            term = fmaxf(d, back * d);
+        }
+        term = fmaxf(term, 0.0f);
+        for (c = 0; c < 3; c++) {
+            color[c] += g_constants[light->color][c] * term;
+        }
+    }
+}
+
+TEST the_light_shape_of_a_lit_program(void) {
+    const WlXboxVshLightShape *shape = &g_program.light;
+    WlXboxVshProgram unlit;
+    WlXboxVshOutput output;
+    unsigned round, c, r;
+    const int bias = WL_XBOX_VSH_CONSTANT_BIAS;
+
+    compile(7); // lit: two lights (one with a back term) and an ambient
+    ASSERT_EQ(2, shape->count);
+    ASSERT_EQ(11, shape->normal);
+    ASSERT_EQ(33 + bias, shape->ambient);
+    ASSERT_EQ(3, shape->zero);
+    ASSERT_EQ(2, shape->zero_component);
+    ASSERT_EQ(30 + bias, shape->lights[0].direction);
+    ASSERT_EQ(0, shape->lights[0].direction_negate);
+    ASSERT_EQ(35 + bias, shape->lights[0].color);
+    ASSERT_EQ(1, shape->lights[0].has_back);
+    ASSERT_EQ(32 + bias, shape->lights[0].back);
+    ASSERT_EQ(1, shape->lights[0].back_component);
+    ASSERT_EQ(1, shape->lights[0].back_negate);
+    ASSERT_EQ(31 + bias, shape->lights[1].direction);
+    ASSERT_EQ(1, shape->lights[1].direction_negate);
+    ASSERT_EQ(34 + bias, shape->lights[1].color);
+    ASSERT_EQ(0, shape->lights[1].has_back);
+    // (the shape's colour is the interpreter's, back terms of either sign among them)
+    for (round = 0; round < 64; round++) {
+        float n[3], expected[3];
+
+        for (r = 30; r <= 36; r++) {
+            for (c = 0; c < 4; c++) {
+                constant((int)r)[c] = (float)((int)((round * 7u + r * 13u + c * 5u) % 17u) - 8) / 4.0f;
+            }
+        }
+        constant(12)[3] = 0.5f;
+        for (c = 0; c < 3; c++) {
+            g_inputs[1][c] = (float)((int)((round * 11u + c * 3u) % 9u) - 4);
+            n[c] = g_inputs[1][c] * 0.5f;
+        }
+        g_inputs[3][2] = 0.0f;
+        run(&output);
+        shape_color(shape, n, expected);
+        for (c = 0; c < 3; c++) {
+            ASSERT_IN_RANGE(expected[c], output.d0[c], 1.0e-4f * (1.0f + fabsf(expected[c])));
+        }
+    }
+    // (its unlit copy writes d0's alpha alone)
+    wl_xbox_vsh_light_unlit(&g_program, &unlit);
+    for (r = 0; r < unlit.count; r++) {
+        if (unlit.steps[r].output == WL_XBOX_VSH_TO_D0) {
+            ASSERT_EQ(0u, unlit.steps[r].output_mask & 0xEu);
+        }
+    }
+    compile(3); // lighting with the specular power: not of the shape
+    ASSERT_EQ(0, g_program.light.count);
+    PASS();
+}
+
 SUITE(vsh_suite) {
     RUN_TEST(compile_decodes_up_to_the_end_bit);
     RUN_TEST(the_hash_is_fnv1a_of_the_words);
@@ -466,6 +552,7 @@ SUITE(vsh_suite) {
     RUN_TEST(shared_arithmetic);
     RUN_TEST(the_analysis_of_a_transform);
     RUN_TEST(the_analysis_finds_what_is_not_affine);
+    RUN_TEST(the_light_shape_of_a_lit_program);
 }
 
 GREATEST_MAIN_DEFS();

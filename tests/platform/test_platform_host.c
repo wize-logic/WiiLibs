@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "greatest.h"
+#include "wl/platform/gx_shadow.h"
 #include "wl/platform/host/audio_host.h"
 #include "wl/platform/host/gx_direct_host.h"
 #include "wl/platform/host/gx_host.h"
@@ -210,6 +211,37 @@ TEST gx_direct_stub_takes_projected_coordinates_after_the_position(void) {
     PASS();
 }
 
+// a lit layout's normal, then a sphere map's direction (a projected coordinate's three numbers), as the
+// normal, binormal and tangent (nine words, the third zero), then the colour
+TEST gx_direct_stub_takes_a_normal_beside_a_sphere_map(void) {
+    WlGxDirectLayout layout;
+    const WlHostGxDirect *d;
+    const float f[13] = {1, 2, 3, 0, 0, 1, 0.6f, 0.8f, 0, 0, 0, 0, 0};
+    uint32_t words[13];
+
+    memcpy(words, f, sizeof words);
+    words[12] = 0x11223344u;
+    memset(&layout, 0, sizeof layout);
+    layout.colors = 1;
+    layout.lit = 1;
+    layout.texcoords_projected = 1u << 3;
+    layout.texcoords_sphere = 1u << 3;
+    wl_host_gx_direct_reset();
+    wl_gx_direct_layout(&layout);
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 1);
+    wl_gx_direct_vertex_words(words, 13);
+    wl_gx_direct_primitive_end();
+    d = wl_host_gx_direct();
+    ASSERT_EQ(1u, d->count);
+    ASSERT_EQ(0u, d->wire_mismatches);
+    ASSERT(d->vertices[0].normal[2] == 1.0f);
+    ASSERT(d->vertices[0].texcoord[3][0] == 0.6f && d->vertices[0].texcoord[3][1] == 0.8f);
+    ASSERT(d->vertices[0].texcoord_q[3] == 0.0f);
+    ASSERT_EQ(0x44, d->vertices[0].color[0][3]);
+    wl_host_gx_direct_reset();
+    PASS();
+}
+
 // a batch of vertices in one call, as the FIFO's words or as indices into arrays: recorded as the same
 // vertices one call each would make
 TEST gx_direct_stub_takes_batches_of_vertices(void) {
@@ -264,6 +296,52 @@ TEST gx_direct_stub_takes_batches_of_vertices(void) {
     ASSERT(d->vertices[0].position[0] == 2.0f && d->vertices[0].position[1] == 4.0f);
     ASSERT(d->vertices[1].position[0] == 0.0f && d->vertices[1].position[2] == 7.0f);
     ASSERT(d->vertices[2].position[1] == 2.0f);
+    wl_host_gx_direct_reset();
+    PASS();
+}
+
+// a colour from the channel's register (not sent: every vertex has it), and vertices whose position
+// alone is indexed, each with words of its own
+TEST gx_direct_stub_takes_register_colours_and_position_indices(void) {
+    WlGxDirectLayout layout;
+    const WlHostGxDirect *d;
+    uint8_t positions[24] __attribute__((aligned(32))) = {0};
+    uint32_t w0[5] = {0, 0, 0, 0x01020304u, 0}, w1[5] = {0, 0, 0, 0x05060708u, 0};
+    const uint32_t *batch[2] = {w0, w1};
+    float s0 = 0.25f, s1 = 0.75f, x = 3.0f;
+    uint32_t bits;
+    unsigned c;
+
+    memcpy(&w0[4], &s0, sizeof s0);
+    memcpy(&w1[4], &s1, sizeof s1);
+    memcpy(&bits, &x, sizeof bits);
+    for (c = 0; c < 4; c++) {
+        positions[12 + c] = (uint8_t)(bits >> (24 - 8 * c)); // (element 1's x)
+    }
+    // colour 0 the register's, colour 1 each vertex's, one coordinate (s): two words after the position's index
+    memset(&layout, 0, sizeof layout);
+    layout.colors = 2;
+    layout.colors_register = 1;
+    layout.texcoords = 1;
+    layout.texcoord_s = 1;
+    layout.indexed = 1u << WL_GX_DIRECT_ARRAY_POSITION;
+    wl_host_gx_direct_reset();
+    wl_gx_direct_layout(&layout);
+    wl_gx_direct_material(0, 0xAABBCCDDu);
+    wl_gx_direct_array(WL_GX_DIRECT_ARRAY_POSITION, positions, 12);
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 2);
+    wl_gx_direct_vertices_position_index(NULL, 0, 1, 2, batch, 3, 2);
+    wl_gx_direct_primitive_end();
+    d = wl_host_gx_direct();
+    ASSERT_EQ(2u, d->count);
+    ASSERT_EQ(0u, d->wire_mismatches);
+    ASSERT(d->vertices[0].position[0] == 3.0f); // (index first + 0 = 1)
+    ASSERT_EQ(0xAA, d->vertices[0].color[0][0]);
+    ASSERT_EQ(0xDD, d->vertices[1].color[0][3]);
+    ASSERT_EQ(0x05, d->vertices[1].color[1][0]);
+    ASSERT_EQ(0x08, d->vertices[1].color[1][3]);
+    ASSERT(d->vertices[1].texcoord[0][0] == 0.75f);
+    ASSERT_EQ(2u + 8u, wl_gx_shadow_layout_vertex_bytes(&layout));
     wl_host_gx_direct_reset();
     PASS();
 }
@@ -369,7 +447,9 @@ SUITE(host_suite) {
     RUN_TEST(gx_stub_records_frames_and_draws);
     RUN_TEST(gx_direct_stub_flushes_a_renderers_own_format);
     RUN_TEST(gx_direct_stub_takes_projected_coordinates_after_the_position);
+    RUN_TEST(gx_direct_stub_takes_a_normal_beside_a_sphere_map);
     RUN_TEST(gx_direct_stub_takes_batches_of_vertices);
+    RUN_TEST(gx_direct_stub_takes_register_colours_and_position_indices);
     RUN_TEST(gx_direct_stub_checks_what_the_console_reads);
     RUN_TEST(audio_stub_renders_through_the_fill_callback);
 }

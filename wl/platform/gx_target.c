@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/platform/gx_direct.h"
 #include "wl/platform/gx_target_internal.h"
 
 #define TAG "TARGET"
@@ -25,6 +26,9 @@ static struct {
     bool park_whole;     // wl_gx_target_set_park_whole
     bool squeeze_warned; // the lack of memory for wl_gx_target_squeeze has been told
     uint32_t parked_w, parked_h;
+    // the part of it the targets since the park can have drawn over: their scissors' bounds (a target draws
+    // within its scissor), all a restore puts back (the switch restore_whole: the part parked)
+    uint32_t spill_w, spill_h;
     void *colour, *depth;
     size_t colour_bytes, depth_bytes; // the blocks' sizes
     // the bytes of each block from its start that the GPU has been copied into: the processor does not
@@ -175,22 +179,42 @@ static void park(uint32_t w, uint32_t h) {
     t.depth_parked = !t.lazy_depth;
     t.parked_w = w;
     t.parked_h = h;
+    t.spill_w = t.spill_h = 0;
     t.stats.parks++;
 }
 
-// The back buffer put back over a target's pixels, if it was parked: the part parked.
+// The back buffer put back over a target's pixels, if it was parked: the part the targets drew over, within
+// a scissor of its size (a park of the whole back buffer, wl_gx_target_set_park_whole, is 640 by 480 where
+// the targets drew 64 by 64 of it: the restore's quad no longer fills and textures the rest, which holds
+// the back buffer still), or with the switch restore_whole the part parked.
 static void restore(void) {
-    uint32_t w, h;
+    uint32_t w, h, rw, rh;
     back_size(&w, &h);
-    wl_gx_target_be_scissor(w, h);
     if (!t.parked) {
+        wl_gx_target_be_scissor(w, h);
         return;
     }
-    // (a depth not parked is the back buffer's still: no target wrote it)
-    wl_gx_target_be_restore(t.colour, t.depth_parked ? t.depth : NULL, t.parked_w, t.parked_h, w, h);
+    rw = t.parked_w;
+    rh = t.parked_h;
+    if (!wl_gx_bisect()->restore_whole) {
+        rw = t.spill_w < rw ? t.spill_w : rw;
+        rh = t.spill_h < rh ? t.spill_h : rh;
+    }
+    // (the quad over the part parked, within the scissor of the part to put back: the back buffer's
+    // when that is all of it)
+    bool all = rw == t.parked_w && rh == t.parked_h;
+    wl_gx_target_be_scissor(all ? w : rw, all ? h : rh);
+    if (rw != 0 && rh != 0) {
+        // (a depth not parked is the back buffer's still: no target wrote it)
+        wl_gx_target_be_restore(t.colour, t.depth_parked ? t.depth : NULL, t.parked_w, t.parked_h, w, h);
+        t.stats.restored_pixels += (uint64_t)rw * rh;
+        t.stats.restores++;
+    }
+    if (!all) {
+        wl_gx_target_be_scissor(w, h);
+    }
     t.parked = false;
     t.depth_parked = false;
-    t.stats.restores++;
 }
 
 // The owning target's pixels into its memory; the target when it was copied.
@@ -250,6 +274,8 @@ const WlGxTarget *wl_gx_target_use(const WlGxTarget *target) {
             park(pw, ph);
         }
         wl_gx_target_be_scissor(sw, sh);
+        t.spill_w = sw > t.spill_w ? sw : t.spill_w;
+        t.spill_h = sh > t.spill_h ? sh : t.spill_h;
         t.owner = *target;
         t.owner_is_target = true;
     }

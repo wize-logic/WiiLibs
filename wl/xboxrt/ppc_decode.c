@@ -42,6 +42,20 @@ static const char *const k_dnames[] = {
 };
 
 WlXbPpcDecode wl_xb_ppc_decode(uint32_t insn, WlXbPpcAccess *out) {
+    // (a recompiled title's device access is nearly always a little-endian word, a push buffer
+    // kick's stwbrx most of all: stwbrx and lwbrx without the table's search)
+    if ((insn & 0xFC0007FEu) == (31u << 26 | 662u << 1) || (insn & 0xFC0007FEu) == (31u << 26 | 534u << 1)) {
+        bool store = (insn & (128u << 1)) != 0; // (662 is 534 + 128)
+        *out = (WlXbPpcAccess){.name = store ? "stwbrx" : "lwbrx",
+                               .rt = (uint8_t)((insn >> 21) & 31u),
+                               .ra = (uint8_t)((insn >> 16) & 31u),
+                               .rb = (uint8_t)((insn >> 11) & 31u),
+                               .size = 4,
+                               .store = store,
+                               .reverse = true,
+                               .indexed = true};
+        return WL_XB_PPC_OK;
+    }
     *out = (WlXbPpcAccess){0};
     uint32_t op = insn >> 26;
     out->rt = (uint8_t)((insn >> 21) & 31u);

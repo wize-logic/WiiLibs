@@ -50,6 +50,24 @@ WiiLibs' copy (wl/xboxrt/recomp/recomp_types.h) is that template, with WiiLibs' 
      volatile registers
  18. on PowerPC the PC=24 fast path is frsp. and a branch on FPSCR[FX] (CR1): an overflow or an
      inexact underflow sets it, and the slow path clears it; no store and reload of the bits
+ 19. on PowerPC, in code built for size, a non-constant guest address goes through a branch to a
+     stub for the register pair (wl_xb_ea_<d>_<s>, a COMDAT group) instead of two inline
+     instructions (RECOMP_NO_EA_STUB keeps them inline)
+ 20. in code built for size, a backward jump's safe point (RECOMP_BACKEDGE) is one call of a small
+     function per unit, and an indirect call or jump (RECOMP_ICALL*, RECOMP_ITAIL: the code-range
+     check, the lookup, the call and the failure path) is one call too (RECOMP_NO_BACKEDGE_CALL,
+     RECOMP_NO_ICALL_CALL keep them inline)
+ 21. on PowerPC, in code built for size, a constant pushed onto g_esp (a call's return address)
+     is a data word after a branch to recomp_push32_word, not lis, ori and a call
+     (RECOMP_NO_PUSH32_WORD turns it off)
+ 22. the stack's integer accesses (MEMxx_SP, PUSH32, POP32) are not volatile: GCC forwards a
+     stored slot to its reload and loads a slot once (RECOMP_STACK_VOLATILE makes them volatile)
+ 23. the SSE loads and stores map their address once, and the --mem-disp forms of the float stores
+     and the SSE and MMX accesses (MEMF_SET_D, XMM_MEM_D, MMX_STORE_D, ...; patch 0025) map base
+     once and add disp on the host side, as MEMxx_D
+ 24. the MMX loads and stores move the guest's 8 bytes as one uint64_t (a memcpy, then on a
+     big-endian host a byte swap into the union's little-endian q): GCC keeps the register in
+     registers, where a memcpy of the union itself went through a stack slot at every access
 
 On a little-endian host the storage-order attribute does nothing and the byte swaps are
 identities, so the same header serves host tests.
@@ -207,6 +225,37 @@ MEM_NEW = """/* WiiLibs: guest address -> host address.
 #else
 #define WL_XB_EA_INLINE static inline __attribute__((always_inline))
 #endif
+#if defined(__OPTIMIZE_SIZE__) && !defined(WL_XB_EA_CALL) && !defined(RECOMP_NO_EA_STUB) && !defined(__powerpc64__)
+/* In code built for size (the units the profile does not name hot) the two instructions are a
+ * branch to a stub for the register pair, wl_xb_ea_<d>_<s> (the same two instructions and a blr,
+ * one copy in the program: a COMDAT group), that touches nothing else, so GCC keeps every value in
+ * its register across it: one instruction instead of two at each guest access whose address is not
+ * a constant, about 320 KB of Halo's MEM1, for a bl and a blr each. RECOMP_NO_EA_STUB keeps them
+ * inline. */
+__asm__(
+    ".macro wl_xb_ea_stub d, s\\n"
+    ".pushsection .text.wl_xb_ea_\\\\d\\\\()_\\\\s,\\"axG\\",@progbits,wl_xb_ea_\\\\d\\\\()_\\\\s,comdat\\n"
+    ".weak wl_xb_ea_\\\\d\\\\()_\\\\s\\n"
+    ".type wl_xb_ea_\\\\d\\\\()_\\\\s,@function\\n"
+    "wl_xb_ea_\\\\d\\\\()_\\\\s:\\n"
+    ".ifc \\\\d,\\\\s\\n"
+    "  rlwimi \\\\d,\\\\s,29,3,3\\n  rlwinm \\\\d,\\\\d,0,3,31\\n"
+    ".else\\n"
+    "  rlwinm \\\\d,\\\\s,0,4,31\\n  rlwimi \\\\d,\\\\s,29,3,3\\n"
+    ".endif\\n"
+    "  blr\\n"
+    ".size wl_xb_ea_\\\\d\\\\()_\\\\s,.-wl_xb_ea_\\\\d\\\\()_\\\\s\\n"
+    ".popsection\\n"
+    ".endm\\n");
+static inline __attribute__((always_inline)) uint32_t wl_xb_ea_ppc(uint32_t guest) {
+    uint32_t ea;
+    if (__builtin_constant_p(guest))
+        return (guest & 0x0FFFFFFFu) | ((guest >> 3) & 0x10000000u);
+    __asm__("bl wl_xb_ea_%0_%1\\n.ifndef wl_xb_ea_%0_%1\\n\\twl_xb_ea_stub %0, %1\\n.endif"
+            : "=r"(ea) : "r"(guest) : "lr");
+    return ea;
+}
+#else
 WL_XB_EA_INLINE uint32_t wl_xb_ea_ppc(uint32_t guest) {
     uint32_t ea;
     if (__builtin_constant_p(guest))
@@ -215,6 +264,7 @@ WL_XB_EA_INLINE uint32_t wl_xb_ea_ppc(uint32_t guest) {
     __asm__("rlwimi %0,%1,29,3,3" : "+r"(ea) : "r"(guest));
     return ea;
 }
+#endif
 #define WL_XB_EA(guest) wl_xb_ea_ppc((uint32_t)(guest))
 #else
 #define WL_XB_EA(guest) ((((uint32_t)(guest)) & 0x0FFFFFFFu) | ((((uint32_t)(guest)) >> 3) & 0x10000000u))
@@ -296,13 +346,35 @@ typedef struct RECOMP_GUEST_LE { double v; } recomp_le_f64;
 #define RECOMP_STACK_PTR(a) ((uintptr_t)(uint32_t)(a) + (uintptr_t)g_xbox_mem_offset)
 #endif
 #define RECOMP_MEM_SP(T, b, d) (((T *)RECOMP_STACK_PTR((uint32_t)(b) + (uint32_t)(int32_t)(d)))->v)
-#define MEM8_SP(b, d)   RECOMP_MEM_SP(recomp_le_u8, b, d)
-#define MEM16_SP(b, d)  RECOMP_MEM_SP(recomp_le_u16, b, d)
-#define MEM32_SP(b, d)  RECOMP_MEM_SP(recomp_le_u32, b, d)
-#define SMEM8_SP(b, d)  RECOMP_MEM_SP(recomp_le_s8, b, d)
-#define SMEM16_SP(b, d) RECOMP_MEM_SP(recomp_le_s16, b, d)
-#define SMEM32_SP(b, d) RECOMP_MEM_SP(recomp_le_s32, b, d)
-#define SMEM64_SP(b, d) RECOMP_MEM_SP(recomp_le_s64, b, d)
+/* The stack's integer accesses (MEMxx_SP, and so PUSH32 and POP32) are not volatile either
+ * (RECOMP_STACK_VOLATILE makes them so again): GCC forwards a value the code stored to a stack
+ * slot to the load that reads it back, and loads a slot once where nothing between can change it,
+ * as the x86's own registers would have held it (1.1% of the instructions of Halo's hot unit). A
+ * guest stack is its own thread's: no device writes it, interrupt work runs on a stack of its own,
+ * and the guest lock passes to another guest thread only inside a call (the safe point's
+ * included), which makes GCC read and write the stack again, or at a device access or a page-in in
+ * the middle of a block, where no other thread's code reads or writes the running frame (on the
+ * Xbox that would be a race with a thread that may run at any instruction). The order of the
+ * stack's stores among the other guest accesses that may alias them is kept. */
+#ifdef RECOMP_STACK_VOLATILE
+#define RECOMP_SP_VOLATILE volatile
+#else
+#define RECOMP_SP_VOLATILE
+#endif
+typedef struct RECOMP_GUEST_LE { RECOMP_SP_VOLATILE uint8_t  v; } recomp_sp_u8;
+typedef struct RECOMP_GUEST_LE { RECOMP_SP_VOLATILE uint16_t v; } recomp_sp_u16;
+typedef struct RECOMP_GUEST_LE { RECOMP_SP_VOLATILE uint32_t v; } recomp_sp_u32;
+typedef struct RECOMP_GUEST_LE { RECOMP_SP_VOLATILE int8_t   v; } recomp_sp_s8;
+typedef struct RECOMP_GUEST_LE { RECOMP_SP_VOLATILE int16_t  v; } recomp_sp_s16;
+typedef struct RECOMP_GUEST_LE { RECOMP_SP_VOLATILE int32_t  v; } recomp_sp_s32;
+typedef struct RECOMP_GUEST_LE { RECOMP_SP_VOLATILE int64_t  v; } recomp_sp_s64;
+#define MEM8_SP(b, d)   RECOMP_MEM_SP(recomp_sp_u8, b, d)
+#define MEM16_SP(b, d)  RECOMP_MEM_SP(recomp_sp_u16, b, d)
+#define MEM32_SP(b, d)  RECOMP_MEM_SP(recomp_sp_u32, b, d)
+#define SMEM8_SP(b, d)  RECOMP_MEM_SP(recomp_sp_s8, b, d)
+#define SMEM16_SP(b, d) RECOMP_MEM_SP(recomp_sp_s16, b, d)
+#define SMEM32_SP(b, d) RECOMP_MEM_SP(recomp_sp_s32, b, d)
+#define SMEM64_SP(b, d) RECOMP_MEM_SP(recomp_sp_s64, b, d)
 #define MEMF_SP(b, d)   RECOMP_MEM_SP(recomp_le_f32, b, d)
 #define MEMD_SP(b, d)   RECOMP_MEM_SP(recomp_le_f64, b, d)
 
@@ -343,6 +415,23 @@ RECOMP_MEM_SET_INLINE void recomp_memd_set_sp(uint32_t addr, double v) {
 }
 #define MEMF_SET_SP(b, d, v) recomp_memf_set_sp((uint32_t)(b) + (uint32_t)(int32_t)(d), (float)(v))
 #define MEMD_SET_SP(b, d, v) recomp_memd_set_sp((uint32_t)(b) + (uint32_t)(int32_t)(d), (double)(v))
+/* The stores at base + disp (--mem-disp), and the SSE and MMX accesses below: base mapped, disp
+ * added on the host side, as MEMxx_D. */
+#define RECOMP_HOST_D(b, d) (XBOX_PTR(b) + (uintptr_t)(intptr_t)(int32_t)(d))
+#define RECOMP_LE32_AT(p) (((recomp_le_u32 *)(p))->v)
+RECOMP_MEM_SET_INLINE void recomp_memf_set_h(uintptr_t p, float v) {
+    union { float f; uint32_t u; } c;
+    c.f = v;
+    RECOMP_LE32_AT(p) = c.u;
+}
+RECOMP_MEM_SET_INLINE void recomp_memd_set_h(uintptr_t p, double v) {
+    union { double d; uint64_t u; } c;
+    c.d = v;
+    RECOMP_LE32_AT(p) = (uint32_t)c.u;
+    RECOMP_LE32_AT(p + 4) = (uint32_t)(c.u >> 32);
+}
+#define MEMF_SET_D(b, d, v) recomp_memf_set_h(RECOMP_HOST_D(b, d), (float)(v))
+#define MEMD_SET_D(b, d, v) recomp_memd_set_h(RECOMP_HOST_D(b, d), (double)(v))
 """
 
 FPPC_OLD = """/* RECOMP_FP_PC_CW takes the control word as an argument: a function whose x87
@@ -481,6 +570,73 @@ CVT_NEW = """static inline int32_t MMX_CVT_F2I(float v, int truncate)
 
 """
 
+XMM_HOST = """/* WiiLibs: the SSE loads and stores map their address once and add the lanes' offsets on the
+ * host side, and the --mem-disp forms (XMM_MEM_D, ...) their displacement too, as MEMxx_D does: a
+ * 16-byte access at an address the guest may touch stays in its 256 MB region. */
+static inline __attribute__((always_inline)) RecompXmm recomp_xmm_mem_h(uintptr_t p) {
+    RecompXmm r;
+    r.u[0] = RECOMP_LE32_AT(p);     r.u[1] = RECOMP_LE32_AT(p + 4);
+    r.u[2] = RECOMP_LE32_AT(p + 8); r.u[3] = RECOMP_LE32_AT(p + 12);
+    return r;
+}
+static inline __attribute__((always_inline)) void recomp_xmm_store_h(uintptr_t p, RecompXmm v) {
+    RECOMP_LE32_AT(p) = v.u[0];     RECOMP_LE32_AT(p + 4) = v.u[1];
+    RECOMP_LE32_AT(p + 8) = v.u[2]; RECOMP_LE32_AT(p + 12) = v.u[3];
+}
+static inline __attribute__((always_inline)) void recomp_xmm_load_half_h(RecompXmm *dst, uintptr_t p, int high) {
+    dst->u[high * 2]     = RECOMP_LE32_AT(p);
+    dst->u[high * 2 + 1] = RECOMP_LE32_AT(p + 4);
+}
+static inline __attribute__((always_inline)) void recomp_xmm_store_half_h(uintptr_t p, RecompXmm src, int high) {
+    RECOMP_LE32_AT(p)     = src.u[high * 2];
+    RECOMP_LE32_AT(p + 4) = src.u[high * 2 + 1];
+}
+#define XMM_MEM_D(b, d)             recomp_xmm_mem_h(RECOMP_HOST_D(b, d))
+#define XMM_STORE_D(b, d, v)        recomp_xmm_store_h(RECOMP_HOST_D(b, d), (v))
+#define XMM_LOAD_LOW_D(dst, b, d)   recomp_xmm_load_half_h(&(dst), RECOMP_HOST_D(b, d), 0)
+#define XMM_LOAD_HIGH_D(dst, b, d)  recomp_xmm_load_half_h(&(dst), RECOMP_HOST_D(b, d), 1)
+#define XMM_STORE_LOW_D(b, d, src)  recomp_xmm_store_half_h(RECOMP_HOST_D(b, d), (src), 0)
+#define XMM_STORE_HIGH_D(b, d, src) recomp_xmm_store_half_h(RECOMP_HOST_D(b, d), (src), 1)
+
+"""
+XMM_HOST_ANCHOR = "/* -- guest memory --\n * Addresses are guest VAs"
+XMM_BODY_EDITS = [
+    ("""    RecompXmm r;
+    r.u[0] = MEM32(addr);      r.u[1] = MEM32(addr + 4);
+    r.u[2] = MEM32(addr + 8);  r.u[3] = MEM32(addr + 12);
+    return r;
+""", """    return recomp_xmm_mem_h(XBOX_PTR(addr));
+"""),
+    ("""    MEM32(addr)      = v.u[0]; MEM32(addr + 4)  = v.u[1];
+    MEM32(addr + 8)  = v.u[2]; MEM32(addr + 12) = v.u[3];
+""", """    recomp_xmm_store_h(XBOX_PTR(addr), v);
+"""),
+    ("""    dst->u[high * 2]     = MEM32(addr);
+    dst->u[high * 2 + 1] = MEM32(addr + 4);
+""", """    recomp_xmm_load_half_h(dst, XBOX_PTR(addr), high);
+"""),
+    ("""    MEM32(addr)     = src.u[high * 2];
+    MEM32(addr + 4) = src.u[high * 2 + 1];
+""", """    recomp_xmm_store_half_h(XBOX_PTR(addr), src, high);
+"""),
+]
+MMX_HOST_ANCHOR = "/* The same at base + disp (--mem-disp), as XMM_MEM_D. */\n#ifndef MMX_MEM_D"
+MMX_HOST = """/* WiiLibs: the --mem-disp forms map base once and add disp on the host side. */
+static inline __attribute__((always_inline)) RecompMmx recomp_mmx_mem_h(uintptr_t p) {
+    RecompMmx r; uint64_t t;
+    memcpy(&t, (const void *)p, 8);
+    r.q = RECOMP_MMX_LE64(t);
+    return r;
+}
+static inline __attribute__((always_inline)) void recomp_mmx_store_h(uintptr_t p, RecompMmx v) {
+    uint64_t t = RECOMP_MMX_LE64(v.q);
+    memcpy((void *)p, &t, 8);
+}
+#define MMX_MEM_D(b, d)      recomp_mmx_mem_h(RECOMP_HOST_D(b, d))
+#define MMX_STORE_D(b, d, v) recomp_mmx_store_h(RECOMP_HOST_D(b, d), (v))
+
+"""
+
 UNION_EDITS = [
     ("typedef union RecompXmm {",
      "/* WiiLibs: little-endian storage, so f[i]/u[i]/d[]/q[] overlay as on x86 (and a memcpy of the\n"
@@ -490,6 +646,36 @@ UNION_EDITS = [
      "/* WiiLibs: little-endian storage: ub[0] is the low byte of q, as on x86, so MMX_FROM32, the\n"
      " * unpacks and MMX_MEM's raw copy of guest bytes agree with the hardware. */\n"
      "typedef union __attribute__((scalar_storage_order(\"little-endian\"))) RecompMmx {"),
+]
+
+# Edit 24: MMX_MEM and MMX_STORE copy the guest's bytes through a uint64_t, not the union: with
+# memcpy into the union (reverse storage order, an aggregate) GCC kept every MMX register that
+# passed through a load or a store in a stack slot (sub_001842D0, Halo's MMX copy loop, stored and
+# reloaded each of them). memcpy into an integer and a byte swap is defined C, and the two swaps of
+# a load and a store cancel. (A raw copy of the union's words through a pointer cast is punning
+# between storage orders, undefined, and GCC 13 miscompiled it.)
+MMX_LE64_ANCHOR = "#ifndef RECOMP_MMX_DEFINED\n"
+MMX_LE64 = """/* WiiLibs: an integer holding 8 guest bytes in host order (a memcpy of them) as RecompMmx's q,
+ * which holds them little-endian, and back: the MMX loads and stores (edit 24). */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define RECOMP_MMX_LE64(t) __builtin_bswap64(t)
+#else
+#define RECOMP_MMX_LE64(t) (t)
+#endif
+"""
+MMX_BODY_EDITS = [
+    ("""    RecompMmx r;
+    memcpy(&r, (const void *)XBOX_PTR(addr), 8);
+    return r;
+""", """    RecompMmx r; uint64_t t;
+    memcpy(&t, (const void *)XBOX_PTR(addr), 8);
+    r.q = RECOMP_MMX_LE64(t);
+    return r;
+"""),
+    ("""    memcpy((void *)XBOX_PTR(addr), &v, 8);
+""", """    uint64_t t = RECOMP_MMX_LE64(v.q);
+    memcpy((void *)XBOX_PTR(addr), &t, 8);
+"""),
 ]
 
 
@@ -587,7 +773,17 @@ BACKEDGE_NEW = """/* WiiLibs: a backward jump is a safe point of wl/xboxrt's gue
 extern volatile uint32_t g_xb_attention;
 void wl_xb_safe_point(void);
 #ifndef RECOMP_BACKEDGE
+/* WiiLibs: in code built for size (-Os) the check is a call of one small function per unit: the
+ * load, compare and the branch around the call (four or five instructions at each of Halo's
+ * ~6,300 loops) become one branch, for a call and a return each time a cold loop goes round. */
+#if defined(__OPTIMIZE_SIZE__) && !defined(RECOMP_NO_BACKEDGE_CALL)
+static __attribute__((noinline, unused)) void recomp_backedge(void) {
+    if (__builtin_expect(g_xb_attention != 0, 0)) wl_xb_safe_point();
+}
+#define RECOMP_BACKEDGE() recomp_backedge()
+#else
 #define RECOMP_BACKEDGE() do { if (__builtin_expect(g_xb_attention != 0, 0)) wl_xb_safe_point(); } while (0)
+#endif
 #endif
 """
 
@@ -636,8 +832,36 @@ PUSH_NEW = """#define RECOMP_PUSH32_INLINE(sp, val) do { \\
 static __attribute__((noinline, unused)) void recomp_push32_esp(uint32_t v) {
     RECOMP_PUSH32_INLINE(g_esp, v);
 }
+#if (defined(__PPC__) || defined(__powerpc__)) && !defined(__powerpc64__) && !defined(WL_XB_EA_NO_ASM) && \\
+    !defined(RECOMP_NO_PUSH32_WORD)
+/* On PowerPC a constant (a call's return address, the common case) follows the branch as a data
+ * word: recomp_push32_word reads it at the link register, returns past it, and pushes it through
+ * recomp_push32_esp_w. Two words at the site instead of three (lis, ori, bl); to the code around
+ * it the same call (every volatile register clobbered). RECOMP_NO_PUSH32_WORD turns it off. */
+__attribute__((weak, noinline, used)) void recomp_push32_esp_w(uint32_t v) {
+    RECOMP_PUSH32_INLINE(g_esp, v);
+}
+__asm__(
+    ".pushsection .text.recomp_push32_word,\\"axG\\",@progbits,recomp_push32_word,comdat\\n"
+    ".weak recomp_push32_word\\n"
+    ".type recomp_push32_word,@function\\n"
+    "recomp_push32_word:\\n"
+    "  mflr 12\\n  lwz 3,0(12)\\n  addi 12,12,4\\n  mtlr 12\\n  b recomp_push32_esp_w\\n"
+    ".size recomp_push32_word,.-recomp_push32_word\\n"
+    ".popsection\\n");
+#define RECOMP_PUSH32_ESP(val) do { \\
+    if (__builtin_constant_p(val)) \\
+        __asm__ __volatile__("bl recomp_push32_word\\n\\t.long %0" : : "i"((uint32_t)(val)) \\
+            : "r0", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "ctr", "lr", \\
+              "cr0", "cr1", "cr5", "cr6", "cr7", "xer", "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", \\
+              "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "fr12", "fr13", "memory"); \\
+    else recomp_push32_esp((uint32_t)(val)); \\
+} while(0)
+#else
+#define RECOMP_PUSH32_ESP(val) recomp_push32_esp((uint32_t)(val))
+#endif
 #define PUSH32(sp, val) do { \\
-    if (&(sp) == &g_esp) recomp_push32_esp((uint32_t)(val)); \\
+    if (&(sp) == &g_esp) RECOMP_PUSH32_ESP(val); \\
     else RECOMP_PUSH32_INLINE(sp, val); \\
 } while(0)
 #else
@@ -649,6 +873,57 @@ static __attribute__((noinline, unused)) void recomp_push32_esp(uint32_t v) {
 POP_OLD = """#define POP32(sp, dst) do { \\
     (dst) = MEM32(sp); \\"""
 POP_NEW = POP_OLD.replace("MEM32(sp)", "MEM32_SP(sp, 0)")
+ICALL_ANCHOR = """/* ================================================================
+ * Register name aliases for generated code
+"""
+ICALL_NEW = """/* WiiLibs: in code built for size (-Os, the units the profile does not name hot) an indirect call
+ * or jump is a call of one small function per unit: the code-range check, the lookup, the call
+ * (a tail call there) and both failure paths are about 25 instructions at each of Halo's ~2,100
+ * sites. Only when the macros' hooks are off (no trace, feedback, ABI check or call profile):
+ * then they are the same steps in the same order. The pushed return address is the caller's;
+ * saved_esp is read at the call instead of at a failure, the same value (nothing between changes
+ * it). RECOMP_NO_ICALL_CALL keeps them inline. */
+#if defined(__OPTIMIZE_SIZE__) && !defined(RECOMP_NO_ICALL_CALL) && !defined(WL_RECOMP_ICALL_TRACE) && \\
+    !defined(RECOMP_ICALL_FEEDBACK) && !defined(RECOMP_ABI_CHECK) && !defined(RECOMP_CALL_PROFILE) && \\
+    !defined(RECOMP_DISPATCH_H)
+static __attribute__((noinline, unused)) void recomp_icall_pop(uint32_t va) {
+    recomp_func_t fn;
+    if (!RECOMP_ICALL_IS_CODE(va)) { recomp_icall_not_code_log(va); g_esp += 4; g_eax = 0; return; }
+    fn = RECOMP_RESOLVE(va);
+    if (fn) { fn(); return; }
+    recomp_icall_fail_log(va); g_esp += 4; g_eax = 0;
+}
+static __attribute__((noinline, unused)) void recomp_icall_to(uint32_t va, uint32_t saved_esp) {
+    recomp_func_t fn;
+    if (!RECOMP_ICALL_IS_CODE(va)) { recomp_icall_not_code_log(va); g_esp = saved_esp; g_eax = 0; return; }
+    fn = RECOMP_RESOLVE(va);
+    if (fn) { fn(); return; }
+    recomp_icall_fail_log(va); g_esp = saved_esp; g_eax = 0;
+}
+static __attribute__((noinline, unused)) void recomp_itail(uint32_t va) {
+    recomp_func_t fn = RECOMP_RESOLVE(va);
+    if (fn) { fn(); return; }
+    recomp_icall_fail_log(va); g_esp += 4; g_eax = 0;
+}
+#undef RECOMP_ICALL
+#undef RECOMP_ICALL_SAFE
+#undef RECOMP_ICALL_SAFE_CC
+#undef RECOMP_ICALL_SAFE_AT
+#undef RECOMP_ICALL_SAFE_AT_CC
+#undef RECOMP_ITAIL
+#define RECOMP_ICALL(xbox_va) recomp_icall_pop((uint32_t)(xbox_va))
+#define RECOMP_ICALL_SAFE(xbox_va, saved_esp) recomp_icall_to((uint32_t)(xbox_va), (uint32_t)(saved_esp))
+#define RECOMP_ICALL_SAFE_CC(xbox_va, saved_esp) do { \\
+    (void)(saved_esp); recomp_icall_pop((uint32_t)(xbox_va)); } while (0)
+#define RECOMP_ICALL_SAFE_AT(xbox_va, saved_esp, site) \\
+    recomp_icall_to((uint32_t)(xbox_va), (uint32_t)(saved_esp))
+#define RECOMP_ICALL_SAFE_AT_CC(xbox_va, saved_esp, site) do { \\
+    (void)(saved_esp); recomp_icall_pop((uint32_t)(xbox_va)); } while (0)
+#define RECOMP_ITAIL(xbox_va) recomp_itail((uint32_t)(xbox_va))
+#endif
+
+""" + ICALL_ANCHOR
+
 
 PORT_OLD = """#ifndef RECOMP_PORT_IN
 #define RECOMP_PORT_IN(port, size) ((void)(port), (void)(size), 0u)
@@ -693,14 +968,22 @@ def transform(src: str, commit: str, release: str, patches: list[str]) -> str:
         src = replace_once(src, old, new, old)
     src = replace_once(src, LANEWISE_OLD, LANEWISE_NEW, "RECOMP_XMM_LANEWISE")
     src = replace_once(src, SHUFFLE_OLD, SHUFFLE_NEW, "XMM_SHUFFLE")
+    src = replace_once(src, XMM_HOST_ANCHOR, XMM_HOST + XMM_HOST_ANCHOR, "SSE accesses on the host side")
+    for old, new in XMM_BODY_EDITS:
+        src = replace_once(src, old, new, "SSE access: " + old.split("\n")[1].strip())
+    src = replace_once(src, MMX_HOST_ANCHOR, MMX_HOST + MMX_HOST_ANCHOR, "MMX accesses at base + disp")
+    for old, new in MMX_BODY_EDITS:
+        src = replace_once(src, old, new, "MMX access: " + old.split("\n")[1].strip())
     for name, sig in ALWAYS_INLINE:
         src = replace_once(src, "static inline " + sig, "static inline __attribute__((always_inline)) " + sig,
                            "always inline: " + name)
     src = hoist_mmx(src)
+    src = replace_once(src, MMX_LE64_ANCHOR, MMX_LE64 + MMX_LE64_ANCHOR, "RECOMP_MMX_LE64")
     src = replace_once(src, BACKEDGE_OLD, BACKEDGE_NEW, "RECOMP_BACKEDGE safe point")
     src = replace_once(src, PORT_OLD, PORT_NEW, "RECOMP_PORT_IN/OUT")
     src = replace_once(src, PUSH_OLD, PUSH_NEW, "PUSH32 onto g_esp out of line")
     src = replace_once(src, POP_OLD, POP_NEW, "POP32 at esp without the address map")
+    src = replace_once(src, ICALL_ANCHOR, ICALL_NEW, "indirect calls out of line")
     for needle in ("__thread", "_InterlockedExchangeAdd", "(*(volatile uint32_t *)XBOX_PTR"):
         if needle in src:
             raise AnchorError(f"after the edits the header still has {needle!r}: an edit missed a new copy")

@@ -216,6 +216,25 @@ PROGRAMS = [
         "mov oT2, r8",
         "mov oFog.x, r7.z",
     ]),
+    ("lit: an ambient and two directional lights' clamped dot products with a normal it makes, one with a "
+     "back term, the 0 of the maxima v3.z (wl_xbox_vsh_light_shape; its lit fused form sends the normal)", [
+        "mul r11.xyz, v1, c[12].w",
+        "dp4 oPos.x, v0, c[0]",
+        "dp4 oPos.y, v0, c[1]",
+        "dp4 oPos.z, v0, c[2]",
+        "dp4 oPos.w, v0, c[3]",
+        "dp3 r1.x, r11, c[30]",
+        "dp3 r1.y, r11, -c[31]",
+        "mul r1.z, r1.x, -c[32].y",
+        "max r2.z, r1.z, r1.x",
+        "max r3.x, r2.z, v3.z",
+        "max r3.y, v3.z, r1.y",
+        "mov r5.xyz, c[33]",
+        "mad r4.xyz, r3.y, c[34], r5",
+        "mad oD0.xyz, c[35], r3.x, r4",
+        "mov oD0.w, c[36].x",
+        "mov oT0.xy, v4",
+    ]),
 ]
 
 
