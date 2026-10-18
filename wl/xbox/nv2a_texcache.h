@@ -120,6 +120,10 @@ typedef struct WlNv2aTexCacheStats {
     size_t frame_bytes;   // of those, drawn in the last frame finished
     uint32_t frame_reduced; // textures drawn in the last frame finished kept smaller (detail missing now)
     size_t peak_frame_bytes;
+    // the frame with peak_frame_bytes: its bytes by GX format (a C8's TLUT and a DXT3/5's alpha
+    // included), and of those a DXT3/5's alpha images
+    size_t peak_by_format[WL_GXC_FORMAT_COUNT];
+    size_t peak_alpha;
 } WlNv2aTexCacheStats;
 
 typedef struct WlNv2aTexCache {
@@ -161,6 +165,14 @@ const WlNv2aTexEntry *wl_nv2a_texcache_get(WlNv2aTexCache *cache, WlNv2a *dev, c
 // and the next frame checks each texture again.
 void wl_nv2a_texcache_frame_done(WlNv2aTexCache *cache);
 void wl_nv2a_texcache_stats(const WlNv2aTexCache *cache, WlNv2aTexCacheStats *out);
+// Whether guest-physical [phys, phys + bytes) is converted and unchanged: the texels of a texture
+// the cache keeps lie on part of it, and every texture kept whose texels lie on part of it is
+// under the write watch with no store to its pages since it was checked (and is not kept smaller,
+// which is made whole from its texels). Such bytes are not read by the cache again until they are
+// stored to or the texture is evicted: a pager may let them go (and read them back when the
+// watch's stores, or an eviction's conversion, need them). False without a watch. Asked between
+// lookups (the GPU's thread, or under its lock); it walks every entry.
+bool wl_nv2a_texcache_converted(const WlNv2aTexCache *cache, uint32_t phys, uint32_t bytes);
 
 // The memory the cache holds, for a census of the host's heap.
 typedef struct WlNv2aTexCacheMemory {

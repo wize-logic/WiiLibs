@@ -285,6 +285,13 @@ static void gpu_status(void) {
              (unsigned)(tk.by_format[WL_GXC_I8] >> 10), (unsigned)tk.count_by_format[WL_GXC_I8],
              (unsigned)(tk.linear >> 10), (unsigned)(tk.source >> 10),
              (unsigned)(tk.largest >> 10));
+    // (the heaviest frame's textures: what the arena must hold)
+    WL_LOG_I(TAG, "status: textures at the peak, KB by format: RGBA8 %u, CMPR %u (%u of it DXT3/5 alpha), C8 %u, "
+             "RGB565 %u, RGB5A3 %u, IA8 %u, I8 %u",
+             (unsigned)(ts.peak_by_format[WL_GXC_RGBA8] >> 10), (unsigned)(ts.peak_by_format[WL_GXC_CMPR] >> 10),
+             (unsigned)(ts.peak_alpha >> 10), (unsigned)(ts.peak_by_format[WL_GXC_C8] >> 10),
+             (unsigned)(ts.peak_by_format[WL_GXC_RGB565] >> 10), (unsigned)(ts.peak_by_format[WL_GXC_RGB5A3] >> 10),
+             (unsigned)(ts.peak_by_format[WL_GXC_IA8] >> 10), (unsigned)(ts.peak_by_format[WL_GXC_I8] >> 10));
     WL_LOG_I(TAG, "status: textures failed: %u refused again, %u formats GX cannot take, %u unreadable, %u bad; %u "
              "stood in, %u draws hidden; not looked up: %u unread, %u disabled, %u unsampled; %u mip-map shares (%u given back)",
              (unsigned)ts.refused_again, (unsigned)ts.unknown, (unsigned)ts.unreadable, (unsigned)ts.bad_texels,
