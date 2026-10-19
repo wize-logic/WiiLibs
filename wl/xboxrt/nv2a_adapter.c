@@ -504,8 +504,9 @@ static void gpu_status(void) {
     if (gs.made_draws != 0) {
         // (nv2a_gx.c's made vertices read by index: how often the ring went round, and waited for GX)
         WL_LOG_I(TAG, "status: made vertices read by index: %u draws, %u vertices sent, %u made; %u fences, %u waits "
-                 "for GX, %u laps", (unsigned)gs.made_draws, (unsigned)gs.made_sent, (unsigned)gs.made_vertices,
-                 (unsigned)gs.made_fences, (unsigned)gs.made_waits, (unsigned)gs.made_laps);
+                 "for GX, %u laps; %u draws (%u vertices) of five words or fewer", (unsigned)gs.made_draws,
+                 (unsigned)gs.made_sent, (unsigned)gs.made_vertices, (unsigned)gs.made_fences, (unsigned)gs.made_waits,
+                 (unsigned)gs.made_laps, (unsigned)gs.made_small_draws, (unsigned)gs.made_small_vertices);
     }
 }
 

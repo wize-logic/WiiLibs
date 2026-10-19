@@ -243,12 +243,40 @@ static uint32_t deposit_bits(uint32_t v, uint32_t mask) {
 
 // One GX tile from the texels at `in` + offs[i] (i = y * tw + x; `n` texels, those of a tile's
 // texels outside the level left out by the caller through `inside`)
+static bool g_plain2;
+
+void wl_xbox_tex_set_plain2(bool on) {
+    g_plain2 = on;
+}
+
 static void tile_convert(WlXboxFormat fmt, const uint8_t *in, const uint32_t *offs, uint32_t n,
                          const uint8_t *inside, uint8_t *tile) {
     uint32_t i;
     switch (fmt) {
     case WL_XBOX_A8R8G8B8: // B, G, R, A to the AR plane, then the GB plane
     case WL_XBOX_X8R8G8B8:
+        if (inside == NULL && !g_plain2) {
+            // (a whole tile, a texel's word at a time: B, G, R, A in memory; the AR pair and the GB pair
+            // stored as halfwords in the host's order)
+            uint32_t x = fmt == WL_XBOX_X8R8G8B8 ? 0xFF00u : 0u;
+            for (i = 0; i < n; i++) {
+                uint32_t v;
+                uint16_t ar, gb;
+                memcpy(&v, in + offs[i], 4);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+                ar = (uint16_t)(((v << 8) & 0xFF00u) | ((v >> 8) & 0xFFu) | x);
+                gb = (uint16_t)(((v >> 8) & 0xFF00u) | (v >> 24));
+#else
+                ar = (uint16_t)((v >> 16) | x);
+                gb = (uint16_t)v;
+                ar = (uint16_t)(ar >> 8 | ar << 8);
+                gb = (uint16_t)(gb >> 8 | gb << 8);
+#endif
+                memcpy(tile + i * 2, &ar, 2);
+                memcpy(tile + 32 + i * 2, &gb, 2);
+            }
+            break;
+        }
         for (i = 0; i < n; i++) {
             if (inside == NULL || inside[i]) {
                 const uint8_t *t = in + offs[i];
@@ -336,7 +364,9 @@ size_t wl_xbox_to_gx(WlXboxFormat fmt, int swizzled, uint32_t pitch, const void 
             offs[y * tw + x] = swizzled ? (deposit_bits(x, mask_x) | deposit_bits(y, mask_y)) * tb : y * row + x * tb;
         }
     }
-    memset(dst, 0, total);
+    if (g_plain2 || w % tw != 0 || h % th != 0) {
+        memset(dst, 0, total); // (a tile past the level's edge: its texels outside it 0)
+    }
     const uint8_t *in = src;
     uint8_t *out = dst;
     uint32_t tiles_x = (w + tw - 1u) / tw;
@@ -378,17 +408,81 @@ static int dxt_args_ok(WlXboxFormat dxt, const void *src, size_t src_len, uint32
     return is_dxt(dxt) && src != NULL && src_len >= wl_xbox_level_bytes(dxt, w, h, 0) && dims_ok(w, h);
 }
 
+// reverse_pairs of every byte
+#define RP1(v) (uint8_t)((((v) & 3u) << 6) | ((((v) >> 2) & 3u) << 4) | ((((v) >> 4) & 3u) << 2) | ((v) >> 6))
+#define RP4(v) RP1(v), RP1((v) + 1u), RP1((v) + 2u), RP1((v) + 3u)
+#define RP16(v) RP4(v), RP4((v) + 4u), RP4((v) + 8u), RP4((v) + 12u)
+#define RP64(v) RP16(v), RP16((v) + 16u), RP16((v) + 32u), RP16((v) + 48u)
+static const uint8_t k_reverse_pairs[256] = {RP64(0u), RP64(64u), RP64(128u), RP64(192u)};
+#undef RP64
+#undef RP16
+#undef RP4
+#undef RP1
+
+static bool g_dxt_plain;
+
+void wl_xbox_dxt_set_plain(bool plain) {
+    g_dxt_plain = plain;
+}
+
+// wl_xbox_dxt_to_cmpr of a level whose blocks fill its 8x8 tiles (an even number of block columns and
+// rows): every byte written, a tile's four blocks at a time, the index bytes reversed by a table
+static void dxt_to_cmpr_tiles(WlXboxFormat dxt, const uint8_t *in, uint32_t cols, uint32_t rows, uint8_t *out) {
+    const size_t bb = dxt_block_bytes(dxt), row_bytes = (size_t)cols * bb;
+    const bool dxt1 = dxt == WL_XBOX_DXT1;
+
+    in += dxt1 ? 0u : 8u;
+    for (uint32_t by = 0; by < rows; by += 2u) {
+        const uint8_t *top = in + (size_t)by * row_bytes;
+
+        for (uint32_t bx = 0; bx < cols; bx += 2u, out += 32) {
+            for (uint32_t k = 0; k < 4u; k++) {
+                // (the tile's 2x2 blocks in row-major order)
+                const uint8_t *b = top + (k >> 1) * row_bytes + ((size_t)bx + (k & 1u)) * bb;
+                uint8_t *o = out + k * 8u;
+                uint32_t c0 = (uint32_t)b[0] | (uint32_t)b[1] << 8, c1 = (uint32_t)b[2] | (uint32_t)b[3] << 8;
+                uint32_t i0 = b[4], i1 = b[5], i2 = b[6], i3 = b[7];
+
+                if (!dxt1) {
+                    if (c0 < c1) {
+                        uint32_t t = c0;
+                        c0 = c1;
+                        c1 = t;
+                        i0 ^= 0x55u, i1 ^= 0x55u, i2 ^= 0x55u, i3 ^= 0x55u;
+                    } else if (c0 == c1) {
+                        i0 = i1 = i2 = i3 = 0;
+                    }
+                } else if (c0 <= c1 && (i0 & i1 & i2 & i3) == 0xFFu) {
+                    c0 = c1 = 0; // (a block all clear: as wl_xbox_dxt_to_cmpr's loop has it)
+                }
+                o[0] = (uint8_t)(c0 >> 8);
+                o[1] = (uint8_t)c0;
+                o[2] = (uint8_t)(c1 >> 8);
+                o[3] = (uint8_t)c1;
+                o[4] = k_reverse_pairs[i0];
+                o[5] = k_reverse_pairs[i1];
+                o[6] = k_reverse_pairs[i2];
+                o[7] = k_reverse_pairs[i3];
+            }
+        }
+    }
+}
+
 size_t wl_xbox_dxt_to_cmpr(WlXboxFormat dxt, const void *src, size_t src_len, uint32_t w, uint32_t h, void *dst, size_t cap) {
     size_t total = wl_gxc_tex_bytes(WL_GXC_CMPR, w, h);
     if (!dxt_args_ok(dxt, src, src_len, w, h) || dst == NULL || total == 0 || total > cap) {
         return 0;
     }
-    memset(dst, 0, total);
     const uint8_t *in = src;
     uint8_t *out = dst;
     uint32_t cols = (w + 3u) / 4u;
     uint32_t rows = (h + 3u) / 4u;
     uint32_t tiles_x = (cols + 1u) / 2u;
+    if (!g_dxt_plain && (cols & 1u) == 0 && (rows & 1u) == 0) {
+        dxt_to_cmpr_tiles(dxt, in, cols, rows, out);
+        return total;
+    }
+    memset(dst, 0, total);
     size_t bb = dxt_block_bytes(dxt);
     size_t colour_off = dxt == WL_XBOX_DXT1 ? 0 : 8;
     for (uint32_t by = 0; by < rows; by++) {
@@ -464,7 +558,9 @@ size_t wl_xbox_dxt_alpha_i4(WlXboxFormat dxt, const void *src, size_t src_len, u
     if (dxt == WL_XBOX_DXT1 || !dxt_args_ok(dxt, src, src_len, w, h) || dst == NULL || total == 0 || total > cap) {
         return 0;
     }
-    memset(dst, 0, total);
+    if (g_plain2 || (w & 7u) != 0 || (h & 7u) != 0) {
+        memset(dst, 0, total); // (whole 8x8 tiles of whole blocks: every byte written below)
+    }
     const uint8_t *in = src;
     uint8_t *out = dst;
     uint32_t cols = (w + 3u) / 4u;

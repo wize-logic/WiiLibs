@@ -53,7 +53,13 @@ enum {
     CANONICAL_POINTS = 4,
     // ...and for its transform unit's matrices (xf_prepare)
     XF_PROBES = 8,
-    TG_CONSTANTS = 16,
+    // (texgen_xf_plan's probes; the programs whose constants for them are listed, at most TG_CONSTANTS;
+    // the outputs kept for those constants' values: 25 KB)
+    TG_PROBES = 4,
+    TG_CONSTANTS = 8,
+    TG_LISTS = 16,
+    TG_SETS = 16,
+    TG_WAYS = 4,
     // programs whose analyses are kept
     XF_ANALYSES = 8,
     // a stand-in texture's image: 4 x 4 RGBA8, one GX tile
@@ -161,6 +167,14 @@ struct WlNv2aGx {
         uint8_t format;
     } readers[8];
     unsigned reader_count;
+    // the EFB's owner (a target) has had clears alone since it took the EFB, these (target_retake)
+    bool owner_clears_only;
+    unsigned owner_clear_count;
+    struct {
+        bool colour, depth;
+        uint32_t rgba, x0, y0, x1, y1;
+        float z;
+    } owner_clears[2];
     uint32_t view_w, view_h;
     // a 4:3 picture on a 16:9 screen drawn narrow (wl_gx_draw_narrow, in the EFB's last columns, the targets
     // drawn beside it): the back buffer's x (0 to
@@ -236,18 +250,33 @@ struct WlNv2aGx {
         bool valid;
     } xf_probe_key, fit_probe_key, tg_probe_key;
     WlXboxVshOutput xf_probe_out[XF_PROBES], fit_probe_out[CANONICAL_POINTS], tg_probe_out[XF_PROBES];
-    // (texgen_xf_plan's probe vertices, and the constants its outputs read when it ran them: kept while
-    // those are the same, as a skinned draw's bones change from draw to draw and they do not)
+    // (texgen_xf_plan's probe vertices; the constants each of the last TG_LISTS programs reads for the
+    // outputs it probed (wl_xbox_vsh_live_constants); and its outputs for those constants' values,
+    // TG_WAYS of each TG_SETS (by a hash of the values): kept while those are the same, as a skinned
+    // draw's bones change from draw to draw and they do not, and the few tens of materials of a frame's
+    // skinned models take turns. tg_t: the outputs texgen_xf_plan reads)
     float tg_probe_in[XF_PROBES][WL_NV2A_ATTRIBS][4];
-    struct {
+    struct TgList {
+        // (a compiled program by its function and words' hash, as the pipeline may compile it again in
+        // another slot from frame to frame; an interpreted one by its address and serial)
         const WlXboxVshProgram *program;
-        uint32_t serial;
+        uint32_t serial, stamp;
+        WlXboxVshLiveProc native;
+        unsigned long hash, instructions;
         unsigned live;
         int count;
         unsigned char registers[TG_CONSTANTS];
+    } tg_lists[TG_LISTS];
+    struct TgKept {
+        // (its list's slot and stamp: 0 for none)
+        const struct TgList *list;
+        uint32_t stamp;
         float values[TG_CONSTANTS][4];
-        bool valid;
-    } tg_kept;
+        float t[TG_PROBES][4][4];
+    } tg_kept[TG_SETS][TG_WAYS];
+    unsigned tg_next;
+    uint32_t tg_stamp;
+    float tg_t[TG_PROBES][4][4];
     bool last_shared;
     // (the last draw's fit made with the camera's slope, made or kept; its depth_check)
     bool last_narrow;
@@ -290,10 +319,11 @@ struct WlNv2aGx {
         uint32_t fence[MADE_CHUNKS]; // the fence behind each chunk's last draw (0: none to wait for)
         uint32_t entered; // chunks entered since the ring began again (their fences met, GX's cache emptied)
         uint32_t pending; // chunks written since the last fence
-        // the draw's: its vertices made into the ring, sent by index; its slots and the next one
+        // the draw's: its vertices made into the ring, sent by index; its slots' bytes (0: not yet
+        // placed, made_place), its slots and the next one
         bool ring_on, indexed;
         PackedVertex *base;
-        uint32_t next, limit, batch_first, made;
+        uint32_t stride, next, limit, batch_first, made;
         uint16_t memo[MEMO];                // (ring_on: a memo slot's vertex, the draw's slot)
         uint32_t index[WL_XBOX_VSH_BATCH];  // the batch's vertices' slots
     } made;
@@ -380,6 +410,19 @@ enum {
     SWITCH_NO_PAGE_HASH = 1u << 12, // "nopagehash": a vertex array's source hashed whole at a check (nv2a_vcache.h)
     SWITCH_NO_INDEX_BOUNDS = 1u << 13, // "noindexbounds": a draw's least and greatest index by a pass at the draw
     SWITCH_NO_XF_TEXGEN = 1u << 14, // "noxftexgen": a fused form's coordinates the processor's (texgen_xf_plan)
+    SWITCH_NO_RING_FIT = 1u << 15, // "noringfit": the ring's slots 88 bytes, whatever the draw's words (made_stride)
+    // "noparkretake": a target that took the EFB with a clear and then reads the picture is not given the EFB again
+    // (the picture parked in part then, the first blur of each size without it for a frame: target_retake)
+    SWITCH_NO_PARK_RETAKE = 1u << 16,
+    SWITCH_NO_TG_KEEP = 1u << 17, // "notgkeep": texgen_xf_plan's probes run at each change of the constants
+    SWITCH_NO_X_TEXGEN = 1u << 18, // "noxtexgen": an "x" form's coordinates the processor's (xf_position_layout)
+    SWITCH_OLD_PUSH2 = 1u << 20, // "oldpush2": the pusher's loop as wave 3 left it (wl_nv2a_set_push_cuts)
+    SWITCH_TEX_PLAIN = 1u << 19, // "texplain": textures converted and checked as before wave 4 (nv2a_texcache.h: plain)
+    SWITCH_OLD_PUSH3 = 1u << 21, // "oldpush3": the arrays' layout made each draw, index and viewport words as before
+    SWITCH_TEX_PLAIN2 = 1u << 22, // "texplain2": textures made and made again as before texcache2 (nv2a_texcache.h: plain2)
+    // "texbudget1": a frame's textures made at their lookups up to the configuration's frame_budget as given (1 MB);
+    // else twice it, the time it took before wave 4's cheaper conversions (card 15: 1299 KB in 29 ms at the worst)
+    SWITCH_TEX_BUDGET1 = 1u << 23,
 };
 
 static const struct {
@@ -401,6 +444,15 @@ static const struct {
     {"nopagehash", "WL_XB_NOPAGEHASH", SWITCH_NO_PAGE_HASH},
     {"noindexbounds", "WL_XB_NOINDEXBOUNDS", SWITCH_NO_INDEX_BOUNDS},
     {"noxftexgen", "WL_XB_NOXFTEXGEN", SWITCH_NO_XF_TEXGEN},
+    {"noringfit", "WL_XB_NORINGFIT", SWITCH_NO_RING_FIT},
+    {"noparkretake", "WL_XB_NOPARKRETAKE", SWITCH_NO_PARK_RETAKE},
+    {"notgkeep", "WL_XB_NOTGKEEP", SWITCH_NO_TG_KEEP},
+    {"noxtexgen", "WL_XB_NOXTEXGEN", SWITCH_NO_X_TEXGEN},
+    {"oldpush2", "WL_XB_OLDPUSH2", SWITCH_OLD_PUSH2},
+    {"texplain", "WL_XB_TEXPLAIN", SWITCH_TEX_PLAIN},
+    {"oldpush3", "WL_XB_OLDPUSH3", SWITCH_OLD_PUSH3},
+    {"texplain2", "WL_XB_TEXPLAIN2", SWITCH_TEX_PLAIN2},
+    {"texbudget1", "WL_XB_TEXBUDGET1", SWITCH_TEX_BUDGET1},
 };
 
 static unsigned g_switches_off;
@@ -474,6 +526,9 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     // (a light's falloff cube as its lit face, wl_nv2a_spot_coordinates, not a sphere map)
     textures.spots = true;
     textures.gpu_lag = gx->cfg.overlap ? 1u : 0u;
+    textures.plain = textures.plain || !switched_on(SWITCH_TEX_PLAIN);
+    textures.plain2 = textures.plain2 || !switched_on(SWITCH_TEX_PLAIN2);
+    textures.frame_budget *= switched_on(SWITCH_TEX_BUDGET1) ? 2u : 1u;
     if (textures.flush == NULL) {
         textures.flush = commit;
     }
@@ -491,6 +546,8 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     }
     vertices.whole_hash = vertices.whole_hash || !switched_on(SWITCH_NO_PAGE_HASH);
     wl_nv2a_set_index_bounds(switched_on(SWITCH_NO_INDEX_BOUNDS));
+    wl_nv2a_set_push_cuts(switched_on(SWITCH_OLD_PUSH2));
+    wl_nv2a_set_push_cuts3(switched_on(SWITCH_OLD_PUSH3));
     wl_nv2a_vcache_init(&gx->vertices, &vertices);
     wl_nv2a_pipeline_init(&gx->pipeline, gx->cfg.natives, gx->cfg.native_count);
     gx->pipeline.decoded = gx->cfg.program_decoded;
@@ -1007,6 +1064,29 @@ static void reader_add(WlNv2aGx *gx, const RenderTarget *t, uint32_t parked_w, u
              (unsigned)gx->back_phys, (unsigned)t->width, (unsigned)t->height, (unsigned)parked_w, (unsigned)parked_h);
 }
 
+// A target that took the EFB with clears (no draw: not known then to read the picture) whose first draw
+// reads it: one of the readers from now on, and the EFB taken again at once, so that the picture is
+// parked whole for this draw (target_texture) and not only from the next park on: the target resolved,
+// the back buffer put back, then parked whole as the target takes the EFB again, and its clears made
+// again. The switch "noparkretake" leaves the picture unread by that draw.
+static void target_retake(WlNv2aGx *gx, RenderTarget *t) {
+    unsigned n;
+
+    reader_add(gx, t, 0, 0);
+    use_back_buffer(gx);
+    target_resolved(gx, wl_gx_target_use(&t->target));
+    gx->owner = t;
+    gx->view_w = t->width < gx->cfg.width ? t->width : gx->cfg.width;
+    gx->view_h = t->height < gx->cfg.height ? t->height : gx->cfg.height;
+    for (n = 0; n < gx->owner_clear_count; n++) {
+        clear_rect(gx, gx->owner_clears[n].colour, gx->owner_clears[n].depth, gx->owner_clears[n].rgba,
+                   gx->owner_clears[n].z, gx->owner_clears[n].x0, gx->owner_clears[n].y0, gx->owner_clears[n].x1,
+                   gx->owner_clears[n].y1);
+    }
+    device_state(gx);
+    gx->stats.picture_retakes++;
+}
+
 // `k`: the draw's state (NULL for a clear)
 static bool surface_prepare(WlNv2aGx *gx, const WlNv2aSurface *s, const WlNv2aKelvin *k) {
     uint32_t sx = s->samples_x, sy = s->samples_y, x0, y0, x1, y1;
@@ -1051,6 +1131,14 @@ static bool surface_prepare(WlNv2aGx *gx, const WlNv2aSurface *s, const WlNv2aKe
             target_resolved(gx, wl_gx_target_use(&t->target));
             gx->owner = t;
             device_state(gx);
+            gx->owner_clears_only = true;
+            gx->owner_clear_count = 0;
+        } else if (k != NULL && gx->owner_clears_only && switched_on(SWITCH_PARK_LATE) &&
+                   switched_on(SWITCH_NO_PARK_RETAKE) && !target_reads_picture(gx, t) && draw_reads_picture(gx, k)) {
+            target_retake(gx, t);
+        }
+        if (k != NULL) {
+            gx->owner_clears_only = false;
         }
         t->resolved = false;
         gx->stats.target_draws++;
@@ -2635,8 +2723,11 @@ static inline __attribute__((always_inline)) void positions_pack(const WlNv2aGx 
             put_float(&out->w[0], px);
             put_float(&out->w[1], py);
             put_float(&out->w[2], as_depth(v->position[2], depth_max) - 1.0f);
-            out->x = px;
-            out->y = py;
+            if (landing) {
+                // (only where they are read: a slot of the ring is the words alone, made_stride)
+                out->x = px;
+                out->y = py;
+            }
         }
     }
 }
@@ -2854,7 +2945,9 @@ static void vertex_pack_xf(const DrawPlan *plan, const float (*inputs)[4], Packe
             put_float(&out->w[i++], inputs[source][1]);
         }
     }
-    out->x = out->y = 0.0f;
+    if (plan->landing) {
+        out->x = out->y = 0.0f;
+    }
 }
 
 // the batch's vertex n (its words' first member)
@@ -3084,8 +3177,9 @@ static void fused_check(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *d
     if (plan->lit || (plan->xf != NULL && plan->xf->world) || plan->texgen_xf != 0) {
         return;
     }
+    // (the draw's words alone: a slot of the ring holds no more, made_stride)
     for (r = 0; r < runs; r++) {
-        fused[r] = *gx->batch.run_vertices[r];
+        memcpy(fused[r].w, gx->batch.run_vertices[r]->w, 4u * plan->words);
     }
     wl_nv2a_fetch_elements(&gx->fetch, draw, gx->batch.elements, runs, gx->batch.inputs);
     wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->batch.inputs, runs,
@@ -3142,7 +3236,7 @@ static void fused_check(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *d
             }
             WL_LOG_W(TAG, "fused check:  inputs%s", text);
         }
-        memcpy(gx->batch.run_vertices[r]->w, fused[r].w, sizeof fused[r].w);
+        memcpy(gx->batch.run_vertices[r]->w, fused[r].w, 4u * plan->words);
     }
 }
 #endif
@@ -3152,12 +3246,15 @@ static void fused_check(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *d
 // vertices about 1.7 times each, 16 to 20 words each time. Its vertices made into the ring
 // (gx->made) are read by GX at an index of their own instead (wl_gx_direct_array_words: each
 // attribute's array the slots' words at its place), written once, each repeat two bytes an
-// attribute. A draw takes slots from `pos` on for at most its vertices and one a batch (a batch's
-// first vertex starts a 32-byte line: GX may have read the line before it, written back with its
-// batch, into its vertex cache); its slots stay its own until GX is past it. The ring's chunks are
+// attribute. A draw takes slots from `pos` on for at most its vertices and, a batch, those up to the
+// next 32-byte line (one, or two or three for slots under 32 bytes: made_spare; a batch's first
+// vertex starts a line: GX may have read the line before it, written back with its batch, into its
+// vertex cache); its slots stay its own until GX is past it. The ring's chunks are
 // written again only once GX is past the fence (wl_gx_fence) sent when the writing left them, and GX's
 // vertex cache is emptied as each is entered. The switch "nomadeindex" (WL_XB_NOMADEINDEX) sends
-// every vertex's words.
+// every vertex's words. A slot is as long as the draw's words (made_stride: 44 to 64 bytes for most,
+// not a PackedVertex's 88), placed at the draw's first batch, when its words are known; the switch
+// "noringfit" (WL_XB_NORINGFIT) keeps every slot a PackedVertex.
 
 // whether a draw of `count` vertices may have its vertices made into the ring
 static bool made_possible(const WlNv2aGx *gx, uint32_t count) {
@@ -3186,11 +3283,9 @@ static void made_fence(WlNv2aGx *gx, uint32_t chunks) {
     gx->stats.made_fences++;
 }
 
-// the draw's slots taken (false: its vertices made the usual way, into the memo)
+// the draw's slots taken (false: its vertices made the usual way, into the memo); they are placed
+// in the ring at its first batch (made_place)
 static bool made_begin(WlNv2aGx *gx, uint32_t count) {
-    uint32_t slots = count + (count + WL_XBOX_VSH_BATCH - 1u) / WL_XBOX_VSH_BATCH + 1u, bytes, c, last, first;
-    bool emptied = false;
-
     gx->made.ring_on = gx->made.indexed = false;
     if (!made_possible(gx, count)) {
         gx->stats.made_refused += switched_on(SWITCH_NO_MADE_INDEX) && count != 0 ? 1u : 0u;
@@ -3205,10 +3300,70 @@ static bool made_begin(WlNv2aGx *gx, uint32_t count) {
         }
         WL_LOG_I(TAG, "made vertices: a ring of %u KB for GX to read by index", MADE_RING_BYTES >> 10);
     }
-    // (the draw's slots from the first that starts at pos or after: the slots are numbered from the
-    // ring's start, which every array has as its base, so that a layout's arrays stay as GX holds them)
-    first = (gx->made.pos + (uint32_t)sizeof(PackedVertex) - 1u) / (uint32_t)sizeof(PackedVertex);
-    if ((first + slots) * (uint32_t)sizeof(PackedVertex) > MADE_RING_BYTES) {
+    gx->made.base = gx->made.ring;
+    gx->made.made = 0;
+    gx->made.stride = 0;
+    gx->made.limit = count; // (the draw's vertices, until made_place)
+    gx->made.ring_on = true;
+    return true;
+}
+
+// The bytes of a slot of the draw: its words (`first`: at its first batch, before projected_plan,
+// which may add up to five: the most its choice can), or a PackedVertex for a draw whose landings
+// are kept (vertices_pack's x, y after the words) and with the switch noringfit
+static uint32_t made_stride(const WlNv2aGx *gx, const DrawPlan *plan, bool first) {
+    unsigned words = plan->words, most = words, may = 0, n, c;
+
+    if (!switched_on(SWITCH_NO_RING_FIT) || plan->landing) {
+        return (uint32_t)sizeof(PackedVertex);
+    }
+    if (first && gx->pipeline.program != NULL && (plan->xf == NULL || !plan->xf->full)) {
+        // (projected_plan's choice: at most WL_GX_DIRECT_PROJECTED of the stages a spot or projective
+        // without a sphere, each taken while the words stay within PACKED_WORDS)
+        for (n = 0; n < plan->stage_count; n++) {
+            const StagePlan *sp = &plan->stages[plan->stage_list[n]];
+
+            may += sp->spot || (sp->projective && !sp->sphere) ? 1u : 0u;
+        }
+        for (c = 1; c <= may && c <= WL_GX_DIRECT_PROJECTED; c++) {
+            unsigned w = words - 2u * c + (c == 1u ? 3u : 3u * WL_GX_DIRECT_PROJECTED);
+
+            if (w > PACKED_WORDS) {
+                break;
+            }
+            most = w > most ? w : most;
+        }
+    }
+    // (an index of two bytes: 65536 slots at most, 8 bytes each)
+    most = most < 2u ? 2u : most;
+    return 4u * (most < PACKED_WORDS ? most : PACKED_WORDS);
+}
+
+// The slots made_flush may pass over at a batch's end, `stride` bytes each: those that start before
+// the next 32-byte line. A slot starts a multiple of the stride from the ring's start (32-byte
+// aligned), so the line is at most 32 - g bytes on, g the greatest power of two dividing the stride
+// (at most 32): one for 16, 24 and 28 bytes and from 32 on (as for every slot before ring-fit), two
+// for 20 (five words), three for 8 and 12 (two and three words)
+static inline uint32_t made_spare(uint32_t stride) {
+    uint32_t g = stride & (0u - stride), spare;
+
+    g = g < 32u ? g : 32u;
+    spare = (32u - g + stride - 1u) / stride;
+    return spare > 1u ? spare : 1u;
+}
+
+// the draw's slots placed in the ring, `stride` bytes each: from the first that starts at pos or
+// after, the ring begun again (behind a fence) where they do not fit, the chunks they enter met; its
+// vertices, a batch the slots made_flush may pass over (made_spare), and one more
+static void made_place(WlNv2aGx *gx, uint32_t stride) {
+    uint32_t count = gx->made.limit, bytes, c, last, first;
+    uint32_t slots = count + (count + WL_XBOX_VSH_BATCH - 1u) / WL_XBOX_VSH_BATCH * made_spare(stride) + 1u;
+    bool emptied = false;
+
+    // (the slots are numbered from the ring's start, which every array has as its base, so that a
+    // layout's arrays stay as GX holds them while the stride does)
+    first = (gx->made.pos + stride - 1u) / stride;
+    if ((first + slots) * stride > MADE_RING_BYTES) {
         // (from the start again: what was written since the last fence goes behind one)
         made_fence(gx, gx->made.pending);
         gx->made.pos = 0;
@@ -3216,7 +3371,7 @@ static bool made_begin(WlNv2aGx *gx, uint32_t count) {
         gx->stats.made_laps++;
         first = 0;
     }
-    bytes = (first + slots) * (uint32_t)sizeof(PackedVertex) - gx->made.pos;
+    bytes = (first + slots) * stride - gx->made.pos;
     last = (gx->made.pos + bytes - 1u) / MADE_CHUNK_BYTES;
     for (c = gx->made.pos / MADE_CHUNK_BYTES; c <= last; c++) {
         if (!(gx->made.entered & (1u << c))) {
@@ -3233,19 +3388,26 @@ static bool made_begin(WlNv2aGx *gx, uint32_t count) {
         // (GX's vertex cache may hold the chunk's lines as their last lap had them)
         wl_gx_direct_arrays_changed();
     }
-    gx->made.base = gx->made.ring;
-    gx->made.made = 0;
+    gx->made.stride = stride;
     gx->made.next = first;
     gx->made.limit = first + slots;
-    gx->made.ring_on = true;
-    return true;
+    if (stride <= 20u) {
+        gx->stats.made_small_draws++;
+        gx->stats.made_small_vertices += count;
+    }
+}
+
+// the draw's slot `at`
+static inline PackedVertex *made_slot(const WlNv2aGx *gx, uint32_t at) {
+    return (PackedVertex *)(void *)((char *)gx->made.base + (size_t)at * gx->made.stride);
 }
 
 // The batch's slots: an indexed draw's vertex kept by its index (the memo) is the slot made for it
 // before, the others each a new slot (a function of its index: the same whatever the memo held).
 // The vertices to make (their elements, their slots) as vertices_make's memo has them; their count.
 static unsigned made_slots(WlNv2aGx *gx, const WlNv2aDraw *draw, uint32_t first, uint32_t count, bool indexed) {
-    PackedVertex *const base = gx->made.base;
+    char *const base = (char *)gx->made.base;
+    const size_t stride = gx->made.stride;
     uint32_t next = gx->made.next, *const slot_of = gx->made.index;
     const uint32_t **const words = gx->batch.words;
     unsigned runs = 0, n;
@@ -3260,33 +3422,37 @@ static unsigned made_slots(WlNv2aGx *gx, const WlNv2aDraw *draw, uint32_t first,
         for (n = 0; n < count; n++) {
             uint32_t index = indices[n], slot = index & (MEMO - 1u), at;
             struct WlNv2aGxMemo *m = &memo[slot];
+            char *vertex;
 
             if (m->stamp == stamp && m->index == index) {
                 at = made_memo[slot];
+                vertex = base + at * stride;
             } else {
                 // (a slot's vertex stays where it is when another index takes the memo's place)
                 m->stamp = stamp;
                 m->index = index;
                 at = next++;
+                vertex = base + at * stride;
                 made_memo[slot] = (uint16_t)at;
                 gx->batch.elements[runs] = index - index_base;
-                gx->batch.words_made[runs] = base[at].w;
-                gx->batch.run_vertices[runs] = &base[at];
+                gx->batch.words_made[runs] = (uint32_t *)(void *)vertex;
+                gx->batch.run_vertices[runs] = (PackedVertex *)(void *)vertex;
                 runs++;
             }
             slot_of[n] = at;
-            words[n] = base[at].w;
+            words[n] = (const uint32_t *)(const void *)vertex;
         }
     } else {
-        for (n = 0; n < count; n++) {
-            uint32_t at = next++;
+        char *at_bytes = base + next * stride;
 
-            slot_of[n] = at;
-            words[n] = base[at].w;
+        for (n = 0; n < count; n++, at_bytes += stride) {
+            slot_of[n] = next + n;
+            words[n] = (const uint32_t *)(const void *)at_bytes;
             gx->batch.elements[n] = first + n;
-            gx->batch.words_made[n] = base[at].w;
-            gx->batch.run_vertices[n] = &base[at];
+            gx->batch.words_made[n] = (uint32_t *)(void *)at_bytes;
+            gx->batch.run_vertices[n] = (PackedVertex *)(void *)at_bytes;
         }
+        next += count;
         runs = count;
     }
     gx->made.made += next - gx->made.batch_first;
@@ -3295,8 +3461,8 @@ static unsigned made_slots(WlNv2aGx *gx, const WlNv2aDraw *draw, uint32_t first,
         // (the new slots' lines, which no one has read since their chunk was entered, zeroed before
         // the vertices are written: on the Wii the wrapped memset's dcbz, a line had without its
         // fill from memory; made_flush writes the same lines back)
-        uintptr_t from = (uintptr_t)&base[gx->made.batch_first] & ~(uintptr_t)31u;
-        uintptr_t to = ((uintptr_t)&base[next] + 31u) & ~(uintptr_t)31u;
+        uintptr_t from = (uintptr_t)(base + gx->made.batch_first * stride) & ~(uintptr_t)31u;
+        uintptr_t to = ((uintptr_t)(base + next * stride) + 31u) & ~(uintptr_t)31u;
 
         memset((void *)from, 0, to - from);
     }
@@ -3310,10 +3476,13 @@ static void made_flush(WlNv2aGx *gx) {
     if (gx->made.next == gx->made.batch_first) {
         return;
     }
-    from = (uintptr_t)&gx->made.base[gx->made.batch_first] & ~(uintptr_t)31u;
-    to = ((uintptr_t)&gx->made.base[gx->made.next] + 31u) & ~(uintptr_t)31u;
+    from = (uintptr_t)made_slot(gx, gx->made.batch_first) & ~(uintptr_t)31u;
+    to = ((uintptr_t)made_slot(gx, gx->made.next) + 31u) & ~(uintptr_t)31u;
     commit(NULL, (void *)from, to - from);
-    gx->made.next = (uint32_t)((to - base + sizeof(PackedVertex) - 1u) / sizeof(PackedVertex));
+    gx->stats.made_bytes += to - from;
+    gx->made.next = (uint32_t)((to - base + gx->made.stride - 1u) / gx->made.stride);
+    // (within the slots made_place took: past them lie chunks whose fence was not met, or the ring's end)
+    WL_ASSERT(gx->made.next <= gx->made.limit);
 }
 
 // The attributes a layout sends, each read from the slots (WlGxDirectLayout.indexed), and the word
@@ -3367,7 +3536,7 @@ static bool made_arrays(WlNv2aGx *gx, const DrawPlan *plan, WlGxDirectLayout *la
     unsigned n, at = made_places(layout, &indexed, place);
     const uint8_t *words = (const uint8_t *)gx->made.ring->w;
 
-    if (at != plan->words || at > PACKED_WORDS) {
+    if (at != plan->words || at > PACKED_WORDS || 4u * at > gx->made.stride) {
         gx->stats.made_unmatched++;
         if (layout->indexed != 0) {
             layout->indexed = 0;
@@ -3379,7 +3548,7 @@ static bool made_arrays(WlNv2aGx *gx, const DrawPlan *plan, WlGxDirectLayout *la
     wl_gx_direct_layout(layout);
     for (n = 0; n <= WL_GX_DIRECT_ARRAY_NORMAL; n++) {
         if (indexed & (1u << n)) {
-            wl_gx_direct_array_words(n, words + 4u * place[n], (uint32_t)sizeof(PackedVertex));
+            wl_gx_direct_array_words(n, words + 4u * place[n], gx->made.stride);
         }
     }
     return true;
@@ -3397,8 +3566,8 @@ static void made_end(WlNv2aGx *gx, uint32_t count) {
         gx->stats.made_sent += count;
     }
     gx->stats.made_vertices += gx->made.made;
-    end = ((gx->made.next * (uint32_t)sizeof(PackedVertex)) + 31u) & ~31u;
-    if (end > gx->made.pos) {
+    end = ((gx->made.next * gx->made.stride) + 31u) & ~31u;
+    if (gx->made.stride != 0 && end > gx->made.pos) {
         last = (end - 1u) / MADE_CHUNK_BYTES;
         for (c = gx->made.pos / MADE_CHUNK_BYTES; c <= last; c++) {
             gx->made.pending |= 1u << c;
@@ -3421,6 +3590,9 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
     // words go; the draw's and the tables' addresses in locals, which the stores would otherwise
     // have the compiler load again for each vertex; or into the draw's slots)
     if (gx->made.ring_on) {
+        if (gx->made.stride == 0) {
+            made_place(gx, made_stride(gx, plan, layout != NULL));
+        }
         runs = made_slots(gx, draw, first, count, indexed);
     } else if (indexed) {
         const uint32_t *indices = draw->indices + first;
@@ -4602,48 +4774,116 @@ static void sphere_xf_plan(WlNv2aGx *gx, DrawPlan *plan, WlGxDirectLayout *layou
 // stages after the first from the first one's input (WL_GX_DIRECT_TG_INPUT0): two words a stage fewer,
 // and the program's instructions for them not run. Not to the bit (GX's arithmetic is its own). A
 // projective stage's q must be 1. The switch "noxftexgen" (WL_XB_NOXFTEXGEN) leaves them to the processor.
-// whether texgen_xf_plan's probe outputs for `live` are those of the program and constants now: the same
-// program, and the constants its instructions for those outputs read the same (none by a0); else the key
-// set for the probes about to run (false)
-static bool texgen_probes_kept(WlNv2aGx *gx, const WlNv2aKelvin *k, unsigned live) {
+// the list of constants texgen_xf_plan's probe outputs for `live` are a function of, for the program now
+// (wl_xbox_vsh_live_constants: count -1 for none); found again, or made in the oldest of TG_LISTS
+static const struct TgList *texgen_list(WlNv2aGx *gx, unsigned live) {
     const WlXboxVshProgram *program = gx->pipeline.program;
-    const float(*c)[4] = (const float(*)[4])k->constants;
-    int n;
+    struct TgList *l;
+    unsigned i;
 
-    if (!g_draw_cuts) {
-        return false;
+    for (i = 0; i < TG_LISTS; i++) {
+        l = &gx->tg_lists[i];
+        if (l->stamp != 0 && l->live == live &&
+            (l->native != NULL ? l->native == program->native && l->hash == program->hash &&
+                                     l->instructions == program->count
+                               : l->program == program && l->serial == program->serial)) {
+            return l;
+        }
     }
-    if (gx->tg_kept.valid && gx->tg_kept.program == program && gx->tg_kept.serial == program->serial &&
-        gx->tg_kept.live == live && gx->tg_kept.count >= 0) {
-        for (n = 0; n < gx->tg_kept.count; n++) {
-            if (memcmp(gx->tg_kept.values[n], c[gx->tg_kept.registers[n]], sizeof gx->tg_kept.values[n]) != 0) {
-                break;
+    l = &gx->tg_lists[gx->tg_next];
+    gx->tg_next = (gx->tg_next + 1u) % TG_LISTS;
+    l->program = program;
+    l->serial = program->serial;
+    l->native = program->native;
+    l->hash = program->hash;
+    l->instructions = program->count;
+    l->live = live;
+    l->count = wl_xbox_vsh_live_constants(program, live, l->registers, TG_CONSTANTS);
+    // (the outputs kept for the list this slot held are not found again: another stamp)
+    l->stamp = ++gx->tg_stamp != 0 ? gx->tg_stamp : ++gx->tg_stamp;
+    return l;
+}
+
+// texgen_xf_plan's probe outputs for `live` into tg_t: those kept for the same program and the same
+// values of the constants its instructions for those outputs read (none by a0: texgen_list), else the
+// probes run (kept by the constants' generation, probes_kept, where there is no list) and kept. The
+// switch "notgkeep" (WL_XB_NOTGKEEP) keeps them by the generation alone (run again at each change of the
+// constants: a skinned draw's every draw)
+static void texgen_probes(WlNv2aGx *gx, const WlNv2aKelvin *k, unsigned live) {
+    static const float probe[TG_PROBES][4] = {
+        {0.0f, 0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 1.0f}};
+    const float(*c)[4] = (const float(*)[4])k->constants;
+    const struct TgList *l = NULL;
+    struct TgKept *set = NULL;
+    unsigned n, a, w;
+
+    if (g_draw_cuts && switched_on(SWITCH_NO_TG_KEEP)) {
+        l = texgen_list(gx, live);
+        if (l->count >= 0) {
+            uint32_t h = l->stamp * 0x9E3779B1u;
+
+            for (n = 0; n < (unsigned)l->count; n++) {
+                uint32_t bits[4];
+
+                memcpy(bits, c[l->registers[n]], sizeof bits);
+                h = (h ^ bits[0] ^ (bits[1] << 7) ^ (bits[2] << 14) ^ (bits[3] << 21)) * 0x01000193u;
+            }
+            // (mixed: a material's values are a few round numbers, their low bits zero)
+            h ^= h >> 16;
+            h *= 0x85EBCA6Bu;
+            h ^= h >> 13;
+            h *= 0xC2B2AE35u;
+            set = gx->tg_kept[(h ^ (h >> 16)) % TG_SETS];
+            for (w = 0; w < TG_WAYS; w++) {
+                if (set[w].list == l && set[w].stamp == l->stamp) {
+                    for (n = 0; n < (unsigned)l->count &&
+                                memcmp(set[w].values[n], c[l->registers[n]], sizeof set[w].values[n]) == 0;
+                         n++) {
+                    }
+                    if (n == (unsigned)l->count) {
+                        memcpy(gx->tg_t, set[w].t, sizeof gx->tg_t);
+                        gx->stats.probes_kept++;
+                        return;
+                    }
+                }
             }
         }
-        if (n == gx->tg_kept.count) {
-            gx->stats.probes_kept++;
-            return true;
+    }
+    if (!probes_kept(gx, &gx->tg_probe_key, k, live)) {
+        uint32_t reads = wl_nv2a_pipeline_inputs(&gx->pipeline, live);
+
+        for (n = 0; n < TG_PROBES; n++) {
+            for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
+                if (reads & (1u << a)) {
+                    memcpy(gx->tg_probe_in[n][a], probe[n], sizeof probe[n]);
+                }
+            }
         }
-    } else {
-        gx->tg_kept.program = program;
-        gx->tg_kept.serial = program->serial;
-        gx->tg_kept.live = live;
-        gx->tg_kept.count = wl_xbox_vsh_live_constants(program, live, gx->tg_kept.registers, TG_CONSTANTS);
+        wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->tg_probe_in, TG_PROBES,
+                                  live, gx->tg_probe_out, &gx->batch.work);
     }
-    gx->tg_kept.valid = gx->tg_kept.count >= 0;
-    for (n = 0; n < gx->tg_kept.count; n++) {
-        memcpy(gx->tg_kept.values[n], c[gx->tg_kept.registers[n]], sizeof gx->tg_kept.values[n]);
+    for (n = 0; n < TG_PROBES; n++) {
+        memcpy(gx->tg_t[n], gx->tg_probe_out[n].t, sizeof gx->tg_t[n]);
     }
-    return false;
+    if (set == NULL) {
+        return;
+    }
+    // (into the set's first way, the others moved down: the least recently made leaves)
+    memmove(&set[1], &set[0], (TG_WAYS - 1u) * sizeof set[0]);
+    set[0].list = l;
+    set[0].stamp = l->stamp;
+    for (n = 0; n < (unsigned)l->count; n++) {
+        memcpy(set[0].values[n], c[l->registers[n]], sizeof set[0].values[n]);
+    }
+    memcpy(set[0].t, gx->tg_t, sizeof set[0].t);
 }
 
 static void texgen_xf_plan(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, DrawPlan *plan,
                            XfPlan *xf) {
+    // (the probes' outputs: texgen_probes)
     enum { T_ZERO, T_X, T_Y, T_W, T_PROBES };
-    static const float probe[T_PROBES][4] = {
-        {0.0f, 0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 1.0f}};
     const WlXboxVshDependencies *d = &gx->xf_dependencies;
-    const WlXboxVshOutput *o = gx->tg_probe_out;
+    const float(*o)[4][4] = (const float(*)[4][4])gx->tg_t;
     unsigned n, stage, live = 0, candidates = 0, row, a;
     bool full;
 
@@ -4688,19 +4928,7 @@ static void texgen_xf_plan(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw
     if (candidates == 0) {
         return;
     }
-    if (!texgen_probes_kept(gx, k, live) && !probes_kept(gx, &gx->tg_probe_key, k, live)) {
-        uint32_t reads = wl_nv2a_pipeline_inputs(&gx->pipeline, live);
-
-        for (n = 0; n < T_PROBES; n++) {
-            for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
-                if (reads & (1u << a)) {
-                    memcpy(gx->tg_probe_in[n][a], probe[n], sizeof probe[n]);
-                }
-            }
-        }
-        wl_nv2a_pipeline_vertices(&gx->pipeline, k, (const float (*)[WL_NV2A_ATTRIBS][4])gx->tg_probe_in, T_PROBES,
-                                  live, gx->tg_probe_out, &gx->batch.work);
-    }
+    texgen_probes(gx, k, live);
     for (stage = 0; stage < 4u; stage++) {
         const StagePlan *sp = &plan->stages[stage];
 
@@ -4708,7 +4936,7 @@ static void texgen_xf_plan(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw
             continue;
         }
         if (sp->projective) {
-            for (n = 0; n < T_PROBES && o[n].t[stage][3] == 1.0f; n++) {
+            for (n = 0; n < T_PROBES && o[n][stage][3] == 1.0f; n++) {
             }
             if (n < T_PROBES) {
                 continue;
@@ -4716,12 +4944,12 @@ static void texgen_xf_plan(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw
         }
         for (row = 0; row < 2; row++) {
             float scale = !sp->linear ? 1.0f : row == 0 ? sp->to_s : sp->to_t;
-            float base = o[T_ZERO].t[stage][row];
+            float base = o[T_ZERO][stage][row];
 
-            xf->stage_matrix[stage][row][0] = (o[T_X].t[stage][row] - base) * scale;
-            xf->stage_matrix[stage][row][1] = (o[T_Y].t[stage][row] - base) * scale;
+            xf->stage_matrix[stage][row][0] = (o[T_X][stage][row] - base) * scale;
+            xf->stage_matrix[stage][row][1] = (o[T_Y][stage][row] - base) * scale;
             xf->stage_matrix[stage][row][2] = 0.0f;
-            xf->stage_matrix[stage][row][3] = o[T_W].t[stage][row] * scale;
+            xf->stage_matrix[stage][row][3] = o[T_W][stage][row] * scale;
         }
         xf->stage_source[stage] = plan->texgen_from[stage];
         plan->texgen_xf |= 1u << stage;
@@ -4772,9 +5000,10 @@ static void texgen_xf_load(WlNv2aGx *gx, const DrawPlan *plan, const XfPlan *xf)
     }
 }
 
-// A draw the processor transforms ("p" and "o" forms, no world position) whose fused form has stages GX's texgen
-// makes: the form decided before the layout (fused_for's lazy choice made here), the matrices into xf (its
-// position unused). false: none, the draw's form found at its first batch as before
+// A draw the processor transforms ("p" and "o" forms, no world position), or whose position alone the
+// transform unit makes ("x" forms: xf_position_layout), whose fused form has stages GX's texgen makes: the
+// form decided before the layout (fused_for's lazy choice made here), the matrices into xf (its position
+// unused, or the transform unit's kept). false: none, the draw's form found at its first batch as before
 static bool texgen_fused_plan(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, DrawPlan *plan,
                               XfPlan *xf) {
     const WlXboxVshProgram *program = gx->pipeline.program;
@@ -4782,11 +5011,16 @@ static bool texgen_fused_plan(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aD
     unsigned n;
 
     if (!switched_on(SWITCH_NO_XF_TEXGEN) || gx->cfg.no_xf || gx->cfg.no_fused || program == NULL ||
-        program->native_fused_count == 0 || plan->xf != NULL || plan->fused_known || plan->stage_count == 0 ||
-        draw->source == WL_NV2A_SOURCE_IMMEDIATE || projected_possible(gx, plan)) {
+        program->native_fused_count == 0 ||
+        (plan->xf != NULL && (plan->xf->full || plan->xf->world || !switched_on(SWITCH_NO_X_TEXGEN))) ||
+        plan->fused_known || plan->stage_count == 0 || draw->source == WL_NV2A_SOURCE_IMMEDIATE ||
+        projected_possible(gx, plan)) {
         return false;
     }
-    memset(xf, 0, sizeof *xf);
+    // (an "x" form's plan keeps the transform unit's position)
+    if (plan->xf == NULL) {
+        memset(xf, 0, sizeof *xf);
+    }
     texgen_xf_plan(gx, k, draw, plan, xf);
     if (plan->texgen_xf == 0 || !fused_key(gx, plan, &key)) {
         plan->texgen_xf = 0;
@@ -4896,6 +5130,57 @@ static bool world_xf_plan(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
     return true;
 }
 
+// a draw whose position the transform unit makes and the processor the rest (xf_prepare's partial
+// plan): its layout, once the fetch is planned (the coordinates GX's texgen makes from an input, the
+// "x" forms' "M" stages, decided with the draw's fused form: texgen_fused_plan). The position GX reads
+// from the vertex cache's array of it, the same floats, where it has one: an index of two bytes a
+// vertex for its twelve; the other passes of the same geometry have it already
+static void xf_position_layout(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw *draw, DrawPlan *plan,
+                               XfPlan *xf, WlGxDirectLayout *layout) {
+    const void *positions = NULL;
+    unsigned stage;
+
+    if (texgen_fused_plan(gx, k, draw, plan, xf)) {
+        texgen_xf_layout(plan, layout);
+    }
+    // (not for a draw whose vertices GX reads from their slots: made_begin)
+    if (switched_on(SWITCH_NO_POSITION_INDEX) && plan->sphere_xf == 0 && plan->words > 3u &&
+        draw->source == WL_NV2A_SOURCE_ARRAYS && (draw->streamed & 1u) && wl_nv2a_vcache_on(&gx->vertices) &&
+        !made_possible(gx, draw->count) && draw->index_last - draw->index_base < WL_NV2A_VCACHE_SPAN) {
+        positions = wl_nv2a_vcache_get(&gx->vertices, gx->dev, &draw->attribs[0], draw->index_base,
+                                       draw->index_last, WL_NV2A_VCACHE_POSITION);
+        layout->indexed = positions != NULL ? (uint16_t)(1u << WL_GX_DIRECT_ARRAY_POSITION) : 0u;
+    }
+    // (the vertices made into slots GX reads them from, where they fit: made_begin)
+    (void)made_begin(gx, draw->count);
+    made_layout(gx, layout);
+    wl_gx_direct_layout(layout);
+    if (positions != NULL) {
+        wl_gx_direct_array(WL_GX_DIRECT_ARRAY_POSITION, positions,
+                           wl_nv2a_vcache_element_bytes(WL_NV2A_VCACHE_POSITION));
+        if (wl_nv2a_vcache_made(&gx->vertices)) {
+            wl_gx_direct_arrays_changed();
+        }
+        gx->stats.position_indexed_draws++;
+        gx->stats.position_indexed_vertices += draw->count;
+    }
+    wl_gx_direct_position_matrix((const float (*)[4])xf->position);
+    gx->xf_position = true;
+    // (the generators of the stages texgen_xf_load does not set again: the coordinates sent)
+    for (stage = 0; (gx->xf_texgens & ~plan->texgen_xf) != 0 && stage < 8; stage++) {
+        if ((gx->xf_texgens & ~plan->texgen_xf) & (1u << stage)) {
+            wl_gx_direct_texgen(stage, WL_GX_DIRECT_TG_TEXCOORD, NULL);
+        }
+    }
+    gx->xf_texgens = 0;
+    if (plan->texgen_xf != 0) {
+        texgen_xf_load(gx, plan, xf);
+        gx->stats.xf_texgen_draws++;
+        gx->stats.xf_texgen_vertices += draw->count;
+    }
+    gx->stats.xf_position_draws++;
+}
+
 static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
     WlNv2aGx *gx = user;
     WlNv2aSurface surface;
@@ -4907,7 +5192,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     float corners[3][2], area = 0.0f;
     uint32_t v, seen = 0, first = 0, run, attributes;
     unsigned stage;
-    bool rebind, pixel;
+    bool rebind, pixel, x_position = false;
 
     // (what changed since the last draw, kept until a draw applies it)
     gx->dirty |= k->dirty;
@@ -5041,43 +5326,10 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     // the transform unit's draw, or the processor's (the transform unit's matrices then the identity)
     xf_ok = xf_prepare(gx, k, draw, &plan, count_pixels, &xf);
     if (xf_ok && !xf.full) {
-        // (the position alone: the layout and the coordinates as the processor makes them. The
-        // position GX reads from the vertex cache's array of it, the same floats, where it has one:
-        // an index of two bytes a vertex for its twelve; the other passes of the same geometry have
-        // it already)
-        const void *positions = NULL;
-
+        // (the position alone: the layout and the coordinates as the processor makes them, once the
+        // fetch is planned: xf_position_layout)
         plan.xf = &xf;
-        // (not for a draw whose vertices GX reads from their slots: made_begin)
-        if (switched_on(SWITCH_NO_POSITION_INDEX) && plan.sphere_xf == 0 && plan.words > 3u && draw->source == WL_NV2A_SOURCE_ARRAYS &&
-            (draw->streamed & 1u) && wl_nv2a_vcache_on(&gx->vertices) && !made_possible(gx, draw->count) &&
-            draw->index_last - draw->index_base < WL_NV2A_VCACHE_SPAN) {
-            positions = wl_nv2a_vcache_get(&gx->vertices, gx->dev, &draw->attribs[0], draw->index_base,
-                                           draw->index_last, WL_NV2A_VCACHE_POSITION);
-            layout.indexed = positions != NULL ? (uint16_t)(1u << WL_GX_DIRECT_ARRAY_POSITION) : 0u;
-        }
-        // (the vertices made into slots GX reads them from, where they fit: made_begin)
-        (void)made_begin(gx, draw->count);
-        made_layout(gx, &layout);
-        wl_gx_direct_layout(&layout);
-        if (positions != NULL) {
-            wl_gx_direct_array(WL_GX_DIRECT_ARRAY_POSITION, positions,
-                               wl_nv2a_vcache_element_bytes(WL_NV2A_VCACHE_POSITION));
-            if (wl_nv2a_vcache_made(&gx->vertices)) {
-                wl_gx_direct_arrays_changed();
-            }
-            gx->stats.position_indexed_draws++;
-            gx->stats.position_indexed_vertices += draw->count;
-        }
-        wl_gx_direct_position_matrix((const float (*)[4])xf.position);
-        gx->xf_position = true;
-        for (stage = 0; gx->xf_texgens != 0 && stage < 8; stage++) {
-            if (gx->xf_texgens & (1u << stage)) {
-                wl_gx_direct_texgen(stage, WL_GX_DIRECT_TG_TEXCOORD, NULL);
-            }
-        }
-        gx->xf_texgens = 0;
-        gx->stats.xf_position_draws++;
+        x_position = true;
     } else if (xf_ok) {
         plan.xf = &xf;
         plan.words = xf.words;
@@ -5198,7 +5450,9 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     wl_nv2a_fetch_plan(draw, attributes, &gx->fetch);
     wl_nv2a_fetch_constants(&gx->fetch, k, gx->batch.inputs, WL_XBOX_VSH_BATCH);
     plan.lit = plan.lit_wanted = false;
-    if (plan.xf == NULL) {
+    if (x_position) {
+        xf_position_layout(gx, k, draw, &plan, &xf, &layout);
+    } else if (plan.xf == NULL) {
         WlGxDirectLighting lighting;
         bool lit, world;
 
@@ -5333,9 +5587,27 @@ static void backend_clear(void *user, const WlNv2aKelvin *k, uint32_t flags) {
             clear_rect(gx, false, true, rgba, z, x0, y0, x1, y1);
         }
         clear_channels(gx, flags, rgba, x0, y0, x1, y1);
+        gx->owner_clears_only = false; // (not made again: target_retake)
         return;
     } else {
         clear_rect(gx, colour, depth, rgba, z, x0, y0, x1, y1);
+        if (gx->owner != NULL && gx->owner_clears_only) {
+            // (the target's clears, made again should it take the EFB again: target_retake)
+            if (gx->owner_clear_count < sizeof gx->owner_clears / sizeof gx->owner_clears[0]) {
+                unsigned n = gx->owner_clear_count++;
+
+                gx->owner_clears[n].colour = colour;
+                gx->owner_clears[n].depth = depth;
+                gx->owner_clears[n].rgba = rgba;
+                gx->owner_clears[n].z = z;
+                gx->owner_clears[n].x0 = x0;
+                gx->owner_clears[n].y0 = y0;
+                gx->owner_clears[n].x1 = x1;
+                gx->owner_clears[n].y1 = y1;
+            } else {
+                gx->owner_clears_only = false;
+            }
+        }
     }
     gx->stats.quad_clears++;
     device_state(gx);

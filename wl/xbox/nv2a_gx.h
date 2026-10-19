@@ -133,6 +133,9 @@ typedef struct WlNv2aGxStats {
     uint32_t kept_frame_reads;    // texture binds the kept frame served
     uint32_t kept_frame_misses;   // reads of a displayed surface other than the kept frame's (an older picture)
     uint32_t screen_reads_unserved; // reads of a picture GX drew that no park or kept frame served (no texture)
+    // targets that took the EFB with clears alone and then read the picture: the EFB taken again, the
+    // picture parked whole ("noparkretake")
+    uint32_t picture_retakes;
     uint32_t textures_unread;     // stage textures not looked up: no combiner reads them (stages 1-3)
     uint32_t textures_disabled;   // ...the stage disabled (D3D's texture NULL: CONTROL0's enable 0)
     uint32_t textures_unsampled;  // ...a stage program that samples none (pass-through, clip plane, DOT_ZW, dot product)
@@ -179,8 +182,12 @@ typedef struct WlNv2aGxStats {
     // the processor's draws whose vertices GX read from their slots by index ("nomadeindex"), their
     // vertices sent, the slots their vertices were made into; the draws refused slots (too large, or
     // no ring) and those whose layout the slots did not match (sent whole); the ring's fences, the
-    // waits for GX to pass one, its laps
+    // waits for GX to pass one, its laps; the bytes of slots written (whole 32-byte lines); the draws
+    // whose slots are five words or fewer (more than one slot a batch kept for made_flush's line), and
+    // their vertices
     uint32_t made_draws, made_sent, made_vertices, made_refused, made_unmatched, made_fences, made_waits, made_laps;
+    uint64_t made_bytes;
+    uint32_t made_small_draws, made_small_vertices;
 } WlNv2aGxStats;
 
 // The draw path's cuts of 2026-10-18 (on by default): the program's outputs for fixed inputs kept

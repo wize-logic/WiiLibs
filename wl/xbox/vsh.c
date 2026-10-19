@@ -1826,30 +1826,213 @@ int wl_xbox_vsh_texgen_source(const WlXboxVshDependencies *dependencies, const W
     return r;
 }
 
-int wl_xbox_vsh_live_constants(const WlXboxVshProgram *program, unsigned live, unsigned char *registers, int most) {
-    unsigned char seen[WL_XBOX_VSH_CONSTANT_COUNT] = {0};
-    unsigned long index;
-    int count = 0, which;
+/* what an operand's components read (`need[c]`: the outputs component c of its value reaches) into
+the backward walk's registers, and a constant's register into the list when one of them is live */
+struct live_walk {
+    unsigned need[13][4], need_a0, live;
+    unsigned char seen[WL_XBOX_VSH_CONSTANT_COUNT];
+    unsigned char *registers;
+    int count, most;
+};
 
-    for (index = 0; index < program->count; index++) {
-        const WlXboxVshStep *step = &program->steps[index];
+static void live_operand(struct live_walk *walk, const WlXboxVshInstruction *instruction, int which,
+                         const unsigned need[4]) {
+    const WlXboxVshOperand *operand = &instruction->operands[which];
+    unsigned all = need[0] | need[1] | need[2] | need[3], n;
+    int component;
 
-        if (!(step->reaches & live))
-            continue;
-        for (which = 0; which < 3; which++) {
-            unsigned file = step->operands[which].file & ~(unsigned)WL_XBOX_VSH_NEGATE, n = step->operands[which].index;
-
-            if (file == WL_XBOX_VSH_FILE_RELATIVE)
-                return -1;
-            if (file != WL_XBOX_VSH_FILE_CONSTANT || n >= WL_XBOX_VSH_CONSTANT_COUNT || seen[n])
-                continue;
-            if (count >= most)
-                return -1;
-            seen[n] = 1;
-            registers[count++] = (unsigned char)n;
+    if (!all)
+        return;
+    switch (operand->mux) {
+    case _mux_temporary:
+        for (component = 0; component < 4; component++)
+            walk->need[temporary_index(operand->index)][operand->swizzle[component] & 3] |= need[component];
+        break;
+    case _mux_constant:
+        if (!(all & walk->live))
+            break;
+        if (instruction->relative) {
+            walk->count = -1;
+            break;
         }
+        n = instruction->constant < WL_XBOX_VSH_CONSTANT_COUNT ? instruction->constant
+                                                               : WL_XBOX_VSH_CONSTANT_COUNT - 1;
+        if (walk->count < 0 || walk->seen[n])
+            break;
+        if (walk->count >= walk->most) {
+            walk->count = -1;
+            break;
+        }
+        walk->seen[n] = 1;
+        walk->registers[walk->count++] = (unsigned char)n;
+        break;
+    default:
+        break;
     }
-    return count;
+}
+
+/* (wl_xbox_vsh_live_needs' walk a unit and a component at a time: what each of an instruction's two
+units makes, and each component of it, reaches; each operand's component read for those alone. A
+skinned program's T0 = c13, c14 . v4 written by an ILU mov beside the MAC's dp3 of the blended
+position reads no bone) */
+int wl_xbox_vsh_live_constants(const WlXboxVshProgram *program, unsigned live, unsigned char *registers, int most) {
+    struct live_walk walk;
+    long index;
+    int component;
+
+    memset(&walk, 0, sizeof(walk));
+    walk.live = live;
+    walk.registers = registers;
+    walk.most = most;
+    for (component = 0; component < 4; component++)
+        walk.need[12][component] = WL_XBOX_VSH_LIVE_POSITION;
+    if (program->light.count)
+        for (component = 0; component < 3; component++)
+            walk.need[temporary_index(program->light.normal)][component] = WL_XBOX_VSH_LIVE_D0;
+    for (index = (long)program->count - 1; index >= 0 && walk.count >= 0; index--) {
+        const WlXboxVshInstruction *instruction = &program->instructions[index];
+        unsigned mac[4] = {0, 0, 0, 0}, ilu[4] = {0, 0, 0, 0}, a[4] = {0, 0, 0, 0}, b[4] = {0, 0, 0, 0},
+                 c[4] = {0, 0, 0, 0}, kills[13] = {0}, sum, *out;
+        int which;
+
+        /* what each unit's writes reach */
+        if (instruction->mac == _mac_arl) {
+            mac[0] = walk.need_a0;
+            walk.need_a0 = 0;
+        } else if (instruction->mac != _mac_nop && instruction->mac_mask) {
+            unsigned t = temporary_index(instruction->temporary);
+
+            for (component = 0; component < 4; component++)
+                if (instruction->mac_mask & (8u >> component))
+                    mac[component] |= walk.need[t][component];
+            kills[t] |= instruction->mac_mask;
+        }
+        if (instruction->ilu != _ilu_nop && instruction->ilu_mask) {
+            unsigned t = temporary_index(instruction->mac != _mac_nop ? 1 : instruction->temporary);
+
+            for (component = 0; component < 4; component++)
+                if (instruction->ilu_mask & (8u >> component))
+                    ilu[component] |= walk.need[t][component];
+            kills[t] |= instruction->ilu_mask;
+        }
+        if (instruction->output_mask && instruction->output_is_register &&
+            (instruction->output_from_ilu ? instruction->ilu : instruction->mac) != 0) {
+            unsigned to = 0;
+
+            out = instruction->output_from_ilu ? ilu : mac;
+            switch (instruction->output_address) {
+            case _output_position:
+                for (component = 0; component < 4; component++)
+                    if (instruction->output_mask & (8u >> component))
+                        out[component] |= walk.need[12][component];
+                kills[12] |= instruction->output_mask;
+                break;
+            case _output_d0:
+                to = WL_XBOX_VSH_LIVE_D0;
+                break;
+            case _output_d1:
+                to = WL_XBOX_VSH_LIVE_D1;
+                break;
+            case _output_b0:
+            case _output_b1:
+                to = WL_XBOX_VSH_LIVE_BACK;
+                break;
+            case _output_fog:
+                out[0] |= (instruction->output_mask & 8) ? WL_XBOX_VSH_LIVE_FOG : 0u;
+                break;
+            case _output_point_size:
+                out[0] |= (instruction->output_mask & 8) ? WL_XBOX_VSH_LIVE_POINT_SIZE : 0u;
+                break;
+            default:
+                if (instruction->output_address >= _output_t0 && instruction->output_address < _output_t0 + 4)
+                    to = (unsigned)WL_XBOX_VSH_LIVE_T0 << (instruction->output_address - _output_t0);
+                break;
+            }
+            for (component = 0; to && component < 4; component++)
+                if (instruction->output_mask & (8u >> component))
+                    out[component] |= to;
+        }
+        for (which = 0; which < 13; which++)
+            for (component = 0; component < 4; component++)
+                if (kills[which] & (8u >> component))
+                    walk.need[which][component] = 0;
+        /* (the clip-space position: p before this instruction's writes) */
+        if (instruction->captures_clip)
+            for (component = 0; component < 4; component++)
+                walk.need[12][component] |= WL_XBOX_VSH_LIVE_POSITION;
+        /* what the units read for it */
+        switch (instruction->mac) {
+        case _mac_mov:
+        case _mac_arl:
+            memcpy(a, mac, sizeof(a));
+            break;
+        case _mac_mul:
+        case _mac_min:
+        case _mac_max:
+        case _mac_slt:
+        case _mac_sge:
+            memcpy(a, mac, sizeof(a));
+            memcpy(b, mac, sizeof(b));
+            break;
+        case _mac_add:
+            memcpy(a, mac, sizeof(a));
+            memcpy(c, mac, sizeof(c));
+            break;
+        case _mac_mad:
+            memcpy(a, mac, sizeof(a));
+            memcpy(b, mac, sizeof(b));
+            memcpy(c, mac, sizeof(c));
+            break;
+        case _mac_dp3:
+        case _mac_dph:
+        case _mac_dp4:
+            sum = mac[0] | mac[1] | mac[2] | mac[3];
+            a[0] = a[1] = a[2] = b[0] = b[1] = b[2] = sum;
+            if (instruction->mac == _mac_dph)
+                b[3] = sum;
+            else if (instruction->mac == _mac_dp4)
+                a[3] = b[3] = sum;
+            break;
+        case _mac_dst:
+            a[1] = b[1] = mac[1];
+            a[2] = mac[2];
+            b[3] = mac[3];
+            break;
+        default:
+            break;
+        }
+        switch (instruction->ilu) {
+        case _ilu_mov:
+            for (component = 0; component < 4; component++)
+                c[component] |= ilu[component];
+            break;
+        case _ilu_rcp:
+        case _ilu_rcc:
+        case _ilu_rsq:
+        case _ilu_exp:
+        case _ilu_log:
+            c[0] |= ilu[0] | ilu[1] | ilu[2] | ilu[3];
+            break;
+        case _ilu_lit:
+            sum = ilu[0] | ilu[1] | ilu[2] | ilu[3];
+            c[0] |= sum;
+            c[1] |= sum;
+            c[3] |= sum;
+            break;
+        default:
+            break;
+        }
+        /* (a constant by a0: a0 needed for what reads it) */
+        if (instruction->relative)
+            for (which = 0; which < 3; which++)
+                if (instruction->operands[which].mux == _mux_constant)
+                    for (component = 0; component < 4; component++)
+                        walk.need_a0 |= (which == 0 ? a : which == 1 ? b : c)[component];
+        live_operand(&walk, instruction, 0, a);
+        live_operand(&walk, instruction, 1, b);
+        live_operand(&walk, instruction, 2, c);
+    }
+    return walk.count;
 }
 
 int wl_xbox_vsh_fused_text(const WlXboxVshFusedKey *key, char *text, unsigned long size) {

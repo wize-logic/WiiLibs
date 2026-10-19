@@ -19,7 +19,8 @@
 // once.
 //
 // usage: xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] [--no-pairs]
-//            [--spill] [--no-forward] [--fused forms.txt] microcode.inc output.c [table]
+//            [--spill] [--no-forward] [--no-alias] [--no-weights]
+//            [--no-r12] [--no-sweep] [--no-splat] [--fused forms.txt] microcode.inc output.c [table]
 //   (table: the name of the table, default xbox_vsh_natives, and of its count, <table>_count;
 //   --if-exists: a microcode file that is not there has no programs, an empty table; --accessor:
 //   also a function of that name, const WlXboxVshNative *name(unsigned long *count), that gives
@@ -31,8 +32,15 @@
 //   per instruction as before; --fused: for each form the file names, "<hash> <form> ...", as
 //   xbox_nv2a_replay --fused-forms prints them, the Wii's loop that reads the arrays, runs the
 //   program and writes GX's words; a skinned form whose registers run out with its blend kept in
-//   them keeps it in memory, or makes it at each vertex; --spill: in memory always, the tests';
-//   --no-forward: a fused loop's inputs stored by its prologue and loaded back, as before))
+//   them keeps it in memory, or makes it at each vertex (always for a program the file names in a
+//   line "<hash> made": one whose vertices seldom repeat the inputs its prefix reads); --spill: in memory always, the tests';
+//   --no-forward: a fused loop's inputs stored by its prologue and loaded back, as before;
+//   --no-alias: a constant that %[k] and the fused state both hold loaded from each, as before;
+//   --no-weights: the loads hoisted out of a loop chosen by their count alone, a reused prefix's
+//   with the rest, as before; --no-r12: a "w" form whose operands leave no room for its world
+//   slot's loads the slot at each use, as before, not into r12 once; --no-sweep: a fused
+//   loop's operations whose results nothing reads left in, as before; --no-splat: a MUL's or MAD's
+//   operand that is one lane twice merged, not the ps_muls or ps_madds of that lane, as before))
 
 #include "../wl/xbox/vsh.c"
 
@@ -1481,8 +1489,13 @@ static struct {
     WlXboxVshFusedKey key;
 } g_forms[MAXIMUM_FORMS];
 static int g_form_count;
+/* the programs whose fused forms make the prefix at each vertex, its compare not made ("<hash> made"
+in the file: a program whose prefix the vertex before's seldom gives) */
+static unsigned long g_made[64];
+static int g_made_count;
 
-/* a --fused file: a form a line, "<hash> <form> ..." (the replay's --fused-forms), "#" a comment */
+/* a --fused file: a form a line, "<hash> <form> ..." (the replay's --fused-forms), "<hash> made"
+(g_made), "#" a comment */
 static int read_forms(const char *path) {
     char line[512];
     FILE *in = fopen(path, "r");
@@ -1497,6 +1510,11 @@ static int read_forms(const char *path) {
 
         if (line[0] == '#' || rest == line || *rest != ' ')
             continue;
+        if (strncmp(rest, " made", 5) == 0 && (rest[5] == '\n' || rest[5] == 0 || rest[5] == ' ')) {
+            if (g_made_count < (int)(sizeof(g_made) / sizeof(g_made[0])))
+                g_made[g_made_count++] = hash;
+            continue;
+        }
         if (g_form_count < MAXIMUM_FORMS && wl_xbox_vsh_fused_parse(rest + 1, &g_forms[g_form_count].key)) {
             g_forms[g_form_count].hash = hash;
             g_form_count++;
@@ -1547,6 +1565,16 @@ int main(int argc, char **argv) {
             g_spill_first = 1;
         } else if (strcmp(argv[1], "--no-forward") == 0) {
             pr_fetched_off = 1;
+        } else if (strcmp(argv[1], "--no-alias") == 0) {
+            pr_alias_off = 1;
+        } else if (strcmp(argv[1], "--no-weights") == 0) {
+            pr_weights_off = 1;
+        } else if (strcmp(argv[1], "--no-r12") == 0) {
+            pr_r12_off = 1;
+        } else if (strcmp(argv[1], "--no-sweep") == 0) {
+            pr_sweep_off = 1;
+        } else if (strcmp(argv[1], "--no-splat") == 0) {
+            pr_splat_off = 1;
         } else if (strcmp(argv[1], "--colors-positions") == 0) {
             colors_positions = 1;
         } else if (strcmp(argv[1], "--accessor") == 0 && argc > 2) {
@@ -1567,7 +1595,7 @@ int main(int argc, char **argv) {
     if (argc != 3 && argc != 4) {
         fprintf(stderr,
                 "usage: xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] "
-                "[--no-pairs] [--spill] [--no-forward] [--fused forms.txt] microcode.inc output.c [table]\n");
+                "[--no-pairs] [--spill] [--no-forward] [--no-alias] [--no-weights] [--no-r12] [--no-sweep] [--no-splat] [--fused forms.txt] microcode.inc output.c [table]\n");
         return 2;
     }
     if (argc == 4)
@@ -1751,7 +1779,7 @@ int main(int argc, char **argv) {
         /* (its fused forms asked for, the Wii's) */
         fused[program_count - 1] = 0;
         for (index = 0; paired && index < (unsigned long)g_form_count; index++) {
-            int made = fused[program_count - 1];
+            int made = fused[program_count - 1], made_at;
 
             if (g_forms[index].hash != hash)
                 continue;
@@ -1794,6 +1822,9 @@ int main(int argc, char **argv) {
                 continue;
             }
             fused_reused = reused;
+            for (made_at = 0; made_at < g_made_count; made_at++)
+                if (g_made[made_at] == hash)
+                    fused_reused = 0;
             if (fused_program(&program, needs, &fused_reused, &prefix)) {
                 fprintf(out, "#if WL_XBOX_VSH_PS\n");
                 fprintf(out,

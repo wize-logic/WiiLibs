@@ -121,8 +121,8 @@ def emu_expression(text, immediates):
 
 def emu_gpr(text):
     text = text.strip()
-    if text == "0":
-        return "r0"
+    if text in ("0", "12"):
+        return "r" + text
     return "e_" + re.match(r"%\[(\w+)\]$", text).group(1)
 
 
@@ -334,7 +334,7 @@ def whole(match):
     outputs = operands(" ".join(sections[0]))
     inputs = operands(" ".join(sections[1]))
     immediates = {}
-    code = ["{", "EmuReg f[32]; intptr_t r0 = 0; uint32_t ctr = 0; int k;",
+    code = ["{", "EmuReg f[32]; intptr_t r0 = 0, r12 = 0; uint32_t ctr = 0; int k;",
             "for (k = 0; k < 32; k++) { f[k].a = f[k].b = NAN; f[k].i = 0; }"]
     for name, constraint, value in outputs:
         code.append("intptr_t e_%s = (intptr_t)(%s);" % (name, value if "+" in constraint else "0"))
@@ -348,6 +348,7 @@ def whole(match):
     for name, constraint, value in outputs:
         code.append("%s = (__typeof__(%s))e_%s;" % (value, value, name))
     code.append("(void)r0;")
+    code.append("(void)r12;")
     code.append("}")
     return "\n\t\t".join(code)
 

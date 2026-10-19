@@ -116,3 +116,9 @@ add_test(NAME test_xboxrecomp_sync
 add_test(NAME test_xbox_recomp_driver
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_xbox_recomp.py)
 set_tests_properties(test_xboxrecomp_sync test_xbox_recomp_driver PROPERTIES LABELS unit SKIP_RETURN_CODE 77)
+
+# the runtime's switches and variables against wl/xboxrt/README.md's tables (each one read has a row, each
+# row's is still read), and the xboxrecomp patch files numbered without a gap
+add_test(NAME check_switch_docs
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/check_switch_docs.py ${PROJECT_SOURCE_DIR})
+set_tests_properties(check_switch_docs PROPERTIES LABELS unit)

@@ -12,6 +12,7 @@
 // that already is in blocks and fill the padding with zero bytes. The padding is never sampled.
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -87,6 +88,15 @@ size_t wl_xbox_to_gx(WlXboxFormat fmt, int swizzled, uint32_t pitch, const void 
 // wl_gxc_tex_bytes(WL_GXC_CMPR, w, h), 0 for bad arguments, a non-DXT format, a too-small `cap` or a source
 // shorter than wl_xbox_level_bytes. Padding blocks are zero.
 size_t wl_xbox_dxt_to_cmpr(WlXboxFormat dxt, const void *src, size_t src_len, uint32_t w, uint32_t h, void *dst, size_t cap);
+
+// true: wl_xbox_dxt_to_cmpr a block at a time always (its first loop, for comparison); false (the default): a level
+// whose blocks fill whole 8x8 tiles a tile at a time. The same bytes either way.
+void wl_xbox_dxt_set_plain(bool plain);
+// true: the conversions as before texcache2 (the switch "texplain2"): wl_xbox_to_gx and wl_xbox_dxt_alpha_i4 zero
+// their whole output before writing it, a 32-bit texel is moved a byte at a time; false (the default): only a level
+// with tiles past its edge zeroed first (the others' bytes all written), a whole tile's 32-bit texels a word at a
+// time. The same bytes either way.
+void wl_xbox_tex_set_plain2(bool on);
 
 // The alpha of a DXT3 or DXT5 level as an I4 texture (the top four bits of each alpha; exact for DXT3), the
 // partner of wl_xbox_dxt_to_cmpr when alpha is a texture of its own. Returns wl_gxc_tex_bytes(WL_GXC_I4, w, h).

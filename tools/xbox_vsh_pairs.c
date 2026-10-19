@@ -32,6 +32,8 @@ typedef struct {
     int web;         /* a temporary's (in place writes allowed when not kept) */
     int splat;       /* ps1 is ps0 */
     int fetched;     /* (fused) an input made by the prologue, read from its register (pr_fetched_*) */
+    int lane_of;     /* both lanes lane lane_of & 1 of value lane_of >> 1 (a ps_merge00 or 11 of it), + 1;
+                        0: none */
 } PrValue;
 
 typedef struct {
@@ -78,6 +80,7 @@ static int pr_world_spill;
 static int pr_program_world;    /* (fused, "w") the world position's temporary */
 static int pr_texgen_from[4];   /* (fused) each stage's input register, for GX's texgen ("M"; -1: none) */
 static int pr_world_w;          /* (fused, "w") the clip-space w (both halves) as the program captures it */
+static void pr_sweep(void);
 static int pr_fused_op(const char *name, int a, int b, int c);
 static void pr_fused_store(int value, const char *format, ...);
 /* (fused, GX taking the clip-space position: the instructions whose writes nothing reads, the
@@ -88,6 +91,11 @@ static int pr_dead_now;
 /* the constants that may be loaded once a batch, and how often each is loaded in a vertex */
 static char pr_keys[PR_KEYS][80];
 static int pr_key_uses[PR_KEYS], pr_key_count, pr_hoist_limit, pr_counting;
+/* (a load's weight in pr_key_uses: with pr_weighted, 1 in a reused prefix, which most vertices skip,
+and 4 elsewhere, so that the loads every vertex makes are hoisted first; pr_program keeps the loop
+that costs less, weighted or not. pr_weights_off: never weighted, as before: xbox_vsh_codegen
+--no-weights. pr_prefix_first, pr_prefix_end: the reused prefix's ops in pr_body) */
+static int pr_use_weight = 4, pr_weighted, pr_weights_off, pr_prefix_first, pr_prefix_end;
 /* (fused: loads past the limit hoisted too, each where the registers still allow it: pr_program's) */
 static unsigned char pr_hoist_extra[PR_KEYS];
 
@@ -188,8 +196,10 @@ static int pr_op3(const char *name, int a, int b, int c) {
     d = pr_new();
     /* (both lanes the same: a merge of one lane twice, or a single-precision
     operation, which writes ps1 as ps0 in paired-single mode) */
-    if ((strcmp(name, "ps_merge00") == 0 || strcmp(name, "ps_merge11") == 0) && a == b)
+    if ((strcmp(name, "ps_merge00") == 0 || strcmp(name, "ps_merge11") == 0) && a == b) {
         pr_values[d].splat = 1;
+        pr_values[d].lane_of = 2 * a + (name[9] == '1') + 1;
+    }
     if (strcmp(name, "fadds") == 0 || strcmp(name, "fsubs") == 0 || strcmp(name, "fdivs") == 0 ||
         strcmp(name, "fmadds") == 0 || strcmp(name, "fnmadds") == 0 || strcmp(name, "fmuls") == 0 ||
         strcmp(name, "fnmsubs") == 0)
@@ -284,6 +294,37 @@ operand (%[c], %[c2], %[k], %[v], %[ra]); hoistable: the same for the whole
 batch (a constant by a fixed index, or %[k]) */
 static int pr_fetched_load(int kind, int offset);
 
+/* (a constant that %[k] and WlXboxVshFused both hold, or that is loaded more than one way, as one
+key: the float in both lanes from %[k], so a loop holds one register for it. pr_alias_off: each
+place its own, as before: xbox_vsh_codegen --no-alias) */
+static int pr_alias_off;
+
+static void pr_alias(int *kind, const char **base, int *offset) {
+    static const struct {
+        int f, kinds, offset, k;
+    } aliases[] = {
+        /* (%[k]: (0, 0) and 0 in both lanes; 1 at 12 and at 16) */
+        {0, 1 << 0, PRK_ZERO, PRK_ZERO}, {0, 1 << 1, PRK_ZERO + 4, PRK_ZERO}, {0, 1 << 1, PRK_W1 + 4, PRK_ONE},
+        /* (WlXboxVshFused's pairs and doubles nv2a_gx.c sets to the same values always) */
+        {1, (1 << 0) | (1 << 1), (int)offsetof(WlXboxVshFused, pack) + 4 * WL_XBOX_VSH_FUSED_HALF, PRK_HALF},
+        {1, (1 << 0) | (1 << 1), (int)offsetof(WlXboxVshFused, pack) + 4 * WL_XBOX_VSH_FUSED_ONES, PRK_ONE},
+        {1, 1 << 3, (int)offsetof(WlXboxVshFused, sphere) + 8 * 2, PRK_THREE_HALVES},
+        {1, 1 << 3, (int)offsetof(WlXboxVshFused, sphere) + 8 * 3, PRK_HALF},
+    };
+    size_t n;
+    int f = strcmp(*base, "%[f]") == 0;
+
+    if (pr_alias_off || (!f && strcmp(*base, "%[k]") != 0))
+        return;
+    for (n = 0; n < sizeof(aliases) / sizeof(aliases[0]); n++)
+        if (aliases[n].f == f && (aliases[n].kinds & (1 << *kind)) && aliases[n].offset == *offset) {
+            *kind = 1;
+            *base = "%[k]";
+            *offset = aliases[n].k;
+            return;
+        }
+}
+
 static int pr_load(int kind, const char *base, int offset, int hoistable) {
     char key[80];
     int n, value, pre = 0;
@@ -291,6 +332,7 @@ static int pr_load(int kind, const char *base, int offset, int hoistable) {
     /* (fused: an input the prologue made, from its registers) */
     if ((n = pr_fetched_load(kind, strcmp(base, "%[v]") == 0 ? offset : -1)) >= 0)
         return n;
+    pr_alias(&kind, &base, &offset);
 
     if (strcmp(base, "%[ra]") == 0)
         snprintf(key, sizeof(key), "%s %d %d %s", base, kind, offset, pr_ra_key);
@@ -309,7 +351,7 @@ static int pr_load(int kind, const char *base, int offset, int hoistable) {
             pr_key_uses[k] = 0;
         }
         if (k >= 0 && pr_counting)
-            pr_key_uses[k]++;
+            pr_key_uses[k] += pr_use_weight;
         if (k >= 0 && !pr_counting && (k < pr_hoist_limit || pr_hoist_extra[k]))
             pre = 1;
     }
@@ -449,6 +491,9 @@ static void pr_constant_row(const WlXboxVshInstruction *instruction, const char 
 /* a memory operand's lanes l0 l1 of its source (before the swizzle): one
 load, or two and a merge */
 static int pr_fetched_lanes(int offset, int s0, int s1);
+static int pr_fetched_source(int n, int c, int *at);
+static unsigned pr_fetched_on;
+static int pr_splat_off;
 
 static int pr_memory_pair(const char *base, int offset, int s0, int s1, int hoistable) {
     int a, b;
@@ -510,6 +555,15 @@ static int pr_scalar(const WlXboxVshInstruction *instruction, const WlXboxVshOpe
     if (operand->mux == _mux_temporary && !(s & 1)) {
         *negate = operand->negate;
         return pr_half(pr_temporary_index(operand->index), s >> 1);
+    }
+    if (operand->mux == _mux_input && pr_fuse && !pr_splat_off && (pr_fetched_on & (1u << instruction->input))) {
+        /* (an input the prologue made: the value that has it in ps0, not merged with the next lane) */
+        int at, v = pr_fetched_source((int)instruction->input, s, &at);
+
+        if (at == 0) {
+            *negate = operand->negate;
+            return v;
+        }
     }
     if ((operand->mux == _mux_input || operand->mux == _mux_constant) && !(s & 1)) {
         /* (the pair that has it in ps0: often loaded for another lane) */
@@ -632,6 +686,21 @@ static int pr_supported(const WlXboxVshInstruction *in) {
     }
 }
 
+/* (the value whose lane both of v's lanes are, or -1: one no in-place write has written since, its
+register its own. pr_splat_off: never, as before: xbox_vsh_codegen --no-splat; and pr_scalar's lane of
+an input the prologue made) */
+
+static int pr_lane_source(int v) {
+    int a;
+
+    if (v <= 0 || !pr_values[v].lane_of)
+        return -1;
+    a = (pr_values[v].lane_of - 1) >> 1;
+    if (pr_values[a].web || pr_root(a) != a || pr_values[a].loop || pr_values[a].fetched)
+        return -1;
+    return a;
+}
+
 /* the MAC's result lanes (needed: bit 3 x); dot products write one lane in
 place when that is all they write (*placed) */
 static void pr_mac(const WlXboxVshInstruction *in, unsigned needed, PrLane result[4], int *dot) {
@@ -751,6 +820,21 @@ static void pr_mac(const WlXboxVshInstruction *in, unsigned needed, PrLane resul
                 negate[1] = b->negate;
             } else {
                 pb = pr_pair(in, b, l0, l1, &negate[1]);
+                /* (a pair that is one lane of a value twice, that value not written since: ps_muls/ps_madds
+                of the value, the merge then unread: pr_sweep) */
+                if (!pr_splat_off && pr_lane_source(pa) >= 0 && pr_lane_source(pb) < 0) {
+                    int swap = pa;
+
+                    pa = pb;
+                    pb = swap;
+                    swap = negate[0];
+                    negate[0] = negate[1];
+                    negate[1] = swap;
+                }
+                if (!pr_splat_off && pr_lane_source(pb) >= 0) {
+                    splat = (pr_values[pb].lane_of - 1) & 1;
+                    pb = pr_lane_source(pb);
+                }
             }
             product_negate = negate[0] ^ negate[1];
             if (in->mac == _mac_mad)
@@ -1195,6 +1279,7 @@ static int pr_owned(int value) {
         return value;
     d = pr_op3("ps_mr", value, -1, -1);
     pr_values[d].splat = pr_values[value].splat;
+    pr_values[d].lane_of = pr_values[value].lane_of;
     pr_adopt(d);
     return d;
 }
@@ -1499,8 +1584,7 @@ static void pr_instruction(const WlXboxVshInstruction *in, int mode) {
             pr_op(0, 0, 1, values, "psq_st @0, 0(%%[o]), 0, 0");
             values[0] = pr_half(pr_program_world, 1);
             pr_op(0, 0, 1, values, "stfs @0, 8(%%[o])");
-            pr_text("lwz 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, world_slot));
-            pr_fused_store(pr_world_w, "stfsx @0, %%[o], 0");
+            pr_fused_store(pr_world_w, "stfsx @0, %%[o], %%[ws]");
         }
     }
     if (in->captures_clip && (mode & WRITE_OUTPUTS) && !(pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD)) {
@@ -2093,7 +2177,7 @@ components 2h and 2h + 1 as a pair; the components the array does not give are t
 loop, each vertex's at its top) and each value's two copies are one register (pr_union), so either
 way reaches the prefix and the rest with it. pr_fetched_off: --no-forward */
 static int pr_fetched_off, pr_fetched_copies;
-static unsigned pr_fetched_on, pr_fetched_stored;
+static unsigned pr_fetched_stored;
 static int pr_fetched_lane[2][16][4], pr_fetched_half[2][16][2];
 
 static void pr_fetched_reset(unsigned stored) {
@@ -2388,8 +2472,8 @@ static void pr_fused_epilogue(void) {
         one at world_slot) */
         pr_fused_store(pr_world_values[0], "psq_st @0, 0(%%[ad]), 0, 0");
         pr_fused_store(pr_world_values[1], "stfs @0, 8(%%[ad])");
-        pr_text("lwz 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, world_slot));
-        pr_fused_store(pr_world_w, "stfsx @0, %%[ad], 0");
+        /* (its offset in a register for the whole loop: [ws]) */
+        pr_fused_store(pr_world_w, "stfsx @0, %%[ad], %%[ws]");
     } else {
         /* (the captured way alone when the program always captures, the other alone without
         perspective; else the program's flag tested) */
@@ -2673,6 +2757,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     int t, h;
 
     pr_value_count = pr_pre_count = pr_body_count = pr_cache_count = 0;
+    pr_prefix_first = pr_prefix_end = 0;
     pr_failed = 0;
     pr_label = 0;
     pr_ra_key[0] = 0;
@@ -2824,6 +2909,8 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         if (!pr_raw_on)
             pr_text("b %s", made);
         pr_place_label(again);
+        pr_use_weight = pr_weighted ? 2 : 4;
+        pr_prefix_first = pr_body_count;
         if (pr_raw_on) {
             /* (what the prologue loaded is not there for the first vertex, which comes from the
             other) */
@@ -2867,6 +2954,8 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
                     }
         }
         pr_place_label(made);
+        pr_use_weight = 4;
+        pr_prefix_end = pr_body_count;
         pr_forward_on = 1;
         /* (the halves the rest reads of the prefix: kept for the vertex after) */
         {
@@ -2981,6 +3070,8 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         }
         pr_text("bdnz %s", top);
         pr_fused_end();
+        if (!pr_failed)
+            pr_sweep();
         return !pr_failed;
     }
     pr_defaults(program);
@@ -2988,6 +3079,154 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     pr_text("addi %%[o], %%[o], %%[os]");
     pr_text("bdnz %s", top);
     return !pr_failed;
+}
+
+/* (the ops whose values nothing reads taken out, until none is: a load or an operation on the
+floating-point registers alone, which writes nothing else. pr_sweep_off: none, as before:
+xbox_vsh_codegen --no-sweep) */
+static int pr_sweep_off;
+
+static int pr_pure(const char *text) {
+    static const char *const names[] = {"ps_", "psq_l ", "lfs ", "lfd ", "lfsx ", "fadds ", "fsubs ", "fmuls ",
+                                        "fdivs ", "fmadds ", "fmsubs ", "fnmadds ", "fnmsubs ", "fabs ", "fneg ",
+                                        "fsel ", "fres ", "frsqrte ", "frsp ", "fctiwz ", "fmr "};
+    size_t n;
+
+    for (n = 0; n < sizeof(names) / sizeof(names[0]); n++)
+        if (strncmp(text, names[n], strlen(names[n])) == 0)
+            return 1;
+    return 0;
+}
+
+/* (whether op reads only ps0 of its kth value) */
+static int pr_reads_ps0(const PrOp *op, int k) {
+    static const char *const names[] = {"fadds ", "fsubs ", "fmuls ", "fdivs ", "fmadds ", "fmsubs ", "fnmadds ",
+                                        "fnmsubs ", "fabs ", "fneg ", "frsqrte ", "fres ", "frsp ", "fctiwz ",
+                                        "fcmpu ", "fsel ", "stfs ", "stfsx "};
+    size_t n;
+
+    if (op->defines & (1u << k))
+        return 0;
+    for (n = 0; n < sizeof(names) / sizeof(names[0]); n++)
+        if (strncmp(op->text, names[n], strlen(names[n])) == 0)
+            return 1;
+    return k == 2 && (strncmp(op->text, "ps_muls0 ", 9) == 0 || strncmp(op->text, "ps_madds0 ", 10) == 0);
+}
+
+/* (a value in no web but its own: no in-place write joined it) */
+static int pr_alone(int v) {
+    int n;
+
+    if (v <= 0 || pr_root(v) != v || pr_values[v].loop || pr_values[v].fetched)
+        return 0;
+    for (n = 0; n < pr_value_count; n++)
+        if (n != v && pr_root(n) == v)
+            return 0;
+    return 1;
+}
+
+/* (a dot product's ps_sum1 whose every reader moves its sum to ps0 (ps_merge11 x, v, v) for readers of
+ps0 alone: a ps_sum0, the sum in ps0, read by them, the merges then unread: pr_sweep. The same sum's
+bits. Under pr_splat_off: not, as before) */
+static PrOp *pr_op_at(int n) {
+    return n < pr_pre_count ? &pr_pre[n] : &pr_body[n - pr_pre_count];
+}
+
+static void pr_lanes(void) {
+    int all = pr_pre_count + pr_body_count, n, m, k, j;
+
+    for (n = 0; n < all && !pr_splat_off; n++) {
+        PrOp *sum = pr_op_at(n);
+        int v = sum->values[0], ok = 1;
+
+        if (strncmp(sum->text, "ps_sum1 ", 8) != 0 || sum->count != 4 || sum->defines != 1u || !pr_alone(v))
+            continue;
+        /* (every reader of v a merge of its ps1 twice, each merge's value read in ps0 alone) */
+        for (m = 0; m < all && ok; m++) {
+            const PrOp *op = pr_op_at(m);
+
+            for (k = 0; k < op->count && ok; k++) {
+                if (op->values[k] != v || (op->defines & (1u << k)))
+                    continue;
+                if (strncmp(op->text, "ps_merge11 ", 11) != 0 || op->count != 3 || op->defines != 1u ||
+                    op->values[1] != v || op->values[2] != v || !pr_alone(op->values[0]))
+                    ok = 0;
+                else
+                    for (j = 0; j < all && ok; j++) {
+                        const PrOp *reader = pr_op_at(j);
+                        int i;
+
+                        for (i = 0; i < reader->count; i++)
+                            if (reader->values[i] == op->values[0] && !(reader->defines & (1u << i)) &&
+                                !pr_reads_ps0(reader, i))
+                                ok = 0;
+                    }
+            }
+        }
+        if (!ok)
+            continue;
+        for (m = 0; m < all; m++) {
+            const PrOp *op = pr_op_at(m);
+
+            if (strncmp(op->text, "ps_merge11 ", 11) != 0 || op->count != 3 || op->values[1] != v)
+                continue;
+            for (j = 0; j < all; j++) {
+                PrOp *reader = pr_op_at(j);
+                int i;
+
+                for (i = 0; i < reader->count; i++)
+                    if (reader->values[i] == op->values[0] && !(reader->defines & (1u << i)))
+                        reader->values[i] = v;
+            }
+        }
+        sum->text[6] = '0';
+        sum->values[2] = sum->values[1];
+    }
+}
+
+static void pr_sweep(void) {
+    static int reads[PR_VALUES];
+    int swept = 1, n, k;
+
+    pr_lanes();
+
+    while (swept && !pr_sweep_off) {
+        swept = 0;
+        memset(reads, 0, sizeof(int) * (size_t)pr_value_count);
+        for (n = 0; n < pr_pre_count + pr_body_count; n++) {
+            const PrOp *op = n < pr_pre_count ? &pr_pre[n] : &pr_body[n - pr_pre_count];
+
+            for (k = 0; k < op->count; k++)
+                if (!(op->defines & (1u << k)))
+                    reads[pr_root(op->values[k])]++;
+        }
+        for (n = 0; n < pr_pre_count + pr_body_count; n++) {
+            int body = n >= pr_pre_count, at = body ? n - pr_pre_count : n, dead = 1;
+            PrOp *ops = body ? pr_body : pr_pre;
+            const PrOp *op = &ops[at];
+
+            if (!op->defines || !pr_pure(op->text))
+                continue;
+            for (k = 0; k < op->count; k++)
+                if ((op->defines & (1u << k)) && reads[pr_root(op->values[k])])
+                    dead = 0;
+            if (!dead)
+                continue;
+            if (body) {
+                memmove(&pr_body[at], &pr_body[at + 1], sizeof(PrOp) * (size_t)(pr_body_count - at - 1));
+                pr_body_count--;
+                if (pr_prefix_first > at)
+                    pr_prefix_first--;
+                if (pr_prefix_end > at)
+                    pr_prefix_end--;
+            } else {
+                memmove(&pr_pre[at], &pr_pre[at + 1], sizeof(PrOp) * (size_t)(pr_pre_count - at - 1));
+                pr_pre_count--;
+            }
+            n--;
+            swept = 1;
+        }
+    }
 }
 
 /* registers for the values (a linear scan); 0 when there are too few */
@@ -3060,12 +3299,17 @@ static int pr_allocate(unsigned *used) {
     return 1;
 }
 
+/* (a "w" form's world slot in a register for the whole loop: pr_print. 1: the operand [ws]; 2: r12,
+loaded before the loop and clobbered, where [ws] would pass GCC's 30 operands. pr_r12_off: never r12,
+the slot loaded at each use there, as before: xbox_vsh_codegen --no-r12) */
+static int pr_ws_register, pr_r12_off;
+
 /* the batch function's body for the Wii as one asm statement (pr_print
 writes it), or 0 when the program can't be written so */
 static unsigned pr_used;
 
-static int pr_program(const WlXboxVshProgram *program, const unsigned *needs, int reused,
-                      const ReusePrefix *prefix) {
+static int pr_program_once(const WlXboxVshProgram *program, const unsigned *needs, int reused,
+                           const ReusePrefix *prefix) {
     int limit, n, k, compares;
     unsigned used = 0;
 
@@ -3119,6 +3363,41 @@ static int pr_program(const WlXboxVshProgram *program, const unsigned *needs, in
     return 1;
 }
 
+/* the loop's cost as pr_program_once made it: its ops (labels aside), a reused prefix's a quarter */
+static long pr_loop_cost(void) {
+    long cost = 0;
+    int n;
+
+    for (n = 0; n < pr_body_count; n++) {
+        size_t length = strlen(pr_body[n].text);
+
+        if (length && pr_body[n].text[length - 1] != ':')
+            cost += n >= pr_prefix_first && n < pr_prefix_end ? 2 : 4;
+    }
+    return cost;
+}
+
+/* a program's asm (pr_program_once): with a reused prefix, the loads hoisted chosen by their count
+and by their count weighted (pr_weighted), the cheaper loop kept */
+static int pr_program(const WlXboxVshProgram *program, const unsigned *needs, int reused,
+                      const ReusePrefix *prefix) {
+    long plain;
+
+    pr_weighted = 0;
+    if (!pr_program_once(program, needs, reused, prefix))
+        return 0;
+    if (!reused || pr_weights_off)
+        return 1;
+    plain = pr_loop_cost();
+    pr_weighted = 1;
+    if (pr_program_once(program, needs, reused, prefix) && pr_loop_cost() < plain) {
+        pr_weighted = 0;
+        return 1;
+    }
+    pr_weighted = 0;
+    return pr_program_once(program, needs, reused, prefix);
+}
+
 /* an output offset's operand (%[od0] ...) and its value: a fused function
 writes the values (its operands would pass GCC's 30) */
 static const struct {
@@ -3156,6 +3435,17 @@ static void pr_print(FILE *out, int reused) {
     } else
         fprintf(out, "\tif (count) {\n\t\tconst char *vp = (const char *)vs;\n\t\tchar *op = (char *)os;\n"
                      "\t\tint slot[2];\n\t\tlong g, ra, a0;\n\n");
+    /* (a "w" form's world slot in a register, [ws], where the statement's operands stay within GCC's
+    30, an in-and-out one ("+") counted twice; else r12) */
+    pr_ws_register = 0;
+    if (pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD) {
+        int operands = 7 + 3 + (reused ? 2 : 0) + 6 + (pr_uses_c2 ? 1 : 0) + (pr_fused_fdata() ? 1 : 0) +
+                       (pr_fused_cmp() ? 2 : 0) + 1;
+
+        for (k = 0; k < 16; k++)
+            operands += (pr_fused_held & (1u << k)) ? 2 : 0;
+        pr_ws_register = operands <= 30 ? 1 : pr_r12_off ? 0 : 2;
+    }
     fprintf(out, "\t\t__asm__ volatile(\n");
     for (n = 0; n < pr_pre_count + pr_body_count + 2; n++) {
         const PrOp *op;
@@ -3172,6 +3462,8 @@ static void pr_print(FILE *out, int reused) {
                             pr_need_values[k], 27 - k, 4 + k, 4 + k);
                 fprintf(out, "\t\t\t\"mtcrf 127, %%[g]\\n\\t\"\n");
             }
+            if (pr_ws_register == 2)
+                fprintf(out, "\t\t\t\"lwz 12, %d(%%[f])\\n\\t\"\n", (int)offsetof(WlXboxVshFused, world_slot));
             if (pr_fuse)
                 fprintf(out, "\t\t\t\"lwz 0, 0(%%[slot])\\n\\t\"\n\t\t\t\"mtctr 0\\n\\t\"\n");
             else
@@ -3183,9 +3475,17 @@ static void pr_print(FILE *out, int reused) {
         if (n == pr_pre_count + 1)
             continue;
         op = n < pr_pre_count ? &pr_pre[n] : &pr_body[n - pr_pre_count - 2];
+        if (!pr_ws_register && strstr(op->text, "%[ws]") != NULL)
+            fprintf(out, "\t\t\t\"lwz 0, %d(%%[f])\\n\\t\"\n", (int)offsetof(WlXboxVshFused, world_slot));
         fprintf(out, "\t\t\t\"");
         for (t = op->text; *t; t++) {
             size_t o;
+
+            if (pr_ws_register != 1 && strncmp(t, "%[ws]", 5) == 0) {
+                fputs(pr_ws_register ? "12" : "0", out);
+                t += 4;
+                continue;
+            }
 
             for (o = 0; pr_fuse && *t == '%' && o < sizeof(pr_output_offsets) / sizeof(pr_output_offsets[0]); o++) {
                 size_t length = strlen(pr_output_offsets[o].name);
@@ -3223,6 +3523,8 @@ static void pr_print(FILE *out, int reused) {
                 fprintf(out, ",\n\t\t\t  [d%d] \"b\"(d%d), [s%d] \"r\"(s%d)", k, k, k, k);
         if (pr_fused_cmp())
             fprintf(out, ",\n\t\t\t  [t11] \"b\"(t11), [t10] \"b\"(t10)");
+        if (pr_ws_register == 1)
+            fprintf(out, ",\n\t\t\t  [ws] \"r\"(fused->world_slot)");
         fprintf(out, "\n");
     } else {
         fprintf(out, "\n\t\t\t: [c] \"b\"(c), [c2] \"b\"(c + 128), [k] \"b\"(wl_xbox_vsh_pairs_k), "
@@ -3231,8 +3533,8 @@ static void pr_print(FILE *out, int reused) {
     if (!pr_fuse)
         fprintf(out, "\t\t\t  [vs] \"i\"(sizeof(vs[0])), [os] \"i\"(sizeof(*os)),\n");
     if (pr_fuse)
-        fprintf(out, "\t\t\t: \"r0\", \"cr0\", \"cr1\", \"cr2\", \"cr3\", \"cr4\", \"cr5\", "
-                     "\"cr6\", \"cr7\", \"ctr\", \"memory\"");
+        fprintf(out, "\t\t\t: \"r0\", %s\"cr0\", \"cr1\", \"cr2\", \"cr3\", \"cr4\", \"cr5\", "
+                     "\"cr6\", \"cr7\", \"ctr\", \"memory\"", pr_ws_register == 2 ? "\"r12\", " : "");
     else
         fprintf(out, "\t\t\t  "
                  "[od0] \"i\"(offsetof(WlXboxVshOutput, d0)), [od1] \"i\"(offsetof(WlXboxVshOutput, d1)),\n"

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "wl/platform/host/gx_direct_host.h"
+#include "wl/platform/host/gx_host.h"
 
 #include "wl/platform/gx_shadow.h"
 #include "wl/platform/host/gx_renderer_host.h"
@@ -17,6 +18,9 @@ static bool g_position_identity = true;
 static uint32_t g_vertex_bytes;
 // the channels' material registers (wl_gx_direct_material), the colours a layout takes from them
 static uint8_t g_material[2][4], g_material_known;
+// the lighting the console's direct layer holds (counted alike: gx_shadow.h)
+static WlGxDirectLighting g_lighting;
+static bool g_lighting_known;
 // a renderer's own vertex formats: the sizes set, and the descriptor a test gives
 static uint8_t g_format_bytes[8][WL_GX_VA_ATTRIBUTES];
 static WlGxVtxDesc g_descriptor[WL_GX_VA_ATTRIBUTES + 1];
@@ -48,7 +52,9 @@ void wl_host_gx_direct_hook(void (*hook)(void *user, WlGxDirectPrim prim, const 
 void wl_gx_direct_begin(void) {
     unsigned n;
 
-    wl_gx_invalidate_shadow();
+    // (as the console's: the maps' textures kept with the maps as a cache, gx_shadow.h)
+    wl_host_gx_invalidate_shadow_maps(wl_gx_shadow_maps_cache_on() ? 0u : 0xFFu);
+    wl_gx_shadow_maps_begin();
     s.begins++;
     s.position_matrix_set = false;
     g_position_identity = true;
@@ -58,6 +64,7 @@ void wl_gx_direct_begin(void) {
     g_flush_due = true;
     g_layout_known = false;
     g_material_known = 0;
+    g_lighting_known = false;
 }
 
 void wl_gx_direct_flush_after(void) {
@@ -73,6 +80,7 @@ static WlGxBisect g_bisect;
 
 void wl_gx_bisect_set(const WlGxBisect *bisect) {
     g_bisect = *bisect;
+    wl_gx_shadow_maps_cache(!bisect->maps_fixed);
 }
 
 const WlGxBisect *wl_gx_bisect(void) {
@@ -107,6 +115,8 @@ static uint32_t g_capacity, g_expected, g_received;
 static bool g_in_primitive;
 
 void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
+    bool flush;
+
     g_in_primitive = false;
     if (count == 0 || count > 65535u || !g_layout_known) {
         return;
@@ -126,12 +136,18 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
         g_vertices = grown;
         g_capacity = count;
     }
-    if (g_flush_due && !g_flush_off) {
-        s.stats.flushes++;
+    wl_tev_maps_follow(); // (the stages read the maps their textures went to, as the console's: gx_shadow.h)
+    if (wl_gx_shadow_token_due()) {
+        // (the console's token put off, counted where it sends it, and the flush after it: gx_direct_wii.c)
+        wl_gx_shadow_token();
+        g_flush_due = true;
     }
+    flush = g_flush_due && !g_flush_off;
+    s.stats.flushes += flush ? 1u : 0u;
     g_flush_due = false;
     g_in_primitive = true;
-    wl_gx_shadow_fifo(WL_GX_FIFO_VERTEX, 3u + count * g_vertex_bytes);
+    // (the console's flush strip counted with the primitive: of its state, in its batch, gx_direct_wii.c)
+    wl_gx_shadow_fifo(WL_GX_FIFO_VERTEX, 3u + count * g_vertex_bytes + (flush ? 3u + 8u * g_vertex_bytes : 0u));
     g_expected = count;
     g_received = 0;
     s.prim = prim;
@@ -566,6 +582,13 @@ void wl_gx_direct_draw(WlGxDirectPrim prim, const WlGxDirectVertex *vertices, ui
 
 void wl_gx_direct_lighting(const WlGxDirectLighting *lighting) {
     s.lighting = *lighting;
+    // (the console's loads counted, and as there only when the lighting changed: gx_direct_wii.c)
+    if (g_lighting_known && memcmp(&g_lighting, lighting, sizeof g_lighting) == 0) {
+        return;
+    }
+    g_lighting = *lighting;
+    g_lighting_known = true;
+    wl_gx_shadow_lighting(lighting);
     g_material_known = 0; // (the Wii's lighting sets the materials white)
 }
 
@@ -680,20 +703,17 @@ void wl_gx_direct_cull(WlGxCull cull) {
 }
 
 void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler *sampler, const WlGxTlut *tlut) {
+    uint32_t regs[WL_GX_TEXREGS];
+    bool ci = tex->format == WL_GX_TEX_C4 || tex->format == WL_GX_TEX_C8, held = false;
+
     if (map >= 8) {
         return;
     }
-    s.textures[map] = tex;
-    s.samplers[map] = sampler != NULL ? *sampler : tex->sampler;
-    s.map_kind[map] = WL_HOST_GX_MAP_TEXTURE;
-    s.map_objects[map] = *tex;
-    s.map_objects[map].sampler = s.samplers[map];
     {
         // (the console's registers counted, gx_shadow.h: the wraps and filters as the Wii binds them)
-        const WlGxSampler *sm = &s.samplers[map];
+        const WlGxSampler *sm = sampler != NULL ? sampler : &tex->sampler;
         bool pow2 = (tex->width & (tex->width - 1u)) == 0 && (tex->height & (tex->height - 1u)) == 0;
-        uint32_t regs[WL_GX_TEXREGS], minf = sm->min_filter;
-        bool ci = tex->format == WL_GX_TEX_C4 || tex->format == WL_GX_TEX_C8;
+        uint32_t minf = sm->min_filter;
 
         if (tex->mips <= 1u && minf >= WL_GX_FILTER_NEAREST_MIP_NEAREST) {
             minf = (minf & 1u) != 0 ? WL_GX_FILTER_LINEAR : WL_GX_FILTER_NEAREST;
@@ -702,9 +722,25 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
                                    tex->mips, pow2 ? sm->wrap_s : WL_GX_WRAP_CLAMP, pow2 ? sm->wrap_t : WL_GX_WRAP_CLAMP,
                                    minf, sm->mag_filter, tex->mips > 1u ? sm->lod_bias : tex->sampler.lod_bias,
                                    tex->tlut, wl_gx_shadow_texture_region(tex->format, tex->mips, g_bisect.regions_libogc));
-        if (wl_gx_shadow_texture(map, regs, ci ? 7u : 6u, g_bisect.tex_whole) == 0) {
-            s.stats.textures_kept++;
-        }
+    }
+    if (!g_bisect.maps_fixed) {
+        // (the map that holds it already, else the one it goes to, as the console's: gx_shadow.h)
+        const uint32_t key[WL_GX_MAP_KEY_WORDS] = {regs[WL_GX_TEXREG_MODE0], regs[WL_GX_TEXREG_MODE1],
+                                                   regs[WL_GX_TEXREG_IMAGE0], regs[WL_GX_TEXREG_IMAGE3],
+                                                   regs[WL_GX_TEXREG_EVEN] << 24 | (ci ? regs[WL_GX_TEXREG_TLUT] : 0xFFFFFFu)};
+
+        map = wl_gx_shadow_map_bind(map, key, &held);
+    }
+    s.textures[map] = tex;
+    s.samplers[map] = sampler != NULL ? *sampler : tex->sampler;
+    s.map_kind[map] = WL_HOST_GX_MAP_TEXTURE;
+    s.map_objects[map] = *tex;
+    s.map_objects[map].sampler = s.samplers[map];
+    if (held) {
+        wl_gx_shadow_texture_kept();
+        s.stats.textures_kept++;
+    } else if (wl_gx_shadow_texture(map, regs, ci ? 7u : 6u, g_bisect.tex_whole) == 0) {
+        s.stats.textures_kept++;
     }
     if (tlut != NULL && (tex->format == WL_GX_TEX_C4 || tex->format == WL_GX_TEX_C8)) {
         // (a TLUT slot holds the last palette loaded into it, whichever map's object reads it; the
@@ -724,7 +760,9 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
 
 void wl_host_gx_direct_ramp(uint32_t map) {
     if (map < 8) {
-        wl_gx_shadow_texture_forget(1u << map); // (loaded behind the shadow, as on the console)
+        if (wl_gx_shadow_texture_forget(1u << map)) { // (loaded behind the shadow, as on the console)
+            wl_tev_maps_follow();
+        }
         s.map_kind[map] = WL_HOST_GX_MAP_RAMP;
         s.textures[map] = NULL;
     }
@@ -734,6 +772,7 @@ void wl_gx_direct_texture_invalidate(void) {
     const WlHostGxRenderer *r = wl_host_gx_renderer();
 
     s.invalidates++;
+    wl_gx_shadow_texture_invalidate(); // (the console's, counted)
     if (r != NULL && r->texture_invalidate != NULL) {
         r->texture_invalidate(r->user);
     }

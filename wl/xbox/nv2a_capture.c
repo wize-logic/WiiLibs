@@ -569,6 +569,7 @@ static WlResult replay(Reader *r, const WlNv2aReplayMemory *theirs, const WlNv2a
             w.data = (uint8_t *)(uintptr_t)p;
             w.size = size;
             walk_state(dev, &w);
+            dev->kelvin.layout_ok = 0; // (the arrays' layout kept made again from the state loaded)
             if (w.failed) {
                 result = WL_ERR_FORMAT;
             }

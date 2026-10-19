@@ -9,7 +9,9 @@
 // arrays through GX's transform unit against the same draws on the processor, within a tolerance,
 // and a second pass over them by a program whose colour the processor computes (the transform unit
 // still doing its position) passing LEQUAL everywhere; the same draw with its arrays kept for GX to
-// read by index (the vertex cache), to the bit, and again after its vertices are rewritten. A
+// read by index (the vertex cache), to the bit, and again after its vertices are rewritten. The
+// processor's vertices of draws of two slot sizes in one frame read by index from the ring, as when sent
+// whole, to the bit (and with noringfit). A
 // projective coordinate whose q varies over a quad, divided at each pixel as the NV2A divides it. A
 // 4:3 picture on a 16:9 screen drawn narrow: its draws, clears and queries in its EFB columns, both
 // ways of each switch (narrowmid, pillarbox).
@@ -24,6 +26,7 @@
 #include "tests/platform/check.h"
 #include "wl/gxsoft/gxsoft.h"
 #include "wl/platform/gx_direct.h"
+#include "wl/platform/host/gx_direct_host.h"
 #include "wl/platform/host/gx_host.h"
 #include "wl/platform/platform.h"
 #include "wl/xbox/nv2a_capture.h"
@@ -1154,6 +1157,107 @@ TEST arrays_kept_for_gx_to_index_draw_to_the_bit(void) {
     PASS();
 }
 
+// ---- the made vertices' ring ---------------------------------------------------------------------------
+
+// one combiner stage r0 = v0 (A = v0, B = 1), the final combiner's output r0: no texture coordinate sent
+static void colour_only_combiner(TGuest *g) {
+    t_m1(g, WL_NV2A_K_SET_COMBINER_COLOR_ICW, 0x04200000u);
+    t_m1(g, WL_NV2A_K_SET_COMBINER_COLOR_OCW, 0x000000C0u);
+    t_m1(g, WL_NV2A_K_SET_COMBINER_ALPHA_ICW, 0x14300000u);
+    t_m1(g, WL_NV2A_K_SET_COMBINER_ALPHA_OCW, 0x000000C0u);
+}
+
+static void indexed_triangles(TGuest *g, const uint16_t *indices, unsigned count) {
+    unsigned i;
+
+    t_m1(g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_TRIANGLES);
+    for (i = 0; i + 1u < count; i += 2u) {
+        t_m1(g, WL_NV2A_K_ARRAY_ELEMENT16, (uint32_t)indices[i + 1u] << 16 | indices[i]);
+    }
+    if (i < count) {
+        t_m1(g, WL_NV2A_K_ARRAY_ELEMENT32, indices[i]);
+    }
+    t_m1(g, WL_NV2A_K_SET_BEGIN_END, 0);
+}
+
+// One frame of three indexed draws whose vertices the processor makes into the ring GX reads by index
+// (made_begin), of two slot sizes (made_stride): the arrays' draw (colour and coordinate, with room for
+// its q: 7 words a vertex), the same vertices by other indices with the colour alone (4 words), and
+// again with the coordinate. Its EFB, each draw's slot stride (the position array's, as GX was given
+// it) and the stats; `dir` a title folder of switches (NULL: none).
+static int ring_frame(uint32_t *efb, const char *dir, uint32_t strides[3], WlNv2aGxStats *stats) {
+    static const uint16_t colour_alone[] = {6, 7, 8, 7, 8, 9, 9, 10, 11, 0, 1, 2};
+    static const uint16_t coordinate[] = {3, 4, 5, 0, 1, 2, 5, 4, 3};
+    TGuest g;
+    int x, y;
+
+    wl_nv2a_gx_set_switches(dir != NULL ? dir : "sd:/nv2a_ring_none");
+    g_no_xf = true;
+    if (pixel_device(&g) == NULL) {
+        g_no_xf = false;
+        return 0;
+    }
+    g_no_xf = false;
+    f_perspective(&g);
+    f_constant(&g, 98, 0, 0, 1000.0f / 999.9f, -100.0f / 999.9f);
+    f_clear(&g, 0xFF000000u);
+    xf_arrays(&g);
+    t_kick(&g);
+    strides[0] = wl_host_gx_direct()->array_strides[WL_GX_DIRECT_ARRAY_POSITION];
+    colour_only_combiner(&g);
+    indexed_triangles(&g, colour_alone, sizeof colour_alone / sizeof colour_alone[0]);
+    t_kick(&g);
+    strides[1] = wl_host_gx_direct()->array_strides[WL_GX_DIRECT_ARRAY_POSITION];
+    f_combiner_texture_times_colour(&g);
+    indexed_triangles(&g, coordinate, sizeof coordinate / sizeof coordinate[0]);
+    t_kick(&g);
+    strides[2] = wl_host_gx_direct()->array_strides[WL_GX_DIRECT_ARRAY_POSITION];
+    for (y = 0; y < 480; y++) {
+        for (x = 0; x < 640; x++) {
+            efb[y * 640 + x] = pixel(x, y);
+        }
+    }
+    wl_nv2a_gx_stats(g_gx, stats);
+    pixel_done(&g);
+    wl_nv2a_gx_set_switches("sd:/nv2a_ring_none");
+    return 1;
+}
+
+// Slots as long as each draw's words: a draw of 28-byte slots, one of 16, one of 28 again in one frame,
+// each indexing its own slots (the slot numbered from the ring's start at the draw's stride), drawn as
+// the same draws sent whole (nomadeindex) draw them, to the bit; and with the switch noringfit, every slot
+// a PackedVertex's 88 bytes, the same picture.
+TEST made_slots_of_each_draws_size_index_right(void) {
+    static uint32_t fit[640 * 480], whole[640 * 480], wide[640 * 480];
+    uint32_t fit_strides[3], whole_strides[3], wide_strides[3];
+    WlNv2aGxStats fit_stats, whole_stats, wide_stats;
+    unsigned i, covered = 0;
+
+    ASSERT_EQ(WL_OK, wl_platform_fs_virtual_set("sd:/nv2a_ring_whole/nomadeindex", "", 0));
+    ASSERT_EQ(WL_OK, wl_platform_fs_virtual_set("sd:/nv2a_ring_wide/noringfit", "", 0));
+    ASSERT(ring_frame(fit, NULL, fit_strides, &fit_stats));
+    ASSERT(ring_frame(whole, "sd:/nv2a_ring_whole", whole_strides, &whole_stats));
+    ASSERT(ring_frame(wide, "sd:/nv2a_ring_wide", wide_strides, &wide_stats));
+    ASSERT_EQ(3u, fit_stats.made_draws);
+    ASSERT_EQ(0u, fit_stats.made_unmatched);
+    ASSERT_EQ(0u, whole_stats.made_draws);
+    ASSERT_EQ(3u, wide_stats.made_draws);
+    // (the slots: the draws' words; 88 bytes with noringfit)
+    ASSERT_EQ(28u, fit_strides[0]);
+    ASSERT_EQ(16u, fit_strides[1]);
+    ASSERT_EQ(28u, fit_strides[2]);
+    for (i = 0; i < 3u; i++) {
+        ASSERT_EQ(88u, wide_strides[i]);
+    }
+    for (i = 0; i < 640u * 480u; i++) {
+        covered += (whole[i] & 0xFFFFFF00u) != 0 ? 1u : 0u;
+    }
+    ASSERT(covered > 20000u);
+    ASSERT_MEM_EQm("ring fitted against sent whole", whole, fit, sizeof fit);
+    ASSERT_MEM_EQm("noringfit against sent whole", whole, wide, sizeof wide);
+    PASS();
+}
+
 // an immediate vertex with a four-component coordinate (s, t, r, q) and a white colour
 static void projective_vertex(TGuest *g, float x, float y, float s, float t, float q) {
     t_method(g, WL_NV2A_K_SET_VERTEX_DATA4F_M + 16 * 9, 4);
@@ -1238,6 +1342,7 @@ SUITE(pixels_suite) {
     RUN_TEST(screen_space_depths_beyond_the_range_are_clamped_on_the_transform_unit_too);
     RUN_TEST(a_second_pass_by_the_processor_passes_over_the_transform_units_depths);
     RUN_TEST(arrays_kept_for_gx_to_index_draw_to_the_bit);
+    RUN_TEST(made_slots_of_each_draws_size_index_right);
     RUN_TEST(a_projective_coordinate_is_divided_at_each_pixel);
     RUN_TEST(a_picture_drawn_narrow_lands_in_its_columns);
 }

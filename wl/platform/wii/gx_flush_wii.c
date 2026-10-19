@@ -134,7 +134,13 @@ WlGxFlushResult wl_gx_direct_flush_pending(uint8_t format) {
     return WL_GX_FLUSH_SENT;
 }
 
+// (tev_wii.c's, gx_shadow.h; weak: this file's test links no TEV)
+void wl_tev_maps_follow(void) __attribute__((weak));
+
 void wl_gx_direct_begin_format(uint8_t gx_primitive, uint8_t format, uint16_t count) {
+    if (wl_tev_maps_follow != NULL) {
+        wl_tev_maps_follow(); // (the stages read the maps their textures went to: gx_shadow.h)
+    }
     wl_gx_direct_flush_pending(format);
     GX_Begin(gx_primitive, format, count);
 }

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // The MCPX APU and AC'97 models (wl/xboxapu) driven as DirectSound drives them: voices set up
 // through the front end's methods in a synthetic guest memory, played, and their mixbins, stereo
-// output, positions, notifiers and interrupts checked against values worked out here.
+// output, positions, notifiers and interrupts checked against values worked out here; voices whose
+// words hold (their additions kept from frame to frame) against the plain paths, bit for bit.
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,7 @@
 #include "wl/base/endian.h"
 #include "wl/xboxapu/ac97.h"
 #include "wl/xboxapu/apu.h"
+#include "wl/xboxapu/apu_internal.h"
 
 // ---- A guest memory and the setup DirectSound makes -------------------------------------------
 
@@ -45,13 +47,18 @@ static uint8_t *lin_ptr(uint32_t lin) {
     return g_mem + page + (lin & 0xFFFu);
 }
 
-static WlXboxApu *setup(void) {
+// (given: NULL for the defaults, else a config whose phys_ptr is set here)
+static WlXboxApu *setup_with(const WlXboxApuConfig *given) {
     if (g_mem == NULL) {
         g_mem = malloc(MEM_BYTES);
     }
     memset(g_mem, 0, MEM_BYTES);
     WlXboxApuConfig cfg;
-    wl_xbox_apu_config_default(&cfg);
+    if (given != NULL) {
+        cfg = *given;
+    } else {
+        wl_xbox_apu_config_default(&cfg);
+    }
     cfg.phys_ptr = phys_ptr;
     WlXboxApu *apu = wl_xbox_apu_create(&cfg);
     w32(apu, 0x202C, VPV);
@@ -67,6 +74,10 @@ static WlXboxApu *setup(void) {
     w32(apu, 0x1100, 0x0);  // the front end runs
     w32(apu, 0x2000, 0x0F); // the counter (and the processor) runs
     return apu;
+}
+
+static WlXboxApu *setup(void) {
+    return setup_with(NULL);
 }
 
 // A buffer voice as DirectSound sets one up. fmt: the format word's high bits (stereo, sizes);
@@ -602,6 +613,100 @@ TEST the_ac97_bus_master_runs_its_descriptors(void) {
     PASS();
 }
 
+// ---- A voice's additions kept while its words hold ----------------------------------------------
+
+// The same voices played by the plain paths (WlXboxApuConfig.plain: each frame's targets and gains
+// worked out again) and by the default ones (a voice whose volume, envelope, target and format words
+// are the last frame's, its gains held then, adds what it added then: apu_vp.c's plan): each frame's
+// mixbins and output the same, bit for bit, through the frames the words hold, a volume changed, the
+// targets changed, a loud and a quiet voice into one bin, an envelope's attack, hold and sustain.
+enum { KEPT_FRAMES = 96 };
+
+static struct {
+    int32_t bins[KEPT_FRAMES][32 * 32];
+    int16_t out[KEPT_FRAMES][64];
+    unsigned frames;
+} g_kept_mix[2];
+
+static void kept_frame(void *user, const int32_t *bins, const int16_t *out) {
+    unsigned which = (unsigned)(uintptr_t)user;
+    unsigned f = g_kept_mix[which].frames++;
+
+    if (f < KEPT_FRAMES) {
+        memcpy(g_kept_mix[which].bins[f], bins, sizeof g_kept_mix[which].bins[f]);
+        if (out != NULL) {
+            memcpy(g_kept_mix[which].out[f], out, sizeof g_kept_mix[which].out[f]);
+        }
+    }
+}
+
+// the voices' frames into g_kept_mix[plain]; *planned: the frames whose end found voice 21's
+// additions kept (its plan valid)
+static void kept_voices(bool plain, unsigned *planned) {
+    WlXboxApuConfig cfg;
+    static int16_t out[64 * KEPT_FRAMES];
+
+    wl_xbox_apu_config_default(&cfg);
+    cfg.plain = plain;
+    cfg.on_frame = kept_frame;
+    cfg.on_frame_user = (void *)(uintptr_t)(plain ? 1u : 0u);
+    memset(&g_kept_mix[plain ? 1 : 0], 0, sizeof g_kept_mix[0]);
+    WlXboxApu *apu = setup_with(&cfg);
+    for (uint32_t i = 0; i < 4096; i++) {
+        wl_wr_le16(lin_ptr(i * 2u), (uint16_t)(ramp(i) * 16)); // 16-bit mono, looped, loud
+    }
+    for (uint32_t i = 0; i < 512; i++) {
+        *lin_ptr(0x2000u + i) = (uint8_t)(i * 7u); // 8-bit stereo, looped
+    }
+    voice(apu, 21, FMT_S16 | FMT_LOOP, 0, 0, 4095, 0, VOL(0, 0x200), 0xFFFFFFFFu);
+    voice(apu, 22, FMT_U8 | FMT_STEREO | FMT_LOOP, 0x2000, 0, 255, -0x800, VOL(0x900, 0x10), 0xFFFFFFFFu);
+    voice(apu, 23, FMT_S16 | FMT_LOOP, 0, 0, 4095, 0x400, VOL(0x80, 0x80), 0xFFFFFFFFu);
+    m(apu, 0x308, 1u);                         // voice 23: attack 1 (16 frames)
+    m(apu, 0x30C, 2u | 1u << 12 | 160u << 24); // decay 2, hold 1, sustain 160
+    play(apu, 21, 0);
+    play(apu, 22, 0);
+    play(apu, 23, 2u << 28);
+    *planned = 0;
+    for (unsigned f = 0; f < KEPT_FRAMES; f++) {
+        if (f == 40) { // voice 21 louder in bin 0, quieter in bin 1
+            m(apu, 0x2F8, 21);
+            m(apu, 0x360, VOL(0x10, 0x400));
+        }
+        if (f == 60) { // voice 22's targets 0..5 to bins 2, 3, 0, 1, 4, 5
+            m(apu, 0x2F8, 22);
+            m(apu, 0x300, 0x14810062u);
+        }
+        wl_xbox_apu_run(apu, 1, out + 64u * f);
+        *planned += apu->voice[21].plan_valid ? 1u : 0u;
+    }
+    wl_xbox_apu_destroy(apu);
+}
+
+TEST a_voice_whose_words_hold_adds_what_it_added_last_frame(void) {
+    unsigned planned, planned_plain;
+
+    kept_voices(false, &planned);
+    kept_voices(true, &planned_plain);
+    ASSERT_EQ((unsigned)KEPT_FRAMES, g_kept_mix[0].frames);
+    ASSERT_EQ((unsigned)KEPT_FRAMES, g_kept_mix[1].frames);
+    // (the kept additions used: most frames, but not by the plain paths)
+    ASSERT(planned > KEPT_FRAMES / 2u);
+    ASSERT_EQ(0u, planned_plain);
+    for (unsigned f = 0; f < KEPT_FRAMES; f++) {
+        ASSERT_MEM_EQm("mixbins", g_kept_mix[1].bins[f], g_kept_mix[0].bins[f], sizeof g_kept_mix[0].bins[f]);
+        ASSERT_MEM_EQm("output", g_kept_mix[1].out[f], g_kept_mix[0].out[f], sizeof g_kept_mix[0].out[f]);
+    }
+    // (and something played in every bin the voices reach)
+    for (unsigned b = 0; b < 4; b++) {
+        int32_t any = 0;
+        for (unsigned s = 0; s < 32; s++) {
+            any |= g_kept_mix[0].bins[KEPT_FRAMES - 1][b * 32 + s];
+        }
+        ASSERT(any != 0);
+    }
+    PASS();
+}
+
 SUITE(xboxapu_suite) {
     RUN_TEST(pcm16_at_unity_pitch_reaches_its_bins_exactly);
     RUN_TEST(volume_is_sixtyfourths_of_a_decibel);
@@ -616,6 +721,7 @@ SUITE(xboxapu_suite) {
     RUN_TEST(the_gp_command_word_is_taken_and_the_fence_lands);
     RUN_TEST(a_3d_voice_reaches_the_hrtf_submixes);
     RUN_TEST(the_ac97_bus_master_runs_its_descriptors);
+    RUN_TEST(a_voice_whose_words_hold_adds_what_it_added_last_frame);
 }
 
 GREATEST_MAIN_DEFS();

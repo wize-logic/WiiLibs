@@ -78,6 +78,18 @@ struct WlNv2aKelvin {
     uint32_t primitive;
     // WL_NV2A_DIRTY_*
     uint32_t dirty;
+    // (the vertex arrays' layout kept between draws, looked at again when WL_NV2A_DIRTY_ARRAYS is set
+    // and made again when layout_ok is 0: each enabled array's attribute, format, stride, bytes a vertex
+    // and guest-physical start, layout_count of them in attribute order, from the formats in
+    // layout_formats (the starts alone made again when they are the same); not part of the state a
+    // capture keeps)
+    struct {
+        uint64_t start;
+        uint32_t stride, bytes;
+        uint8_t attrib, type, size;
+    } layout[WL_NV2A_ATTRIBS];
+    uint32_t layout_formats[WL_NV2A_ATTRIBS];
+    uint8_t layout_count, layout_ok;
 };
 
 // a method's word, and as a float
@@ -231,6 +243,16 @@ extern bool wl_nv2a_prefetch_on;
 void wl_nv2a_set_prefetch(bool on);
 // the pusher's header loop as before the method table's run kinds (true), for an A/B on the console
 void wl_nv2a_set_old_push(bool on);
+// the pusher's loop of wave 4 (true, the default: the one-word headers to plain methods alone in the
+// loop, runs of plain methods and the load slots and begin/end straight, the index runs a line at a
+// time, the windows' slots read in place); false: the loop as wave 3 left it (a file "oldpush2",
+// WL_XB_OLDPUSH2), for an A/B
+void wl_nv2a_set_push_cuts(bool on);
+// true (the default): the vertex arrays' layout kept between draws (made again when their formats
+// change, their starts alone when an offset or a vertex DMA does), the 16-bit index lines in assembly on
+// Broadway, the viewport's words straight to their constants; false: as wave 4's first six left them (a file "oldpush3", WL_XB_OLDPUSH3), for an
+// A/B. A span whose start passes 4 GiB is refused either way.
+void wl_nv2a_set_push_cuts3(bool on);
 static inline bool wl_nv2a_prefetching(void) {
     return WL_NV2A_PREFETCHES && wl_nv2a_prefetch_on;
 }

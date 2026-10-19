@@ -539,6 +539,94 @@ TEST the_light_shape_of_a_lit_program(void) {
     PASS();
 }
 
+// ---- the constants the outputs read (wl_xbox_vsh_live_constants) --------------------------------
+// (assembled by tests/xbox/vsh_programs.py's assemble(); the instructions in the comments)
+
+// each constant into a component of its own, each output reading one of them
+static const uint32_t g_split_words[] = {
+    0x00000000, 0x00EC001B, 0x0836186C, 0x00008800, // dp4 oPos.x, v0, c[0]
+    0x00000000, 0x00EC201B, 0x0836186C, 0x00004800, // dp4 oPos.y, v0, c[1]
+    0x00000000, 0x00EC401B, 0x0836186C, 0x00002800, // dp4 oPos.z, v0, c[2]
+    0x00000000, 0x00EC601B, 0x0836186C, 0x00001800, // dp4 oPos.w, v0, c[3]
+    0x00000000, 0x002E801B, 0x0C36006C, 0x08200000, // mov r2.x, c[20]
+    0x00000000, 0x002EA01B, 0x0C36006C, 0x04200000, // mov r2.y, c[21]
+    0x00000000, 0x002EC01B, 0x0C36006C, 0x08300000, // mov r3.x, c[22]
+    0x00000000, 0x002EE01B, 0x0C36006C, 0x04300000, // mov r3.y, c[23]
+    0x00000000, 0x00200000, 0x2436006C, 0x00008848, // mov oT0.x, r2.x
+    0x00000000, 0x00200055, 0x2436006C, 0x00008818, // mov oD0.x, r2.y
+    0x00000000, 0x00200055, 0x3436006C, 0x00008851, // mov oT1.x, r3.y
+};
+
+// skinned: the position by a bone's rows (c[a0+60]); T0 = (c13, c14) . v4 written by an ILU mov beside the MAC's
+// dp3 of the bone's row
+static const uint32_t g_skinned_words[] = {
+    0x00000000, 0x01A00200, 0x0836006C, 0x00000000, // arl a0.x, v1.x
+    0x00000000, 0x0033801B, 0x0C36006C, 0x0F700002, // mov r7, c[a0+60]
+    0x00000000, 0x00EDA81B, 0x0836186C, 0x08100000, // dp4 r1.x, v4, c[13]
+    0x00000000, 0x00EDC81B, 0x0836186C, 0x04100000, // dp4 r1.y, v4, c[14]
+    0x00000000, 0x02A0001B, 0x0836E854, 0x58B0C84C, // dp3 r11.x, v0, r7 : imov oT0.xy, r1.xy
+    0x00000000, 0x002000FF, 0x0836006C, 0x01B00000, // mov r11.w, v0.w
+    0x00000000, 0x00EC001B, 0xB436186C, 0x00008800, // dp4 oPos.x, r11, c[0]
+    0x00000000, 0x00EC201B, 0xB436186C, 0x00004800, // dp4 oPos.y, r11, c[1]
+    0x00000000, 0x00EC401B, 0xB436186C, 0x00002800, // dp4 oPos.z, r11, c[2]
+    0x00000000, 0x00EC601B, 0xB436186C, 0x00001801, // dp4 oPos.w, r11, c[3]
+};
+
+// the live constants of `live` as a set of c[n] (n from -96): a bit each of c[0] to c[31]; ~0 for -1, 0xDEAD
+// for one out of that range or listed twice, 0xBAD for a register written past the count
+static uint32_t live_set(const uint32_t *words, unsigned long count, unsigned live, int most, int *n) {
+    unsigned char registers[16];
+    uint32_t set = 0;
+    memset(registers, 0xEE, sizeof registers);
+    wl_xbox_vsh_compile(words, count, NULL, 0, &g_program);
+    *n = wl_xbox_vsh_live_constants(&g_program, live, registers, most);
+    if (*n < 0) {
+        return ~0u;
+    }
+    for (int i = 0; i < *n; i++) {
+        int c = registers[i] - WL_XBOX_VSH_CONSTANT_BIAS;
+        if (c < 0 || c >= 32 || (set & 1u << c)) {
+            return 0xDEADu;
+        }
+        set |= 1u << c;
+    }
+    return registers[*n] == 0xEE ? set : 0xBADu;
+}
+
+TEST live_constants_a_component_at_a_time(void) {
+    const unsigned long count = sizeof g_split_words / 16;
+    int n;
+    // r2.x alone reaches T0, r2.y alone D0, r3.y alone T1 (a walk a register at a time takes both of each)
+    ASSERT_EQ(1u << 20, live_set(g_split_words, count, WL_XBOX_VSH_LIVE_T0, 16, &n));
+    ASSERT_EQ(1, n);
+    ASSERT_EQ(1u << 21, live_set(g_split_words, count, WL_XBOX_VSH_LIVE_D0, 16, &n));
+    ASSERT_EQ(1u << 23, live_set(g_split_words, count, WL_XBOX_VSH_LIVE_T0 << 1, 16, &n));
+    ASSERT_EQ(1u << 20 | 1u << 23,
+              live_set(g_split_words, count, WL_XBOX_VSH_LIVE_T0 | WL_XBOX_VSH_LIVE_T0 << 1, 16, &n));
+    ASSERT_EQ(2, n);
+    ASSERT_EQ(0xFu, live_set(g_split_words, count, WL_XBOX_VSH_LIVE_POSITION, 16, &n));
+    ASSERT_EQ(4, n);
+    // an output nothing writes reads none; more than `most` is -1
+    ASSERT_EQ(0u, live_set(g_split_words, count, WL_XBOX_VSH_LIVE_FOG, 16, &n));
+    ASSERT_EQ(0, n);
+    ASSERT_EQ(0xFu | 1u << 20 | 1u << 21 | 1u << 23, live_set(g_split_words, count, WL_XBOX_VSH_LIVE_ALL, 7, &n));
+    ASSERT_EQ(~0u, live_set(g_split_words, count, WL_XBOX_VSH_LIVE_ALL, 6, &n));
+    ASSERT_EQ(-1, n);
+    PASS();
+}
+
+TEST live_constants_a_unit_at_a_time(void) {
+    const unsigned long count = sizeof g_skinned_words / 16;
+    int n;
+    // the texture coordinates read c[13] and c[14], not the bone the MAC's dp3 beside the ILU's mov reads
+    ASSERT_EQ(1u << 13 | 1u << 14, live_set(g_skinned_words, count, WL_XBOX_VSH_LIVE_T0, 16, &n));
+    ASSERT_EQ(2, n);
+    // the position reads a bone by a0: no list
+    ASSERT_EQ(~0u, live_set(g_skinned_words, count, WL_XBOX_VSH_LIVE_POSITION, 16, &n));
+    ASSERT_EQ(~0u, live_set(g_skinned_words, count, WL_XBOX_VSH_LIVE_POSITION | WL_XBOX_VSH_LIVE_T0, 16, &n));
+    PASS();
+}
+
 SUITE(vsh_suite) {
     RUN_TEST(compile_decodes_up_to_the_end_bit);
     RUN_TEST(the_hash_is_fnv1a_of_the_words);
@@ -553,6 +641,8 @@ SUITE(vsh_suite) {
     RUN_TEST(the_analysis_of_a_transform);
     RUN_TEST(the_analysis_finds_what_is_not_affine);
     RUN_TEST(the_light_shape_of_a_lit_program);
+    RUN_TEST(live_constants_a_component_at_a_time);
+    RUN_TEST(live_constants_a_unit_at_a_time);
 }
 
 GREATEST_MAIN_DEFS();

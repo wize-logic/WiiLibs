@@ -1,0 +1,443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Mon, 19 Oct 2026 00:37:01 -0400
+Subject: [PATCH] recomp: --callee-regs writes back and reloads around a call
+ only the registers the callee touches
+
+With --reg-locals a caller writes back every register it changed before a
+call and loads every one it uses after it, since the callee may read or
+change any of them. touched.py finds, for each generated function, the
+register globals it and everything it calls by name may read or write (a
+function that calls anything else -- an indirect call, a call by address,
+hand-written code, port I/O, a trace hook -- may touch them all). Around a
+plain direct call to a function that leaves the x87 stack alone, x87_locals
+now writes back and reloads only those (esp always); the caller's other
+locals, its x87 stack positions included, stay the truth across the call,
+with no store before it and no load after it.
+
+A safe point inside the callee may run other guest code (an APC); that
+code gives back the registers of the code it interrupted, as it must where
+the registers are in locals already.
+---
+ tools/recomp/__main__.py     |   6 ++
+ tools/recomp/test_touched.py |  96 ++++++++++++++++++++++++++++
+ tools/recomp/touched.py      | 117 +++++++++++++++++++++++++++++++++++
+ tools/recomp/translator.py   |  12 +++-
+ tools/recomp/x87_locals.py   |  48 ++++++++++++--
+ 5 files changed, 271 insertions(+), 8 deletions(-)
+ create mode 100644 tools/recomp/test_touched.py
+ create mode 100644 tools/recomp/touched.py
+
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 313f997..806120d 100644
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -307,6 +307,11 @@ def main():
+                         help="Write a float or double read from a fixed address in the XBE's "
+                              "read-only data (not writable, loaded at boot) as a literal "
+                              "(const_load.py)")
++    parser.add_argument("--callee-regs", action="store_true",
++                        help="With --reg-locals and --keep-preserved: around a direct call to a "
++                             "function that touches only some registers (with all it calls) "
++                             "and not the x87 stack, write back and load again only those; "
++                             "the caller's other locals stay (touched.py)")
+     parser.add_argument("--seh-prolog", metavar="ADDR",
+                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
+     parser.add_argument("--seh-epilog", metavar="ADDR",
+@@ -390,6 +395,7 @@ def main():
+     translator.translator.keep_preserved = args.keep_preserved
+     translator.translator.bounded_loops = args.bounded_loops
+     translator.translator.rodata_consts = args.rodata_consts
++    translator.translator.callee_regs = args.callee_regs
+     translator.translator.mem_disp = args.mem_disp
+     translator.translator.stack_disp = args.stack_disp
+ 
+diff --git a/tools/recomp/test_touched.py b/tools/recomp/test_touched.py
+new file mode 100644
+index 0000000..f5cf7d4
+--- /dev/null
++++ b/tools/recomp/test_touched.py
+@@ -0,0 +1,96 @@
++"""
++--callee-regs: around a direct call, only the registers the callee may touch
++go to memory and back (touched.py, x87_locals.py).
++"""
++
++import os
++import re
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
++
++from tools.recomp import touched  # noqa: E402
++from tools.recomp.translator import FP_STACK_MACROS, FP_STACK_UNDEFS  # noqa: E402
++from tools.recomp.x87_locals import localise_x87  # noqa: E402
++
++
++def _fn(name, body):
++    return ["void %s(void)" % name, "{"] + body + ["}", ""]
++
++
++def test_a_function_touches_what_it_and_its_callees_name():
++    funcs = {
++        "sub_00001000": _fn("sub_00001000", ["    eax = MEM32(ecx + 4); /* mov eax, [ebx] */",
++                                             "    PUSH32(esp, 0x00001008u); RECOMP_ABI_CALL(0x00002000u, sub_00002000);",
++                                             "    return;"]),
++        "sub_00002000": _fn("sub_00002000", ["    edx = memcpy(0, 0, 0) ? 1 : 0;", "    return;"]),
++        "sub_00003000": _fn("sub_00003000", ["    RECOMP_ICALL_SAFE_AT(0x3004u, eax);", "    return;"]),
++        "sub_00004000": _fn("sub_00004000", ["    PUSH32(esp, 0x00004008u); RECOMP_ABI_CALL(0x00003000u, sub_00003000);",
++                                             "    return;"]),
++        "sub_00005000": _fn("sub_00005000", ["    sub_00009000();", "    return;"]),  # not generated
++        "sub_00006000": _fn("sub_00006000", FP_STACK_MACROS + ["    fp_push(1.0);", "    fp_pop();", "    return;"]
++                            + FP_STACK_UNDEFS),
++        "sub_00007000": _fn("sub_00007000", ["    eax = RECOMP_FP_PC(eax);", "    return;"]),
++    }
++    t = touched.analyse(funcs)
++    # the comment's ebx is not a use; the callee's edx is
++    assert t["sub_00001000"] == {"g_eax", "g_ecx", "g_esp", "g_edx"}, t
++    assert t["sub_00002000"] == {"g_edx"}, t
++    # an indirect call, a caller of one, a call to code that is not generated: anything
++    assert "sub_00003000" not in t and "sub_00004000" not in t and "sub_00005000" not in t, t
++    assert touched.X87 in t["sub_00006000"], t
++    assert t["sub_00007000"] == {"g_eax", "g_fp_control_word"}, t
++
++
++def test_recursion_settles():
++    funcs = {
++        "sub_00001000": _fn("sub_00001000", ["    eax = 1;",
++                                             "    PUSH32(esp, 0x00001008u); RECOMP_ABI_CALL(0x00002000u, sub_00002000);",
++                                             "    return;"]),
++        "sub_00002000": _fn("sub_00002000", ["    ecx = 2;",
++                                             "    PUSH32(esp, 0x00002008u); RECOMP_ABI_CALL(0x00001000u, sub_00001000);",
++                                             "    return;"]),
++    }
++    t = touched.analyse(funcs)
++    assert t["sub_00001000"] == t["sub_00002000"] == {"g_eax", "g_ecx", "g_esp"}, t
++
++
++_CALLER = ["    eax = MEM32(0x2000);", "    ebx = MEM32(0x2004);", "    ecx = eax + ebx;",
++           "    PUSH32(esp, 0x00001010u); RECOMP_ABI_CALL(0x00002000u, sub_00002000); /* call 0x00002000 */",
++           "    MEM32(0x2008) = ebx + ecx + eax;", "    return;"]
++
++
++def _around(out):
++    i = [k for k, line in enumerate(out) if "RECOMP_ABI_CALL" in line][0]
++    return out[i - 1], out[i + 1]
++
++
++def test_only_what_the_callee_touches_goes_to_memory_and_back():
++    out, why = localise_x87(_fn("f", _CALLER), FP_STACK_MACROS, FP_STACK_UNDEFS, x87=True, regs=True,
++                            touched={"sub_00002000": frozenset({"g_eax"})})
++    assert why is None, why
++    text = "\n".join(out)
++    line_before, line_after = _around(out)
++    assert "g_eax = _r_eax;" in line_before and "g_ebx" not in line_before and "g_ecx" not in line_before, text
++    assert "_r_eax = g_eax;" in line_after and "g_ebx" not in line_after and "g_ecx" not in line_after, text
++    assert "MEM32(0x2008) = _r_ebx + _r_ecx + _r_eax;" in text, text
++    # the rest is written back where the function returns
++    assert re.search(r"g_ebx = _r_ebx;[^\n]*\n\s*return;", text), text
++
++
++def test_a_callee_that_may_touch_anything_or_the_x87_stack_syncs_everything():
++    for t in ({}, {"sub_00002000": frozenset({"g_eax", touched.X87})}):
++        out, why = localise_x87(_fn("f", _CALLER), FP_STACK_MACROS, FP_STACK_UNDEFS, x87=True, regs=True,
++                                touched=t)
++        assert why is None, why
++        text = "\n".join(out)
++        line_before, line_after = _around(out)
++        assert all("g_%s = _r_%s;" % (r, r) in line_before for r in ("eax", "ebx", "ecx")), text
++        assert "state to memory" in line_before and line_after.strip() == "_LOCALS_LOAD();", text
++
++
++if __name__ == "__main__":
++    for name, fn in sorted(globals().items()):
++        if name.startswith("test_"):
++            fn()
++    print("ok")
+diff --git a/tools/recomp/touched.py b/tools/recomp/touched.py
+new file mode 100644
+index 0000000..13860bc
+--- /dev/null
++++ b/tools/recomp/touched.py
+@@ -0,0 +1,117 @@
++"""
++Which guest registers a generated function may read or write, with all it calls.
++
++With --reg-locals a function keeps the guest registers in C locals and, before
++a call, writes back every one it changed; after the call it loads again every
++one it uses, since the callee may read or change any of them. A callee that
++never names a register, and calls nothing that does, neither reads nor writes
++its global: the caller's local stays the truth across the call, with no store
++before it and no load after.
++
++This pass finds, for each generated function, the register globals (g_eax ..
++g_edi, g_esp, g_xmm0.., g_mm0.., the x87 control word, compare result and
++condition codes) its body names, and whether it names the x87 stack, joined
++over every function it calls by name. It reads the C text translate_function
++produces. A function is unknown (it may touch everything) when it calls
++anything that is not a generated function by name: an indirect call, a call
++by address (RECOMP_ITAIL), a hand-written function, port I/O, a trace hook, a
++runtime service that may run guest code, an unimplemented instruction. The
++header's helpers that take their operands by value (the SIMD helpers, the
++memory accessors, fist, the libm functions) touch no register. A safe point
++(RECOMP_BACKEDGE) may run other guest code, which leaves the registers of the
++code it interrupts as they were (wl_xb_call_guest_preserving).
++"""
++
++import re
++
++X87 = "x87"  # the x87 stack (g_fp_top, g_fp_stack): a caller's x87 locals do not survive it
++
++_REG = re.compile(r"\b(?:g_)?(eax|ecx|edx|ebx|esp|esi|edi|xmm[0-7]|mm[0-7])\b")
++_X87_SCALAR = re.compile(r"\b(g_fp_control_word|g_fp_cmp|g_fp_cc)\b")
++_X87_STACK = re.compile(r"\b(g_fp_top|g_fp_stack|fp_push|fp_pop|fp_top|fp_st|fp_st1)\b")
++_FP_PC = re.compile(r"\bRECOMP_FP_PC\s*\(")  # reads g_fp_control_word
++_FUNC = re.compile(r"\b(sub_[0-9A-Fa-f]{8}\w*)\b")
++_CALLISH = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*\(")
++_COMMENT = re.compile(r"/\*.*?\*/", re.S)
++_STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"')
++
++# Names in generated code that only compute from their operands and guest memory.
++_PURE = frozenset("""
++    if for while switch return sizeof fp_push fp_pop fp_top fp_st fp_st1
++    MEM8 MEM16 MEM32 MEM64 SMEM8 SMEM16 SMEM32 SMEM64 MEMF MEMD MEMF_SET MEMD_SET XBOX_PTR
++    LO8 HI8 LO16 SET_LO8 SET_HI8 SET_LO16 SX8 SX16 ZX8 ZX16 PUSH32 POP32
++    CMP_EQ CMP_NE CMP_L CMP_LE CMP_G CMP_GE CMP_B CMP_BE CMP_A CMP_AE TEST_Z TEST_NZ TEST_S
++    RECOMP_PARITY8 RECOMP_DF_STEP RECOMP_FCMP RECOMP_FCMP_CC RECOMP_FP_PC RECOMP_FP_PC_CW RECOMP_BACKEDGE
++    RECOMP_ATOMIC_CAS32 RECOMP_ATOMIC_ADD32 ROL8 ROL16 ROL32 ROR8 ROR16 ROR32 RC_ROT
++    RECOMP_ABI_CALL
++    memcpy memset memmove fabs fabsf sqrt sqrtf sin cos tan atan atan2 log log2 log10 exp exp2
++    floor ceil fmod ldexp frexp trunc round rint nearbyint
++    recomp_fist recomp_frndint recomp_ld80 recomp_st80 recomp_fxam recomp_fprem_cc recomp_cvt_si32
++""".split())
++_PURE_PREFIX = ("XMM_", "MMX_")
++
++
++def _strip(text):
++    return _STRING.sub('""', _COMMENT.sub(" ", text))
++
++
++def _of(text, names):
++    """(the registers the text names, the generated functions it calls, unknown)"""
++    regs = set(m.group(1) and "g_" + m.group(1) for m in _REG.finditer(text))
++    regs |= set(_X87_SCALAR.findall(text))
++    if _FP_PC.search(text):
++        regs.add("g_fp_control_word")
++    if _X87_STACK.search(text):
++        regs.add(X87)
++    calls, unknown = set(), False
++    for m in _FUNC.finditer(text):  # a call, or its address passed on
++        if m.group(1) in names:
++            calls.add(m.group(1))
++        else:
++            unknown = True
++    for m in _CALLISH.finditer(text):
++        name = m.group(1)
++        if name in names:
++            calls.add(name)
++        elif not (name in _PURE or name.startswith(_PURE_PREFIX)
++                  or re.fullmatch(r"(S?MEM(8|16|32|64|F|D)|MEM[FD]_SET)_(D|SP)", name)):
++            unknown = True
++    return regs, calls, unknown
++
++
++def analyse(functions):
++    """functions: {C name: lines of the function as translate_function makes
++    them}. Returns {C name: frozenset of the register globals (and X87) it and
++    its callees may touch} for the functions whose callees are all known; the
++    others are left out (they may touch everything)."""
++    names = set(functions)
++    own, calls, unknown = {}, {}, set()
++    for name, lines in functions.items():
++        text = _strip("\n".join(lines))
++        r, c, u = _of(text, names)
++        own[name], calls[name] = r, c - {name}
++        if u:
++            unknown.add(name)
++    # unknown spreads to callers; the rest is a union over callees to a fixpoint
++    callers = {}
++    for n, cs in calls.items():
++        for c in cs:
++            callers.setdefault(c, set()).add(n)
++    work = list(unknown)
++    while work:
++        n = work.pop()
++        for c in callers.get(n, ()):
++            if c not in unknown:
++                unknown.add(c)
++                work.append(c)
++    touch = {n: set(own[n]) for n in names if n not in unknown}
++    changed = True
++    while changed:
++        changed = False
++        for n, t in touch.items():
++            before = len(t)
++            for c in calls[n]:
++                t |= touch[c]
++            if len(t) != before:
++                changed = True
++    return {n: frozenset(t) for n, t in touch.items()}
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 28e8f8e..6039d00 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -31,6 +31,7 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+                      detect_setjmp_helpers, _func_ident, _operand_width)
+ from .x87_locals import localise_x87
+ from . import preserve
++from . import touched
+ 
+ 
+ # Float compares snapshot at the compare as well, and their conditions read
+@@ -530,6 +531,10 @@ class FunctionTranslator:
+         # const_load.py: a float or double read from a fixed address in
+         # read-only data as a literal (--rodata-consts)
+         self.rodata_consts = False
++        # a plain call to a function that touches only some registers writes
++        # back and reloads only those (--callee-regs, touched.py)
++        self.callee_regs = False
++        self.touched = {}
+         self.rodata_const_count = 0
+         self.kept = {}
+         self.preserve_stats = {}
+@@ -3125,7 +3130,7 @@ class FunctionTranslator:
+         if self.reg_locals or (has_fpu and self.x87_locals):
+             out, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS,
+                                     x87=self.x87_locals, regs=self.reg_locals,
+-                                    kept=self.kept)
++                                    kept=self.kept, touched=self.touched)
+             key = why or "in locals"
+             if why is not None and self.x87_locals and self.reg_locals:
+                 # The x87 stack is what does not fit (more than eight positions
+@@ -3134,7 +3139,8 @@ class FunctionTranslator:
+                 # in memory, rather than the whole body keeping every register
+                 # in its global (a load and a store around each use).
+                 regs_only, why_regs = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS,
+-                                                   x87=False, regs=True, kept=self.kept)
++                                                   x87=False, regs=True, kept=self.kept,
++                                                   touched=self.touched)
+                 if why_regs is None:
+                     out, key = regs_only, "registers in locals, x87 not: " + why
+             lines = out
+@@ -3467,6 +3473,8 @@ class BatchTranslator:
+             return translations
+         summaries = preserve.analyse(pending)
+         t.kept = preserve.preserved_by_name(summaries)
++        if t.callee_regs:
++            t.touched = touched.analyse(pending)
+         counts = {}
+         for s in summaries.values():
+             key = "+".join(sorted(s.preserved)) or ("none: " + s.why if s.why else "none")
+diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
+index 39a1e7c..61d4ef1 100644
+--- a/tools/recomp/x87_locals.py
++++ b/tools/recomp/x87_locals.py
+@@ -452,13 +452,14 @@ def _rewrite(code, k, x87=True, regs=False, skip=frozenset()):
+ # ------------------------------------------------------------- the pass
+ 
+ class _Node:
+-    __slots__ = ("first", "last", "code", "kind", "gotos", "terminal", "label", "x87", "keeps")
++    __slots__ = ("first", "last", "code", "kind", "gotos", "terminal", "label", "x87", "keeps", "touch")
+ 
+     def __init__(self, first, last):
+         self.first, self.last = first, last
+         self.code, self.kind, self.gotos, self.terminal, self.label = "", None, [], False, None
+         self.x87 = False  # it names the x87 state (and the pass keeps that in locals)
+         self.keeps = frozenset()  # a call: the register globals it gives back (preserve.py)
++        self.touch = frozenset()  # a "call": the register globals the callee may touch (touched.py)
+ 
+ 
+ def _body_bounds(lines, macros, undefs):
+@@ -548,14 +549,18 @@ def _nodes(lines, lo, hi):
+     return nodes
+ 
+ 
+-def localise_x87(lines, macros, undefs, x87=True, regs=False, kept=None):
++def localise_x87(lines, macros, undefs, x87=True, regs=False, kept=None, touched=None):
+     """lines: one function as translate_function emits it. Returns (lines,
+     None) with the x87 state (x87) and the registers (regs) in locals,
+     or (lines unchanged, reason). kept (with regs): {callee name: the globals
+     (g_ebx, g_esi, g_edi) a call to it gives back}, from preserve.py; after a
+-    plain call to one of them those locals are not loaded again."""
++    plain call to one of them those locals are not loaded again. touched
++    (with regs): {callee name: the register globals it may read or write, and
++    "x87" if it may touch the x87 stack}, from touched.py; around a plain call
++    to a callee that leaves the x87 stack alone only those go to memory and
++    back, and the other locals stay as they are."""
+     try:
+-        return _localise(lines, macros, undefs, x87, regs, kept or {}), None
++        return _localise(lines, macros, undefs, x87, regs, kept or {}, touched or {}), None
+     except _NotLocal as e:
+         return lines, str(e)
+ 
+@@ -598,6 +603,17 @@ _DIRECT_CALL = re.compile(r"\s*PUSH32\(esp, 0x[0-9A-Fa-f]+u\); RECOMP_ABI_CALL\(
+                           r"\s*(?:\x01\d+\x02)?\s*")
+ 
+ 
++def _touched_by(code, touched):
++    """The register globals a plain direct call may read or write (touched.py),
++    esp included (the call pushes on it), or None: not a plain direct call, a
++    callee that may touch any register, or one that touches the x87 stack."""
++    m = _DIRECT_CALL.fullmatch(code)
++    t = touched.get(m.group(1)) if m else None
++    if t is None or "x87" in t:
++        return None
++    return frozenset(t) | frozenset(("g_esp",))
++
++
+ def _kept_by(code, kept):
+     """The register globals a sync statement leaves in memory as they were
+     (so in the locals too): a plain direct call to a function that preserves
+@@ -606,8 +622,9 @@ def _kept_by(code, kept):
+     return kept.get(m.group(1), frozenset()) if m else frozenset()
+ 
+ 
+-def _localise(lines, macros, undefs, x87=True, regs=False, kept=None):
++def _localise(lines, macros, undefs, x87=True, regs=False, kept=None, touched=None):
+     kept = kept or {}
++    touched = touched or {}
+     bounds = _function_bounds(lines) if regs else _body_bounds(lines, macros, undefs)
+     if bounds is None:
+         raise _NotLocal("no body" if regs else "no x87 macros")
+@@ -641,6 +658,9 @@ def _localise(lines, macros, undefs, x87=True, regs=False, kept=None):
+                 raise _NotLocal("a goto in a statement that calls out or returns")
+             n.kind = "sync"
+             n.keeps = _kept_by(n.code, kept) if regs else frozenset()
++            t = _touched_by(n.code, touched) if regs and not leaves else None
++            if t is not None:
++                n.kind, n.touch = "call", t
+         elif fp or rg:
+             n.kind = "fp"
+         else:
+@@ -813,6 +833,13 @@ def _flow(nodes, labels, plan, x87=True, regs=False, skip=frozenset()):
+             positions |= wr | rd
+             scalars |= sused
+             out = (k2, s[1] | frozenset(wr), s[2], s[3] | frozenset(swr))
++        elif n.kind == "call":
++            # a callee that touches only n.touch: those are written back before it
++            # and loaded after it (see _emit), the other locals stay as they were
++            if _is_mem(s):
++                out = _mem(_valid(s) - (n.touch - n.keeps))
++            else:
++                out = (s[0], s[1], s[2], s[3] - n.touch)
+         else:  # sync: written back before it (see _emit); memory is the truth after
+             # the locals of the registers a call gives back still hold them
+             out = _mem(n.keeps & (_valid(s) if _is_mem(s) else _REG_KEPT))
+@@ -925,7 +952,16 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow, regs=False):
+                 f = flush(s)
+                 if f:
+                     out.append(indent + f + note)
+-            if n.kind in ("fp", "plain"):
++            if n.kind == "call" and not _is_mem(s):
++                f = " ".join("%s = %s;" % (g, _scalar(g)) for g in _SCALARS if g in s[3] and g in n.touch)
++                if f:
++                    out.append(indent + f + " /* what the callee may touch, to memory */")
++                out.extend(lines[n.first:n.last + 1])
++                back = " ".join("%s = %s;" % (_scalar(g), g) for g in _SCALARS
++                                if g in used and g in n.touch and g not in n.keeps)
++                if back:
++                    out.append(indent + back + " /* and back; the other locals are as they were */")
++            elif n.kind in ("fp", "plain"):
+                 # a goto whose edge needs code gets it in a block of its own
+                 code, restore = _protect(lines[n.first])
+                 if n.kind == "fp":

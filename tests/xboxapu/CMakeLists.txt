@@ -17,3 +17,8 @@ add_test(NAME bench_xboxapu_blink COMMAND bench_xboxapu 3000 b5b89d04)
 set_tests_properties(bench_xboxapu_blink PROPERTIES LABELS "unit;be" ENVIRONMENT "BENCH_VOICES=blink")
 add_test(NAME bench_xboxapu_plain COMMAND bench_xboxapu 3000 0cdf232f)
 set_tests_properties(bench_xboxapu_plain PROPERTIES LABELS "unit;be" ENVIRONMENT "BENCH_PLAIN=1")
+# Halo's a10 shape (bench_xboxapu.c, halo_voices): paused voices in the lists, 3D streams.
+add_test(NAME bench_xboxapu_a10 COMMAND bench_xboxapu 3000 a3a5ef29)
+set_tests_properties(bench_xboxapu_a10 PROPERTIES LABELS "unit;be" ENVIRONMENT "BENCH_VOICES=a10")
+add_test(NAME bench_xboxapu_a10_plain COMMAND bench_xboxapu 3000 a3a5ef29)
+set_tests_properties(bench_xboxapu_a10_plain PROPERTIES LABELS "unit;be" ENVIRONMENT "BENCH_VOICES=a10;BENCH_PLAIN=1")

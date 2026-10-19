@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Mon, 19 Oct 2026 00:36:44 -0400
+Subject: [PATCH] recomp: the registers go into locals where the x87 stack does
+ not fit
+
+x87_locals keeps a function's x87 stack and its integer and SIMD registers
+in C locals together. When the x87 part cannot be kept (more than eight
+stack positions, say: paths that join at different depths), the whole body
+fell back to the memory model, every register read from and written to its
+global around each use. The registers alone are now tried again (x87_locals
+with x87=False, as --reg-locals does without --x87-locals): the x87 state
+stays in memory and the rest goes into locals.
+
+In Halo, 9 functions (one of them hot, 2282 instructions on the Wii's
+PowerPC) kept the memory model for this reason.
+---
+ tools/recomp/test_reg_locals.py | 18 ++++++++++++++++++
+ tools/recomp/translator.py      | 17 ++++++++++++++---
+ 2 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/tools/recomp/test_reg_locals.py b/tools/recomp/test_reg_locals.py
+index 634ff27..d4a31f4 100644
+--- a/tools/recomp/test_reg_locals.py
++++ b/tools/recomp/test_reg_locals.py
+@@ -233,6 +233,24 @@ def test_simd_registers_go_round_a_loop_in_their_locals():
+     assert text.index("g_mm0 = _r_mm0; /* SIMD registers to memory */") < text.index("goto loc_00001010;"), text
+ 
+ 
++def test_an_x87_stack_that_does_not_fit_leaves_the_registers_in_locals():
++    # nine positions of the x87 stack in one body: the x87 state stays in memory, the registers
++    # still go into locals (before, the whole body kept every register in its global)
++    body = (FP_STACK_MACROS + ["    eax = MEM32(0x2000);"]
++            + ["    fp_push(MEMF(0x%X));" % (0x3000 + 4 * i) for i in range(9)]
++            + ["    MEMF_SET(0x2008, (float)fp_top()); fp_pop();",
++               "    eax = eax + 1;", "    MEM32(0x2004) = eax;", "    return;"] + FP_STACK_UNDEFS)
++    _, why = _localise(body)
++    assert why == "more than eight stack positions", why
++    _, t = _translate(b"\xC3")
++    t.kept = {}
++    text = t.finish_function(["void f(void)", "{"] + body + ["}", ""], True)
++    assert "_r_eax = _r_eax + 1;" in text and "MEM32(0x2004) = _r_eax;" in text, text
++    assert "    fp_push(MEMF(0x3000));" in text and "_x87t" not in text, text
++    assert re.search(r"g_eax = _r_eax;[^\n]*\n\s*return;", text), text
++    assert t.x87_stats["registers in locals, x87 not: more than eight stack positions"] == 1, t.x87_stats
++
++
+ if __name__ == "__main__":
+     for name, fn in sorted(globals().items()):
+         if name.startswith("test_"):
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 2a36963..28e8f8e 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -3123,10 +3123,21 @@ class FunctionTranslator:
+         """The passes over a translated body's C text: x87_locals (with the
+         callees preserve.py proved, self.kept), then mem_disp."""
+         if self.reg_locals or (has_fpu and self.x87_locals):
+-            lines, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS,
+-                                      x87=self.x87_locals, regs=self.reg_locals,
+-                                      kept=self.kept)
++            out, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS,
++                                    x87=self.x87_locals, regs=self.reg_locals,
++                                    kept=self.kept)
+             key = why or "in locals"
++            if why is not None and self.x87_locals and self.reg_locals:
++                # The x87 stack is what does not fit (more than eight positions
++                # where paths join at different depths, say): the integer and
++                # SIMD registers still go into locals and the x87 state stays
++                # in memory, rather than the whole body keeping every register
++                # in its global (a load and a store around each use).
++                regs_only, why_regs = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS,
++                                                   x87=False, regs=True, kept=self.kept)
++                if why_regs is None:
++                    out, key = regs_only, "registers in locals, x87 not: " + why
++            lines = out
+             self.x87_stats[key] = self.x87_stats.get(key, 0) + 1
+             if self.kept:
+                 self.kept_sites += sum(line.count("kept across the call") for line in lines)

@@ -89,6 +89,20 @@ A title's own knowledge is data, passed with --config (JSON; relative paths are 
       "rodata_consts": false,                read every float and double constant from guest memory
                                              (the default true writes one read from a fixed address
                                              in read-only data as a literal: const_load.py, patch 0034)
+      "callee_regs": false,                  write back and load again every register around a call
+                                             (the default true, with keep_preserved, does it only for
+                                             the registers the callee and all it calls may touch when
+                                             they leave the x87 stack alone: touched.py, patch 0036)
+      "x87_balanced": false,                 write back and load again the caller's x87 stack around
+                                             every call to a function that uses it (the default true,
+                                             with callee_regs, keeps it in the caller's locals across
+                                             a callee that pops what it pushes and names no slot it did
+                                             not push: touched.balanced, patch 0037)
+      "stack_locals": false,                 every access to a function's own stack slots in guest
+                                             memory (the default true keeps a slot that nothing else
+                                             can reach in a C local, written to memory before a call
+                                             and, for the caller's slots, at a return: stack_locals.py,
+                                             patch 0038)
       "hot_functions": "hot.txt" or ["sub_00052520", "0x00088B80"],   the functions compiled at
                                              -O2 (tu/recomp_tu_hot.c); a file is read for its
                                              sub_XXXXXXXX names and 0x addresses (a profile report
@@ -364,6 +378,12 @@ class Run:
             rcmd.append("--bounded-loops")
         if c.get("rodata_consts", True):
             rcmd.append("--rodata-consts")
+        if c.get("callee_regs", True) and c.get("keep_preserved", True) and c.get("reg_locals", True):
+            rcmd.append("--callee-regs")
+            if c.get("x87_balanced", True):
+                rcmd.append("--x87-balanced")
+        if c.get("stack_locals", True):
+            rcmd.append("--stack-locals")
         rin = [self.xbe, functions, disasm / "labels.json", func_id / "identified_functions.json", abi]
         if c.get("icall_sites"):
             rcmd += ["--icall-sites", str(self.cfg_path(c["icall_sites"]))]
@@ -593,7 +613,7 @@ def load_config(path):
              "coalesce_functions", "trace_functions", "split", "disasm_args", "func_id_args",
              "abi_args", "recomp_args", "icall_sites", "patches", "comment", "vertex_programs", "x87_locals",
              "reg_locals", "mem_disp", "stack_disp", "keep_preserved", "bounded_loops", "rodata_consts",
-             "hot_functions"}
+             "callee_regs", "x87_balanced", "stack_locals", "hot_functions"}
     unknown = sorted(set(cfg) - known)
     if unknown:
         raise Failure(f"{path}: unknown keys {unknown} (known: {sorted(known)})")

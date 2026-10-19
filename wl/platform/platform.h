@@ -497,7 +497,11 @@ bool wl_gx_sync(void);
 // ready), for memory the GPU reads by address that the CPU means to write again before the frame
 // ends (a ring of vertices). wl_gx_fence_passed says whether the GPU is past it (true for 0 and on
 // the host, whose GPU draws as it is told), wl_gx_fence_wait waits for it (false on timeout). A token
-// is a raster state change: a direct draw after it wants wl_gx_direct_flush_after first.
+// is a raster state change: the next direct draw after it is flushed first (the backend asks for it as it
+// sends the token, gx_direct.h), whenever the token goes. The token is put off to the next direct
+// primitive that follows a change of state (where Dolphin cuts its batch anyway), or until the fence is
+// asked about (gx_shadow.h; the title switch gxfenceeager sends it at once): the GPU past it is past
+// everything submitted before the call all the same.
 uint32_t wl_gx_fence(void);
 bool wl_gx_fence_passed(uint32_t fence);
 bool wl_gx_fence_wait(uint32_t fence);
@@ -669,6 +673,8 @@ typedef struct {
     uint32_t efb_copies;      // texture copies out of the EFB (render targets, parks, the squeeze); the GPU's
                               // pixel pipe syncs after each, the processor does not wait
     uint64_t efb_copy_bytes;  // the bytes of wl_gx_copy_efb_texture's copies (the targets' are WlGxTargetStats')
+    uint32_t efb_peeks;       // EFB pixels the processor read (wl_gx_peek_rgba, wl_gx_peek_z): on Dolphin's dual core
+                              // each waits for its GPU thread to draw everything before it
 } WlGxStats;
 void wl_gx_stats(WlGxStats *out);
 

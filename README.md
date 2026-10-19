@@ -28,7 +28,7 @@ Each module is `wl/<name>/` with its own README, a CMake target `wl_<name>` (ali
 | `gs` | Genius Sonority FSYS archives, TOC, LZSS | all |
 | `brstm` | NW4R audio: BRSTM, BRSAR, RWSD, DSP-ADPCM (via `codec`) | all (path open: host) |
 | `sdat` | NDS SDAT sound archives (SSEQ/SBNK/SWAR/STRM) | all (index: host) |
-| `xbox` | The Xbox's NV2A on GX: pixel shaders' register combiners translated to TEV programs (with a cache that rewrites constants in place, and a hook for a game's hand-made programs), vertex programs decoded, analysed (inputs, affinity, constants read) and run on the processor, and compiled ahead of time to C by `tools/xbox_vsh_codegen.c`; the NV2A as a device for a title whose own Direct3D runs unchanged (MMIO registers, push buffers executed, semaphores, interrupts, the 3D state, vertex fetch of every format, textures converted and kept in an arena and checked through a write watch, captures and their replay), with a backend on GX (`wl_xbox_gx`: draws whose outputs are affine go to GX's transform unit, static vertex arrays are kept for GX to read by index) and a recorder | all (the tools: host) |
+| `xbox` | The Xbox's NV2A on GX: pixel shaders' register combiners translated to TEV programs (with a cache that rewrites constants in place, and a hook for a game's hand-made programs), vertex programs decoded, analysed (inputs, affinity, constants read) and run on the processor, and compiled ahead of time to C by `tools/xbox_vsh_codegen.c`; the NV2A as a device for a title whose own Direct3D runs unchanged (MMIO registers, push buffers executed, semaphores, interrupts, the 3D state, vertex fetch of every format, textures converted and kept in an arena and checked through a write watch, captures and their replay), with a backend on GX (`wl_xbox_gx`: draws whose outputs are affine go to GX's transform unit, static vertex arrays are kept for GX to read by index, the vertices the processor makes go once into a ring GX reads by index, skinned models' positions and texture coordinates are finished by GX's transform unit and texture-coordinate generation, GX's eight texture maps keep their textures, the 16:9 picture is drawn narrow in the EFB) and a recorder | all (the tools: host) |
 | `xboxapu` | The Xbox's audio hardware as device models a recompiled title's own DirectSound drives: the MCPX APU (registers, front end methods, the voice processor playing PCM and Xbox ADPCM buffer and stream voices with pitch, envelopes and 32 mixbins at 48 kHz, notifiers, interrupts, a stereo mix in place of the GP/EP DSP programs) and the AC'97 controller | all |
 | `xboxrt` | The runtime a recompiled Xbox title runs on: guest memory at the Xbox's addresses (the Wii's MMU with a hashed page table filled on first touch, demand paging to a swap file when the frames run out; a reservation elsewhere, paged the same way under a frame limit), devices behind faults with PowerPC and x86-64 instruction decoders, the generated code's register file, guest threads under one guest lock, interrupts and the vertical blank, the kernel thunk dispatcher, the XBE loader, crash reports, the audio devices (`xboxapu`'s models, the platform's output at 48 kHz, a WAV on the host), the USB host controllers with the Xbox's gamepads (the Wii's controllers mapped onto them), a play harness that drives them from a script, a deterministic mode (a virtual clock), a capture bench, diagnostics (a stall report, a freeze watch, a heap census) and the boot code (`wl_xboxrt_boot`, `wl_xboxrt_main`) | all (the MMU backend: Wii; faults: host, ppc-be) |
 | `xboxkrnl` | The Xbox kernel's exports for recompiled titles over `xboxrt` and `platform`: dispatcher objects and waits, critical sections, threads, IRQL/DPCs/timers/interrupts, memory, files through a mount table (the title's folder, the hard disk's partitions, sparse cache drives), settings, AV and HAL queries, Rtl, SHA-1/HMAC/RC4; every import of Halo's XBE covered | all |
@@ -123,19 +123,28 @@ What makes it trustworthy: `ctest -R xbox_recomp_conformance` lifts every one of
 conformance cases (x86 snippets with inputs; 243 cases, 6,815 vectors, the x87 ones also through `--x87-locals`) and runs them big-endian
 under qemu-ppc against a recording of this machine's x86 CPU; `xbox_recomp_e2e` does the same with
 whole programs; `xboxrecomp_pytest` runs upstream's own test suite on the patched pipeline.
-WiiLibs' fixes to upstream (shift counts, float-to-int conversions, float stores, reserved names,
-80-bit x87 operands, parity conditions, a runtime-header option, a safe point at backward jumps, port
-I/O, jumps and calls into code no function starts at, and the x87 state kept in locals) are patch files (0001-0013) in
-`third_party/xboxrecomp/patches/`, written to be sent upstream. Upstream updates are taken with
-`tools/xboxrecomp_sync.py` ([docs/xboxrecomp-sync.md](docs/xboxrecomp-sync.md)). Retail Halo
-(7,493 functions) lifts and compiles for the Wii to about 11.8 MiB of code at `-Os` with patches
-0001-0013 (12,367,796 bytes of `.text` summed over the objects; the Wii executable is about 14 MB:
-[docs/xboxrecomp-sync.md](docs/xboxrecomp-sync.md)'s reference numbers, which need the game's XBE
-and were not re-measured for this document).
+WiiLibs' fixes and additions to upstream are numbered patch files in `third_party/xboxrecomp/patches/`,
+written to be sent upstream: correctness (shift counts, float-to-int conversions, float stores, reserved
+names, 80-bit x87 operands, parity conditions, port I/O, jumps and calls into code no function starts at,
+`rep` string instructions that could reach MMIO or wrap), the runtime's needs (a runtime-header option, a
+safe point at backward jumps, none in a loop that ends by itself) and the generated code's speed (the x87
+state and the registers kept in locals, stack accesses not volatile, SSE addresses mapped once, fused
+compare-and-branch, the register writes around a call limited to what the callee touches, the caller's x87
+values kept across a balanced callee, float constants in read-only sections folded to literals). The
+title config turns each speed patch off (`"x87_locals"`, `"bounded_loops"`, `"rodata_consts"`,
+`"callee_regs"`, `"x87_balanced"`: `tools/xbox_recomp.py`'s documentation). Upstream updates are taken with
+`tools/xboxrecomp_sync.py` ([docs/xboxrecomp-sync.md](docs/xboxrecomp-sync.md)); the vendored version is in
+[third_party/README.md](third_party/README.md). Retail Halo (7,493 functions) lifts and compiles for the
+Wii to a 9 MB executable at `-Os`, the hot functions (a list the title project keeps) in one `-O2` unit.
 
-Running the result, on the host or on the Wii: the title's folder, the files in it that switch
-things (`play.cfg`, `profile.txt`, `hwcount.txt`, `noxf`, `vcache`, `novcache`, `noaudio`) and the
-environment variables (`WL_XB_*`) are listed in [wl/xboxrt/README.md](wl/xboxrt/README.md), "Running a title".
+Running the result, on the host or on the Wii: the title's folder, the files in it that switch things
+(`play.cfg`, `profile.txt`, `hwcount.txt`, and one empty file per change that alters timing, memory or
+what is drawn, so a change can be turned off without a rebuild) and the environment variables (`WL_XB_*`)
+are listed in [wl/xboxrt/README.md](wl/xboxrt/README.md), "Running a title" and its "Off switches" table.
+A title's vertex programs are compiled to C and, for the Wii, fused with the vertex fetch into PowerPC
+forms listed in the title's `vsh_forms.txt` ([wl/xbox/README.md](wl/xbox/README.md)). What is measured
+and how (the capture bench, the sampling profiler and hardware counters, instruction counts under
+qemu-ppc, byte-identical replays, deterministic runs) is in the module READMEs.
 
 ## Conventions
 
@@ -149,20 +158,21 @@ environment variables (`WL_XB_*`) are listed in [wl/xboxrt/README.md](wl/xboxrt/
 - `wl_tex_bytes` (`wl/gfx/tex_codec.c`) keeps its own tile table beside `wl_gxc_tex_bytes`.
   It is not delegated yet because `wl_gxc_tex_bytes` returns 0 above `WL_GXC_MAX_DIM` and
   `wl_tex_bytes` does not.
-- The Wii backends of `wl/platform` and `wl/audio` pass the console tests in Dolphin: GX
-  read-back, video pacing, LWP threads with real priorities, libfat SD on IOS 58, and AESND
-  output. Input is only initialised, not driven. Nothing has run on hardware yet.
+- The Wii backends of `wl/platform` and `wl/audio` pass the console tests in Dolphin (GX
+  read-back, video pacing, LWP threads with real priorities, libfat SD on IOS 58, AESND output) and
+  run on a real Wii from the Homebrew Channel; the controllers are driven through the USB model.
 - No tests against real game files (the Xbox smoke check, `tools/xbox_recomp_smoke.py`, is run by
   hand on a title the developer owns).
-- Recompiled Xbox code: retail Halo boots on the Wii in Dolphin (with `--mmu`), draws on GX, plays
-  sound through the APU model, takes the controllers through the USB model and plays whole levels
-  (the play harness, a deterministic mode for comparing runs, the capture bench, demand paging,
-  a stall report and a freeze watch are the tools for long runs). Not done: the Xbox's 30 frames a
-  second is not reached; materials GX cannot do exactly get stand-ins (cube maps, per-pixel dot
+- Recompiled Xbox code: retail Halo boots on a real Wii and in Dolphin (with `--mmu`), draws on GX,
+  plays sound through the APU model, takes the controllers through the USB model and plays whole
+  levels (the play harness, a deterministic mode for comparing runs, the capture bench, demand
+  paging, a stall report and a freeze watch are the tools for long runs). Not done: the Xbox's 30
+  frames a second (Dolphin at the Wii's settings holds it in the opening level's quiet parts and
+  falls to half in its fights and in the later levels; the console is slower still, bound by memory
+  rather than instructions); materials GX cannot do exactly get stand-ins (cube maps, per-pixel dot
   products, the stencil: `wl/xbox/README.md`, "Not handled yet"); the audio has no effects
-  (`wl/xboxapu/README.md`); nothing of it has run on hardware. Each `tail_jump_alias` entry is
-  lifted as a full copy of the body it enters (Halo: 2.0 MB of x86 lifted from 1.6 MB of unique
-  code).
+  (`wl/xboxapu/README.md`). Each `tail_jump_alias` entry is lifted as a full copy of the body it
+  enters (Halo: 2.0 MB of x86 lifted from 1.6 MB of unique code).
 
 ## Licence
 

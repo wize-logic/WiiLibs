@@ -46,9 +46,21 @@ void wl_gx_target_be_copy_end(void) {
     wl_gx_wii_note_commands();
 }
 
+// (gx_wii.c's; weak: this file's test links its own wl_gx_invalidate_shadow alone)
+void wl_gx_wii_invalidate_shadow_own(void) __attribute__((weak));
+
+// the shadow forgotten after the GX set here, the maps this file loaded forgotten already (wl_gx_wii_texmaps_loaded)
+static void invalidate_own(void) {
+    if (wl_gx_wii_invalidate_shadow_own != NULL) {
+        wl_gx_wii_invalidate_shadow_own();
+    } else {
+        wl_gx_invalidate_shadow();
+    }
+}
+
 void wl_gx_target_be_scissor(uint32_t x, uint32_t w, uint32_t h) {
     GX_SetScissor(x, 0, w, h);
-    wl_gx_invalidate_shadow();
+    invalidate_own();
 }
 
 // A quad over a rectangle of the back buffer's pixels: its colour and alpha from texture map 0 or a
@@ -60,7 +72,7 @@ static void quad(float x0, float y0, float x1, float y1, const GXColor *colour, 
     static const float corners[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
 
     if (wl_gx_bisect()->no_quads) {
-        wl_gx_invalidate_shadow(); // (the bisection: no quad; the state its callers set stays)
+        invalidate_own(); // (the bisection: no quad; the state its callers set stays)
         return;
     }
     memset(matrix, 0, sizeof matrix);
@@ -139,7 +151,7 @@ static void quad(float x0, float y0, float x1, float y1, const GXColor *colour, 
         GX_SetZTexture(GX_ZT_DISABLE, GX_TF_Z8, 0);
         GX_SetZCompLoc(GX_TRUE);
     }
-    wl_gx_invalidate_shadow();
+    invalidate_own();
     wl_gx_wii_note_commands();
 }
 

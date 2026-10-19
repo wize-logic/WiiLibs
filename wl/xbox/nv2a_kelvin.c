@@ -518,37 +518,22 @@ void wl_nv2a_fetch_vertex(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw, u
 }
 
 void wl_nv2a_prim_info(uint32_t primitive, WlNv2aPrimInfo *out) {
-    memset(out, 0, sizeof *out);
-    switch (primitive) {
-    case WL_NV2A_PRIM_POINTS:
-        out->first = 1, out->step = 1, out->points = 1;
-        break;
-    case WL_NV2A_PRIM_LINES:
-        out->first = 2, out->step = 2, out->lines = 1;
-        break;
-    case WL_NV2A_PRIM_LINE_LOOP:
-    case WL_NV2A_PRIM_LINE_STRIP:
-        out->first = 2, out->step = 1, out->lines = 1, out->strip = 1;
-        break;
-    case WL_NV2A_PRIM_TRIANGLES:
-        out->first = 3, out->step = 3;
-        break;
-    case WL_NV2A_PRIM_TRIANGLE_STRIP:
-        out->first = 3, out->step = 1, out->strip = 1;
-        break;
-    case WL_NV2A_PRIM_TRIANGLE_FAN:
-    case WL_NV2A_PRIM_POLYGON:
-        out->first = 3, out->step = 1, out->fan = 1;
-        break;
-    case WL_NV2A_PRIM_QUADS:
-        out->first = 4, out->step = 4;
-        break;
-    case WL_NV2A_PRIM_QUAD_STRIP:
-        out->first = 4, out->step = 2, out->strip = 1;
-        break;
-    default:
-        break;
-    }
+    // (a table: each draw asks twice; first, step, lines, points, strip, fan; none for any other)
+    static const WlNv2aPrimInfo prims[] = {
+        [WL_NV2A_PRIM_POINTS] = {1, 1, 0, 1, 0, 0},
+        [WL_NV2A_PRIM_LINES] = {2, 2, 1, 0, 0, 0},
+        [WL_NV2A_PRIM_LINE_LOOP] = {2, 1, 1, 0, 1, 0},
+        [WL_NV2A_PRIM_LINE_STRIP] = {2, 1, 1, 0, 1, 0},
+        [WL_NV2A_PRIM_TRIANGLES] = {3, 3, 0, 0, 0, 0},
+        [WL_NV2A_PRIM_TRIANGLE_STRIP] = {3, 1, 0, 0, 1, 0},
+        [WL_NV2A_PRIM_TRIANGLE_FAN] = {3, 1, 0, 0, 0, 1},
+        [WL_NV2A_PRIM_QUADS] = {4, 4, 0, 0, 0, 0},
+        [WL_NV2A_PRIM_QUAD_STRIP] = {4, 2, 0, 0, 1, 0},
+        [WL_NV2A_PRIM_POLYGON] = {3, 1, 0, 0, 0, 1},
+    };
+    static const WlNv2aPrimInfo none;
+
+    *out = primitive < sizeof prims / sizeof prims[0] ? prims[primitive] : none;
 }
 
 // ---- the decoded views ----------------------------------------------------------------------
@@ -687,16 +672,21 @@ void wl_nv2a_kelvin_init(WlNv2a *dev) {
 // what each method is, decided once (the dispatch's tests per method, from a table): known, an
 // immediate vertex method, plain (a value kept and nothing else: no window, no case of
 // wl_nv2a_kelvin_method's switch), and its dirty group; for the pusher, a method a run may start at
-// (wl_nv2a_bulk_method's own tests), or in a window
+// (wl_nv2a_bulk_method's own tests), or in a window; one of the few the pusher's runs take straight
+// to their work (the load slots, begin/end: METHOD_DIRECT)
 enum {
     METHOD_KNOWN = 0x8000u,
     METHOD_IMMEDIATE = 0x4000u,
     METHOD_PLAIN = 0x2000u,
     METHOD_BULK = 0x1000u,
     METHOD_WINDOW = 0x0800u,
+    METHOD_DIRECT = 0x0400u,
     METHOD_DIRTY = 0x03FFu
 };
 static uint16_t g_method_info[WL_NV2A_K_METHODS / 4];
+// how many plain methods (METHOD_PLAIN and METHOD_BULK) follow from each on, itself counted (up to 255):
+// an increasing run of at most that many keeps its words' values and nothing else
+static uint8_t g_plain_run[WL_NV2A_K_METHODS / 4];
 
 static uint32_t dirty_group(uint32_t method) {
     if (method >= 0x200 && method <= 0x214) {
@@ -798,6 +788,17 @@ static void method_info_make(void) {
         g_method_info[m >> 2] = (uint16_t)((known ? METHOD_KNOWN : 0u) | (immediate_range(m) ? METHOD_IMMEDIATE : 0u) |
                                            (known && !special_method(m) ? METHOD_PLAIN : 0u) |
                                            (bulk ? METHOD_BULK : 0u) | (window ? METHOD_WINDOW : 0u) | dirty_group(m));
+        if (m == WL_NV2A_K_SET_TRANSFORM_PROGRAM_LOAD || m == WL_NV2A_K_SET_TRANSFORM_CONSTANT_LOAD ||
+            m == WL_NV2A_K_SET_BEGIN_END) {
+            g_method_info[m >> 2] |= METHOD_DIRECT;
+        }
+    }
+    for (m = WL_NV2A_K_METHODS; m != 0; m -= 4) {
+        uint32_t i = (m - 4u) >> 2, next = m < WL_NV2A_K_METHODS ? g_plain_run[i + 1u] : 0u;
+
+        g_plain_run[i] = (g_method_info[i] & (METHOD_PLAIN | METHOD_BULK)) == (METHOD_PLAIN | METHOD_BULK)
+                             ? (uint8_t)(next < 255u ? next + 1u : 255u)
+                             : 0u;
     }
 }
 
@@ -937,6 +938,39 @@ static uint32_t inline_layout(const WlNv2aKelvin *k, WlNv2aAttrib attribs[WL_NV2
     return (offset + 3u) & ~3u;
 }
 
+// (the draws' cuts of wave 4's second six: the arrays' layout kept between draws (layout_arrays), the
+// 16-bit index lines in assembly on Broadway (index_run16_cut), the viewport's words straight to their
+// constants (viewport_words); false: as the first six left them, a file "oldpush3" in the title's
+// folder, WL_XB_OLDPUSH3 on the host and in the replay)
+static bool g_push_cuts3 = true;
+
+void wl_nv2a_set_push_cuts3(bool on) {
+    g_push_cuts3 = on;
+}
+
+static unsigned g_arrays_logged;
+
+// an enabled array's span for indices [least, last] from its start (base + offset), `stride` and
+// `bytes` a vertex: its guest-physical address in *phys and its host address (NULL: not in guest RAM).
+// (In 64 bits: a guest's 32-bit indices far apart made a 32-bit length wrap to a small one that
+// passed the check, and the fetch read past it; a start past 4 GiB wrapped back into guest RAM, to
+// other bytes than the index's.)
+static const uint8_t *array_span(WlNv2a *dev, unsigned a, uint64_t start, uint32_t stride, uint32_t bytes,
+                                 uint32_t least, uint32_t last, uint32_t *phys) {
+    uint64_t at = start + (uint64_t)least * stride, length = (uint64_t)(last - least) * stride + bytes;
+    const uint8_t *data = NULL;
+
+    *phys = (uint32_t)at;
+    if (at <= 0xFFFFFFFFu && length <= 0xFFFFFFFFu) {
+        data = wl_nv2a_phys(dev, (uint32_t)at, (uint32_t)length);
+    }
+    if (data == NULL && g_arrays_logged++ < 8) {
+        WL_LOG_W(WL_NV2A_TAG, "vertex array %u at %08x (%u bytes) not in guest RAM", a, (unsigned)at,
+                 (unsigned)length);
+    }
+    return data;
+}
+
 // the arrays for indices [least, last]: each enabled attribute's host address of index least
 static uint32_t arrays_layout(WlNv2a *dev, uint32_t least, uint32_t last, WlNv2aAttrib attribs[WL_NV2A_ATTRIBS]) {
     const WlNv2aKelvin *k = &dev->kelvin;
@@ -949,22 +983,15 @@ static uint32_t arrays_layout(WlNv2a *dev, uint32_t least, uint32_t last, WlNv2a
         uint8_t type = (uint8_t)(format & 0xFu), size = (uint8_t)((format >> 4) & 0xFu);
         uint32_t stride = format >> 8, bytes = wl_nv2a_attrib_bytes(type, size);
         const WlNv2aDma *dma = (offset & 0x80000000u) ? &k->dma_vertex_b : &k->dma_vertex_a;
-        uint32_t phys, length;
+        uint32_t phys;
 
         memset(&attribs[a], 0, sizeof attribs[a]);
         if (bytes == 0) {
             continue;
         }
-        phys = dma->base + (offset & 0x0FFFFFFFu) + least * stride;
-        length = (last - least) * stride + bytes;
-        attribs[a].data = wl_nv2a_phys(dev, phys, length);
+        attribs[a].data = array_span(dev, a, (uint64_t)dma->base + (offset & 0x0FFFFFFFu), stride, bytes, least, last,
+                                     &phys);
         if (attribs[a].data == NULL) {
-            static unsigned logged;
-
-            if (logged++ < 8) {
-                WL_LOG_W(WL_NV2A_TAG, "vertex array %u at %08x (%u bytes) not in guest RAM", a, (unsigned)phys,
-                         (unsigned)length);
-            }
             continue;
         }
         attribs[a].phys = phys;
@@ -972,6 +999,83 @@ static uint32_t arrays_layout(WlNv2a *dev, uint32_t least, uint32_t last, WlNv2a
         attribs[a].size = size;
         attribs[a].stride = stride;
         streamed |= 1u << a;
+    }
+    return streamed;
+}
+
+// an enabled array's start: its vertex DMA's base and its offset
+static inline uint64_t array_start(const WlNv2aKelvin *k, unsigned a) {
+    uint32_t offset = wl_nv2a_k(k, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_OFFSET + 4 * a);
+    const WlNv2aDma *dma = (offset & 0x80000000u) ? &k->dma_vertex_b : &k->dma_vertex_a;
+
+    return (uint64_t)dma->base + (offset & 0x0FFFFFFFu);
+}
+
+// the arrays' layout kept: each enabled array's format, stride and start, made again only when an
+// array's register or a vertex DMA changed (WL_NV2A_DIRTY_ARRAYS) or the state was loaded (layout_ok)
+static void layout_make(WlNv2aKelvin *k) {
+    unsigned a, n = 0;
+
+    for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
+        uint32_t format = wl_nv2a_k(k, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT + 4 * a);
+        uint8_t type = (uint8_t)(format & 0xFu), size = (uint8_t)((format >> 4) & 0xFu);
+        uint32_t bytes = wl_nv2a_attrib_bytes(type, size);
+
+        k->layout_formats[a] = format;
+        if (bytes == 0) {
+            continue;
+        }
+        k->layout[n].start = array_start(k, a);
+        k->layout[n].stride = format >> 8;
+        k->layout[n].bytes = bytes;
+        k->layout[n].attrib = (uint8_t)a;
+        k->layout[n].type = type;
+        k->layout[n].size = size;
+        n++;
+    }
+    k->layout_count = (uint8_t)n;
+    k->layout_ok = 1;
+}
+
+// arrays_layout's work from the layout kept, into attributes already zero
+static uint32_t layout_arrays(WlNv2a *dev, uint32_t least, uint32_t last, WlNv2aAttrib attribs[WL_NV2A_ATTRIBS]) {
+    WlNv2aKelvin *k = &dev->kelvin;
+    uint32_t streamed = 0;
+    unsigned i, n;
+
+    if (!k->layout_ok) {
+        layout_make(k);
+    } else if (k->dirty & WL_NV2A_DIRTY_ARRAYS) {
+        // (a title moves its arrays far more often than it changes their formats: the formats compared,
+        // and when they are the same the enabled arrays' starts alone made again)
+        const uint32_t *formats = &k->raw[WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT >> 2];
+        uint32_t differ = 0;
+
+        for (i = 0; i < WL_NV2A_ATTRIBS; i++) {
+            differ |= formats[i] ^ k->layout_formats[i];
+        }
+        if (differ != 0) {
+            layout_make(k);
+        } else {
+            for (i = 0, n = k->layout_count; i < n; i++) {
+                k->layout[i].start = array_start(k, k->layout[i].attrib);
+            }
+        }
+    }
+    for (i = 0, n = k->layout_count; i < n; i++) {
+        WlNv2aAttrib *at = &attribs[k->layout[i].attrib];
+        uint32_t phys;
+
+        at->data = array_span(dev, k->layout[i].attrib, k->layout[i].start, k->layout[i].stride, k->layout[i].bytes,
+                              least, last, &phys);
+        if (at->data == NULL) {
+            continue;
+        }
+        at->phys = phys;
+        at->type = k->layout[i].type;
+        at->size = k->layout[i].size;
+        at->stride = k->layout[i].stride;
+        streamed |= 1u << k->layout[i].attrib;
     }
     return streamed;
 }
@@ -1057,7 +1161,8 @@ static void batch_draw(WlNv2a *dev, uint32_t primitive, uint32_t count, bool con
         draw.indices = dev->batch_indices;
         draw.index_base = least;
         draw.index_last = last;
-        draw.streamed = arrays_layout(dev, least, last, draw.attribs);
+        draw.streamed = g_push_cuts3 ? layout_arrays(dev, least, last, draw.attribs)
+                                    : arrays_layout(dev, least, last, draw.attribs);
         break;
     }
     case WL_NV2A_SOURCE_INLINE:
@@ -1855,7 +1960,15 @@ static inline __attribute__((always_inline)) uint32_t methods_run(WlNv2a *dev, c
     return count;
 }
 
+static bool g_push_cuts = true;
+static uint32_t index_run_fit(WlNv2a *dev, uint32_t method, const uint8_t *words, uint32_t count);
+
 uint32_t wl_nv2a_kelvin_methods(WlNv2a *dev, uint32_t method, bool increasing, const uint8_t *words, uint32_t count) {
+    if (g_push_cuts && !increasing && (method & (WL_NV2A_K_METHODS - 4u)) == WL_NV2A_K_ARRAY_ELEMENT16 &&
+        index_run_fit(dev, method, words, count) != 0) {
+        // (the rest of an index run the pusher's loop began, cut at PUT)
+        return count;
+    }
     return methods_run(dev, dev->current_channel >= 0 ? &dev->channels[dev->current_channel] : NULL, method,
                        increasing, words, count);
 }
@@ -1975,22 +2088,17 @@ static inline __attribute__((always_inline)) uint32_t increasing_run(WlNv2a *dev
 // method on a path of its own (most of a title's headers: its render states), each kind of run to a
 // loop of its own, the dirty groups and the methods gathered here: the channel is looked at for a
 // stop only after a method that may stop it, and the subchannels bound to the 3D object once, as no
-// method a run takes binds one)
+// method a run takes binds one. The loop as wave 3 left it: wl_nv2a_set_push_cuts(false))
 #if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("no-shrink-wrap-separate")))
 #endif
-uint32_t wl_nv2a_kelvin_push(WlNv2a *dev, WlNv2aChannel *ch, const uint8_t *words, uint32_t avail) {
+static __attribute__((noinline)) uint32_t push_wave3(WlNv2a *dev, WlNv2aChannel *ch, const uint8_t *words,
+                                                     uint32_t avail) {
     WlNv2aKelvin *k = &dev->kelvin;
     uint32_t taken = 0, methods = 0, last_header = 0, dirty = 0, kelvin = 0;
     unsigned s;
     bool prefetch;
 
-    if (g_method_info[0] == 0) {
-        method_info_make();
-    }
-    if (g_old_push) {
-        return push_old(dev, ch, words, avail);
-    }
     prefetch = wl_nv2a_prefetching();
     for (s = 0; s < WL_NV2A_SUBCHANNELS; s++) {
         kelvin |= (uint32_t)(ch->subchannel_class[s] == WL_NV2A_CLASS_KELVIN) << s;
@@ -2078,6 +2186,593 @@ uint32_t wl_nv2a_kelvin_push(WlNv2a *dev, WlNv2aChannel *ch, const uint8_t *word
                          ? method
                          : method + 4u * ((last_header >> WL_NV2A_CMD_COUNT_SHIFT) & WL_NV2A_CMD_COUNT_MASK);
         ch->subchannel = (uint8_t)((last_header >> WL_NV2A_CMD_SUBCH_SHIFT) & 7u);
+        ch->count = 0;
+        ch->non_increasing = non_increasing;
+    }
+    return taken;
+}
+
+// ---- the pusher's loop of wave 4 ------------------------------------------------------------------
+// (wl_nv2a_set_push_cuts(false): the loop as wave 3 left it, push_wave3; a file "oldpush2" in the
+// title's folder, WL_XB_OLDPUSH2 on the host and in the replay)
+
+void wl_nv2a_set_push_cuts(bool on) {
+    g_push_cuts = on;
+}
+
+// a push buffer word read (lwbrx on Broadway: one instruction, where GCC may make a load and three
+// rotates of it), and the line `ahead` bytes on from `p` asked for (dcbt with the distance in a
+// register: one instruction)
+#if (defined(__powerpc__) || defined(__PPC__)) && defined(__BYTE_ORDER__) && \
+    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__ && !defined(WL_NV2A_PREFETCH_RECORD)
+static inline __attribute__((always_inline)) uint32_t push_rd(const uint8_t *p) {
+    uint32_t value;
+
+    __asm__("lwbrx %0,%y1" : "=r"(value) : "Z"(*(const SlotWord *)(const void *)p));
+    return value;
+}
+#define PUSH_AHEAD_AT(p, ahead) __asm__ volatile("dcbt %0,%1" : : "b"(p), "r"(ahead))
+#else
+static inline uint32_t push_rd(const uint8_t *p) {
+    return wl_rd_le32(p);
+}
+#define PUSH_AHEAD_AT(p, ahead) WL_NV2A_PREFETCH((p) + (ahead))
+#endif
+
+// (methods_run out of line: the runs push_run leaves to it are few, and inlined they took push_run's
+// registers)
+static __attribute__((noinline)) uint32_t methods_out(WlNv2a *dev, const WlNv2aChannel *ch, uint32_t method,
+                                                      bool increasing, const uint8_t *words, uint32_t count) {
+    return methods_run(dev, ch, method, increasing, words, count);
+}
+
+static __attribute__((noinline)) void immediate_out(WlNv2a *dev, uint32_t method, uint32_t param) {
+    immediate_method(dev, method, param);
+}
+
+static __attribute__((noinline)) void begin_end_out(WlNv2a *dev, uint32_t param) {
+    begin_end(dev, param);
+}
+
+// a word of two 16-bit indices into `to`, the least and the greatest kept: the pair's lesser against
+// the least, its greater against the greatest
+static inline __attribute__((always_inline)) void index_word(uint32_t param, uint32_t *to, uint32_t *least,
+                                                             uint32_t *last) {
+    uint32_t lo = param & 0xFFFFu, hi = param >> 16;
+
+    to[0] = lo;
+    to[1] = hi;
+    if (lo < hi) {
+        *least = lo < *least ? lo : *least;
+        *last = hi > *last ? hi : *last;
+    } else {
+        *least = hi < *least ? hi : *least;
+        *last = lo > *last ? lo : *last;
+    }
+}
+
+static inline __attribute__((always_inline)) void index_pair(const uint8_t *w, uint32_t *to, uint32_t *least,
+                                                             uint32_t *last) {
+    index_word(wl_rd_le32(w), to, least, last);
+}
+
+// index_run16's lines of eight words (`left` / 8 of them) into `to`, their least and greatest index
+// in *least and *last, the line `ahead` on asked for at each line's first word: the words left. On
+// Broadway a word is eleven or twelve instructions when the bounds do not move: lwbrx with its offset in
+// a register (no address made for each word), its halves stored, the pair's lesser against the least
+// and its greater against the greatest (GCC kept both paths' moves in the line and an address a word).
+#if (defined(__powerpc__) || defined(__PPC__)) && defined(__BYTE_ORDER__) && \
+    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__ && !defined(WL_NV2A_PREFETCH_RECORD)
+#define INDEX_WORD_ASM(load, at)                                                                           \
+    "   " load "\n"                                                                                         \
+    "   clrlwi %[lo],%[t],16\n"                                                                            \
+    "   srwi %[hi],%[t],16\n"                                                                              \
+    "   stw %[lo]," #at "(%[to])\n"                                                                        \
+    "   stw %[hi]," #at "+4(%[to])\n"                                                                      \
+    "   cmplw %[lo],%[hi]\n"                                                                               \
+    "   bge 1f\n"                                                                                          \
+    "   cmplw %[lo],%[least]\n"                                                                            \
+    "   bge 2f\n"                                                                                          \
+    "   mr %[least],%[lo]\n"                                                                               \
+    "2: cmplw %[hi],%[last]\n"                                                                             \
+    "   ble 3f\n"                                                                                          \
+    "   mr %[last],%[hi]\n"                                                                                \
+    "   b 3f\n"                                                                                            \
+    "1: cmplw %[hi],%[least]\n"                                                                            \
+    "   bge 2f\n"                                                                                          \
+    "   mr %[least],%[hi]\n"                                                                               \
+    "2: cmplw %[lo],%[last]\n"                                                                             \
+    "   ble 3f\n"                                                                                          \
+    "   mr %[last],%[lo]\n"                                                                                \
+    "3:\n"
+static inline __attribute__((always_inline)) uint32_t index_lines(const uint8_t **wp, uint32_t **top, uint32_t left,
+                                                                  uint32_t *least, uint32_t *last) {
+    const uint8_t *w = *wp;
+    uint32_t *to = *top, lo_bound = *least, hi_bound = *last, ahead = WL_NV2A_PUSH_AHEAD;
+    uint32_t o4 = 4, o8 = 8, o12 = 12, o16 = 16, o20 = 20, o24 = 24, o28 = 28, t, lo, hi;
+
+    for (; left >= 8u; left -= 8u, w += 32, to += 16) {
+        PUSH_AHEAD_AT(w, ahead);
+        __asm__ volatile(INDEX_WORD_ASM("lwbrx %[t],0,%[w]", 0) INDEX_WORD_ASM("lwbrx %[t],%[w],%[o4]", 8)
+                             INDEX_WORD_ASM("lwbrx %[t],%[w],%[o8]", 16) INDEX_WORD_ASM("lwbrx %[t],%[w],%[o12]", 24)
+                                 INDEX_WORD_ASM("lwbrx %[t],%[w],%[o16]", 32)
+                                     INDEX_WORD_ASM("lwbrx %[t],%[w],%[o20]", 40)
+                                         INDEX_WORD_ASM("lwbrx %[t],%[w],%[o24]", 48)
+                                             INDEX_WORD_ASM("lwbrx %[t],%[w],%[o28]", 56)
+                         : [least] "+r"(lo_bound), [last] "+r"(hi_bound), [t] "=&r"(t), [lo] "=&r"(lo), [hi] "=&r"(hi)
+                         : [w] "b"(w), [to] "b"(to), [o4] "r"(o4), [o8] "r"(o8), [o12] "r"(o12), [o16] "r"(o16),
+                           [o20] "r"(o20), [o24] "r"(o24), [o28] "r"(o28)
+                         : "cc", "memory");
+    }
+    *wp = w;
+    *top = to;
+    *least = lo_bound;
+    *last = hi_bound;
+    return left;
+}
+// (a word alone, the head's and tail's: the same work)
+static inline __attribute__((always_inline)) void index_one(const uint8_t *w, uint32_t *to, uint32_t *least,
+                                                            uint32_t *last) {
+    uint32_t lo_bound = *least, hi_bound = *last, t, lo, hi;
+
+    __asm__ volatile(INDEX_WORD_ASM("lwbrx %[t],0,%[w]", 0)
+                     : [least] "+r"(lo_bound), [last] "+r"(hi_bound), [t] "=&r"(t), [lo] "=&r"(lo), [hi] "=&r"(hi)
+                     : [w] "b"(w), [to] "b"(to)
+                     : "cc", "memory");
+    *least = lo_bound;
+    *last = hi_bound;
+}
+#else
+static inline __attribute__((always_inline)) uint32_t index_lines(const uint8_t **wp, uint32_t **top, uint32_t left,
+                                                                  uint32_t *least, uint32_t *last) {
+    const uint8_t *w = *wp;
+    uint32_t *to = *top, ahead = WL_NV2A_PUSH_AHEAD;
+    unsigned i;
+
+    (void)ahead;
+    for (; left >= 8u; left -= 8u, w += 32, to += 16) {
+        PUSH_AHEAD_AT(w, ahead);
+        for (i = 0; i < 8u; i++) {
+            index_pair(w + 4u * i, to + 2u * i, least, last);
+        }
+    }
+    *wp = w;
+    *top = to;
+    return left;
+}
+static inline __attribute__((always_inline)) void index_one(const uint8_t *w, uint32_t *to, uint32_t *least,
+                                                            uint32_t *last) {
+    index_pair(w, to, least, last);
+}
+#endif
+
+// index_run16's work as wave 4's second part makes it (wl_nv2a_set_push_cuts3): its head, lines and
+// tail by index_one and index_lines
+static __attribute__((noinline)) void index_run16_cut(WlNv2a *dev, const uint8_t *w, uint32_t count) {
+    uint32_t at = dev->batch_index_count, *to = dev->batch_indices + at, left = count;
+    uint32_t least = 0xFFFFFFFFu, last = 0;
+
+    if (wl_nv2a_prefetching()) {
+        uint32_t head = ((WL_NV2A_CACHE_LINE - ((uint32_t)(uintptr_t)w & (WL_NV2A_CACHE_LINE - 1u))) &
+                         (WL_NV2A_CACHE_LINE - 1u)) >> 2;
+
+        head = head < left ? head : left;
+        if (head != 0) {
+            WL_NV2A_PREFETCH(w + WL_NV2A_PUSH_AHEAD);
+            for (left -= head; head != 0; head--, w += 4, to += 2) {
+                index_one(w, to, &least, &last);
+            }
+        }
+        left = index_lines(&w, &to, left, &least, &last);
+        if (left != 0) {
+            WL_NV2A_PREFETCH(w + WL_NV2A_PUSH_AHEAD);
+        }
+    }
+    for (; left != 0; left--, w += 4, to += 2) {
+        index_one(w, to, &least, &last);
+    }
+    bounds_add(dev, at, 2u * count, least, last);
+    dev->batch_index_count = at + 2u * count;
+}
+
+// a run of `count` words of 16-bit indices into the batch, which has room for them all: what
+// methods_run makes of it (the least and greatest index as they come, the line WL_NV2A_PUSH_AHEAD on
+// asked for at each line's first word read), a line of eight words a pass
+static __attribute__((noinline)) void index_run16(WlNv2a *dev, const uint8_t *w, uint32_t count) {
+    uint32_t at = dev->batch_index_count, *to = dev->batch_indices + at, left = count;
+    uint32_t least = 0xFFFFFFFFu, last = 0;
+
+    if (wl_nv2a_prefetching()) {
+        uint32_t head = ((WL_NV2A_CACHE_LINE - ((uint32_t)(uintptr_t)w & (WL_NV2A_CACHE_LINE - 1u))) &
+                         (WL_NV2A_CACHE_LINE - 1u)) >> 2;
+
+        head = head < left ? head : left;
+        if (head != 0) {
+            WL_NV2A_PREFETCH(w + WL_NV2A_PUSH_AHEAD);
+            for (left -= head; head != 0; head--, w += 4, to += 2) {
+                index_pair(w, to, &least, &last);
+            }
+        }
+        for (; left >= 8u; left -= 8u, w += 32, to += 16) {
+            unsigned i;
+
+            WL_NV2A_PREFETCH(w + WL_NV2A_PUSH_AHEAD);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC unroll 8
+#endif
+            for (i = 0; i < 8u; i++) {
+                index_pair(w + 4u * i, to + 2u * i, &least, &last);
+            }
+        }
+        if (left != 0) {
+            WL_NV2A_PREFETCH(w + WL_NV2A_PUSH_AHEAD);
+        }
+    }
+    for (; left != 0; left--, w += 4, to += 2) {
+        index_pair(w, to, &least, &last);
+    }
+    bounds_add(dev, at, 2u * count, least, last);
+    dev->batch_index_count = at + 2u * count;
+}
+
+// a non-increasing run of `count` (1 or more) words to `method`: index_run16's when they are 16-bit
+// indices inside a begin/end with room for them all in the batch (`count`), else none taken (0)
+static uint32_t index_run_fit(WlNv2a *dev, uint32_t method, const uint8_t *words, uint32_t count) {
+    if (count == 0 || (method & (WL_NV2A_K_METHODS - 4u)) != WL_NV2A_K_ARRAY_ELEMENT16 || !g_index_bounds ||
+        dev->kelvin.primitive == 0 || count > (WL_NV2A_BATCH_INDICES - dev->batch_index_count) / 2u ||
+        !batch_open(dev, WL_NV2A_SOURCE_ARRAYS)) {
+        return 0;
+    }
+    if (g_push_cuts3) {
+        index_run16_cut(dev, words, count);
+    } else {
+        index_run16(dev, words, count);
+    }
+    dev->kelvin.raw[WL_NV2A_K_ARRAY_ELEMENT16 >> 2] = wl_rd_le32(words + 4u * (count - 1u));
+    return count;
+}
+
+// window_run's work, the words read through a pointer that walks (push_rd): the words before the first
+// whole slot and after the last one (or past the window's bound) one at a time, the whole slots four
+// words at once, their changes counted as window_word counts them
+static __attribute__((noinline)) void window_words(WlNv2aKelvin *k, uint32_t method, const uint8_t *w,
+                                                   uint32_t count) {
+    bool program = method < WL_NV2A_K_SET_TRANSFORM_CONSTANT;
+    unsigned word = (method >> 2) & 3u, last = word;
+    uint32_t load = program ? k->program_load : k->constant_load;
+    uint32_t bound = program ? WL_NV2A_PROGRAM_SLOTS : WL_NV2A_CONSTANTS, changes = 0;
+    SlotWord *slots = program ? (SlotWord *)(void *)k->program : (SlotWord *)(void *)k->constants;
+    const uint8_t *end = w + 4u * (size_t)count;
+
+    for (;;) {
+        if (word == 0) {
+            for (; (size_t)(end - w) >= 16u && load < bound; w += 16, load++) {
+                SlotWord *s = slots + 4u * load;
+                uint32_t a = push_rd(w), b = push_rd(w + 4), c = push_rd(w + 8), d = push_rd(w + 12);
+
+                changes += (uint32_t)(s[0] != a) + (uint32_t)(s[1] != b) + (uint32_t)(s[2] != c) + (uint32_t)(s[3] != d);
+                s[0] = a;
+                s[1] = b;
+                s[2] = c;
+                s[3] = d;
+                last = 3;
+            }
+        }
+        if (w == end) {
+            break;
+        }
+        if (load < bound) {
+            uint32_t param = push_rd(w);
+
+            // (the bits compared, as window_word's memcmp)
+            if (slots[4u * load + word] != param) {
+                slots[4u * load + word] = param;
+                changes++;
+            }
+        }
+        w += 4;
+        last = word;
+        if (word == 3) {
+            load++;
+            word = 0;
+        } else {
+            word++;
+        }
+    }
+    if (program) {
+        if (changes != 0) {
+            k->program_generation += changes;
+            k->dirty |= WL_NV2A_DIRTY_PROGRAM;
+        }
+        k->program_load = load;
+        k->program_word = last;
+        return;
+    }
+    if (changes != 0) {
+        k->constants_generation += changes;
+        k->dirty |= WL_NV2A_DIRTY_CONSTANTS;
+    }
+    k->constant_load = load;
+    k->constant_word = last;
+}
+
+// increasing_run, with the load slots and begin/end taken to their work straight (METHOD_DIRECT: what
+// wl_nv2a_kelvin_method does with them, without its dispatch); a window's word to
+// wl_nv2a_kelvin_method (window_word, as increasing_run's)
+static inline __attribute__((always_inline)) uint32_t increasing_direct(WlNv2a *dev, const WlNv2aChannel *ch,
+                                                                        uint32_t method, const uint8_t *words,
+                                                                        uint32_t count) {
+    WlNv2aKelvin *k = &dev->kelvin;
+    const uint16_t *infos = &g_method_info[method >> 2];
+    uint32_t *raw = &k->raw[method >> 2];
+    uint32_t dirty = 0, n;
+
+    for (n = 0; n < count; n++) {
+        uint32_t param = wl_rd_le32(words + 4u * n), info = infos[n], m;
+
+        if (info & METHOD_PLAIN) {
+            if (raw[n] != param) {
+                raw[n] = param;
+                dirty |= info;
+            }
+            continue;
+        }
+        k->dirty |= dirty & METHOD_DIRTY;
+        dirty = 0;
+        m = method + 4u * n;
+        if (info & METHOD_IMMEDIATE) {
+            raw[n] = param;
+            immediate_out(dev, m, param);
+            continue;
+        }
+        if (info & METHOD_DIRECT) {
+            raw[n] = param;
+            if (m == WL_NV2A_K_SET_TRANSFORM_CONSTANT_LOAD) {
+                k->constant_load = param;
+                k->constant_word = 0;
+                continue;
+            }
+            if (m == WL_NV2A_K_SET_TRANSFORM_PROGRAM_LOAD) {
+                k->program_load = param;
+                k->program_word = 0;
+                continue;
+            }
+            begin_end_out(dev, param);
+        } else {
+            wl_nv2a_kelvin_method(dev, m, param);
+        }
+        if (ch->suspended) {
+            // (a method stopped the channel: the rest of the run after it)
+            return n + 1u;
+        }
+    }
+    k->dirty |= dirty & METHOD_DIRTY;
+    return count;
+}
+
+// a run of `count` words inside one of the viewport's vectors (SET_VIEWPORT_OFFSET or _SCALE, from
+// `method` on): what wl_nv2a_kelvin_method does with each, without its dispatch (the word kept; the
+// constant it is changed if the word changes it, its generation counted a word)
+static __attribute__((noinline)) void viewport_words(WlNv2aKelvin *k, uint32_t method, const uint8_t *w,
+                                                      uint32_t count) {
+    uint32_t *raw = &k->raw[method >> 2], changes = 0, n;
+    float *slot = method >= WL_NV2A_K_SET_VIEWPORT_SCALE
+                      ? &k->constants[WL_NV2A_CONSTANT_VIEWPORT_SCALE][(method - WL_NV2A_K_SET_VIEWPORT_SCALE) >> 2]
+                      : &k->constants[WL_NV2A_CONSTANT_VIEWPORT_OFFSET][(method - WL_NV2A_K_SET_VIEWPORT_OFFSET) >> 2];
+
+    for (n = 0; n < count; n++) {
+        uint32_t param = wl_rd_le32(w + 4u * n), was;
+
+        raw[n] = param;
+        memcpy(&was, &slot[n], sizeof was);
+        if (was != param) {
+            memcpy(&slot[n], &param, sizeof param);
+            changes++;
+        }
+    }
+    if (changes != 0) {
+        k->constants_generation += changes;
+        k->dirty |= WL_NV2A_DIRTY_VIEWPORT | WL_NV2A_DIRTY_CONSTANTS;
+    }
+}
+
+// a header at `at` that is not one word to a plain method, `left` words from it on (2 or more): its
+// run as push_wave3 takes it; the words taken, the header's with them (0: a header the pusher takes,
+// not a method header to the 3D object or not a run this loop takes), *cut when the run was cut short
+// (its rest left in the header state)
+static __attribute__((noinline)) uint32_t push_run(WlNv2a *dev, WlNv2aChannel *ch, uint32_t header,
+                                                   const uint8_t *at, uint32_t left, uint32_t kelvin, bool *cut) {
+    WlNv2aKelvin *k = &dev->kelvin;
+    uint32_t method = header & WL_NV2A_CMD_METHOD_MASK, info = g_method_info[method >> 2];
+    uint32_t count = (header >> WL_NV2A_CMD_COUNT_SHIFT) & WL_NV2A_CMD_COUNT_MASK, run, done;
+    bool non_increasing = (header & WL_NV2A_CMD_NON_INCREASING) != 0;
+
+    // (a header, increasing or not, to the 3D object: what the pusher takes it for when it is not a
+    // jump, a call or a return, which never match these bits; then wl_nv2a_bulk_method's tests: the
+    // method's in the table, a run up to the handles' here)
+    if ((header & (WL_NV2A_CMD_TYPE_MASK & ~WL_NV2A_CMD_NON_INCREASING)) != 0 ||
+        !((kelvin >> ((header >> WL_NV2A_CMD_SUBCH_SHIFT) & 7u)) & 1u) || count == 0 || !(info & METHOD_BULK) ||
+        (!non_increasing && method < WL_NV2A_PULLER_HANDLE_FIRST && method + 4u * count > WL_NV2A_PULLER_HANDLE_FIRST)) {
+        return 0;
+    }
+    run = left - 1u < count ? left - 1u : count;
+    at += 4;
+    if (non_increasing) {
+        done = index_run_fit(dev, method, at, run);
+        if (done == 0) {
+            done = methods_out(dev, ch, method, false, at, run);
+        }
+    } else if ((info & METHOD_WINDOW) && ((method + 4u * (run - 1u)) ^ method) < 0x80u) {
+        // (a run inside one window: its words stored without each one's dispatch)
+        window_words(k, method, at, run);
+        done = run;
+    } else if (g_push_cuts3 &&
+               (method - WL_NV2A_K_SET_VIEWPORT_OFFSET < 16u || method - WL_NV2A_K_SET_VIEWPORT_SCALE < 16u) &&
+               (method & 0xCu) + 4u * run <= 16u) {
+        // (a run inside one of the viewport's vectors: its words to their constants without the dispatch)
+        viewport_words(k, method, at, run);
+        done = run;
+    } else if (method + 4u * run <= WL_NV2A_K_METHODS) {
+        done = increasing_direct(dev, ch, method, at, run);
+    } else {
+        done = methods_out(dev, ch, method, true, at, run); // (past the last method: wrapped)
+    }
+    if (done < count) {
+        // (a run cut short: the rest left in the header state, for the pusher)
+        ch->method = non_increasing ? method : method + 4u * done;
+        ch->subchannel = (uint8_t)((header >> WL_NV2A_CMD_SUBCH_SHIFT) & 7u);
+        ch->count = count - done;
+        ch->non_increasing = non_increasing;
+        *cut = true;
+    }
+    return 1u + done;
+}
+
+// (as push_wave3, with the header of one word to a plain method alone in the loop: its tests in one
+// mask, the method's table entry and value found by the header's bits, a header's place a pointer, the
+// methods counted as the words less the headers; any other header to push_run)
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-shrink-wrap-separate")))
+#endif
+uint32_t wl_nv2a_kelvin_push(WlNv2a *dev, WlNv2aChannel *ch, const uint8_t *words, uint32_t avail) {
+    WlNv2aKelvin *k;
+    const uint8_t *at = words, *stop, *last = NULL, *infos;
+    uint8_t *raw;
+    uint32_t headers = 0, dirty = 0, kelvin = 0, taken, ahead = WL_NV2A_PUSH_AHEAD, short_header;
+    unsigned s;
+    bool prefetch, cut = false;
+    const uint32_t short_mask = (uint32_t)WL_NV2A_CMD_TYPE_MASK | WL_NV2A_CMD_NON_INCREASING |
+                                (uint32_t)WL_NV2A_CMD_COUNT_MASK << WL_NV2A_CMD_COUNT_SHIFT |
+                                7u << WL_NV2A_CMD_SUBCH_SHIFT;
+
+    if (g_method_info[0] == 0) {
+        method_info_make();
+    }
+    if (g_old_push) {
+        return push_old(dev, ch, words, avail);
+    }
+    if (!g_push_cuts) {
+        return push_wave3(dev, ch, words, avail);
+    }
+    if (avail < 2u) {
+        return 0;
+    }
+    k = &dev->kelvin;
+    stop = words + 4u * (size_t)(avail - 2u); // (the last place a header and a word fit)
+    infos = (const uint8_t *)g_method_info;
+    raw = (uint8_t *)k->raw;
+    prefetch = wl_nv2a_prefetching();
+    for (s = 0; s < WL_NV2A_SUBCHANNELS; s++) {
+        kelvin |= (uint32_t)(ch->subchannel_class[s] == WL_NV2A_CLASS_KELVIN) << s;
+    }
+    // (a short header's bits under short_mask: increasing, a count of 1, the first subchannel bound to the
+    // 3D object (a header to another one bound to it goes the longer way); none when no subchannel is)
+    for (s = 0; s < WL_NV2A_SUBCHANNELS && !((kelvin >> s) & 1u); s++) {
+    }
+    short_header = s < WL_NV2A_SUBCHANNELS ? 1u << WL_NV2A_CMD_COUNT_SHIFT | s << WL_NV2A_CMD_SUBCH_SHIFT : 0xFFFFFFFFu;
+    while (at <= stop) {
+        // (the method's table entry: its index, header bits 2-12, times the entry's two bytes)
+        uint32_t header = push_rd(at), info = *(const uint16_t *)(const void *)(infos + ((header >> 1) & 0xFFEu));
+        uint32_t n;
+
+        (void)ahead;
+        if (prefetch) {
+            // (the headers and short runs that follow: the line WL_NV2A_PUSH_AHEAD on asked for)
+            PUSH_AHEAD_AT(at, ahead);
+        }
+        // (one word, increasing, to a plain method of the 3D object: not a jump, a call or a return, a
+        // count of 1, the subchannel's; its value kept, as increasing_run keeps it)
+        if ((header & short_mask) == short_header &&
+            (info & (METHOD_PLAIN | METHOD_BULK)) == (METHOD_PLAIN | METHOD_BULK)) {
+            uint32_t *slot = (uint32_t *)(void *)(raw + (header & WL_NV2A_CMD_METHOD_MASK)), param = push_rd(at + 4);
+
+            if (*slot != param) {
+                *slot = param;
+                dirty |= info;
+            }
+            last = at;
+            at += 8;
+            headers++;
+            continue;
+        }
+        if ((header & WL_NV2A_CMD_TYPE_MASK) == 0 && ((kelvin >> ((header >> WL_NV2A_CMD_SUBCH_SHIFT) & 7u)) & 1u)) {
+            // (an increasing header to the 3D object)
+            uint32_t count = (header >> WL_NV2A_CMD_COUNT_SHIFT) & WL_NV2A_CMD_COUNT_MASK;
+            uint32_t method = header & WL_NV2A_CMD_METHOD_MASK;
+
+            if (count - 1u < g_plain_run[method >> 2] && count - 1u <= (uint32_t)((size_t)(stop - at) >> 2)) {
+                // (a run of plain methods, all of it here: their values kept, as increasing_run keeps them)
+                uint32_t *slots = (uint32_t *)(void *)(raw + method);
+                const uint16_t *of = &g_method_info[method >> 2];
+
+                for (n = 0; n < count; n++) {
+                    uint32_t param = push_rd(at + 4u + 4u * n);
+
+                    if (slots[n] != param) {
+                        slots[n] = param;
+                        dirty |= of[n];
+                    }
+                }
+                last = at;
+                at += 4u * (count + 1u);
+                headers++;
+                continue;
+            }
+            if (count == 1u && (info & METHOD_DIRECT)) {
+                // (one word to a load slot or begin/end: increasing_direct's work for it)
+                uint32_t param = push_rd(at + 4);
+
+                k->dirty |= dirty & METHOD_DIRTY;
+                dirty = 0;
+                k->raw[method >> 2] = param;
+                if (method == WL_NV2A_K_SET_TRANSFORM_CONSTANT_LOAD) {
+                    k->constant_load = param;
+                    k->constant_word = 0;
+                } else if (method == WL_NV2A_K_SET_TRANSFORM_PROGRAM_LOAD) {
+                    k->program_load = param;
+                    k->program_word = 0;
+                } else {
+                    begin_end_out(dev, param);
+                }
+                last = at;
+                at += 8;
+                headers++;
+                if (ch->suspended) {
+                    break;
+                }
+                continue;
+            }
+        }
+        // (the dirty groups stored before any other method's work)
+        k->dirty |= dirty & METHOD_DIRTY;
+        dirty = 0;
+        n = push_run(dev, ch, header, at, avail - (uint32_t)((size_t)(at - words) >> 2), kelvin, &cut);
+        if (n == 0) {
+            break;
+        }
+        last = at;
+        at += 4u * n;
+        headers++;
+        if (cut) {
+            taken = (uint32_t)((size_t)(at - words) >> 2);
+            dev->stats.methods += taken - headers;
+            return taken;
+        }
+        if (ch->suspended) {
+            break;
+        }
+    }
+    k->dirty |= dirty & METHOD_DIRTY;
+    taken = (uint32_t)((size_t)(at - words) >> 2);
+    dev->stats.methods += taken - headers;
+    if (last != NULL) {
+        // (the last header's state when its run is done, as the pusher leaves it)
+        uint32_t header = wl_rd_le32(last), method = header & WL_NV2A_CMD_METHOD_MASK;
+        bool non_increasing = (header & WL_NV2A_CMD_NON_INCREASING) != 0;
+
+        ch->method =
+            non_increasing ? method : method + 4u * ((header >> WL_NV2A_CMD_COUNT_SHIFT) & WL_NV2A_CMD_COUNT_MASK);
+        ch->subchannel = (uint8_t)((header >> WL_NV2A_CMD_SUBCH_SHIFT) & 7u);
         ch->count = 0;
         ch->non_increasing = non_increasing;
     }

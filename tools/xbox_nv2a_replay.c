@@ -1129,8 +1129,8 @@ static void fused_forms_print(void) {
 }
 
 // The title's switches for the old ways of the GX layer, as the runtime reads them on the host
-// (gxrestorewhole, gxtlutall, gxregions, gxtexload, gxarrayall: WL_XB_RESTORE_WHOLE, WL_XB_TLUT_ALL,
-// WL_XB_GX_REGIONS, WL_XB_TEX_WHOLE, WL_XB_ARRAYS_ALL); what they change is counted alike on the host
+// (gxrestorewhole, gxtlutall, gxregions, gxtexload, gxarrayall, gxfenceeager, gxmapsfixed: WL_XB_RESTORE_WHOLE, WL_XB_TLUT_ALL,
+// WL_XB_GX_REGIONS, WL_XB_TEX_WHOLE, WL_XB_ARRAYS_ALL, WL_XB_GX_FENCE_EAGER, WL_XB_GX_MAPS_FIXED); what they change is counted alike on the host
 static void bisect_from_env(void) {
     WlGxBisect bisect = *wl_gx_bisect();
 
@@ -1139,6 +1139,8 @@ static void bisect_from_env(void) {
     bisect.regions_libogc = getenv("WL_XB_GX_REGIONS") != NULL;
     bisect.tex_whole = getenv("WL_XB_TEX_WHOLE") != NULL;
     bisect.arrays_always = getenv("WL_XB_ARRAYS_ALL") != NULL;
+    bisect.fence_eager = getenv("WL_XB_GX_FENCE_EAGER") != NULL;
+    bisect.maps_fixed = getenv("WL_XB_GX_MAPS_FIXED") != NULL;
     bisect.pillarbox = getenv("WL_XB_PILLARBOX") != NULL;
     bisect.narrow_mid = getenv("WL_XB_NARROW_MID") != NULL;
     wl_gx_bisect_set(&bisect);
@@ -1204,8 +1206,8 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
         wl_gx_stats(&xs);
         wl_gx_direct_stats(&ds);
         printf("bench: GX syncs a frame: %.2f processor waits for GX, %.2f copies out of the EFB (GX's own pixel "
-               "sync after each)\n", (double)xs.gpu_waits / ((double)runs * frames),
-               (double)xs.efb_copies / ((double)runs * frames));
+               "sync after each), %.2f EFB pixels read\n", (double)xs.gpu_waits / ((double)runs * frames),
+               (double)xs.efb_copies / ((double)runs * frames), (double)xs.efb_peeks / ((double)runs * frames));
         printf("bench: GX state calls a draw (setters and TEV): %.2f asked, %.2f sent (the rest GX held)\n",
                (double)ds.state_calls / ((double)runs * (info.stats.draws != 0 ? info.stats.draws : 1u)),
                (double)ds.state_sent / ((double)runs * (info.stats.draws != 0 ? info.stats.draws : 1u)));
@@ -1217,16 +1219,26 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
             double per = 1.0 / ((double)runs * frames), all = 0.0;
             unsigned k;
 
-            printf("bench: texture binds a frame: %.1f asked, %.1f wrote (%.1f whole loads), %.1f BP writes; "
-                   "arrays a frame: %.1f asked, %.1f sent\n",
+            printf("bench: texture binds a frame: %.1f asked, %.1f wrote (%.1f whole loads), %.1f BP writes, %.1f found "
+                   "in another map (%.1f TEV orders for them); arrays a frame: %.1f asked, %.1f sent\n",
                    ds.tex_binds * per, ds.tex_changed * per, ds.tex_loads * per, ds.tex_writes * per,
-                   ds.array_calls * per, ds.array_sent * per);
+                   ds.tex_map_hits * per, ds.tex_map_orders * per, ds.array_calls * per, ds.array_sent * per);
             printf("bench: FIFO bytes a frame (the console's, a model):");
             for (k = 0; k < 8; k++) {
                 printf(" %s %.0f", kinds[k], (double)ds.fifo[k] * per);
                 all += (double)ds.fifo[k] * per;
             }
             printf("; state %.0f, all %.0f\n", all - (double)ds.fifo[7] * per, all);
+            printf("bench: tokens a frame: %.1f (%.1f after no other command, %.1f started a batch, %.1f alone); "
+                   "texture cache invalidations %.1f; the transform unit's flushes %.1f\n", ds.tokens * per,
+                   ds.tokens_idle * per, ds.token_breaks * per, ds.token_alone * per, ds.tex_invalidates * per,
+                   ds.flushes * per);
+            printf("bench: Dolphin's batches a frame (a model: a primitive after a change of state starts one): "
+                   "%.1f primitives, %.1f batches; started by", ds.primitives * per, ds.batches * per);
+            for (k = 0; k < 7; k++) {
+                printf(" %s %.1f (%.1f alone)", kinds[k], ds.batch_breaks[k] * per, ds.batch_alone[k] * per);
+            }
+            printf("\n");
         }
         {
             // the copies out of the EFB a frame by kind, in bytes (the display copy, 640x480 into the XFB, is
@@ -1300,9 +1312,11 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
         wl_nv2a_gx_stats(g_gx, &fs);
         printf("bench: %u vertices made by fused batches in all runs\n", (unsigned)fs.vertices_fused);
         printf("bench: made vertices read by index: %u draws, %u vertices sent, %u slots made; %u draws refused, "
-               "%u unmatched; %u fences, %u waits, %u laps\n",
+               "%u unmatched; %u fences, %u waits, %u laps; %llu bytes of slots written; %u draws (%u vertices) of "
+               "five words or fewer\n",
                (unsigned)fs.made_draws, (unsigned)fs.made_sent, (unsigned)fs.made_vertices, (unsigned)fs.made_refused,
-               (unsigned)fs.made_unmatched, (unsigned)fs.made_fences, (unsigned)fs.made_waits, (unsigned)fs.made_laps);
+               (unsigned)fs.made_unmatched, (unsigned)fs.made_fences, (unsigned)fs.made_waits, (unsigned)fs.made_laps,
+               (unsigned long long)fs.made_bytes, (unsigned)fs.made_small_draws, (unsigned)fs.made_small_vertices);
     }
     fused_forms_print();
     wl_nv2a_gx_destroy(g_gx);

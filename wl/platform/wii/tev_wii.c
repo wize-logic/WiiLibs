@@ -58,15 +58,45 @@ static GXColor unpack(uint32_t rgba) {
     return c;
 }
 
+// the last program's orders as applied, their maps the logical ones (gx_shadow.h: texture maps as a cache)
+static struct {
+    u8 texcoord, texmap, channel;
+} g_order[WL_TEV_MAX_STAGES];
+static u8 g_order_count;
+
 #ifdef WL_GX_CHECK
-// the program GX holds, for the draws' check (gx_direct_wii.c)
+// the program GX holds, for the draws' check (gx_direct_wii.c; its stages' maps those they read)
 static WlTevProgram g_last;
 static bool g_last_set;
 
 const WlTevProgram *wl_gx_wii_tev_last(void) {
+    if (g_last_set) {
+        for (u8 i = 0; i < g_last.stage_count; i++) {
+            g_last.stages[i].texmap = g_order[i].texmap < WL_TEV_TEXMAPS ? (u8)wl_gx_shadow_map_of(g_order[i].texmap) : g_order[i].texmap;
+        }
+    }
     return g_last_set ? &g_last : NULL;
 }
 #endif
+
+static inline u8 map_read(u8 texmap) {
+    return texmap < WL_TEV_TEXMAPS ? (u8)wl_gx_shadow_map_of(texmap) : texmap;
+}
+
+void wl_tev_maps_follow(void) {
+    if (!wl_gx_shadow_maps_moved()) {
+        return;
+    }
+    wl_gx_shadow_maps_followed();
+    for (u8 i = 0; i < g_order_count; i++) {
+        u8 m = map_read(g_order[i].texmap);
+
+        if (g_order[i].texmap < WL_TEV_TEXMAPS &&
+            wl_tev_shadow_order_moved(i, g_order[i].texcoord, m, g_order[i].channel)) {
+            GX_SetTevOrder((u8)(GX_TEVSTAGE0 + i), g_order[i].texcoord, m, g_order[i].channel);
+        }
+    }
+}
 
 void wl_tev_apply_unchecked_ex(const WlTevProgram *p, uint32_t flags) {
     WlTevSend send;
@@ -75,6 +105,12 @@ void wl_tev_apply_unchecked_ex(const WlTevProgram *p, uint32_t flags) {
     g_last = *p;
     g_last_set = true;
 #endif
+    g_order_count = p->stage_count;
+    for (u8 i = 0; i < p->stage_count; i++) {
+        g_order[i].texcoord = p->stages[i].texcoord;
+        g_order[i].texmap = p->stages[i].texmap;
+        g_order[i].channel = p->stages[i].channel;
+    }
 
     // (what to send: everything, or with WL_TEV_APPLY_CHANGES what GX does not hold already)
     wl_tev_shadow_plan(p, flags, &send);
@@ -103,7 +139,7 @@ void wl_tev_apply_unchecked_ex(const WlTevProgram *p, uint32_t flags) {
             continue;
         }
         if (calls & WL_TEV_SEND_ORDER) {
-            GX_SetTevOrder(st, s->texcoord, s->texmap, s->channel);
+            GX_SetTevOrder(st, s->texcoord, map_read(s->texmap), s->channel);
         }
         if (calls & WL_TEV_SEND_SWAP) {
             GX_SetTevSwapMode(st, s->ras_swap, s->tex_swap);

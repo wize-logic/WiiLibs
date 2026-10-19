@@ -95,8 +95,11 @@ enum {
 uint32_t wl_gx_shadow_texture(uint32_t map, const uint32_t *regs, unsigned count, bool whole);
 // A bind counted that its caller found the map holding already (the same object as its last bind).
 void wl_gx_shadow_texture_kept(void);
-// The maps of the mask `maps` forgotten (set behind the shadow: wl/platform's quads, the ramp, ...).
-void wl_gx_shadow_texture_forget(uint32_t maps);
+// The maps of the mask `maps` forgotten (set behind the shadow: wl/platform's quads, the ramp, ...): with
+// the cache, those maps are their own logical maps again (wl/platform's own draws read the map they load),
+// and all of them (0xFF) frees every map. Whether a logical map moved (the TEV to follow it at once:
+// wl/platform's quads may have applied it before their load).
+bool wl_gx_shadow_texture_forget(uint32_t maps);
 // The binds asked for since the start, the ones that wrote something, of those the whole loads, and
 // the BP writes they made.
 void wl_gx_shadow_texture_counts(uint32_t *binds, uint32_t *changed, uint32_t *loads, uint32_t *writes);
@@ -109,6 +112,36 @@ void wl_gx_shadow_texture_model(uint32_t regs[WL_GX_TEXREGS], uintptr_t address,
                                 uint32_t mag_filter, float lod_bias, uint32_t tlut_slot, uint32_t region);
 // The region set the console's callback (wl_gx_wii_regions_apply) picks for a texture: 0, 1 or 2.
 uint32_t wl_gx_shadow_texture_region(uint32_t format, uint32_t mips, bool regions_libogc);
+
+// ---- texture maps as a cache ------------------------------------------------------------------------
+// A bind (wl_gx_direct_texture) names the map its TEV stages read (the logical map). With the cache on (the
+// default; the switch gxmapsfixed turns it off), GX's eight maps keep their last textures: the bind goes to
+// whichever map holds that texture already, or else to the map bound longest ago (one never given a texture,
+// or forgotten, first) that no other logical map reads, and the TEV's stages read the map it went to
+// (wl_tev_shadow_plan's orders, and tev_wii.c's at the next primitive when only the binds moved). A texture
+// is known by `key`: its registers that do not depend on the map (mode 0 and 1, image 0 and 3, its TLUT and
+// region set), equal exactly where the registers are. Off, every map is its logical map, as before.
+#define WL_GX_MAP_KEY_WORDS 5u
+void wl_gx_shadow_maps_cache(bool on);
+bool wl_gx_shadow_maps_cache_on(void);
+// wl_gx_direct_begin's: the maps keep their textures (wl/platform's own loads forget the maps they load), and
+// no logical map is read until it is bound again (its map free for the others').
+void wl_gx_shadow_maps_begin(void);
+// Logical map `logical`'s bind of the texture `key`: the map it goes to; *held: that map holds it already
+// (nothing to load: counted kept), else the caller loads it there (the key is remembered). Off: `logical`,
+// *held false.
+uint32_t wl_gx_shadow_map_bind(uint32_t logical, const uint32_t key[WL_GX_MAP_KEY_WORDS], bool *held);
+// The map logical map `logical` (< 8) reads (itself when the cache is off).
+uint32_t wl_gx_shadow_map_of(uint32_t logical);
+// Whether a logical map has moved to another map since the TEV last followed (wl_gx_shadow_maps_followed).
+bool wl_gx_shadow_maps_moved(void);
+void wl_gx_shadow_maps_followed(void);
+// TEV stage `stage`'s order moved to map `texmap` (its coordinate and channel as applied): whether it is to
+// be sent (the stage's map not known to be `texmap`); the shadow then holds it. Counted as a TEV write.
+bool wl_tev_shadow_order_moved(unsigned stage, uint8_t texcoord, uint8_t texmap, uint8_t channel);
+// (each backend's tev_*.c) The last program applied made to read the maps its logical maps read now, where
+// one moved since (wl_gx_shadow_maps_moved): the direct layer's primitives call it, and a forget that moved one.
+void wl_tev_maps_follow(void);
 
 // ---- the vertex arrays: GX_SetArray's base and stride (two CP writes) ------------------------------
 // Whether attribute `attribute`'s (< WL_GX_SHADOW_ARRAYS) array is not what GX holds, or nothing is known:
@@ -150,6 +183,32 @@ uint32_t wl_gx_shadow_layout_bytes(unsigned texgens, unsigned chans, bool lit);
 // (counted once a primitive: begin's 3 bytes and its vertices, not at each vertex).
 struct WlGxDirectLayout;
 uint32_t wl_gx_shadow_layout_vertex_bytes(const struct WlGxDirectLayout *layout);
+
+// ---- the lighting's loads ------------------------------------------------------------------------
+// wl_gx_direct_lighting's loads of a changed lighting counted (WL_GX_FIFO_MATRIX): the normal matrix (an XF load
+// of 9 words), lights 0-3 and the extra ones a channel adds (16 words each), the channels' ambient colours and
+// their materials made white (an XF register each). (Halo's change all at once: its lights' directions are the
+// model's, its ambients each draw's, so they are not shadowed part by part.)
+struct WlGxDirectLighting;
+void wl_gx_shadow_lighting(const struct WlGxDirectLighting *lighting);
+
+// ---- the tokens and the texture cache's invalidations ----------------------------------------------
+// A draw-sync token sent (wl_gx_fence, wl_gx_sync, a frame's end: two BP writes): counted, and whether anything
+// reached the FIFO since the token before it. GX's texture cache invalidated (GX_InvalidateTexAll: four BP
+// writes). Dolphin flushes its batch at both, whatever their values: a batch of draws of the same state is cut
+// in two by a token between them.
+void wl_gx_shadow_token(void);
+void wl_gx_shadow_texture_invalidate(void);
+// A fence's token put off (wl_gx_fence; not the switch gxfenceeager): sent where Dolphin cuts its batch anyway,
+// before the next primitive after a change of GX's state, or before the WL_GX_SHADOW_TOKEN_LATE'th primitive
+// at the latest (wl_gx_shadow_token_due), or when the fence is asked about or a token is sent for another
+// reason. The fence is the next token's number: GX past it is past everything given before the fence.
+#define WL_GX_SHADOW_TOKEN_LATE 8u
+void wl_gx_shadow_token_defer(void);
+// Whether a token is put off.
+bool wl_gx_shadow_token_deferred(void);
+// Before a primitive (its state given, its command not): whether the token put off is to be sent now.
+bool wl_gx_shadow_token_due(void);
 
 // Everything forgotten: the next value of each key is sent.
 void wl_gx_shadow_forget(void);

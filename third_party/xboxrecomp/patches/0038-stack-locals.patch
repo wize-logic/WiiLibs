@@ -1,0 +1,1376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <bcolb7@protonmail.com>
+Date: Mon, 19 Oct 2026 10:22:24 -0400
+Subject: [PATCH] recomp: --stack-locals keeps a function's own stack slots in
+ C locals
+
+Compiled x86 code keeps its locals and spills in its stack frame, and the
+lifter writes each access there as a guest memory access: a byte-reversed
+load or store on a big-endian host. The compiler forwards a stored value to
+the next load of the same slot only where nothing between may alias it, and
+never drops a store; any store through a pointer or any call ends it.
+
+stack_locals.py, run on each body before x87_locals, follows esp (pushes,
+pops, esp arithmetic, each callee's effect from preserve.py) and the values
+that are addresses in the function's own frame (esp + K, ebp after
+`mov ebp, esp`, a register loaded from a slot that holds one), so that every
+access to the frame lands on a known slot. A slot that only same-width
+integer or float accesses reach (no push or pop, no SSE or 80-bit access, at
+least two accesses) becomes a C local: loaded at the entry and after each
+call (plain loads the compiler drops where the local is written first),
+written back before each call when it may have changed, and before a return
+when it belongs to the caller (the arguments). The slots below the entry esp
+are not written back at a return.
+
+A function keeps the memory model when an access lands at an offset the pass
+cannot know (a local array indexed by a register, esp after an indirect call
+that cleans the stack itself), when a frame address is stored outside the
+frame or passed to anything but an access or a guest call, when a callee
+given a frame address returns a pointer that is then used, or at setjmp, a
+switch or a form it does not follow. It assumes, beyond preserve.py, that a
+pointer the function did not make from esp or ebp does not point into its
+frame, and that a callee reads its caller's frame only through its arguments
+and the pointers it was given.
+
+test_stack_locals.py lifts small functions: slots kept, an indexed access and
+a frame address stored outside the frame that must not be converted, and
+four programs compiled and run both ways with the same results.
+---
+ tools/recomp/__main__.py          |   6 +
+ tools/recomp/stack_locals.py      | 954 ++++++++++++++++++++++++++++++
+ tools/recomp/test_stack_locals.py | 271 +++++++++
+ tools/recomp/translator.py        |  30 +-
+ 4 files changed, 1259 insertions(+), 2 deletions(-)
+ create mode 100644 tools/recomp/stack_locals.py
+ create mode 100644 tools/recomp/test_stack_locals.py
+
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 9f17f80..25ed750 100644
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -316,6 +316,11 @@ def main():
+                         help="With --callee-regs: a callee that pops what it pushes and names "
+                              "no x87 slot it did not push (with all it calls) also keeps the "
+                              "caller's x87 stack positions in their locals (touched.balanced)")
++    parser.add_argument("--stack-locals", action="store_true",
++                        help="Keep a function's own stack slots that nothing else can reach "
++                             "(their address never leaves the function but to a call) in C "
++                             "locals, written to guest memory before a call and at a return "
++                             "(stack_locals.py)")
+     parser.add_argument("--seh-prolog", metavar="ADDR",
+                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
+     parser.add_argument("--seh-epilog", metavar="ADDR",
+@@ -401,6 +406,7 @@ def main():
+     translator.translator.rodata_consts = args.rodata_consts
+     translator.translator.callee_regs = args.callee_regs
+     translator.translator.x87_balanced = args.x87_balanced
++    translator.translator.stack_locals = args.stack_locals
+     translator.translator.mem_disp = args.mem_disp
+     translator.translator.stack_disp = args.stack_disp
+ 
+diff --git a/tools/recomp/stack_locals.py b/tools/recomp/stack_locals.py
+new file mode 100644
+index 0000000..3ed6f7c
+--- /dev/null
++++ b/tools/recomp/stack_locals.py
+@@ -0,0 +1,954 @@
++"""
++A function's own guest stack slots in C locals.
++
++Compiled x86 code keeps its locals and spills in its stack frame: `mov
++[esp+0x2c], eax` ... `mov ecx, [esp+0x2c]`, `fstp dword [esp+0x14]` ... `fld
++dword [esp+0x14]`. The lifter writes each of those as a guest memory access
++(MEM32(esp + 0x2C), a byte-reversed load or store on a big-endian host). The
++header already lets the compiler forward a stored value to the next load of
++the same slot, but only where nothing between may alias it: any store through
++a pointer, any call, ends that, and no stack store is ever dropped.
++
++This pass, run on the C text translate_function produces (before x87_locals,
++like preserve.py), keeps such slots in C locals (`_sl_m2c` for entry esp -
++0x2C) for the whole function, and writes guest memory only where it can be
++observed:
++
++  * the slots are named by their offset from esp at the function's entry. The
++    pass follows esp through PUSH32, POP32, `esp += K`, `esp = ebp + K` and the
++    calls (preserve.py's esp effect of each callee), and follows which values
++    are addresses in this function's frame ("frame pointers": `ecx = esp +
++    0x14`, ebp after `ebp = esp`, a register loaded from a slot that holds
++    one), so that an access through such a pointer is an access to a known
++    slot too (`lea ecx, [esp+0x14]` ... `fstp dword [ecx]`);
++  * a slot is kept in a local when every access that may touch its bytes is
++    that same slot, at the same width: a guest access at esp + K, ebp + K or a
++    frame pointer + K whose offset the pass knows. A PUSH32 or POP32 there (an
++    argument, a saved register), an access of another width, an SSE or 80-bit
++    access, keeps it in memory; so does a slot with one access only;
++  * at the entry each local is loaded from its slot, and after every call it
++    is loaded again (the callee may have written it through a pointer it was
++    given); these are plain loads the compiler drops where the local is
++    written before it is read;
++  * before every call, the locals written since memory was last current go
++    back to their slots (a callee reads its arguments, and anything it was
++    given a pointer to, from memory); before a return, those of the slots
++    above the return address (the caller's: its arguments to this function).
++    The slots below the entry esp are not written back at a return: nothing
++    may read them after it.
++
++A function keeps all its slots in memory when the pass cannot tell where an
++access lands: an access at esp + K where esp is not known (after a call by
++address or an indirect call that cleans the stack itself, `and esp, -8`), an
++access through a frame pointer whose offset is not known (a local array
++indexed by a register, a pointer that is a frame address on one path only), a
++frame address stored outside the frame or passed to anything but a guest
++function or an access, setjmp, a switch, or a form it does not follow.
++
++What the pass assumes of guest code, beyond what preserve.py assumes:
++
++  * a pointer that this function did not make from esp or ebp does not point
++    into its frame (a store or load through a register loaded from guest
++    memory, or received as an argument, misses its slots); in particular a
++    callee does not store a pointer into its caller's frame into that frame
++    (a stack-built ring of pointers to itself);
++  * a callee that was given no frame address returns none (eax, ecx, edx);
++    a callee given one may (they are then pointers the pass does not know);
++  * a callee reads its caller's frame only through its arguments (in memory
++    at the call) and the pointers it was given; another guest thread or an
++    interrupt never reads or writes a running frame (preserve.py's and
++    x87_locals' assumptions: the stack of a guest thread is its own);
++  * a callee's own frame, below the caller's esp, holds nothing the caller
++    reads afterwards (the caller loads every slot again after a call, so a
++    slot below esp at a call reads what the callee left, as before).
++
++The memory model is kept, unchanged, for a function that breaks any rule the
++pass can see; the reason is counted (stack_locals_stats).
++"""
++
++import re
++
++from .x87_locals import (_NotLocal, _items, _match_paren, _nodes, _function_bounds, _protect,
++                         _calls, _reg_written, _TRANSPARENT, _KEYWORDS, _FP_MACROS)
++from .preserve import NEVER, _address_taken
++
++__all__ = ["localise_stack", "ret_deltas", "STACK_LOCALS_PREFIX"]
++
++STACK_LOCALS_PREFIX = "_sl_"
++
++_REGS = ("eax", "ecx", "edx", "ebx", "esi", "edi", "ebp")
++_CALLEE_SAVED = ("ebx", "esi", "edi")
++_SCRATCH = ("eax", "ecx", "edx")
++_NUM = r"(?:0x[0-9A-Fa-f]+|\d+)[uU]?"
++
++# What a register or a slot may hold, as far as addresses in this frame go:
++#   None       not an address in this function's frame
++#   ("f", a)   exactly entry esp + a
++#   _T         maybe an address in this frame, where is not known
++#   _I         the frame the function inherited (g_ebp or g_seh_ebp at the entry):
++#              its caller's, which holds this function's arguments
++_T = "T"
++_I = "I"
++
++
++def _vjoin(a, b):
++    if a == b:
++        return a
++    if a in (None, _I) and b in (None, _I):
++        return _I
++    return _T
++
++
++def _framey(v):
++    return v is not None and v != _I
++
++
++# The accesses: name -> (bytes, kind, index of the address argument).
++# kind: "u" unsigned integer, "s" signed integer, "f" float load, "F" float
++# store, "d"/"D" the same for double, "x" a form kept in memory (SSE, MMX,
++# 80-bit, atomics, 64-bit integers).
++_ACCESS = {
++    "MEM8": (1, "u", 0), "MEM16": (2, "u", 0), "MEM32": (4, "u", 0), "MEM64": (8, "x", 0),
++    "SMEM8": (1, "s", 0), "SMEM16": (2, "s", 0), "SMEM32": (4, "s", 0), "SMEM64": (8, "x", 0),
++    "MEMF": (4, "f", 0), "MEMD": (8, "d", 0),
++    "MEMF_SET": (4, "F", 0), "MEMD_SET": (8, "D", 0),
++    "XMM_MEM": (16, "x", 0), "MMX_MEM": (8, "x", 0), "XMM_STORE": (16, "x", 0),
++    "XMM_STORE_LOW": (8, "x", 0), "XMM_STORE_HIGH": (8, "x", 0), "MMX_STORE": (8, "x", 0),
++    "XMM_LOAD_LOW": (8, "x", 1), "XMM_LOAD_HIGH": (8, "x", 1),
++    "recomp_ld80": (10, "x", 0), "recomp_st80": (10, "x", 0),
++    "RECOMP_ATOMIC_CAS32": (4, "x", 0), "RECOMP_ATOMIC_ADD32": (4, "x", 0),
++}
++_STORES_X = ("XMM_STORE", "XMM_STORE_LOW", "XMM_STORE_HIGH", "MMX_STORE", "recomp_st80",
++             "RECOMP_ATOMIC_CAS32", "RECOMP_ATOMIC_ADD32")
++_ACCESS_RE = re.compile(r"\b(" + "|".join(sorted(_ACCESS, key=len, reverse=True)) + r")\s*\(")
++_ASSIGN_OP = re.compile(r"\s*(=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)")
++# esp and the six registers are globals (`eax` a macro for g_eax); ebp is a C
++# local of each function, and g_ebp another variable (the frame it publishes).
++_G = r"(?:g_(?=(?:esp|eax|ecx|edx|ebx|esi|edi)\b))?"
++_FRAME_TOK = re.compile(r"\b" + _G + r"(esp|eax|ecx|edx|ebx|esi|edi|ebp)\b")
++_CAST = re.compile(r"^\(\s*(?:uint32_t|int32_t)\s*\)\s*")
++# Value-computing macros and helpers a frame address may pass through without escaping.
++_VALUE_FNS = (_TRANSPARENT | frozenset(_FP_MACROS)) - frozenset(
++    "memcpy memset memmove PUSH32 POP32 XBOX_PTR".split()) - frozenset(_ACCESS)
++# Calls that only count or trace: no guest code runs, esp stays.
++_BOOKKEEPING = frozenset(("RECOMP_ICALL_GUARD_HIT", "RECOMP_ICALL_GUARD_MISS"))
++
++
++class _Decline(_NotLocal):
++    pass
++
++
++_RET = re.compile(r"\besp \+= (\d+); return; /\* ret\b")
++_ESP_SET = re.compile(r"\b" + "(?:g_)?" + r"esp\s*=(?!=)\s*(?!(?:g_)?esp\b|ebp\b)|POP32\(\s*esp\s*,\s*esp\s*\)")
++
++
++def ret_deltas(functions):
++    """{name: esp after its return minus esp at its entry} for each function
++    whose every return is a `ret` (esp += 4 + n; return) with the same n and
++    which sets esp only from esp or ebp (its frame): by the calling convention
++    its esp is back where it started at each ret. preserve.py proves the same
++    where it can follow every call; this covers a function whose esp it loses
++    (after an indirect call), for its callers. A function that moves its
++    caller's esp (_alloca's probe, the SEH prolog) sets esp from another
++    register or from memory, and gets nothing."""
++    out = {}
++    for name, lines in functions.items():
++        ks, ok = set(), True
++        for line in lines:
++            if "return;" in line:
++                m = _RET.search(line)
++                if not m:
++                    ok = False
++                    break
++                ks.add(int(m.group(1)))
++            elif _ESP_SET.search(_protect(line)[0]):
++                ok = False
++                break
++        if ok and len(ks) == 1:
++            out[name] = ks.pop()
++    return out
++
++
++def _num(text):
++    text = text.rstrip("uU")
++    return int(text, 16) if text.lower().startswith("0x") else int(text)
++
++
++def _strip(e):
++    e = e.strip()
++    while True:
++        while e.startswith("(") and _match_paren(e, 0) == len(e):
++            e = e[1:-1].strip()
++        m = _CAST.match(e)
++        if not m:
++            return e
++        e = e[m.end():].strip()
++
++
++def _args(code, open_paren):
++    """The (start, end) spans of the top-level arguments of the call whose '('
++    is at open_paren, and the index just past its ')'."""
++    end = _match_paren(code, open_paren)
++    out, depth, start = [], 0, open_paren + 1
++    for i in range(open_paren + 1, end - 1):
++        c = code[i]
++        if c in "([{":
++            depth += 1
++        elif c in ")]}":
++            depth -= 1
++        elif c == "," and depth == 0:
++            out.append((start, i))
++            start = i + 1
++    out.append((start, end - 1))
++    return out, end
++
++
++def _top_terms(e):
++    """e as a sum at its top level: [(sign, term)], or None when another
++    operator binds there."""
++    e = e.strip()
++    terms, start, sign, i = [], 0, 1, 0
++    while i < len(e):
++        c = e[i]
++        if c in "([":
++            i = _match_paren(e, i)
++            continue
++        if c in "+-":
++            prev = e[start:i].strip()
++            if not prev or prev.endswith(("*", "/", "%", "<", ">", "&", "|", "^", "=", "?", ":", "!", "~")):
++                i += 1
++                continue  # a sign, not a sum
++            terms.append((sign, prev))
++            sign = 1 if c == "+" else -1
++            start = i + 1
++        elif c in "*/%<>&|^=?:!~," and not (c == "-" or c == "+"):
++            return None
++        i += 1
++    terms.append((sign, e[start:].strip()))
++    out = []
++    for s, t in terms:
++        while t[:1] in ("-", "+"):
++            s, t = (-s if t[0] == "-" else s), t[1:].strip()
++        if not t:
++            return None
++        out.append((s, t))
++    return out
++
++
++class _State:
++    __slots__ = ("off", "regs", "slots")
++
++    def __init__(self, off, regs, slots):
++        self.off = off      # esp - entry esp, or None
++        self.regs = regs    # register -> value (None left out)
++        self.slots = slots  # slot offset -> value it holds (None left out)
++
++    def key(self):
++        return (self.off, tuple(sorted(self.regs.items(), key=str)),
++                tuple(sorted(self.slots.items(), key=str)))
++
++    def copy(self):
++        return _State(self.off, dict(self.regs), dict(self.slots))
++
++    def set_reg(self, r, v):
++        if v is None:
++            self.regs.pop(r, None)
++        else:
++            self.regs[r] = v
++
++    def set_slot(self, o, v):
++        if v is None:
++            self.slots.pop(o, None)
++        else:
++            self.slots[o] = v
++
++
++def _join(a, b):
++    if a is None:
++        return None if b is None else b.copy()
++    if b is None:
++        return a.copy()
++    off = a.off if a.off == b.off else None
++    regs = {}
++    for r in set(a.regs) | set(b.regs):
++        v = _vjoin(a.regs.get(r), b.regs.get(r))
++        if v is not None:
++            regs[r] = v
++    slots = {}
++    for o in set(a.slots) | set(b.slots):
++        v = _vjoin(a.slots.get(o), b.slots.get(o)) if off is not None else _T
++        if v is not None:
++            slots[o] = v
++    return _State(off, regs, slots)
++
++
++class _Access:
++    __slots__ = ("o", "size", "kind", "write", "node", "bad")
++
++    def __init__(self, o, size, kind, write, node, bad):
++        self.o, self.size, self.kind, self.write, self.node, self.bad = o, size, kind, write, node, bad
++
++
++class _Walk:
++    """A walk over the body's statements: the state after each, and (when
++    recording) the accesses, and for each node the decision for each access in
++    it in textual order (None: guest memory; ("slot", o): the slot at o)."""
++
++    def __init__(self, summaries, kept, deltas):
++        self.summaries = summaries
++        self.kept = kept
++        self.deltas = deltas
++        self.record = False
++        self.prologue = False
++        self.accesses = []
++        self.decisions = {}
++        self.args_aliased = False
++        self.node = None
++        self.node_sync = False
++        self.sync_seen = False
++
++    # ------------------------------------------------------------ values
++    def esp_value(self, st):
++        return _T if st.off is None else ("f", st.off)
++
++    def atom(self, t, st):
++        t = _strip(t)
++        m = re.fullmatch(_G + r"(esp|eax|ecx|edx|ebx|esi|edi|ebp)", t)
++        if m:
++            return self.esp_value(st) if m.group(1) == "esp" else st.regs.get(m.group(1))
++        m = _ACCESS_RE.match(t)
++        if m and _match_paren(t, m.end() - 1) == len(t):
++            name = m.group(1)
++            size, kind, ai = _ACCESS[name]
++            args, _ = _args(t, m.end() - 1)
++            where = self.resolve(t[args[ai][0]:args[ai][1]], st)
++            if where[0] == "slot":
++                return st.slots.get(where[1]) if size == 4 and kind in "us" else None
++            return _T if where[0] == "unknown" else None
++        return self.anything(t, st)
++
++    def value(self, e, st):
++        """What expression e holds."""
++        e = _strip(e)
++        terms = _top_terms(e)
++        if terms is None:
++            return self.anything(e, st)
++        base, k, other = None, 0, False
++        for s, t in terms:
++            t = _strip(t)
++            if re.fullmatch(_NUM, t):
++                k += s * _num(t)
++                continue
++            v = self.atom(t, st)
++            if v is None:
++                other = True
++            elif base is not None or s < 0:
++                return _T
++            else:
++                base = v
++        if base is None or base == _I:
++            return base
++        if other or base == _T:
++            return _T
++        return ("f", base[1] + k)
++
++    def anything(self, e, st):
++        """An expression of another form: a frame address if anything in it may be one."""
++        masked, vals = self.mask(e, st)
++        v = None
++        for m in _FRAME_TOK.finditer(masked):
++            r = m.group(1)
++            rv = self.esp_value(st) if r == "esp" else st.regs.get(r)
++            v = rv if v is None else _vjoin(v, rv) if rv is not None else v
++        for lv in vals:
++            if lv is not None:
++                v = lv if v is None else _vjoin(v, lv)
++        return _T if _framey(v) else v
++
++    def mask(self, e, st):
++        """e with each top-level access replaced by 0, and the values those loads give."""
++        out, vals, i = [], [], 0
++        for m in _ACCESS_RE.finditer(e):
++            if m.start() < i:
++                continue
++            end = _match_paren(e, m.end() - 1)
++            out.append(e[i:m.start()] + " 0 ")
++            vals.append(self.atom(e[m.start():end], st))
++            i = end
++        out.append(e[i:])
++        return "".join(out), vals
++
++    def resolve(self, addr, st):
++        """Where an access at addr lands: ("slot", o), ("other",), ("unknown",)
++        or ("inherited",)."""
++        v = self.value(addr, st)
++        if v is None:
++            return ("other",)
++        if v == _I:
++            return ("inherited",)
++        if v == _T:
++            return ("unknown",)
++        return ("slot", v[1])
++
++    # ------------------------------------------------------------ accesses
++    def skip(self, text):
++        """Text the walk does not reach: its accesses stay in memory."""
++        if self.record:
++            for _ in _ACCESS_RE.finditer(text):
++                self.decisions[self.node].append(None)
++
++    def accesses_in(self, text, st):
++        """Every access in text, outer before inner, as the rewrite meets them."""
++        for m in _ACCESS_RE.finditer(text):
++            name = m.group(1)
++            size, kind, ai = _ACCESS[name]
++            args, end = _args(text, m.end() - 1)
++            addr = text[args[ai][0]:args[ai][1]]
++            where = self.resolve(addr, st)
++            if where[0] == "unknown":
++                if st.off is None and re.search(r"\b" + _G + r"esp\b", addr):
++                    raise _Decline("an access at esp + K where esp is not known")
++                raise _Decline("an access in the frame where the offset is not known")
++            if where[0] == "inherited":
++                self.args_aliased = True
++            write = (kind in "FD" or name in _STORES_X or bool(_ASSIGN_OP.match(text, end))
++                     or bool(re.search(r"(\+\+|--)\s*$", text[:m.start()])))
++            dec = ("slot", where[1]) if where[0] == "slot" else None
++            if self.record:
++                if dec is not None:
++                    bad = self.node_sync and (write or self.sync_seen)
++                    self.accesses.append(_Access(where[1], size, kind, write, self.node, bad))
++                self.decisions[self.node].append(dec)
++
++    def check_escape(self, e, st):
++        """A frame address passed to anything but an access, a value macro or a
++        guest call by name declines the function."""
++        masked = self.mask(e, st)[0]
++        if not _FRAME_TOK.search(masked):
++            return
++        for m in re.finditer(r"(?<![\w.])([A-Za-z_]\w*)\s*\(", masked):
++            name = m.group(1)
++            if name in _KEYWORDS or name in _VALUE_FNS or name.startswith(("XMM_", "MMX_")):
++                continue
++            args, _ = _args(masked, m.end() - 1)
++            for a, b in args:
++                if _framey(self.anything(masked[a:b], st)):
++                    raise _Decline("a frame address passed to %s" % name)
++
++    # ------------------------------------------------------------ statements
++    def stmt(self, t, st, edges, cond):
++        """One statement without braces: the state after it, or None when it
++        does not fall through."""
++        t = t.strip()
++        if not t or t == "(void)0":
++            return st
++        if re.match(r"if\s*\(", t):
++            i = t.index("(")
++            j = _match_paren(t, i)
++            st = self.expr(t[i + 1:j - 1], st, cond, head=True)
++            return _join(st, self.stmt(t[j:], st.copy(), edges, True))
++        m = re.fullmatch(r"goto\s+(\w+)", t)
++        if m:
++            edges.append((m.group(1), st))
++            return None
++        if t == "return":
++            self.sync_seen = True
++            return None
++        return self.expr(t, st, cond)
++
++    def expr(self, t, st, cond, head=False):
++        st = st.copy()
++        if re.search(r"\b(setjmp|longjmp)\b", t):
++            raise _Decline("setjmp")
++        if _address_taken(t):
++            raise _Decline("a register's address is taken")
++        self.accesses_in(t, st)
++        if head:
++            self.check_escape(t, st)
++            if self.call_names(t):
++                raise _Decline("a call in a condition")
++            return st
++        m = re.fullmatch(r"PUSH32\(\s*esp\s*,\s*(.*)\)", t, re.S)
++        if m:
++            if cond:
++                raise _Decline("a push in a conditional")
++            if st.off is None:
++                raise _Decline("a push where esp is not known")
++            self.check_escape(m.group(1), st)
++            v = self.value(m.group(1), st)
++            st.off -= 4
++            if self.record:
++                self.accesses.append(_Access(st.off, 4, "p", True, self.node, True))
++            st.set_slot(st.off, v)
++            return st
++        m = re.fullmatch(r"POP32\(\s*esp\s*,\s*(\w+)\s*\)", t)
++        if m:
++            if cond:
++                raise _Decline("a pop in a conditional")
++            if st.off is None:
++                raise _Decline("a pop where esp is not known")
++            if self.record:
++                self.accesses.append(_Access(st.off, 4, "p", False, self.node, True))
++            v = st.slots.get(st.off)
++            st.off += 4
++            r = m.group(1)
++            if r == "esp":
++                st.off = None
++            elif r in _REGS:
++                st.set_reg(r, v)
++            return st
++        m = re.fullmatch(_G + r"esp\s*(=|\+=|-=)(?!=)\s*(.*)", t, re.S)
++        if m:
++            if cond:
++                raise _Decline("esp moved in a conditional")
++            op, rhs = m.group(1), m.group(2)
++            v = self.value(rhs if op == "=" else "esp %s (%s)" % (op[0], rhs), st)
++            st.off = v[1] if isinstance(v, tuple) else None
++            return st
++        m = re.fullmatch(r"(?:(?:uint32_t|int32_t)\s+)?" + _G + r"(eax|ecx|edx|ebx|esi|edi|ebp)\s*"
++                         r"(=|\+=|-=|\|=|&=|\^=|<<=|>>=|\*=)(?!=)\s*(.*)", t, re.S)
++        if m:
++            r, op, rhs = m.group(1), m.group(2), m.group(3)
++            self.check_escape(rhs, st)
++            if r == "ebp" and re.fullmatch(r"g_(?:seh_)?ebp", rhs.strip()):
++                v = _I if self.prologue else _T
++            elif op == "=":
++                v = self.value(rhs, st)
++            elif op in ("+=", "-="):
++                v = self.value("%s %s (%s)" % (r, op[0], rhs), st)
++            else:
++                v = _T if _framey(st.regs.get(r)) or _framey(self.anything(rhs, st)) else None
++            st.set_reg(r, _vjoin(v, st.regs.get(r)) if cond else v)
++            return st
++        m = re.fullmatch(_G + r"(eax|ecx|edx|ebx|esi|edi|ebp)\s*(\+\+|--)|(\+\+|--)\s*" + _G +
++                         r"(eax|ecx|edx|ebx|esi|edi|ebp)", t)
++        if m:
++            r = m.group(1) or m.group(4)
++            v = st.regs.get(r)
++            if isinstance(v, tuple):
++                v = ("f", v[1] + (1 if (m.group(2) or m.group(3)) == "++" else -1))
++            st.set_reg(r, _vjoin(v, st.regs.get(r)) if cond else v)
++            return st
++        m = re.fullmatch(r"(?:(?:uint32_t|int32_t|int|uint16_t|uint8_t|double|float)\s+)?(\w+)\s*"
++                         r"(?:=|\+=|-=|\|=|&=|\^=)(?!=)\s*(.*)", t, re.S)
++        if m and m.group(1) in ("_fa", "_fb", "_fas", "_fbs"):
++            return st  # a flag temporary: compared, never an address
++        if m and m.group(1) == "_icall_esp" and m.group(2).strip() == "g_esp":
++            return st  # what an indirect call's failure path puts back
++        if m and m.group(1) not in ("g_ebp", "g_seh_ebp") and _framey(self.value(m.group(2), st)):
++            raise _Decline("a frame address in a temporary")
++        sm = _ACCESS_RE.match(t)
++        if sm and not self.call_names(t):
++            return self.store(t, sm, st, cond)
++        names = self.call_names(t)
++        if names:
++            return self.call(t, st, names)
++        # anything else: a register it may write loses what is known of it
++        self.check_escape(t, st)
++        anyv = self.anything(t, st)
++        for m in _FRAME_TOK.finditer(t):
++            if _reg_written(t, m.start(), m.end()):
++                if m.group(1) == "esp":
++                    st.off = None
++                else:
++                    st.set_reg(m.group(1), _T if _framey(anyv) else None)
++        return st
++
++    def store(self, t, sm, st, cond):
++        name = sm.group(1)
++        size, kind, ai = _ACCESS[name]
++        args, end = _args(t, sm.end() - 1)
++        where = self.resolve(t[args[ai][0]:args[ai][1]], st)
++        if end != len(t) and not _ASSIGN_OP.match(t, end):
++            raise _Decline("a statement of another form")
++        if kind in "FDx":
++            vtext = ",".join(t[a:b] for a, b in args[ai + 1:]) if end == len(t) else t[end:]
++            v = None  # a float or vector value is not an address
++            self.check_escape(vtext, st)
++        else:
++            am = _ASSIGN_OP.match(t, end)
++            if not am:
++                raise _Decline("a statement of another form")
++            rhs = t[am.end():]
++            self.check_escape(rhs, st)
++            if am.group(1) == "=":
++                v = self.value(rhs, st)
++            elif where[0] == "slot" and am.group(1) in ("+=", "-=") and size == 4:
++                v = st.slots.get(where[1])
++                v = _T if _framey(v) or _framey(self.anything(rhs, st)) else None
++            else:
++                v = _T if _framey(self.anything(rhs, st)) else None
++        if where[0] == "slot":
++            o = where[1]
++            for so in list(st.slots):
++                if so < o + size and o < so + 4:
++                    full = o <= so and so + 4 <= o + size
++                    st.set_slot(so, None if full and not cond else _T if _framey(st.slots[so]) else st.slots[so])
++            if size == 4 and kind in "us":
++                st.set_slot(o, _vjoin(v, st.slots.get(o)) if cond else v)
++        elif _framey(v):
++            raise _Decline("a frame address stored outside the frame")
++        return st
++
++    def call_names(self, t):
++        return {n for n in _calls(t) if n not in _ACCESS}
++
++    def call(self, t, st, names):
++        if names <= _BOOKKEEPING:
++            return st
++        self.sync_seen = True
++        escaped = any(_framey(v) for v in st.regs.values()) or (
++            st.off is not None and any(_framey(v) and st.off <= o < st.off + 64
++                                       for o, v in st.slots.items()))
++        m = re.fullmatch(r"RECOMP_ABI_CALL\(\s*0x[0-9A-Fa-f]+u?\s*,\s*(\w+)\s*\)", t)
++        callee = m.group(1) if m else None
++        if callee is None:
++            m = re.fullmatch(r"(\w+)\(\s*\)", t)
++            callee = m.group(1) if m and (m.group(1) in self.summaries or m.group(1) in self.deltas) else None
++        if callee is None:
++            m = re.fullmatch(r"(RECOMP_ICALL_SAFE(?:_AT)?(?:_CC)?|RECOMP_ITAIL)\s*\(", t[:t.find("(") + 1])
++            if m:
++                args, _ = _args(t, t.index("("))
++                if _framey(self.anything(t[args[0][0]:args[0][1]], st)):
++                    raise _Decline("an indirect call to a frame address")
++            else:
++                self.check_escape(t, st)
++        s = self.summaries.get(callee) if callee else None
++        if s is not None and (s.delta == NEVER or isinstance(s.delta, int)):
++            delta = s.delta
++        elif callee in self.deltas:
++            delta = self.deltas[callee]
++        elif re.match(r"RECOMP_ICALL_SAFE(?:_AT)?_CC\s*\(", t):
++            delta = 4
++        else:
++            delta = None
++        if delta == NEVER:
++            return None
++        if not isinstance(delta, int):
++            delta = None
++        st = st.copy()
++        kept = self.kept.get(callee, frozenset()) if callee else frozenset()
++        for r in _SCRATCH:
++            st.set_reg(r, _T if escaped else None)
++        for r in _CALLEE_SAVED:
++            if "g_" + r not in kept:
++                st.set_reg(r, _T if escaped else None)
++        st.off = None if (st.off is None or delta is None) else st.off + delta
++        return st
++
++    # ------------------------------------------------------------ sequences
++    def seq(self, code, st, edges, cond):
++        last_if = None
++        for item in _items(code):
++            kind = item[0]
++            if st is None:
++                self.skip(" ".join(item[1:]))
++                last_if = None
++                continue
++            if kind == "stmt":
++                t = item[1].strip()
++                if re.match(r"else\b", t):
++                    if last_if is None:
++                        raise _Decline("an else of another form")
++                    before, then = last_if
++                    st, last_if = _join(then, self.stmt(t[4:], before.copy(), edges, True)), None
++                    continue
++                if re.match(r"if\s*\(", t):
++                    i = t.index("(")
++                    j = _match_paren(t, i)
++                    before = self.expr(t[i + 1:j - 1], st, cond, head=True)
++                    then = self.stmt(t[j:], before.copy(), edges, True)
++                    st, last_if = _join(before, then), (before, then)
++                    continue
++                st, last_if = self.stmt(t, st, edges, cond), None
++            elif kind == "block":
++                head, inner = item[1].strip(), item[2]
++                if head == "":
++                    st, last_if = self.seq(inner, st, edges, cond), None
++                elif re.match(r"if\s*\(", head) and _match_paren(head, head.index("(")) == len(head):
++                    before = self.expr(head[head.index("(") + 1:-1], st, cond, head=True)
++                    then = self.seq(inner, before.copy(), edges, True)
++                    st, last_if = _join(before, then), (before, then)
++                elif head == "else":
++                    if last_if is None:
++                        raise _Decline("an else of another form")
++                    before, then = last_if
++                    st, last_if = _join(then, self.seq(inner, before.copy(), edges, True)), None
++                elif re.match(r"(while|for)\s*\(", head) or head == "do":
++                    if re.search(r"\b(goto|return|PUSH32|POP32|RECOMP_ABI_CALL)\b", inner) or \
++                            self.call_names(inner) - _BOOKKEEPING:
++                        raise _Decline("a loop that calls, leaves or moves esp")
++                    i = head.find("(")
++                    if i >= 0:
++                        self.expr(head[i + 1:_match_paren(head, i) - 1], st, cond, head=True)
++                    rec = self.record
++                    self.record = False
++                    once = self.seq(inner, st.copy(), [], True)
++                    self.record = rec
++                    st2 = _join(st, once)
++                    st, last_if = _join(st2, self.seq(inner, st2.copy(), edges, True)), None
++                else:
++                    raise _Decline("a block of another form")
++            elif kind == "open":
++                if item[1].strip():
++                    raise _Decline("a block left open with a head")
++                last_if = None
++            elif kind == "close":
++                if item[1].strip():
++                    st = self.stmt(item[1], st, edges, cond)
++                last_if = None
++        return st
++
++
++def _local_type(kinds, size):
++    """The C type of a slot's local, and whether its float accesses go through its bits."""
++    if size == 1 and kinds <= set("us"):
++        return "uint8_t", False
++    if size == 2 and kinds <= set("us"):
++        return "uint16_t", False
++    if size == 4 and kinds <= set("usfF"):
++        if kinds <= set("fF"):
++            return "float", False
++        return "uint32_t", bool(kinds & set("fF"))
++    if size == 8 and kinds <= set("dD"):
++        return "double", False
++    return None, False
++
++
++def _name(o):
++    return "%s%s%x" % (STACK_LOCALS_PREFIX, "m" if o < 0 else "", abs(o))
++
++
++def _at(d):
++    return "esp + 0x%X" % d if d >= 0 else "esp - 0x%X" % -d
++
++
++def localise_stack(lines, summaries=None, kept=None, deltas=None, min_accesses=2):
++    """lines: one function as translate_function emits it (before x87_locals).
++    summaries: preserve.py's {name: Summary} (each callee's effect on esp);
++    kept: {name: the register globals a call to it gives back}; deltas:
++    ret_deltas' {name: esp effect} where summaries have none. Returns (lines,
++    None, slots kept in locals, accesses rewritten), or (lines unchanged, the
++    reason, 0, 0)."""
++    try:
++        out, n_slots, n_acc = _localise(lines, summaries or {}, kept or {}, deltas or {}, min_accesses)
++        return out, None, n_slots, n_acc
++    except _NotLocal as e:
++        return lines, str(e), 0, 0
++
++
++def _localise(lines, summaries, kept, deltas, min_accesses):
++    bounds = _function_bounds(lines)
++    if bounds is None:
++        raise _Decline("no body")
++    lo, hi = bounds
++    text = "\n".join(lines[lo:hi])
++    if STACK_LOCALS_PREFIX in text:
++        raise _Decline("the names are taken")
++    if not re.search(r"\b" + _G + r"(esp|ebp)\b", text):
++        raise _Decline("no frame")
++    nodes = _nodes(lines, lo, hi)
++    if re.search(r"\b(switch|case|default)\b", " ".join(n.code for n in nodes)):
++        raise _Decline("a switch")
++    labels = {n.label: x for x, n in enumerate(nodes) if n.kind == "label"}
++    first_label = next((x for x, n in enumerate(nodes) if n.kind == "label"), None)
++    if first_label is None:
++        raise _Decline("no label")
++    syncs = []
++    for n in nodes:
++        if n.kind in ("label", "pp"):
++            syncs.append(False)
++            continue
++        for g in n.gotos:
++            if g not in labels:
++                raise _Decline("a goto to a label outside the body")
++        calls = {c for c in _calls(n.code) if c not in _ACCESS} - _BOOKKEEPING
++        syncs.append("call" if calls else "return" if re.search(r"\breturn\b", n.code) else False)
++
++    walk = _Walk(summaries, kept, deltas)
++
++    def visit(x, st, edges):
++        n = nodes[x]
++        if n.kind in ("label", "pp") or st is None:
++            return st
++        walk.prologue = x < first_label
++        walk.node = x
++        walk.node_sync = bool(syncs[x])
++        walk.sync_seen = False
++        if walk.record:
++            walk.decisions[x] = []
++        return walk.seq(n.code, st.copy(), edges, False)
++
++    # the states where each node starts: a fixpoint over the gotos
++    state_in = [None] * len(nodes)
++    state_in[0] = _State(0, {}, {})
++    work, steps = [0], 0
++    while work:
++        steps += 1
++        if steps > 50 * len(nodes) + 1000:
++            raise _Decline("no fixpoint")
++        x = min(work)
++        work.remove(x)
++        edges = []
++        out = visit(x, state_in[x], edges)
++        succ = list(edges)
++        if out is not None and x + 1 < len(nodes):
++            succ.append((None, out))
++        for lab, s in succ:
++            y = x + 1 if lab is None else labels[lab]
++            new = _join(state_in[y], s)
++            if state_in[y] is None or new.key() != state_in[y].key():
++                state_in[y] = new
++                if y not in work:
++                    work.append(y)
++
++    # once more in order, recording, with those states
++    walk.record = True
++    state_out = [visit(x, state_in[x], []) for x in range(len(nodes))]
++
++    # the slots kept in locals
++    by_slot = {}
++    for a in walk.accesses:
++        by_slot.setdefault((a.o, a.size), []).append(a)
++    chosen = {}
++    for (o, size), accs in by_slot.items():
++        if len(accs) < min_accesses:
++            continue
++        if o < 4 and o + size > 0:
++            continue  # the return address
++        if walk.args_aliased and o + size > 0:
++            continue  # the arguments, in the frame inherited through ebp
++        if any(a.bad or a.kind in "px" for a in accs):
++            continue
++        if any((a.o, a.size) != (o, size) for a in walk.accesses if a.o < o + size and o < a.o + a.size):
++            continue
++        ctype, pun = _local_type({a.kind for a in accs}, size)
++        if ctype is not None:
++            chosen[o] = (size, ctype, pun)
++    if not chosen:
++        raise _Decline("no slot to keep")
++
++    # what may have been written since memory was last current, where each node starts
++    writes = {}
++    for a in walk.accesses:
++        if a.write and a.o in chosen and chosen[a.o][0] == a.size:
++            writes.setdefault(a.node, set()).add(a.o)
++    dirty = [None] * len(nodes)
++    dirty[0] = frozenset()
++    work = [0]
++    while work:
++        x = work.pop()
++        d = dirty[x]
++        n = nodes[x]
++        if n.kind not in ("label", "pp"):
++            if syncs[x] == "call":
++                d = frozenset()
++            elif syncs[x] == "return":
++                d = frozenset(o for o in d if o < 4)
++            d = d | frozenset(writes.get(x, ()))
++        falls = (state_out[x] if n.kind not in ("label", "pp") else state_in[x]) is not None
++        succ = [labels[g] for g in n.gotos] + ([x + 1] if falls and x + 1 < len(nodes) else [])
++        for y in succ:
++            if state_in[y] is None:
++                continue
++            new = d if dirty[y] is None else dirty[y] | d
++            if new != dirty[y]:
++                dirty[y] = new
++                work.append(y)
++
++    def load(o, off):
++        size, ctype, _ = chosen[o]
++        src = {"float": "MEMF", "double": "MEMD"}.get(ctype, "MEM%d" % (size * 8))
++        return "%s = %s(%s);" % (_name(o), src, _at(o - off))
++
++    def store(o, off):
++        size, ctype, _ = chosen[o]
++        if ctype in ("float", "double"):
++            return "%s(%s, %s);" % ("MEMF_SET" if ctype == "float" else "MEMD_SET", _at(o - off), _name(o))
++        return "MEM%d(%s) = %s;" % (size * 8, _at(o - off), _name(o))
++
++    slots = sorted(chosen)
++    before, after = {}, {}
++    entry = nodes[first_label].first
++    before.setdefault(entry, []).append("    %s /* the frame's slots in locals (stack_locals) */" % " ".join(
++        "%s %s;" % (chosen[o][1], _name(o)) for o in slots))
++    before[entry].append("    %s /* from memory at the entry */" % " ".join(load(o, 0) for o in slots))
++    for x, n in enumerate(nodes):
++        if not syncs[x] or state_in[x] is None:
++            continue
++        d = dirty[x] or frozenset()
++        if syncs[x] == "return":
++            d = frozenset(o for o in d if o >= 4)
++        if d:
++            if state_in[x].off is None:
++                raise _Decline("a call or return where esp is not known")
++            before.setdefault(n.first, []).append("    %s /* the slots written since, to memory */" % " ".join(
++                store(o, state_in[x].off) for o in sorted(d)))
++        if syncs[x] == "call" and state_out[x] is not None:
++            if state_out[x].off is None:
++                raise _Decline("esp not known after a call")
++            after.setdefault(n.last, []).append("    %s /* and back */" % " ".join(
++                load(o, state_out[x].off) for o in slots))
++
++    out = list(lines)
++    n_acc = 0
++    for x, decs in walk.decisions.items():
++        if not any(d is not None and d[1] in chosen for d in decs):
++            continue
++        it = iter(decs)
++        for li in range(nodes[x].first, nodes[x].last + 1):
++            code, restore = _protect(out[li])
++            new, k = _rewrite(code, it, chosen)
++            n_acc += k
++            out[li] = restore(new)
++        if next(it, "end") != "end":
++            raise _Decline("the accesses did not line up")
++    result = []
++    for i, line in enumerate(out):
++        result.extend(before.get(i, ()))
++        result.append(line)
++        result.extend(after.get(i, ()))
++    return result, len(chosen), n_acc
++
++
++def _rewrite(code, it, chosen):
++    """code with each access whose decision (the next from it, in textual
++    order, outer before inner) is a chosen slot written as its local."""
++    out, i, count = [], 0, 0
++    while True:
++        m = _ACCESS_RE.search(code, i)
++        if not m:
++            out.append(code[i:])
++            return "".join(out), count
++        try:
++            dec = next(it)
++        except StopIteration:
++            raise _Decline("the accesses did not line up")
++        name = m.group(1)
++        args, end = _args(code, m.end() - 1)
++        new_args = []
++        for a, b in args:
++            sub, k = _rewrite(code[a:b], it, chosen)
++            count += k
++            new_args.append(sub)
++        out.append(code[i:m.start()])
++        if dec is not None and dec[1] in chosen:
++            nm = _name(dec[1])
++            _, ctype, pun = chosen[dec[1]]
++            count += 1
++            if name == "MEMF_SET":
++                v = new_args[1].strip()
++                out.append("(%s = ((union { float f; uint32_t u; }){ .f = (float)(%s) }).u)" % (nm, v) if pun
++                           else "(%s = (float)(%s))" % (nm, v))
++            elif name == "MEMD_SET":
++                out.append("(%s = (double)(%s))" % (nm, new_args[1].strip()))
++            elif name == "MEMF" and pun:
++                out.append("(((union { uint32_t u; float f; }){ .u = %s }).f)" % nm)
++            elif name in ("SMEM8", "SMEM16", "SMEM32") and not (
++                    _ASSIGN_OP.match(code, end) or re.search(r"(\+\+|--)\s*$", code[:m.start()])):
++                out.append("((int%s_t)%s)" % (name[4:], nm))  # a read; a store (fistp) writes the bits
++            else:
++                out.append(nm)
++        else:
++            out.append(code[m.start():m.end()] + ",".join(new_args) + ")")
++        i = end
+diff --git a/tools/recomp/test_stack_locals.py b/tools/recomp/test_stack_locals.py
+new file mode 100644
+index 0000000..bb54f2f
+--- /dev/null
++++ b/tools/recomp/test_stack_locals.py
+@@ -0,0 +1,271 @@
++"""
++--stack-locals: a function's own stack slots in C locals (stack_locals.py).
++
++These checks lift small x86 functions (test_preserve's harness) and look at
++what the pass keeps in locals, what it must not (a slot reached through a
++pointer the pass cannot follow), and that the code computes what the memory
++model computes: guest memory, registers and esp after each function, compiled
++and run both ways.
++"""
++
++import os
++import re
++import shutil
++import subprocess
++import sys
++import tempfile
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
++
++from tools.recomp import preserve  # noqa: E402
++from tools.recomp.stack_locals import localise_stack  # noqa: E402
++from tools.recomp.test_preserve import _lift  # noqa: E402
++
++
++def _h(s):
++    return bytes.fromhex(s.replace(" ", ""))
++
++
++RET = _h("C3")
++SUB_ESP_10 = _h("83EC10")      # sub esp, 0x10
++ADD_ESP_10 = _h("83C410")      # add esp, 0x10
++ST_4_EAX = _h("89442404")      # mov [esp+4], eax
++LD_EDX_4 = _h("8B542404")      # mov edx, [esp+4]
++ST_EBX_ECX = _h("890B")        # mov [ebx], ecx
++ADD_4_EAX = _h("01442404")     # add [esp+4], eax
++ST_8_ECX = _h("894C2408")      # mov [esp+8], ecx
++LD_EAX_8 = _h("8B442408")      # mov eax, [esp+8]
++LEA_ECX_8 = _h("8D4C2408")     # lea ecx, [esp+8]
++ST_PECX_EDX = _h("8911")       # mov [ecx], edx
++ST_PECX_IDX = _h("891481")     # mov [ecx+eax*4], edx
++ST_G_ECX = _h("890D00200000")  # mov [0x2000], ecx
++LD_EAX_ARG = _h("8B442414")    # mov eax, [esp+0x14] (the first argument, after sub esp, 0x10)
++ST_ARG_EDX = _h("89542414")    # mov [esp+0x14], edx
++FLD_4 = _h("D9442404")         # fld dword [esp+4]
++FSTP_C = _h("D95C240C")        # fstp dword [esp+0xc]
++FLD_C = _h("D944240C")         # fld dword [esp+0xc]
++FSTP_G = _h("D91D04200000")    # fstp dword [0x2004]
++PUSH_EAX, PUSH_ECX = _h("50"), _h("51")
++ADD_ESP_4 = _h("83C404")
++DEC_ECX, JNZ_BACK = _h("49"), None
++
++
++def _call(i):
++    return ("call", i)
++
++
++def _run_pass(funcs):
++    t, pend, names = _lift(funcs)
++    s = preserve.analyse({names[i]: p.lines for i, p in pend.items()})
++    kept = preserve.preserved_by_name(s)
++    out = {}
++    for i, n in enumerate(names):
++        out[n] = localise_stack(pend[i].lines, s, kept)
++    return t, pend, names, out
++
++
++def _body(lines):
++    return "\n".join(lines)
++
++
++def test_a_spill_in_a_leaf_stays_in_a_local():
++    # sub esp,0x10; mov [esp+4],eax; mov [ebx],ecx; mov edx,[esp+4]; add [esp+4],eax;
++    # mov eax,[esp+4]... : the slot at entry - 0xc, never read by anyone else
++    f = [SUB_ESP_10, ST_4_EAX, ST_EBX_ECX, LD_EDX_4, ADD_4_EAX, LD_EDX_4, ADD_ESP_10, RET]
++    _, _, names, out = _run_pass([f])
++    lines, why, n_slots, n_acc = out[names[0]]
++    assert why is None, why
++    assert n_slots == 1 and n_acc >= 4
++    text = _body(lines)
++    assert "MEM32(ebx) = ecx;" in text            # the store through a pointer stays
++    assert "_sl_mc = eax;" in text and "edx = _sl_mc;" in text
++    assert "_sl_mc = _sl_mc + eax;" in text
++    # a slot below the entry esp is not written back at the return
++    assert not re.search(r"MEM32\(esp[^)]*\)\s*=\s*_sl_mc", text), text
++
++
++def test_a_slot_written_before_a_call_goes_to_memory_and_back():
++    # caller: sub esp,0x10; mov [esp+8],ecx; push eax; call f1; add esp,4; mov eax,[esp+8]; add esp,0x10; ret
++    caller = [SUB_ESP_10, ST_8_ECX, ST_4_EAX, PUSH_EAX, _call(1), ADD_ESP_4, LD_EAX_8, LD_EDX_4, LD_EAX_8,
++              LD_EDX_4, ADD_ESP_10, RET]
++    leaf = [_h("8B442404"), RET]  # mov eax, [esp+4]
++    _, _, names, out = _run_pass([caller, leaf])
++    lines, why, n_slots, _ = out[names[0]]
++    assert why is None, why
++    text = _body(lines)
++    i_call = text.index("RECOMP_ABI_CALL")
++    flush = text.rfind("/* the slots written since, to memory */", 0, i_call)
++    assert flush > 0 and "_sl_m8" in text[text.rfind("\n", 0, flush):flush], text
++    assert "/* and back */" in text[i_call:]
++    # the argument push stays a push
++    assert "PUSH32(esp, eax);" in text
++
++
++def test_an_argument_written_goes_back_at_the_return():
++    # sub esp,0x10; mov eax,[esp+0x14]; mov [esp+0x14],edx; mov eax,[esp+0x14]; add esp,0x10; ret
++    f = [SUB_ESP_10, LD_EAX_ARG, ST_ARG_EDX, LD_EAX_ARG, ADD_ESP_10, RET]
++    _, _, names, out = _run_pass([f])
++    lines, why, _, _ = out[names[0]]
++    assert why is None, why
++    text = _body(lines)
++    assert re.search(r"MEM32\(esp \+ 0x4\) = _sl_4; /\* the slots written since, to memory \*/", text), text
++
++
++def test_a_slot_reached_through_its_address_is_followed():
++    # lea ecx,[esp+8]; mov [ecx],edx; mov eax,[esp+8]: the store through ecx is the slot's
++    f = [SUB_ESP_10, LEA_ECX_8, ST_PECX_EDX, LD_EAX_8, LD_EAX_8, ADD_ESP_10, RET]
++    _, _, names, out = _run_pass([f])
++    lines, why, n_slots, n_acc = out[names[0]]
++    assert why is None, why
++    text = _body(lines)
++    assert "_sl_m8 = edx;" in text and "eax = _sl_m8;" in text, text
++
++
++def test_an_indexed_access_through_a_frame_address_keeps_memory():
++    # lea ecx,[esp+8]; mov [ecx+eax*4],edx: a local array; nothing is kept
++    f = [SUB_ESP_10, LEA_ECX_8, ST_PECX_IDX, LD_EAX_8, LD_EAX_8, ADD_ESP_10, RET]
++    _, pend, names, out = _run_pass([f])
++    lines, why, _, _ = out[names[0]]
++    assert why is not None and "offset is not known" in why, why
++    assert lines == pend[0].lines
++
++
++def test_a_frame_address_stored_outside_the_frame_keeps_memory():
++    # lea ecx,[esp+8]; mov [0x2000],ecx: anyone may write the slot through the global
++    f = [SUB_ESP_10, LEA_ECX_8, ST_G_ECX, ST_8_ECX, LD_EAX_8, LD_EAX_8, ADD_ESP_10, RET]
++    _, _, names, out = _run_pass([f])
++    _, why, _, _ = out[names[0]]
++    assert why is not None and "stored outside the frame" in why, why
++
++
++def test_a_pointer_returned_by_a_callee_given_a_frame_address_is_not_followed():
++    # lea ecx,[esp+8]; push ecx; call f1; add esp,4; mov [eax],edx; mov eax,[esp+8]...:
++    # f1 may return the address it was given; the store through eax may be the slot's
++    caller = [SUB_ESP_10, ST_8_ECX, LEA_ECX_8, PUSH_ECX, _call(1), ADD_ESP_4, _h("8910"), LD_EAX_8, LD_EAX_8,
++              ADD_ESP_10, RET]
++    leaf = [_h("8B442404"), RET]  # mov eax, [esp+4]: returns its argument
++    _, _, names, out = _run_pass([caller, leaf])
++    _, why, _, _ = out[names[0]]
++    assert why is not None and "offset is not known" in why, why
++
++
++def test_a_signed_store_writes_the_local():
++    # fild dword [esp+8]; fistp dword [esp+8]; mov eax,[esp+8] (twice): the store is an lvalue
++    f = [SUB_ESP_10, ST_8_ECX, _h("DB442408"), _h("DB5C2408"), LD_EAX_8, LD_EAX_8, ADD_ESP_10, RET]
++    _, _, names, out = _run_pass([f])
++    lines, why, _, _ = out[names[0]]
++    assert why is None, why
++    assert not re.search(r"\(\(int32_t\)_sl_m8\)\s*=", _body(lines)), _body(lines)
++
++
++# ------------------------------------------------------------ run both ways
++
++HARNESS = r"""
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++static uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esp, g_esi, g_edi, g_ebp, g_seh_ebp;
++static double g_fp_stack[8];
++static uint32_t g_fp_top;
++static uint16_t g_fp_control_word;
++static int g_fp_cmp;
++static uint16_t g_fp_cc;
++#define eax g_eax
++#define ecx g_ecx
++#define edx g_edx
++#define ebx g_ebx
++#define esp g_esp
++#define esi g_esi
++#define edi g_edi
++static unsigned char mem[0x10000];
++#define M(T, a) (*(T *)(mem + ((uint32_t)(a) & 0xFFFFu)))
++#define MEM8(a) M(uint8_t, a)
++#define MEM16(a) M(uint16_t, a)
++#define MEM32(a) M(uint32_t, a)
++#define SMEM8(a) M(int8_t, a)
++#define SMEM16(a) M(int16_t, a)
++#define SMEM32(a) M(int32_t, a)
++#define MEMF(a) M(float, a)
++#define MEMD(a) M(double, a)
++#define MEMF_SET(a, v) (M(float, a) = (float)(v))
++#define MEMD_SET(a, v) (M(double, a) = (double)(v))
++#define PUSH32(sp, v) do { uint32_t _pv = (v); (sp) -= 4u; MEM32(sp) = _pv; } while (0)
++#define POP32(sp, d) do { (d) = MEM32(sp); (sp) += 4u; } while (0)
++#define RECOMP_ABI_CALL(va, fn) fn()
++#define RECOMP_BACKEDGE() ((void)0)
++#define RECOMP_FP_PC(v) (v)
++#define CMP_EQ(a, b) ((a) == (b))
++#define CMP_NE(a, b) ((a) != (b))
++"""
++
++MAIN = r"""
++int main(void) {
++    for (int i = 0; i < 0x10000; i++) mem[i] = (unsigned char)(i * 7 + 3);
++    for (int run = 0; run < 3; run++) {
++        g_esp = 0x8000 + 0x1000 * run; g_eax = 0x11 + run; g_ecx = 0x2222; g_edx = 0x333; g_ebx = 0x2100;
++        g_esi = 0x55; g_edi = 0x66;
++        PUSH32(g_esp, 0x1234u); PUSH32(g_esp, 0x99u);  /* an argument and the return address */
++        ENTRY();
++        printf("%x %x %x %x %x %x %x\n", g_eax, g_ecx, g_edx, g_ebx, g_esp, g_esi, g_edi);
++    }
++    /* below each entry esp is the dead frame: what is left there is no one's */
++    unsigned h = 0;
++    for (int i = 0; i < 0x10000; i++)
++        if (!((i >= 0x8000 - 8 - 0x200 && i < 0x8000 - 8) || (i >= 0x9000 - 8 - 0x200 && i < 0x9000 - 8)
++              || (i >= 0xA000 - 8 - 0x200 && i < 0xA000 - 8)))
++            h = h * 31 + mem[i];
++    printf("%x\n", h);
++    return 0;
++}
++"""
++
++
++def _compile_run(text, entry, tmp, tag):
++    cc = shutil.which("gcc") or shutil.which("clang")
++    src, exe = os.path.join(tmp, tag + ".c"), os.path.join(tmp, tag)
++    with open(src, "w") as f:
++        f.write(HARNESS + text + MAIN.replace("ENTRY", entry))
++    subprocess.run([cc, "-std=gnu11", "-O2", "-w", "-o", exe, src], check=True)
++    return subprocess.run([exe], check=True, capture_output=True, text=True).stdout
++
++
++CASES = [
++    # spills, a store through a pointer between them, a float through a slot, an argument rewritten
++    [[SUB_ESP_10, ST_4_EAX, ST_EBX_ECX, LD_EDX_4, ADD_4_EAX, LD_EDX_4, FLD_4, FSTP_C, FLD_C, FSTP_G,
++      LD_EAX_ARG, ST_ARG_EDX, LD_EAX_ARG, ADD_ESP_10, RET]],
++    # a call between: an argument pushed, a slot read after, the callee writes its argument
++    [[SUB_ESP_10, ST_8_ECX, ST_4_EAX, PUSH_EAX, _call(1), ADD_ESP_4, LD_EAX_8, ADD_4_EAX, LD_EDX_4,
++      ADD_ESP_10, RET],
++     [_h("8B442404"), _h("89542404"), _h("8B4C2404"), RET]],
++    # a slot written through its address, then read
++    [[SUB_ESP_10, LEA_ECX_8, ST_PECX_EDX, LD_EAX_8, ADD_4_EAX, LD_EAX_8, ADD_ESP_10, RET]],
++    # the callee is given the slot's address and writes it
++    [[SUB_ESP_10, ST_8_ECX, LEA_ECX_8, PUSH_ECX, _call(1), ADD_ESP_4, LD_EAX_8, LD_EAX_8, ADD_ESP_10, RET],
++     [_h("8B442404"), _h("C700AA000000"), RET]],  # mov eax,[esp+4]; mov dword [eax], 0xAA
++]
++
++
++@pytest.mark.parametrize("funcs", CASES)
++def test_the_locals_compute_what_the_memory_model_computes(funcs):
++    if not (shutil.which("gcc") or shutil.which("clang")):
++        pytest.skip("C compiler unavailable")
++    _, pend, names, out = _run_pass(funcs)
++    assert out[names[0]][1] is None, out[names[0]][1]
++    protos = "".join("static void %s(void);\n" % n for n in names)
++    plain = protos + "\n".join(_body(p.lines) for p in pend.values())
++    done = protos + "\n".join(_body(out[n][0]) for n in names)
++    with tempfile.TemporaryDirectory() as tmp:
++        a = _compile_run(plain, names[0], tmp, "plain")
++        b = _compile_run(done, names[0], tmp, "locals")
++    assert a == b, (a, b)
++
++
++if __name__ == "__main__":
++    for name, fn in sorted(globals().items()):
++        if name.startswith("test_") and name != "test_the_locals_compute_what_the_memory_model_computes":
++            fn()
++    for c in CASES:
++        test_the_locals_compute_what_the_memory_model_computes(c)
++    print("ok")
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index e0bd1b5..9955619 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -30,6 +30,7 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
+                      detect_setjmp_helpers, _func_ident, _operand_width)
+ from .x87_locals import localise_x87
++from .stack_locals import localise_stack, ret_deltas
+ from . import preserve
+ from . import touched
+ 
+@@ -542,6 +543,15 @@ class FunctionTranslator:
+         self.kept = {}
+         self.preserve_stats = {}
+         self.kept_sites = 0
++        # stack_locals.py: the function's own stack slots that nothing else can
++        # reach in C locals, written to memory only where it may be read
++        # (--stack-locals); summaries: preserve.py's, for each callee's effect on esp
++        self.stack_locals = False
++        self.summaries = {}
++        self.ret_deltas = {}
++        self.stack_stats = {}
++        self.stack_slots = 0
++        self.stack_accesses = 0
+ 
+     def discover_static_indirect_targets(self, *, coalescing=False):
+         """Recover function entries from bounded static callback tables."""
+@@ -3128,8 +3138,16 @@ class FunctionTranslator:
+         return self.finish_function(lines, has_fpu)
+ 
+     def finish_function(self, lines, has_fpu):
+-        """The passes over a translated body's C text: x87_locals (with the
+-        callees preserve.py proved, self.kept), then mem_disp."""
++        """The passes over a translated body's C text: stack_locals, x87_locals
++        (with the callees preserve.py proved, self.kept), then mem_disp."""
++        if self.stack_locals:
++            out, why, n_slots, n_acc = localise_stack(lines, self.summaries, self.kept, self.ret_deltas)
++            key = why or "in locals"
++            self.stack_stats[key] = self.stack_stats.get(key, 0) + 1
++            if why is None:
++                lines = out
++                self.stack_slots += n_slots
++                self.stack_accesses += n_acc
+         if self.reg_locals or (has_fpu and self.x87_locals):
+             out, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS,
+                                     x87=self.x87_locals, regs=self.reg_locals,
+@@ -3476,6 +3494,9 @@ class BatchTranslator:
+             return translations
+         summaries = preserve.analyse(pending)
+         t.kept = preserve.preserved_by_name(summaries)
++        t.summaries = summaries
++        if t.stack_locals:
++            t.ret_deltas = ret_deltas(pending)
+         if t.callee_regs:
+             t.touched = touched.analyse(pending)
+             if t.x87_balanced:
+@@ -3593,6 +3614,11 @@ class BatchTranslator:
+         if getattr(self.translator, "preserve_stats", None):
+             stats["preserved"] = self.translator.preserve_stats
+             stats["kept_call_sites"] = self.translator.kept_sites
++        if getattr(self.translator, "stack_locals", False):
++            stats["stack_locals"] = dict(sorted(self.translator.stack_stats.items(),
++                                                key=lambda kv: -kv[1]))
++            stats["stack_locals_slots"] = self.translator.stack_slots
++            stats["stack_locals_accesses"] = self.translator.stack_accesses
+         if getattr(self.translator, "x87_balanced", False):
+             stats["x87_balanced"] = sum(1 for t in self.translator.touched.values()
+                                         if touched.X87_BALANCED in t)

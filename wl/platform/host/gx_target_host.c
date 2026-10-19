@@ -5,6 +5,8 @@
 #include "wl/platform/host/gx_target_host.h"
 
 #include "wl/platform/gx_direct.h"
+#include "wl/platform/gx_shadow.h"
+#include "wl/platform/host/gx_host.h"
 #include "wl/platform/host/gx_renderer_host.h"
 
 static WlHostTargetOp ops[WL_HOST_TARGET_OPS_MAX];
@@ -66,7 +68,9 @@ void wl_gx_target_be_copy(void *dst, uint32_t x, uint32_t w, uint32_t h, WlGxTar
 
 // What the console's quads (wii/gx_target_wii.c) leave in GX, so that the state recorded is what
 // a draw after one would meet there.
-static void quad_state(uint32_t back_w, uint32_t back_h, bool colour, bool alpha, bool z_test, bool z_write) {
+// `maps`: the texture maps it loads (forgotten; the others kept with the maps as a cache, as the console's)
+static void quad_state(uint32_t back_w, uint32_t back_h, bool colour, bool alpha, bool z_test, bool z_write,
+                       uint32_t maps) {
     float m[4][4];
 
     memset(m, 0, sizeof m);
@@ -85,7 +89,7 @@ static void quad_state(uint32_t back_w, uint32_t back_h, bool colour, bool alpha
     wl_gx_direct_zmode(z_test, WL_GX_ALWAYS, z_write);
     wl_gx_direct_zcompare_early(true);
     // (the console's quad sets GX behind the shadow and then forgets it: counted alike)
-    wl_gx_invalidate_shadow();
+    wl_host_gx_invalidate_shadow_maps(wl_gx_shadow_maps_cache_on() ? maps : 0xFFu);
 }
 
 void wl_gx_target_be_copy_end(void) {
@@ -99,7 +103,7 @@ void wl_gx_target_be_scissor(uint32_t x, uint32_t w, uint32_t h) {
     op->h = h;
     // (GX has one scissor: the direct layer's)
     wl_gx_direct_scissor(x, 0, w, h);
-    wl_gx_invalidate_shadow(); // (as the console's)
+    wl_host_gx_invalidate_shadow_maps(wl_gx_shadow_maps_cache_on() ? 0u : 0xFFu); // (as the console's)
 }
 
 void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t x, uint32_t w, uint32_t h, uint32_t back_w,
@@ -116,7 +120,8 @@ void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t x, 
     if (r != NULL && r->restore != NULL) {
         r->restore(r->user, colour, depth, (int)x, w, h);
     }
-    quad_state(back_w, back_h, true, true, depth != NULL, depth != NULL);
+    quad_state(back_w, back_h, true, true, depth != NULL, depth != NULL,
+               depth != NULL && !wl_gx_bisect()->no_z_restore ? 3u : 1u);
 }
 
 void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int x, int y, int rw, int rh,
@@ -136,7 +141,7 @@ void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int 
     if (r != NULL && r->clear != NULL) {
         r->clear(r->user, colour, depth, rgba, z, x, y, rw, rh);
     }
-    quad_state(back_w, back_h, colour, colour, depth, depth);
+    quad_state(back_w, back_h, colour, colour, depth, depth, 0u);
 }
 
 void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uint32_t x, uint32_t w,
@@ -153,6 +158,6 @@ void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uin
     if (r != NULL && r->squeeze != NULL) {
         r->squeeze(r->user, back_w, back_h, x, w);
     }
-    quad_state(back_w, back_h, true, true, false, false);
+    quad_state(back_w, back_h, true, true, false, false, 1u);
     wl_gx_direct_scissor(0, 0, back_w, back_h);
 }

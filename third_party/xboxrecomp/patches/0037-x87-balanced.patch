@@ -1,0 +1,502 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Mon, 19 Oct 2026 06:55:08 -0400
+Subject: [PATCH] recomp: --x87-balanced keeps the caller's x87 positions in
+ locals across a balanced callee
+
+With --x87-locals and --callee-regs, a call to a function that touches the
+x87 stack was a point where memory had to be the truth: the caller wrote
+every stack position it had changed to g_fp_stack before the call and
+loaded them all again after it, since the callee might push a result, pop
+an argument, or read a slot below it.
+
+Most callees that use the x87 stack do none of that: on every path they
+pop what they pushed and no more, and they name only the slots they
+pushed. x87_locals.x87_balanced follows a body's static depth through its C
+text (the same rewrite the pass itself does) and says so; touched.balanced
+marks such functions, with all they call, as a greatest fixpoint, so that a
+function calling itself with x87 values live is balanced when its body is.
+
+Around a plain direct call to a balanced callee the caller now writes only
+g_fp_top (its depth, where the callee's own stack starts) and the
+registers and x87 scalars the callee may touch; its stack positions stay
+in their locals, with no store before the call and no load after it.
+Where a body keeps the x87 state in memory (the registers-only fallback),
+any callee whose registers are known is such a call.
+---
+ tools/recomp/__main__.py          |   5 +
+ tools/recomp/test_x87_balanced.py | 180 ++++++++++++++++++++++++++++++
+ tools/recomp/touched.py           |  39 +++++++
+ tools/recomp/translator.py        |   8 ++
+ tools/recomp/x87_locals.py        | 114 ++++++++++++++++++-
+ 5 files changed, 341 insertions(+), 5 deletions(-)
+ create mode 100644 tools/recomp/test_x87_balanced.py
+
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 806120d..9f17f80 100644
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -312,6 +312,10 @@ def main():
+                              "function that touches only some registers (with all it calls) "
+                              "and not the x87 stack, write back and load again only those; "
+                              "the caller's other locals stay (touched.py)")
++    parser.add_argument("--x87-balanced", action="store_true",
++                        help="With --callee-regs: a callee that pops what it pushes and names "
++                             "no x87 slot it did not push (with all it calls) also keeps the "
++                             "caller's x87 stack positions in their locals (touched.balanced)")
+     parser.add_argument("--seh-prolog", metavar="ADDR",
+                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
+     parser.add_argument("--seh-epilog", metavar="ADDR",
+@@ -396,6 +400,7 @@ def main():
+     translator.translator.bounded_loops = args.bounded_loops
+     translator.translator.rodata_consts = args.rodata_consts
+     translator.translator.callee_regs = args.callee_regs
++    translator.translator.x87_balanced = args.x87_balanced
+     translator.translator.mem_disp = args.mem_disp
+     translator.translator.stack_disp = args.stack_disp
+ 
+diff --git a/tools/recomp/test_x87_balanced.py b/tools/recomp/test_x87_balanced.py
+new file mode 100644
+index 0000000..603144e
+--- /dev/null
++++ b/tools/recomp/test_x87_balanced.py
+@@ -0,0 +1,180 @@
++"""
++--x87-balanced: a caller's x87 stack positions stay in its locals across a
++direct call to a callee that pops what it pushes and names no slot it did not
++push (touched.balanced, x87_locals.x87_balanced).
++"""
++
++import os
++import re
++import shutil
++import subprocess
++import sys
++import tempfile
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
++
++from tools.recomp import touched  # noqa: E402
++from tools.recomp.translator import FP_STACK_MACROS, FP_STACK_UNDEFS  # noqa: E402
++from tools.recomp.x87_locals import localise_x87  # noqa: E402
++
++
++def _fn(name, body):
++    return ["static void %s(void)" % name, "{"] + FP_STACK_MACROS + body + FP_STACK_UNDEFS + ["}", ""]
++
++
++def _call(name, ret=0x1000):
++    return "    PUSH32(esp, 0x%08Xu); RECOMP_ABI_CALL(0x%su, %s); /* call */" % (ret, name[4:], name)
++
++
++# a leaf that pushes, works and pops all it pushed
++LEAF = ["    fp_push(MEMD(0x2000));", "    fp_push(fp_st(0) * 2.0);", "    fp_st(1) = fp_st(1) + fp_top();",
++        "    fp_pop();", "    MEMD_SET(0x2010, fp_top());", "    fp_pop();", "    return;"]
++# it calls itself with its own value live: balanced if its body is, given the calls are
++RECURSIVE = ["    fp_push(MEMD(0x2000) + (double)ecx);", "    if (ecx == 0) goto loc_00003020;", "    ecx = ecx - 1;",
++             _call("sub_00003000", 0x3010), "    ecx = ecx + 1;", "loc_00003020: ;",
++             "    MEMD_SET(0x2020 + ecx * 8, fp_top() * 3.0);", "    fp_pop();", "    return;"]
++
++
++def _analyse(funcs):
++    return touched.balanced(funcs, touched.analyse(funcs))
++
++
++def test_what_is_balanced():
++    funcs = {
++        "sub_00001000": _fn("sub_00001000", LEAF),
++        # reads st(0) of its caller
++        "sub_00002000": _fn("sub_00002000", ["    MEMD_SET(0x2010, fp_top());", "    return;"]),
++        "sub_00003000": _fn("sub_00003000", RECURSIVE),
++        # leaves a result in st(0)
++        "sub_00004000": _fn("sub_00004000", ["    fp_push(1.0);", "    return;"]),
++        # pops one of its caller's
++        "sub_00005000": _fn("sub_00005000", ["    fp_pop();", "    fp_push(1.0);", "    fp_pop();", "    return;"]),
++        # balanced itself, but calls one that is not
++        "sub_00006000": _fn("sub_00006000", ["    fp_push(1.0);", _call("sub_00004000"), "    fp_pop();",
++                                             "    fp_pop();", "    return;"]),
++        # a pop that may not happen
++        "sub_00007000": _fn("sub_00007000", ["    fp_push(1.0);", "    if (eax) fp_pop();", "    return;"]),
++        # paths that join at different depths
++        "sub_00008000": _fn("sub_00008000", ["    fp_push(1.0);", "    if (eax) goto loc_00008010;", "    fp_pop();",
++                                             "loc_00008010: ;", "    return;"]),
++        # writes the slot below its own (fstp st(1) at depth 1 is st(0) of the caller)
++        "sub_00009000": _fn("sub_00009000", ["    fp_push(1.0);", "    fp_st(1) = fp_top();", "    fp_pop();",
++                                             "    return;"]),
++        # calls the balanced leaf and an integer function, reads TOP
++        "sub_0000A000": _fn("sub_0000A000", ["    fp_push(1.0);", _call("sub_00001000"), _call("sub_0000B000"),
++                                             "    eax = (g_fp_top & 7u);", "    fp_pop();", "    return;"]),
++        "sub_0000B000": ["static void sub_0000B000(void)", "{", "    eax = 1;", "    return;", "}", ""],
++        # a jump back into the body at a depth the C text does not show
++        "sub_0000C000": _fn("sub_0000C000", ["    if (setjmp(g_jb)) goto loc_0000C010;", "    fp_push(1.0);",
++                                             "    fp_pop();", "loc_0000C010: ;", "    return;"]),
++    }
++    t = _analyse(funcs)
++    bal = {n for n, s in t.items() if touched.X87_BALANCED in s}
++    assert bal == {"sub_00001000", "sub_00003000", "sub_0000A000"}, bal
++    assert touched.X87_BALANCED not in t["sub_0000B000"] and touched.X87 not in t["sub_0000B000"]
++
++
++CALLER = ["    fp_push(MEMD(0x2100));", "    fp_push(MEMD(0x2108));", "    fp_st(1) = fp_st(1) * fp_top();",
++          _call("sub_00001000", 0x1010),
++          "    fp_st(1) = fp_st(1) - fp_top();", "    fp_pop();", "    MEMD_SET(0x2110, fp_top());", "    fp_pop();",
++          "    return;"]
++
++
++def test_the_caller_keeps_its_positions_across_a_balanced_call():
++    funcs = {"sub_00001000": _fn("sub_00001000", LEAF), "sub_00000100": _fn("sub_00000100", CALLER)}
++    out, why = localise_x87(funcs["sub_00000100"], FP_STACK_MACROS, FP_STACK_UNDEFS, x87=True, regs=True,
++                            touched=_analyse(funcs))
++    assert why is None, why
++    text = "\n".join(out)
++    i = [k for k, line in enumerate(out) if "RECOMP_ABI_CALL" in line][0]
++    # the depth goes to g_fp_top (the callee starts there), the values stay in their locals
++    assert "g_fp_top = (int)((_x87t + 6u) & 7u);" in out[i - 1], text
++    assert "g_fp_stack[" not in out[i - 1] and "_LOCALS_LOAD" not in out[i + 1], text
++    assert "_x87sm1 = _x87sm1 - _x87sm2;" in text, text
++    # without the mark, the call is a sync as before
++    out2, _ = localise_x87(funcs["sub_00000100"], FP_STACK_MACROS, FP_STACK_UNDEFS, x87=True, regs=True,
++                           touched=touched.analyse(funcs))
++    assert "_LOCALS_LOAD();" in "\n".join(out2) and "g_fp_stack[(_x87t" in "\n".join(out2)
++
++
++HARNESS = r"""
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++static double g_fp_stack[8];
++static uint32_t g_fp_top;
++static uint16_t g_fp_control_word;
++static int g_fp_cmp;
++static uint16_t g_fp_cc;
++static uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esp = 0x8000, g_esi, g_edi;
++#define eax g_eax
++#define ecx g_ecx
++#define edx g_edx
++#define ebx g_ebx
++#define esp g_esp
++#define esi g_esi
++#define edi g_edi
++static unsigned char mem[0x3000];
++static double MEMD(uint32_t a) { double d; memcpy(&d, mem + a, 8); return d; }
++#define MEMD_SET(a, v) do { double _d = (v); memcpy(mem + (a), &_d, 8); } while (0)
++#define PUSH32(r, v) ((r) -= 4u)
++#define RECOMP_ABI_CALL(a, f) do { f(); esp += 4u; } while (0)
++"""
++
++
++def _run(text, tmp, name):
++    cc = shutil.which("gcc") or shutil.which("clang")
++    src, exe = os.path.join(tmp, name + ".c"), os.path.join(tmp, name)
++    main = r"""
++int main(void) {
++    for (int i = 0; i < 0x3000 / 8; i++) { double d = 0.25 * i - 7.0; memcpy(mem + 8 * i, &d, 8); }
++    for (uint32_t top = 0; top < 8; top++) {
++        g_fp_top = top; g_ecx = 3;
++        g_fp_stack[top] = 42.0; g_fp_stack[(top + 1) & 7] = -5.5;  /* the caller's caller's values */
++        sub_00000100();
++        printf("%u %u %.17g %.17g\n", top, g_fp_top, g_fp_stack[top], g_fp_stack[(top + 1) & 7]);
++    }
++    for (int i = 0x2000; i < 0x2140; i += 8) printf("%.17g\n", MEMD(i));
++    return 0;
++}
++"""
++    with open(src, "w") as f:
++        f.write(HARNESS + text + main)
++    subprocess.run([cc, "-std=gnu11", "-O2", "-w", "-o", exe, src], check=True)
++    return subprocess.run([exe], check=True, capture_output=True, text=True).stdout
++
++
++def test_balanced_calls_compute_what_the_memory_model_computes():
++    if not (shutil.which("gcc") or shutil.which("clang")):
++        pytest.skip("C compiler unavailable")
++    # the caller holds two values over the leaf and the recursion; the recursion
++    # holds its own over itself
++    caller = CALLER[:3] + [_call("sub_00003000", 0x1008)] + CALLER[3:]
++    funcs = {"sub_00001000": _fn("sub_00001000", LEAF), "sub_00003000": _fn("sub_00003000", RECURSIVE),
++             "sub_00000100": _fn("sub_00000100", caller)}
++    t = _analyse(funcs)
++    assert touched.X87_BALANCED in t["sub_00003000"]
++    protos = "".join("static void %s(void);\n" % n for n in funcs)
++    plain = protos + "\n".join("\n".join(lines) for lines in funcs.values())
++    done, kept = [], 0
++    for n, lines in funcs.items():
++        out, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS, x87=True, regs=True, touched=t)
++        assert why is None, (n, why)
++        kept += sum(1 for line in out if "RECOMP_ABI_CALL" in line) - sum(
++            1 for k, line in enumerate(out) if "RECOMP_ABI_CALL" in line and "_LOCALS_LOAD" in out[k + 1])
++        done.append("\n".join(out))
++    assert kept == 3  # every call site keeps the locals
++    with tempfile.TemporaryDirectory() as tmp:
++        a = _run(plain, tmp, "plain")
++        b = _run(protos + "\n".join(done), tmp, "locals")
++    assert a == b, (a, b)
++    assert re.search(r"^0 0 42 -5.5$", a, re.M), a
++
++
++if __name__ == "__main__":
++    for name, fn in sorted(globals().items()):
++        if name.startswith("test_"):
++            fn()
++    print("ok")
+diff --git a/tools/recomp/touched.py b/tools/recomp/touched.py
+index 13860bc..e4555d6 100644
+--- a/tools/recomp/touched.py
++++ b/tools/recomp/touched.py
+@@ -24,7 +24,12 @@ code it interrupts as they were (wl_xb_call_guest_preserving).
+ 
+ import re
+ 
++from .x87_locals import x87_balanced
++
+ X87 = "x87"  # the x87 stack (g_fp_top, g_fp_stack): a caller's x87 locals do not survive it
++# with X87: the function leaves the stack as deep as it found it and names no slot that was on
++# it (x87_locals.x87_balanced, with all it calls): a caller's x87 locals do survive it
++X87_BALANCED = "x87 balanced"
+ 
+ _REG = re.compile(r"\b(?:g_)?(eax|ecx|edx|ebx|esp|esi|edi|xmm[0-7]|mm[0-7])\b")
+ _X87_SCALAR = re.compile(r"\b(g_fp_control_word|g_fp_cmp|g_fp_cc)\b")
+@@ -115,3 +120,37 @@ def analyse(functions):
+             if len(t) != before:
+                 changed = True
+     return {n: frozenset(t) for n, t in touch.items()}
++
++
++def balanced(functions, touch):
++    """touch as analyse returns it, with X87_BALANCED added to the set of each
++    function that uses the x87 stack in a balanced way: on every path it pops
++    what it pushed and no more, and reads and writes only the slots it pushed,
++    and so does everything it calls (x87_locals.x87_balanced). A caller can
++    then keep its own x87 values in locals across a call to it: they are
++    below what the callee uses.
++
++    The answer is the greatest fixpoint: every candidate is assumed balanced
++    and the ones that are not (alone, or because of a callee that is not) are
++    dropped until none is. A function that calls itself (or a cycle of them)
++    is balanced when its body is, given that the calls are: each call that
++    returns ran a path that is balanced by the same argument one level
++    deeper, down to a call that makes no more."""
++    cand = {n for n, t in touch.items() if X87 in t and n in functions}
++    callers = {}
++    for n in cand:
++        for c in set(_FUNC.findall(_strip("\n".join(functions[n])))):
++            callers.setdefault(c, set()).add(n)
++
++    def ok(c):
++        t = touch.get(c)
++        return t is not None and (X87 not in t or c in cand)
++
++    work = sorted(cand)
++    while work:
++        n = work.pop()
++        if n in cand and not x87_balanced(functions[n], ok):
++            cand.discard(n)
++            work.extend(sorted(callers.get(n, ()) & cand))
++    return {n: (t | {X87_BALANCED} if n in cand else t) for n, t in touch.items()}
++
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 6039d00..e0bd1b5 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -534,6 +534,9 @@ class FunctionTranslator:
+         # a plain call to a function that touches only some registers writes
+         # back and reloads only those (--callee-regs, touched.py)
+         self.callee_regs = False
++        # with callee_regs: a callee whose x87 stack use is balanced keeps the
++        # caller's x87 positions in their locals too (--x87-balanced, touched.balanced)
++        self.x87_balanced = False
+         self.touched = {}
+         self.rodata_const_count = 0
+         self.kept = {}
+@@ -3475,6 +3478,8 @@ class BatchTranslator:
+         t.kept = preserve.preserved_by_name(summaries)
+         if t.callee_regs:
+             t.touched = touched.analyse(pending)
++            if t.x87_balanced:
++                t.touched = touched.balanced(pending, t.touched)
+         counts = {}
+         for s in summaries.values():
+             key = "+".join(sorted(s.preserved)) or ("none: " + s.why if s.why else "none")
+@@ -3588,6 +3593,9 @@ class BatchTranslator:
+         if getattr(self.translator, "preserve_stats", None):
+             stats["preserved"] = self.translator.preserve_stats
+             stats["kept_call_sites"] = self.translator.kept_sites
++        if getattr(self.translator, "x87_balanced", False):
++            stats["x87_balanced"] = sum(1 for t in self.translator.touched.values()
++                                        if touched.X87_BALANCED in t)
+         # Instructions the lifter has no translation for become a comment, and
+         # a comment is a silent no-op. Surfacing the tally is the difference
+         # between "bsf is unimplemented" being a line of build output and being
+diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
+index 61d4ef1..0ebbce2 100644
+--- a/tools/recomp/x87_locals.py
++++ b/tools/recomp/x87_locals.py
+@@ -54,6 +54,14 @@ does not understand runs against memory, so an unknown x87 instruction costs
+ speed, never correctness; so does a conditional or loop written over several
+ lines.
+ 
++A direct call to a callee that is balanced (x87_balanced: on every path it
++pops what it pushed and no more, and names only the slots it pushed, and so
++does all it calls; touched.balanced marks it) is not a point where memory
++has to be the truth for the stack: the caller writes g_fp_top (its depth)
++before it, the callee's own positions start below st(0), the caller's
++positions stay in their locals, and only the scalars and registers the
++callee may touch go to memory and back.
++
+ RECOMP_BACKEDGE is treated as not touching the x87 state. A runtime whose
+ backedge hook switches guest threads, or runs interrupt work on the current
+ thread, has to save and restore the x87 registers around it (a guest thread
+@@ -64,7 +72,7 @@ restored copy comes back the same, and the locals hold the truth.
+ 
+ import re
+ 
+-__all__ = ["localise_x87", "X87_LOCALS_PREFIX", "REG_LOCALS_PREFIX"]
++__all__ = ["localise_x87", "x87_balanced", "X87_LOCALS_PREFIX", "REG_LOCALS_PREFIX"]
+ 
+ X87_LOCALS_PREFIX = "_x87"
+ REG_LOCALS_PREFIX = "_r_"
+@@ -565,6 +573,87 @@ def localise_x87(lines, macros, undefs, x87=True, regs=False, kept=None, touched
+         return lines, str(e)
+ 
+ 
++_SUB = re.compile(r"\bsub_[0-9A-Fa-f]{8}\w*\b")
++
++
++def x87_balanced(lines, call_ok):
++    """Whether one function as translate_function emits it leaves the x87
++    stack as deep as it found it on every return, and never reads or writes a
++    slot that was on the stack when it was entered: its own pushes are the
++    only slots it names, and it pops no more than it pushed. call_ok(name)
++    says whether a call to a generated function keeps those two promises too
++    (it leaves the x87 stack alone, or is balanced in turn).
++
++    The depth is followed statically through the body's C text, as the pass
++    above follows it: a statement this pass cannot rewrite at a static depth,
++    a push or pop that may not happen, paths that join at different depths,
++    or a call to anything call_ok does not accept make the answer False."""
++    bounds = _function_bounds(lines)
++    if bounds is None:
++        return False
++    lo, hi = bounds
++    if re.search(r"setjmp|longjmp", "\n".join(lines[lo:hi])):
++        return False  # a jump back into the body, at whatever depth the stack has then
++    try:
++        nodes = _nodes(lines, lo, hi)
++    except _NotLocal:
++        return False
++    labels = {n.label: x for x, n in enumerate(nodes) if n.kind == "label"}
++    if any(g not in labels for n in nodes for g in n.gotos):
++        return False
++
++    def step(code, k):
++        """The depth after one line of code at depth k, or None."""
++        if not _LEFTOVER.search(code):
++            return k
++        r = _rewrite(code, k, x87=True, regs=False)
++        if r is None:
++            return None
++        _, k_out, wr, rd = r[:4]
++        if k_out < 0 or any(p >= 0 for p in wr | rd):
++            return None  # a slot of the caller's
++        return k_out
++
++    depth = [None] * len(nodes)
++    if nodes:
++        depth[0] = 0
++    work = [0] if nodes else []
++    while work:
++        x = work.pop()
++        n, k = nodes[x], depth[x]
++        if n.kind in ("label", "pp"):
++            out = k
++        else:
++            names = set(_SUB.findall(n.code))
++            if names and (not all(call_ok(c) for c in names) or _LEFTOVER.search(n.code)):
++                return False  # a call to code that may move the stack, or one beside x87 code
++            if n.kind == "region":
++                out = k
++                for li in range(n.first, n.last + 1):
++                    if step(_protect(lines[li])[0], k) != k:
++                        return False  # a push or pop inside a conditional block
++            else:
++                out = step(n.code, k)
++                if out is None:
++                    return False
++            if re.search(r"\breturn\b", n.code) and out != 0:
++                return False
++        succ = [labels[g] for g in n.gotos] if n.kind != "label" else []
++        if not n.terminal:
++            succ.append(x + 1)
++        for y in succ:
++            if y >= len(nodes):
++                if out != 0:
++                    return False  # the fall-through out of the body
++                continue
++            if depth[y] is None:
++                depth[y] = out
++                work.append(y)
++            elif depth[y] != out:
++                return False
++    return True
++
++
+ def _function_bounds(lines):
+     """The body: from after the function's opening brace to its closing one."""
+     try:
+@@ -603,13 +692,19 @@ _DIRECT_CALL = re.compile(r"\s*PUSH32\(esp, 0x[0-9A-Fa-f]+u\); RECOMP_ABI_CALL\(
+                           r"\s*(?:\x01\d+\x02)?\s*")
+ 
+ 
+-def _touched_by(code, touched):
++def _touched_by(code, touched, x87=True):
+     """The register globals a plain direct call may read or write (touched.py),
+     esp included (the call pushes on it), or None: not a plain direct call, a
+-    callee that may touch any register, or one that touches the x87 stack."""
++    callee that may touch any register, or one that touches the x87 stack in a
++    way the caller's x87 locals do not survive. With "x87 balanced" in its set
++    the callee leaves the stack as deep as it found it and names no slot that
++    was on it (x87_balanced): the caller's positions stay in their locals and
++    only g_fp_top goes to memory, so that the callee's own start above them.
++    Without x87 (the x87 state stays in memory in this body) the stack is
++    nothing to the caller's locals."""
+     m = _DIRECT_CALL.fullmatch(code)
+     t = touched.get(m.group(1)) if m else None
+-    if t is None or "x87" in t:
++    if t is None or (x87 and "x87" in t and "x87 balanced" not in t):
+         return None
+     return frozenset(t) | frozenset(("g_esp",))
+ 
+@@ -658,7 +753,7 @@ def _localise(lines, macros, undefs, x87=True, regs=False, kept=None, touched=No
+                 raise _NotLocal("a goto in a statement that calls out or returns")
+             n.kind = "sync"
+             n.keeps = _kept_by(n.code, kept) if regs else frozenset()
+-            t = _touched_by(n.code, touched) if regs and not leaves else None
++            t = _touched_by(n.code, touched, x87) if regs and not leaves else None
+             if t is not None:
+                 n.kind, n.touch = "call", t
+         elif fp or rg:
+@@ -838,6 +933,10 @@ def _flow(nodes, labels, plan, x87=True, regs=False, skip=frozenset()):
+             # and loaded after it (see _emit), the other locals stay as they were
+             if _is_mem(s):
+                 out = _mem(_valid(s) - (n.touch - n.keeps))
++            elif x87 and "x87" in n.touch:
++                # a balanced callee: g_fp_top is written before it (its depth) and is
++                # the same after it; the positions stay in their locals
++                out = (s[0], s[1], s[0], s[3] - n.touch)
+             else:
+                 out = (s[0], s[1], s[2], s[3] - n.touch)
+         else:  # sync: written back before it (see _emit); memory is the truth after
+@@ -954,6 +1053,11 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow, regs=False):
+                     out.append(indent + f + note)
+             if n.kind == "call" and not _is_mem(s):
+                 f = " ".join("%s = %s;" % (g, _scalar(g)) for g in _SCALARS if g in s[3] and g in n.touch)
++                if "x87" in n.touch and s[2] != s[0]:
++                    # a balanced callee (x87_balanced) starts its stack at g_fp_top
++                    if not base:
++                        raise _NotLocal("a depth without a base")
++                    f = ("g_fp_top = (int)((%s + %du) & 7u); " % (t, (-s[0]) & 7) + f).strip()
+                 if f:
+                     out.append(indent + f + " /* what the callee may touch, to memory */")
+                 out.extend(lines[n.first:n.last + 1])

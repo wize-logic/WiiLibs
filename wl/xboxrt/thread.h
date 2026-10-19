@@ -45,6 +45,7 @@ struct WlXbThread {
     uint32_t suspend_count;
     bool terminated;
     bool is_service;           // the runtime's service thread (not a guest thread)
+    bool spared;               // the service thread's wait for the lock ended unneeded (yield_if_due)
     bool counted;              // made by wl_xb_thread_create: the process ends when the last ends
     uint32_t exit_status;
     void *kernel;              // the kernel's per-thread state
@@ -170,6 +171,16 @@ void wl_xb_thread_foreach(void (*fn)(WlXbThread *t, void *user), void *user);
 
 // Takes the guest lock for `self` (not held) and loads its registers.
 void wl_xb_lock(WlXbThread *self);
+// The same, waiting `timeout_ms` at most (WL_WAIT_FOREVER: none): false when the lock did not come
+// (the thread is not queued then). The title's exit takes the lock so: a holder that never gives it
+// up does not hold the exit. The service thread's wait (any timeout) ends with false once
+// wl_xb_service_stop_within stops it (wl_xb_thread_lock_stop).
+bool wl_xb_lock_within(WlXbThread *self, uint32_t timeout_ms);
+// The exit (true): the service thread's wait for the lock gives up; false at its start.
+void wl_xb_thread_lock_stop(bool stop);
+// The lock's holder now (NULL: free), and the ready queue's head; for a report or a test.
+WlXbThread *wl_xb_thread_lock_holder(void);
+WlXbThread *wl_xb_thread_ready_head(void);
 // Saves the registers into `self` and gives the lock to the next ready thread.
 void wl_xb_unlock(WlXbThread *self);
 // Gives the lock up and sleeps until wl_xb_wake(self) or `timeout_ms` (WL_WAIT_FOREVER: no
@@ -257,6 +268,13 @@ bool wl_xb_lock_wanted(void);
 #define WL_XB_COMPAT_OLDAPC 1u    // SleepEx(0, TRUE) runs no queued APC (it yields, as before 52f29e2)
 #define WL_XB_COMPAT_OLDYIELD 2u  // NtYieldExecution gives way to equal or higher priorities only
 #define WL_XB_COMPAT_OLDVBLANK 4u // vblanks raised while one is pending merge into it (none owed)
+// a device access's safe point is a whole one every time (a file "olddevpoint", WL_XB_OLDDEVPOINT on
+// the host; wl_xb_device_safe_point): not only a poll in a quiet window, not nothing after a read
+// with the attention down
+#define WL_XB_COMPAT_OLDDEVPOINT 8u
+// the service thread queued for the lock gets it even when the holder's poll has just run the work it
+// came for (a file "oldservice", WL_XB_OLDSERVICE on the host; yield_if_due)
+#define WL_XB_COMPAT_OLDSERVICE 16u
 extern uint32_t g_xb_compat;
 // The safe point of a device access once the device has answered (fault_posix.c, mem_wii.c): what
 // wl_xb_safe_point does, at a device access's cost in the deterministic mode's clock.
@@ -335,6 +353,10 @@ typedef struct {
     uint32_t tie_handoffs;  // the lock given to a thread of equal priority that waited a quantum (preempt)
     uint32_t gpu_blocks;    // waits for the GPU that gave the lock up (wl_xb_gpu_wait_begin)
     uint32_t gpu_off_ms;    // their time off the lock
+    uint32_t device_points; // wl_xb_device_safe_point calls (a device access the runtime emulated)
+    uint32_t quiet_device_points; // of those, the ones in a quiet window that only polled (OLDDEVPOINT off)
+    uint32_t read_device_points;  // ...the reads with the attention down that returned at once (OLDDEVPOINT off)
+    uint32_t service_spared; // the service thread sent back unqueued: the holder had run its work (OLDSERVICE off)
 } WlXbThreadStats;
 void wl_xb_thread_stats(WlXbThreadStats *out);
 // The service thread's longest wait for the guest lock since the last call, in ms (what the

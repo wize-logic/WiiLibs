@@ -51,6 +51,7 @@ set_tests_properties(bench_safe_point_runs PROPERTIES LABELS "unit;be")
 # A lock holder that lowers its own priority below a ready thread hands it the lock at its next safe
 # point, with quiet safe points and without (the switch fullsafe).
 wl_add_test(test_xboxrt_lower_priority SOURCES test_xboxrt_lower_priority.c LIBS wl_xboxrt LABELS unit be)
+wl_add_test(test_xboxrt_service SOURCES test_xboxrt_service.c LIBS wl_xboxrt LABELS unit be)
 # The page packer (the compressed page cache's): pages back byte for byte, bad bytes refused; its
 # cost per page for tools/qemu_icount.py on ppc-be.
 wl_add_test(test_xboxrt_page_pack SOURCES test_xboxrt_page_pack.c LIBS wl_xboxrt LABELS unit be)

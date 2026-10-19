@@ -151,6 +151,32 @@ with that is not compiled in to `<hard disk folder>/vsh_programs.inc` (wl/xboxrt
 the Wii too), and its programs run as functions. The list and the C are made from the game's
 code: they stay in the title's folders, never in WiiLibs.
 
+**The forms file** (`--fused forms.txt`; a title's `vsh_forms.txt`, which `wl_add_xbox_title` passes when
+the title's build sets `WL_XBOX_VSH_FORMS`) lists the fused forms to compile, a line a form: the program's
+hash (hex), then the form as `wl_xbox_vsh_fused_text` writes it (`vsh.h`): `<live, hex> <p, o, x or w>
+<colours> <channels>[L][I] <stages> <formats>`; a line starting `#` is a comment. `xbox_nv2a_replay
+--fused-forms <capture>` prints the forms a capture's draws could run, the most vertices first, in this
+format. It prints the base forms only: a draw asks for a twin that GX's transform unit takes part of only
+when its program has that twin compiled in (`world_xf_plan` and `texgen_xf_plan` look it up before they
+take the draw), so a build without the twins never names them. **A new program's twins are added by hand**:
+
+- **"w"** (a skinned program, whose clip-space position is made from a blended world position:
+  `wl_xbox_vsh_world_position`): its "p" line with `w` for `p` and the position's bit (1,
+  `WL_XBOX_VSH_LIVE_POSITION`) cleared from live, `1e7 p 2 3 0P,1P,2P,3S ...` giving
+  `1e6 w 2 3 0P,1P,2P,3S ...`, for each of its lines (`L`, `I`, `U` stages and all). Without it the draw
+  runs its "p" form, the clip position the processor's (`noworldxf`'s way).
+- **"M"** (each form a stage of which GX can make from one input register: `wl_xbox_vsh_texgen_source`):
+  those stages written `<n>M` and their bits (`WL_XBOX_VSH_LIVE_T0 << n`: 0x20, 0x40, 0x80, 0x100)
+  cleared from live, `1e7 p 2 3 0P,1P,2P,3S` giving `107 p 2 3 0M,1M,2M,3S`, for its "p", "w" and "x"
+  lines alike (`1e6 w` giving `106 w`); a sphere map's stage (`S`, `U`) stays. Without it the coordinates
+  are the processor's (`noxftexgen`'s way; an "x" form's, `noxtexgen`'s).
+
+The twins multiply: a skinned program with lit, interleaved and sphere-by-GX forms has 32 lines (`p` and `w`,
+plain and `M`, each of `""`, `L`, `I`, `LI`, each with `S` or `U`). A twin no draw takes costs code size
+alone; a missing one costs the draws that would have taken it the processor's work, with nothing drawn
+differently, so the capture bench's `vertices made by fused batches` (a Wii build's replay of a capture:
+the host and ppc-be fuse none) or a profile is how a missing twin shows.
+
 ## Tests
 
 `tests/xbox/`: random combiner programs translated and simulated as TEV against the combiners

@@ -118,8 +118,10 @@ static void check_draw(void) {
 #endif
 
 void wl_gx_wii_texmaps_forget(uint32_t maps) {
-    wl_gx_shadow_texture_forget(maps);
     d.maps_known &= (uint8_t)~maps;
+    if (wl_gx_shadow_texture_forget(maps)) {
+        wl_tev_maps_follow(); // (a program applied before the load reads the map loaded: gx_shadow.h)
+    }
 }
 
 void wl_gx_wii_texmaps_loaded(uint32_t maps) {
@@ -143,6 +145,7 @@ void wl_gx_bisect_set(const WlGxBisect *bisect) {
     unsigned i;
 
     d.bisect = *bisect;
+    wl_gx_shadow_maps_cache(!bisect->maps_fixed);
     d.bisect_on = bisect->no_textures || bisect->no_tlut || bisect->tlut_mem1 || bisect->max_draws != 0 ||
                   bisect->no_quads || bisect->no_z_restore || bisect->no_copies || bisect->late_z || bisect->vtx_inval;
     if (bisect->tlut_mem1 && tlut_copies == NULL) {
@@ -334,6 +337,25 @@ static bool load_texture(GXTexObj *obj, u8 map) {
     return answer != 0;
 }
 
+// the map logical map `logical`'s texture `obj` goes to (gx_shadow.h: the maps as a cache), its key the
+// object's words that do not depend on the map (*held: that map holds it already)
+static u8 map_for(u8 logical, GXTexObj *obj, bool *held) {
+    TexObjWords o;
+    uint32_t key[WL_GX_MAP_KEY_WORDS];
+
+    if (d.bisect.maps_fixed) {
+        *held = false;
+        return logical;
+    }
+    memcpy(&o, obj, sizeof o);
+    key[0] = o.mode0 & 0x00FFFFFFu;
+    key[1] = o.mode1 & 0x00FFFFFFu;
+    key[2] = o.image0 & 0x00FFFFFFu;
+    key[3] = o.image3 & 0x00FFFFFFu;
+    key[4] = (uint32_t)o.flags << 24 | (o.tlut & 0x00FFFFFFu);
+    return (u8)wl_gx_shadow_map_bind(logical, key, held);
+}
+
 void wl_gx_wii_bisect_frame(void) {
     d.frame_draws = 0;
 }
@@ -355,7 +377,10 @@ void wl_gx_direct_begin(void) {
     unsigned stage;
 
     wl_gx_wii_own_thread();
-    wl_gx_invalidate_shadow(); // (wl_gx's own TLUT shadow too; the slots' palettes are kept: gx_shadow.h)
+    // (wl_gx's own TLUT shadow too; the slots' palettes are kept: gx_shadow.h; with the maps as a cache, their
+    // textures too: wl/platform's own loads forget the maps they load)
+    wl_gx_wii_invalidate_shadow_own();
+    wl_gx_shadow_maps_begin();
     d.layout_known = false;
     d.lighting_known = false;
     d.material_known = 0;
@@ -555,6 +580,7 @@ void wl_gx_direct_lighting(const WlGxDirectLighting *lighting) {
                 d.lighting.clamped != lighting->clamped);
     d.lighting = *lighting;
     d.lighting_known = true;
+    wl_gx_shadow_lighting(lighting); // (its loads counted)
     if (channels) {
         lit_channels();
     }
@@ -665,6 +691,7 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     static const u8 prims[] = {GX_POINTS,    GX_LINES,         GX_LINESTRIP, GX_TRIANGLES,
                                GX_TRIANGLESTRIP, GX_TRIANGLEFAN, GX_QUADS};
     uint32_t i;
+    bool flush;
 
     d.in_primitive = false;
     if (count == 0 || count > 65535u || (unsigned)prim >= sizeof prims || !d.layout_known) {
@@ -676,12 +703,15 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     if (d.bisect_on && d.bisect.vtx_inval) {
         GX_InvVtxCache();
     }
-    // (noted before its commands: the flush, the state GX_Begin sends, the primitive)
+    // (noted before its commands: a fence's token put off, the flush, the state GX_Begin sends, the primitive)
     wl_gx_wii_hang_event('P', (uint32_t)prim << 16 | count, d.stats.draws);
+    wl_tev_maps_follow(); // (the stages read the maps their textures went to: gx_shadow.h)
+    wl_gx_wii_token_due();
 #ifdef WL_GX_CHECK
     check_draw();
 #endif
-    if (wl_gx_flush_wii_take()) {
+    flush = wl_gx_flush_wii_take();
+    if (flush) {
         static const WlGxDirectVertex zero;
 
         GX_Begin(GX_TRIANGLESTRIP, DIRECT_FORMAT, XF_FLUSH_VERTICES);
@@ -693,7 +723,9 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
         wl_gx_wii_hang_event('X', 0, 0);
     }
     GX_Begin(prims[prim], DIRECT_FORMAT, (u16)count);
-    wl_gx_shadow_fifo(WL_GX_FIFO_VERTEX, 3u + count * d.vertex_bytes);
+    // (the flush's strip counted with the primitive: of its state, in its batch)
+    wl_gx_shadow_fifo(WL_GX_FIFO_VERTEX, 3u + count * d.vertex_bytes +
+                                             (flush ? 3u + XF_FLUSH_VERTICES * d.vertex_bytes : 0u));
     d.in_primitive = true;
     d.stats.draws++;
     d.stats.vertices += count;
@@ -967,7 +999,7 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
     const WlGxSampler *s = sampler != NULL ? sampler : &tex->sampler;
     GXTexObj obj;
     u8 minf = s->min_filter, wrap_s = s->wrap_s, wrap_t = s->wrap_t;
-    bool pow2 = (tex->width & (tex->width - 1u)) == 0 && (tex->height & (tex->height - 1u)) == 0;
+    bool pow2 = (tex->width & (tex->width - 1u)) == 0 && (tex->height & (tex->height - 1u)) == 0, held;
 
     if (map >= GX_MAX_TEXMAP) {
         return;
@@ -976,7 +1008,10 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
                         (d.bisect.no_tlut && (tex->format == WL_GX_TEX_C4 || tex->format == WL_GX_TEX_C8)))) {
         d.stats.textures++;
         obj = d.fixed;
-        if (load_texture(&obj, (u8)(GX_TEXMAP0 + map))) {
+        map = map_for((u8)map, &obj, &held);
+        if (held) {
+            wl_gx_shadow_texture_kept();
+        } else if (load_texture(&obj, (u8)(GX_TEXMAP0 + map))) {
             wl_gx_wii_hang_event('T', (uint32_t)(uintptr_t)fixed_texels,
                                  map << 28 | (uint32_t)WL_GX_TEX_RGBA8 << 22 | 4u << 11 | 4u);
             d.maps_loaded |= (uint8_t)(1u << map);
@@ -1012,6 +1047,13 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
         GX_InitTexObjLODBias(&obj, s->lod_bias);
     }
     d.stats.textures++;
+    // (the map that holds it already, else the one it goes to; the TEV's stages follow: gx_shadow.h)
+    map = map_for((u8)map, &obj, &held);
+    if (held) {
+        wl_gx_shadow_texture_kept();
+        d.stats.textures_kept++;
+        return;
+    }
     if (!load_texture(&obj, (u8)(GX_TEXMAP0 + map))) {
         // (the map holds it: its registers as they would be written; GX's texture cache is
         // wl_gx_direct_texture_invalidate's)
@@ -1026,6 +1068,7 @@ void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler
 }
 
 void wl_gx_direct_texture_invalidate(void) {
+    wl_gx_shadow_texture_invalidate(); // (counted)
     GX_InvalidateTexAll();
 }
 

@@ -122,6 +122,27 @@ full SHAs and takes the release name from the newest such commit at or before th
    `advance` refuses while the copy is not at that commit's vendored content or a patch does not
    apply.
 
+## Pending: upstream v0.14.0 (eb0aa1d)
+
+Looked at on 2026-10-19 (`fetch`, `brief`; not synced). The copy is at v0.13.1 (193e299, 2026-10-07)
+and `check-map` is clean there (441 upstream files, all mapped; 158 vendored, 36 patches). Upstream's
+head eb0aa1d (v0.14.0 "Other Machines", 2026-10-16) is 98 commits later (122 with merges; 167 files,
++18,953/-1,461), and the brief maps every new file (no area needs a decision). What it would bring:
+
+| Area | Upstream commits | For WiiLibs |
+|---|---|---|
+| lifter (vendored, patched) | `cebfc64` neg in unsigned arithmetic; `e108d0e` xadd / lock xadd flags; `01064f3` FCMOVcc; `c50c597` MXCSR modelled, CVTSS2SI/CVTSD2SI round by its RC; `46aee91`/`6931018` in/out to runtime port I/O, the field pin at 0x80C0; `bb2b5c7` sahf, fcomi, comiss flags; `b40805c` x87 tbyte loads and stores; `2d38bcd` ficom; `999a8c6` x87 trig, remainder, scale edges; `8862b6c` SSE conversions and estimates; `f69a435` FPREM's C2; `bbbaadb` COMISD/UCOMISD double lanes; `2db0a2f` parity SETcc/CMOVcc; `8af3ef7` `tools/recomp/fpdiff.py`, an x87/SSE differential tester | most of it is fixed already by WiiLibs' patches: 0005 (m80), 0007 (parity), 0009 (port I/O), 0015 (sahf, C2), 0017 (neg and widths), 0018 (MXCSR, FCMOVcc) are to be dropped or cut to what upstream lacks, each against its conformance cases; the xadd flags and SSE rounding are new to WiiLibs |
+| analysis (patched) | `0239dd3` ... `4b449d7` (18 commits): static callback recovery (callbacks hidden by aliases, passed as immediates, past inline switch tables, their dependencies and bounds); `34f5e1c` ... `801e288` (15 disasm fixes): tail closure, shared bodies, int3 padding; `2649f5f` blocks that alias bodies branch to | 0019 (discovery gaps) to rebase or drop; the Halo smoke check (functions, unresolved targets, `.text`) to compare with "Reference numbers" |
+| runtime-abi (patched) | `templates/runtime/recomp_types.h` for MXCSR and port I/O | patches 0002, 0003, 0005, 0008, 0009, 0013, 0015, 0021, 0023, 0025, 0030, 0032 touch it; `wl/xboxrt/recomp/` gains the new runtime symbols (`RECOMP_PORT_IN`/`OUT` exist already through 0009) |
+| nv2a, d3d (concept, port) | `1d050ac`, `19ef9f0`, `53f49ad` the pushbuffer executor (a DMA-style walk, fixed-function transform and lighting, back ends); `eed7f4e` oPos.w == 0 drawn with w = 1; `0ca0947` vertex-program triangles that never divide by w; `27c95f4` constant-arrival tracing | facts for `wl/xbox` (the w = 0 vertices, screen-space programs) |
+| audio (concept; LGPL files) | `cde57b3` addresses above 64 MB; `148431d` pitch resampling; `a16163f` device-paced output; `e0d2525` FETINTSTS latched once a trap; `7fe4d49` one idle-voice trap at a time; `5e40efb` the sample-limit interrupt (ISTS bit 3), a real XGSCNT; diagnostics (`a87919d`, `2d9c96c`, `ed1432d`, `b7c311a`) | `src/apu/*` is LGPL (BLOCK): facts only, from a public source, for `wl/xboxapu` (the sample-limit interrupt: Black's DirectSound waited for it) |
+| kernel, memory, io (concept) | `e7462cf` guest thread objects, TLS from TlsDataSize; `f775a5a` events in multiple-object waits; `ae11965` FATX overwrite and rename; `8d0442b` directory searches released at NtClose; `13d9637` a page allocator for the contiguous arena, MmAllocateContiguousMemoryEx's range; POSIX and arm64 hosts, SDL2, a keyboard/mouse pad | facts for `wl/xboxkrnl` (the multiple-object waits, the contiguous range) |
+| conformance, tests, build | `607f62c` C fixtures under MSVC; `1f7ab62`, `c0af02d` exact comparisons; `60a947c` archives linked as a group | the conformance suite's new cases come with the vendored files |
+
+Patches against eb0aa1d, in order (one that fails is left out): 0001, 0004, 0006, 0008, 0010, 0027 and 0028 apply; the other 29
+do not (upstream's own fixes in the same lines, or the context of a patch left out before them). The sync is
+`merge --to eb0aa1d --apply`, then step 5 above, patch by patch from 0002.
+
 ## Reference numbers
 
 The smoke check on the reference title, Halo: Combat Evolved retail (01.10.12.2276), so a later

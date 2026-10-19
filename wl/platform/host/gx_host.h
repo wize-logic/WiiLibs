@@ -77,3 +77,6 @@ void wl_host_gx_set_widescreen(bool widescreen);
 // The rate wl_platform_video_set_rate last asked for (0: none, or an interval's).
 uint32_t wl_host_gx_rate(void);
 void wl_host_gx_clear_counters(void);
+// wl_gx_invalidate_shadow forgetting only the texture maps of the mask `maps` (the console's wl_gx_direct_begin
+// with the maps as a cache: gx_shadow.h)
+void wl_host_gx_invalidate_shadow_maps(uint32_t maps);

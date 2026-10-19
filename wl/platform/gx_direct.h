@@ -10,7 +10,9 @@
 // token or a draw-done. libogc names the remedy, GX_SetMisc(GX_MT_XF_FLUSH, GX_XF_FLUSH_SAFE), but its
 // GX_Begin sends only the primitive (libogc.a's gx.o, disassembled: OpenCE-Wii's finding). So the
 // first wl_gx_direct_draw after wl_gx_direct_begin or wl_gx_direct_flush_after is preceded by a strip
-// of eight vertices of zeros in its own format, which are one point and draw nothing.
+// of eight vertices of zeros in its own format, which are one point and draw nothing. Every draw-sync
+// token wl/platform sends (a fence's, put off or not, wl_gx_sync's, a frame's, hwcount's marks) asks for
+// the flush itself, as it goes into the FIFO.
 //
 // Indexed attributes. An attribute the layout marks indexed is not sent with each vertex but read by
 // GX from an array (wl_gx_direct_array) at a 16-bit index the vertex sends in its place
@@ -227,6 +229,10 @@ typedef struct {
     // a picture drawn narrow in the framebuffer's middle columns, as shown, and copied to the screen whole (not in
     // its last columns, the display copy taking those alone into the screen's middle: wl_gx_draw_narrow)
     bool narrow_mid;
+    // a fence's token sent at once (not put off to where Dolphin cuts its batch anyway: gx_shadow.h)
+    bool fence_eager;
+    // each texture on the map its stage names (not GX's eight maps kept as a cache of textures: gx_shadow.h)
+    bool maps_fixed;
 } WlGxBisect;
 void wl_gx_bisect_set(const WlGxBisect *bisect);
 // The switches set (all off before wl_gx_bisect_set).
@@ -257,7 +263,10 @@ void wl_gx_direct_cull(WlGxCull cull);
 // object's) and, for C4/C8, its TLUT (loaded into the object's slot). An object the map already
 // holds as it would be loaded is not loaded again (the TLUT is: its entries may have changed);
 // wl/platform's own loads (its quads, wl_gx_tex_bind, the ramp) and wl_gx_invalidate_shadow make
-// the maps they touch unknown.
+// the maps they touch unknown. `map` is the map the TEV's stages name: GX's eight maps keep their last
+// textures as a cache (gx_shadow.h; not with the switch gxmapsfixed), the texture going to the map that
+// holds it already or to one no other stage's map is on, and the stages reading it there. After
+// wl_gx_direct_begin the maps the draws read are bound again before them (their maps free until then).
 void wl_gx_direct_texture(uint32_t map, const WlGxTexObj *tex, const WlGxSampler *sampler, const WlGxTlut *tlut);
 // GX's texture cache emptied: memory a texture was read from has changed.
 void wl_gx_direct_texture_invalidate(void);
@@ -278,6 +287,17 @@ typedef struct WlGxDirectStats {
     uint32_t array_calls, array_sent;
     // the FIFO's bytes by kind (WlGxFifoKind: a model, gx_shadow.h)
     uint64_t fifo[8];
+    // Dolphin's batches, a model (gx_shadow.c): the primitives, the batches they made (a primitive after a
+    // write that changed GX's state, the arrays' aside, starts one), and by kind the batches each kind of
+    // write started, and started alone
+    uint32_t primitives, batches;
+    uint32_t batch_breaks[8], batch_alone[8];
+    // tokens sent (gx_shadow.h), of them those after no other command, the batches a token started and
+    // those it started alone, the texture cache's invalidations
+    uint32_t tokens, tokens_idle, token_breaks, token_alone, tex_invalidates;
+    // texture maps as a cache (gx_shadow.h): binds found in a map other than their stage's last, and TEV
+    // orders sent only because a stage's texture moved to another map
+    uint32_t tex_map_hits, tex_map_orders;
 } WlGxDirectStats;
 void wl_gx_direct_stats(WlGxDirectStats *out);
 

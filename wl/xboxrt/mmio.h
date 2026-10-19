@@ -53,11 +53,17 @@ extern uint32_t g_xb_mmio_depth;
 void wl_xb_mmio_set_fault_pc(uintptr_t pc);
 uintptr_t wl_xb_mmio_fault_pc(void);
 
+// The last access dispatched was a write (1) or a read (0): the device access's safe point after a
+// read looks only when something waits (wl_xb_device_safe_point; a read raises no device's line).
+extern uint32_t g_xb_mmio_last_write;
+
 // Counters for tests and reports.
 typedef struct {
     uint32_t reads, writes, unclaimed;
 } WlXbMmioStats;
 void wl_xb_mmio_stats(WlXbMmioStats *out);
+// The `top` 256-byte blocks of registers accessed most (device, block, read or written), a line each.
+void wl_xb_mmio_log_hot(const char *tag, uint32_t top);
 
 // ---- Fault handling ----------------------------------------------------------------------------
 

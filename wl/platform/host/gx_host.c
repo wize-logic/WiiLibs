@@ -221,6 +221,7 @@ static uint32_t g_frames_ended; // wl_gx_frame_index (not reset with the counter
 static bool g_overlap;
 // the frames ended without overlap: the console's processor waits for the GPU at each
 static uint32_t g_frame_waits;
+static uint32_t g_peeks; // (WlGxStats.efb_peeks)
 
 WlResult wl_platform_video_init(void) {
     return WL_OK;
@@ -338,27 +339,50 @@ void wl_gx_stats(WlGxStats *out) {
     out->gpu_waits = s.sync_calls + g_frame_waits;
     out->efb_copies = s.efb_copies + wl_host_gx_target_copies();
     out->efb_copy_bytes = g_copy_bytes;
+    out->efb_peeks = g_peeks;
+}
+
+// A token the console sends, counted, and the transform unit's flush it asks for before the next direct
+// primitive (gx_wii.c's send_token; gx_direct.h)
+static void console_token(void) {
+    wl_gx_shadow_token();
+    wl_gx_direct_flush_after();
 }
 
 bool wl_gx_sync(void) {
     s.sync_calls++;
+    console_token();
     return true;
 }
 
+// (the first fence the token put off stands for: asking about it or a later one sends the token, as the
+// console does, gx_wii.c)
+static uint32_t g_fence_put_off;
+
 uint32_t wl_gx_fence(void) {
     static uint32_t fences;
+    bool put_off = wl_gx_shadow_token_deferred();
+    uint32_t fence = ++fences != 0u ? fences : ++fences;
 
-    return ++fences != 0u ? fences : ++fences;
+    // (the console's token, counted where it sends it: at once, or put off, gx_wii.c)
+    if (wl_gx_bisect()->fence_eager) {
+        console_token();
+    } else {
+        wl_gx_shadow_token_defer();
+        g_fence_put_off = put_off ? g_fence_put_off : fence;
+    }
+    return fence;
 }
 
 bool wl_gx_fence_passed(uint32_t fence) {
-    (void)fence;
+    if (fence != 0u && fence >= g_fence_put_off && wl_gx_shadow_token_deferred()) {
+        console_token(); // (the console sends the token put off once its fence is asked about)
+    }
     return true;
 }
 
 bool wl_gx_fence_wait(uint32_t fence) {
-    (void)fence;
-    return true;
+    return wl_gx_fence_passed(fence);
 }
 
 void wl_gx_set_frame_overlap(bool on) {
@@ -388,9 +412,15 @@ bool wl_gx_frame_wait(uint32_t index) {
     return true;
 }
 
-void wl_gx_invalidate_shadow(void) {
+void wl_host_gx_invalidate_shadow_maps(uint32_t maps) {
     wl_gx_shadow_forget();
-    wl_gx_shadow_texture_forget(0xFFu); // (the console's: its maps too)
+    if (wl_gx_shadow_texture_forget(maps)) { // (the console's: its maps too)
+        wl_tev_maps_follow();
+    }
+}
+
+void wl_gx_invalidate_shadow(void) {
+    wl_host_gx_invalidate_shadow_maps(0xFFu);
 }
 
 void wl_gx_reset_state(void) {
@@ -508,12 +538,14 @@ uint32_t wl_gx_end_frame(void) {
     s.in_frame = false;
     s.end_frames++;
     g_frames_ended++;
+    console_token(); // (the console's frame token)
     // (the stub GPU has finished every frame: overlap changes nothing but the waits counted)
     g_frame_waits += g_overlap ? 0u : 1u;
     return wl_platform_video_present();
 }
 
 uint32_t wl_gx_peek_rgba(int x, int y) {
+    g_peeks++;
     if (g_renderer_set && g_renderer.peek != NULL) {
         return g_renderer.peek(g_renderer.user, x, y);
     }
@@ -521,6 +553,7 @@ uint32_t wl_gx_peek_rgba(int x, int y) {
 }
 
 uint32_t wl_gx_peek_z(int x, int y) {
+    g_peeks++;
     if (g_renderer_set && g_renderer.peek_z != NULL) {
         return g_renderer.peek_z(g_renderer.user, x, y);
     }
@@ -827,7 +860,9 @@ void wl_gx_tex_bind_ex(const WlGxTexObj *tex, const WlGxSampler *sampler, const 
         return;
     }
     const WlGxSampler *sm = sampler != NULL ? sampler : &tex->sampler;
-    wl_gx_shadow_texture_forget(1u); // (map 0, behind the direct layer's shadow as on the console)
+    if (wl_gx_shadow_texture_forget(1u)) { // (map 0, behind the direct layer's shadow as on the console)
+        wl_tev_maps_follow();
+    }
     wl_gx_resolve_filters(sm, tex->mips, s.filter_override, &s.tex_min, &s.tex_mag);
     s.tex_wrap_s = sm->wrap_s;
     s.tex_wrap_t = sm->wrap_t;

@@ -74,6 +74,9 @@ void wl_xb_service_config_default(WlXbServiceConfig *cfg);
 WlResult wl_xb_service_start(const WlXbServiceConfig *cfg);
 // Stops it (tests). Lock not held.
 void wl_xb_service_stop(void);
+// The same within `timeout_ms` (WL_WAIT_FOREVER: none): false, logged with what the thread was
+// doing, when it did not end in time (it is left running; the title's exit goes on without it).
+bool wl_xb_service_stop_within(uint32_t timeout_ms);
 
 // Asserts / deasserts an interrupt line (any thread, lock held or not). A level source is asked
 // each time the handler looks at the line: `pending(user)` true means asserted.
@@ -100,6 +103,9 @@ void wl_xb_service_poll(void);
 // The same, asking the level sources too (a device access's safe point: the device may have just
 // raised its line).
 void wl_xb_service_poll_levels(void);
+// Work the service thread would take the lock for: something pending, the timer's deadline come, an
+// interrupt line asserted (whatever the holder's IRQL lets in). Any thread.
+bool wl_xb_service_wanted(void);
 // True while the handler runs (an ISR's or DPC's kernel calls see it).
 bool wl_xb_in_service(void);
 
@@ -117,6 +123,10 @@ typedef struct {
     // rest waits for the next call) with vertical blanks still owed, and with interrupt lines still
     // deliverable (a line no ISR takes down); the most rounds in one call since the last status line
     uint32_t services, services_full_owed, services_full_lines, rounds_max;
+    // what the service costs the holder and the service thread (the runtime's counts at the exit):
+    // polls (wl_xb_service_poll/_poll_levels outside the handler), of them the ones that asked the
+    // level sources; the service thread's rounds (each wake-up of its loop) and the ticks run
+    uint32_t polls, level_scans, service_rounds, ticks_run;
 } WlXbServiceStats;
 void wl_xb_service_stats(WlXbServiceStats *out);
 // More lines for the status report every 10 s (the kernel's I/O numbers); called on the service

@@ -281,6 +281,44 @@ TEST changes_send_only_what_gx_does_not_hold(void) {
     PASS();
 }
 
+// GX's maps as a cache (gx_shadow.h): an apply sends the map a stage's texture went to, and when only the
+// binds move a stage's texture, wl_tev_maps_follow sends that stage's order alone, once.
+TEST orders_follow_the_maps(void) {
+    static const uint32_t ka[WL_GX_MAP_KEY_WORDS] = {1, 2, 3, 0x100, 0xFFFFFF};
+    static const uint32_t kb[WL_GX_MAP_KEY_WORDS] = {1, 2, 3, 0x200, 0xFFFFFF};
+    WlTevProgram p;
+    bool held;
+
+    wl_gx_shadow_maps_cache(true);
+    (void)wl_gx_shadow_texture_forget(0xFFu);
+    wl_gx_shadow_forget();
+    ASSERT_EQ(0u, wl_gx_shadow_map_bind(0, ka, &held));
+    ASSERT_EQ(1u, wl_gx_shadow_map_bind(0, kb, &held));
+    wl_tev_recipe(&p, WL_GX_RECIPE_TEX_MODULATE);
+    gx_stub_reset();
+    wl_tev_apply_unchecked_ex(&p, WL_TEV_APPLY_CHANGES);
+    ASSERT_EQ(1u, g_gx_stub.stage[0].texmap);
+    // (A bound again: held in map 0, the order follows at the next primitive)
+    ASSERT_EQ(0u, wl_gx_shadow_map_bind(0, ka, &held));
+    ASSERT(held);
+    g_gx_stub.calls = 0;
+    wl_tev_maps_follow();
+    ASSERT_EQ(1u, g_gx_stub.calls);
+    ASSERT_EQ(0u, g_gx_stub.stage[0].texmap);
+    wl_tev_maps_follow();
+    ASSERT_EQ(1u, g_gx_stub.calls);
+    // (the same program applied again: nothing, GX holds it)
+    wl_tev_apply_unchecked_ex(&p, WL_TEV_APPLY_CHANGES);
+    ASSERT_EQ(1u, g_gx_stub.calls);
+    // (wl/platform's own load of map 0 while logical map 0 reads map 1: logical map 0 is map 0's again at once)
+    ASSERT_EQ(1u, wl_gx_shadow_map_bind(0, kb, &held));
+    wl_tev_maps_follow();
+    ASSERT_EQ(1u, g_gx_stub.stage[0].texmap);
+    ASSERT((wl_gx_shadow_texture_forget(1u) ? (wl_tev_maps_follow(), true) : false));
+    ASSERT_EQ(0u, g_gx_stub.stage[0].texmap);
+    PASS();
+}
+
 SUITE(tev_gx_suite) {
     RUN_TEST(recipes_leave_gx_as_the_hand_written_code_did);
     RUN_TEST(apply_writes_every_field);
@@ -288,6 +326,7 @@ SUITE(tev_gx_suite) {
     RUN_TEST(unused_swap_tables_are_left_alone);
     RUN_TEST(skip_swaps_leaves_the_tables_to_the_caller);
     RUN_TEST(changes_send_only_what_gx_does_not_hold);
+    RUN_TEST(orders_follow_the_maps);
 }
 
 GREATEST_MAIN_DEFS();

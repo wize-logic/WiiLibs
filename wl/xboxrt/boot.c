@@ -571,6 +571,8 @@ static void gx_bisect_options(const WlXbTitleConfig *cfg) {
     b.arrays_always = title_flag(cfg, "gxarrayall", NULL) || getenv("WL_XB_ARRAYS_ALL") != NULL;
     b.pillarbox = title_flag(cfg, "pillarbox", NULL) || getenv("WL_XB_PILLARBOX") != NULL; // (16:9: the old copy, not drawn narrow)
     b.narrow_mid = title_flag(cfg, "narrowmid", NULL) || getenv("WL_XB_NARROW_MID") != NULL; // (16:9: drawn in the middle columns)
+    b.fence_eager = title_flag(cfg, "gxfenceeager", NULL) || getenv("WL_XB_GX_FENCE_EAGER") != NULL; // (a fence's token at once)
+    b.maps_fixed = title_flag(cfg, "gxmapsfixed", NULL) || getenv("WL_XB_GX_MAPS_FIXED") != NULL; // (no texture maps as a cache)
     if (b.pipe32 || b.copy_filter || b.restore_whole || b.tlut_always || b.regions_libogc || b.tex_whole ||
         b.arrays_always) {
         WL_LOG_I(TAG, "GX the old ways:%s%s%s%s%s%s%s", b.pipe32 ? " gxpipe32" : "",
@@ -604,8 +606,8 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
     WlPlatformFile *vf = NULL;
 
     // earlier behaviours put back, for a bisection on the console (read once, before the guest runs):
-    // files "oldapc", "oldyield", "oldvblank" (thread.h's WL_XB_COMPAT_*) and "oldoccl" (occlusion
-    // queries counted by their area). The old yield is the default ("newyield" takes it away): card run 13
+    // files "oldapc", "oldyield", "oldvblank", "olddevpoint", "oldservice" (thread.h's WL_XB_COMPAT_*)
+    // and "oldoccl" (occlusion queries counted by their area). The old yield is the default ("newyield" takes it away): card run 13
     // showed no read gained by the new one. The new APC is (card run 13: Halo's reads over 100 ms 354 -> 47).
     // The old vblanks are too (card run 13: the smoothest a10, 14.6 fps against 12.5); "newvblank" owes them again.
     {
@@ -615,8 +617,10 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
         } k_compat[] = {{"oldapc", WL_XB_COMPAT_OLDAPC},
                         {"oldyield", WL_XB_COMPAT_OLDYIELD},
                         {"oldvblank", WL_XB_COMPAT_OLDVBLANK},
+                        {"olddevpoint", WL_XB_COMPAT_OLDDEVPOINT},
+                        {"oldservice", WL_XB_COMPAT_OLDSERVICE},
                         {"oldoccl", 0u}};
-        char in_force[64] = "";
+        char in_force[128] = "";
         bool old_occl = false;
         g_xb_compat = WL_XB_COMPAT_OLDYIELD | WL_XB_COMPAT_OLDVBLANK;
         snprintf(flag, sizeof flag, "%s/newvblank", cfg->title_dir);
@@ -627,6 +631,14 @@ static void gpu_options(const WlXbTitleConfig *cfg) {
         if (wl_platform_fs_exists(flag)) {
             g_xb_compat &= ~WL_XB_COMPAT_OLDYIELD;
         }
+#if !defined(__wii__)
+        if (getenv("WL_XB_OLDDEVPOINT") != NULL) {
+            g_xb_compat |= WL_XB_COMPAT_OLDDEVPOINT;
+        }
+        if (getenv("WL_XB_OLDSERVICE") != NULL) {
+            g_xb_compat |= WL_XB_COMPAT_OLDSERVICE;
+        }
+#endif
         for (size_t i = 0; i < sizeof k_compat / sizeof k_compat[0]; i++) {
             snprintf(flag, sizeof flag, "%s/%s", cfg->title_dir, k_compat[i].name);
             if (wl_platform_fs_exists(flag)) {
@@ -773,6 +785,33 @@ static int sd_speed_boot(const char *title_dir, const char *file) {
     wl_platform_log_flush();
 #endif
     return r == WL_OK ? 0 : 1;
+}
+
+// The title's exit: how long the wind-down waits for the service thread to end and for the guest
+// lock to come back (each), before it goes on without them.
+#define EXIT_WAIT_MS 5000u
+
+// What the runtime's own paths ran over the whole run (a deterministic run's are the same every
+// time: compare builds by them): the safe points, the polls, the service thread's rounds, the
+// device accesses.
+static void runtime_counts_log(void) {
+    WlXbThreadStats ts;
+    WlXbServiceStats ss;
+    WlXbMmioStats ms;
+    wl_xb_thread_stats(&ts);
+    wl_xb_service_stats(&ss);
+    wl_xb_mmio_stats(&ms);
+    WL_LOG_I(TAG, "runtime counts: %u safe points (%u quiet windows, %u yields), %u device points (%u in a quiet "
+             "window, %u reads that returned at once; %u reads, %u writes), %u kernel calls, %u handoffs, %u waits, %u service waits spared",
+             (unsigned)ts.safe_points, (unsigned)ts.quiet_windows, (unsigned)ts.safe_yields, (unsigned)ts.device_points,
+             (unsigned)ts.quiet_device_points, (unsigned)ts.read_device_points, (unsigned)ms.reads, (unsigned)ms.writes, (unsigned)ts.kernel_calls, (unsigned)ts.handoffs,
+             (unsigned)ts.waits, (unsigned)ts.service_spared);
+    WL_LOG_I(TAG, "runtime counts: %u polls (%u asked the level sources, %u with work), %u services (%u rounds), "
+             "%u vblanks, %u ticks run; the service thread %u rounds, %u took the lock",
+             (unsigned)ss.polls, (unsigned)ss.level_scans, (unsigned)ss.polls_with_work, (unsigned)ss.services,
+             (unsigned)ss.handler_runs, (unsigned)ss.vblanks, (unsigned)ss.ticks_run, (unsigned)ss.service_rounds,
+             (unsigned)ss.service_thread_runs);
+    wl_xb_mmio_log_hot(TAG, 8);
 }
 
 int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
@@ -1045,6 +1084,7 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     wl_xb_unlock(boot);
     int code = wl_xb_process_wait();
     WL_LOG_I(TAG, "the title left with %d", code);
+    runtime_counts_log();
     wl_mem_census_log(TAG, false); // (the heap's peak over the whole run, and who holds it now)
 #if !defined(__wii__)
     wl_platform_heap_log_sites(24);
@@ -1053,8 +1093,19 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     // thread's interrupts and vertical blanks) would go on running the title's code while the
     // card is unmounted and the audio and video are stopped. The service thread first (it may be
     // waiting for the lock), then the lock is the boot thread's for good: no guest code runs again.
-    wl_xb_service_stop();
-    wl_xb_lock(boot);
+    // Each wait is bounded (EXIT_WAIT_MS): a thread that never lets go (a holder parked for good,
+    // a service thread stuck in the title's interrupt work) is named in the log and the wind-down
+    // goes on without it, so the process ends (a host run once hung here for good after the
+    // title's exit line, 1 in 15).
+    if (!wl_xb_service_stop_within(EXIT_WAIT_MS)) {
+        WL_LOG_W(TAG, "exit: going on without the service thread");
+    }
+    if (!wl_xb_lock_within(boot, EXIT_WAIT_MS)) {
+        WlXbThread *holder = wl_xb_thread_lock_holder();
+        WL_LOG_W(TAG, "exit: the guest lock did not come back in %u ms (thread %u, %s, holds it): going on without it",
+                 (unsigned)EXIT_WAIT_MS, holder != NULL ? (unsigned)holder->id : 0u, holder != NULL ? holder->name : "-");
+        wl_xb_thread_log_guest_stacks();
+    }
     wl_xk_files_stop(true); // a guest thread's card transfer outside the guest lock goes no further
     wl_xk_files_flush();    // the files the title left open (its Z: cache slots) whole on the card
 #if defined(__wii__)

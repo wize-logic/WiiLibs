@@ -103,9 +103,26 @@ position, its stream's notifications and the two samples it resumes from exact) 
 3 to 4% of the processor at 1500 frames a second. Since 2026-10-18 (ppc-be -O3): 47 600 playing,
 22 900 silent, 1 600 paused (from 49 250, 24 000, 2 200): ADPCM's table holds each entry's next row
 as a pointer and its clamp is one compare, the stereo mix sums two bins a pass, and a voice's held
-gains are queued without the ramp checks. `WlXboxApuConfig.plain` (the runtime: a file `apuplain` in
+gains are queued without the ramp checks. Since 2026-10-19: 45 800 playing, 22 300 silent, 1 540
+paused: a voice whose volume, envelope, target and format words are the last frame's (and whose
+gains held then) queues the additions kept from that frame (its plan) without working out its
+targets and gains again; the waiting additions of every bin are made in one call (their loops'
+registers saved once); the lists' current/next voice registers are written once a list. Later
+on 2026-10-19 (44 600 playing; Halo's shapes a10 37 800 -> 36 200): a paused voice is passed over in
+the list walk; a frame whose samples all lie in the voice's run (a decoded block, a page or a
+segment of 16-bit PCM) takes them without fill's loop; both envelopes off is checked once; a
+stream's buffer words are not read; the plan's words are compared in place. All of it is off with
+`WlXboxApuConfig.plain`. `WlXboxApuConfig.plain` (the runtime: a file `apuplain` in
 the title folder, `WL_XB_APU_PLAIN=1` on the host; the bench: `BENCH_PLAIN=1`) runs the earlier
 paths, for an A/B: the same bins and output, bit for bit (`bench_xboxapu_plain`).
+
+In Halo's levels (deterministic host runs, 2026-10-19: a10's bridge, a30 and d40 from their checkpoints,
+60-90 s of play each) a frame has 17-22 playing voices and 13-24 paused ones in the lists: 70-83%
+mono ADPCM streams near 22 kHz into two 3D submixes and the effect send (3 additions each), 8-20%
+stereo ADPCM streams at 44.1 kHz to front left and right, 10% silent 16-bit loops; no envelopes; 98% of
+the voice frames repeat the last frame's additions (plan), 1% move a gain; 65-69% of the frames'
+samples lie in one run; 40-55 additions a frame over 5 bins (the two submixes and the effect send
+11-17 each). The bench's `BENCH_VOICES=a10`, `a30` and `d40` play those shapes.
 
 In Halo (a deterministic host run of a10's menu and opening, 100 s of sound) a frame has 8.7 voices:
 77% ADPCM, 70% streams, a fifth with a silent source; 1.8 ADPCM blocks are decoded a frame, and a

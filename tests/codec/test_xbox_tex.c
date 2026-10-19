@@ -616,7 +616,44 @@ TEST packed_pitch_zero_is_the_row_width(void) {
     PASS();
 }
 
+// The tile-at-a-time DXT to CMPR (levels of whole tiles) gives the bytes of the block-at-a-time loop
+// (wl_xbox_dxt_set_plain), for every DXT format, on blocks of every kind (random, equal and clear).
+TEST dxt_to_cmpr_by_tiles_matches_the_plain_loop(void) {
+    static const uint32_t sizes[][2] = {{8, 8}, {16, 8}, {64, 32}, {32, 128}, {24, 16}};
+    static const WlXboxFormat formats[] = {WL_XBOX_DXT1, WL_XBOX_DXT3, WL_XBOX_DXT5};
+    uint32_t seed = 12345u;
+    for (size_t f = 0; f < 3; f++) {
+        for (size_t s = 0; s < sizeof sizes / sizeof sizes[0]; s++) {
+            uint32_t w = sizes[s][0], h = sizes[s][1];
+            size_t in_len = wl_xbox_level_bytes(formats[f], w, h, 0), out_len = wl_gxc_tex_bytes(WL_GXC_CMPR, w, h);
+            uint8_t *in = malloc(in_len), *plain = malloc(out_len), *tiles = malloc(out_len);
+            ASSERT(in != NULL && plain != NULL && tiles != NULL);
+            for (size_t i = 0; i < in_len; i++) {
+                seed = seed * 1664525u + 1013904223u;
+                in[i] = (uint8_t)(seed >> 24);
+            }
+            // (a few blocks with equal endpoints, and a few all clear)
+            for (size_t b = 0; b + 16u <= in_len; b += 48u) {
+                in[b + 2] = in[b], in[b + 3] = in[b + 1];
+                memset(in + b + 4, 0xFF, 4);
+                in[b + 10] = in[b + 8], in[b + 11] = in[b + 9];
+            }
+            memset(tiles, 0xAB, out_len);
+            wl_xbox_dxt_set_plain(true);
+            ASSERT_EQ(out_len, wl_xbox_dxt_to_cmpr(formats[f], in, in_len, w, h, plain, out_len));
+            wl_xbox_dxt_set_plain(false);
+            ASSERT_EQ(out_len, wl_xbox_dxt_to_cmpr(formats[f], in, in_len, w, h, tiles, out_len));
+            ASSERT_MEM_EQ(plain, tiles, out_len);
+            free(in);
+            free(plain);
+            free(tiles);
+        }
+    }
+    PASS();
+}
+
 SUITE(xbox_tex_suite) {
+    RUN_TEST(dxt_to_cmpr_by_tiles_matches_the_plain_loop);
     RUN_TEST(swizzle_masks_alternate_x_then_y);
     RUN_TEST(unswizzle_follows_the_masks_and_round_trips);
     RUN_TEST(dxt1_to_cmpr_reorders_without_changing_a_bit_of_meaning);

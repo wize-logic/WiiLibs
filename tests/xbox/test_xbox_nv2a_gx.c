@@ -440,6 +440,76 @@ TEST a_blur_through_the_depth_buffer_is_drawn_in_one_frame(void) {
     PASS();
 }
 
+// The picture drawn, then a target of a quarter of the screen that takes the EFB with a clear (not known then
+// to read the picture: no draw) and reads the picture into itself, the first blur of its size. Returns the
+// draw's reads that no park served and the targets that took the EFB again.
+static void quarter_blur(TGuest *g, WlNv2aGxStats *stats) {
+    f_frame_setup(g);
+    f_program(g, 0, f_screen_program, 3);
+    f_clear(g, 0xFF000000u);
+    f_quad(g, 10, 10, 100, 100, 0.5f, 0xFFFFFFFFu);
+    t_kick(g);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_FORMAT, WL_NV2A_SURFACE_COLOR_A8R8G8B8 | WL_NV2A_SURFACE_TYPE_PITCH << 8);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_CLIP_HORIZONTAL, 320u << 16);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_CLIP_VERTICAL, 240u << 16);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_PITCH, 1280u << 16 | 1280u);
+    t_m1(g, WL_NV2A_K_SET_SURFACE_COLOR_OFFSET, 0x300000);
+    t_m1(g, WL_NV2A_K_SET_DEPTH_TEST_ENABLE, 0);
+    t_m1(g, WL_NV2A_K_SET_COLOR_CLEAR_VALUE, 0xFF204060u);
+    t_m1(g, WL_NV2A_K_SET_CLEAR_RECT_HORIZONTAL, 319u << 16);
+    t_m1(g, WL_NV2A_K_SET_CLEAR_RECT_VERTICAL, 239u << 16);
+    t_m1(g, WL_NV2A_K_CLEAR_SURFACE, WL_NV2A_CLEAR_COLOR);
+    t_m1(g, WL_NV2A_K_SET_TEXTURE_OFFSET, F_COLOR);
+    t_m1(g, WL_NV2A_K_SET_TEXTURE_FORMAT, 1u | 2u << 4 | (uint32_t)WL_NV2A_TEX_LU_A8R8G8B8 << 8 | 1u << 16);
+    t_m1(g, WL_NV2A_K_SET_TEXTURE_CONTROL1, 2560u << 16);
+    t_m1(g, WL_NV2A_K_SET_TEXTURE_IMAGE_RECT, 640u << 16 | 480u);
+    f_quad(g, 0, 0, 320, 240, 0, 0xFFFFFFFFu);
+    t_kick(g);
+    wl_nv2a_gx_stats(g_gx, stats);
+}
+
+// A blur target that first takes the EFB with a clear reads the picture at its first draw all the same: the
+// EFB taken again at that draw, the picture parked whole (not from its next park on, which left the first
+// blur of each size without it for a frame), its clear made again; with the switch noparkretake, unread.
+TEST a_target_that_took_the_efb_with_a_clear_reads_the_picture_at_once(void) {
+    TGuest g;
+    WlNv2aGxStats stats;
+    WlGxTargetStats targets;
+    uint32_t w = 0, h = 0, clears;
+
+    ASSERT(gx_device(&g) != NULL);
+    wl_gx_target_stats(&targets, true);
+    quarter_blur(&g, &stats);
+    ASSERT_EQ(1u, stats.picture_retakes);
+    ASSERT_EQ(0u, stats.screen_reads_unserved);
+    ASSERT_EQ(0u, stats.frames);
+    ASSERT(wl_gx_target_parked_colour(&w, &h) != NULL);
+    ASSERT_EQ(640u, w);
+    ASSERT_EQ(480u, h);
+    ASSERT(wl_host_gx_direct()->textures[0] != NULL);
+    ASSERT_EQ(640u, wl_host_gx_direct()->textures[0]->width);
+    // (the target resolved once, as it gave the EFB back; its clear made again)
+    wl_gx_target_stats(&targets, false);
+    ASSERT_EQ(1u, targets.resolves);
+    clears = targets.clears;
+    gx_done(&g);
+
+    // the switch noparkretake (a file in the title's folder, here a virtual one): the draw reads no picture
+    ASSERT_EQ(WL_OK, wl_platform_fs_virtual_set("sd:/nv2a_gx_retake/noparkretake", "", 0));
+    wl_nv2a_gx_set_switches("sd:/nv2a_gx_retake");
+    ASSERT(gx_device(&g) != NULL);
+    wl_gx_target_stats(&targets, true);
+    quarter_blur(&g, &stats);
+    wl_nv2a_gx_set_switches("sd:/nv2a_gx_none");
+    ASSERT_EQ(0u, stats.picture_retakes);
+    ASSERT_EQ(1u, stats.screen_reads_unserved);
+    wl_gx_target_stats(&targets, false);
+    ASSERT_EQ(0u, targets.resolves);
+    ASSERT_EQ(clears, targets.clears + 1u);
+    gx_done(&g);
+    PASS();
+}
+
 // a write watch that sees the stores a test says were made: to [g_stored_phys, + g_stored_bytes)
 static uint32_t g_watch_stamp, g_stored_phys, g_stored_bytes;
 
@@ -772,6 +842,7 @@ SUITE(gx_suite) {
     RUN_TEST(culling_by_the_nv2a_rule_and_stencil_skipped);
     RUN_TEST(partial_clears_are_quads_and_render_targets_take_the_efb);
     RUN_TEST(a_blur_through_the_depth_buffer_is_drawn_in_one_frame);
+    RUN_TEST(a_target_that_took_the_efb_with_a_clear_reads_the_picture_at_once);
     RUN_TEST(a_target_the_guest_stores_to_reads_as_the_guests_texels);
     RUN_TEST(a_texture_the_guest_rewrites_is_drawn_with_its_new_texels);
     RUN_TEST(a_target_read_as_x8r8g8b8_has_no_alpha);

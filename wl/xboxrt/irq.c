@@ -65,6 +65,11 @@ static bool g_in_service;
 static volatile bool g_running;
 static bool g_started;
 static WlXbThread *g_svc;
+// The service thread's end (wl_xb_service_stop_within waits for it with a bound, g_sm held), and
+// where its loop is (a stop that times out names it)
+static WlPlatformCond g_stop_cond;
+static bool g_svc_ended;
+static const char *volatile g_svc_at = "starting";
 static WlPlatformThread g_svc_host, g_relay_host;
 static void *g_svc_stack, *g_relay_stack;
 static WlPlatformSemaphore g_retrace_sem;
@@ -198,6 +203,7 @@ static void run_ticks(void) {
     n = n < WL_XB_MAX_TICKS ? n : WL_XB_MAX_TICKS; // (never more; it tells the compiler so)
     for (uint32_t i = 0; i < n; i++) {
         if (__atomic_exchange_n(&g_tick[i].due, 0u, __ATOMIC_ACQ_REL) != 0) {
+            g_stats.ticks_run++;
             g_tick[i].fn(g_tick[i].user);
         }
     }
@@ -426,6 +432,7 @@ static void poll(bool levels) {
     if (g_in_service) {
         return;
     }
+    g_stats.polls++;
     const uint64_t now = wl_xb_time_us();
     update_tick_at(now);
     if (__atomic_load_n(&g_svc_waiting, __ATOMIC_ACQUIRE) != 0) {
@@ -437,6 +444,7 @@ static void poll(bool levels) {
     bool due = g_pending != 0 || (deadline != 0 && now >= deadline);
     if (!due && (levels || g_lines != 0)) {
         // the lines the holder's IRQL lets in (a kernel call's poll leaves the level sources out)
+        g_stats.level_scans += levels;
         uint32_t lines = levels ? wl_xb_irq_lines() : g_lines;
         due = lines != 0 && (g_mask_fn == NULL || (lines & g_mask_fn(g_mask_user)) != 0);
     }
@@ -450,6 +458,11 @@ static void poll(bool levels) {
 
 void wl_xb_service_poll(void) {
     poll(false);
+}
+
+bool wl_xb_service_wanted(void) {
+    uint64_t deadline = g_deadline;
+    return g_pending != 0 || (deadline != 0 && wl_xb_time_us() >= deadline) || wl_xb_irq_lines() != 0;
 }
 
 void wl_xb_service_poll_levels(void) {
@@ -667,7 +680,9 @@ static void det_service_main(void) {
     uint64_t next_status = wl_platform_time_us() + 10000000u;
     bool warned = false;
     while (g_running) {
+        g_svc_at = "waiting for the lock (idle)";
         if (wl_xb_det_idle_take(g_svc, 1000)) {
+            g_svc_at = "moving the virtual clock on (lock held)";
             g_stats.service_thread_runs++;
             int r = 0;
             while (r == 0 && g_running) {
@@ -682,15 +697,26 @@ static void det_service_main(void) {
         uint64_t now = wl_platform_time_us();
         if (now >= next_status) {
             next_status = now + 10000000u;
+            g_svc_at = "writing the status lines";
             status_report();
         }
     }
+}
+
+// The service thread has left its loop: a stop waiting for it goes on.
+static void service_ended(void) {
+    g_svc_at = "ended";
+    wl_platform_mutex_lock(g_sm);
+    g_svc_ended = true;
+    wl_platform_cond_broadcast(g_stop_cond);
+    wl_platform_mutex_unlock(g_sm);
 }
 
 static void *service_main(void *arg) {
     (void)arg;
     if (wl_xb_deterministic()) {
         det_service_main();
+        service_ended();
         return NULL;
     }
     uint64_t vblank_period = g_cfg.vblank_hz_milli > 0 ? 1000000000ull / g_cfg.vblank_hz_milli : 16683u;
@@ -712,6 +738,7 @@ static void *service_main(void *arg) {
             wake = deadline;
         }
         wake = ticks_due(now, wake);
+        g_svc_at = "asleep";
         wl_platform_mutex_lock(g_sm);
         if (g_pending == 0 && g_running) {
             uint32_t ms = wake > now ? (uint32_t)((wake - now + 999u) / 1000u) : 0;
@@ -723,12 +750,14 @@ static void *service_main(void *arg) {
         if (!g_running) {
             break;
         }
+        g_stats.service_rounds++;
         update_tick();
         now = wl_platform_time_us();
         ticks_due(now, now);
         wl_xb_thread_quiet_due(now); // (a quiet window's end: the holder's next safe point looks again)
         if (now >= next_status) {
             next_status = now + 10000000u;
+            g_svc_at = "writing the status lines";
             status_report();
         }
         if (now >= next_watch) {
@@ -750,12 +779,19 @@ static void *service_main(void *arg) {
         if (due && g_handler != NULL) {
             g_stats.service_thread_runs++;
             __atomic_store_n(&g_svc_waiting, 1u, __ATOMIC_RELEASE);
-            wl_xb_lock(g_svc);
+            g_svc_at = "waiting for the guest lock";
+            // (false: the holder ran the work first and sent it back, or the stop)
+            bool took = wl_xb_lock_within(g_svc, WL_WAIT_FOREVER);
             __atomic_store_n(&g_svc_waiting, 0u, __ATOMIC_RELEASE);
+            if (!took) {
+                continue;
+            }
+            g_svc_at = "running the interrupt work (lock held)";
             run_service();
             wl_xb_unlock(g_svc);
         }
     }
+    service_ended();
     return NULL;
 }
 
@@ -798,9 +834,12 @@ WlResult wl_xb_service_start(const WlXbServiceConfig *cfg) {
     g_wall_start_us = wl_platform_time_us();
     g_vblank_period_us = g_cfg.vblank_hz_milli > 0 ? 1000000000ull / g_cfg.vblank_hz_milli : 16683u;
     g_det_vblank_us = wl_xb_time_us() + g_vblank_period_us;
-    if (wl_platform_mutex_create(&g_sm) != WL_OK || wl_platform_cond_create(&g_sc) != WL_OK) {
+    if (wl_platform_mutex_create(&g_sm) != WL_OK || wl_platform_cond_create(&g_sc) != WL_OK ||
+        wl_platform_cond_create(&g_stop_cond) != WL_OK) {
         return WL_ERR_NOMEM;
     }
+    g_svc_ended = false;
+    wl_xb_thread_lock_stop(false);
     // the service thread is a WlXbThread of its own (it takes the lock like a guest thread and
     // runs ISRs and DPCs on a guest stack of its own), above every guest priority
     WlXbThread *self = wl_xb_current();
@@ -865,19 +904,47 @@ WlResult wl_xb_service_start(const WlXbServiceConfig *cfg) {
 }
 
 void wl_xb_service_stop(void) {
+    (void)wl_xb_service_stop_within(WL_WAIT_FOREVER);
+}
+
+bool wl_xb_service_stop_within(uint32_t timeout_ms) {
     if (!g_started) {
-        return;
+        return true;
     }
     g_running = false;
     if (wl_xb_deterministic()) {
         wl_xb_det_set_idle(NULL);
     }
     wake_service();
-    wl_platform_thread_join(g_svc_host, NULL);
+    wl_xb_thread_lock_stop(true); // (a wait for the guest lock looks at the stop: wl_xb_lock_within)
+    // the thread's end, then its join (at once): a thread that does not end in time is left as it
+    // is, named, and the caller goes on without it
+    const uint64_t start = wl_platform_time_ms();
+    bool ended;
+    wl_platform_mutex_lock(g_sm);
+    while (!g_svc_ended) {
+        uint64_t spent = wl_platform_time_ms() - start;
+        if (timeout_ms != WL_WAIT_FOREVER && spent >= timeout_ms) {
+            break;
+        }
+        uint32_t step = timeout_ms == WL_WAIT_FOREVER ? 1000u : (uint32_t)(timeout_ms - spent);
+        (void)wl_platform_cond_wait_timeout(g_stop_cond, g_sm, step);
+    }
+    ended = g_svc_ended;
+    wl_platform_mutex_unlock(g_sm);
 #if defined(__wii__)
     wl_platform_video_set_retrace_hook(NULL, NULL);
 #endif
+    if (!ended) {
+        WlXbThread *holder = wl_xb_thread_lock_holder();
+        WL_LOG_W(TAG, "the service thread did not stop in %u ms (%s; the guest lock: %s): left running", (unsigned)timeout_ms,
+                 (const char *)g_svc_at, holder == NULL ? "free" : holder->name);
+        wl_xb_thread_log_guest_stacks();
+        return false;
+    }
+    wl_platform_thread_join(g_svc_host, NULL);
     g_started = false;
+    return true;
 }
 
 void wl_xb_service_stats(WlXbServiceStats *out) {

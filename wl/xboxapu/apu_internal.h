@@ -63,6 +63,16 @@ typedef struct {
     uint8_t vol_act; // the targets whose gain is not 0 (bit t)
     uint32_t vol_key[4];
     uint16_t vol_gain[8];
+    // the voice's additions to its bins while its gains hold (apu_vp.c, not with cfg.plain): kept
+    // from the frame it was made in while plan_key (VOLA, VOLB, VOLC, the envelope, VBIN, FMT,
+    // the HRTF submixes of a 3D voice) stays the same
+    bool plan_valid;
+    uint8_t plan_n;          // additions
+    uint8_t plan_bin[8];     // each one's bin
+    uint8_t plan_ch[8];      // its channel's frame (0, 1)
+    int32_t plan_gain[8];    // its gain << 15
+    uint32_t plan_used;      // the bins (bit b)
+    uint32_t plan_key[7];
 } WlApuVoice;
 
 struct WlXboxApu {

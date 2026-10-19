@@ -22,7 +22,10 @@ lifted three times: with the x87 state in memory at every operation, with --x87-
 x87_locals.py: the stack, control word and compare result in C locals inside a function), and with
 --x87-locals --reg-locals (the integer registers in locals too); and a fourth time with
 --keep-preserved as well (preserve.py: after a call to a function proven to give back ebx, esi and
-edi, the caller keeps them in its locals). With --reg-locals the lifts also leave the safe point out of
+edi, the caller keeps them in its locals; and around a call writes back and reloads only the registers
+the callee touches, --callee-regs, and keeps the caller's x87 positions across a callee whose x87
+stack use is balanced, --x87-balanced; and keeps a function's own stack slots that nothing else
+reaches in C locals, --stack-locals). With --reg-locals the lifts also leave the safe point out of
 loops that end by themselves (--bounded-loops, loop_bound.py) and write float and double constants read
 from .rodata as literals (--rodata-consts, const_load.py).
 
@@ -182,6 +185,9 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False
     ft.mem_disp = reg_locals
     ft.stack_disp = reg_locals
     ft.keep_preserved = keep
+    ft.callee_regs = keep  # around a call, only what the callee touches (touched.py)
+    ft.x87_balanced = keep  # and the x87 positions kept across a balanced callee (touched.balanced)
+    ft.stack_locals = keep  # and a function's own stack slots in C locals (stack_locals.py)
     # and its loops: no safe point where a loop's own counter ends it (loop_bound.py)
     ft.bounded_loops = reg_locals
     # and its float constants from read-only data as literals (const_load.py)
@@ -201,7 +207,8 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False
         protos.append(f"void sub_{a:08X}(void);")
     pending = {f"sub_{a:08X}": c.lines for a, c in zip(sorted(db), chunks) if isinstance(c, Pending)}
     if pending:  # as BatchTranslator.finish_pending: the whole program first
-        ft.kept = preserve.preserved_by_name(preserve.analyse(pending))
+        ft.summaries = preserve.analyse(pending)
+        ft.kept = preserve.preserved_by_name(ft.summaries)
         chunks = [ft.finish_function(c.lines, c.has_fpu) if isinstance(c, Pending) else c for c in chunks]
         ft.x87_stats["kept across calls"] = sum(c.count("kept across the call") for c in chunks)
     unimpl = {k: len(v) for k, v in ft.lifter.unimplemented.items()}

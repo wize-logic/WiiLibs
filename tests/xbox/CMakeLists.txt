@@ -24,6 +24,10 @@ wl_add_test(test_xbox_nv2a_prefetch SOURCES test_xbox_nv2a_prefetch.c ${PROJECT_
     LIBS wl_xbox wl_platform LABELS unit be)
 wl_target_defaults(test_xbox_nv2a_prefetch DETERMINISTIC)
 target_compile_definitions(test_xbox_nv2a_prefetch PRIVATE WL_NV2A_PREFETCH_RECORD)
+# the ring of made vertices' slots (nv2a_gx.c's made_place, made_slots, made_flush): the file built into
+# the test itself, its static functions driven draw by draw
+wl_add_test(test_xbox_nv2a_ring SOURCES test_xbox_nv2a_ring.c LIBS wl_xbox wl_platform LABELS unit be)
+wl_target_defaults(test_xbox_nv2a_ring DETERMINISTIC)
 # the raster state's mappings from values alone (nv2a_raster.c), linked without the rest of wl_xbox as a
 # Direct3D device's harness links it (OpenCE-Wii's draw bench)
 wl_add_test(test_xbox_nv2a_raster SOURCES test_xbox_nv2a_raster.c ${PROJECT_SOURCE_DIR}/wl/xbox/nv2a_raster.c

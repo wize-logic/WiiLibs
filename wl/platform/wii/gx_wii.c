@@ -329,12 +329,20 @@ void wl_gx_stats(WlGxStats *out) {
     *out = g.stats;
 }
 
-void wl_gx_invalidate_shadow(void) {
+void wl_gx_wii_invalidate_shadow_maps(uint32_t maps) {
     g.known = 0;
     wl_gx_shadow_forget();
-    wl_gx_wii_texmaps_forget(0xFFu);
+    wl_gx_wii_texmaps_forget(maps);
     g.nrm_valid = false;
     memset(g.tlut, 0, sizeof g.tlut);
+}
+
+void wl_gx_invalidate_shadow(void) {
+    wl_gx_wii_invalidate_shadow_maps(0xFFu);
+}
+
+void wl_gx_wii_invalidate_shadow_own(void) {
+    wl_gx_wii_invalidate_shadow_maps(wl_gx_shadow_maps_cache_on() ? 0u : 0xFFu);
 }
 
 // ---- sync and frames --------------------------------------------------------------------------
@@ -353,10 +361,16 @@ static bool token_passed(uint32_t t) {
     return (uint16_t)(GX_GetDrawSync() - (uint16_t)t) < 0x8000u;
 }
 
+// A draw-sync token, and the transform unit's flush before the next direct primitive: a token is a raster
+// state change, which a clipped primitive must not follow unflushed (gx_direct.h). Every token: a fence's
+// put off to a later primitive (wl_gx_wii_token_due, a poll) comes after the flush its caller asked for
+// was spent, and hwcount's marks and wl_gx_sync's come between any two draws.
 static uint32_t send_token(void) {
     g.token++;
+    wl_gx_shadow_token(); // (counted: gx_shadow.h)
     GX_SetDrawSync((u16)g.token);
     GX_Flush();
+    wl_gx_direct_flush_after();
     wl_gx_wii_hang_event('S', g.token, 0);
     return g.token;
 }
@@ -444,11 +458,26 @@ uint32_t wl_gx_fence(void) {
     if (!g.ready) {
         return 0;
     }
+    if (!wl_gx_bisect()->fence_eager && g.token + 1u != 0u) {
+        // (the next token's number, the token put off to where Dolphin's batch is cut anyway: gx_shadow.h,
+        // wl_gx_wii_token_due. The switch gxfenceeager sends it at once)
+        wl_gx_shadow_token_defer();
+        return g.token + 1u;
+    }
     t = send_token();
     return t != 0u ? t : send_token();
 }
 
+void wl_gx_wii_token_due(void) {
+    if (g.ready && wl_gx_shadow_token_due()) {
+        (void)send_token();
+    }
+}
+
 bool wl_gx_fence_passed(uint32_t fence) {
+    if (fence != 0u && g.ready && fence == g.token + 1u && wl_gx_shadow_token_deferred()) {
+        (void)send_token(); // (the fence's token put off: sent now that it is asked about)
+    }
     // (the first token after init exactly, as wait_token has it; a fence 32768 tokens or more behind
     // the last one sent, which the token register's 16 bits no longer tell from one ahead, as
     // passed: the frames' own waits keep GX within a few frames of the processor)
@@ -714,6 +743,7 @@ uint32_t wl_gx_peek_rgba(int x, int y) {
         (void)wl_gx_sync();
     }
     GXColor c;
+    g.stats.efb_peeks++;
     GX_PeekARGB((u16)x, (u16)y, &c);
     return ((uint32_t)c.r << 24) | ((uint32_t)c.g << 16) | ((uint32_t)c.b << 8) | c.a;
 }
@@ -724,6 +754,7 @@ uint32_t wl_gx_peek_z(int x, int y) {
     if (!g.ready || x < 0 || y < 0 || (uint32_t)x >= g.fb_w || (uint32_t)y >= g.efb_h) {
         return 0xFFFFFFFFu;
     }
+    g.stats.efb_peeks++;
     GX_PeekZ((u16)x, (u16)y, &z);
     return z & 0xFFFFFFu;
 }
@@ -931,6 +962,7 @@ static void ensure_nrm(void) {
         n[0][0] = n[1][1] = n[2][2] = 1.0f;
     }
     GX_LoadNrmMtxImm(n, GX_PNMTX0);
+    wl_gx_shadow_forget(); // (the direct layer's normal matrix: loaded behind it)
     g.nrm_valid = true;
     g.dirty = true;
 }

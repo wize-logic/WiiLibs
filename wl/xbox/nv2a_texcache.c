@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wl/codec/xbox_tex.h"
 #include "wl/platform/platform.h"
 #include "wl/xbox/nv2a_capture.h"
 
@@ -50,6 +51,9 @@ void wl_nv2a_texcache_init(WlNv2aTexCache *cache, const WlNv2aTexCacheConfig *cf
         cache->cfg.written = NULL;
     }
     cache->frame = 1;
+    wl_xbox_dxt_set_plain(cache->cfg.plain);
+    wl_nv2a_texture_set_plain(cache->cfg.plain2);
+    wl_xbox_tex_set_plain2(cache->cfg.plain2);
 }
 
 // ---- images -------------------------------------------------------------------------------------
@@ -394,6 +398,13 @@ static uint64_t hash_texels(WlNv2aTexCache *cache, const uint8_t *src, size_t by
         cache->stats.hashed_bytes += 8192u + 64u * 256u;
     }
     return hash;
+}
+
+// whether a texture under the watch that it saw stored to is hashed whole before it is made again
+// (not under plain or plain2; not one found changed by its hash WL_NV2A_TEXCACHE_REHASH_MISSES times
+// in a row: its stores change it)
+static bool rehashing(const WlNv2aTexCache *cache, const WlNv2aTexEntry *e) {
+    return !cache->cfg.plain && !cache->cfg.plain2 && e->rehash_misses < WL_NV2A_TEXCACHE_REHASH_MISSES;
 }
 
 // whether the texture's checks may use the write watch now (a capture must see the texels read)
@@ -785,11 +796,7 @@ static bool convert(WlNv2aTexCache *cache, WlNv2aTexEntry *e, const WlNv2aTextur
     }
     // (a cube map: a light's falloff made its face, where the backend reads it so, else its
     // sphere map)
-    if (cache->cfg.spots)
-        wl_nv2a_texture_spot(t, &e->layout, src, palette, scratch);
-    else
-        e->layout.spot = 0;
-    done = wl_nv2a_texture_convert(t, &e->layout, src, palette, e->image, scratch);
+    done = wl_nv2a_texture_convert_cube(t, &e->layout, cache->cfg.spots, src, palette, e->image, scratch);
     scratch_give(cache, scratch);
     if (!done) {
         return false;
@@ -1028,18 +1035,26 @@ static const WlNv2aTexEntry *lookup(WlNv2aTexCache *cache, WlNv2a *dev, const Wl
     }
     if (e != NULL) {
         bool drawn_now = gpu_reads(cache, e->used_frame);
+        // (one never hashed, checked with the texels read (a capture's): unchanged when the watch
+        // has seen no store since it was made, and hashed now)
+        bool unchanged = e->unhashed && e->stamp != 0 && cache->cfg.written != NULL && !watch_written(cache, e, t);
 
         // (the watch armed before the texels are read: a store from here on is seen at the next
-        // check; a large texture under the watch is not hashed, its samples would not see every
-        // store, so a store to its pages has it made again)
+        // check; a texture under the watch is not hashed (unless plain: a large one), a store to
+        // its pages has it made again)
         stamp = watching(cache, dev) ? watch_arm(cache, t) : 0u;
-        large = stamp != 0 && t->total_bytes > WL_NV2A_TEXCACHE_FULL_HASH;
+        large = stamp != 0 && (t->total_bytes > WL_NV2A_TEXCACHE_FULL_HASH || !cache->cfg.plain);
 
         e->checked_frame = cache->frame;
         e->used_frame = cache->frame;
         e->stamp = stamp;
         if (!large) {
             hash = hash_texels(cache, src, t->total_bytes);
+            if (unchanged) {
+                e->hash = hash;
+                e->palette_hash = palette_hash;
+            }
+            e->unhashed = 0;
             if (e->hash == hash && e->palette_hash == palette_hash) {
                 if (!restore(cache, dev, e, t, drawn_now, src, palette, made)) {
                     cache->stats.no_memory++, cache->stats.failed++;
@@ -1049,9 +1064,38 @@ static const WlNv2aTexEntry *lookup(WlNv2aTexCache *cache, WlNv2a *dev, const Wl
                 return e;
             }
         }
-        // rewritten since: made again, in place when the GPU cannot be reading it yet
-        e->hash = hash;
-        e->palette_hash = palette_hash;
+        if (large && rehashing(cache, e)) {
+            // (a texture the watch saw stored to: its texels hashed whole, and kept as it was when
+            // they hash as at its last making (the stores were to its neighbours on its pages, or
+            // wrote what was there); one found changed WL_NV2A_TEXCACHE_REHASH_MISSES times in a row
+            // is made again without)
+            bool same;
+
+            hash = hash_update(HASH_INIT, src, t->total_bytes);
+            cache->stats.hashed++;
+            cache->stats.hashed_bytes += t->total_bytes;
+            same = e->rehashed && e->hash == hash && e->palette_hash == palette_hash;
+            e->rehash_misses = (uint8_t)(same ? 0u : e->rehashed ? e->rehash_misses + 1u : 0u);
+            if (same) {
+                if (!restore(cache, dev, e, t, drawn_now, src, palette, made)) {
+                    cache->stats.no_memory++, cache->stats.failed++;
+                    return NULL;
+                }
+                cache->stats.hits++;
+                cache->stats.rewritten_same++;
+                return e;
+            }
+            e->hash = hash;
+            e->palette_hash = palette_hash;
+            e->rehashed = 1;
+            e->unhashed = 0;
+        } else {
+            // rewritten since: made again, in place when the GPU cannot be reading it yet
+            e->hash = hash;
+            e->palette_hash = palette_hash;
+            e->unhashed = (uint8_t)(large && !cache->cfg.plain);
+            e->rehashed = 0;
+        }
         e->dynamic = 1;
         if (drawn_now) {
             // (the GPU may read the old image in this frame: a new one, the old given back at its end)
@@ -1116,7 +1160,7 @@ static const WlNv2aTexEntry *lookup(WlNv2aTexCache *cache, WlNv2a *dev, const Wl
         return NULL;
     }
     stamp = watching(cache, dev) ? watch_arm(cache, t) : 0u;
-    large = stamp != 0 && t->total_bytes > WL_NV2A_TEXCACHE_FULL_HASH;
+    large = stamp != 0 && (t->total_bytes > WL_NV2A_TEXCACHE_FULL_HASH || !cache->cfg.plain);
     if (!large) {
         hash = hash_texels(cache, src, t->total_bytes);
     }
@@ -1138,6 +1182,9 @@ static const WlNv2aTexEntry *lookup(WlNv2aTexCache *cache, WlNv2a *dev, const Wl
     e->used_frame = e->checked_frame = cache->frame;
     e->stamp = stamp;
     e->dynamic = 0;
+    e->unhashed = (uint8_t)(large && !cache->cfg.plain);
+    e->rehashed = 0;
+    e->rehash_misses = 0;
     if (!convert(cache, e, t, src, palette)) {
         image_free(cache, e->image);
         memset(e, 0, sizeof *e);

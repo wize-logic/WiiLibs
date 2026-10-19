@@ -10,7 +10,8 @@
 // checked at every use from then on. With a write watch (the configuration's `watch`/`written`:
 // the runtime's MMU, whose changed bits say which guest pages were stored to), a texture whose
 // pages were not written since it was made is as it was, without its texels read; one whose pages
-// were is hashed (a large one is made again). Without a watch, or while a capture runs (it must see
+// were is made again (unless `plain`: then hashed, and a large one made again; the texels are hashed
+// at a conversion only for that). Without a watch, or while a capture runs (it must see
 // the texels read), the texels are hashed: a texture of at most WL_NV2A_TEXCACHE_FULL_HASH bytes
 // whole, a larger one at spread samples.
 //
@@ -52,7 +53,10 @@ enum {
     WL_NV2A_TEXCACHE_REDUCE_MAX = 3,
     WL_NV2A_TEXCACHE_RESTORE_FRAMES = 60,
     // textures put off by the frame budget, kept to be made while the processor waits
-    WL_NV2A_TEXCACHE_DEFERRED = 64
+    WL_NV2A_TEXCACHE_DEFERRED = 64,
+    // a texture the watch sees stored to, hashed before it is made again: made again without once
+    // its hash has found it changed this many times in a row
+    WL_NV2A_TEXCACHE_REHASH_MISSES = 4
 };
 
 typedef struct WlNv2aTexCacheConfig {
@@ -92,6 +96,12 @@ typedef struct WlNv2aTexCacheConfig {
     // put off to a later frame or the GPU's wait (wl_nv2a_texcache_work); 0: no limit. The texture
     // that crosses it is made whole, so a frame always makes one.
     size_t frame_budget;
+    // the checks and conversions as before wave 4 (the switch "texplain"): a texture of at most
+    // WL_NV2A_TEXCACHE_FULL_HASH bytes hashed under the watch too; wl_xbox_dxt_set_plain(true)
+    bool plain;
+    // texcache2's changes off (the switch "texplain2"): the conversions as before (wl_nv2a_texture_set_plain,
+    // wl_xbox_tex_set_plain2), and a texture the watch saw stored to made again without its texels hashed
+    bool plain2;
 } WlNv2aTexCacheConfig;
 
 typedef struct WlNv2aTexEntry {
@@ -111,6 +121,9 @@ typedef struct WlNv2aTexEntry {
     uint32_t stamp;  // the write watch's over its texels and palette since it was checked (0: none)
     uint32_t serial; // changes when the image is made anew
     uint8_t dynamic; // found changed once: checked at every use
+    uint8_t unhashed; // checked by the write watch alone: its texels never hashed (hash 0)
+    uint8_t rehashed; // stored to under the watch: `hash` its texels' whole when it was last made
+    uint8_t rehash_misses; // of those checks in a row, the ones that found it changed
     uint8_t reduced; // levels left out for want of memory (0: whole)
     uint16_t next;   // in its bucket, + 1
     uint32_t restore_frame; // a reduced one's last try to be made whole
@@ -119,6 +132,7 @@ typedef struct WlNv2aTexEntry {
 typedef struct WlNv2aTexCacheStats {
     uint32_t lookups, hits, converted, reconverted, evicted, failed, hashed;
     uint32_t checks;      // lookups that looked at the texture (not its frame's first check again)
+    uint32_t rewritten_same; // textures the watch saw stored to whose texels hashed as before (kept)
     uint32_t watched;     // of those, answered by the write watch (unchanged, nothing read)
     uint32_t no_memory;   // of the failures, for want of memory
     uint32_t refused_again; // ...lookups of a texture refused so in their frame

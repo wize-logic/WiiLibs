@@ -5,8 +5,11 @@
 // starvation far off, and the level sources a title has (the USB host controllers, the GPU, the
 // APU and the AC'97) none asserted. Prints the safe points and the yields (none).
 //
-//     bench_safe_point [points] [full]
+//     bench_safe_point [points] [full] [device]
 //
+// "device" calls the device access's safe point (wl_xb_device_safe_point) every time instead, as
+// the DSI handler does after each emulated write ("devread": after a read; "olddevpoint": the old
+// look).
 // "full" runs every safe point's whole look (the switch "fullsafe": wl_xb_thread_set_quiet_points
 // off); otherwise the first safe point arms a quiet window (no service thread here ends it) and the
 // rest cost the backward jump's load and compare. Count instructions with tools/qemu_icount.py on a ppc-be build (--base with fewer points for
@@ -18,6 +21,7 @@
 
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
+#include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/thread.h"
 
 static uint32_t g_reg[5][4]; // a device's enable and status words (each line's source looks at two)
@@ -37,6 +41,12 @@ static void waiter(WlXbThread *self, void *user) {
 int main(int argc, char **argv) {
     uint32_t points = argc > 1 ? (uint32_t)strtoul(argv[1], NULL, 0) : 100000u;
     bool full = argc > 2 && strcmp(argv[2], "full") == 0;
+    bool device = argc > 3 && (strcmp(argv[3], "device") == 0 || strcmp(argv[3], "devread") == 0);
+    g_xb_mmio_last_write = argc > 3 && strcmp(argv[3], "devread") == 0 ? 0u : 1u;
+    if (argc > 3 && strcmp(argv[3], "olddevpoint") == 0) {
+        device = true;
+        g_xb_compat |= WL_XB_COMPAT_OLDDEVPOINT;
+    }
     WlXbMemConfig cfg;
     wl_xb_mem_config_default(&cfg);
     WlXbThreadConfig tcfg;
@@ -68,7 +78,9 @@ int main(int argc, char **argv) {
 #endif
     g_xb_attention = 1;
     for (uint32_t i = 0; i < points; i++) {
-        if (g_xb_attention != 0) { // (RECOMP_BACKEDGE)
+        if (device) {
+            wl_xb_device_safe_point();
+        } else if (g_xb_attention != 0) { // (RECOMP_BACKEDGE)
             wl_xb_safe_point();
         }
     }

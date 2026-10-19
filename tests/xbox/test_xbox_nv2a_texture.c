@@ -467,6 +467,119 @@ TEST a_falloff_cube_becomes_its_lit_face(void) {
 
 // a texture of one level kept smaller: its image halved by a box filter (a texel checker of black
 // and white comes out grey), in its own GX format
+// The conversions without the whole image zeroed first, and a cube map's faces decoded once (texcache2's,
+// the switch "texplain2" off) give the bytes the plain way gives: every byte of every image written, its
+// pads zeroed (a DXT level of partial tiles, an odd linear level, a P8 with and without its palette, a
+// cube map's sphere map and a light's falloff face)
+static uint8_t g_both_src[6 * 4096];
+static uint8_t g_both_a[65536] __attribute__((aligned(32)));
+static uint8_t g_both_b[65536] __attribute__((aligned(32)));
+static uint8_t g_both_scratch[1 << 18];
+
+TEST both_ways(const WlNv2aTexture *t, bool mipmaps, const uint8_t *palette, bool spots) {
+    WlNv2aGxLayout la, lb;
+
+    ASSERT(wl_nv2a_texture_layout(t, mipmaps, &la));
+    ASSERT(la.total_bytes <= sizeof g_both_a);
+    ASSERT(wl_nv2a_texture_scratch_bytes(t, &la) <= sizeof g_both_scratch);
+    lb = la;
+    memset(g_both_a, 0xCD, sizeof g_both_a);
+    memset(g_both_b, 0x5A, sizeof g_both_b);
+    wl_nv2a_texture_set_plain(true);
+    wl_xbox_tex_set_plain2(true);
+    ASSERT(wl_nv2a_texture_convert_cube(t, &la, spots, g_both_src, palette, g_both_a, g_both_scratch));
+    wl_nv2a_texture_set_plain(false);
+    wl_xbox_tex_set_plain2(false);
+    ASSERT(wl_nv2a_texture_convert_cube(t, &lb, spots, g_both_src, palette, g_both_b, g_both_scratch));
+    ASSERT_EQ(la.spot, lb.spot);
+    ASSERT_MEM_EQ(g_both_a, g_both_b, la.total_bytes);
+    PASS();
+}
+
+static void both_texture(WlNv2aTexture *t, uint8_t color, uint32_t w, uint32_t h, uint32_t levels, uint32_t texel_bytes) {
+    uint32_t l, bytes = 0;
+
+    memset(t, 0, sizeof *t);
+    t->color = color;
+    t->known = 1;
+    t->width = w;
+    t->height = h;
+    t->depth = 1;
+    t->levels = levels;
+    t->texel_bytes = texel_bytes;
+    t->compressed = color == WL_NV2A_TEX_L_DXT1 || color == WL_NV2A_TEX_L_DXT23 || color == WL_NV2A_TEX_L_DXT45;
+    t->swizzled = !t->compressed;
+    for (l = 0; l < levels; l++) {
+        uint32_t lw = w >> l ? w >> l : 1u, lh = h >> l ? h >> l : 1u;
+
+        bytes += t->compressed ? ((lw + 3u) / 4u) * ((lh + 3u) / 4u) * (color == WL_NV2A_TEX_L_DXT1 ? 8u : 16u)
+                               : lw * lh * texel_bytes;
+    }
+    t->total_bytes = t->face_bytes = bytes;
+}
+
+TEST conversions_need_no_zeroing_first(void) {
+    static uint8_t palette[64 * 4];
+    WlNv2aTexture t;
+    uint32_t b, x = 12345u;
+
+    for (b = 0; b < sizeof g_both_src; b++) {
+        x = x * 1103515245u + 12345u;
+        g_both_src[b] = (uint8_t)(x >> 16);
+    }
+    for (b = 0; b < sizeof palette; b++) {
+        palette[b] = (uint8_t)(b * 5u + 1u);
+    }
+    both_texture(&t, WL_NV2A_TEX_L_DXT1, 12, 12, 1, 0); // (CMPR tiles past the edge)
+    CHECK_CALL(both_ways(&t, false, NULL, false));
+    both_texture(&t, WL_NV2A_TEX_L_DXT45, 16, 16, 3, 0); // (the alpha's 4x4 level: part of an I4 tile)
+    CHECK_CALL(both_ways(&t, true, NULL, false));
+    both_texture(&t, WL_NV2A_TEX_L_DXT23, 8, 4, 1, 0);
+    CHECK_CALL(both_ways(&t, false, NULL, false));
+    both_texture(&t, WL_NV2A_TEX_SZ_A8R8G8B8, 16, 16, 3, 4);
+    CHECK_CALL(both_ways(&t, true, NULL, false));
+    both_texture(&t, WL_NV2A_TEX_LU_X8R8G8B8, 8, 8, 1, 4); // (a linear one, its rows 40 bytes apart)
+    t.swizzled = 0, t.linear = 1, t.pitch = 40, t.total_bytes = t.face_bytes = 320;
+    CHECK_CALL(both_ways(&t, false, NULL, false));
+    both_texture(&t, WL_NV2A_TEX_SZ_A8R8G8B8, 2, 2, 1, 4); // (part of a tile)
+    CHECK_CALL(both_ways(&t, false, NULL, false));
+    both_texture(&t, WL_NV2A_TEX_SZ_Y8, 8, 8, 4, 1); // (I8 levels of 2x2 and 1x1: part of a tile)
+    CHECK_CALL(both_ways(&t, true, NULL, false));
+    both_texture(&t, WL_NV2A_TEX_SZ_A4R4G4B4, 16, 16, 2, 2);
+    CHECK_CALL(both_ways(&t, true, NULL, false));
+    both_texture(&t, WL_NV2A_TEX_SZ_I8_A8R8G8B8, 8, 8, 1, 1); // P8: its TLUT, and without a palette
+    t.palette_entries = 64;
+    CHECK_CALL(both_ways(&t, false, palette, false));
+    CHECK_CALL(both_ways(&t, false, NULL, false));
+    // a linear R5G6B5 of 6 x 5 (rows 16 bytes apart), a linear A4R4G4B4 decoded texel by texel
+    both_texture(&t, WL_NV2A_TEX_LU_R5G6B5, 6, 5, 1, 2);
+    t.swizzled = 0, t.linear = 1, t.pitch = 16, t.total_bytes = t.face_bytes = 80;
+    CHECK_CALL(both_ways(&t, false, NULL, false));
+    both_texture(&t, WL_NV2A_TEX_LU_A4R4G4B4, 6, 6, 1, 2);
+    t.swizzled = 0, t.linear = 1, t.pitch = 12, t.total_bytes = t.face_bytes = 72;
+    CHECK_CALL(both_ways(&t, false, NULL, false));
+    // cube maps: a sphere map (spots asked and not), and a light's falloff face
+    both_texture(&t, WL_NV2A_TEX_SZ_A8R8G8B8, 16, 16, 1, 4);
+    t.cube = 1, t.face_bytes = 1024, t.total_bytes = 6 * 1024;
+    CHECK_CALL(both_ways(&t, false, NULL, false));
+    CHECK_CALL(both_ways(&t, false, NULL, true));
+    both_texture(&t, WL_NV2A_TEX_L_DXT1, 16, 16, 1, 0);
+    t.cube = 1, t.face_bytes = 128, t.total_bytes = 6 * 128;
+    CHECK_CALL(both_ways(&t, false, NULL, true));
+    both_texture(&t, WL_NV2A_TEX_LU_Y8, 32, 32, 1, 1);
+    t.swizzled = 0, t.linear = 1, t.pitch = 32, t.cube = 1, t.face_bytes = 1024, t.total_bytes = 6 * 1024;
+    memset(g_both_src, 0, 6 * 1024);
+    for (b = 0; b < 1024; b++) {
+        float dx = (float)(b & 31u) - 15.5f, dy = (float)(b >> 5) - 15.5f;
+        g_both_src[b] = dx * dx + dy * dy < 100.0f ? 255 : 0;
+    }
+    CHECK_CALL(both_ways(&t, false, NULL, true));
+    CHECK_CALL(both_ways(&t, false, NULL, false));
+    wl_nv2a_texture_set_plain(false);
+    wl_xbox_tex_set_plain2(false);
+    PASS();
+}
+
 TEST a_texture_without_levels_halved(void) {
     static uint8_t src[16 * 16 * 4], swizzled[16 * 16 * 4];
     static uint8_t dst[4096] __attribute__((aligned(32)));
@@ -618,6 +731,7 @@ TEST cache_watched_and_in_an_arena(void) {
     memset(&cfg, 0, sizeof cfg);
     cfg.watch = w_watch;
     cfg.written = w_written;
+    cfg.plain = true; // (hashed under the watch too: the switch "texplain"; the default below)
     wl_nv2a_texcache_init(&cache, &cfg);
 
     ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
@@ -665,6 +779,67 @@ TEST cache_watched_and_in_an_arena(void) {
     wl_nv2a_texcache_stats(&cache, &s);
     ASSERT_EQ(3u, s.hashed);
     ASSERT_EQ(2u, s.reconverted);
+    wl_nv2a_texcache_clear(&cache);
+
+    // plain2 (wave 4's first way): nothing hashed under the watch, a store in its pages has it made again
+    cfg.plain = false;
+    cfg.plain2 = true;
+    wl_nv2a_texcache_init(&cache, &cfg);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT(made);
+    w_store(&g, 0x100800, 0x11);
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT(made);
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT_FALSE(made);
+    w_store(&g, 0x100800, 0x11);
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT(made);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(0u, s.hashed);
+    ASSERT_EQ(2u, s.reconverted);
+    wl_nv2a_texcache_clear(&cache);
+
+    // the default: nothing hashed while the watch sees no store; one stored to is hashed whole when it
+    // is made again, and kept at a later store that leaves its texels as they were
+    cfg.plain2 = false;
+    wl_nv2a_texcache_init(&cache, &cfg);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT(made);
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT_FALSE(made);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(0u, s.hashed);
+    w_store(&g, 0x100100, 0x12);
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT(made);
+    w_store(&g, 0x100100, 0x12); // (the same byte again)
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT_FALSE(made);
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(2u, s.hashed);
+    ASSERT_EQ(1u, s.reconverted);
+    ASSERT_EQ(1u, s.rewritten_same);
+    w_store(&g, 0x100800, 0x13); // (past its texels, on their page)
+    wl_nv2a_texcache_frame_done(&cache);
+    ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+    ASSERT_FALSE(made);
+    // changed at every store: hashed until WL_NV2A_TEXCACHE_REHASH_MISSES in a row, then made again without
+    for (i = 0; i < WL_NV2A_TEXCACHE_REHASH_MISSES + 2u; i++) {
+        w_store(&g, 0x100100, (uint8_t)(0x20u + i));
+        wl_nv2a_texcache_frame_done(&cache);
+        ASSERT(wl_nv2a_texcache_get(&cache, g.dev, &t, false, &made) != NULL);
+        ASSERT(made);
+    }
+    wl_nv2a_texcache_stats(&cache, &s);
+    ASSERT_EQ(3u + WL_NV2A_TEXCACHE_REHASH_MISSES, s.hashed);
+    ASSERT_EQ(3u + WL_NV2A_TEXCACHE_REHASH_MISSES, s.reconverted);
     wl_nv2a_texcache_clear(&cache);
 
     // an arena with room for three 1 KiB images (each with its heap's 32-byte header)
@@ -1215,6 +1390,7 @@ SUITE(texture_suite) {
     RUN_TEST(dxt_and_palettes);
     RUN_TEST(cube_maps_become_sphere_maps);
     RUN_TEST(a_falloff_cube_becomes_its_lit_face);
+    RUN_TEST(conversions_need_no_zeroing_first);
     RUN_TEST(a_texture_without_levels_halved);
     RUN_TEST(cache_keeps_finds_changes_and_evicts);
     RUN_TEST(cache_watched_and_in_an_arena);

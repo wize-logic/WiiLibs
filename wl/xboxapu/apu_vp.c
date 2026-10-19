@@ -524,6 +524,52 @@ static int fetch(WlXboxApu *apu, uint32_t v, WlApuVoice *vs, const VoiceFormat *
     return f->stream ? fetch_stream(apu, v, vs, f, out, at) : fetch_buffer(apu, vs, f, out, at);
 }
 
+// Takes the next `take` samples of the voice's run (take <= run_left) into l (and r for a stereo
+// voice), moving its position on; returns the OR of the samples.
+static inline __attribute__((always_inline)) int32_t run_take(WlApuVoice *vs, uint32_t ch,
+                                                              int32_t *restrict l,
+                                                              int32_t *restrict r, uint32_t take) {
+    const uint8_t *p = vs->run;
+    int32_t o = 0;
+    if (vs->run_host) {
+        const int16_t *h = (const int16_t *)(const void *)p;
+        if (ch == 2) {
+            for (uint32_t j = 0; j < take; j++) {
+                const int32_t a = h[2u * j], b = h[2u * j + 1u];
+                l[j] = a;
+                r[j] = b;
+                o |= a | b;
+            }
+        } else {
+            for (uint32_t j = 0; j < take; j++) {
+                const int32_t a = h[j];
+                l[j] = a;
+                o |= a;
+            }
+        }
+    } else if (ch == 2) {
+        for (uint32_t j = 0; j < take; j++) {
+            const int32_t a = (int16_t)wl_rd_le16(p + 4u * j);
+            const int32_t b = (int16_t)wl_rd_le16(p + 4u * j + 2u);
+            l[j] = a;
+            r[j] = b;
+            o |= a | b;
+        }
+    } else {
+        for (uint32_t j = 0; j < take; j++) {
+            const int32_t a = (int16_t)wl_rd_le16(p + 2u * j);
+            l[j] = a;
+            o |= a;
+        }
+    }
+    vs->pos_prev = take >= 2u ? vs->rd + take - 2u : vs->pos1;
+    vs->run = p + 2u * ch * take;
+    vs->run_left -= take;
+    vs->rd += take;
+    vs->pos1 = vs->rd - 1u;
+    return o;
+}
+
 // Fills up to n samples after s1 into l (and r for a stereo voice): runs are copied in tight loops,
 // anything else goes through fetch. Stops early at a buffer's end or where a stream has no data
 // (vs->ending / vs->starving). Keeps pos1 (the last sample's position) and pos_prev (the one
@@ -536,44 +582,7 @@ static uint32_t fill(WlXboxApu *apu, uint32_t v, WlApuVoice *vs, const VoiceForm
     while (k < n) {
         if (vs->run_left != 0) { // within a page, a segment or a decoded block: no lookups
             const uint32_t take = n - k < vs->run_left ? n - k : vs->run_left;
-            const uint8_t *p = vs->run;
-            int32_t *lk = l + k, *rk = r + k;
-            if (vs->run_host) {
-                const int16_t *h = (const int16_t *)(const void *)p;
-                if (ch == 2) {
-                    for (uint32_t j = 0; j < take; j++) {
-                        const int32_t a = h[2u * j], b = h[2u * j + 1u];
-                        lk[j] = a;
-                        rk[j] = b;
-                        o |= a | b;
-                    }
-                } else {
-                    for (uint32_t j = 0; j < take; j++) {
-                        const int32_t a = h[j];
-                        lk[j] = a;
-                        o |= a;
-                    }
-                }
-            } else if (ch == 2) {
-                for (uint32_t j = 0; j < take; j++) {
-                    const int32_t a = (int16_t)wl_rd_le16(p + 4u * j);
-                    const int32_t b = (int16_t)wl_rd_le16(p + 4u * j + 2u);
-                    lk[j] = a;
-                    rk[j] = b;
-                    o |= a | b;
-                }
-            } else {
-                for (uint32_t j = 0; j < take; j++) {
-                    const int32_t a = (int16_t)wl_rd_le16(p + 2u * j);
-                    lk[j] = a;
-                    o |= a;
-                }
-            }
-            vs->pos_prev = take >= 2u ? vs->rd + take - 2u : vs->pos1;
-            vs->run = p + 2u * ch * take;
-            vs->run_left -= take;
-            vs->rd += take;
-            vs->pos1 = vs->rd - 1u;
+            o |= run_take(vs, ch, l + k, r + k, take);
             k += take;
             continue;
         }
@@ -697,7 +706,13 @@ static bool voice_samples(WlXboxApu *apu, uint32_t v, WlApuVoice *vs, const Voic
     if (vs->ending || vs->starving) {
         valid = 1;
     } else if (adv > 0) {
-        valid = 2u + fill(apu, v, vs, f, bl + 2, br + 2, adv, &any);
+        if (vs->run_left >= adv && !apu->cfg.plain) {
+            // the frame's samples are all in the run (the most): taken here, without fill's loop
+            any = run_take(vs, f->channels, bl + 2, br + 2, adv);
+            valid = 2u + adv;
+        } else {
+            valid = 2u + fill(apu, v, vs, f, bl + 2, br + 2, adv, &any);
+        }
     }
     for (uint32_t i = valid; i < adv + 2u && i < SRC_MAX; i++) {
         bl[i] = br[i] = 0; // silence after the end, as the last sample's partner
@@ -810,7 +825,7 @@ typedef struct WlApuPend Pend;
 #define TERM(k) mul_high(s##k[i], g##k)
 #define TAKE(k) const int32_t *restrict s##k = e[k].frame, g##k = e[k].gain
 #define FRAMES_1(name, OP)                                                                         \
-    static void name(int32_t *restrict bin, const Pend *e) {                                       \
+    static inline void name(int32_t *restrict bin, const Pend *e) {                                \
         TAKE(0);                                                                                   \
         for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i += 2u) {                                     \
             bin[i] OP TERM(0);                                                                     \
@@ -818,7 +833,7 @@ typedef struct WlApuPend Pend;
         }                                                                                          \
     }
 #define FRAMES_2(name, OP)                                                                         \
-    static void name(int32_t *restrict bin, const Pend *e) {                                       \
+    static inline void name(int32_t *restrict bin, const Pend *e) {                                \
         TAKE(0);                                                                                   \
         TAKE(1);                                                                                   \
         for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {                                         \
@@ -826,7 +841,7 @@ typedef struct WlApuPend Pend;
         }                                                                                          \
     }
 #define FRAMES_4(name, OP)                                                                         \
-    static void name(int32_t *restrict bin, const Pend *e) {                                       \
+    static inline void name(int32_t *restrict bin, const Pend *e) {                                \
         TAKE(0);                                                                                   \
         TAKE(1);                                                                                   \
         TAKE(2);                                                                                   \
@@ -836,7 +851,7 @@ typedef struct WlApuPend Pend;
         }                                                                                          \
     }
 #define FRAMES_8(name, OP)                                                                         \
-    static void name(int32_t *restrict bin, const Pend *e) {                                       \
+    static inline void name(int32_t *restrict bin, const Pend *e) {                                \
         TAKE(0);                                                                                   \
         TAKE(1);                                                                                   \
         TAKE(2);                                                                                   \
@@ -875,9 +890,10 @@ static void bin_live(WlXboxApu *apu, uint32_t b) {
 }
 
 // Makes bin b's waiting additions; the first into a bin not yet written this frame sets it.
-static void pend_flush_bin(WlXboxApu *apu, uint32_t b) {
+static inline __attribute__((always_inline)) void flush_bin(WlXboxApu *apu, uint32_t b) {
     int32_t *bin = apu->mix[b];
     const Pend *e = apu->pend[b], *end = e + apu->pend_n[b];
+    apu->pend_n[b] = 0;
     if ((apu->mix_live & (1u << b)) == 0) {
         apu->mix_live |= 1u << b;
         apu->mix_used |= 1u << b;
@@ -910,13 +926,24 @@ static void pend_flush_bin(WlXboxApu *apu, uint32_t b) {
     if (e != end) {
         add_frames1(bin, e);
     }
-    apu->pend_n[b] = 0;
 }
 
-// Makes every waiting addition: before a multipass voice reads a bin, and at the frame's end.
+// The same, out of line (a bin that is full).
+static __attribute__((noinline)) void pend_flush_bin(WlXboxApu *apu, uint32_t b) {
+    flush_bin(apu, b);
+}
+
+// Makes every waiting addition: before a multipass voice reads a bin, and at the frame's end
+// (the bins in one call: the registers its loops take saved once).
 static void pend_flush(WlXboxApu *apu) {
-    for (uint32_t bins = apu->pend_bins; bins != 0; bins &= bins - 1u) {
-        pend_flush_bin(apu, (uint32_t)__builtin_ctz(bins));
+    if (apu->cfg.plain) {
+        for (uint32_t bins = apu->pend_bins; bins != 0; bins &= bins - 1u) {
+            pend_flush_bin(apu, (uint32_t)__builtin_ctz(bins));
+        }
+    } else {
+        for (uint32_t bins = apu->pend_bins; bins != 0; bins &= bins - 1u) {
+            flush_bin(apu, (uint32_t)__builtin_ctz(bins));
+        }
     }
     apu->pend_bins = 0;
     apu->pend_frames = 0;
@@ -973,11 +1000,11 @@ static void mix_targets(WlXboxApu *apu, int32_t *const fr[2], uint32_t channels,
     apu->pend_bins |= used;
 }
 
-// The voice's gains this frame, Q15, from its volumes and the amplitude envelope's value ea (Q16);
+// The voice's gains this frame, Q15, from its volume words (VOLA, VOLB, VOLC) and the amplitude
+// envelope's value ea (Q16);
 // worked out again only when they change.
-static const uint16_t *voice_gains(WlApuVoice *vs, const uint8_t *rec, uint32_t ea) {
-    const uint32_t va = wl_rd_le32(rec + WL_APU_V_VOLA), vb = wl_rd_le32(rec + WL_APU_V_VOLB),
-                   vc = wl_rd_le32(rec + WL_APU_V_VOLC);
+static const uint16_t *voice_gains(WlApuVoice *vs, uint32_t va, uint32_t vb, uint32_t vc,
+                                   uint32_t ea) {
     if (vs->vol_valid && vs->vol_key[0] == va && vs->vol_key[1] == vb && vs->vol_key[2] == vc &&
         vs->vol_key[3] == ea) {
         return vs->vol_gain;
@@ -1004,6 +1031,47 @@ static const uint16_t *voice_gains(WlApuVoice *vs, const uint8_t *rec, uint32_t 
     return vs->vol_gain;
 }
 
+// The voice's additions while its gains hold (they held in this frame: vs->gain is gains), as
+// mix_targets queues them, kept for the frames after this one with the words they came from.
+static void plan_make(WlApuVoice *vs, const uint32_t key[7], uint32_t channels,
+                      const uint32_t bins[8], const uint16_t gains[8], uint32_t act) {
+    uint32_t n = 0, used = 0;
+    for (; act != 0; act &= act - 1u) {
+        const uint32_t t = (uint32_t)__builtin_ctz(act);
+        vs->plan_bin[n] = (uint8_t)bins[t];
+        vs->plan_ch[n] = (uint8_t)(t & (channels - 1u));
+        vs->plan_gain[n] = GAIN_HIGH(gains[t]);
+        used |= 1u << bins[t];
+        n++;
+    }
+    vs->plan_n = (uint8_t)n;
+    vs->plan_used = used;
+    memcpy(vs->plan_key, key, sizeof vs->plan_key);
+    vs->plan_valid = true;
+}
+
+// Queues the voice's additions as its plan holds them (f0, f1: its channels' frames).
+static inline void plan_mix(WlXboxApu *apu, const WlApuVoice *vs, const int32_t *f0,
+                            const int32_t *f1) {
+    uint8_t *const pend_n = apu->pend_n;
+    Pend(*const pend)[WL_APU_PEND_ADDS] = apu->pend;
+    const uint8_t *const bins = vs->plan_bin, *const chs = vs->plan_ch;
+    const int32_t *const gains = vs->plan_gain;
+    for (uint32_t i = 0, n = vs->plan_n; i < n; i++) {
+        const uint32_t bin = bins[i];
+        uint32_t k = pend_n[bin];
+        if (__builtin_expect(k == WL_APU_PEND_ADDS, 0)) {
+            pend_flush_bin(apu, bin);
+            k = 0;
+        }
+        pend_n[bin] = (uint8_t)(k + 1u);
+        Pend *e = &pend[bin][k];
+        e->frame = chs[i] ? f1 : f0;
+        e->gain = gains[i];
+    }
+    apu->pend_bins |= vs->plan_used;
+}
+
 // ---- A voice's frame ---------------------------------------------------------------------------
 
 static void voice_frame(WlXboxApu *apu, uint32_t v, uint8_t *rec, uint32_t list) {
@@ -1018,9 +1086,13 @@ static void voice_frame(WlXboxApu *apu, uint32_t v, uint8_t *rec, uint32_t list)
     f.loop = (f.fmt & WL_APU_FMT_LOOP) != 0;
     f.stream = (f.fmt & WL_APU_FMT_STREAM) != 0;
     f.persist = (f.fmt & WL_APU_FMT_PERSIST) != 0;
-    f.base = wl_rd_le32(rec + WL_APU_V_BASE) & 0x00FFFFFFu;
-    f.lbo = wl_rd_le32(rec + WL_APU_V_LBO) & 0x00FFFFFFu;
-    f.ebo = wl_rd_le32(rec + WL_APU_V_EBO) & 0x00FFFFFFu;
+    if (!f.stream || apu->cfg.plain) { // (a stream's samples come from its segments)
+        f.base = wl_rd_le32(rec + WL_APU_V_BASE) & 0x00FFFFFFu;
+        f.lbo = wl_rd_le32(rec + WL_APU_V_LBO) & 0x00FFFFFFu;
+        f.ebo = wl_rd_le32(rec + WL_APU_V_EBO) & 0x00FFFFFFu;
+    } else {
+        f.base = f.lbo = f.ebo = 0;
+    }
 
     // the guest moved the play position (VOICE_ON, SET_VOICE_BUF_CBO): start fetching there
     const uint32_t cbo = wl_rd_le32(rec + WL_APU_V_CBO) & 0x00FFFFFFu;
@@ -1031,15 +1103,29 @@ static void voice_frame(WlXboxApu *apu, uint32_t v, uint8_t *rec, uint32_t list)
         vs->blk_next = 0xFFu;
     }
 
-    bool off = false;
-    const uint32_t ef = envelope(apu, rec, v, false, &off);
-    const uint32_t ea = envelope(apu, rec, v, true, &off);
-    if (off) {
-        apu->stats.voices_ended++;
-        wl_apu_voice_off(apu, v);
-        return;
+    uint32_t ef = 65536u, ea = 65536u;
+    if ((state >> 24) == (WL_APU_ENV_OFF << 4 | WL_APU_ENV_OFF) && !apu->cfg.plain) {
+        // both envelopes off (Halo's voices): what envelope() does for each, at once
+        if (wl_rd_le32(rec + WL_APU_V_ECNT) != 0) {
+            wl_wr_le32(rec + WL_APU_V_ECNT, 0);
+        }
+        if (rec[WL_APU_V_EBO + 3u] != 0xFFu) {
+            rec[WL_APU_V_EBO + 3u] = 0xFFu;
+        }
+        if (rec[WL_APU_V_CBO + 3u] != 0xFFu) {
+            rec[WL_APU_V_CBO + 3u] = 0xFFu;
+        }
+    } else {
+        bool off = false;
+        ef = envelope(apu, rec, v, false, &off);
+        ea = envelope(apu, rec, v, true, &off);
+        if (off) {
+            apu->stats.voices_ended++;
+            wl_apu_voice_off(apu, v);
+            return;
+        }
+        state = wl_rd_le32(rec + WL_APU_V_STATE);
     }
-    state = wl_rd_le32(rec + WL_APU_V_STATE);
     if (state & WL_APU_STATE_NEW) {
         wl_wr_le32(rec + WL_APU_V_STATE, state & ~WL_APU_STATE_NEW);
     }
@@ -1081,29 +1167,52 @@ static void voice_frame(WlXboxApu *apu, uint32_t v, uint8_t *rec, uint32_t list)
 
     // targets: six bins in VBIN, two in FMT; a 3D voice's first four go to the HRTF submixes
     const uint32_t vbin = wl_rd_le32(rec + WL_APU_V_VBIN);
-    uint32_t bins[8] = {vbin & 31u,         (vbin >> 5) & 31u,  (vbin >> 10) & 31u,
-                        (vbin >> 16) & 31u, (vbin >> 21) & 31u, (vbin >> 26) & 31u,
-                        f.fmt & 31u,        (f.fmt >> 5) & 31u};
-    if (list == 1 && v < 64u) {
-        for (uint32_t i = 0; i < 4u; i++) {
-            bins[i] = apu->hrtf_submix[i];
-        }
+    const uint32_t va = wl_rd_le32(rec + WL_APU_V_VOLA), vb = wl_rd_le32(rec + WL_APU_V_VOLB),
+                   vc = wl_rd_le32(rec + WL_APU_V_VOLC);
+    const bool hrtf = list == 1 && v < 64u;
+    uint32_t sub = 0xFFFFFFFFu; // (submixes are below 32)
+    if (hrtf) {
+        memcpy(&sub, apu->hrtf_submix, sizeof sub);
     }
-    // the targets mixed: those with a gain, now or in the last frame (it ramps down to 0); a
-    // silent frame (DirectSound keeps silent looping voices running) adds nothing to any bin
-    const uint16_t *gains = voice_gains(vs, rec, ea);
-    uint32_t last[4], now[4];
-    memcpy(last, vs->gain, sizeof last);
-    memcpy(now, gains, sizeof now);
-    const bool steady =
-        ((last[0] ^ now[0]) | (last[1] ^ now[1]) | (last[2] ^ now[2]) | (last[3] ^ now[3])) == 0;
+    // the same words as the last frame's, whose gains held: the same additions (the most)
+    const uint32_t *const pk = vs->plan_key;
+    const bool planned = !apu->cfg.plain && vs->plan_valid &&
+                         ((pk[0] ^ va) | (pk[1] ^ vb) | (pk[2] ^ vc) | (pk[3] ^ ea) |
+                          (pk[4] ^ vbin) | (pk[5] ^ f.fmt) | (pk[6] ^ sub)) == 0;
+    uint32_t bins[8];
+    const uint16_t *gains = NULL;
     uint16_t from[8];
-    uint32_t act = vs->vol_act;
-    if (!steady) {
-        memcpy(from, vs->gain, sizeof from);
-        memcpy(vs->gain, gains, sizeof vs->gain);
-        for (uint32_t t = 0; t < 8u; t++) {
-            act |= (uint32_t)(from[t] != 0) << t;
+    bool steady = true;
+    uint32_t act = vs->plan_n; // planned: not 0 when there is an addition
+    if (!planned) {
+        bins[0] = vbin & 31u;
+        bins[1] = (vbin >> 5) & 31u;
+        bins[2] = (vbin >> 10) & 31u;
+        bins[3] = (vbin >> 16) & 31u;
+        bins[4] = (vbin >> 21) & 31u;
+        bins[5] = (vbin >> 26) & 31u;
+        bins[6] = f.fmt & 31u;
+        bins[7] = (f.fmt >> 5) & 31u;
+        if (hrtf) {
+            for (uint32_t i = 0; i < 4u; i++) {
+                bins[i] = apu->hrtf_submix[i];
+            }
+        }
+        // the targets mixed: those with a gain, now or in the last frame (it ramps down to 0); a
+        // silent frame (DirectSound keeps silent looping voices running) adds nothing to any bin
+        gains = voice_gains(vs, va, vb, vc, ea);
+        uint32_t last[4], now[4];
+        memcpy(last, vs->gain, sizeof last);
+        memcpy(now, gains, sizeof now);
+        steady = ((last[0] ^ now[0]) | (last[1] ^ now[1]) | (last[2] ^ now[2]) |
+                  (last[3] ^ now[3])) == 0;
+        act = vs->vol_act;
+        if (!steady) {
+            memcpy(from, vs->gain, sizeof from);
+            memcpy(vs->gain, gains, sizeof vs->gain);
+            for (uint32_t t = 0; t < 8u; t++) {
+                act |= (uint32_t)(from[t] != 0) << t;
+            }
         }
     }
     if (src.any != 0 && act != 0) {
@@ -1119,7 +1228,18 @@ static void voice_frame(WlXboxApu *apu, uint32_t v, uint8_t *rec, uint32_t list)
         } else {
             interpolate(&src, f.channels, fr[0], fr[1]);
         }
-        mix_targets(apu, fr, f.channels, bins, steady ? NULL : from, gains, act);
+        if (planned) {
+            plan_mix(apu, vs, fr[0], fr[1]);
+        } else {
+            mix_targets(apu, fr, f.channels, bins, steady ? NULL : from, gains, act);
+        }
+    }
+    if (!planned) {
+        vs->plan_valid = false;
+        if (steady && !apu->cfg.plain) { // the next frames' additions, while the words hold
+            const uint32_t key[7] = {va, vb, vc, ea, vbin, f.fmt, sub};
+            plan_make(vs, key, f.channels, bins, gains, act);
+        }
     }
 
     // the position the guest reads (DirectSound's GetCurrentPosition)
@@ -1150,6 +1270,11 @@ void wl_apu_vp_frame(WlXboxApu *apu) {
     for (uint32_t list = 0; list < 3u; list++) {
         const uint32_t regs = WL_APU_TVL2D + list * WL_APU_LIST_STRIDE;
         uint32_t v = wl_apu_reg(apu, regs) & 0xFFFFu;
+        // the current voice and the one after it (CVL, NVL), which the guest reads between frames:
+        // written once at the list's end (the plain code: at each voice)
+        const bool each = apu->cfg.plain;
+        uint32_t nvl = WL_APU_NO_VOICE;
+        bool walked = false;
         for (uint32_t n = 0; v != WL_APU_NO_VOICE; n++) {
             uint8_t *rec = recs == NULL             ? wl_apu_voice_rec(apu, v)
                            : v < WL_XBOX_APU_VOICES ? recs + v * WL_APU_VOICE_SIZE
@@ -1161,15 +1286,26 @@ void wl_apu_vp_frame(WlXboxApu *apu) {
                 break;
             }
             const uint32_t next = wl_rd_le32(rec + WL_APU_V_PITCH_LINK) & 0xFFFFu;
-            wl_apu_set_reg(apu, regs + 4u, v);
-            wl_apu_set_reg(apu, regs + 8u, next);
-            if ((wl_rd_le32(rec + WL_APU_V_STATE) & WL_APU_STATE_ACTIVE) == 0) {
+            if (each) {
+                wl_apu_set_reg(apu, regs + 4u, v);
+                wl_apu_set_reg(apu, regs + 8u, next);
+            } else {
+                nvl = next;
+                walked = true;
+            }
+            const uint32_t state = wl_rd_le32(rec + WL_APU_V_STATE);
+            if ((state & WL_APU_STATE_ACTIVE) == 0) {
                 wl_apu_idle_voice(apu, v);
+            } else if ((state & WL_APU_STATE_PAUSED) && !each) {
+                voices++; // a paused voice (Halo's lists hold about as many as play): nothing to do
             } else {
                 voice_frame(apu, v, rec, list);
                 voices++;
             }
             v = next;
+        }
+        if (walked) {
+            wl_apu_set_reg(apu, regs + 8u, nvl);
         }
         wl_apu_set_reg(apu, regs + 4u, WL_APU_NO_VOICE);
     }

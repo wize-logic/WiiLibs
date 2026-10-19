@@ -101,6 +101,13 @@ bool wl_nv2a_texture_layout_reduced(const WlNv2aTexture *t, bool mipmaps, uint32
 bool wl_nv2a_texture_convert(const WlNv2aTexture *t, const WlNv2aGxLayout *layout, const uint8_t *src,
                              const uint8_t *palette, void *dst, void *scratch);
 size_t wl_nv2a_texture_scratch_bytes(const WlNv2aTexture *t, const WlNv2aGxLayout *layout);
+// A cube map's sphere layout: wl_nv2a_texture_spot (when `spots`; else layout->spot 0) and
+// wl_nv2a_texture_convert in one, its faces decoded once. Any other layout: the two calls.
+bool wl_nv2a_texture_convert_cube(const WlNv2aTexture *t, WlNv2aGxLayout *layout, bool spots, const uint8_t *src,
+                                  const uint8_t *palette, void *dst, void *scratch);
+// The conversions as before texcache2 (the switch "texplain2"): each image zeroed whole before it is
+// written, a cube map's faces decoded twice, its sphere's directions worked out at each conversion.
+void wl_nv2a_texture_set_plain(bool plain);
 
 // One texel of a linear (unswizzled) level as RGBA8: the decoder of the formats without an exact GX
 // equivalent, and the reference for the others. `row` is the level's row y.

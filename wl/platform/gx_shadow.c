@@ -52,7 +52,55 @@ static struct {
     uint16_t arrays_known;
     uint32_t array_calls, array_sent;
     uint64_t fifo[WL_GX_FIFO_KINDS];
+    // Dolphin's batches, a model: a primitive after a write that changed GX's state (any kind but the
+    // arrays') starts a new one (Dolphin flushes its vertices into a draw of the host's GPU there); the
+    // kinds written since the last primitive (bit per kind), the batches, and for each kind the batches
+    // it started and those it started alone
+    uint32_t dirty;
+    uint32_t primitives, batches;
+    uint32_t breaks[WL_GX_FIFO_KINDS], alone[WL_GX_FIFO_KINDS];
+    // the tokens (a batch's start too: TOKEN_DIRTY in dirty), whether a command reached the FIFO since the last
+    uint32_t tokens, tokens_idle, token_breaks, token_alone, tex_invalidates;
+    bool written;
+    // a fence's token put off (wl_gx_shadow_token_defer), and the primitives since
+    bool token_deferred;
+    uint32_t token_late;
+    // texture maps as a cache (gx_shadow.h): the map each logical map reads, as map ^ logical (zero: itself),
+    // each map's texture (its key, bit per map of keys_known), when it was last bound (a count of binds),
+    // the logical maps bound since all were forgotten, whether one moved since the TEV followed, the switch
+    uint8_t map_x[WL_GX_SHADOW_TEXMAPS];
+    uint32_t map_key[WL_GX_SHADOW_TEXMAPS][WL_GX_MAP_KEY_WORDS];
+    uint32_t map_stamp[WL_GX_SHADOW_TEXMAPS], stamp;
+    uint8_t keys_known, bound;
+    bool maps_moved, maps_fixed;
+    uint32_t map_hits, map_orders;
 } s;
+
+#define TOKEN_DIRTY (1u << WL_GX_FIFO_KINDS)
+
+static void fifo_add(WlGxFifoKind kind, uint32_t bytes) {
+    s.fifo[kind] += bytes;
+    s.written = s.written || bytes != 0;
+    if (kind == WL_GX_FIFO_VERTEX) {
+        s.primitives++;
+        if (s.dirty != 0) {
+            unsigned k;
+
+            s.batches++;
+            for (k = 0; k < WL_GX_FIFO_KINDS; k++) {
+                if (s.dirty & (1u << k)) {
+                    s.breaks[k]++;
+                    s.alone[k] += s.dirty == (1u << k) ? 1u : 0u;
+                }
+            }
+            s.token_breaks += (s.dirty & TOKEN_DIRTY) != 0 ? 1u : 0u;
+            s.token_alone += s.dirty == TOKEN_DIRTY ? 1u : 0u;
+            s.dirty = 0;
+        }
+    } else if (kind != WL_GX_FIFO_ARRAY && bytes != 0) {
+        s.dirty |= 1u << kind;
+    }
+}
 
 bool wl_gx_shadow_differs(WlGxShadowKey key, const void *value, size_t bytes) {
     uint16_t bit = (uint16_t)(1u << key);
@@ -64,7 +112,7 @@ bool wl_gx_shadow_differs(WlGxShadowKey key, const void *value, size_t bytes) {
     memcpy(s.values[key], value, bytes);
     s.known |= bit;
     s.sent += k_calls[key];
-    s.fifo[WL_GX_FIFO_STATE] += k_bytes[key];
+    fifo_add(WL_GX_FIFO_STATE, k_bytes[key]);
     return true;
 }
 
@@ -168,7 +216,14 @@ void wl_tev_shadow_plan(const WlTevProgram *p, uint32_t flags, WlTevSend *out) {
     }
     for (i = 0; i < p->stage_count; i++) {
         const WlTevStage *now = &p->stages[i];
+        WlTevStage moved;
 
+        if (now->texmap < WL_GX_SHADOW_TEXMAPS && s.map_x[now->texmap] != 0) {
+            // (the map its texture went to: gx_shadow.h's cache)
+            moved = *now;
+            moved.texmap = (uint8_t)(now->texmap ^ s.map_x[now->texmap]);
+            now = &moved;
+        }
         calls += 8u;
         out->stages[i] = changes ? stage_calls(now, &s.stages[i], (s.stages_known & (1u << i)) != 0)
                                  : (uint8_t)WL_TEV_SEND_STAGE;
@@ -176,12 +231,13 @@ void wl_tev_shadow_plan(const WlTevProgram *p, uint32_t flags, WlTevSend *out) {
         s.stages_known |= (uint16_t)(1u << i);
         sent += bits(out->stages[i]);
     }
+    s.maps_moved = false; // (the stages read the maps their textures are on)
     sent += bits(out->swaps) + bits(out->konst) + bits(out->preload) + (out->stage_count ? 1u : 0u);
     s.calls += calls;
     s.sent += sent;
     // (a stage's call one BP write; a swap table and a konst colour two, a preloaded register four:
     // GX_SetTevColor writes its second half three times)
-    s.fifo[WL_GX_FIFO_TEV] += BP_BYTES * (sent + bits(out->swaps) + bits(out->konst) + 3u * bits(out->preload));
+    fifo_add(WL_GX_FIFO_TEV, BP_BYTES * (sent + bits(out->swaps) + bits(out->konst) + 3u * bits(out->preload)));
 }
 
 bool wl_gx_shadow_tlut_differs(uint32_t slot, const void *entries, uint32_t bytes, uint8_t format) {
@@ -200,7 +256,7 @@ bool wl_gx_shadow_tlut_differs(uint32_t slot, const void *entries, uint32_t byte
     s.tlut_format[slot] = format;
     s.tluts_known |= bit;
     s.tlut_sent++;
-    s.fifo[WL_GX_FIFO_TLUT] += 4u * BP_BYTES; // (GX_LoadTlut's BP writes, around two texture-state flushes)
+    fifo_add(WL_GX_FIFO_TLUT, 4u * BP_BYTES); // (GX_LoadTlut's BP writes, around two texture-state flushes)
     return true;
 }
 
@@ -245,8 +301,8 @@ uint32_t wl_gx_shadow_texture(uint32_t map, const uint32_t *regs, unsigned count
     s.tex_writes += bits(answer & 0xFFu);
     // (a whole load: libogc sends the coordinates' scale again at the next primitive, two BP writes for
     // the coordinate that reads the map, as a rule one)
-    s.fifo[WL_GX_FIFO_TEXTURE] +=
-        BP_BYTES * bits(answer & 0xFFu) + ((answer & WL_GX_TEXREG_LOAD) != 0 ? 2u * BP_BYTES : 0u);
+    fifo_add(WL_GX_FIFO_TEXTURE,
+             BP_BYTES * bits(answer & 0xFFu) + ((answer & WL_GX_TEXREG_LOAD) != 0 ? 2u * BP_BYTES : 0u));
     if ((answer & WL_GX_TEXREG_LOAD) != 0) {
         s.tex_loads++;
     }
@@ -257,8 +313,151 @@ void wl_gx_shadow_texture_kept(void) {
     s.tex_binds++;
 }
 
-void wl_gx_shadow_texture_forget(uint32_t maps) {
+bool wl_gx_shadow_texture_forget(uint32_t maps) {
+    bool moved = false;
+    unsigned m;
+
     s.texmaps_known &= (uint8_t)~maps;
+    s.keys_known &= (uint8_t)~maps;
+    if ((maps & 0xFFu) == 0xFFu) {
+        s.bound = 0;
+    }
+    for (m = 0; m < WL_GX_SHADOW_TEXMAPS; m++) {
+        if ((maps & (1u << m)) != 0 && s.map_x[m] != 0) {
+            s.map_x[m] = 0; // (wl/platform's own draws read the map they loaded)
+            moved = true;
+        }
+    }
+    s.maps_moved = s.maps_moved || moved;
+    return moved;
+}
+
+// ---- texture maps as a cache --------------------------------------------------------------------
+
+void wl_gx_shadow_maps_cache(bool on) {
+    if (s.maps_fixed != !on) {
+        s.maps_fixed = !on;
+        (void)wl_gx_shadow_texture_forget(0xFFu);
+    }
+}
+
+bool wl_gx_shadow_maps_cache_on(void) {
+    return !s.maps_fixed;
+}
+
+void wl_gx_shadow_maps_begin(void) {
+    s.bound = 0;
+}
+
+// the maps a logical map's texture may go to: maps 0-5, and its own (maps 6 and 7's regions overlap maps 4
+// and 5's in the console's texture memory: gx_direct_wii.c, wl_gx_wii_regions_apply)
+#define CACHE_MAPS 0x3Fu
+
+static bool map_holds(unsigned m, const uint32_t *key) {
+    return (s.keys_known & (1u << m)) != 0 && memcmp(s.map_key[m], key, WL_GX_MAP_KEY_WORDS * sizeof *key) == 0;
+}
+
+uint32_t wl_gx_shadow_map_bind(uint32_t logical, const uint32_t key[WL_GX_MAP_KEY_WORDS], bool *held) {
+    unsigned here, m, best = WL_GX_SHADOW_TEXMAPS, l;
+    uint32_t pinned = 0, best_age = 0;
+
+    *held = false;
+    if (s.maps_fixed || logical >= WL_GX_SHADOW_TEXMAPS) {
+        return logical;
+    }
+    here = logical ^ s.map_x[logical];
+    s.stamp++;
+    s.bound |= (uint8_t)(1u << logical);
+    if (map_holds(here, key)) {
+        s.map_stamp[here] = s.stamp;
+        *held = true;
+        return here;
+    }
+    for (m = 0; m < WL_GX_SHADOW_TEXMAPS; m++) {
+        if (m != here && ((CACHE_MAPS | 1u << logical) & (1u << m)) != 0 && map_holds(m, key)) {
+            // (another map holds it: read there, nothing loaded)
+            best = m;
+            s.map_hits++;
+            *held = true;
+            break;
+        }
+    }
+    if (best == WL_GX_SHADOW_TEXMAPS) {
+        // (the maps the other logical maps read are kept; of the others the one never given a texture or
+        // forgotten, else the one bound longest ago, `here` first among equals)
+        pinned = ~(CACHE_MAPS | 1u << logical);
+        for (l = 0; l < WL_GX_SHADOW_TEXMAPS; l++) {
+            if (l != logical && (s.bound & (1u << l)) != 0) {
+                pinned |= 1u << (l ^ s.map_x[l]);
+            }
+        }
+        for (m = 0; m < WL_GX_SHADOW_TEXMAPS; m++) {
+            // (binds since its last; one holding nothing the oldest)
+            uint32_t age = (s.keys_known & (1u << m)) == 0 ? UINT32_MAX : s.stamp - s.map_stamp[m];
+
+            if ((pinned & (1u << m)) != 0) {
+                continue;
+            }
+            if (best == WL_GX_SHADOW_TEXMAPS || age > best_age || (age == best_age && m == here)) {
+                best = m;
+                best_age = age;
+            }
+        }
+        if (best == WL_GX_SHADOW_TEXMAPS) {
+            // (every map another logical map reads: seven of them bound and their separate alphas: its own
+            // map, the logical maps that read it to be bound again)
+            best = here;
+            for (l = 0; l < WL_GX_SHADOW_TEXMAPS; l++) {
+                if (l != logical && (l ^ s.map_x[l]) == best) {
+                    s.bound &= (uint8_t)~(1u << l);
+                }
+            }
+        }
+        memcpy(s.map_key[best], key, WL_GX_MAP_KEY_WORDS * sizeof *key);
+        s.keys_known |= (uint8_t)(1u << best);
+    }
+    s.map_stamp[best] = s.stamp;
+    if (best != here) {
+        s.map_x[logical] = (uint8_t)(best ^ logical);
+        s.maps_moved = true;
+    }
+    return best;
+}
+
+uint32_t wl_gx_shadow_map_of(uint32_t logical) {
+    return logical < WL_GX_SHADOW_TEXMAPS ? logical ^ s.map_x[logical] : logical;
+}
+
+bool wl_gx_shadow_maps_moved(void) {
+    return s.maps_moved;
+}
+
+void wl_gx_shadow_maps_followed(void) {
+    s.maps_moved = false;
+}
+
+bool wl_tev_shadow_order_moved(unsigned stage, uint8_t texcoord, uint8_t texmap, uint8_t channel) {
+    WlTevStage *was;
+    bool known;
+
+    if (stage >= WL_TEV_MAX_STAGES) {
+        return false;
+    }
+    was = &s.stages[stage];
+    known = (s.stages_known & (1u << stage)) != 0;
+    if (known && was->texmap == texmap && was->texcoord == texcoord && was->channel == channel) {
+        return false;
+    }
+    if (known) {
+        was->texcoord = texcoord;
+        was->texmap = texmap;
+        was->channel = channel;
+    }
+    s.map_orders++;
+    s.calls++;
+    s.sent++;
+    fifo_add(WL_GX_FIFO_TEV, BP_BYTES);
+    return true;
 }
 
 void wl_gx_shadow_texture_counts(uint32_t *binds, uint32_t *changed, uint32_t *loads, uint32_t *writes) {
@@ -313,7 +512,7 @@ bool wl_gx_shadow_array(unsigned attribute, const void *data, uint32_t stride, b
         s.arrays_known |= bit;
     }
     s.array_sent++;
-    s.fifo[WL_GX_FIFO_ARRAY] += 2u * CP_BYTES;
+    fifo_add(WL_GX_FIFO_ARRAY, 2u * CP_BYTES);
     return true;
 }
 
@@ -327,7 +526,7 @@ void wl_gx_shadow_array_counts(uint32_t *calls, uint32_t *sent) {
 }
 
 void wl_gx_shadow_fifo(WlGxFifoKind kind, uint32_t bytes) {
-    s.fifo[kind] += bytes;
+    fifo_add(kind, bytes);
 }
 
 void wl_gx_shadow_fifo_counts(uint64_t *out) {
@@ -370,6 +569,41 @@ uint32_t wl_gx_shadow_layout_vertex_bytes(const WlGxDirectLayout *layout) {
     return bytes + 4u * (projected == 0 ? 0u : projected == 1u ? 3u : 9u);
 }
 
+void wl_gx_shadow_token(void) {
+    s.token_deferred = false;
+    s.tokens++;
+    s.tokens_idle += s.written ? 0u : 1u;
+    s.written = false;
+    s.dirty |= TOKEN_DIRTY;
+}
+
+void wl_gx_shadow_token_defer(void) {
+    if (!s.token_deferred) {
+        s.token_deferred = true;
+        s.token_late = 0;
+    }
+}
+
+bool wl_gx_shadow_token_deferred(void) {
+    return s.token_deferred;
+}
+
+bool wl_gx_shadow_token_due(void) {
+    // (its batch cut by the state given since the last primitive already, or put off long enough)
+    return s.token_deferred && (s.dirty != 0 || ++s.token_late >= WL_GX_SHADOW_TOKEN_LATE);
+}
+
+void wl_gx_shadow_texture_invalidate(void) {
+    s.tex_invalidates++;
+    fifo_add(WL_GX_FIFO_TEXTURE, 4u * BP_BYTES);
+}
+
+void wl_gx_shadow_lighting(const WlGxDirectLighting *l) {
+    unsigned extra = bits((uint32_t)(l->extra[0] | l->extra[1] | l->extra[2] | l->extra[3]) & 0x0Fu);
+
+    fifo_add(WL_GX_FIFO_MATRIX, XF_BYTES(9u) + (4u + extra) * XF_BYTES(16u) + 4u * XF_BYTES(1u));
+}
+
 void wl_gx_shadow_forget(void) {
     s.known = 0;
     s.arrays_known = 0;
@@ -392,4 +626,15 @@ void wl_gx_shadow_stats(WlGxDirectStats *out) {
     wl_gx_shadow_texture_counts(&out->tex_binds, &out->tex_changed, &out->tex_loads, &out->tex_writes);
     wl_gx_shadow_array_counts(&out->array_calls, &out->array_sent);
     wl_gx_shadow_fifo_counts(out->fifo);
+    out->tokens = s.tokens;
+    out->tokens_idle = s.tokens_idle;
+    out->token_breaks = s.token_breaks;
+    out->token_alone = s.token_alone;
+    out->tex_invalidates = s.tex_invalidates;
+    out->tex_map_hits = s.map_hits;
+    out->tex_map_orders = s.map_orders;
+    out->primitives = s.primitives;
+    out->batches = s.batches;
+    memcpy(out->batch_breaks, s.breaks, sizeof s.breaks);
+    memcpy(out->batch_alone, s.alone, sizeof s.alone);
 }

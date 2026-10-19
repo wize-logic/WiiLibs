@@ -422,8 +422,8 @@ _parse the characters read (0: not a form; the key's every byte set) */
 register (of at most two components in the form) its s and t read, affinely; -1 for none */
 int wl_xbox_vsh_texgen_source(const WlXboxVshDependencies *dependencies, const WlXboxVshFusedKey *key,
                               unsigned stage);
-/* the constant registers (c[n - 96]) the instructions that reach the outputs `live`
-(WL_XBOX_VSH_LIVE_...) read, at most `most` of them into registers: their count, -1 when one
+/* the constant registers (c[n - 96]) the outputs `live` (WL_XBOX_VSH_LIVE_...) read, found a unit
+(MAC, ILU) and a component at a time, at most `most` of them into registers: their count, -1 when one
 is read by a0 or there are more (what those outputs are, for any vertex, is a function of them) */
 int wl_xbox_vsh_live_constants(const WlXboxVshProgram *program, unsigned live, unsigned char *registers, int most);
 int wl_xbox_vsh_fused_text(const WlXboxVshFusedKey *key, char *text, unsigned long size);

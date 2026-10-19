@@ -10,7 +10,8 @@
 // BENCH_VOICES=mute plays the same voices with every target at full attenuation (silent), and
 // BENCH_VOICES=pause pauses every voice once it is on: what the voices cost when they add nothing.
 // BENCH_VOICES=blink silences every voice on odd game ticks (a silent voice going on and coming
-// back as it would have played). BENCH_PLAIN=1 runs the model's plain code paths
+// back as it would have played). BENCH_VOICES=a10, a30 or d40 plays a scene shaped like what Halo's
+// levels play (halo_voices). BENCH_PLAIN=1 runs the model's plain code paths
 // (WlXboxApuConfig.plain), which must give the same checksums.
 //
 // With an expected checksum (hex), exits 1 when the checksum differs (ctest runs it so). Count
@@ -157,6 +158,7 @@ typedef struct {
     uint32_t data;           // streams: 0 mono ADPCM, 1 stereo ADPCM, 2 silence
     bool moving;             // volumes move each game tick
     uint32_t env[3];         // the amplitude envelope: ENV0, ENVA, release (0: off)
+    bool paused;             // paused once it is on (it stays in its list)
 } Voice;
 
 #define VBIN_SPK (0u | 1u << 5 | 2u << 10 | 3u << 16 | 4u << 21 | 5u << 26)
@@ -165,9 +167,103 @@ typedef struct {
 
 static Voice g_voices[64];
 static uint32_t g_nvoices;
-static uint32_t g_release_voice; // released at game tick 40
+static uint32_t g_release_voice = UINT32_MAX; // released at game tick 40
 static bool g_mute, g_pause;     // BENCH_VOICES: every target silent, every voice paused
 static bool g_blink;             // BENCH_VOICES: every target silent on odd game ticks
+
+// Halo's mix as counted in deterministic host runs of three of its levels (2026-10-19: the APU's
+// voice frames over 60-90 s of play), a frame: a10's bridge 22 voices (18 mono ADPCM streams near
+// 22 kHz into two 3D submixes and the effect send, 2 stereo ADPCM streams at 44.1 kHz to front
+// left and right, 2 silent 16-bit loops, one at 48 kHz), and 21 paused voices in the lists; a30
+// 17 (12, 3, 2) and 24 paused; d40 18 (13, 3, 2) and 13 paused. No envelopes; one stream in 20 is
+// silent; about 1% of the voice frames move a gain. The bins: the two 3D submixes and the effect
+// send hold 11-17 additions each, front left and right 2-3.
+typedef struct {
+    const char *name;
+    uint32_t mono, stereo, paused;
+} Shape;
+static const Shape k_shapes[] = {{"a10", 18, 2, 21}, {"a30", 12, 3, 24}, {"d40", 13, 3, 13}};
+static const Shape *g_shape; // BENCH_VOICES=a10, a30 or d40: that scene's shape
+
+static uint32_t add(const Voice *d);
+
+// A paused voice (in its list, as DirectSound leaves them).
+static void add_paused(uint32_t list) {
+    Voice e = {FMT_ADPCM | FMT_LOOP,
+               list,
+               VBIN_SPK,
+               BINS67_FX,
+               {0x100, 0x100, X, X, X, X, X, X},
+               P_22K,
+               0x84000u,
+               0,
+               100u * 64u - 1u,
+               0,
+               false,
+               {0, 0, 0},
+               true};
+    add(&e);
+}
+
+static void halo_voices(const Shape *sh) {
+    uint32_t paused = sh->paused;
+    for (uint32_t i = 0; i < sh->mono; i++) { // 3D: the submixes (targets 0, 1) and the effect send
+        const uint16_t a = (uint16_t)(0x80 + i * 23u), b = (uint16_t)(0xC0 + i * 17u);
+        Voice d = {FMT_ADPCM | FMT_STREAM | FMT_PERSIST,
+                   2,
+                   VBIN_SPK,
+                   BINS67_FX,
+                   {a, b, X, X, X, X, (uint16_t)(0x200 + i * 8u), X},
+                   (int16_t)(P_22K + (int32_t)(i * 97u % 600u) - 300),
+                   0,
+                   0,
+                   0,
+                   i == 0 ? 2u : 0u,
+                   i < 10u,
+                   {0, 0, 0},
+                   false};
+        add(&d);
+        if (paused > 0) { // the paused voices between the others
+            add_paused(2);
+            paused--;
+        }
+    }
+    for (uint32_t i = 0; i < sh->stereo; i++) { // 2D: front left and right
+        Voice d = {FMT_ADPCM | FMT_STEREO | FMT_STREAM | FMT_PERSIST,
+                   1,
+                   VBIN_SPK,
+                   BINS67_FX,
+                   {0x100, 0x100, X, X, X, X, X, X},
+                   (int16_t)(P_44K + (int32_t)i * 40),
+                   0,
+                   0,
+                   0,
+                   1,
+                   false,
+                   {0, 0, 0},
+                   false};
+        add(&d);
+    }
+    for (uint32_t i = 0; i < 2u; i++) { // 16-bit loops of silence (past the buffer data)
+        Voice d = {FMT_S16 | FMT_LOOP,
+                   1,
+                   VBIN_SPK,
+                   BINS67_FX,
+                   {0x100, 0x100, X, X, X, X, X, X},
+                   i ? P_22K : 0,
+                   0xA0000u + i * 0x8000u,
+                   0,
+                   0x3000u,
+                   0,
+                   false,
+                   {0, 0, 0},
+                   false};
+        add(&d);
+    }
+    for (; paused > 0; paused--) {
+        add_paused(1);
+    }
+}
 
 // VOLA, VOLB, VOLC of the eight attenuations: 0..5 at bits 4 and 20, 6 and 7 in the low nibbles.
 static void vol_words(const uint16_t *vol, uint32_t w[3]) {
@@ -282,6 +378,10 @@ static WlXboxApu *scene(bool sum) {
     w32(apu, 0x1100, 0x0);
     w32(apu, 0x2000, 0x0F);
 
+    if (g_shape != NULL) {
+        halo_voices(g_shape);
+        goto voices_on;
+    }
     // mono ADPCM streams around 22 kHz: front left, front right, the effect send; four 3D ones
     // moving, three of silence
     for (uint32_t i = 0; i < 16; i++) {
@@ -297,14 +397,14 @@ static WlXboxApu *scene(bool sum) {
                    0,
                    i >= 13 ? 2u : 0u,
                    i < 4,
-                   {0, 0, 0}};
+                   {0, 0, 0}, false};
         add(&d);
     }
     // stereo ADPCM loops at 44.1 kHz
     for (uint32_t i = 0; i < 3; i++) {
         Voice d = {FMT_ADPCM | FMT_STEREO | FMT_LOOP, 1,     VBIN_SPK,       BINS67_FX,
                    {0x100, 0x100, X, X, X, X, X, X},  P_44K, i * 72u * 300u, 0,
-                   (600u + 100u * i) * 64u - 1u,      0,     false,          {0, 0, 0}};
+                   (600u + 100u * i) * 64u - 1u,      0,     false,          {0, 0, 0}, false};
         add(&d);
     }
     // 16-bit PCM loops with more targets: at 48 kHz (unity) and at 22 kHz
@@ -320,7 +420,7 @@ static WlXboxApu *scene(bool sum) {
                    0x7000u + i * 0x111u,
                    0,
                    false,
-                   {0, 0, 0}};
+                   {0, 0, 0}, false};
         add(&d);
     }
     // 8-bit at 11 kHz, a one-shot that ends, a voice at full attenuation
@@ -336,15 +436,15 @@ static WlXboxApu *scene(bool sum) {
                    0x3FFF,
                    0,
                    false,
-                   {0, 0, 0}};
+                   {0, 0, 0}, false};
         add(&d);
         Voice e = {FMT_ADPCM, 1,        VBIN_SPK, BINS67_FX,       {0x20, 0x20, X, X, X, X, X, X},
                    P_22K,     0x84000u, 0,        300u * 64u - 1u, 0,
-                   false,     {0, 0, 0}};
+                   false,     {0, 0, 0}, false};
         add(&e);
         Voice f = {FMT_ADPCM | FMT_LOOP,     1,     VBIN_SPK, BINS67_FX,
                    {X, X, X, X, X, X, X, X}, P_22K, 0x84000u, 0,
-                   100u * 64u - 1u,          0,     false,    {0, 0, 0}};
+                   100u * 64u - 1u,          0,     false,    {0, 0, 0}, false};
         add(&f);
     }
     // ADPCM noise (the largest steps, the prediction clamping) under an amplitude envelope:
@@ -361,7 +461,7 @@ static WlXboxApu *scene(bool sum) {
                    0x4000u / 36u * 64u - 1u,
                    0,
                    false,
-                   {2u, 1u | 1u << 12 | 160u << 24, 3u}};
+                   {2u, 1u | 1u << 12 | 160u << 24, 3u}, false};
         add(&d);
         Voice e = {FMT_S16 | FMT_LOOP,
                    1,
@@ -374,7 +474,7 @@ static WlXboxApu *scene(bool sum) {
                    0x2000u,
                    0,
                    false,
-                   {1u, 1u | 1u << 12 | 200u << 24, 2u}};
+                   {1u, 1u | 1u << 12 | 200u << 24, 2u}, false};
         g_release_voice = add(&e);
     }
     // a multipass voice: the effect send bin 10 back into the front bins (clearing it)
@@ -390,9 +490,10 @@ static WlXboxApu *scene(bool sum) {
                    0,
                    0,
                    false,
-                   {0, 0, 0}};
+                   {0, 0, 0}, false};
         add(&d);
     }
+voices_on:
     for (uint32_t v = 0; v < g_nvoices; v++) {
         voice_setup(apu, v, &g_voices[v]);
         if (g_voices[v].fmt & FMT_STREAM) {
@@ -401,7 +502,7 @@ static WlXboxApu *scene(bool sum) {
         }
         m(apu, 0x120, 0xFFFFu | g_voices[v].list << 16);
         m(apu, 0x124, v | (g_voices[v].env[0] != 0 ? 2u << 28 : 0)); // EA from its attack
-        if (g_pause) {
+        if (g_pause || g_voices[v].paused) {
             m(apu, 0x140, v | 1u << 18);
         }
     }
@@ -410,7 +511,7 @@ static WlXboxApu *scene(bool sum) {
 
 // A game tick: the moving voices get new volumes and pitches; played stream lists get new segments.
 static void game_tick(WlXboxApu *apu, uint32_t tick) {
-    if (tick == 40u) {
+    if (tick == 40u && g_release_voice != UINT32_MAX) {
         m(apu, 0x12C, g_release_voice);
     }
     for (uint32_t v = 0; v < g_nvoices; v++) {
@@ -473,6 +574,11 @@ int main(int argc, char **argv) {
     g_mute = mode != NULL && strcmp(mode, "mute") == 0;
     g_pause = mode != NULL && strcmp(mode, "pause") == 0;
     g_blink = mode != NULL && strcmp(mode, "blink") == 0;
+    for (uint32_t i = 0; mode != NULL && i < sizeof k_shapes / sizeof k_shapes[0]; i++) {
+        if (strcmp(mode, k_shapes[i].name) == 0) {
+            g_shape = &k_shapes[i];
+        }
+    }
     WlXboxApu *apu = scene(sum);
     if (apu == NULL) {
         fprintf(stderr, "out of memory\n");

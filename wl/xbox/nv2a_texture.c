@@ -23,6 +23,8 @@
 
 enum { LAYOUT_SZ, LAYOUT_LU, LAYOUT_DXT };
 
+static bool g_plain; // wl_nv2a_texture_set_plain
+
 typedef struct FormatInfo {
     uint8_t known;
     uint8_t bytes;   // a texel's (0: DXT)
@@ -459,20 +461,26 @@ void wl_nv2a_sphere_coordinates(const float direction[3], float st[2]) {
     wl_nv2a_sphere_coordinates_inline(direction, st);
 }
 
-void wl_nv2a_sphere_direction(float s, float t, float direction[3]) {
+// (`root` sqrtf or wl_sqrtf_exact: the same bits, newlib's a bit at a time and about four times the
+// instructions on the Wii)
+static inline void sphere_direction(float s, float t, float direction[3], bool exact) {
     float a = 2.0f * s - 1.0f, b = 2.0f * t - 1.0f, r2 = a * a + b * b, c;
 
     if (r2 > 1.0f) {
-        float r = sqrtf(r2);
+        float r = exact ? wl_sqrtf_exact(r2) : sqrtf(r2);
         a /= r;
         b /= r;
         r2 = 1.0f;
     }
-    c = sqrtf(1.0f - r2);
+    c = exact ? wl_sqrtf_exact(1.0f - r2) : sqrtf(1.0f - r2);
     // the reflection of the view direction about the half vector (a, b, c)
     direction[0] = 2.0f * c * a;
     direction[1] = 2.0f * c * b;
     direction[2] = 2.0f * c * c - 1.0f;
+}
+
+void wl_nv2a_sphere_direction(float s, float t, float direction[3]) {
+    sphere_direction(s, t, direction, false);
 }
 
 // a cube map's face and its texel coordinates (0..1) for a direction (Direct3D's faces: +x, -x,
@@ -845,13 +853,23 @@ void wl_nv2a_spot_coordinates(const float direction[3], unsigned spot, float st[
     st[1] = (v + 1.0f) * 0.5f;
 }
 
-static bool convert_sphere(const WlNv2aTexture *t, const WlNv2aGxLayout *layout, const uint8_t *src,
-                           const uint8_t *palette, uint8_t *dst, uint8_t *scratch) {
+// the texel of decoded faces a sphere map's direction reads (into `out`, RGBA)
+static inline void sphere_texel(const WlNv2aTexture *t, const uint8_t *faces, const float d[3], uint8_t *out) {
+    float s, tt;
+    unsigned face = cube_face(d, &s, &tt);
+    uint32_t x = (uint32_t)(s * (float)t->width), y = (uint32_t)(tt * (float)t->height);
+
+    x = x >= t->width ? t->width - 1u : x;
+    y = y >= t->height ? t->height - 1u : y;
+    memcpy(out, faces + (((size_t)face * t->height + y) * t->width + x) * 4u, 4);
+}
+
+// a cube map's sphere map (or its spot's face) from its decoded faces, `sphere` scratch for its RGBA
+static bool sphere_from_faces(const WlNv2aTexture *t, const WlNv2aGxLayout *layout, const uint8_t *faces,
+                              uint8_t *sphere, uint8_t *dst) {
     size_t face_texels = (size_t)t->width * t->height;
-    uint8_t *faces = scratch, *unswizzled = scratch + 6u * face_texels * 4u, *sphere = unswizzled + face_texels * 4u;
     uint32_t size = layout->width, i, j;
 
-    faces_decode(t, src, palette, faces, unswizzled);
     if (layout->spot >= 1 && layout->spot <= 6) {
         // a spot's face, filling the image, its edge texels dark (what a direction off it reads)
         const uint8_t *face = faces + (size_t)(layout->spot - 1u) * face_texels * 4u;
@@ -869,23 +887,46 @@ static bool convert_sphere(const WlNv2aTexture *t, const WlNv2aGxLayout *layout,
         }
         return wl_gxc_encode(WL_GXC_RGBA8, sphere, size, size, dst, layout->image_bytes) != 0;
     }
+    if (!g_plain && pow2(size)) {
+        // A quarter's directions, the other three's by their signs: of a size a power of two, texel
+        // i's a = 2 (i + 1/2) / size - 1 is exact, and texel size - 1 - i's is -a, so its direction
+        // is this one's with x negated, bit for bit (the same for rows and y)
+        uint32_t half = size / 2u;
+
+        for (j = 0; j < half; j++) {
+            for (i = 0; i < half; i++) {
+                float d[3], m[3];
+
+                sphere_direction(((float)i + 0.5f) / (float)size, ((float)j + 0.5f) / (float)size, d, true);
+                sphere_texel(t, faces, d, sphere + ((size_t)j * size + i) * 4u);
+                m[0] = -d[0], m[1] = d[1], m[2] = d[2];
+                sphere_texel(t, faces, m, sphere + ((size_t)j * size + (size - 1u - i)) * 4u);
+                m[1] = -d[1];
+                sphere_texel(t, faces, m, sphere + ((size_t)(size - 1u - j) * size + (size - 1u - i)) * 4u);
+                m[0] = d[0];
+                sphere_texel(t, faces, m, sphere + ((size_t)(size - 1u - j) * size + i) * 4u);
+            }
+        }
+        return wl_gxc_encode(WL_GXC_RGBA8, sphere, size, size, dst, layout->image_bytes) != 0;
+    }
     for (j = 0; j < size; j++) {
         for (i = 0; i < size; i++) {
-            float d[3], s, tt;
-            uint32_t x, y;
-            unsigned face;
+            float d[3];
 
-            wl_nv2a_sphere_direction(((float)i + 0.5f) / (float)size, ((float)j + 0.5f) / (float)size, d);
-            face = cube_face(d, &s, &tt);
-            x = (uint32_t)(s * (float)t->width);
-            y = (uint32_t)(tt * (float)t->height);
-            x = x >= t->width ? t->width - 1u : x;
-            y = y >= t->height ? t->height - 1u : y;
-            memcpy(sphere + ((size_t)j * size + i) * 4u, faces + ((size_t)face * face_texels + (size_t)y * t->width + x) * 4u,
-                   4);
+            sphere_direction(((float)i + 0.5f) / (float)size, ((float)j + 0.5f) / (float)size, d, !g_plain);
+            sphere_texel(t, faces, d, sphere + ((size_t)j * size + i) * 4u);
         }
     }
     return wl_gxc_encode(WL_GXC_RGBA8, sphere, size, size, dst, layout->image_bytes) != 0;
+}
+
+static bool convert_sphere(const WlNv2aTexture *t, const WlNv2aGxLayout *layout, const uint8_t *src,
+                           const uint8_t *palette, uint8_t *dst, uint8_t *scratch) {
+    size_t face_texels = (size_t)t->width * t->height;
+    uint8_t *faces = scratch, *unswizzled = scratch + 6u * face_texels * 4u;
+
+    faces_decode(t, src, palette, faces, unswizzled);
+    return sphere_from_faces(t, layout, faces, unswizzled + face_texels * 4u, dst);
 }
 
 // an A4R4G4B4 level straight to GX's RGBA8 tiles, each channel's four bits doubled (as
@@ -929,6 +970,27 @@ static size_t a4r4g4b4_to_rgba8(const WlNv2aTexture *t, const uint8_t *src, size
     return (size_t)w * h * 4u;
 }
 
+void wl_nv2a_texture_set_plain(bool plain) {
+    g_plain = plain;
+}
+
+// The bytes of an image no conversion writes zeroed: the image's and its alpha's pads to 32 bytes,
+// and a TLUT's past the palette's entries (all of it without a palette). Every level's conversion
+// writes each byte of its GX size (wl/codec's, the tile loops here, wl_gxc_encode).
+static void zero_pads(const WlNv2aGxLayout *layout, uint8_t *dst, bool palette) {
+    size_t image_end = round32(layout->image_bytes);
+
+    memset(dst + layout->image_bytes, 0, image_end - layout->image_bytes);
+    if (layout->alpha_bytes != 0) {
+        memset(dst + image_end + layout->alpha_bytes, 0, round32(layout->alpha_bytes) - layout->alpha_bytes);
+    }
+    if (layout->format == WL_GXC_C8) {
+        size_t from = palette ? 2u * (size_t)layout->tlut_entries : 0u;
+
+        memset(dst + layout->tlut_offset + from, 0, round32(2u * (size_t)layout->tlut_entries) - from);
+    }
+}
+
 bool wl_nv2a_texture_convert(const WlNv2aTexture *t, const WlNv2aGxLayout *layout, const uint8_t *src,
                              const uint8_t *palette, void *dst, void *scratch) {
     FormatInfo info = format_info(t->color);
@@ -939,7 +1001,11 @@ bool wl_nv2a_texture_convert(const WlNv2aTexture *t, const WlNv2aGxLayout *layou
     if (src == NULL || dst == NULL || !info.known) {
         return false;
     }
-    memset(dst, 0, layout->total_bytes);
+    if (g_plain) {
+        memset(dst, 0, layout->total_bytes);
+    } else {
+        zero_pads(layout, dst, palette != NULL);
+    }
     if (layout->sphere) {
         return scratch != NULL && convert_sphere(t, layout, src, palette, out, scratch);
     }
@@ -1020,4 +1086,31 @@ bool wl_nv2a_texture_convert(const WlNv2aTexture *t, const WlNv2aGxLayout *layou
         }
     }
     return true;
+}
+
+bool wl_nv2a_texture_convert_cube(const WlNv2aTexture *t, WlNv2aGxLayout *layout, bool spots, const uint8_t *src,
+                                  const uint8_t *palette, void *dst, void *scratch) {
+    size_t face_texels = (size_t)t->width * t->height;
+    uint8_t *faces = scratch, *unswizzled;
+
+    if (!layout->sphere || g_plain) {
+        // (as before: the faces decoded for the spot's test, and again for the image)
+        if (spots) {
+            wl_nv2a_texture_spot(t, layout, src, palette, scratch);
+        } else {
+            layout->spot = 0;
+        }
+        return wl_nv2a_texture_convert(t, layout, src, palette, dst, scratch);
+    }
+    layout->spot = 0;
+    if (src == NULL || dst == NULL || scratch == NULL || !format_info(t->color).known) {
+        return false;
+    }
+    unswizzled = faces + 6u * face_texels * 4u;
+    faces_decode(t, src, palette, faces, unswizzled);
+    if (spots) {
+        layout->spot = spot_face(t, faces);
+    }
+    zero_pads(layout, dst, palette != NULL);
+    return sphere_from_faces(t, layout, faces, unswizzled + face_texels * 4u, dst);
 }

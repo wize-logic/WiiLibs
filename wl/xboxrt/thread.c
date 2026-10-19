@@ -17,6 +17,7 @@
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/mem_internal.h"
+#include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/thread.h"
 #include "wl/xboxrt/thunk.h"
 
@@ -208,12 +209,22 @@ static void unqueue(WlXbThread *t) {
     }
 }
 
+// A quiet window is its holder's (quiet_arm weighed the ready threads against it): the lock changing
+// hands ends it, and the new holder's first safe point looks (g_m held).
+static void quiet_end(void) {
+    if (g_quiet_armed != 0) {
+        g_quiet_armed = 0;
+        g_xb_attention = 1;
+    }
+}
+
 // Gives the baton away (g_m held; the caller is the holder): to the head of the queue, or to no
 // one. In the deterministic mode no one is the idle thread, which moves the clock on.
 static void hand_off(void) {
     if (g_boosted == g_owner) {
         g_boosted = NULL; // a boost lasts the turn it was given for
     }
+    quiet_end();
     WlXbThread *next = dequeue();
     if (next == NULL && g_det && g_idle != NULL && g_owner != g_idle) {
         next = g_idle;
@@ -234,9 +245,14 @@ static void log_guest_stack(const char *what, const WlXbThread *t, const WlXbThr
 // above, where its own safe points run the interrupts and nothing else runs), its guest return
 // addresses, and where its host thread is (wl_xb_backend_probe). Nothing of this runs before.
 static uint64_t g_svc_wait_max_us; // the service thread's longest wait for the lock (g_m)
+// The title's exit: the service thread's wait for the lock gives up (wl_xb_service_stop_within)
+static volatile bool g_lock_stop;
 static uint32_t g_svc_wait_holder;  // the thread that had the lock when that wait began
 
-static void take(WlXbThread *self) {
+// Takes the lock for `self` (g_m held). A thread's wait is `timeout_ms` at most (WL_WAIT_FOREVER: none;
+// the title's exit bounds the boot thread's), the service thread's until the exit stops it; false
+// when it did not get the lock (out of the queue again).
+static bool take(WlXbThread *self, uint32_t timeout_ms) {
     if (g_owner == NULL && g_ready == NULL) {
         off_end(self, wl_xb_time_us());
         self->io_back = false;
@@ -253,8 +269,33 @@ static void take(WlXbThread *self) {
         uint32_t points0 = g_stats.safe_points, raised0 = g_stats.raised_holds;
         while (g_owner != self) {
             if (!self->is_service) {
-                wl_platform_cond_wait(self->cond, g_m);
+                if (timeout_ms == WL_WAIT_FOREVER) {
+                    wl_platform_cond_wait(self->cond, g_m);
+                    continue;
+                }
+                if (g_owner == NULL) {
+                    // no one to hand it on (the deterministic mode with its idle thread stopped: a
+                    // thread queued while the lock was free waits for a hand-off that never comes)
+                    unqueue(self);
+                    g_owner = self;
+                    break;
+                }
+                uint64_t spent = wl_platform_time_ms() - since;
+                if (spent >= timeout_ms) {
+                    unqueue(self);
+                    return false;
+                }
+                const uint32_t left = (uint32_t)(timeout_ms - spent);
+                wl_platform_cond_wait_timeout(self->cond, g_m, left < 100u ? left : 100u);
                 continue;
+            }
+            if (self->spared) {
+                self->spared = false; // (out of the queue: yield_if_due)
+                return false;
+            }
+            if (g_lock_stop) {
+                unqueue(self);
+                return false;
             }
             wl_platform_cond_wait_timeout(self->cond, g_m, 500);
             uint64_t waited = wl_platform_time_ms() - since;
@@ -288,6 +329,7 @@ static void take(WlXbThread *self) {
         }
     }
     g_quantum_start = wl_xb_time_us();
+    return true;
 }
 
 // The deterministic mode: `self` was handed the baton (it waited for it on its own): it becomes
@@ -308,13 +350,40 @@ static void det_await(WlXbThread *self) {
 }
 
 void wl_xb_lock(WlXbThread *self) {
+    (void)wl_xb_lock_within(self, WL_WAIT_FOREVER);
+}
+
+bool wl_xb_lock_within(WlXbThread *self, uint32_t timeout_ms) {
     self->host_tid = wl_platform_thread_self_id();
     self->host_handle = wl_xb_backend_thread_handle();
     wl_platform_mutex_lock(g_m);
-    take(self);
+    bool took = take(self, timeout_ms);
     wl_platform_mutex_unlock(g_m);
+    if (!took) {
+        return false;
+    }
     g_cur = self;
     wl_xb_cpu_load(&self->cpu);
+    return true;
+}
+
+void wl_xb_thread_lock_stop(bool stop) {
+    wl_platform_mutex_lock(g_m);
+    g_lock_stop = stop;
+    for (WlXbThread *t = g_ready; t != NULL; t = t->next_ready) {
+        if (t->is_service) { // (queued: its wait for the lock looks at the stop now)
+            wl_platform_cond_signal(t->cond);
+        }
+    }
+    wl_platform_mutex_unlock(g_m);
+}
+
+WlXbThread *wl_xb_thread_lock_holder(void) {
+    return g_owner;
+}
+
+WlXbThread *wl_xb_thread_ready_head(void) {
+    return g_ready;
 }
 
 void wl_xb_unlock(WlXbThread *self) {
@@ -403,7 +472,7 @@ bool wl_xb_wait(WlXbThread *self, uint32_t timeout_ms) {
     if (!woke) {
         g_stats.timeouts++;
     }
-    take(self);
+    take(self, WL_WAIT_FOREVER);
     wl_platform_mutex_unlock(g_m);
     g_cur = self;
     wl_xb_cpu_load(&self->cpu);
@@ -452,6 +521,7 @@ static bool irql_raised(const WlXbThread *t) {
 // queued by priority, the holder would otherwise take it back at the next safe point), and waits
 // in the queue for its turn (g_m held; released on return).
 static void give_to(WlXbThread *self, WlXbThread *to) {
+    quiet_end();
     note_ready_wait(to);
     g_boosted = to;
     wl_xb_cpu_save(&self->cpu);
@@ -486,6 +556,24 @@ static bool yield_if_due(WlXbThread *self) {
         // wait for the voice that never ends).
         g_stats.raised_holds++;
         return false;
+    }
+    if (head->is_service && !(g_xb_compat & WL_XB_COMPAT_OLDSERVICE) && !wl_xb_service_wanted()) {
+        // The service thread queued for the lock (an interrupt, a tick, a vertical blank), and the
+        // holder's poll just before has run that work itself: the lock's round trip (two thread
+        // switches, and the service finding nothing to do) is spared. It goes back to its sleep
+        // unqueued; work raised from now on brings it back (or the holder's next poll runs it).
+        wl_platform_mutex_lock(g_m);
+        if (g_ready == head && !wl_xb_service_wanted()) {
+            unqueue(head);
+            head->spared = true;
+            g_stats.service_spared++;
+            wl_platform_cond_signal(head->cond);
+        }
+        wl_platform_mutex_unlock(g_m);
+        head = g_ready;
+        if (head == NULL) {
+            return false;
+        }
     }
     uint64_t now = wl_xb_time_us();
     bool boosted = self == g_boosted && now - g_quantum_start < (uint64_t)g_cfg.quantum_ms * 1000u;
@@ -664,9 +752,35 @@ void wl_xb_yield_point(void) {
 }
 
 void wl_xb_device_safe_point(void) {
+    g_stats.device_points++;
     if (g_det) {
         det_point(g_det_device_ns, true);
         return;
+    }
+    if (g_xb_attention == 0 && g_xb_mmio_last_write == 0 && !(g_xb_compat & WL_XB_COMPAT_OLDDEVPOINT) &&
+        wl_xb_irq_lines() == 0) {
+        // A read raises no device's line, no line is up (one the holder's IRQL kept out goes in at
+        // the first access once it is lowered), and nothing waits (no thread ready, or a quiet window;
+        // new work raises the attention): nothing for the safe point to do, as at a backward jump.
+        g_stats.read_device_points++;
+        return;
+    }
+    if (g_quiet_armed != 0 && g_xb_attention == 0 && !(g_xb_compat & WL_XB_COMPAT_OLDDEVPOINT)) {
+        // A quiet window, the holder's (a hand-off ends it): no ready thread's turn comes before its
+        // end, and new work raises the attention, so the look for a turn (a lock round trip, and one
+        // more to arm the window again) would find none. The access may have raised its device's
+        // line: that alone is looked at, and the whole safe point runs when the poll's work raised
+        // the attention (a thread it woke). Off: a file "olddevpoint" (WL_XB_OLDDEVPOINT).
+        WlXbThread *self = g_cur;
+        if (self == NULL || self->kernel_depth != 0 || self->is_service || wl_xb_in_service() ||
+            self->host_tid != wl_platform_thread_self_id()) {
+            return; // not the holder in guest code (wl_xb_safe_point)
+        }
+        g_stats.quiet_device_points++;
+        wl_xb_service_poll_levels();
+        if (g_xb_attention == 0) {
+            return;
+        }
     }
     wl_xb_safe_point();
 }

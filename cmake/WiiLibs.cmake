@@ -301,6 +301,7 @@ endfunction()
 # variable WL_XBOX_VSH_FORMS names the title's fused forms (the lines xbox_nv2a_replay --fused-forms
 # prints, derived from the title: never commit it): on the Wii each gets one loop that reads the
 # arrays, runs the program and writes GX's words (xbox_vsh_codegen --fused).
+# WL_XBOX_VSH_CODEGEN_FLAGS: more of its options (its --no-* switches: the forms as an older build made them).
 # (a cache entry: a project that adds WiiLibs with add_subdirectory calls the functions below from its
 # own scope, where a plain variable of this directory is not seen)
 set(WL_CMAKE_DIR ${CMAKE_CURRENT_LIST_DIR} CACHE INTERNAL "WiiLibs' cmake directory")
@@ -494,7 +495,7 @@ function(wl_add_xbox_title target)
         endif()
         # (run at every build, the list being the runtime's; the C is replaced only when it changes)
         add_custom_target(${target}_vsh
-            COMMAND ${vsh_tool} --if-exists ${vsh_fused} --accessor wl_xb_title_vsh_natives ${vsh_list}
+            COMMAND ${vsh_tool} --if-exists ${WL_XBOX_VSH_CODEGEN_FLAGS} ${vsh_fused} --accessor wl_xb_title_vsh_natives ${vsh_list}
                 ${vsh_c}.new wl_xb_vsh_natives
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${vsh_c}.new ${vsh_c}
             BYPRODUCTS ${vsh_c}
