@@ -42,17 +42,18 @@ void wl_gx_target_be_copy_begin(void) {
     (void)next_op(WL_HOST_TARGET_COPY_BEGIN);
 }
 
-void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what, bool invalidate) {
+void wl_gx_target_be_copy(void *dst, uint32_t x, uint32_t w, uint32_t h, WlGxTargetCopy what, bool invalidate) {
     (void)invalidate; // (no processor cache to keep in step)
     const WlHostGxRenderer *r = wl_host_gx_renderer();
     WlHostTargetOp *op = next_op(WL_HOST_TARGET_COPY);
     copies++;
     op->what = (uint8_t)what;
+    op->x = (int32_t)x;
     op->w = w;
     op->h = h;
     op->dst = dst;
     if (r != NULL && r->copy != NULL) {
-        r->copy(r->user, 0, 0, w, h, dst,
+        r->copy(r->user, (int)x, 0, w, h, dst,
                 what == WL_GX_TARGET_COPY_Z24X8 ? WL_HOST_GX_COPY_Z24X8
                 : what == WL_GX_TARGET_COPY_RGB565 ? (unsigned)WL_GX_TEX_RGB565
                                                    : (unsigned)WL_GX_TEX_RGBA8,
@@ -91,27 +92,29 @@ void wl_gx_target_be_copy_end(void) {
     (void)next_op(WL_HOST_TARGET_COPY_END);
 }
 
-void wl_gx_target_be_scissor(uint32_t w, uint32_t h) {
+void wl_gx_target_be_scissor(uint32_t x, uint32_t w, uint32_t h) {
     WlHostTargetOp *op = next_op(WL_HOST_TARGET_SCISSOR);
+    op->x = (int32_t)x;
     op->w = w;
     op->h = h;
     // (GX has one scissor: the direct layer's)
-    wl_gx_direct_scissor(0, 0, w, h);
+    wl_gx_direct_scissor(x, 0, w, h);
     wl_gx_invalidate_shadow(); // (as the console's)
 }
 
-void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, uint32_t h, uint32_t back_w,
+void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t x, uint32_t w, uint32_t h, uint32_t back_w,
                              uint32_t back_h) {
     const WlHostGxRenderer *r = wl_host_gx_renderer();
     WlHostTargetOp *op = next_op(WL_HOST_TARGET_RESTORE);
     op->dst = colour;
     op->depth_src = depth;
+    op->x = (int32_t)x;
     op->w = w;
     op->h = h;
     op->back_w = back_w;
     op->back_h = back_h;
     if (r != NULL && r->restore != NULL) {
-        r->restore(r->user, colour, depth, w, h);
+        r->restore(r->user, colour, depth, (int)x, w, h);
     }
     quad_state(back_w, back_h, true, true, depth != NULL, depth != NULL);
 }

@@ -159,6 +159,9 @@ def emu_line(line, immediates):
         return "{ float t; memcpy(&t, %s, 4); f_set(&%s, t); }" % (emu_memory(a[1], immediates), F(a[0]))
     if op == "stfs":
         return "{ uint32_t t = emu_single(%s.a, 0); memcpy(%s, &t, 4); }" % (F(a[0]), emu_memory(a[1], immediates))
+    if op == "stfsx":
+        base = "0" if a[1] == "0" else "(char *)" + emu_gpr(a[1])
+        return "{ uint32_t t = emu_single(%s.a, 0); memcpy((char *)%s + %s, &t, 4); }" % (F(a[0]), base, emu_gpr(a[2]))
     if op == "stfiwx":
         return "memcpy((char *)%s, &%s.i, 4);" % (emu_gpr(a[2]), F(a[0]))
     if op == "lwz" and "%[ptr]" in a[1]:

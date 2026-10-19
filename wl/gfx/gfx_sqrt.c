@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// The correctly rounded square root by integer arithmetic (gfx_sqrt.h's last resort).
+// The correctly rounded square roots by integer arithmetic (gfx_sqrt.h's last resorts).
 #include "wl/gfx/gfx_sqrt.h"
 
 #include <math.h>
@@ -50,4 +50,28 @@ float wl_sqrtf_integer(float value) {
     }
     // (kept is at most 2^24: exact in a float, and the result is never subnormal)
     return ldexpf((float)kept, exponent / 2 - 14 + drop);
+}
+
+// gfx_sqrt.h: every double, scaled into [1, 4) and decided in 128-bit integers
+double wl_sqrt_wide(double x) {
+    if (!(x > 0.0 && x <= 1.7976931348623157e308)) {
+        if (x == 0.0 || x > 0.0) {
+            return x; // zero or +infinity
+        }
+        if (x != x || x < -1.7976931348623157e308) {
+            return x * x + x; // NaN or -infinity
+        }
+        return (x - x) / (x - x);
+    }
+    int scale = 0;
+    if (x < 2.2250738585072014e-308) {
+        x *= 18014398509481984.0; // 2^54
+        scale = -27;
+    }
+    uint64_t bits = wl_double_bits(x);
+    int exponent = (int)(bits >> 52) - 1023;
+    int half = exponent >= 0 ? exponent / 2 : -((1 - exponent) / 2); // (the floor of exponent / 2)
+    double value = wl_bits_double((bits & (((uint64_t)1 << 52) - 1)) | ((uint64_t)(1023 + exponent - 2 * half) << 52));
+    double root = wl_sqrt_refine(value, wl_rsqrt_estimate(value));
+    return root * wl_bits_double((uint64_t)(1023 + half + scale) << 52);
 }

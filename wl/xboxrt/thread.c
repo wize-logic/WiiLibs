@@ -64,6 +64,17 @@ static uint64_t g_det_next_us;          // the holder looks at the clock's event
 static uint32_t g_det_backedge_ns, g_det_call_ns, g_det_device_ns;
 static WlXbThread *volatile g_idle;     // the idle thread (the service thread)
 
+// Quiet safe points (thread.h, wl_xb_thread_set_quiet_points): a window armed by a safe point that
+// found only threads whose turn cannot come before g_quiet_until (microseconds of wl_xb_time_us,
+// its low 32 bits); the service thread raises the attention when it ends (wl_xb_thread_quiet_due).
+#define QUIET_MAX_US 100000u // a window ends within this whatever the deadlines (the service looks again)
+#define QUIET_MIN_US 200u    // a deadline closer than this: no window (the safe points look as before)
+#define QUIET_SERVICE_US 50000u // no window unless the service thread looked this lately (it ends them)
+static bool g_quiet_on = true;
+static volatile uint32_t g_quiet_armed;
+static volatile uint32_t g_quiet_until;
+static volatile uint32_t g_quiet_seen; // the service thread's last round (us, low 32 bits; 0: none yet)
+
 static void census_threads(void *user, WlMemCensusReport *out);
 
 void wl_xb_thread_config_default(WlXbThreadConfig *cfg) {
@@ -547,6 +558,60 @@ static bool yield_if_due(WlXbThread *self) {
     return false;
 }
 
+// The holder's safe point found threads ready and gave none of them the lock. When none can have it
+// before a time named now (none outranks the holder, none is the service thread or back from the
+// card, and the quantum's end and the waiters' starvation are that far off), the attention stays
+// down until then instead of every backward jump looking again (an emulated thread spends a third
+// of its back edges' cost so in Dolphin): any new work raises it as before (a thread queued, an
+// interrupt, a tick due), and the service thread raises it when the window ends, at its next round
+// (a millisecond late at most). true when a window was armed.
+static bool quiet_arm(WlXbThread *self) {
+    if (!g_quiet_on || self == NULL) {
+        return false;
+    }
+    const uint64_t now = wl_xb_time_us();
+    uint32_t seen = g_quiet_seen;
+    if (seen == 0 || (uint32_t)now - seen > QUIET_SERVICE_US) {
+        return false; // no service thread going round to end the window (not started, or stopped)
+    }
+    const uint64_t quantum_us = (uint64_t)g_cfg.quantum_ms * 1000u;
+    uint64_t starve_us = (uint64_t)g_cfg.starve_ms * 1000u;
+    if (g_preempt && starve_us > quantum_us) {
+        starve_us = quantum_us;
+    }
+    uint64_t until = now + QUIET_MAX_US;
+    if (self == g_boosted && g_quantum_start + quantum_us < until) {
+        until = g_quantum_start + quantum_us; // the boost's end (yield_if_due)
+    }
+    bool quiet = true;
+    wl_platform_mutex_lock(g_m);
+    for (const WlXbThread *t = g_ready; t != NULL; t = t->next_ready) {
+        if (t->is_service || t->priority > self->priority || (g_preempt && t->io_back)) {
+            quiet = false; // its turn comes at the next safe point the holder's IRQL lets it
+            break;
+        }
+        uint64_t due = until;
+        if (t->priority == self->priority) {
+            due = g_quantum_start + quantum_us; // a tie: the holder's quantum's end
+            if (g_preempt && t->ready_since_us + quantum_us < due) {
+                due = t->ready_since_us + quantum_us; // ...or the waiter's own quantum's wait
+            }
+        }
+        if (starve_us != 0 && t->ready_since_us + starve_us < due) {
+            due = t->ready_since_us + starve_us;
+        }
+        until = due < until ? due : until;
+    }
+    quiet = quiet && until >= now + QUIET_MIN_US;
+    if (quiet) {
+        g_quiet_until = (uint32_t)until;
+        __atomic_store_n(&g_quiet_armed, 1u, __ATOMIC_RELEASE);
+        g_stats.quiet_windows++;
+    }
+    wl_platform_mutex_unlock(g_m);
+    return quiet;
+}
+
 // The deterministic mode: the clock's events whose time has come (the service's, the waits'
 // timeouts, KeTickCount's next millisecond) are marked due; the next one is remembered.
 static void det_events(uint64_t now) {
@@ -681,9 +746,29 @@ void wl_xb_safe_point(void) {
     if (yield_if_due(self)) {
         g_stats.safe_yields++;
     }
-    if (g_ready != NULL) {
+    if (g_ready != NULL && !quiet_arm(g_cur)) {
         g_xb_attention = 1; // a thread of equal priority still waits for the quantum's end
     }
+}
+
+void wl_xb_thread_set_quiet_points(bool on) {
+    g_quiet_on = on;
+    if (!on && g_quiet_armed != 0) {
+        g_quiet_armed = 0;
+        g_xb_attention = 1;
+    }
+}
+
+void wl_xb_thread_quiet_due(uint64_t now_us) {
+    g_quiet_seen = (uint32_t)now_us | 1u;
+    if (__atomic_load_n(&g_quiet_armed, __ATOMIC_ACQUIRE) != 0 && (int32_t)((uint32_t)now_us - g_quiet_until) >= 0) {
+        g_quiet_armed = 0;
+        g_xb_attention = 1;
+    }
+}
+
+bool wl_xb_lock_wanted(void) {
+    return g_xb_attention != 0 || (g_quiet_armed != 0 && g_ready != NULL);
 }
 
 void wl_xb_yield(void) {
@@ -1247,6 +1332,9 @@ void wl_xb_thread_set_priority(WlXbThread *t, int priority) {
         priority = 31;
     }
     wl_platform_mutex_lock(g_m);
+    if (t == g_cur && priority < t->priority) {
+        g_xb_attention = 1; // the holder lowered itself: a ready thread may outrank it now, with no enqueue to say so
+    }
     t->priority = priority;
     if (t->ready) {
         unqueue(t); // queued again at its new priority (a thread made and then given its priority)

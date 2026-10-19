@@ -430,12 +430,115 @@ TEST fused_lit_form_sends_the_normal(void) {
     PASS();
 }
 
+// the program to the screen (e53b834b, its clip-space position captured) and its form of perspective
+// (perspective 1) or of the screen (0)
+static const WlXboxVshFusedForm *screen_form(unsigned perspective, const WlXboxVshNative **native) {
+    unsigned long i, f;
+
+    for (i = 0; i < test_vsh_fused_natives_count; i++) {
+        if (test_vsh_fused_natives[i].hash == 0xe53b834bUL) {
+            *native = &test_vsh_fused_natives[i];
+            for (f = 0; f < test_vsh_fused_natives[i].fused_count; f++) {
+                if (test_vsh_fused_natives[i].fused[f].key.perspective == perspective) {
+                    return &test_vsh_fused_natives[i].fused[f];
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+// the screen program's forms for a target of 2 x 4 samples a pixel: the runtime gives the viewport's
+// scale and offset already times 1 / the samples (nv2a_gx.c's fused pack), so the perspective form's
+// x w and y w are positions_pack's ((clip scale + offset w) / samples + w / 2) to the bit, scaled once
+// (not again by 1 / the samples, which a target of one sample a pixel cannot tell), and the screen
+// form's x and y are (position / samples + 1/2)
+TEST fused_forms_scale_by_the_samples_once(void) {
+    static float constants[192][4];
+    static WlXboxVshFused fused;
+    static unsigned char positions[VERTICES * 12];
+    static uint32_t elements[VERTICES], clipped[VERTICES][4], screen[VERTICES][4];
+    static uint32_t *words_made[VERTICES];
+    static const float scale[2] = {320.0f, -240.0f}, offset[2] = {320.5f, 240.25f}, to[2] = {0.5f, 0.25f};
+    const WlXboxVshNative *native = NULL;
+    const WlXboxVshFusedForm *form = screen_form(1, &native), *plain = screen_form(0, &native);
+    unsigned v, r, c;
+
+    ASSERT(form != NULL);
+    ASSERT(plain != NULL);
+    ASSERT(native != NULL);
+    for (r = 0; r < 192; r++) {
+        for (c = 0; c < 4; c++) {
+            constants[r][c] = random_component();
+        }
+    }
+    memset(&fused, 0, sizeof fused);
+    for (c = 0; c < 2; c++) {
+        fused.pack[WL_XBOX_VSH_FUSED_SCALE + c] = scale[c] * to[c];
+        fused.pack[WL_XBOX_VSH_FUSED_OFFSET + c] = offset[c] * to[c];
+        fused.pack[WL_XBOX_VSH_FUSED_TO_SAMPLES + c] = to[c];
+        fused.pack[WL_XBOX_VSH_FUSED_HALF + c] = 0.5f;
+        fused.pack[WL_XBOX_VSH_FUSED_ONES + c] = 1.0f;
+    }
+    fused.pack[WL_XBOX_VSH_FUSED_DEPTH] = fused.pack[WL_XBOX_VSH_FUSED_DEPTH + 1] = 1.0f;
+    fused.data[0] = positions;
+    fused.stride[0] = 12;
+    fused.elements = elements;
+    fused.words = words_made;
+    for (v = 0; v < VERTICES; v++) {
+        for (r = 0; r < 3; r++) {
+            put_le_float(&positions[12 * v + 4 * r], random_component());
+        }
+        elements[v] = v;
+    }
+    for (r = 0; r < 2; r++) {
+        for (v = 0; v < 16; v++) {
+            fused.inputs[r][v][3] = 1.0f;
+        }
+    }
+    for (v = 0; v < VERTICES; v++) {
+        words_made[v] = clipped[v];
+    }
+    form->run((const float (*)[4])constants, &fused, VERTICES, form->key.live);
+    for (v = 0; v < VERTICES; v++) {
+        words_made[v] = screen[v];
+    }
+    plain->run((const float (*)[4])constants, &fused, VERTICES, plain->key.live);
+    for (v = 0; v < VERTICES; v++) {
+        float inputs[16][4];
+        WlXboxVshOutput out;
+
+        memset(inputs, 0, sizeof inputs);
+        memset(&out, 0, sizeof out);
+        for (r = 0; r < 16; r++) {
+            inputs[r][3] = 1.0f;
+        }
+        for (r = 0; r < 3; r++) {
+            inputs[0][r] = get_le_float(&positions[12 * v + 4 * r]);
+        }
+        native->run((const float (*)[4])constants, (const float (*)[4])inputs, &out, WL_XBOX_VSH_LIVE_POSITION);
+        ASSERT_EQ(1, out.clip_captured);
+        for (c = 0; c < 2; c++) {
+            // (each step rounded as a float, as positions_pack's: volatile against a fused multiply-add)
+            volatile float cw = out.clip[3], product = out.clip[c] * scale[c], moved = offset[c] * cw;
+            volatile float sum = product + moved, samples = sum * to[c], half = 0.5f * cw;
+            volatile float position = out.position[c] * to[c];
+
+            ASSERT_EQ(float_bits(samples + half), clipped[v][c]);
+            ASSERT_EQ(float_bits(position + 0.5f), screen[v][c]);
+        }
+        ASSERT_EQ(float_bits(-out.clip[3]), clipped[v][2]);
+    }
+    PASS();
+}
+
 // a form's text read back the same: interleaved arrays ("I"), projected stages ("G", "H"), sphere maps
 // GX makes ("U") and shorts as they are ("SK")
 TEST fused_form_text_round_trips(void) {
     static const char *const texts[] = {"23 p 1 1I 0G,1P 0:UB.3,8:SK.1,9:UB.3",
                                         "1e7 p 2 3LI 2H,0P,1P,3S 0:F3,1:CMP,4:S1.2,5:UB.2,6:SK.4",
-                                        "1e7 x 2 3LI 0P,1U,3U 0:F3,1:CMP,4:S1.2"};
+                                        "1e7 x 2 3LI 0P,1U,3U 0:F3,1:CMP,4:S1.2",
+                                        "106 w 2 3I 0M,1M,2M,3U 0:F3,1:CMP,4:S1.2"};
     WlXboxVshFusedKey key;
     char text[200];
     unsigned n;
@@ -449,6 +552,8 @@ TEST fused_form_text_round_trips(void) {
     ASSERT(wl_xbox_vsh_fused_parse(texts[0], &key) > 0);
     ASSERT_EQ(WL_XBOX_VSH_FUSED_STAGE_PROJECTED, key.stages[0] >> 2);
     ASSERT_EQ(WL_XBOX_VSH_FUSED_S32K, key.format[8]);
+    ASSERT(wl_xbox_vsh_fused_parse(texts[3], &key) > 0);
+    ASSERT_EQ(WL_XBOX_VSH_FUSED_STAGE_INPUT, key.stages[1] >> 2);
     PASS();
 }
 
@@ -457,6 +562,7 @@ SUITE(xbox_vsh_fused) {
     RUN_TEST(fused_sphere_stage_is_close_to_the_general_path);
     RUN_TEST(fused_blend_kept_from_the_vertex_before_is_the_same);
     RUN_TEST(fused_lit_form_sends_the_normal);
+    RUN_TEST(fused_forms_scale_by_the_samples_once);
 }
 
 GREATEST_MAIN_DEFS();

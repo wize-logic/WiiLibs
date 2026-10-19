@@ -171,6 +171,48 @@ TEST cvt_si32(void) {
     PASS();
 }
 
+// fist and frndint: the integer path for values under 2^30 against the libm path, every rounding mode and
+// width, at the halves, the integers beside them, the ends of the fast range and random values of every size
+TEST fist_and_frndint_match_the_wide_path(void) {
+    static const double edge[] = {0.0, -0.0, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 0.49999999999999994, 32767.5,
+                                  -32768.5, 32768.0, -32769.0, 1073741823.5, -1073741823.5, 1073741824.0,
+                                  -1073741824.0, 2147483647.5, -2147483648.5, 4.6e18, -9.3e18, INFINITY, NAN};
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    unsigned long differ = 0;
+    for (int i = 0; i < 400000; i++) {
+        double v;
+        if (i < (int)(sizeof edge / sizeof edge[0])) {
+            v = edge[i];
+        } else {
+            rng ^= rng << 13, rng ^= rng >> 7, rng ^= rng << 17;
+            v = ldexp((double)(int64_t)(rng >> 11) / 9007199254740992.0, (int)(rng % 40)); // |v| < 2^40
+            if (i % 3 == 0) {
+                v = floor(v * 2.0) / 2.0; // a half or an integer
+            }
+            if (i % 5 == 0) {
+                v = -v;
+            }
+        }
+        for (uint16_t mode = 0; mode < 4; mode++) {
+            uint16_t cw = (uint16_t)(0x037F | mode << 10);
+            for (unsigned bits = 16; bits <= 64; bits *= 2) {
+                if (recomp_fist(v, cw, bits) != recomp_fist_wide(v, cw, bits)) {
+                    differ++;
+                }
+            }
+            double a = recomp_frndint(v, cw), b = recomp_frndint_wide(v, cw);
+            if (memcmp(&a, &b, sizeof a) != 0 && !(a != a && b != b)) {
+                differ++;
+            }
+        }
+    }
+    ASSERT_EQ_FMT(0ul, differ, "%lu");
+    ASSERT_EQ(-3, recomp_fist(-2.5, 0x077F, 32)); // down
+    ASSERT_EQ(-2, recomp_fist(-2.5, 0x037F, 32)); // nearest, even
+    ASSERT_EQ(-32768, recomp_fist(32768.0, 0x0F7F, 16)); // out of range: the indefinite
+    PASS();
+}
+
 TEST extended_80bit(void) {
     guest_reset();
     recomp_st80(0x800, 1.0);
@@ -292,6 +334,7 @@ SUITE(recomp_header) {
     RUN_TEST(simd_lanes_overlay_as_on_x86);
     RUN_TEST(shufps_then_movhps);
     RUN_TEST(cvt_si32);
+    RUN_TEST(fist_and_frndint_match_the_wide_path);
     RUN_TEST(extended_80bit);
     RUN_TEST(fp_pc24_matches_the_slow_path);
     RUN_TEST(fp_pc24_slow_path_keeps_registers);

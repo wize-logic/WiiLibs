@@ -210,7 +210,12 @@ void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetch
 // dcbt (a hint: no fault on an address not mapped, and no change to what is read). PowerPC only; the
 // host's build has none of it. wl_nv2a_set_prefetch(false) (the title folder's file "noprefetch",
 // the replay's --no-prefetch) leaves them out, for an A/B on the console.
-#if defined(__powerpc__) || defined(__PPC__)
+#if defined(WL_NV2A_PREFETCH_RECORD)
+// (a test's build of nv2a_gx.c: each line asked for handed to the test, test_xbox_nv2a_prefetch)
+#define WL_NV2A_PREFETCHES 1
+void wl_nv2a_prefetch_record(const void *p);
+#define WL_NV2A_PREFETCH(p) wl_nv2a_prefetch_record((const void *)(p))
+#elif defined(__powerpc__) || defined(__PPC__)
 #define WL_NV2A_PREFETCHES 1
 // (in asm: GCC removes a loop of __builtin_prefetch alone as having no effect)
 #define WL_NV2A_PREFETCH(p) __asm__ volatile("dcbt 0,%0" : : "r"((const void *)(p)))

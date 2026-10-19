@@ -23,6 +23,8 @@ static WlGxVtxDesc g_descriptor[WL_GX_VA_ATTRIBUTES + 1];
 static unsigned g_descriptor_count;
 static void (*g_hook)(void *user, WlGxDirectPrim prim, const WlGxDirectVertex *vertices, uint32_t count);
 static void *g_hook_user;
+// bit n: array n's elements are the processor's words (wl_gx_direct_array_words), not GX's bytes
+static uint16_t g_array_words;
 
 const WlHostGxDirect *wl_host_gx_direct(void) {
     return &s;
@@ -31,6 +33,7 @@ const WlHostGxDirect *wl_host_gx_direct(void) {
 void wl_host_gx_direct_reset(void) {
     memset(&s, 0, sizeof s);
     memset(g_format_bytes, 0, sizeof g_format_bytes);
+    g_array_words = 0;
     g_flush_due = g_layout_known = false;
     g_descriptor_count = 0;
 }
@@ -224,12 +227,13 @@ static uint32_t wire_bytes(const WlGxDirectLayout *layout, bool *describable, ui
         projected += (layout->texcoords_projected >> n) & 1u;
     }
     // (a lit layout's normal and the projected coordinates: no more than the normal, binormal and
-    // tangent hold, the normal not indexed beside projected ones; a sphere map's a projected one)
+    // tangent hold, at one index when indexed; a sphere map's a projected one)
     *describable = (layout->texcoords_sphere & (uint8_t)~layout->texcoords_projected) == 0 &&
-                   !(layout->lit && projected != 0 && (layout->indexed & (1u << WL_GX_DIRECT_ARRAY_NORMAL))) &&
                    projected + (layout->lit ? 1u : 0u) <= WL_GX_DIRECT_PROJECTED;
     projected += layout->lit && projected != 0 ? 1u : 0u;
-    if (projected == 1u) {
+    if (projected != 0u && WL_WIRE_INDEXED(WL_GX_DIRECT_ARRAY_NORMAL)) {
+        bytes += 2u;
+    } else if (projected == 1u) {
         bytes += 12u;
     } else if (projected > 1u) {
         bytes += 36u;
@@ -349,6 +353,14 @@ void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride) {
     if (attribute < 12u) {
         s.arrays[attribute] = data;
         s.array_strides[attribute] = stride;
+        g_array_words &= (uint16_t)~(1u << attribute);
+    }
+}
+
+void wl_gx_direct_array_words(unsigned attribute, const void *data, uint32_t stride) {
+    wl_gx_direct_array(attribute, data, stride);
+    if (attribute < 12u) {
+        g_array_words |= (uint16_t)(1u << attribute);
     }
 }
 
@@ -358,6 +370,17 @@ static float be_float(const uint8_t *p) {
 
     memcpy(&f, &bits, sizeof f);
     return f;
+}
+
+// float k of an indexed attribute's element: GX's big-endian bytes, or the processor's word
+static float element_float(unsigned attribute, const uint8_t *e, unsigned k) {
+    float f;
+
+    if (g_array_words & (1u << attribute)) {
+        memcpy(&f, e + 4u * k, sizeof f);
+        return f;
+    }
+    return be_float(e + 4u * k);
 }
 
 // an indexed attribute's element, or NULL when its array was not set
@@ -384,31 +407,72 @@ void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t c
     }
     if (s.layout.indexed & (1u << WL_GX_DIRECT_ARRAY_POSITION)) {
         if ((e = element(WL_GX_DIRECT_ARRAY_POSITION, index)) != NULL) {
-            v.position[0] = be_float(e);
-            v.position[1] = be_float(e + 4);
-            v.position[2] = be_float(e + 8);
+            v.position[0] = element_float(WL_GX_DIRECT_ARRAY_POSITION, e, 0);
+            v.position[1] = element_float(WL_GX_DIRECT_ARRAY_POSITION, e, 1);
+            v.position[2] = element_float(WL_GX_DIRECT_ARRAY_POSITION, e, 2);
         }
     } else {
         for (n = 0; n < 3 && i < count; n++) {
             memcpy(&v.position[n], &words[i++], sizeof(float));
         }
     }
-    if (s.layout.lit && (s.layout.indexed & (1u << WL_GX_DIRECT_ARRAY_NORMAL))) {
+    if ((s.layout.lit || s.layout.texcoords_projected) && (s.layout.indexed & (1u << WL_GX_DIRECT_ARRAY_NORMAL))) {
+        // (the normal, or the normal, binormal and tangent, at one index: a lit layout's normal first,
+        // then each projected coordinate's s, t, q)
         if ((e = element(WL_GX_DIRECT_ARRAY_NORMAL, index)) != NULL) {
-            v.normal[0] = be_float(e);
-            v.normal[1] = be_float(e + 4);
-            v.normal[2] = be_float(e + 8);
+            unsigned k = 0;
+
+            if (s.layout.lit) {
+                for (k = 0; k < 3u; k++) {
+                    v.normal[k] = element_float(WL_GX_DIRECT_ARRAY_NORMAL, e, k);
+                }
+            }
+            for (n = 0; n < 8; n++) {
+                if (s.layout.texcoords_projected & (1u << n)) {
+                    v.texcoord[n][0] = element_float(WL_GX_DIRECT_ARRAY_NORMAL, e, k);
+                    v.texcoord[n][1] = element_float(WL_GX_DIRECT_ARRAY_NORMAL, e, k + 1u);
+                    v.texcoord_q[n] = element_float(WL_GX_DIRECT_ARRAY_NORMAL, e, k + 2u);
+                    k += 3u;
+                }
+            }
         }
-    } else if (s.layout.lit) {
-        for (n = 0; n < 3 && i < count; n++) {
-            memcpy(&v.normal[n], &words[i++], sizeof(float));
+    } else {
+        unsigned projected = 0;
+
+        if (s.layout.lit) {
+            for (n = 0; n < 3 && i < count; n++) {
+                memcpy(&v.normal[n], &words[i++], sizeof(float));
+            }
+            projected = 1u;
+        }
+        // (projected coordinates sent: their (s, t, q) as the normal, or normal, binormal and tangent)
+        for (n = 0; n < 8 && s.layout.texcoords_projected != 0; n++) {
+            if ((s.layout.texcoords_projected & (1u << n)) && i + 3u <= count) {
+                memcpy(&v.texcoord[n][0], &words[i], sizeof(float));
+                memcpy(&v.texcoord[n][1], &words[i + 1u], sizeof(float));
+                memcpy(&v.texcoord_q[n], &words[i + 2u], sizeof(float));
+                i += 3u;
+                projected++;
+            }
+        }
+        for (; s.layout.texcoords_projected != 0 && projected > 1u && projected < 3u; projected++) {
+            i += 3u;
         }
     }
     for (n = 0; n < s.layout.colors && n < 2; n++) {
         if (s.layout.colors_register & (1u << n)) {
             memcpy(v.color[n], g_material[n], 4);
         } else if (s.layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_COLOR0 + n))) {
-            if ((e = element(WL_GX_DIRECT_ARRAY_COLOR0 + n, index)) != NULL) {
+            if ((e = element(WL_GX_DIRECT_ARRAY_COLOR0 + n, index)) != NULL &&
+                (g_array_words & (1u << (WL_GX_DIRECT_ARRAY_COLOR0 + n)))) {
+                uint32_t word;
+
+                memcpy(&word, e, sizeof word);
+                v.color[n][0] = (uint8_t)(word >> 24);
+                v.color[n][1] = (uint8_t)(word >> 16);
+                v.color[n][2] = (uint8_t)(word >> 8);
+                v.color[n][3] = (uint8_t)word;
+            } else if (e != NULL) {
                 memcpy(v.color[n], e, 4);
             }
         } else if (i < count) {
@@ -427,8 +491,8 @@ void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t c
         }
         if (s.layout.indexed & (1u << (WL_GX_DIRECT_ARRAY_TEXCOORD0 + n))) {
             if ((e = element(WL_GX_DIRECT_ARRAY_TEXCOORD0 + n, index)) != NULL) {
-                v.texcoord[n][0] = be_float(e);
-                v.texcoord[n][1] = one ? 0.0f : be_float(e + 4);
+                v.texcoord[n][0] = element_float(WL_GX_DIRECT_ARRAY_TEXCOORD0 + n, e, 0);
+                v.texcoord[n][1] = one ? 0.0f : element_float(WL_GX_DIRECT_ARRAY_TEXCOORD0 + n, e, 1);
             }
             continue;
         }

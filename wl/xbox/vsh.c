@@ -382,6 +382,7 @@ void wl_xbox_vsh_compile(const uint32_t *instructions, unsigned long instruction
     memset(&program->light, 0, sizeof program->light);
     steps_make(program);
     wl_xbox_vsh_light_shape(program, &program->light);
+    wl_xbox_vsh_world_position(program, &program->world);
     program->native = NULL;
     program->native_colors = NULL;
     program->native_positions = NULL;
@@ -1454,6 +1455,72 @@ int wl_xbox_vsh_run_positions(const WlXboxVshProgram *program, const float (*con
     return 1;
 }
 
+/* ---------- the clip-space position's shape (wl_xbox_vsh_world_position) */
+
+/* the last instruction before `before` that writes the position's component
+(-1: none) */
+static long world_writer(const WlXboxVshProgram *program, long before, unsigned component) {
+    long index;
+
+    for (index = before - 1; index >= 0; index--) {
+        const WlXboxVshInstruction *in = &program->instructions[index];
+
+        if (in->output_is_register && in->output_address == _output_position && (in->output_mask & (8u >> component)) &&
+            (in->output_from_ilu ? in->ilu : in->mac) != 0)
+            return index;
+    }
+    return -1;
+}
+
+int wl_xbox_vsh_world_position(const WlXboxVshProgram *program, WlXboxVshWorldPosition *world) {
+    long capture = -1, first = (long)program->count, index;
+    unsigned c, j;
+
+    memset(world, 0, sizeof(*world));
+    for (index = 0; index < (long)program->count && capture < 0; index++)
+        if (program->instructions[index].captures_clip)
+            capture = index;
+    if (capture < 0)
+        return 0;
+    for (c = 0; c < 4; c++) {
+        long at = world_writer(program, capture, c);
+        const WlXboxVshInstruction *in;
+        const WlXboxVshOperand *r, *k;
+
+        if (at < 0)
+            return 0;
+        in = &program->instructions[at];
+        r = &in->operands[0];
+        k = &in->operands[1];
+        if (in->output_from_ilu || in->mac != _mac_dph || in->relative || r->mux != _mux_temporary || r->negate ||
+            r->index >= 12 || k->mux != _mux_constant || k->negate || (c != 0 && r->index != world->temporary))
+            return 0;
+        for (j = 0; j < 4; j++)
+            if ((j < 3 && r->swizzle[j] != j) || k->swizzle[j] != j)
+                return 0;
+        world->temporary = r->index;
+        world->constant[c] = in->constant;
+        first = at < first ? at : first;
+    }
+    /* (the temporary's x, y and z the same from the first dph to the capture, and to the end) */
+    world->to_end = 1;
+    for (index = first; index < (long)program->count; index++) {
+        const WlXboxVshInstruction *in = &program->instructions[index];
+
+        if ((in->mac != _mac_nop && in->mac != _mac_arl && (in->mac_mask & 0xEu) && in->temporary == world->temporary) ||
+            (in->ilu != _ilu_nop && (in->ilu_mask & 0xEu) &&
+             (in->mac != _mac_nop ? 1u : in->temporary) == world->temporary)) {
+            if (index <= capture) {
+                memset(world, 0, sizeof(*world));
+                return 0;
+            }
+            world->to_end = 0;
+        }
+    }
+    world->found = 1;
+    return 1;
+}
+
 /* ---------- d0's light shape (wl_xbox_vsh_light_shape)
 
 A walk back from the instructions that write d0's r, g and b through the
@@ -1720,7 +1787,7 @@ void wl_xbox_vsh_light_unlit(const WlXboxVshProgram *program, WlXboxVshProgram *
 
 /* ---------- fused forms as text */
 
-static const char g_fused_kinds[] = "NLPQSGHU";
+static const char g_fused_kinds[] = "NLPQSGHUM";
 
 static const char *fused_format_name(unsigned format, char name[8]) {
     static const char *const names[] = {"-", "F1", "F2", "F3", "F4", "D3D", "CMP"};
@@ -1735,20 +1802,74 @@ static const char *fused_format_name(unsigned format, char name[8]) {
     return name;
 }
 
+int wl_xbox_vsh_texgen_source(const WlXboxVshDependencies *dependencies, const WlXboxVshFusedKey *key,
+                              unsigned stage) {
+    unsigned long all = dependencies->t[stage & 3u][0] | dependencies->t[stage & 3u][1];
+    unsigned format;
+    int r = 0;
+
+    all &= ~(unsigned long)WL_XBOX_VSH_READS_CONSTANT;
+    if ((all & WL_XBOX_VSH_NOT_AFFINE) || (all & 0xFFFFu) == 0 || (all & (all - 1u)) != 0)
+        return -1;
+    while (!(all & 1u)) {
+        all >>= 1;
+        r++;
+    }
+    /* (a register of the form's arrays, of one or two components: (s, t) as GX takes them, w 1) */
+    format = key->format[r];
+    if (r == 0 || format == WL_XBOX_VSH_FUSED_NONE ||
+        !(format == WL_XBOX_VSH_FUSED_F1 || format == WL_XBOX_VSH_FUSED_F2 ||
+          (format >= WL_XBOX_VSH_FUSED_S1 && format < WL_XBOX_VSH_FUSED_S1 + 2u) ||
+          (format >= WL_XBOX_VSH_FUSED_UB && format < WL_XBOX_VSH_FUSED_UB + 2u) ||
+          (format >= WL_XBOX_VSH_FUSED_S32K && format < WL_XBOX_VSH_FUSED_S32K + 2u)))
+        return -1;
+    return r;
+}
+
+int wl_xbox_vsh_live_constants(const WlXboxVshProgram *program, unsigned live, unsigned char *registers, int most) {
+    unsigned char seen[WL_XBOX_VSH_CONSTANT_COUNT] = {0};
+    unsigned long index;
+    int count = 0, which;
+
+    for (index = 0; index < program->count; index++) {
+        const WlXboxVshStep *step = &program->steps[index];
+
+        if (!(step->reaches & live))
+            continue;
+        for (which = 0; which < 3; which++) {
+            unsigned file = step->operands[which].file & ~(unsigned)WL_XBOX_VSH_NEGATE, n = step->operands[which].index;
+
+            if (file == WL_XBOX_VSH_FILE_RELATIVE)
+                return -1;
+            if (file != WL_XBOX_VSH_FILE_CONSTANT || n >= WL_XBOX_VSH_CONSTANT_COUNT || seen[n])
+                continue;
+            if (count >= most)
+                return -1;
+            seen[n] = 1;
+            registers[count++] = (unsigned char)n;
+        }
+    }
+    return count;
+}
+
 int wl_xbox_vsh_fused_text(const WlXboxVshFusedKey *key, char *text, unsigned long size) {
     char stages[32] = "-", formats[160] = "-", name[8];
     unsigned n, at = 0;
 
     for (n = 0; n < key->stage_count && n < 4; n++)
         at += (unsigned)snprintf(stages + at, sizeof(stages) - at, "%s%u%c", n ? "," : "", key->stages[n] & 3u,
-                                 g_fused_kinds[(key->stages[n] >> 2) % 8u]);
+                                 g_fused_kinds[(key->stages[n] >> 2) % 9u]);
     at = 0;
     for (n = 0; n < 16; n++)
         if (key->format[n] != WL_XBOX_VSH_FUSED_NONE)
             at += (unsigned)snprintf(formats + at, sizeof(formats) - at, "%s%u:%s", at ? "," : "", n,
                                      fused_format_name(key->format[n] % WL_XBOX_VSH_FUSED_FORMATS, name));
     return snprintf(text, size, "%x %c %u %u%s%s %s %s", key->live,
-                    key->perspective == WL_XBOX_VSH_FUSED_XF ? 'x' : key->perspective ? 'p' : 'o', key->colors,
+                    key->perspective == WL_XBOX_VSH_FUSED_WORLD ? 'w'
+                    : key->perspective == WL_XBOX_VSH_FUSED_XF  ? 'x'
+                    : key->perspective                          ? 'p'
+                                                                : 'o',
+                    key->colors,
                     key->channels, key->lit ? "L" : "", key->interleaved ? "I" : "", stages, formats);
 }
 
@@ -1783,10 +1904,10 @@ int wl_xbox_vsh_fused_parse(const char *text, WlXboxVshFusedKey *key) {
     char name[8];
 
     memset(key, 0, sizeof(*key));
-    if (!fused_number(&p, 16, &live) || live > 0xFFFFu || p[0] != ' ' || (p[1] != 'p' && p[1] != 'o' && p[1] != 'x'))
+    if (!fused_number(&p, 16, &live) || live > 0xFFFFu || p[0] != ' ' || (p[1] != 'p' && p[1] != 'o' && p[1] != 'x' && p[1] != 'w'))
         return 0;
     key->live = (unsigned short)live;
-    key->perspective = p[1] == 'x' ? WL_XBOX_VSH_FUSED_XF : p[1] == 'p';
+    key->perspective = p[1] == 'w' ? WL_XBOX_VSH_FUSED_WORLD : p[1] == 'x' ? WL_XBOX_VSH_FUSED_XF : p[1] == 'p';
     p += 2;
     if (!fused_number(&p, 10, &colors) || colors > 2 || !fused_number(&p, 10, &channels) || channels > 3)
         return 0;

@@ -71,6 +71,15 @@ extern uint32_t g_xb_pg_frames; // frames in the pool; 0: paging is off (the OS 
 extern uint32_t *g_xb_pg_wgen;  // [ram pages]
 extern uint32_t g_xb_pg_epoch;
 #define WL_XB_PG_EPOCH_WINDOW 0x40000000u
+// The look's summaries (wl_xb_pg_written): for each run of 16 pages, an epoch no older than any of
+// their write epochs (the last sighting among them), so a run with nothing newer than a stamp is
+// one load; and a bit for each page that has a mapping through which a store may pass unseen until
+// the backend is asked (wl_xb_mmu_look: the Wii's PTEs, the host's pages open for writing), set by
+// the backend as it maps the page (wl_xb_pg_opened) and cleared by the look once none is left. A
+// page without the bit faults at its next touch, so its write epoch is all a look needs.
+#define WL_XB_PG_WSUM_SHIFT 4u     // (16 pages a summary word)
+extern uint32_t *g_xb_pg_wsum; // [ram pages >> WL_XB_PG_WSUM_SHIFT, rounded up]
+extern uint32_t *g_xb_pg_open; // [(ram pages + 31) / 32] bit p % 32 of word p / 32
 
 // Page `p` was seen written (exception-safe; the MMU lock or exception context).
 static inline void wl_xb_pg_wrote(uint32_t p) {
@@ -78,6 +87,15 @@ static inline void wl_xb_pg_wrote(uint32_t p) {
         g_xb_pg_epoch = 1;
     }
     g_xb_pg_wgen[p] = g_xb_pg_epoch;
+    g_xb_pg_wsum[p >> WL_XB_PG_WSUM_SHIFT] = g_xb_pg_epoch;
+}
+
+// Page `p` got a mapping that lets stores through unseen (exception-safe; the MMU lock or exception
+// context). Nothing before the core's start.
+static inline void wl_xb_pg_opened(uint32_t p) {
+    if (g_xb_pg_open != NULL) {
+        g_xb_pg_open[p >> 5] |= 1u << (p & 31u);
+    }
 }
 
 // A store to page `p` was seen: only a watched page's matters (fewer sightings, a slower wrap).
@@ -170,6 +188,14 @@ void wl_xb_mmu_frame_move(uint32_t from, uint32_t to, uint32_t f);
 // written: wl_xb_pg_wrote) and cleared, so that the next store sets it again. false when the MMU
 // cannot see the page's stores (no C bits; the host keeps a pinned page open).
 bool wl_xb_mmu_watch(uint32_t p);
+// The write watch's look at page `p` (wl_xb_pg_written), the MMU lock held: as wl_xb_mmu_watch, a C
+// bit harvested (wl_xb_pg_wrote) and cleared; WL_XB_MMU_BLIND when its stores cannot be seen, and
+// WL_XB_MMU_SEALED when no mapping of it is left that lets a store through unseen (its next touch
+// faults). With `seal`, a mapping not used since the last look may go (the Wii: a PTE with R clear;
+// R cleared on the others, so that the next look sees whether they were used).
+#define WL_XB_MMU_BLIND 0x1u
+#define WL_XB_MMU_SEALED 0x2u
+uint32_t wl_xb_mmu_look(uint32_t p, bool seal);
 // Page `p` was pinned and has its frame: map it wherever a fault must not be needed (the host maps
 // both EAs read-write; the Wii's fast path maps a resident page without I/O, so nothing).
 void wl_xb_mmu_pinned(uint32_t p);

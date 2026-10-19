@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Sun, 18 Oct 2026 21:09:17 -0400
+Subject: [PATCH] recomp: --rodata-consts writes a float or double read from a
+ fixed address in read-only data as a literal
+
+Compilers keep floating-point constants in the XBE's read-only data and read them with an absolute operand (fmul dword ptr [0x1f0a78]). A section the XBE marks neither writable nor code and loads at boot is never written by the title, so the value is known when the function is lifted. On a big-endian host each such read was a byte-reversed load through the stack after the address was formed and mapped; the literal goes to the compiler's constant pool or a register. Only reads of finite values that lie in the section's file bytes are folded (const_load.py); test_const_load.py covers the folded reads, stores, writable data, a NaN and a value past the file bytes.
+---
+ tools/recomp/__main__.py        |  5 ++
+ tools/recomp/config.py          | 25 ++++++++-
+ tools/recomp/const_load.py      | 56 ++++++++++++++++++++
+ tools/recomp/test_const_load.py | 93 +++++++++++++++++++++++++++++++++
+ tools/recomp/translator.py      |  9 ++++
+ 5 files changed, 187 insertions(+), 1 deletion(-)
+ create mode 100644 tools/recomp/const_load.py
+ create mode 100644 tools/recomp/test_const_load.py
+
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 2c24aae..313f997 100644
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -303,6 +303,10 @@ def main():
+     parser.add_argument("--bounded-loops", action="store_true",
+                         help="No RECOMP_BACKEDGE() on the back edge of a loop its own counter "
+                              "ends (a counted loop, a scan to a bound: loop_bound.py)")
++    parser.add_argument("--rodata-consts", action="store_true",
++                        help="Write a float or double read from a fixed address in the XBE's "
++                             "read-only data (not writable, loaded at boot) as a literal "
++                             "(const_load.py)")
+     parser.add_argument("--seh-prolog", metavar="ADDR",
+                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
+     parser.add_argument("--seh-epilog", metavar="ADDR",
+@@ -385,6 +389,7 @@ def main():
+     translator.translator.reg_locals = args.reg_locals
+     translator.translator.keep_preserved = args.keep_preserved
+     translator.translator.bounded_loops = args.bounded_loops
++    translator.translator.rodata_consts = args.rodata_consts
+     translator.translator.mem_disp = args.mem_disp
+     translator.translator.stack_disp = args.stack_disp
+ 
+diff --git a/tools/recomp/config.py b/tools/recomp/config.py
+index 159f56c..85f4a0c 100644
+--- a/tools/recomp/config.py
++++ b/tools/recomp/config.py
+@@ -15,8 +15,10 @@ the stale table's end looked like "not code" and its functions failed to lift.
+ from dataclasses import dataclass
+ from typing import List, Optional
+ 
+-# Section flag bit from the XBE format (see tools/xbe_parser).
++# Section flag bits from the XBE format (see tools/xbe_parser).
+ SECTION_EXECUTABLE = 0x00000004
++SECTION_WRITABLE = 0x00000001
++SECTION_PRELOAD = 0x00000002
+ 
+ # Sections that hold code despite not being marked executable in the XBE, or
+ # that we always want treated as code. Matched by exact section name.
+@@ -38,6 +40,8 @@ class Section:
+     raw_addr: int
+     raw_size: int
+     is_code: bool
++    # never written by the title: not writable, not code, loaded at boot (--rodata-consts)
++    read_only: bool = False
+ 
+ 
+ # Populated by configure_from_xbe(). Fallback: Xbox Dashboard build 3944.
+@@ -110,6 +114,13 @@ def _classify(name: str, flags: int) -> bool:
+     return bool(flags & SECTION_EXECUTABLE)
+ 
+ 
++def _read_only(name: str, flags: int) -> bool:
++    """A section the title never writes: not writable, not code, loaded at boot
++    (a section loaded later may hold anything until it is)."""
++    return (not flags & SECTION_WRITABLE and bool(flags & SECTION_PRELOAD)
++            and not _classify(name, flags))
++
++
+ def configure_from_xbe(xbe_path: str) -> None:
+     """Load the real section layout from the XBE being recompiled.
+ 
+@@ -128,6 +139,7 @@ def configure_from_xbe(xbe_path: str) -> None:
+             raw_addr=s.raw_addr,
+             raw_size=s.raw_size,
+             is_code=_classify(s.name, s.flags),
++            read_only=_read_only(s.name, s.flags),
+         )
+         for s in xbe.sections
+     ]
+@@ -191,6 +203,17 @@ def va_to_file_offset(va):
+     return None
+ 
+ 
++def read_only_offset(va, size):
++    """XBE file offset of [va, va + size) when it lies in the file bytes of a
++    read-only section (Section.read_only), else None."""
++    for s in _SECTIONS:
++        if s.va <= va < s.va + s.va_size:
++            if not s.read_only or va + size > s.va + min(s.va_size, s.raw_size):
++                return None
++            return va - s.va + s.raw_addr
++    return None
++
++
+ def is_code_address(va):
+     """Check if VA is in an executable section (.text or XDK library sections)."""
+     for s in _SECTIONS:
+diff --git a/tools/recomp/const_load.py b/tools/recomp/const_load.py
+new file mode 100644
+index 0000000..a53cb40
+--- /dev/null
++++ b/tools/recomp/const_load.py
+@@ -0,0 +1,56 @@
++"""--rodata-consts: a float or double read from a fixed address in read-only data as a literal.
++
++Compilers keep floating-point constants in the XBE's read-only data and read
++them with an absolute operand (`fmul dword ptr [0x1f0a78]`), which the
++lifter writes MEMF(0x1F0A78). On a big-endian host each such read is a
++byte-reversed load through the stack (lwbrx, a store and a reload) after the
++address is formed and mapped. A section the XBE marks neither writable nor
++executable and loads at boot (.rdata) is never written by the title, so the
++value can be read from the XBE now: MEMF(0x1F0A78) becomes
++((float)0x1.0p-1), which the compiler keeps in its constant pool or a
++register.
++
++Only reads are rewritten (an access followed by an assignment is left), and
++only finite values (an infinity or a NaN keeps the load: a hex literal has no
++NaN payload). The whole value must lie in the section's file bytes (not its
++zero-filled tail).
++"""
++
++import re
++import struct
++
++from . import config
++
++_ACCESS = re.compile(r"\b(MEMF|MEMD)\((0x[0-9A-Fa-f]+)u?\)(?!\s*(?:[-+*/%&|^]|<<|>>)?=(?!=))")
++
++
++def _literal(name, data):
++    if name == "MEMF":
++        v = struct.unpack("<f", data)[0]
++    else:
++        v = struct.unpack("<d", data)[0]
++    if v != v or v in (float("inf"), float("-inf")):
++        return None
++    lit = float.hex(v)
++    return f"((float){lit})" if name == "MEMF" else f"({lit})"
++
++
++def rewrite(text, xbe_data):
++    """(text, reads folded): every eligible MEMF/MEMD(constant) read as a literal."""
++    if not xbe_data:
++        return text, 0
++    hits = 0
++
++    def fold(m):
++        nonlocal hits
++        size = 4 if m.group(1) == "MEMF" else 8
++        off = config.read_only_offset(int(m.group(2), 16), size)
++        if off is None or off + size > len(xbe_data):
++            return m.group(0)
++        lit = _literal(m.group(1), bytes(xbe_data[off:off + size]))
++        if lit is None:
++            return m.group(0)
++        hits += 1
++        return lit
++
++    return _ACCESS.sub(fold, text), hits
+diff --git a/tools/recomp/test_const_load.py b/tools/recomp/test_const_load.py
+new file mode 100644
+index 0000000..fe823b2
+--- /dev/null
++++ b/tools/recomp/test_const_load.py
+@@ -0,0 +1,93 @@
++"""
++With --rodata-consts, a float or double read from a fixed address in
++read-only data is written as a literal (const_load.py); a read from
++writable data, a store, a NaN and a value past the file bytes keep the load.
++"""
++
++import os
++import struct
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
++
++from tools.recomp import config  # noqa: E402
++from tools.recomp.const_load import rewrite  # noqa: E402
++from tools.recomp.translator import FunctionTranslator  # noqa: E402
++
++BASE = 0x00010000
++RO = 0x00020000
++RW = 0x00030000
++
++
++def _install(ro_raw=0x100):
++    # file: code at 0, read-only data at 0x1000, writable data at 0x2000
++    config._install(
++        [config.Section(".text", BASE, 0x100, 0x0000, 0x100, True),
++         config.Section(".rdata", RO, 0x200, 0x1000, ro_raw, False, read_only=True),
++         config.Section(".data", RW, 0x100, 0x2000, 0x100, False)],
++        entry_point=BASE, kernel_thunk_addr=BASE, origin="const-load-test")
++
++
++def _image(code=b""):
++    img = bytearray(0x2100)
++    img[0:len(code)] = code
++    struct.pack_into("<f", img, 0x1000, 0.5)
++    struct.pack_into("<d", img, 0x1008, -3.25)
++    struct.pack_into("<I", img, 0x1010, 0x7FC00000)  # NaN
++    struct.pack_into("<f", img, 0x2000, 2.0)
++    return bytes(img)
++
++
++def _translate(code, on=True):
++    _install()
++    img = _image(code)
++    db = {BASE: {"start": f"0x{BASE:08X}", "end": BASE + len(code),
++                 "_addr": BASE, "size": len(code)}}
++    t = FunctionTranslator(img, db)
++    t.rodata_consts = on
++    return t.translate_function(BASE, db[BASE]), t
++
++
++def _abs(op, addr):
++    return op + struct.pack("<I", addr)
++
++
++def test_float_and_double_reads_become_literals():
++    # fld dword [RO] / fmul qword [RO+8] / fstp dword [RW] / ret
++    code = _abs(b"\xD9\x05", RO) + _abs(b"\xDC\x0D", RO + 8) + _abs(b"\xD9\x1D", RW) + b"\xC3"
++    text, t = _translate(code)
++    assert "((float)0x1.0000000000000p-1)" in text
++    assert "(-0x1.a000000000000p+1)" in text
++    assert "MEMF(0x20000)" not in text and "MEMD(0x20008)" not in text
++    assert "MEMF_SET(0x30000," in text
++    assert t.rodata_const_count == 2
++    off, t = _translate(code, on=False)
++    assert t.rodata_const_count == 0 and "MEMF(0x20000)" in off and "MEMD(0x20008)" in off
++
++
++def test_writable_nan_and_stores_keep_the_load():
++    _install()
++    text = f"x = MEMF(0x{RW:X}); y = MEMF(0x{RO + 0x10:X}); MEMF(0x{RO:X}) = x; z = MEMF(0x{RO:X}) == y;"
++    out, n = rewrite(text, _image())
++    assert n == 1
++    assert f"MEMF(0x{RW:X})" in out and f"MEMF(0x{RO + 0x10:X})" in out
++    assert f"MEMF(0x{RO:X}) = x" in out and "z = ((float)0x1.0000000000000p-1) == y" in out
++
++
++def test_value_past_the_file_bytes_keeps_the_load():
++    _install(ro_raw=0x0C)
++    out, n = rewrite(f"a = MEMD(0x{RO + 8:X}); b = MEMF(0x{RO:X});", _image())
++    assert n == 1 and f"MEMD(0x{RO + 8:X})" in out
++
++
++def test_read_only_sections():
++    _install()
++    assert config.read_only_offset(RO, 4) == 0x1000
++    assert config.read_only_offset(RW, 4) is None
++    assert config.read_only_offset(BASE, 4) is None
++    # from the XBE's flags: .rdata (preload | executable, forced data) is; writable,
++    # not preloaded or code is not
++    assert config._read_only(".rdata", 0x6)
++    assert not config._read_only(".data", 0x7)
++    assert not config._read_only("BINKDATA", 0x5)
++    assert not config._read_only(".text", 0x6)
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 0d856b4..2a36963 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -24,6 +24,7 @@ from .config import va_to_file_offset, is_code_address
+ from . import config as _config
+ from .disasm import Disassembler
+ from .mem_disp import rewrite as mem_disp_rewrite
++from .const_load import rewrite as const_load_rewrite
+ from .loop_bound import bounded_loop_headers
+ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
+@@ -526,6 +527,10 @@ class FunctionTranslator:
+         # loop_bound.py: a back edge of a loop that ends by itself (a counted
+         # loop, a scan to a bound) is a plain goto (--bounded-loops)
+         self.bounded_loops = False
++        # const_load.py: a float or double read from a fixed address in
++        # read-only data as a literal (--rodata-consts)
++        self.rodata_consts = False
++        self.rodata_const_count = 0
+         self.kept = {}
+         self.preserve_stats = {}
+         self.kept_sites = 0
+@@ -3126,6 +3131,10 @@ class FunctionTranslator:
+             if self.kept:
+                 self.kept_sites += sum(line.count("kept across the call") for line in lines)
+ 
++        if self.rodata_consts:
++            text, n = const_load_rewrite("\n".join(lines), self.xbe_data)
++            self.rodata_const_count += n
++            lines = text.split("\n")
+         if self.mem_disp or self.stack_disp:
+             text, n = mem_disp_rewrite("\n".join(lines), stack=self.stack_disp)
+             self.mem_disp_count += n

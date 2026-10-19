@@ -1,0 +1,510 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Sun, 18 Oct 2026 20:11:59 -0400
+Subject: [PATCH] recomp: --bounded-loops leaves RECOMP_BACKEDGE out of loops
+ that end by themselves
+
+RECOMP_BACKEDGE() before every backward jump gives a runtime a break-in
+point in a loop that makes no call: a loop polling memory another thread
+or an interrupt writes never ends without one. In a runtime that defines
+it as a check of a flag, that is a load, a compare and a branch on every
+iteration of every loop, and a counted loop or a scan to a bound pays it
+for nothing: its own counter ends it whatever other threads do.
+
+loop_bound.py finds those loops: one latch, no call, indirect jump,
+interrupt, port, locked or halting instruction, and an exit test in the
+header or the latch on a register the loop moves once per iteration by a
+constant (inc, dec, add, sub, lea, loop), against an immediate, a register
+the loop does not write, or a stack slot in a loop that stores nothing.
+A test that goes on while the counter differs from the bound needs an odd
+step. With --bounded-loops (off by default) their back edges are plain
+gotos; every other back edge keeps the hook.
+---
+ tools/recomp/__main__.py        |   4 +
+ tools/recomp/loop_bound.py      | 298 ++++++++++++++++++++++++++++++++
+ tools/recomp/test_loop_bound.py | 105 +++++++++++
+ tools/recomp/translator.py      |  11 +-
+ 4 files changed, 416 insertions(+), 2 deletions(-)
+ create mode 100644 tools/recomp/loop_bound.py
+ create mode 100644 tools/recomp/test_loop_bound.py
+
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 75a3db9..2c24aae 100644
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -300,6 +300,9 @@ def main():
+                         help="With --reg-locals: after a call to a function proven to give "
+                              "back ebx, esi or edi, keep them in the caller's locals instead "
+                              "of loading them again (preserve.py)")
++    parser.add_argument("--bounded-loops", action="store_true",
++                        help="No RECOMP_BACKEDGE() on the back edge of a loop its own counter "
++                             "ends (a counted loop, a scan to a bound: loop_bound.py)")
+     parser.add_argument("--seh-prolog", metavar="ADDR",
+                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
+     parser.add_argument("--seh-epilog", metavar="ADDR",
+@@ -381,6 +384,7 @@ def main():
+     translator.translator.x87_locals = args.x87_locals
+     translator.translator.reg_locals = args.reg_locals
+     translator.translator.keep_preserved = args.keep_preserved
++    translator.translator.bounded_loops = args.bounded_loops
+     translator.translator.mem_disp = args.mem_disp
+     translator.translator.stack_disp = args.stack_disp
+ 
+diff --git a/tools/recomp/loop_bound.py b/tools/recomp/loop_bound.py
+new file mode 100644
+index 0000000..540224d
+--- /dev/null
++++ b/tools/recomp/loop_bound.py
+@@ -0,0 +1,298 @@
++"""
++Loops that end by themselves: the back edges that need no RECOMP_BACKEDGE.
++
++RECOMP_BACKEDGE() before a backward jump is a runtime's break-in point in a
++loop that makes no call (see the translator's hook): a loop that polls memory
++another thread or an interrupt writes never ends without one. A loop whose
++trip count is bounded by its own registers ends whatever other threads do, so
++its hook only costs a load, a compare and a branch per iteration; this module
++finds those loops, and the translator leaves their back edges plain.
++
++A loop (the blocks that reach its latch without passing its header H) is
++bounded when all of these hold:
++
++  * it has one latch: one block of the loop jumps back to H;
++  * it makes no call, no indirect jump and no interrupt, port, locked or
++    halting instruction (an inner loop is the inner loop's business: its
++    own back edge keeps its hook unless it is bounded too);
++  * the header or the latch ends in a conditional jump that leaves the loop,
++    its flags set in that block by
++      - the update of a counter register r (inc, dec, add or sub of a
++        constant k, or `loop`), or
++      - cmp/test of r against an immediate, a stack slot ([esp/ebp+d], the
++        base unwritten) in a loop that stores nothing, or a register the loop
++        never writes or only loads again from such a slot,
++    where r is a general register (not esp) that the loop writes once, by
++    such an update in the header or the latch, so every iteration moves r by
++    the same constant k;
++  * the test is not a parity or overflow test, nor a carry test after inc
++    or dec (which leave CF as it was), and a test that keeps the loop going
++    while r differs from the bound (jne) has an odd step, which reaches
++    every 32-bit value.
++
++r then walks the 32-bit circle by k, and the loop goes on only while r lies
++in an interval the bound fixes; it ends within 2^32 iterations once r reaches
++the complement. The one case left over is an ordered test whose complement
++is shorter than the step (a bound within one step of the wrap point), which no
++array or count bound is.
++"""
++
++_FAMILY = {}
++for _fam, _names in {
++    "a": ("eax", "ax", "al", "ah"), "b": ("ebx", "bx", "bl", "bh"),
++    "c": ("ecx", "cx", "cl", "ch"), "d": ("edx", "dx", "dl", "dh"),
++    "si": ("esi", "si", "sil"), "di": ("edi", "di", "dil"),
++    "bp": ("ebp", "bp", "bpl"), "sp": ("esp", "sp", "spl"),
++}.items():
++    for _n in _names:
++        _FAMILY[_n] = _fam
++
++_COUNTER_FAMILIES = frozenset({"a", "b", "c", "d", "si", "di", "bp"})
++
++# Instructions after which a loop cannot be shown to end by itself: they call
++# out, leave through an unknown target, wait on the outside world or on
++# another processor's memory.
++_STOPS = frozenset({
++    "call", "int", "int3", "into", "hlt", "pause", "in", "out", "insb", "insw",
++    "insd", "outsb", "outsw", "outsd", "cmpxchg", "cmpxchg8b", "xchg", "xadd",
++    "iret", "iretd", "ret", "retn", "retf", "sti", "cli", "wait", "fwait",
++    "sysenter", "syscall",
++})
++
++_NE = frozenset({"jne", "jnz"})
++_EQ = frozenset({"je", "jz"})
++_REJECT = frozenset({"jo", "jno", "jp", "jnp", "jpe", "jpo", "jcxz", "jecxz"})
++# tests that read CF, which inc and dec leave as it was
++_READS_CF = frozenset({"jb", "jnae", "jc", "jae", "jnb", "jnc", "ja", "jnbe", "jbe", "jna"})
++# after test r, r: CF = 0, so these are constant (or the same as ne / e)
++_TEST_CONST = frozenset({"jb", "jnae", "jc", "jae", "jnb", "jnc"})
++_TEST_AS_NE = frozenset({"ja", "jnbe"})
++_TEST_AS_EQ = frozenset({"jbe", "jna"})
++
++_NO_FLAGS = frozenset({"mov", "lea", "movzx", "movsx", "nop"})
++
++
++def _base_mnemonic(insn):
++    return insn.mnemonic.split()[-1]
++
++
++def _families_written(insn):
++    fams = set()
++    for name in getattr(insn, "regs_written", ()) or ():
++        fam = _FAMILY.get(name)
++        if fam is not None:
++            fams.add(fam)
++    ops = insn.operands
++    if ops and ops[0].type == "reg" and _base_mnemonic(insn) not in (
++            "cmp", "test", "bt", "push"):
++        fam = _FAMILY.get(ops[0].reg)
++        if fam is not None:
++            fams.add(fam)
++    return fams
++
++
++def _writes_memory(insn):
++    m = _base_mnemonic(insn)
++    if m.startswith(("stos", "movs", "push", "call", "enter")) or m in ("pusha", "pushal", "pushfd"):
++        return True
++    ops = insn.operands
++    return bool(ops) and ops[0].type == "mem" and m not in ("cmp", "test", "bt", "push")
++
++
++def _stops(insn):
++    if insn.mnemonic.startswith("lock"):
++        return True
++    m = _base_mnemonic(insn)
++    if m in _STOPS:
++        return True
++    if m == "jmp" and (not insn.operands or insn.operands[0].type != "imm"):
++        return True
++    return False
++
++
++def _step(insn, fam):
++    """The constant an update adds to r's family (None: not a counter update)."""
++    m = _base_mnemonic(insn)
++    ops = insn.operands
++    if not ops or ops[0].type != "reg" or ops[0].reg not in (
++            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"):
++        return None
++    if _FAMILY[ops[0].reg] != fam:
++        return None
++    if m == "inc" and len(ops) == 1:
++        return 1
++    if m == "dec" and len(ops) == 1:
++        return -1
++    if m in ("add", "sub") and len(ops) == 2 and ops[1].type == "imm":
++        k = ops[1].imm & 0xFFFFFFFF
++        if k & 0x80000000:
++            k -= 1 << 32
++        return k if m == "add" else -k
++    if m == "lea" and len(ops) == 2 and ops[1].type == "mem":
++        mem = ops[1]
++        if mem.mem_base == ops[0].reg and mem.mem_index is None and mem.mem_seg is None:
++            k = mem.mem_disp
++            if k & 0x80000000:
++                k -= 1 << 32
++            return k
++    return None
++
++
++def bounded_loop_headers(blocks):
++    """The headers H whose loop ends by itself (the module's rules): a back
++    edge to H needs no RECOMP_BACKEDGE. A back edge is a jump to a block at or
++    before the one it ends, as the translator's hook defines it."""
++    by_start = {bb.start: bb for bb in blocks}
++    preds = {bb.start: set() for bb in blocks}
++    for bb in blocks:
++        for s in bb.successors:
++            if s in preds:
++                preds[s].add(bb.start)
++    latches = {}
++    for bb in blocks:
++        last = bb.last_insn
++        if last is None or last.jump_target is None:
++            continue
++        if last.jump_target <= bb.start and last.jump_target in by_start:
++            latches.setdefault(last.jump_target, []).append(bb)
++    result = set()
++    for h, lats in latches.items():
++        if len(lats) == 1 and _bounded(h, lats[0], by_start, preds):
++            result.add(h)
++    return result
++
++
++def _bounded(h, latch, by_start, preds):
++    # the natural loop: what reaches the latch without passing the header
++    body = {h, latch.start}
++    work = [latch.start]
++    while work:
++        b = work.pop()
++        if b == h:
++            continue
++        for p in preds.get(b, ()):
++            if p not in body:
++                body.add(p)
++                work.append(p)
++    # one latch: only it goes back to H from inside the loop
++    if any(h in by_start[b].successors for b in body if b != latch.start):
++        return False
++    insns = [i for b in body for i in by_start[b].instructions]
++    if not insns or any(_stops(i) for i in insns):
++        return False
++    stores = any(_writes_memory(i) for i in insns)
++    writers = {}
++    for i in insns:
++        for fam in _families_written(i):
++            writers.setdefault(fam, []).append(i)
++    for test_block in {h, latch.start}:
++        if _test_ends(by_start[test_block], h, latch, body, by_start, writers, stores):
++            return True
++    return False
++
++
++def _test_ends(tb, h, latch, body, by_start, writers, stores):
++    jcc = tb.last_insn
++    m = _base_mnemonic(jcc)
++    if not jcc.is_cond_jump or m in _REJECT:
++        return False
++    succ = [s for s in tb.successors]
++    inside = [s for s in succ if s in body]
++    outside = [s for s in succ if s not in body]
++    if len(outside) != 1 or len(inside) != 1:
++        return False  # the test must both leave the loop and stay in it
++    goes_on_when_taken = jcc.jump_target in body
++    if m in ("loop", "loope", "loopne"):
++        return goes_on_when_taken and _counter_once(
++            "c", writers, h, latch, by_start, allow=jcc) is not None
++    # the flags' producer: the last instruction before the jump that is not
++    # a flagless move
++    idx = len(tb.instructions) - 2
++    while idx >= 0 and _base_mnemonic(tb.instructions[idx]) in _NO_FLAGS:
++        idx -= 1
++    if idx < 0:
++        return False
++    prod = tb.instructions[idx]
++    pm = _base_mnemonic(prod)
++    cond = m
++    if pm in ("cmp", "test"):
++        ops = prod.operands
++        if len(ops) != 2:
++            return False
++        if pm == "test":
++            if not (ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg):
++                return False
++            if cond in _TEST_CONST:
++                return False
++            cond = "jne" if cond in _TEST_AS_NE else "je" if cond in _TEST_AS_EQ else cond
++            r_op, bound = ops[0], None
++        else:
++            r_op, bound = ops[0], ops[1]
++            fam0 = _FAMILY.get(ops[0].reg) if ops[0].type == "reg" else None
++            if fam0 not in _COUNTER_FAMILIES or fam0 not in writers:
++                r_op, bound = ops[1], ops[0]
++        if r_op.type != "reg" or r_op.reg not in (
++                "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"):
++            return False
++        fam = _FAMILY[r_op.reg]
++        if bound is not None and not _invariant(bound, fam, writers, stores):
++            return False
++        k = _counter_once(fam, writers, h, latch, by_start)
++    else:
++        ops = prod.operands
++        if not ops or ops[0].type != "reg" or ops[0].reg not in _FAMILY:
++            return False
++        fam = _FAMILY[ops[0].reg]
++        if fam not in _COUNTER_FAMILIES:
++            return False
++        k = _counter_once(fam, writers, h, latch, by_start)
++        if k is None or writers[fam][0] is not prod:
++            return False
++        if pm in ("inc", "dec") and cond in _READS_CF:
++            return False
++    if k is None or k == 0:
++        return False
++    # the loop goes on while r differs from the bound: only an odd step is
++    # sure to reach it
++    differs = (cond in _NE and goes_on_when_taken) or (cond in _EQ and not goes_on_when_taken)
++    if differs and k % 2 == 0:
++        return False
++    return True
++
++
++def _counter_once(fam, writers, h, latch, by_start, allow=None):
++    """r's step when the loop writes r once, by a counter update in the header
++    or the latch (allow: the `loop` instruction, which is that update)."""
++    ws = writers.get(fam, [])
++    if allow is not None:
++        ws = [w for w in ws if w is not allow]
++        if ws:
++            return None
++        return -1
++    if len(ws) != 1:
++        return None
++    w = ws[0]
++    if not any(w is i for b in (h, latch.start) for i in by_start[b].instructions):
++        return None
++    return _step(w, fam)
++
++
++def _invariant(op, fam, writers, stores):
++    if op.type == "imm":
++        return True
++    if op.type == "reg":
++        f = _FAMILY.get(op.reg)
++        if f is None or f == fam or f == "sp":
++            return False
++        # unwritten, or only loaded again from an invariant stack slot
++        return all(_base_mnemonic(w) == "mov" and len(w.operands) == 2
++                   and w.operands[0].type == "reg" and w.operands[0].reg == op.reg
++                   and w.operands[1].type == "mem"
++                   and _invariant(w.operands[1], fam, writers, stores)
++                   for w in writers.get(f, ()))
++    if op.type == "mem":
++        if stores or op.mem_seg is not None or op.mem_index is not None:
++            return False
++        f = _FAMILY.get(op.mem_base)
++        return f in ("sp", "bp") and f not in writers
++    return False
+diff --git a/tools/recomp/test_loop_bound.py b/tools/recomp/test_loop_bound.py
+new file mode 100644
+index 0000000..e0e4a8e
+--- /dev/null
++++ b/tools/recomp/test_loop_bound.py
+@@ -0,0 +1,105 @@
++"""
++With --bounded-loops, a loop its own counter ends jumps back without
++RECOMP_BACKEDGE() (loop_bound.py); a loop that polls memory, calls out or
++may never reach its bound keeps the hook.
++"""
++
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
++
++from tools.recomp import config  # noqa: E402
++from tools.recomp.translator import FunctionTranslator  # noqa: E402
++
++BASE = 0x00010000
++HOOK = "RECOMP_BACKEDGE();"
++
++
++def _translate(image, bounded=True):
++    config._install(
++        [config.Section(".text", BASE, len(image), 0x0000, len(image), True)],
++        entry_point=BASE, kernel_thunk_addr=BASE, origin="loop-bound-test")
++    db = {BASE: {"start": f"0x{BASE:08X}", "end": BASE + len(image),
++                 "_addr": BASE, "size": len(image)}}
++    t = FunctionTranslator(image, db)
++    t.bounded_loops = bounded
++    return t.translate_function(BASE, db[BASE])
++
++
++# mov ecx, 10 / L: inc eax / dec ecx / jnz L / ret
++COUNTED = b"\xB9\x0A\x00\x00\x00" b"\x40" b"\x49" b"\x75\xFC" b"\xC3"
++# xor esi, esi / L: add eax, [esi*4+0x2000] / inc esi / cmp esi, edx / jb L / ret
++SCAN = b"\x31\xF6" b"\x03\x04\xB5\x00\x20\x00\x00" b"\x46" b"\x39\xD6" b"\x72\xF4" b"\xC3"
++# L: mov eax, [0x2000] / test eax, eax / je L / ret: a poll
++POLL = b"\xA1\x00\x20\x00\x00" b"\x85\xC0" b"\x74\xF7" b"\xC3"
++# mov ecx, 10 / L: call BASE / dec ecx / jnz L / ret
++CALLS = b"\xB9\x0A\x00\x00\x00" b"\xE8\xF6\xFF\xFF\xFF" b"\x49" b"\x75\xF8" b"\xC3"
++# mov ecx, 10 / L: inc eax / sub ecx, 2 / jnz L / ret: an even step may pass 0
++EVEN_STEP = b"\xB9\x0A\x00\x00\x00" b"\x40" b"\x83\xE9\x02" b"\x75\xFA" b"\xC3"
++# L: mov eax, [0x2000] / inc esi / cmp esi, [esp+4] / jb L / ret: a bound on the stack
++STACK_BOUND = b"\xA1\x00\x20\x00\x00" b"\x46" b"\x3B\x74\x24\x04" b"\x72\xF4" b"\xC3"
++# L: mov [0x2000], eax / inc esi / cmp esi, [esp+4] / jb L / ret: a store may move it
++STORE_BOUND = b"\xA3\x00\x20\x00\x00" b"\x46" b"\x3B\x74\x24\x04" b"\x72\xF4" b"\xC3"
++# L: inc esi / mov esi, [0x2000] / cmp esi, edx / jb L / ret: the counter is reloaded
++RELOADED = b"\x46" b"\x8B\x35\x00\x20\x00\x00" b"\x39\xD6" b"\x72\xF5" b"\xC3"
++# L: mov esi, [esp+0x14] / add ebx, 4 / cmp ebx, esi / jae X / cmp [ebx], ecx / jl L / X: ret
++# (the bound loaded again from the stack in the header, the test in the header)
++RELOADED_BOUND = (b"\x8B\x74\x24\x14" b"\x83\xC3\x04" b"\x39\xF3" b"\x73\x04"
++                  b"\x39\x0B" b"\x7C\xF1" b"\xC3")
++# mov ecx, 10 / L: inc eax / dec ecx / jae L / ret: CF is not dec's
++DEC_CARRY = b"\xB9\x0A\x00\x00\x00" b"\x40" b"\x49" b"\x73\xFC" b"\xC3"
++# mov ecx, 10 / L: inc eax / loop L / ret
++LOOP_INSN = b"\xB9\x0A\x00\x00\x00" b"\x40" b"\xE2\xFD" b"\xC3"
++
++
++def _hooked(image, bounded=True):
++    code = _translate(image, bounded)
++    assert code is not None
++    return HOOK in code
++
++
++def test_counted_loop_has_no_hook():
++    assert not _hooked(COUNTED)
++    assert _hooked(COUNTED, bounded=False)
++
++
++def test_scan_to_a_register_bound_has_no_hook():
++    assert not _hooked(SCAN)
++
++
++def test_loop_instruction_has_no_hook():
++    assert not _hooked(LOOP_INSN)
++
++
++def test_stack_bound_without_stores_has_no_hook():
++    assert not _hooked(STACK_BOUND)
++
++
++def test_poll_keeps_the_hook():
++    assert _hooked(POLL)
++
++
++def test_call_keeps_the_hook():
++    assert _hooked(CALLS)
++
++
++def test_even_step_to_inequality_keeps_the_hook():
++    assert _hooked(EVEN_STEP)
++
++
++def test_store_with_memory_bound_keeps_the_hook():
++    assert _hooked(STORE_BOUND)
++
++
++def test_reloaded_counter_keeps_the_hook():
++    assert _hooked(RELOADED)
++
++
++def test_bound_reloaded_from_the_stack_has_no_hook():
++    assert not _hooked(RELOADED_BOUND)
++    assert _hooked(RELOADED_BOUND, bounded=False)
++
++
++def test_carry_test_after_dec_keeps_the_hook():
++    assert _hooked(DEC_CARRY)
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index a23532d..0d856b4 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -24,6 +24,7 @@ from .config import va_to_file_offset, is_code_address
+ from . import config as _config
+ from .disasm import Disassembler
+ from .mem_disp import rewrite as mem_disp_rewrite
++from .loop_bound import bounded_loop_headers
+ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
+                      detect_setjmp_helpers, _func_ident, _operand_width)
+@@ -522,6 +523,9 @@ class FunctionTranslator:
+         # translate_function then returns the body unfinished (a Pending), and
+         # finish_function completes it once every body is known.
+         self.keep_preserved = False
++        # loop_bound.py: a back edge of a loop that ends by itself (a counted
++        # loop, a scan to a bound) is a plain goto (--bounded-loops)
++        self.bounded_loops = False
+         self.kept = {}
+         self.preserve_stats = {}
+         self.kept_sites = 0
+@@ -3059,7 +3063,9 @@ class FunctionTranslator:
+         # for a runtime to break in at; the hook gives it one. The runtime header decides what it
+         # does (nothing in this template; a check of a "someone is waiting" flag in a runtime
+         # whose guest threads share one host thread or one lock). A jump is backward when its
+-        # target is at or before the block it is in.
++        # target is at or before the block it is in. With --bounded-loops, a loop whose own
++        # counter ends it (loop_bound.py) jumps back without the hook.
++        _bounded = bounded_loop_headers(blocks) if self.bounded_loops else set()
+         _cur_block = None
+         for _i, _line in enumerate(lines):
+             _m = re.match(r'^loc_([0-9A-Fa-f]{8}): ;', _line)
+@@ -3070,7 +3076,8 @@ class FunctionTranslator:
+                 continue
+ 
+             def _hook(_gm, _block=_cur_block):
+-                if int(_gm.group(1), 16) <= _block:
++                _target = int(_gm.group(1), 16)
++                if _target <= _block and _target not in _bounded:
+                     return "{ RECOMP_BACKEDGE(); goto loc_" + _gm.group(1) + "; }"
+                 return _gm.group(0)
+ 

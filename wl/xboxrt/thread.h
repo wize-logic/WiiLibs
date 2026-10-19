@@ -236,6 +236,21 @@ void wl_xb_safe_point(void);
 // lock). Generated code may test it at loop back edges, where a spin on plain guest memory has no
 // other safe point: if (g_xb_attention) wl_xb_safe_point();
 extern volatile uint32_t g_xb_attention;
+// Quiet safe points (on by default; off: a file "fullsafe" in the title's folder, WL_XB_FULL_SAFE on
+// the host, boot.c): while threads are ready but none can have the lock before a time a safe point
+// names (none outranks the holder; the quantum's end and the waiters' starvation are that far off),
+// the attention stays down until then, so a backward jump costs its one load and compare instead of
+// a whole safe point; any new work raises it as before, and the service thread raises it when the
+// window ends (wl_xb_thread_quiet_due, a millisecond late at most). Off: every safe point with a
+// thread ready leaves it up, as before.
+#define WL_XB_HAS_QUIET_POINTS 1
+void wl_xb_thread_set_quiet_points(bool on);
+// The service thread, at each round (no lock): the attention raised when the quiet window ended.
+// No window is armed unless it was called in the last 50 ms (nothing would end it).
+void wl_xb_thread_quiet_due(uint64_t now_us);
+// Someone wants the guest lock: interrupt work raised or a thread ready (the attention, or a quiet
+// window's). A GPU wait gives the lock up only then (nv2a_adapter.c). No lock needed.
+bool wl_xb_lock_wanted(void);
 // Earlier behaviours put back for a bisection on the console (boot.c reads them from the title's
 // folder once, before the guest runs): files "oldapc", "oldyield", "oldvblank". OLDYIELD and OLDVBLANK are the
 // boot's default; files "newyield" and "newvblank" clear them.
@@ -306,6 +321,7 @@ typedef struct {
     uint32_t safe_points;   // wl_xb_safe_point calls that held the lock in guest code
     uint32_t starved_handoffs; // the lock given to a thread that waited past starve_ms
     uint32_t safe_yields;   // of those, the ones that gave the lock to a waiting thread
+    uint32_t quiet_windows; // of those, the ones that left the attention down (wl_xb_thread_set_quiet_points)
     uint32_t service_starved; // the service thread waited a second or more for the lock (logged)
     // safe points that kept the lock from a waiting thread: the holder was at DISPATCH_LEVEL or above
     uint32_t raised_holds;

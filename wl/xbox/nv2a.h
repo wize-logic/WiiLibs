@@ -108,6 +108,10 @@ typedef struct WlNv2aStats {
     uint32_t memory_misses;   // guest memory the model wanted that phys_ptr did not give
 } WlNv2aStats;
 void wl_nv2a_stats(const WlNv2a *dev, WlNv2aStats *out);
+// A batch's least and greatest index found as its indices come (a run of them from the pushbuffer, a
+// DRAW_ARRAYS range), not by a pass over them at each draw: on by default, for every device (false:
+// the pass; nv2a_gx.h's "noindexbounds").
+void wl_nv2a_set_index_bounds(bool on);
 // The host memory the device holds (its record, the batch buffers, the instance memory's pages made
 // so far), for a census of the host's heap. A backend's (nv2a_gx.h) is its own.
 size_t wl_nv2a_host_bytes(const WlNv2a *dev);

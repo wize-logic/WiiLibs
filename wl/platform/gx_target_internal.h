@@ -11,21 +11,21 @@ typedef enum {
     WL_GX_TARGET_COPY_Z24X8      // the EFB's depth as a Z24X8 texture
 } WlGxTargetCopy;
 
-// Copies out of the EFB's origin, `w` by `h` pixels, unfiltered (the display copy's deflicker
+// Copies out of the EFB from column `x` of its first row, `w` by `h` pixels, unfiltered (the display copy's deflicker
 // filter is switched off for a run of copies and back on after). The destination is 32-byte
 // aligned memory of wl_gx_tex_bytes bytes; the texture cache is invalidated after the run. The
 // processor's cache is invalidated over `dst` first when `invalidate` (false for memory the GPU
 // has been copied into and the processor has not touched since: no line of it can be cached).
 void wl_gx_target_be_copy_begin(void);
-void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what, bool invalidate);
+void wl_gx_target_be_copy(void *dst, uint32_t x, uint32_t w, uint32_t h, WlGxTargetCopy what, bool invalidate);
 void wl_gx_target_be_copy_end(void);
-// The scissor: (0, 0, w, h).
-void wl_gx_target_be_scissor(uint32_t w, uint32_t h);
-// The parked colour (RGBA8) and depth (Z24X8), `w` by `h` from the EFB's origin, written back over the
+// The scissor: (x, 0, w, h).
+void wl_gx_target_be_scissor(uint32_t x, uint32_t w, uint32_t h);
+// The parked colour (RGBA8) and depth (Z24X8), `w` by `h` from column `x` of the EFB's first row, written back over the
 // EFB by a quad of that part of a `back_w` by `back_h` back buffer, depth test always passing and
 // writing; `depth` NULL: the colour alone (the EFB's depth left as it is, no depth test or write). Leaves the viewport and projection over the whole back buffer, as a clear does.
-void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, uint32_t h, uint32_t back_w,
-                             uint32_t back_h);
+void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t x, uint32_t w, uint32_t h,
+                             uint32_t back_w, uint32_t back_h);
 // A clear quad, as wl_gx_target_clear describes (z already clamped); `w`, `h` the back buffer's size.
 void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int x, int y, int rw, int rh,
                            uint32_t back_w, uint32_t back_h);
@@ -41,6 +41,7 @@ void wl_gx_target_be_squeeze(void *colour, uint32_t back_w, uint32_t back_h, uin
 void wl_gx_target_be_default_size(uint32_t *w, uint32_t *h);
 
 // Called by the GX layer's backends.
-void wl_gx_target_frame_begun(void); // wl_gx_begin_frame: the back buffer owns the EFB, nothing drawn
+// wl_gx_begin_frame: the back buffer owns the EFB, nothing drawn; the EFB cleared to `clear_rgba` (0xRRGGBBAA)
+void wl_gx_target_frame_begun(uint32_t clear_rgba);
 void wl_gx_target_frame_ending(void); // wl_gx_end_frame: the back buffer is put back
 void wl_gx_target_shutdown(void);    // wl_gx_shutdown: the parked blocks are released

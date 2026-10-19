@@ -20,12 +20,20 @@ static struct {
     WlGxTarget owner;
     WlGxTarget resolved; // the last one wl_gx_target_use returned
     bool drawn;          // the back buffer has had something drawn or cleared this frame
-    bool parked;         // its colour and depth are in `colour` and `depth`, (0, 0) to (parked_w, parked_h)
+    bool parked;         // its colour and depth are in `colour` and `depth`, (parked_x, 0) to (+parked_w, parked_h)
     bool depth_parked;   // ...its depth too (always, unless lazy_depth: then from wl_gx_target_depth_write)
     bool lazy_depth;     // wl_gx_target_set_lazy_depth
     bool park_whole;     // wl_gx_target_set_park_whole
     bool squeeze_warned; // the lack of memory for wl_gx_target_squeeze has been told
-    uint32_t parked_w, parked_h;
+    uint32_t parked_x, parked_w, parked_h;
+    // the part of the EFB a target can draw over that the park covers, from the EFB's origin (the
+    // whole back buffer for a whole park): a larger target has it parked again
+    uint32_t cover_w, cover_h;
+    // the picture's columns (wl_gx_target_set_picture; pic_w 0: all of the back buffer), and whether
+    // its bars may hold anything but black (a target drew there, the frame's clear was not black)
+    uint32_t pic_x, pic_w;
+    bool bars_dirty;
+    bool bars_hidden; // wl_gx_target_set_bars_shown(false): the columns beside the picture are not shown
     // the part of it the targets since the park can have drawn over: their scissors' bounds (a target draws
     // within its scissor), all a restore puts back (the switch restore_whole: the part parked)
     uint32_t spill_w, spill_h;
@@ -124,11 +132,62 @@ void wl_gx_target_scissor_size(const WlGxTarget *target, uint32_t back_w, uint32
     *h = target->height < back_h ? target->height : back_h;
 }
 
-void wl_gx_target_frame_begun(void) {
+void wl_gx_target_frame_begun(uint32_t clear_rgba) {
     t.owner_is_target = false;
     t.drawn = false;
     t.parked = false;
     t.depth_parked = false;
+    // (the bars are cleared with the rest of the EFB: to the frame's colour)
+    t.bars_dirty = t.bars_dirty || (clear_rgba >> 8) != 0;
+}
+
+// the picture's columns: [*x, *x + *w) of a back buffer `bw` wide
+static void picture_columns(uint32_t bw, uint32_t *x, uint32_t *w) {
+    if (t.pic_w == 0u || t.pic_x + t.pic_w > bw) {
+        *x = 0;
+        *w = bw;
+    } else {
+        *x = t.pic_x;
+        *w = t.pic_w;
+    }
+}
+
+void wl_gx_target_set_picture(uint32_t x, uint32_t w) {
+    // (from an even column, whole tiles wide: GX's copy rectangle)
+    t.pic_x = w != 0u ? x & ~1u : 0u;
+    t.pic_w = w != 0u ? (w + 3u) & ~3u : 0u;
+    t.bars_dirty = true;
+}
+
+void wl_gx_target_set_bars_shown(bool shown) {
+    t.bars_hidden = !shown;
+}
+
+bool wl_gx_target_picture(uint32_t *x, uint32_t *w) {
+    uint32_t bw, bh;
+    back_size(&bw, &bh);
+    picture_columns(bw, x, w);
+    return *w < bw;
+}
+
+// The bars of a picture drawn narrow blackened when something may have drawn over them (at the end of
+// the frame, once the back buffer has the EFB again)
+static void bars_blacken(void) {
+    uint32_t bw, bh, x, w;
+    back_size(&bw, &bh);
+    picture_columns(bw, &x, &w);
+    if (w >= bw || !t.bars_dirty || t.bars_hidden) {
+        return;
+    }
+    wl_gx_target_be_scissor(0, bw, bh);
+    if (x != 0u) {
+        wl_gx_target_be_clear(true, false, 0x000000FFu, 1.0f, 0, 0, (int)x, (int)bh, bw, bh);
+    }
+    if (x + w < bw) {
+        wl_gx_target_be_clear(true, false, 0x000000FFu, 1.0f, (int)(x + w), 0, (int)(bw - x - w), (int)bh, bw, bh);
+    }
+    t.bars_dirty = false;
+    t.stats.bar_clears++;
 }
 
 void wl_gx_target_shutdown(void) {
@@ -138,9 +197,9 @@ void wl_gx_target_shutdown(void) {
     t.drawn = false;
 }
 
-// The part of the back buffer a target of scissor `w` by `h` can draw over, which a park keeps: from
-// the EFB's origin, in whole 4 by 4 tiles of the copies, within the back buffer.
-static void park_size(uint32_t w, uint32_t h, uint32_t *pw, uint32_t *ph) {
+// The part of the EFB a target of scissor `w` by `h` can draw over (from the EFB's origin), which a
+// park covers: in whole 4 by 4 tiles of the copies, within the back buffer.
+static void park_size(uint32_t w, uint32_t h, uint32_t *cw, uint32_t *ch) {
     uint32_t bw, bh;
     back_size(&bw, &bh);
     if (t.park_whole) {
@@ -149,14 +208,32 @@ static void park_size(uint32_t w, uint32_t h, uint32_t *pw, uint32_t *ph) {
     }
     w = (w + 3u) & ~3u;
     h = (h + 3u) & ~3u;
-    *pw = w < bw ? w : bw;
-    *ph = h < bh ? h : bh;
+    *cw = w < bw ? w : bw;
+    *ch = h < bh ? h : bh;
 }
 
-// The back buffer's colour and depth, `w` by `h` from the EFB's origin (what the targets coming can
-// draw over: park_size), out of the EFB, into blocks asked for at the first park and again, larger,
-// when a park needs more (with lazy depth, the depth's at its first copy).
-static void park(uint32_t w, uint32_t h) {
+// The back buffer's colour and depth where targets of `cw` by `ch` from the EFB's origin can draw over
+// its picture (park_size; the picture's columns: wl_gx_target_set_picture), out of the EFB, into blocks
+// asked for at the first park and again, larger, when a park needs more (with lazy depth, the depth's
+// at its first copy). Targets over the bars alone park nothing.
+static void park(uint32_t cw, uint32_t ch) {
+    uint32_t bw, bh, x, pw, w, h = ch;
+    back_size(&bw, &bh);
+    picture_columns(bw, &x, &pw);
+    w = cw > x ? cw - x : 0u;
+    w = w < pw ? (w + 3u) & ~3u : pw;
+    w = x + w > bw ? bw - x : w;
+    t.cover_w = cw;
+    t.cover_h = ch;
+    if (w == 0u || h == 0u) {
+        t.parked = true;
+        t.depth_parked = true; // (nothing of the picture to keep)
+        t.parked_x = x;
+        t.parked_w = t.parked_h = 0;
+        t.spill_w = t.spill_h = 0;
+        t.stats.bars_parks++;
+        return;
+    }
     size_t bytes = wl_gx_tex_bytes(WL_GX_TEX_RGBA8, w, h);
     // (the colour's block may be there already, and larger: wl_gx_target_squeeze's)
     if (!block_at_least(&t.colour, &t.colour_bytes, &t.colour_clean, bytes) ||
@@ -167,16 +244,19 @@ static void park(uint32_t w, uint32_t h) {
         return;
     }
     wl_gx_target_be_copy_begin();
-    wl_gx_target_be_copy(t.colour, w, h, WL_GX_TARGET_COPY_RGBA8, t.colour_clean < bytes);
+    wl_gx_target_be_copy(t.colour, x, w, h, WL_GX_TARGET_COPY_RGBA8, t.colour_clean < bytes);
+    t.stats.park_bytes += bytes;
     if (!t.lazy_depth) {
-        wl_gx_target_be_copy(t.depth, w, h, WL_GX_TARGET_COPY_Z24X8, t.depth_clean < bytes);
+        wl_gx_target_be_copy(t.depth, x, w, h, WL_GX_TARGET_COPY_Z24X8, t.depth_clean < bytes);
         t.depth_clean = t.depth_clean > bytes ? t.depth_clean : bytes;
         t.stats.depths++;
+        t.stats.depth_bytes += bytes;
     }
     t.colour_clean = t.colour_clean > bytes ? t.colour_clean : bytes;
     wl_gx_target_be_copy_end();
     t.parked = true;
     t.depth_parked = !t.lazy_depth;
+    t.parked_x = x;
     t.parked_w = w;
     t.parked_h = h;
     t.spill_w = t.spill_h = 0;
@@ -191,27 +271,30 @@ static void restore(void) {
     uint32_t w, h, rw, rh;
     back_size(&w, &h);
     if (!t.parked) {
-        wl_gx_target_be_scissor(w, h);
+        wl_gx_target_be_scissor(0, w, h);
         return;
     }
     rw = t.parked_w;
     rh = t.parked_h;
     if (!wl_gx_bisect()->restore_whole) {
-        rw = t.spill_w < rw ? t.spill_w : rw;
+        // (the targets drew over columns [0, spill_w): of the part parked, from its column parked_x)
+        uint32_t spill = t.spill_w > t.parked_x ? t.spill_w - t.parked_x : 0u;
+        rw = spill < rw ? spill : rw;
         rh = t.spill_h < rh ? t.spill_h : rh;
     }
     // (the quad over the part parked, within the scissor of the part to put back: the back buffer's
     // when that is all of it)
     bool all = rw == t.parked_w && rh == t.parked_h;
-    wl_gx_target_be_scissor(all ? w : rw, all ? h : rh);
+    wl_gx_target_be_scissor(all ? 0u : t.parked_x, all ? w : rw, all ? h : rh);
     if (rw != 0 && rh != 0) {
         // (a depth not parked is the back buffer's still: no target wrote it)
-        wl_gx_target_be_restore(t.colour, t.depth_parked ? t.depth : NULL, t.parked_w, t.parked_h, w, h);
+        wl_gx_target_be_restore(t.colour, t.depth_parked ? t.depth : NULL, t.parked_x, t.parked_w, t.parked_h, w,
+                                h);
         t.stats.restored_pixels += (uint64_t)rw * rh;
         t.stats.restores++;
     }
     if (!all) {
-        wl_gx_target_be_scissor(w, h);
+        wl_gx_target_be_scissor(0, w, h);
     }
     t.parked = false;
     t.depth_parked = false;
@@ -226,11 +309,12 @@ static const WlGxTarget *resolve(void) {
         return NULL;
     }
     wl_gx_target_be_copy_begin();
-    wl_gx_target_be_copy(t.owner.memory, t.owner.width, t.owner.height,
+    wl_gx_target_be_copy(t.owner.memory, 0, t.owner.width, t.owner.height,
                          t.owner.format == WL_GX_TEX_RGB565 ? WL_GX_TARGET_COPY_RGB565 : WL_GX_TARGET_COPY_RGBA8,
                          !t.owner.resident);
     wl_gx_target_be_copy_end();
     t.stats.resolves++;
+    t.stats.resolve_bytes += wl_gx_target_bytes(&t.owner);
     t.resolved = t.owner;
     return &t.resolved;
 }
@@ -266,14 +350,17 @@ const WlGxTarget *wl_gx_target_use(const WlGxTarget *target) {
         restore();
         t.owner_is_target = false;
     } else {
-        if (t.parked && (sw > t.parked_w || sh > t.parked_h)) {
-            // a target larger than the part parked: the back buffer put back (the last target's
-            // pixels are resolved), then parked again, the larger part
-            park_size(sw > t.parked_w ? sw : t.parked_w, sh > t.parked_h ? sh : t.parked_h, &pw, &ph);
+        park_size(sw, sh, &pw, &ph);
+        if (t.parked && (pw > t.cover_w || ph > t.cover_h)) {
+            // a target larger than the part parked (or one with whole parks asked for since the
+            // park): the back buffer put back (the last target's pixels are resolved), then parked
+            // again, the larger part
+            park_size(pw > t.cover_w ? pw : t.cover_w, ph > t.cover_h ? ph : t.cover_h, &pw, &ph);
             restore();
             park(pw, ph);
         }
-        wl_gx_target_be_scissor(sw, sh);
+        wl_gx_target_be_scissor(0, sw, sh);
+        t.bars_dirty = true;
         t.spill_w = sw > t.spill_w ? sw : t.spill_w;
         t.spill_h = sh > t.spill_h ? sh : t.spill_h;
         t.owner = *target;
@@ -287,7 +374,7 @@ const WlGxTarget *wl_gx_target_current(void) {
 }
 
 const void *wl_gx_target_parked_colour(uint32_t *w, uint32_t *h) {
-    if (!t.parked || !t.owner_is_target || t.colour == NULL) {
+    if (!t.parked || !t.owner_is_target || t.colour == NULL || t.parked_w == 0u) {
         return NULL;
     }
     *w = t.parked_w;
@@ -317,11 +404,12 @@ void wl_gx_target_depth_write(void) {
         return;
     }
     wl_gx_target_be_copy_begin();
-    wl_gx_target_be_copy(t.depth, t.parked_w, t.parked_h, WL_GX_TARGET_COPY_Z24X8, t.depth_clean < bytes);
+    wl_gx_target_be_copy(t.depth, t.parked_x, t.parked_w, t.parked_h, WL_GX_TARGET_COPY_Z24X8, t.depth_clean < bytes);
     wl_gx_target_be_copy_end();
     t.depth_clean = t.depth_clean > bytes ? t.depth_clean : bytes;
     t.depth_parked = true;
     t.stats.depths++;
+    t.stats.depth_bytes += bytes;
 }
 
 void wl_gx_target_drawn(void) {
@@ -334,6 +422,7 @@ void wl_gx_target_frame_ending(void) {
     if (t.owner_is_target) {
         (void)wl_gx_target_use(NULL);
     }
+    bars_blacken();
 }
 
 void wl_gx_target_clear(bool colour, bool depth, uint32_t rgba, float z, int x, int y, int w, int h) {
@@ -345,6 +434,7 @@ void wl_gx_target_clear(bool colour, bool depth, uint32_t rgba, float z, int x, 
     }
     wl_gx_target_be_clear(colour, depth, rgba, z, x, y, w, h, bw, bh);
     t.stats.clears++;
+    t.stats.clear_pixels += (uint64_t)(w > 0 ? w : 0) * (uint64_t)(h > 0 ? h : 0);
 }
 
 bool wl_gx_target_squeeze(uint32_t x, uint32_t w) {
@@ -369,6 +459,7 @@ bool wl_gx_target_squeeze(uint32_t x, uint32_t w) {
     wl_gx_target_be_squeeze(t.colour, bw, bh, x, w, t.colour_clean < squeeze_bytes);
     t.colour_clean = t.colour_clean > squeeze_bytes ? t.colour_clean : squeeze_bytes;
     t.stats.squeezes++;
+    t.stats.squeeze_bytes += squeeze_bytes;
     return true;
 }
 

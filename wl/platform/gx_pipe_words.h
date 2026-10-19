@@ -261,8 +261,8 @@ static inline __attribute__((always_inline)) void wl_pipe_vertices_index(WL_PIPE
             sends_words = 1;
         }
     }
-    if (!sends_words && indexes <= 4u) {
-        // (a few indices alone: nothing to flatten)
+    if (!sends_words) {
+        // (indices alone: nothing to flatten)
         items = indexes;
         order_count = 0;
     }
@@ -318,9 +318,25 @@ static inline __attribute__((always_inline)) void wl_pipe_vertices_index(WL_PIPE
             WL_PIPE_CASE(2u)
             WL_PIPE_CASE(3u)
             WL_PIPE_CASE(4u)
+            WL_PIPE_CASE(5u)
+            WL_PIPE_CASE(6u)
+            WL_PIPE_CASE(7u)
+            WL_PIPE_CASE(8u)
 #undef WL_PIPE_CASE
         default:
-            break;
+            // (more: the pairs in a loop of the vertex's own)
+            for (v = 0; v < n; v++) {
+                const uint16_t index = (uint16_t)(indices != NULL ? indices[v] - base : v);
+                const uint32_t pair = (uint32_t)index * 0x10001u;
+
+                for (i = 0; i + 2u <= items; i += 2u) {
+                    WL_PIPE_W32(pipe, pair);
+                }
+                if (items & 1u) {
+                    WL_PIPE_W16(pipe, index);
+                }
+            }
+            return;
         }
     }
     if (items <= WL_PIPE_ITEMS_MAX) {

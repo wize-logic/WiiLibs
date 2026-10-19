@@ -12,7 +12,9 @@
  *   - an indirect call to saver;
  *   - argw stores over its arguments, onto a slot where its caller saved ebx;
  *   - mid saves ebx, and the frameless helper it calls (frw) stores through the frame it
- *     inherits (its caller's caller's ebp) onto that saved ebx.
+ *     inherits (its caller's caller's ebp) onto that saved ebx;
+ *   - fpo, built without a frame pointer, uses ebp as a general register: a pointer loaded into
+ *     it and moved through ecx, and stores through it, which are not stores into a frame.
  *
  * run(seed) fills out[] with the registers after each call and returns a hash; the image runs
  * natively (the oracle) and lifted, and both must agree. */
@@ -173,6 +175,26 @@ framed:
         ret
         .size   framed, . - framed
 
+/* int fpo(int *p): frameless, ebp a data pointer; p[1] = p[0] + 5, p[2] = p[1] ^ esi; gives back esi */
+        .globl  fpo
+        .type   fpo, @function
+fpo:
+        push    ebp
+        push    esi
+        mov     ebp, [esp+12]
+        mov     esi, [ebp]
+        add     esi, 5
+        mov     [ebp+4], esi
+        mov     ecx, ebp
+        mov     ebp, ecx
+        xor     esi, 0x5A5A
+        mov     [ebp+8], esi
+        lea     eax, [esi + 1]
+        pop     esi
+        pop     ebp
+        ret
+        .size   fpo, . - fpo
+
 /* int run(int seed) */
         .globl  run
         .type   run, @function
@@ -224,13 +246,23 @@ run:
         add     esp, 4
         mov     [out+72], eax
         mov     [out+76], edi
+        mov     [fbuf], ebx
+        push    OFFSET fbuf
+        call    fpo
+        add     esp, 4
+        mov     [out+80], eax
+        mov     [out+84], esi
+        mov     eax, [fbuf+4]
+        mov     [out+88], eax
+        mov     eax, [fbuf+8]
+        mov     [out+92], eax
         xor     eax, eax
         xor     ecx, ecx
 .Lrun_hash:
         imul    eax, eax, 31
         add     eax, [out + ecx*4]
         inc     ecx
-        cmp     ecx, 20
+        cmp     ecx, 24
         jb      .Lrun_hash
         pop     edi
         pop     esi
@@ -243,7 +275,12 @@ run:
         .globl  out
         .type   out, @object
 out:
-        .zero   80
+        .zero   96
         .size   out, . - out
+        .globl  fbuf
+        .type   fbuf, @object
+fbuf:
+        .zero   16
+        .size   fbuf, . - fbuf
 
         .section .note.GNU-stack, "", @progbits

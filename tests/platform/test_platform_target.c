@@ -7,7 +7,9 @@
 #include <string.h>
 
 #include "greatest.h"
+#include "wl/platform/gx_direct.h"
 #include "wl/platform/host/gx_host.h"
+#include "wl/platform/host/gx_renderer_host.h"
 #include "wl/platform/host/gx_target_host.h"
 
 #define BACK_W 640u
@@ -444,7 +446,7 @@ TEST squeeze_narrows_the_finished_picture_with_the_parked_colour_block(void) {
     ASSERT_EQ(block, o[1].dst);
     // a park after it takes the block it finds and asks for the depth's only
     WlGxTarget a = target_a();
-    wl_gx_target_frame_begun();
+    wl_gx_target_frame_begun(0x000000FFu);
     wl_gx_target_drawn();
     (void)wl_gx_target_use(&a);
     ASSERT_EQ(2u, g_allocs);
@@ -502,6 +504,151 @@ TEST the_host_end_frame_squeezes_only_a_pillarboxed_picture(void) {
     wl_gx_end_frame();
     (void)ops(&n);
     ASSERT_EQ(0u, n); // a 4:3 setting
+    finish();
+    PASS();
+}
+
+static uint8_t g_memory_wide[128 * 128 * 4] __attribute__((aligned(32)));
+static const int g_id_wide = 3;
+
+TEST a_picture_drawn_narrow_parks_its_columns_alone_and_blackens_the_bars(void) {
+    start();
+    wl_gx_target_set_picture(80, 480);
+    uint32_t x = 0, w = 0, n, i, clears = 0;
+    ASSERT(wl_gx_target_picture(&x, &w));
+    ASSERT_EQ(80u, x);
+    ASSERT_EQ(480u, w);
+    wl_gx_begin_frame(0x000000FFu);
+    wl_gx_target_drawn();
+    WlGxTarget a = target_a(), wide = {&g_id_wide, g_memory_wide, 128, 128, WL_GX_TEX_RGBA8, 0xC, false};
+    // 64 by 64 from the EFB's origin: over the left bar alone, nothing parked
+    (void)wl_gx_target_use(&a);
+    const WlHostTargetOp *o = ops(&n);
+    for (i = 0; i < n; i++) {
+        ASSERT(o[i].kind != WL_HOST_TARGET_COPY);
+    }
+    // 128 by 128: a resolved, then columns 80..128 parked (colour and depth)
+    wl_host_target_clear_ops();
+    (void)wl_gx_target_use(&wide);
+    o = ops(&n);
+    uint32_t parked = 0;
+    for (i = 0; i < n; i++) {
+        if (o[i].kind == WL_HOST_TARGET_COPY && o[i].dst != g_memory_a) {
+            ASSERT_EQ(80, o[i].x);
+            ASSERT_EQ(48u, o[i].w);
+            ASSERT_EQ(128u, o[i].h);
+            parked++;
+        }
+    }
+    ASSERT_EQ(2u, parked);
+    ASSERT(wl_gx_target_parked_colour(&w, &n) != NULL);
+    ASSERT_EQ(48u, w);
+    // back: those columns put back, and at the end of the frame both bars black
+    wl_host_target_clear_ops();
+    wl_gx_target_frame_ending();
+    o = ops(&n);
+    bool restored = false;
+    for (i = 0; i < n; i++) {
+        if (o[i].kind == WL_HOST_TARGET_RESTORE) {
+            restored = o[i].x == 80 && o[i].w == 48u && o[i].h == 128u;
+        }
+        if (o[i].kind == WL_HOST_TARGET_CLEAR) {
+            ASSERT(o[i].colour && !o[i].depth && o[i].rgba == 0x000000FFu && o[i].w == 80u && o[i].h == BACK_H);
+            ASSERT(o[i].x == 0 || o[i].x == 560);
+            clears++;
+        }
+    }
+    ASSERT(restored);
+    ASSERT_EQ(2u, clears);
+    WlGxTargetStats st;
+    wl_gx_target_stats(&st, false);
+    ASSERT_EQ(1u, st.parks);
+    ASSERT_EQ(1u, st.bars_parks);
+    ASSERT_EQ(1u, st.bar_clears);
+    ASSERT_EQ((uint64_t)wl_gx_tex_bytes(WL_GX_TEX_RGBA8, 48, 128), st.park_bytes);
+    // a frame with nothing over the bars leaves them alone
+    wl_gx_target_frame_begun(0x000000FFu);
+    wl_host_target_clear_ops();
+    wl_gx_target_frame_ending();
+    (void)ops(&n);
+    ASSERT_EQ(0u, n);
+    wl_gx_target_set_picture(0, 0);
+    ASSERT(!wl_gx_target_picture(&x, &w));
+    finish();
+    PASS();
+}
+
+static uint32_t g_disp[4]; // the display rectangle a renderer was told: src_x, src_w, dst_x, calls
+
+static void disp_rect(void *user, uint32_t src_x, uint32_t src_w, uint32_t dst_x) {
+    (void)user;
+    g_disp[0] = src_x;
+    g_disp[1] = src_w;
+    g_disp[2] = dst_x;
+    g_disp[3]++;
+}
+
+TEST a_picture_in_the_last_columns_leaves_the_first_to_targets_and_shows_its_own_alone(void) {
+    start();
+    WlHostGxRenderer r;
+    memset(&r, 0, sizeof r);
+    r.display_rect = disp_rect;
+    memset(g_disp, 0, sizeof g_disp);
+    wl_host_gx_set_renderer(&r);
+    wl_host_gx_set_widescreen(true);
+    ASSERT(wl_gx_draw_narrow(true));
+    uint32_t x = 0, w = 0, n, i;
+    // (16:9's 480 columns at the EFB's 160..640, shown at the XFB's 80..560)
+    ASSERT(wl_gx_target_picture(&x, &w));
+    ASSERT_EQ(160u, x);
+    ASSERT_EQ(480u, w);
+    ASSERT_EQ(160u, g_disp[0]);
+    ASSERT_EQ(480u, g_disp[1]);
+    ASSERT_EQ(80u, g_disp[2]);
+    wl_gx_begin_frame(0x000000FFu);
+    wl_gx_target_drawn();
+    WlGxTarget wide = {&g_id_wide, g_memory_wide, 128, 128, WL_GX_TEX_RGBA8, 0xC, false};
+    WlGxTarget a = target_a();
+    // 128 by 128 from the EFB's origin, then 64 by 64: neither parks, the first is resolved
+    wl_host_target_clear_ops();
+    (void)wl_gx_target_use(&wide);
+    ASSERT(wl_gx_target_use(&a) != NULL);
+    const WlHostTargetOp *o = ops(&n);
+    uint32_t copies = 0;
+    for (i = 0; i < n; i++) {
+        if (o[i].kind == WL_HOST_TARGET_COPY) {
+            ASSERT(o[i].dst == g_memory_wide);
+            copies++;
+        }
+    }
+    ASSERT_EQ(1u, copies);
+    // back: nothing put back, and the columns beside the picture (not shown) never blackened
+    wl_host_target_clear_ops();
+    (void)wl_gx_end_frame();
+    o = ops(&n);
+    for (i = 0; i < n; i++) {
+        ASSERT(o[i].kind != WL_HOST_TARGET_RESTORE && o[i].kind != WL_HOST_TARGET_CLEAR);
+    }
+    WlGxTargetStats st;
+    wl_gx_target_stats(&st, false);
+    ASSERT_EQ(0u, st.parks);
+    ASSERT_EQ(0u, st.restores);
+    ASSERT_EQ(0u, st.bar_clears);
+    ASSERT_EQ(0u, (unsigned)st.park_bytes);
+    // the switch narrowmid: in the middle columns, the display copy whole
+    WlGxBisect b = *wl_gx_bisect();
+    b.narrow_mid = true;
+    wl_gx_bisect_set(&b);
+    ASSERT(wl_gx_draw_narrow(true));
+    ASSERT(wl_gx_target_picture(&x, &w));
+    ASSERT_EQ(80u, x);
+    ASSERT_EQ(0u, g_disp[1]);
+    b.narrow_mid = false;
+    wl_gx_bisect_set(&b);
+    (void)wl_gx_draw_narrow(false);
+    wl_host_gx_set_widescreen(false);
+    wl_host_gx_set_renderer(NULL);
+    wl_gx_target_set_bars_shown(true);
     finish();
     PASS();
 }
@@ -602,6 +749,8 @@ SUITE(target_suite) {
     RUN_TEST(the_host_end_frame_squeezes_only_a_pillarboxed_picture);
     RUN_TEST(a_larger_target_parks_the_larger_part_after_putting_the_back_buffer_back);
     RUN_TEST(the_part_parked_is_whole_tiles_within_the_back_buffer);
+    RUN_TEST(a_picture_drawn_narrow_parks_its_columns_alone_and_blackens_the_bars);
+    RUN_TEST(a_picture_in_the_last_columns_leaves_the_first_to_targets_and_shows_its_own_alone);
 }
 
 // ---- the ramp --------------------------------------------------------------------------------------

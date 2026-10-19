@@ -245,7 +245,7 @@ static uint64_t gpu_time_ns(void *user) {
 // Off (a file "holdgxlock", WL_XB_HOLD_GX_LOCK on the host): the lock kept through every wait.
 
 // how long a wait spins with the lock before it gives the lock up (a short sync costs less than two
-// hand-offs), and only when another thread or interrupt work wants it (g_xb_attention)
+// hand-offs), and only when another thread or interrupt work wants it (wl_xb_lock_wanted)
 #define GX_SPIN_US 100u
 #define GX_QUEUE 64u
 #define GX_VBLANK 0xFFFFFFFFu // a queued vertical blank's offset
@@ -298,7 +298,7 @@ static void gx_wait_idle(void *user, bool done) {
         g_gw.t0 = now | 1u;
         return;
     }
-    if (now - g_gw.t0 < GX_SPIN_US || g_xb_attention == 0) {
+    if (now - g_gw.t0 < GX_SPIN_US || !wl_xb_lock_wanted()) {
         return;
     }
     if (g_hold_gx_lock || g_gpu_depth == 0 || g_gx_given_up || !wl_xb_lock_held()) {
@@ -500,6 +500,12 @@ static void gpu_status(void) {
                  (unsigned)(vs.frame_bytes / 1024u), (unsigned)(vs.peak_frame_bytes / 1024u), (unsigned)vs.converted,
                  (unsigned)vs.reconverted, (unsigned)vs.refused, (unsigned)vs.failed, (unsigned)vs.evicted,
                  (unsigned)vs.checks, (unsigned)vs.watched);
+    }
+    if (gs.made_draws != 0) {
+        // (nv2a_gx.c's made vertices read by index: how often the ring went round, and waited for GX)
+        WL_LOG_I(TAG, "status: made vertices read by index: %u draws, %u vertices sent, %u made; %u fences, %u waits "
+                 "for GX, %u laps", (unsigned)gs.made_draws, (unsigned)gs.made_sent, (unsigned)gs.made_vertices,
+                 (unsigned)gs.made_fences, (unsigned)gs.made_waits, (unsigned)gs.made_laps);
     }
 }
 

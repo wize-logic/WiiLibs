@@ -71,6 +71,15 @@ so each block runs or is left out, with no test */
 static const WlXboxVshFusedKey *pr_fuse;
 static int pr_fused_captured;   /* (fused) the clip-space position captured, always */
 static int pr_lit_values[2];    /* (fused, lit) the normal's halves as the program ends */
+static int pr_world_values[2];  /* (fused, "w") the world position's halves as the program ends */
+/* (fused, "w", too few registers to keep it to the end: the world position stored in the output's
+position where the program captures the clip-space one, and its words copied from there) */
+static int pr_world_spill;
+static int pr_program_world;    /* (fused, "w") the world position's temporary */
+static int pr_texgen_from[4];   /* (fused) each stage's input register, for GX's texgen ("M"; -1: none) */
+static int pr_world_w;          /* (fused, "w") the clip-space w (both halves) as the program captures it */
+static int pr_fused_op(const char *name, int a, int b, int c);
+static void pr_fused_store(int value, const char *format, ...);
 /* (fused, GX taking the clip-space position: the instructions whose writes nothing reads, the
 screen-space position's divide and viewport among them; pr_dead_now: the one being written's) */
 static unsigned char pr_dead[WL_XBOX_VSH_MAX_INSTRUCTIONS];
@@ -79,6 +88,8 @@ static int pr_dead_now;
 /* the constants that may be loaded once a batch, and how often each is loaded in a vertex */
 static char pr_keys[PR_KEYS][80];
 static int pr_key_uses[PR_KEYS], pr_key_count, pr_hoist_limit, pr_counting;
+/* (fused: loads past the limit hoisted too, each where the registers still allow it: pr_program's) */
+static unsigned char pr_hoist_extra[PR_KEYS];
 
 /* the floats %[k] points at (wl_xbox_vsh_pairs_k in the generated file) */
 enum {
@@ -299,7 +310,7 @@ static int pr_load(int kind, const char *base, int offset, int hoistable) {
         }
         if (k >= 0 && pr_counting)
             pr_key_uses[k]++;
-        if (k >= 0 && !pr_counting && k < pr_hoist_limit)
+        if (k >= 0 && !pr_counting && (k < pr_hoist_limit || pr_hoist_extra[k]))
             pre = 1;
     }
     value = pr_new();
@@ -1453,8 +1464,10 @@ static void pr_instruction(const WlXboxVshInstruction *in, int mode) {
     char text[24];
 
     /* (fused: an output the form does not read not made, as the other unit's work keeps the
-    instruction: the position a draw whose position is the transform unit's co-issues with an RSQ) */
-    if (pr_fuse && out && !(pr_fuse->live & pr_output_live(in->output_address)))
+    instruction: the position a draw whose position is the transform unit's co-issues with an RSQ; a "w"
+    form's clip-space w is made, the rest of it dead: pr_liveness) */
+    if (pr_fuse && out && !(pr_fuse->live & pr_output_live(in->output_address)) &&
+        !(pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD && in->output_address == _output_position))
         out = 0;
 
     if (in->mac != _mac_arl && !mac_mask)
@@ -1475,7 +1488,22 @@ static void pr_instruction(const WlXboxVshInstruction *in, int mode) {
     if (pr_failed)
         return;
     /* (the clip-space position: p before this instruction's writes) */
-    if (in->captures_clip && (mode & WRITE_OUTPUTS)) {
+    if (in->captures_clip && (mode & WRITE_OUTPUTS) && pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD) {
+        /* (the clip-space w, the processor's as for every other form, for GX's depth to be the same
+        to the bit: it is sent in place of the world position's component the matrix recovers) */
+        int values[1];
+
+        pr_world_w = pr_fused_op("ps_merge11", pr_half(12, 1), pr_half(12, 1), -1);
+        if (pr_world_spill) {
+            values[0] = pr_half(pr_program_world, 0);
+            pr_op(0, 0, 1, values, "psq_st @0, 0(%%[o]), 0, 0");
+            values[0] = pr_half(pr_program_world, 1);
+            pr_op(0, 0, 1, values, "stfs @0, 8(%%[o])");
+            pr_text("lwz 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, world_slot));
+            pr_fused_store(pr_world_w, "stfsx @0, %%[o], 0");
+        }
+    }
+    if (in->captures_clip && (mode & WRITE_OUTPUTS) && !(pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD)) {
         PrLane p[4];
 
         for (k = 0; k < 4; k++) {
@@ -1641,7 +1669,8 @@ drop_position (fused, GX taking the clip-space position the program captures):
 the position read by none at the end, and an instruction whose writes are then
 all unread is dead (pr_dead), reading nothing but for its capture; of the
 capture, x, y and w alone (GX's vertex is x w, y w, -w: the clip-space z is
-never sent) */
+never sent); 2 (a "w" form: GX's position matrix makes it from the world
+position sent), of the capture w alone */
 static void pr_liveness(const WlXboxVshProgram *program, const unsigned *needs, unsigned long from,
                         unsigned (*after)[13], int drop_position) {
     unsigned live[13];
@@ -1653,6 +1682,10 @@ static void pr_liveness(const WlXboxVshProgram *program, const unsigned *needs, 
     /* (a lit form sends the normal: its x, y and z read as the program ends) */
     if (pr_fuse && pr_fuse->lit && program->light.count)
         live[pr_temporary_index(program->light.normal)] |= 0xe;
+    /* (a "w" form sends the world position: its x, y and z read as the program ends, or where the
+    clip-space position is captured: pr_world_spill) */
+    if (pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD && program->world.found && !pr_world_spill)
+        live[pr_temporary_index(program->world.temporary)] |= 0xe;
     for (index = (long)program->count - 1; index >= (long)from; index--) {
         const WlXboxVshInstruction *in = &program->instructions[index];
         WlXboxVshInstruction made;
@@ -1674,13 +1707,20 @@ static void pr_liveness(const WlXboxVshProgram *program, const unsigned *needs, 
             if (!mac_live && !ilu_live && !out_live) {
                 pr_dead[index] = 1;
                 if (in->captures_clip)
-                    live[12] = 0xd;
+                    live[12] = drop_position == 2 ? 0x1 : 0xd;
+                if (in->captures_clip && drop_position == 2 && pr_world_spill)
+                    live[pr_temporary_index(program->world.temporary)] |= 0xe;
                 continue;
             }
         }
         /* (the operands' lanes the live lanes read: a unit's lanes nothing reads after are not
         made, pr_instruction's) */
         made = *in;
+        /* (fused: an output the form does not read reads nothing, pr_instruction leaving it out: the
+        temporaries it alone reads not made) */
+        if (pr_fuse && made.output_mask && made.output_is_register && made.output_address != _output_position &&
+            !(pr_fuse->live & pr_output_live(made.output_address)))
+            made.output_mask = 0;
         if (made.mac != _mac_nop && made.mac != _mac_arl)
             made.mac_mask = (unsigned char)(made.mac_mask & live[pr_temporary_index(in->temporary)]);
         if (made.ilu != _ilu_nop)
@@ -1694,7 +1734,9 @@ static void pr_liveness(const WlXboxVshProgram *program, const unsigned *needs, 
             in->output_address == _output_position)
             live[12] &= ~in->output_mask;
         if (in->captures_clip)
-            live[12] = drop_position ? 0xd : 0xf;
+            live[12] = drop_position == 2 ? 0x1 : drop_position ? 0xd : 0xf;
+        if (in->captures_clip && drop_position == 2 && pr_world_spill)
+            live[pr_temporary_index(program->world.temporary)] |= 0xe;
         pr_reads(&made, WRITE_ALL, reads);
         for (which = 0; which < 3; which++)
             if (in->operands[which].mux == _mux_temporary)
@@ -2335,6 +2377,19 @@ static void pr_fused_epilogue(void) {
             pr_text("lwz 0, %d(%%[v])", 4 * n);
             pr_text("stw 0, %d(%%[ad])", 4 * n);
         }
+    } else if (key->perspective == WL_XBOX_VSH_FUSED_WORLD && pr_world_spill) {
+        /* (the transform unit's from the world position, stored where the program captured) */
+        for (n = 0; n < 3; n++) {
+            pr_text("lwz 0, %d(%%[o])", 4 * n);
+            pr_text("stw 0, %d(%%[ad])", 4 * n);
+        }
+    } else if (key->perspective == WL_XBOX_VSH_FUSED_WORLD) {
+        /* (the transform unit's from the world position: its x, y and z, the clip-space w over the
+        one at world_slot) */
+        pr_fused_store(pr_world_values[0], "psq_st @0, 0(%%[ad]), 0, 0");
+        pr_fused_store(pr_world_values[1], "stfs @0, 8(%%[ad])");
+        pr_text("lwz 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, world_slot));
+        pr_fused_store(pr_world_w, "stfsx @0, %%[ad], 0");
     } else {
         /* (the captured way alone when the program always captures, the other alone without
         perspective; else the program's flag tested) */
@@ -2352,10 +2407,11 @@ static void pr_fused_epilogue(void) {
             }
             xy = pr_fused_output(0, "%[oclip]", 0);
             zw = pr_fused_output(0, "%[oclip]", 8);
+            /* (the scale and offset already in samples: 1 / the samples is a power of two, so
+            (x scale + w offset) / samples is x (scale / samples) + w (offset / samples) to the bit) */
             x = pr_fused_op("ps_mul", xy, pr_fused_pack(0, WL_XBOX_VSH_FUSED_SCALE), -1);
             x = pr_fused_op("ps_add", x, pr_fused_op("ps_muls1", pr_fused_pack(0, WL_XBOX_VSH_FUSED_OFFSET), zw, -1),
                             -1);
-            x = pr_fused_op("ps_mul", x, to_samples, -1);
             h = pr_fused_op("ps_muls1", half, zw, -1);
             /* (-w as (-z, -w) at word 1, which x and y then write over) */
             pr_fused_store(pr_fused_op("ps_neg", zw, -1, -1), "psq_st @0, 4(%%[ad]), 0, 0");
@@ -2494,6 +2550,23 @@ static void pr_fused_epilogue(void) {
             word -= 2;
             continue;
         }
+        if (kind == WL_XBOX_VSH_FUSED_STAGE_INPUT) {
+            /* (GX's from the input register's x and y as the fetch made them, sent in the first stage
+            made from it; the later ones not sent) */
+            int k, first = 1;
+
+            for (k = 0; k < n; k++)
+                if ((key->stages[k] >> 2) == WL_XBOX_VSH_FUSED_STAGE_INPUT &&
+                    pr_texgen_from[key->stages[k] & 3u] == pr_texgen_from[stage])
+                    first = 0;
+            if (!first) {
+                word -= 2;
+                continue;
+            }
+            pr_fused_store(pr_load(0, "%[v]", 16 * pr_texgen_from[stage], 0), "psq_st @0, %d(%%[ad]), 0, 0",
+                           4 * word);
+            continue;
+        }
         at = 16 * (int)stage;
         st = pr_fused_output(0, "%[ot]", at);
         int linear = kind == WL_XBOX_VSH_FUSED_STAGE_LINEAR || kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTIVE_LINEAR;
@@ -2615,8 +2688,34 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     if (pr_fuse) {
         static unsigned fused_needs[WL_XBOX_VSH_MAX_INSTRUCTIONS];
 
+        /* (a "w" form: the instructions the position needs kept, the world position among them; the
+        clip-space position's own then dead, pr_liveness') */
+        unsigned keep = pr_fuse->live | (pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD ? WL_XBOX_VSH_LIVE_POSITION : 0u);
+
+        if (pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD &&
+            (!program->world.found || !program->captures_clip || (!program->world.to_end && !pr_world_spill)))
+            return 0;
+        pr_program_world = program->world.temporary;
+        /* (the stages GX makes from an input register: the register each reads, the form not written
+        for a stage not of that shape) */
+        {
+            WlXboxVshDependencies dependencies;
+            unsigned n;
+
+            memset(pr_texgen_from, -1, sizeof(pr_texgen_from));
+            wl_xbox_vsh_analyze(program, &dependencies);
+            for (n = 0; n < pr_fuse->stage_count; n++) {
+                unsigned stage = pr_fuse->stages[n] & 3u;
+
+                if ((pr_fuse->stages[n] >> 2) != WL_XBOX_VSH_FUSED_STAGE_INPUT)
+                    continue;
+                pr_texgen_from[stage] = wl_xbox_vsh_texgen_source(&dependencies, pr_fuse, stage);
+                if (pr_texgen_from[stage] < 0 || (pr_fuse->live & (WL_XBOX_VSH_LIVE_T0 << stage)))
+                    return 0;
+            }
+        }
         for (index = 0; index < program->count; index++)
-            fused_needs[index] = needs[index] & pr_fuse->live ? ~0u : 0u;
+            fused_needs[index] = needs[index] & keep ? ~0u : 0u;
         needs = fused_needs;
     }
     for (index = 0; index < program->count; index++)
@@ -2630,6 +2729,8 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         if (pr_fuse && pr_fuse->perspective)
             for (index = 0; index < program->count; index++)
                 drop |= needs[index] && program->instructions[index].captures_clip;
+        if (pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD)
+            drop = 2;
         pr_liveness(program, needs, 0, after, drop);
     }
     /* (each block's test: a condition register bit set once a batch) */
@@ -2831,7 +2932,8 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     if (pr_fuse) {
         int values[1], live = (pr_fuse->live & WL_XBOX_VSH_LIVE_POSITION) != 0;
 
-        if (!(pr_fuse->perspective && pr_fused_captured) && pr_fuse->perspective != WL_XBOX_VSH_FUSED_XF) {
+        if (!(pr_fuse->perspective && pr_fused_captured) && pr_fuse->perspective != WL_XBOX_VSH_FUSED_XF &&
+            pr_fuse->perspective != WL_XBOX_VSH_FUSED_WORLD) {
             values[0] = live ? pr_half(12, 0) : pr_k(0, PRK_ZERO);
             pr_op(0, 0, 1, values, "psq_st @0, 0(%%[o]), 0, 0");
             pr_forward_store(0, 8, values[0]);
@@ -2863,6 +2965,10 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         if (pr_fuse->lit) {
             pr_lit_values[0] = pr_half(program->light.normal, 0);
             pr_lit_values[1] = pr_half(program->light.normal, 1);
+        }
+        if (pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD && !pr_world_spill) {
+            pr_world_values[0] = pr_half(program->world.temporary, 0);
+            pr_world_values[1] = pr_half(program->world.temporary, 1);
         }
         pr_fused_epilogue();
         pr_forward_finish();
@@ -2967,6 +3073,7 @@ static int pr_program(const WlXboxVshProgram *program, const unsigned *needs, in
     pr_key_count = 0;
     pr_counting = 1;
     pr_hoist_limit = 0;
+    memset(pr_hoist_extra, 0, sizeof(pr_hoist_extra));
     if (!pr_generate(program, needs, reused, prefix, &compares)) {
         pr_counting = 0;
         return 0;
@@ -2991,6 +3098,23 @@ static int pr_program(const WlXboxVshProgram *program, const unsigned *needs, in
     }
     if (limit < 0)
         return 0;
+    /* (a fused form's loop: each later load hoisted where the registers still allow it, most used first;
+    the same arithmetic, a load a vertex fewer each) */
+    if (pr_fuse && limit < pr_key_count) {
+        int extra;
+
+        for (extra = limit + 1; extra < pr_key_count; extra++) {
+            pr_hoist_extra[extra] = 1;
+            if (!(pr_generate(program, needs, reused, prefix, &compares) && pr_allocate(&used)))
+                pr_hoist_extra[extra] = 0;
+        }
+        /* (the code of the loads kept made again: the last try may have failed) */
+        if (!(pr_generate(program, needs, reused, prefix, &compares) && pr_allocate(&used))) {
+            memset(pr_hoist_extra, 0, sizeof(pr_hoist_extra));
+            if (!(pr_generate(program, needs, reused, prefix, &compares) && pr_allocate(&used)))
+                return 0;
+        }
+    }
     pr_used = used;
     return 1;
 }

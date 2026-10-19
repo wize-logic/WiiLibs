@@ -1442,8 +1442,8 @@ static void reuse_code(FILE *out, const WlXboxVshProgram *program, const ReusePr
 the next, else (too few registers) kept in the slot, else made at each vertex (*reused cleared) */
 static int g_spill_first;
 
-static int fused_program(const WlXboxVshProgram *program, const unsigned *needs, int *reused,
-                         const ReusePrefix *prefix) {
+static int fused_program_once(const WlXboxVshProgram *program, const unsigned *needs, int *reused,
+                              const ReusePrefix *prefix) {
     pr_spill = 0;
     if (!(g_spill_first && *reused) && pr_program(program, needs, *reused, prefix))
         return 1;
@@ -1457,8 +1457,25 @@ static int fused_program(const WlXboxVshProgram *program, const unsigned *needs,
     return pr_program(program, needs, 0, prefix);
 }
 
+/* ... and for a "w" form, the world position kept in registers to the end, else stored where the
+program captures the clip-space position (pr_world_spill) */
+static int fused_program(const WlXboxVshProgram *program, const unsigned *needs, int *reused,
+                         const ReusePrefix *prefix) {
+    int first = *reused, made;
+
+    pr_world_spill = 0;
+    made = fused_program_once(program, needs, reused, prefix);
+    if (made || !pr_fuse || pr_fuse->perspective != WL_XBOX_VSH_FUSED_WORLD)
+        return made;
+    pr_world_spill = 1;
+    *reused = first;
+    made = fused_program_once(program, needs, reused, prefix);
+    pr_world_spill = 0;
+    return made;
+}
+
 /* the fused forms asked for (--fused): a program's hash and its form */
-enum { MAXIMUM_FORMS = 256, MAXIMUM_FUSED = 8 };
+enum { MAXIMUM_FORMS = 256, MAXIMUM_FUSED = 16 };
 static struct {
     unsigned long hash;
     WlXboxVshFusedKey key;

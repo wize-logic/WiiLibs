@@ -240,6 +240,19 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
     if (mc.pte_scan) {
         WL_LOG_I(TAG, "page table: a PTE is looked for in its whole group (ptescan)");
     }
+    // the write watch's look at a range: its pages' write epochs, the MMU only for the pages still
+    // mapped ("oldwatch": every page through the MMU, as before)
+    snprintf(flag, sizeof flag, "%s/oldwatch", cfg->title_dir);
+    mc.old_watch = wl_platform_fs_exists(flag);
+#if !defined(__wii__)
+    const char *ow = getenv("WL_XB_OLDWATCH");
+    if (ow != NULL && ow[0] != '\0') {
+        mc.old_watch = ow[0] != '0';
+    }
+#endif
+    if (mc.old_watch) {
+        WL_LOG_I(TAG, "write watch: every page of a range looked at through the MMU (oldwatch)");
+    }
     // the pages of converted textures give their frames back first ("notexfirst": the clock alone)
     snprintf(flag, sizeof flag, "%s/notexfirst", cfg->title_dir);
     mc.converted_ordinary = wl_platform_fs_exists(flag);
@@ -439,6 +452,17 @@ static WlResult guest_memory(const WlXbTitleConfig *cfg, const char *data_dir, b
         if (!tc.preempt) {
             WL_LOG_I(TAG, "nopreempt: no hand-off to a thread back from the card or after a quantum's wait");
         }
+        // a file "fullsafe" (WL_XB_FULL_SAFE on the host): every safe point with a thread ready leaves
+        // the attention up, as before the quiet windows (thread.h, wl_xb_thread_set_quiet_points)
+        snprintf(det_flag, sizeof det_flag, "%s/fullsafe", cfg->title_dir);
+        bool full_safe = wl_platform_fs_exists(det_flag);
+#if !defined(__wii__)
+        full_safe = full_safe || getenv("WL_XB_FULL_SAFE") != NULL;
+#endif
+        wl_xb_thread_set_quiet_points(!full_safe);
+        if (full_safe) {
+            WL_LOG_I(TAG, "fullsafe: every safe point with a thread ready looks again at the next backward jump");
+        }
         // a file "bigstacks": the host stacks of before 2026-10-18 (256 KB at most, not 128)
         snprintf(det_flag, sizeof det_flag, "%s/bigstacks", cfg->title_dir);
         g_big_stacks = wl_platform_fs_exists(det_flag);
@@ -545,6 +569,8 @@ static void gx_bisect_options(const WlXbTitleConfig *cfg) {
     // at each call)
     b.tex_whole = title_flag(cfg, "gxtexload", NULL) || getenv("WL_XB_TEX_WHOLE") != NULL;
     b.arrays_always = title_flag(cfg, "gxarrayall", NULL) || getenv("WL_XB_ARRAYS_ALL") != NULL;
+    b.pillarbox = title_flag(cfg, "pillarbox", NULL) || getenv("WL_XB_PILLARBOX") != NULL; // (16:9: the old copy, not drawn narrow)
+    b.narrow_mid = title_flag(cfg, "narrowmid", NULL) || getenv("WL_XB_NARROW_MID") != NULL; // (16:9: drawn in the middle columns)
     if (b.pipe32 || b.copy_filter || b.restore_whole || b.tlut_always || b.regions_libogc || b.tex_whole ||
         b.arrays_always) {
         WL_LOG_I(TAG, "GX the old ways:%s%s%s%s%s%s%s", b.pipe32 ? " gxpipe32" : "",
@@ -955,6 +981,9 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
             audio.off = true;
             WL_LOG_I(TAG, "audio: off (%s)", flag);
         }
+        // a file "apuplain": the APU model's first code paths (the same sound, slower), for an A/B
+        snprintf(flag, sizeof flag, "%s/apuplain", cfg->title_dir);
+        audio.apu_plain = audio.apu_plain || wl_platform_fs_exists(flag);
     }
     r = wl_xb_audio_attach(&audio);
     if (r != WL_OK && r != WL_ERR_UNSUPPORTED) {

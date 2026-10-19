@@ -101,7 +101,7 @@ static void start(void) {
     wl_gx_target_set_allocator(park_alloc, park_free);
     wl_gx_target_set_back_buffer_size(640, 480);
     wl_gx_target_set_lazy_depth(false);
-    wl_gx_target_frame_begun();
+    wl_gx_target_frame_begun(0x000000FFu);
 }
 
 // The lines of the log since `from` that start with `prefix`.
@@ -379,7 +379,7 @@ TEST gpu_owned_blocks_are_invalidated_once(void) {
     (void)wl_gx_target_use(NULL); // a resolved (its memory is the caller's: invalidated)
     ASSERT_EQ(1u, invalidations_since(from));
     from = g_gx_stub_log_count;
-    wl_gx_target_frame_begun();
+    wl_gx_target_frame_begun(0x000000FFu);
     wl_gx_target_drawn();
     (void)wl_gx_target_use(&a); // parks again, into the same blocks
     ASSERT_EQ(0u, invalidations_since(from));

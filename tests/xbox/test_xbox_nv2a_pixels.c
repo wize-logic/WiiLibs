@@ -10,7 +10,9 @@
 // and a second pass over them by a program whose colour the processor computes (the transform unit
 // still doing its position) passing LEQUAL everywhere; the same draw with its arrays kept for GX to
 // read by index (the vertex cache), to the bit, and again after its vertices are rewritten. A
-// projective coordinate whose q varies over a quad, divided at each pixel as the NV2A divides it.
+// projective coordinate whose q varies over a quad, divided at each pixel as the NV2A divides it. A
+// 4:3 picture on a 16:9 screen drawn narrow: its draws, clears and queries in its EFB columns, both
+// ways of each switch (narrowmid, pillarbox).
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +23,8 @@
 #include "nv2a_frames.h"
 #include "tests/platform/check.h"
 #include "wl/gxsoft/gxsoft.h"
+#include "wl/platform/gx_direct.h"
+#include "wl/platform/host/gx_host.h"
 #include "wl/platform/platform.h"
 #include "wl/xbox/nv2a_capture.h"
 #include "wl/xbox/nv2a_gx.h"
@@ -72,8 +76,8 @@ static void on_draw(void *user, const WlGxSoftDraw *d) {
     g_last_draw = *d;
 }
 
-// (the next pixel_device's GX backend never uses the transform unit)
-static bool g_no_xf, g_no_xf_light;
+// (the next pixel_device's GX backend never uses the transform unit; on a 16:9 console setting)
+static bool g_no_xf, g_no_xf_light, g_wide;
 static size_t g_vertex_cache;
 
 static WlNv2a *pixel_device(TGuest *g) {
@@ -87,6 +91,7 @@ static WlNv2a *pixel_device(TGuest *g) {
     if (wl_gx_init() != WL_OK || wl_gxsoft_attach(&cfg) != WL_OK) {
         return NULL;
     }
+    wl_host_gx_set_widescreen(g_wide);
     {
         WlNv2aGxConfig gcfg;
 
@@ -114,6 +119,7 @@ static void pixel_done(TGuest *g) {
     g_gx = NULL;
     t_destroy(g);
     wl_gxsoft_detach();
+    wl_host_gx_set_widescreen(false);
     wl_gx_shutdown();
     free(g_frame);
     g_frame = NULL;
@@ -258,6 +264,90 @@ TEST occlusion_queries_count_the_pixels_that_pass_the_depth_test(void) {
     // (a small one exactly: the 2 of its 6 columns beside the wall)
     ASSERT_EQ(12u, query_quad(&g, 196, 120, 202, 126, 0.5f, 0x21030));
     pixel_done(&g);
+    PASS();
+}
+
+// one frame of a 4:3 picture whose EFB columns start at `base` and are `scale` (3/4 or 1) of the back
+// buffer's: a quad, a clear of a part, an occlusion query against a wall, all at their mapped columns,
+// and the frame shown in the screen's middle three quarters (with widescreen) or whole
+static enum greatest_test_res narrow_frame(bool wide, uint32_t base, float scale) {
+    TGuest g;
+    uint32_t count;
+
+    g_wide = wide;
+    ASSERT(pixel_device(&g) != NULL);
+    g_wide = false;
+    f_program(&g, 0, f_screen_program, 3);
+    f_clear(&g, 0xFF000000u);
+    // white times the grey texture over the back buffer's (0, 0)-(64, 64): the EFB's base .. base + 64 scale
+    f_quad(&g, 0, 0, 64, 64, 0.5f, 0xFFFFFFFFu);
+    t_kick(&g);
+    ASSERT(near_rgb(pixel((int)base + 1, 30), 0x808080FFu, 4));
+    ASSERT(near_rgb(pixel((int)base + (int)(62.0f * scale), 30), 0x808080FFu, 4));
+    ASSERT(near_rgb(pixel((int)base + (int)(66.0f * scale) + 1, 30), 0x000000FFu, 4));
+    ASSERT(near_rgb(pixel((int)base + 30, 70), 0x000000FFu, 4));
+    if (base != 0u) {
+        // (left of the picture: none of its draws or clears)
+        ASSERT(!near_rgb(pixel((int)base - 2, 30), 0x808080FFu, 4));
+    }
+    // a clear of the back buffer's columns 320..400, rows 200..250: the EFB's base + 240 scale ..
+    t_m1(&g, WL_NV2A_K_SET_COLOR_CLEAR_VALUE, 0xFFFF0000u);
+    t_m1(&g, WL_NV2A_K_SET_CLEAR_RECT_HORIZONTAL, 399u << 16 | 320u);
+    t_m1(&g, WL_NV2A_K_SET_CLEAR_RECT_VERTICAL, 249u << 16 | 200u);
+    t_m1(&g, WL_NV2A_K_CLEAR_SURFACE, WL_NV2A_CLEAR_COLOR);
+    t_kick(&g);
+    ASSERT(near_rgb(pixel((int)base + (int)(321.0f * scale), 220), 0xFF0000FFu, 4));
+    ASSERT(near_rgb(pixel((int)base + (int)(398.0f * scale), 220), 0xFF0000FFu, 4));
+    ASSERT(near_rgb(pixel((int)base + (int)(318.0f * scale), 220), 0x000000FFu, 4));
+    ASSERT(near_rgb(pixel((int)base + (int)(402.0f * scale), 220), 0x000000FFu, 4));
+    ASSERT(near_rgb(pixel((int)base + (int)(360.0f * scale), 260), 0x000000FFu, 4));
+    // a wall at depth 0.3 over the back buffer's (100, 100)-(200, 200): a query behind it passes none
+    // (its depth read at the EFB's columns of the picture, not the back buffer's own), one in front all
+    f_quad(&g, 100, 100, 200, 200, 0.3f, 0xFF0000FFu);
+    t_kick(&g);
+    ASSERT_EQ(0u, query_quad(&g, 120, 120, 136, 136, 0.5f, 0x21000));
+    count = query_quad(&g, 120, 120, 136, 136, 0.1f, 0x21010);
+    ASSERT(count >= 240u && count <= 272u);
+    // (a small one exactly: the 2 of its 6 columns beside the wall)
+    ASSERT_EQ(12u, query_quad(&g, 196, 120, 202, 126, 0.5f, 0x21030));
+    // shown: the picture in the screen's columns 80 .. 560 on 16:9, black beside it
+    t_m1(&g, WL_NV2A_K_FLIP_INCREMENT_WRITE, 0);
+    t_kick(&g);
+    ASSERT_EQ(1u, g_frames_seen);
+    ASSERT_EQ(640u, g_frame_w);
+    if (wide) {
+        ASSERT(near_rgb(shown(80 + 24, 30), 0x808080FFu, 4));
+        ASSERT(near_rgb(shown(80 + 270, 220), 0xFF0000FFu, 4));
+        ASSERT(near_rgb(shown(40, 30), 0x000000FFu, 4));
+        ASSERT(near_rgb(shown(600, 220), 0x000000FFu, 4));
+    } else {
+        ASSERT(near_rgb(shown(30, 30), 0x808080FFu, 4));
+        ASSERT(near_rgb(shown(360, 220), 0xFF0000FFu, 4));
+    }
+    pixel_done(&g);
+    PASS();
+}
+
+// a 4:3 picture on a 16:9 console setting drawn narrow (nv2a_gx.c's view_set, clear_rect and
+// query_triangle): its draws' viewport and scissor, its clears and its occlusion queries' depth reads
+// in the EFB's columns 160 .. 640, the display copy 480 wide into the XFB's column 80; with the switch
+// narrowmid in the columns 80 .. 560 (the display copy whole); with the switch pillarbox drawn whole
+// and narrowed by a copy at the frame's end; on 4:3, whole. Each shows the same picture.
+TEST a_picture_drawn_narrow_lands_in_its_columns(void) {
+    WlGxBisect b = *wl_gx_bisect(), saved = b;
+
+    CHECK_CALL(narrow_frame(true, 160u, 0.75f));
+    b.narrow_mid = true;
+    wl_gx_bisect_set(&b);
+    CHECK_CALL(narrow_frame(true, 80u, 0.75f));
+    b.narrow_mid = false;
+    b.pillarbox = true;
+    wl_gx_bisect_set(&b);
+    CHECK_CALL(narrow_frame(true, 0u, 1.0f));
+    wl_gx_bisect_set(&saved);
+    CHECK_CALL(narrow_frame(false, 0u, 1.0f));
+    // (the switches off again: narrow as at first)
+    CHECK_CALL(narrow_frame(true, 160u, 0.75f));
     PASS();
 }
 
@@ -1149,6 +1239,7 @@ SUITE(pixels_suite) {
     RUN_TEST(a_second_pass_by_the_processor_passes_over_the_transform_units_depths);
     RUN_TEST(arrays_kept_for_gx_to_index_draw_to_the_bit);
     RUN_TEST(a_projective_coordinate_is_divided_at_each_pixel);
+    RUN_TEST(a_picture_drawn_narrow_lands_in_its_columns);
 }
 
 GREATEST_MAIN_DEFS();

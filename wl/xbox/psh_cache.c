@@ -420,6 +420,7 @@ const WlXboxPshProgram *wl_xbox_psh_cache_program(WlXboxPshCache *cache,
         entry = structural;
         memcpy(entry->constants, constants, sizeof(constants));
         constants_patch(entry, &entry->program, constants);
+        entry->version++;
         counts->patched++;
         if (entry->changes++ % AUDIT_INTERVAL == 0) {
             bool audit_usable =
@@ -434,6 +435,7 @@ const WlXboxPshProgram *wl_xbox_psh_cache_program(WlXboxPshCache *cache,
                 entry->generic = false;
                 entry->usable = audit_usable;
                 memcpy(&entry->program, audit, sizeof(*audit));
+                entry->version++;
             }
         }
     } else if (structural) {
@@ -466,6 +468,7 @@ const WlXboxPshProgram *wl_xbox_psh_cache_program(WlXboxPshCache *cache,
                 }
         memcpy(&entry->key, key, sizeof(*key));
         memcpy(entry->constants, constants, sizeof(constants));
+        entry->version++;
         entry->hash = structural ? exact_hash : hash;
         entry->structural = !structural;
         entry->generic = false;
@@ -494,6 +497,55 @@ const WlXboxPshProgram *wl_xbox_psh_cache_program(WlXboxPshCache *cache,
     cache->last_entry = entry;
     *usable = entry->usable;
     return &entry->program;
+}
+
+/* the slot of the caller's words in the recent calls, and their hash */
+static unsigned recent_slot(const uint32_t *words, uint32_t extra, uint32_t *hash_out) {
+    uint32_t hash = extra * 0x9E3779B1u;
+    unsigned index;
+
+    for (index = 0; index < WL_XBOX_PSH_WORDS; index++)
+        hash = (hash ^ words[index]) * 0x01000193u;
+    hash ^= hash >> 16;
+    *hash_out = hash;
+    return hash % WL_XBOX_PSH_CACHE_RECENT;
+}
+
+const WlXboxPshProgram *wl_xbox_psh_cache_recent(WlXboxPshCache *cache, const uint32_t *words, uint32_t extra,
+                                                 const WlXboxPshTextures *textures, bool *usable) {
+    uint32_t hash;
+    unsigned slot = recent_slot(words, extra, &hash);
+    WlXboxPshCacheEntry *entry = cache->recent[slot].entry;
+
+    if (!entry || cache->recent[slot].hash != hash || cache->recent[slot].version != entry->version ||
+        cache->recent[slot].extra != extra ||
+        memcmp(cache->recent[slot].words, words, sizeof(cache->recent[slot].words)) ||
+        memcmp(&cache->recent[slot].textures, textures, sizeof(*textures)))
+        return NULL;
+    /* (as wl_xbox_psh_cache_program finds it: used now; the last call's
+    state, which the caller's words do not give, no longer the last) */
+    cache->stamp++;
+    entry->stamp = cache->stamp;
+    cache->last_entry = NULL;
+    cache->counts.found++;
+    cache->counts.recent++;
+    *usable = entry->usable;
+    return &entry->program;
+}
+
+void wl_xbox_psh_cache_remember(WlXboxPshCache *cache, const uint32_t *words, uint32_t extra,
+                                const WlXboxPshTextures *textures) {
+    uint32_t hash;
+    unsigned slot = recent_slot(words, extra, &hash);
+
+    if (!cache->last_entry)
+        return;
+    cache->recent[slot].hash = hash;
+    cache->recent[slot].version = cache->last_entry->version;
+    cache->recent[slot].extra = extra;
+    cache->recent[slot].entry = cache->last_entry;
+    memcpy(cache->recent[slot].words, words, sizeof(cache->recent[slot].words));
+    memcpy(&cache->recent[slot].textures, textures, sizeof(*textures));
 }
 
 void wl_xbox_psh_cache_counts(const WlXboxPshCache *cache, WlXboxPshCacheCounts *out) {

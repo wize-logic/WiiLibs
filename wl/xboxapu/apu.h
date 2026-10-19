@@ -47,6 +47,9 @@ typedef struct {
     // NULL: none.
     void (*on_frame)(void *user, const int32_t *bins, const int16_t *out);
     void *on_frame_user;
+    // The voice processor's and the output mix's first, plainer code paths (the same output bit
+    // for bit; slower): for an A/B of the faster ones. false by default.
+    bool plain;
 } WlXboxApuConfig;
 
 void wl_xbox_apu_config_default(WlXboxApuConfig *cfg);

@@ -9,3 +9,7 @@
 4fd1043b 23 o 1 1L 0P 0:F3,1:F3,4:F2
 # and its form for a draw whose position is GX's transform unit's (x: v0 sent as fetched, the program's position not made)
 4fd1043b 22 x 1 1 0P 0:F3,1:F3,4:F2
+# and the program to the screen (e53b834b, which captures the clip-space position): its perspective and
+# screen forms, which a target of more than one sample a pixel runs with the viewport's in samples
+e53b834b 1 p 0 0 - 0:F3
+e53b834b 1 o 0 0 - 0:F3

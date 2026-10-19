@@ -142,6 +142,9 @@ static bool drop_array(WlNv2aVCache *cache, WlNv2aVCacheEntry *e) {
     cache->stats.bytes -= e->bytes;
     e->array = NULL;
     e->bytes = 0;
+    free(e->page_hash);
+    e->page_hash = NULL;
+    e->pages = 0;
     return true;
 }
 
@@ -253,6 +256,7 @@ void wl_nv2a_vcache_clear(WlNv2aVCache *cache) {
         if (cache->entries[i].array != NULL) {
             array_free(cache, cache->entries[i].array);
         }
+        free(cache->entries[i].page_hash);
         memset(&cache->entries[i], 0, sizeof cache->entries[i]);
         cache->entries[i].kind = 0xFFu;
     }
@@ -369,14 +373,63 @@ static uint64_t hash_source(WlNv2aVCache *cache, const uint8_t *src, uint32_t by
     return wl_nv2a_texcache_hash(0x9E3779B97F4A7C15ull, src, bytes);
 }
 
-// whether the entry's source is as it was converted; the entry checked (its watch armed again)
+// ---- the source page by page --------------------------------------------------------------------
+enum { VCACHE_PAGE = 4096u };
+
+// the guest pages the entry's source spans
+static uint32_t source_pages(const WlNv2aVCacheEntry *e) {
+    uint32_t phys = source_phys(e);
+
+    return (phys + source_bytes(e) - 1u) / VCACHE_PAGE - phys / VCACHE_PAGE + 1u;
+}
+
+// the part of the source in its page k: its offset in the source and its bytes
+static uint32_t page_part(const WlNv2aVCacheEntry *e, uint32_t k, uint32_t *bytes) {
+    uint32_t phys = source_phys(e), end = phys + source_bytes(e);
+    uint32_t from = (phys / VCACHE_PAGE + k) * VCACHE_PAGE, to = from + VCACHE_PAGE;
+
+    from = from > phys ? from : phys;
+    to = to < end ? to : end;
+    *bytes = to - from;
+    return from - phys;
+}
+
+static uint64_t hash_page(WlNv2aVCache *cache, const WlNv2aVCacheEntry *e, const uint8_t *src, uint32_t k) {
+    uint32_t bytes, at = page_part(e, k, &bytes);
+
+    return hash_source(cache, src + at, bytes);
+}
+
+// every page's hash, into a new table (NULL: no memory)
+static uint64_t *hash_pages(WlNv2aVCache *cache, const WlNv2aVCacheEntry *e, const uint8_t *src) {
+    uint64_t *pages = malloc((size_t)e->pages * sizeof *pages);
+    uint32_t k;
+
+    for (k = 0; pages != NULL && k < e->pages; k++) {
+        pages[k] = hash_page(cache, e, src, k);
+    }
+    return pages;
+}
+
+// whether the source's page k was written since `stamp`
+static bool page_written(WlNv2aVCache *cache, const WlNv2aVCacheEntry *e, uint32_t k, uint32_t stamp) {
+    uint32_t bytes, at = page_part(e, k, &bytes);
+
+    return cache->cfg.written(cache->cfg.user, source_phys(e) + at, bytes, stamp);
+}
+
+// Whether the entry's source is as it was converted; the entry checked (its watch armed again). An
+// entry hashed page by page rehashes the pages the watch found written, and when one of them changed
+// (or there is no watch to say which) all of them, into a new table (*pages_out) that is its own
+// once it is converted again.
 static bool unchanged(WlNv2aVCache *cache, WlNv2a *dev, WlNv2aVCacheEntry *e, const uint8_t **src_out,
-                      uint64_t *hash_out) {
-    uint32_t phys = source_phys(e), bytes = source_bytes(e);
+                      uint64_t *hash_out, uint64_t **pages_out) {
+    uint32_t phys = source_phys(e), bytes = source_bytes(e), before = e->stamp;
     const uint8_t *src;
     uint64_t hash;
 
     cache->stats.checks++;
+    *pages_out = NULL;
     if (e->stamp != 0 && watching(cache, dev) && !cache->cfg.written(cache->cfg.user, phys, bytes, e->stamp)) {
         cache->stats.watched++;
         return true;
@@ -387,8 +440,44 @@ static bool unchanged(WlNv2aVCache *cache, WlNv2a *dev, WlNv2aVCacheEntry *e, co
     }
     // (the watch armed before the source is read: a store from here on is seen at the next check)
     e->stamp = watching(cache, dev) ? cache->cfg.watch(cache->cfg.user, phys, bytes) : 0u;
-    hash = hash_source(cache, src, bytes);
     *src_out = src;
+    if (e->page_hash != NULL) {
+        uint64_t *pages;
+        uint32_t k;
+        bool same = true;
+
+        if (before != 0 && watching(cache, dev)) {
+            // (the pages written since the last check alone, the others as they were)
+            for (k = 0; k < e->pages; k++) {
+                if (page_written(cache, e, k, before) && hash_page(cache, e, src, k) != e->page_hash[k]) {
+                    break;
+                }
+            }
+            if (k == e->pages) {
+                cache->stats.page_checks++;
+                return true;
+            }
+        }
+        pages = hash_pages(cache, e, src);
+        if (pages != NULL) {
+            for (k = 0; k < e->pages; k++) {
+                same = same && pages[k] == e->page_hash[k];
+            }
+            if (same) {
+                free(pages);
+                return true;
+            }
+            *pages_out = pages;
+            return false;
+        }
+        // (no memory for a new table: hashed whole from here on, found changed now)
+        free(e->page_hash);
+        e->page_hash = NULL;
+        e->pages = 0;
+        *hash_out = hash_source(cache, src, bytes);
+        return false;
+    }
+    hash = hash_source(cache, src, bytes);
     *hash_out = hash;
     return hash == e->hash;
 }
@@ -429,7 +518,12 @@ static WlNv2aVCacheEntry *make(WlNv2aVCache *cache, WlNv2a *dev, const WlNv2aVCa
         return NULL;
     }
     e->stamp = watching(cache, dev) ? cache->cfg.watch(cache->cfg.user, source_phys(e), source_bytes(e)) : 0u;
-    e->hash = hash_source(cache, src, source_bytes(e));
+    e->pages = cache->cfg.whole_hash ? 1u : source_pages(e);
+    e->page_hash = e->pages > 1u ? hash_pages(cache, e, src) : NULL;
+    if (e->page_hash == NULL) {
+        e->pages = 0;
+        e->hash = hash_source(cache, src, source_bytes(e));
+    }
     e->checked_frame = cache->frame;
     convert(cache, e, src, e->array);
     cache->stats.bytes += e->bytes;
@@ -515,10 +609,11 @@ const void *wl_nv2a_vcache_get(WlNv2aVCache *cache, WlNv2a *dev, const WlNv2aAtt
         // an array the guest writes again within a frame, a ring of quads drawn range by range, is
         // otherwise drawn as it was at the frame's first check, a30's decals lost)
         const uint8_t *src = NULL;
-        uint64_t hash = 0;
+        uint64_t hash = 0, *pages = NULL;
 
-        if (!unchanged(cache, dev, e, &src, &hash)) {
+        if (!unchanged(cache, dev, e, &src, &hash, &pages)) {
             if (src == NULL || ++e->changes >= 2) {
+                free(pages);
                 // (rewritten twice, or no longer guest RAM: not kept)
                 drop_array(cache, e);
                 e->changes = 2;
@@ -537,12 +632,18 @@ const void *wl_nv2a_vcache_get(WlNv2aVCache *cache, WlNv2a *dev, const WlNv2aAtt
                     // (its array the old contents still: the watch armed by the check forgotten, so
                     // the next check hashes the source again and finds it changed, not "unwritten")
                     e->stamp = 0;
+                    free(pages);
                     cache->stats.failed++;
                     return NULL;
                 }
                 e->array = array;
             }
-            e->hash = hash;
+            if (pages != NULL) {
+                free(e->page_hash);
+                e->page_hash = pages;
+            } else {
+                e->hash = hash;
+            }
             convert(cache, e, src, e->array);
             cache->stats.reconverted++;
         }

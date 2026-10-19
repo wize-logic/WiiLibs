@@ -73,7 +73,8 @@ typedef struct WlGxDirectLayout {
     uint8_t texcoords;  // bit n: texture coordinate n is sent (GX_VA_TEXn -> GX_TEXCOORDn, identity)
     uint8_t texcoord_s; // of them, those of one component (s); the others two (s, t)
     // bit n: texture coordinate n is not sent but made by the transform unit from the position
-    // (wl_gx_direct_texgen with WL_GX_DIRECT_TG_POSITION)
+    // (wl_gx_direct_texgen with WL_GX_DIRECT_TG_POSITION) or from another coordinate's input
+    // (WL_GX_DIRECT_TG_INPUT0 + k)
     uint8_t texcoords_generated;
     // the attributes read from arrays at the vertex's index (bit WL_GX_DIRECT_ARRAY_*: the position,
     // a colour, a texture coordinate the layout has), the others sent
@@ -105,7 +106,9 @@ enum { WL_GX_DIRECT_PROJECTED = 3 };
 
 // an indexed attribute (WlGxDirectLayout.indexed's bit, wl_gx_direct_array's attribute): the
 // position, colour c (WL_GX_DIRECT_ARRAY_COLOR0 + c), texture coordinate n (..._TEXCOORD0 + n), the
-// normal of a lit layout (three big-endian floats)
+// normal of a lit layout (three big-endian floats), or what GX takes as the normal of a layout with
+// projected coordinates (the normal, or the normal, binormal and tangent: three or nine floats at one
+// index, a lit layout's normal first)
 enum {
     WL_GX_DIRECT_ARRAY_POSITION = 0,
     WL_GX_DIRECT_ARRAY_COLOR0 = 1,
@@ -139,7 +142,11 @@ void wl_gx_direct_material(unsigned c, uint32_t rgba);
 // what a texture coordinate is generated from (wl_gx_direct_texgen)
 typedef enum {
     WL_GX_DIRECT_TG_TEXCOORD = 0, // the vertex's own coordinate n, as (s, t, 1, 1)
-    WL_GX_DIRECT_TG_POSITION      // its position as sent (before the position matrix), (x, y, z, 1)
+    WL_GX_DIRECT_TG_POSITION,     // its position as sent (before the position matrix), (x, y, z, 1)
+    // the numbers the vertex sends for coordinate k (WL_GX_DIRECT_TG_INPUT0 + k, one the layout sends), as
+    // (s, t, 1, 1): a generated coordinate (WlGxDirectLayout.texcoords_generated) made from another one's
+    // input, several coordinates from one pair of numbers sent
+    WL_GX_DIRECT_TG_INPUT0
 } WlGxDirectTexSource;
 
 // Starts direct drawing: wl_gx's shadow and this layer's are marked unknown, the position matrix 0
@@ -166,6 +173,11 @@ void wl_gx_direct_primitive_end(void);
 // its bytes r, g, b, a, a texture coordinate its one or two big-endian floats. Set it after the
 // layout.
 void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride);
+// The same for an array whose elements are words as wl_gx_direct_vertex_words takes them, each a
+// uint32_t in the processor's own order (a renderer's vertices made once and sent again by index:
+// the attribute's words at data + i * stride). On the Wii these are the bytes wl_gx_direct_array
+// describes; the host reads them as the processor wrote them.
+void wl_gx_direct_array_words(unsigned attribute, const void *data, uint32_t stride);
 // A vertex of the layout set with indexed attributes: `index` (into every array) for each of them,
 // `count` words for the others, as wl_gx_direct_vertex_words takes them (the attributes the layout
 // sends, in its order, the indexed ones left out).
@@ -211,6 +223,10 @@ typedef struct {
     bool regions_libogc; // libogc's texture cache regions (32K + 32K a map; not 128K + 128K for maps 0-2)
     bool tex_whole;      // a bind that changes anything is GX_LoadTexObj's whole load (not only its registers that differ)
     bool arrays_always;  // GX_SetArray at each call (not only when its base or stride differs)
+    bool pillarbox;      // a 16:9 pillarbox narrowed by a copy of the finished picture (wl_gx_draw_narrow refused)
+    // a picture drawn narrow in the framebuffer's middle columns, as shown, and copied to the screen whole (not in
+    // its last columns, the display copy taking those alone into the screen's middle: wl_gx_draw_narrow)
+    bool narrow_mid;
 } WlGxBisect;
 void wl_gx_bisect_set(const WlGxBisect *bisect);
 // The switches set (all off before wl_gx_bisect_set).

@@ -153,6 +153,7 @@ typedef struct WlNv2aGxStats {
     uint32_t xf_draws;            // draws whose vertices GX's transform unit transformed
     uint32_t xf_vertices;         // ...and their vertices
     uint32_t xf_position_draws;   // draws whose positions alone it transformed (the rest the program's)
+    uint32_t xf_texgen_draws, xf_texgen_vertices; // draws whose coordinates GX made from an input (texgen_xf_plan)
     uint32_t xf_lit_draws;        // of the xf draws, those whose colours GX lit from a normal
     // of the processor's draws, those whose d0 GX lit from the normal a lit fused form sent, and
     // their vertices (no_xf_skin)
@@ -175,6 +176,11 @@ typedef struct WlNv2aGxStats {
     // position-alone draws whose positions GX read from the vertex cache's arrays, and their vertices
     uint32_t position_indexed_draws, position_indexed_vertices;
     uint32_t probes_kept;         // the program's outputs for fixed inputs kept from a draw before (draw cuts)
+    // the processor's draws whose vertices GX read from their slots by index ("nomadeindex"), their
+    // vertices sent, the slots their vertices were made into; the draws refused slots (too large, or
+    // no ring) and those whose layout the slots did not match (sent whole); the ring's fences, the
+    // waits for GX to pass one, its laps
+    uint32_t made_draws, made_sent, made_vertices, made_refused, made_unmatched, made_fences, made_waits, made_laps;
 } WlNv2aGxStats;
 
 // The draw path's cuts of 2026-10-18 (on by default): the program's outputs for fixed inputs kept
@@ -190,8 +196,11 @@ void wl_nv2a_gx_set_draw_cuts(bool on);
 // projection fitted from its own vertices, no fit kept for its transform within the frame),
 // "nocolorreg" (an indexed draw's constant colour sent with each vertex, not GX's channel register),
 // "noposindex" (a draw with its position alone on GX's transform unit sends the position's floats,
-// not an index into the vertex cache's array of them). Call it
-// before wl_nv2a_gx_create.
+// not an index into the vertex cache's array of them), "nomadeindex" (the processor's vertices sent
+// whole each time their index comes, not made once into a ring GX reads them from by index),
+// "nopagehash" (a vertex array's source hashed whole when the write watch fires, not the pages it
+// found written alone), "noindexbounds" (a draw's least and greatest index found by a pass over its
+// indices, not as they come). Call it before wl_nv2a_gx_create.
 void wl_nv2a_gx_set_switches(const char *title_dir);
 
 // A backend over GX, which must be up (wl_gx_init). NULL when there is no memory. The device it

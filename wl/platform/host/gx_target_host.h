@@ -7,10 +7,10 @@
 
 typedef enum {
     WL_HOST_TARGET_COPY_BEGIN = 0, // a run of copies out of the EFB starts (the copy filter off)
-    WL_HOST_TARGET_COPY,           // one copy: dst, w x h, what
+    WL_HOST_TARGET_COPY,           // one copy: dst, w x h from column x of the first row, what
     WL_HOST_TARGET_COPY_END,       // ...and ends (the filter back on, the texture cache invalidated)
-    WL_HOST_TARGET_SCISSOR,        // (0, 0, w, h)
-    WL_HOST_TARGET_RESTORE,        // the parked colour and depth over the EFB: colour, depth, w x h, back buffer's size
+    WL_HOST_TARGET_SCISSOR,        // (x, 0, w, h)
+    WL_HOST_TARGET_RESTORE,        // the parked colour and depth over the EFB: colour, depth, w x h at column x, back buffer's size
     WL_HOST_TARGET_CLEAR,          // a clear quad
     WL_HOST_TARGET_SQUEEZE         // the finished back buffer narrowed: colour block, x, w, back buffer's size
 } WlHostTargetOpKind;
@@ -20,7 +20,7 @@ typedef struct {
     uint8_t what;           // WlGxTargetCopy of a COPY
     bool colour, depth;     // a CLEAR's
     uint32_t w, h;          // a COPY's, a SCISSOR's and a RESTORE's size; a CLEAR's rectangle size
-    int32_t x, y;           // a CLEAR's rectangle origin
+    int32_t x, y;           // a CLEAR's rectangle origin; the column of a COPY, a SCISSOR, a RESTORE
     uint32_t back_w, back_h; // a CLEAR's and a RESTORE's back buffer
     uint32_t rgba;          // a CLEAR's colour
     float z;                // a CLEAR's depth

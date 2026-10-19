@@ -100,7 +100,17 @@ them: 49 400 instructions a frame playing, 24 200 silent (930 a voice: a silent 
 interpolated or mixed, but its samples are still fetched and its ADPCM decoded, to keep its
 position, its stream's notifications and the two samples it resumes from exact) and 2 200 paused
 (85 a voice). In the game (Dolphin, the profile's log) 12 to 17 voices a frame cost 20 to 29 us,
-3 to 4% of the processor at 1500 frames a second.
+3 to 4% of the processor at 1500 frames a second. Since 2026-10-18 (ppc-be -O3): 47 600 playing,
+22 900 silent, 1 600 paused (from 49 250, 24 000, 2 200): ADPCM's table holds each entry's next row
+as a pointer and its clamp is one compare, the stereo mix sums two bins a pass, and a voice's held
+gains are queued without the ramp checks. `WlXboxApuConfig.plain` (the runtime: a file `apuplain` in
+the title folder, `WL_XB_APU_PLAIN=1` on the host; the bench: `BENCH_PLAIN=1`) runs the earlier
+paths, for an A/B: the same bins and output, bit for bit (`bench_xboxapu_plain`).
+
+In Halo (a deterministic host run of a10's menu and opening, 100 s of sound) a frame has 8.7 voices:
+77% ADPCM, 70% streams, a fifth with a silent source; 1.8 ADPCM blocks are decoded a frame, and a
+block's bytes come again in 9% of decodes within 64 blocks, 15% within 1024: too few for a decode
+cache to pay for its lookups.
 
 ## Tests
 

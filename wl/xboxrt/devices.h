@@ -57,6 +57,9 @@ typedef struct {
     const char *wav_path;     // the host: a WAV of the output (NULL: none)
     const char *trace_path;   // the host: the MMIO trace (NULL: none)
     const char *hash_path;    // the host: the mixbin and output checksums (NULL: none)
+    // the APU model's first, plainer code paths (WlXboxApuConfig.plain: the same output, slower;
+    // the file "apuplain" in the title folder, WL_XB_APU_PLAIN=1 on the host)
+    bool apu_plain;
 } WlXbAudioConfig;
 void wl_xb_audio_config_default(WlXbAudioConfig *cfg);
 // Call after wl_xb_devices_register_mcpx. WL_ERR_UNSUPPORTED in a build without wl/xboxapu.

@@ -254,11 +254,93 @@ TEST a_translation_by_way_is_the_translation(void) {
     PASS();
 }
 
+// the caller's own words for a combiner state (any function of them: here the state's words turned)
+static void words_of(const uint32_t *state, uint32_t *words) {
+    for (int i = 0; i < WL_XBOX_PSH_WORDS; i++) {
+        words[i] = state[i] ^ 0x5A5A5A5Au;
+    }
+}
+
+// wl_xbox_psh_cache_recent: the program a remembered call found, for the same words, extra word and
+// textures, while its entry is unchanged; NULL for other words, another extra word or other textures,
+// and once its entry was patched (its constants changed within the signature: the program the entry
+// holds is another state's) or evicted (the entry another program's)
+TEST the_recent_calls_found_by_the_callers_words(void) {
+    static uint32_t state[WL_XBOX_PSH_WORDS], changed[WL_XBOX_PSH_WORDS], words[WL_XBOX_PSH_WORDS],
+        other[WL_XBOX_PSH_WORDS], flood[WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures, changed_textures, flood_textures, other_textures;
+    WlXboxPshCacheCounts before, after;
+    const WlXboxPshProgram *program, *found;
+    bool usable, found_usable, translated;
+    int n, patched = 0;
+
+    wl_xbox_psh_cache_init(&g_cache, NULL);
+    // (a program whose structure the cache patches: a constant change within its signature)
+    for (n = 0; n < 200 && !patched; n++) {
+        program_random(state, &textures);
+        words_of(state, words);
+        program = wl_xbox_psh_cache_program(&g_cache, state, 3, &textures, &usable, &translated);
+        wl_xbox_psh_cache_remember(&g_cache, words, 3, &textures);
+        // a hit: the program the call found, counted
+        wl_xbox_psh_cache_counts(&g_cache, &before);
+        found_usable = !usable;
+        found = wl_xbox_psh_cache_recent(&g_cache, words, 3, &textures, &found_usable);
+        ASSERT(found == program);
+        ASSERT_EQ(usable, found_usable);
+        wl_xbox_psh_cache_counts(&g_cache, &after);
+        ASSERT_EQ(before.recent + 1ul, after.recent);
+        ASSERT_EQ(before.found + 1ul, after.found);
+        ASSERT(wl_xbox_psh_translate(state, &textures, NULL, &g_fresh) == usable);
+        ASSERT(!usable || !memcmp(found, &g_fresh, sizeof g_fresh));
+        // a miss: other words, another extra word, other textures
+        memcpy(other, words, sizeof other);
+        other[WL_XBOX_PSH_COMBINER_COUNT] ^= 1u;
+        ASSERT(wl_xbox_psh_cache_recent(&g_cache, other, 3, &textures, &found_usable) == NULL);
+        ASSERT(wl_xbox_psh_cache_recent(&g_cache, words, 4, &textures, &found_usable) == NULL);
+        other_textures = textures;
+        other_textures.fog ^= 1u;
+        ASSERT(wl_xbox_psh_cache_recent(&g_cache, words, 3, &other_textures, &found_usable) == NULL);
+        // the entry patched for other constants: a miss for the first state's words
+        memcpy(changed, state, sizeof changed);
+        changed_textures = textures;
+        constants_change(changed, &changed_textures, true);
+        if (!memcmp(changed, state, sizeof changed) && !memcmp(&changed_textures, &textures, sizeof textures)) {
+            continue;
+        }
+        wl_xbox_psh_cache_counts(&g_cache, &before);
+        (void)wl_xbox_psh_cache_program(&g_cache, changed, 3, &changed_textures, &usable, &translated);
+        wl_xbox_psh_cache_counts(&g_cache, &after);
+        if (after.patched == before.patched) {
+            continue;
+        }
+        patched = 1;
+        ASSERT(wl_xbox_psh_cache_recent(&g_cache, words, 3, &textures, &found_usable) == NULL);
+    }
+    ASSERT(patched);
+    // remembered again, then more structures than the cache holds: the entry evicted, a miss
+    program = wl_xbox_psh_cache_program(&g_cache, state, 3, &textures, &usable, &translated);
+    wl_xbox_psh_cache_remember(&g_cache, words, 3, &textures);
+    ASSERT(wl_xbox_psh_cache_recent(&g_cache, words, 3, &textures, &found_usable) == program);
+    wl_xbox_psh_cache_counts(&g_cache, &before);
+    for (n = 0; n < 2 * WL_XBOX_PSH_CACHE_SETS * WL_XBOX_PSH_CACHE_WAYS; n++) {
+        program_random(flood, &flood_textures);
+        (void)wl_xbox_psh_cache_program(&g_cache, flood, 3, &flood_textures, &usable, &translated);
+    }
+    wl_xbox_psh_cache_counts(&g_cache, &after);
+    ASSERT(after.evicted > before.evicted + WL_XBOX_PSH_CACHE_SETS * WL_XBOX_PSH_CACHE_WAYS);
+    ASSERT(wl_xbox_psh_cache_recent(&g_cache, words, 3, &textures, &found_usable) == NULL);
+    // (and the state itself made again, as wl_xbox_psh_cache_program gives it)
+    program = wl_xbox_psh_cache_program(&g_cache, state, 3, &textures, &usable, &translated);
+    ASSERT(translated);
+    PASS();
+}
+
 SUITE(psh_cache_suite) {
     RUN_TEST(a_translation_by_way_is_the_translation);
     RUN_TEST(cached_programs_are_fresh_translations);
     RUN_TEST(the_last_call_and_the_extra_word);
     RUN_TEST(the_cache_translates_through_its_recipe);
+    RUN_TEST(the_recent_calls_found_by_the_callers_words);
 }
 
 GREATEST_MAIN_DEFS();

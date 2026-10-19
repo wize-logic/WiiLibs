@@ -570,9 +570,101 @@ static void out_side(WlXboxApu *apu, const int32_t *acc, int16_t *out) {
     }
 }
 
+// bin17 for the faster mix: a sample within 17 bits (nearly all) is told by one compare.
+static inline int32_t bin17_fast(int32_t v) {
+    if (__builtin_expect((uint32_t)(v + 65535) > 131070u, 0)) {
+        v = v > 0 ? 65535 : -65535;
+    }
+    return v;
+}
+
+// One side's sum into acc (written, not added: 0 where no bin is): the bins in `bins` two at a
+// time (acc is read and written once a pair), the bins at full weight without the multiply. The
+// same sums as mix_side's (integer adds: the order changes nothing).
+static void mix_side_fast(const WlXboxApu *apu, uint32_t bins, const uint16_t *weight,
+                          int32_t *restrict acc) {
+    const int32_t *unit[WL_XBOX_APU_BINS], *part[WL_XBOX_APU_BINS];
+    int32_t g[WL_XBOX_APU_BINS];
+    uint32_t nu = 0, np = 0;
+    for (; bins != 0; bins &= bins - 1u) {
+        const uint32_t b = (uint32_t)__builtin_ctz(bins);
+        if (weight[b] == 32768u) {
+            unit[nu++] = apu->mix[b];
+        } else {
+            g[np] = weight[b];
+            part[np++] = apu->mix[b];
+        }
+    }
+    uint32_t k = 0;
+    if (nu >= 2u) {
+        const int32_t *restrict b0 = unit[0], *restrict b1 = unit[1];
+        for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
+            acc[i] = bin17_fast(b0[i]) + bin17_fast(b1[i]);
+        }
+        k = 2;
+    } else if (nu == 1u) {
+        const int32_t *restrict b0 = unit[0];
+        for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
+            acc[i] = bin17_fast(b0[i]);
+        }
+        k = 1;
+    } else if (np == 0) {
+        for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
+            acc[i] = 0;
+        }
+        return;
+    } else {
+        const int32_t *restrict b0 = part[0];
+        const int32_t g0 = g[0];
+        for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
+            acc[i] = (bin17_fast(b0[i]) * g0) >> 15;
+        }
+        part[0] = NULL;
+    }
+    for (; k + 2u <= nu; k += 2u) {
+        const int32_t *restrict b0 = unit[k], *restrict b1 = unit[k + 1u];
+        for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
+            acc[i] += bin17_fast(b0[i]) + bin17_fast(b1[i]);
+        }
+    }
+    if (k < nu) {
+        const int32_t *restrict b0 = unit[k];
+        for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
+            acc[i] += bin17_fast(b0[i]);
+        }
+    }
+    uint32_t j = part[0] == NULL ? 1u : 0u;
+    for (; j + 2u <= np; j += 2u) {
+        const int32_t *restrict b0 = part[j], *restrict b1 = part[j + 1u];
+        const int32_t g0 = g[j], g1 = g[j + 1u];
+        for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
+            acc[i] += ((bin17_fast(b0[i]) * g0) >> 15) + ((bin17_fast(b1[i]) * g1) >> 15);
+        }
+    }
+    if (j < np) {
+        const int32_t *restrict b0 = part[j];
+        const int32_t g0 = g[j];
+        for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
+            acc[i] += (bin17_fast(b0[i]) * g0) >> 15;
+        }
+    }
+}
+
 static void mix_out(WlXboxApu *apu, int16_t *out) {
     // the bins mixed this frame with a weight on a side (the others add nothing to it)
     int32_t l[WL_XBOX_APU_FRAME], r[WL_XBOX_APU_FRAME];
+    if (!apu->cfg.plain) {
+        const uint32_t left = apu->out_left & apu->mix_used, right = apu->out_right & apu->mix_used;
+        if ((left | right) == 0) { // nothing sounds: silence (nothing clips)
+            memset(out, 0, WL_XBOX_APU_FRAME * 2u * sizeof *out);
+            return;
+        }
+        mix_side_fast(apu, left, apu->cfg.mix_left, l);
+        mix_side_fast(apu, right, apu->cfg.mix_right, r);
+        out_side(apu, l, out);
+        out_side(apu, r, out + 1);
+        return;
+    }
     for (uint32_t i = 0; i < WL_XBOX_APU_FRAME; i++) {
         l[i] = r[i] = 0;
     }

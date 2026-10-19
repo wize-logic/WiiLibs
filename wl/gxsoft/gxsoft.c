@@ -100,6 +100,10 @@ static struct {
     uint8_t *color; // EFB_W * EFB_H * 4, as the pixels read back
     uint32_t *depth;
     uint32_t clear_rgba;
+    // the display copy's rectangle (display_rect): the EFB's columns [disp_x, disp_x + disp_w) shown from
+    // column disp_dst (disp_w 0: all of it), and whether it changed since the last frame began
+    uint32_t disp_x, disp_w, disp_dst;
+    bool disp_changed;
     WlGxSoftStats stats;
     uint32_t draw_index;
     uint32_t use;
@@ -602,10 +606,19 @@ static void vertex_transform(const Plan *plan, const WlGxDirectVertex *v, float 
             const float (*m)[4] = plan->st->texgen[n].m;
             float in[4];
 
+            unsigned from = plan->st->texgen[n].source >= WL_GX_DIRECT_TG_INPUT0 &&
+                                    plan->st->texgen[n].source < WL_GX_DIRECT_TG_INPUT0 + 8u
+                                ? (unsigned)plan->st->texgen[n].source - (unsigned)WL_GX_DIRECT_TG_INPUT0
+                                : n;
+
             if (plan->st->texgen[n].source == WL_GX_DIRECT_TG_POSITION) {
                 in[0] = v->position[0], in[1] = v->position[1], in[2] = v->position[2], in[3] = 1.0f;
             } else {
-                in[0] = v->texcoord[n][0], in[1] = v->texcoord[n][1], in[2] = 1.0f, in[3] = 1.0f;
+                // (its own coordinate's numbers, or another's: WL_GX_DIRECT_TG_INPUT0 + k; one of a
+                // single component (s) has t 0)
+                in[0] = v->texcoord[from][0];
+                in[1] = (plan->st->layout.texcoord_s & (1u << from)) ? 0.0f : v->texcoord[from][1];
+                in[2] = 1.0f, in[3] = 1.0f;
             }
             t[0] = m[0][0] * in[0] + m[0][1] * in[1] + m[0][2] * in[2] + m[0][3] * in[3];
             t[1] = m[1][0] * in[0] + m[1][1] * in[1] + m[1][2] * in[2] + m[1][3] * in[3];
@@ -1226,7 +1239,7 @@ static void on_copy(void *user, int x, int y, uint32_t w, uint32_t h, void *dst,
     textures_unchecked();
 }
 
-static void on_restore(void *user, const void *colour, const void *depth, uint32_t w, uint32_t h) {
+static void on_restore(void *user, const void *colour, const void *depth, int x0, uint32_t w, uint32_t h) {
     const uint8_t *c = colour, *d = depth;
     const WlHostGxDirect *st = wl_host_gx_direct();
     uint32_t x, y, sx1 = st->scissor[0] + st->scissor[2], sy1 = st->scissor[1] + st->scissor[3];
@@ -1235,13 +1248,17 @@ static void on_restore(void *user, const void *colour, const void *depth, uint32
     if (g.color == NULL) {
         return;
     }
+    if (x0 < 0) {
+        return;
+    }
     for (y = 0; y < h && y < EFB_H; y++) {
-        for (x = 0; x < w && x < EFB_W; x++) {
-            size_t i = (size_t)y * EFB_W + x, o = tile_offset(x, y, w, 4, 4, 64);
+        for (x = 0; x < w && x + (uint32_t)x0 < EFB_W; x++) {
+            uint32_t ex = x + (uint32_t)x0; // (the EFB's column)
+            size_t i = (size_t)y * EFB_W + ex, o = tile_offset(x, y, w, 4, 4, 64);
             uint32_t k = (y % 4u) * 4u + x % 4u;
             uint8_t px[4];
 
-            if (x < st->scissor[0] || y < st->scissor[1] || x >= sx1 || y >= sy1) {
+            if (ex < st->scissor[0] || y < st->scissor[1] || ex >= sx1 || y >= sy1) {
                 continue;
             }
             g.stats.restored++;
@@ -1317,8 +1334,23 @@ static void on_frame_begin(void *user, uint32_t clear_rgba) {
     (void)user;
     g.clear_rgba = clear_rgba;
     if (g.color != NULL) {
-        efb_fill(0, 0, (int)EFB_W, (int)EFB_H, true, clear_rgba, true, Z_FAR);
+        // (the display copy's clear: of its columns alone with a narrow one, as the console's)
+        bool all = g.disp_w == 0u || g.disp_changed;
+        efb_fill(all ? 0 : (int)g.disp_x, 0, all ? (int)EFB_W : (int)(g.disp_x + g.disp_w), (int)EFB_H, true,
+                 clear_rgba, true, Z_FAR);
     }
+    g.disp_changed = false;
+}
+
+static void on_display_rect(void *user, uint32_t src_x, uint32_t src_w, uint32_t dst_x) {
+    (void)user;
+    if (src_x + src_w > EFB_W) {
+        src_w = 0;
+    }
+    g.disp_changed = g.disp_changed || src_x != g.disp_x || src_w != g.disp_w || dst_x != g.disp_dst;
+    g.disp_x = src_w != 0u ? src_x : 0u;
+    g.disp_w = src_w;
+    g.disp_dst = src_w != 0u ? dst_x : 0u;
 }
 
 static void on_frame_end(void *user, uint32_t width, uint32_t height) {
@@ -1334,8 +1366,23 @@ static void on_frame_end(void *user, uint32_t width, uint32_t height) {
         uint32_t y;
 
         if (picture != NULL) {
-            for (y = 0; y < height; y++) {
-                memcpy(picture + (size_t)y * width * 4u, g.color + (size_t)y * EFB_W * 4u, (size_t)width * 4u);
+            if (g.disp_w != 0u && g.disp_dst + g.disp_w <= width) {
+                // (a narrow display copy: its columns into the picture's, the rest the XFB's black bars)
+                for (y = 0; y < height; y++) {
+                    uint8_t *row = picture + (size_t)y * width * 4u;
+                    uint32_t x;
+
+                    for (x = 0; x < width; x++) {
+                        row[x * 4u] = row[x * 4u + 1u] = row[x * 4u + 2u] = 0;
+                        row[x * 4u + 3u] = 0xFF;
+                    }
+                    memcpy(row + (size_t)g.disp_dst * 4u, g.color + ((size_t)y * EFB_W + g.disp_x) * 4u,
+                           (size_t)g.disp_w * 4u);
+                }
+            } else {
+                for (y = 0; y < height; y++) {
+                    memcpy(picture + (size_t)y * width * 4u, g.color + (size_t)y * EFB_W * 4u, (size_t)width * 4u);
+                }
             }
             g.cfg.frame(g.cfg.user, picture, width, height);
             free(picture);
@@ -1408,6 +1455,7 @@ WlResult wl_gxsoft_attach(const WlGxSoftConfig *cfg) {
     r.peek_z = on_peek_z;
     r.efb_alpha = on_efb_alpha;
     r.texture_invalidate = on_texture_invalidate;
+    r.display_rect = on_display_rect;
     wl_host_gx_set_renderer(&r);
     g.attached = true;
     return WL_OK;

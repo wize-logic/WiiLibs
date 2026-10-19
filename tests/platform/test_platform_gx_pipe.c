@@ -223,12 +223,39 @@ TEST indexed_vertex_of_many_items_is_walked(void) {
     PASS();
 }
 
+// every attribute indexed, one to twelve of them (a renderer's made vertices read back by index), the
+// indices given or the vertices' own numbers
+TEST all_indexed_vertices_of_every_size(void) {
+    static Rec got, want;
+    static const uint32_t indices[5] = {300, 301, 377, 300, 302};
+    uint8_t order[12] = {0};
+    unsigned items, pass;
+
+    make_vertices();
+    for (items = 1; items <= 12; items++) {
+        for (pass = 0; pass < 2; pass++) {
+            const uint32_t *ix = pass == 0 ? indices : NULL;
+
+            memset(&got, 0, sizeof got);
+            memset(&want, 0, sizeof want);
+            wl_gx_pipe_vertices_index(&got, order, items, ix, 300, 5, NULL, 0);
+            reference_index(&want, order, items, ix, 300, 5, NULL, 0);
+            ASSERT(same(&got, &want));
+            memset(&got, 0, sizeof got);
+            wl_gx_pipe_vertices_index64(&got, order, items, ix, 300, 5, NULL, 0);
+            ASSERT(same(&got, &want));
+        }
+    }
+    PASS();
+}
+
 SUITE(gx_pipe_suite) {
     RUN_TEST(vertices_words_match_the_plain_loop);
     RUN_TEST(one_vertex_matches_the_plain_loop);
     RUN_TEST(indexed_vertices_match_the_plain_loop);
     RUN_TEST(indexed_vertices_of_every_small_shape);
     RUN_TEST(indexed_vertex_of_many_items_is_walked);
+    RUN_TEST(all_indexed_vertices_of_every_size);
 }
 
 GREATEST_MAIN_DEFS();

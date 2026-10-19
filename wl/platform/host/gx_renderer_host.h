@@ -35,8 +35,8 @@ typedef struct WlHostGxRenderer {
     // (tile-ordered, wl_gx_tex_bytes long), the rectangle cleared afterwards to the frame's clear
     // colour and the far depth when `clear`
     void (*copy)(void *user, int x, int y, uint32_t w, uint32_t h, void *dst, unsigned format, bool clear);
-    // a parked colour (RGBA8) and depth (Z24X8), `w` by `h`, written back at the EFB's origin
-    void (*restore)(void *user, const void *colour, const void *depth, uint32_t w, uint32_t h);
+    // a parked colour (RGBA8) and depth (Z24X8), `w` by `h`, written back at column `x` of the EFB's first row
+    void (*restore)(void *user, const void *colour, const void *depth, int x, uint32_t w, uint32_t h);
     // a clear quad over (x, y) `w` by `h`: colour and alpha where `colour`, depth where `depth`
     // (within the scissor)
     void (*clear)(void *user, bool colour, bool depth, uint32_t rgba, float z, int x, int y, int w, int h);
@@ -50,6 +50,11 @@ typedef struct WlHostGxRenderer {
     void (*efb_alpha)(void *user, bool on);
     // GX's texture cache emptied (wl_gx_direct_texture_invalidate, wl_gx_tex_invalidate)
     void (*texture_invalidate)(void *user);
+    // the display copy's rectangle from the next frame on (wl_gx_draw_narrow): the EFB's columns [src_x, src_x +
+    // src_w) shown from column dst_x of frame_end's picture, black beside them (the XFB's bars, never written),
+    // and the only columns the copy clears for the next frame (frame_begin's clear; the frame after a change
+    // clears all of the EFB, as the copy before it did). src_w 0: all of the EFB, as without it
+    void (*display_rect)(void *user, uint32_t src_x, uint32_t src_w, uint32_t dst_x);
 } WlHostGxRenderer;
 
 // Sets the renderer (copied), or none for NULL. Any member may be NULL.

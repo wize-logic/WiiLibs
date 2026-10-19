@@ -88,6 +88,7 @@
 #include "wl/codec/gx_tex.h"
 #include "wl/gxsoft/gxsoft.h"
 #include "wl/gxtex/gxtex.h"
+#include "wl/platform/gx_target.h"
 #include "wl/platform/host/gx_direct_host.h"
 #include "wl/platform/host/gx_renderer_host.h"
 #include "wl/platform/host/tev_host.h"
@@ -1049,12 +1050,12 @@ static void vertex_cache_line(const char *prefix) {
     }
     wl_nv2a_vcache_stats(wl_nv2a_gx_vertex_cache(g_gx), &vs);
     wl_nv2a_gx_stats(g_gx, &gs);
-    printf("%svertex arrays: %u draws (%u vertices) sent as indices; %u lookups, %u checks (%u by the write watch), "
+    printf("%svertex arrays: %u draws (%u vertices) sent as indices; %u lookups, %u checks (%u by the write watch, %u by the pages it found written), "
            "%u hashes (%llu bytes), %u converted (%llu elements), %u made again, %u refused, %u evicted, %u failed, "
            "%u waits for GX; "
            "%u KB kept (%u KB at most), %u KB drawn in a frame at most\n",
            prefix, (unsigned)gs.indexed_draws, (unsigned)gs.indexed_vertices, (unsigned)vs.lookups, (unsigned)vs.checks,
-           (unsigned)vs.watched, (unsigned)vs.hashed, (unsigned long long)vs.hashed_bytes, (unsigned)vs.converted,
+           (unsigned)vs.watched, (unsigned)vs.page_checks, (unsigned)vs.hashed, (unsigned long long)vs.hashed_bytes, (unsigned)vs.converted,
            (unsigned long long)vs.converted_elements, (unsigned)vs.reconverted, (unsigned)vs.refused,
            (unsigned)vs.evicted, (unsigned)vs.failed, (unsigned)vs.gpu_waits, (unsigned)(vs.bytes >> 10), (unsigned)(vs.peak_bytes >> 10),
            (unsigned)(vs.peak_frame_bytes >> 10));
@@ -1138,6 +1139,8 @@ static void bisect_from_env(void) {
     bisect.regions_libogc = getenv("WL_XB_GX_REGIONS") != NULL;
     bisect.tex_whole = getenv("WL_XB_TEX_WHOLE") != NULL;
     bisect.arrays_always = getenv("WL_XB_ARRAYS_ALL") != NULL;
+    bisect.pillarbox = getenv("WL_XB_PILLARBOX") != NULL;
+    bisect.narrow_mid = getenv("WL_XB_NARROW_MID") != NULL;
     wl_gx_bisect_set(&bisect);
 }
 
@@ -1225,11 +1228,31 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
             }
             printf("; state %.0f, all %.0f\n", all - (double)ds.fifo[7] * per, all);
         }
+        {
+            // the copies out of the EFB a frame by kind, in bytes (the display copy, 640x480 into the XFB, is
+            // one a frame whatever the rest)
+            WlGxTargetStats ts;
+            double per = 1.0 / ((double)runs * frames);
+
+            wl_gx_target_stats(&ts, false);
+            printf("bench: EFB copy bytes a frame: park %.0f, park depth %.0f, resolve %.0f, kept frames %.0f, "
+                   "squeeze %.0f, all %.0f (%.2f copies); parks %.2f (%.2f over the bars alone), restores %.2f "
+                   "(%.0f pixels), bar clears %.2f, clear quads %.2f (%.0f pixels)\n",
+                   (double)ts.park_bytes * per, (double)ts.depth_bytes * per, (double)ts.resolve_bytes * per,
+                   (double)xs.efb_copy_bytes * per, (double)ts.squeeze_bytes * per,
+                   (double)(ts.park_bytes + ts.depth_bytes + ts.resolve_bytes + xs.efb_copy_bytes + ts.squeeze_bytes) *
+                       per,
+                   (double)xs.efb_copies * per, ts.parks * per, ts.bars_parks * per, ts.restores * per,
+                   (double)ts.restored_pixels * per, ts.bar_clears * per, ts.clears * per,
+                   (double)ts.clear_pixels * per);
+        }
     }
     {
         WlNv2aGxStats gs;
 
         wl_nv2a_gx_stats(g_gx, &gs);
+        printf("bench: reads of the picture being drawn that no park served in all runs: %u\n",
+               (unsigned)gs.screen_reads_unserved);
         printf("bench: %u draws (%u vertices) through GX's transform unit in all runs (%u lit by it), %u more for "
                "their position alone (%u of them, %u vertices, read it from the vertex cache)\n",
                (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_lit_draws,
@@ -1276,6 +1299,10 @@ static int bench(const uint8_t *data, size_t size, unsigned runs) {
 
         wl_nv2a_gx_stats(g_gx, &fs);
         printf("bench: %u vertices made by fused batches in all runs\n", (unsigned)fs.vertices_fused);
+        printf("bench: made vertices read by index: %u draws, %u vertices sent, %u slots made; %u draws refused, "
+               "%u unmatched; %u fences, %u waits, %u laps\n",
+               (unsigned)fs.made_draws, (unsigned)fs.made_sent, (unsigned)fs.made_vertices, (unsigned)fs.made_refused,
+               (unsigned)fs.made_unmatched, (unsigned)fs.made_fences, (unsigned)fs.made_waits, (unsigned)fs.made_laps);
     }
     fused_forms_print();
     wl_nv2a_gx_destroy(g_gx);
@@ -1511,8 +1538,9 @@ int main(int argc, char **argv) {
                (unsigned)gs.xf_draws, (unsigned)gs.xf_vertices, (unsigned)gs.xf_position_draws,
                (unsigned)gs.projected_draws, (unsigned)gs.vertices_reused);
         printf("            %u vertices made by fused batches; %u draws (%u vertices) of them lit by GX from the "
-               "normal sent\n",
-               (unsigned)gs.vertices_fused, (unsigned)gs.skin_lit_draws, (unsigned)gs.skin_lit_vertices);
+               "normal sent, %u (%u vertices) with coordinates GX made from an input\n",
+               (unsigned)gs.vertices_fused, (unsigned)gs.skin_lit_draws, (unsigned)gs.skin_lit_vertices,
+               (unsigned)gs.xf_texgen_draws, (unsigned)gs.xf_texgen_vertices);
         printf("            %u draws counted without drawing (they write nothing; %u depth-tested), %u skipped; %u kept "
                "the raster state, %u the textures, %u the pixel program\n",
                (unsigned)gs.unwritten_counted, (unsigned)gs.queries_tested, (unsigned)gs.unwritten_skipped, (unsigned)gs.raster_kept,

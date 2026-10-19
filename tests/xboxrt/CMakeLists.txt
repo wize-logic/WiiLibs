@@ -32,6 +32,25 @@ wl_target_defaults(bench_gpu_wait)
 target_link_libraries(bench_gpu_wait PRIVATE wl_xboxrt)
 add_test(NAME bench_gpu_wait_runs COMMAND bench_gpu_wait 1000)
 set_tests_properties(bench_gpu_wait_runs PROPERTIES LABELS "unit;be")
+# The write watch's look as the GPU's caches make it (wl_xb_phys_written over ranges a frame):
+# tools/qemu_icount.py counts it on ppc-be; the old look ("old") must answer the same.
+add_executable(bench_pg_written bench_pg_written.c)
+wl_target_defaults(bench_pg_written)
+target_link_libraries(bench_pg_written PRIVATE wl_xboxrt)
+add_test(NAME bench_pg_written_runs COMMAND bench_pg_written 20)
+add_test(NAME bench_pg_written_old_runs COMMAND bench_pg_written 20 old)
+set_tests_properties(bench_pg_written_runs bench_pg_written_old_runs PROPERTIES LABELS "unit;be"
+    PASS_REGULAR_EXPRESSION "40960 looks, 80 written")
+# A safe point with nothing due (a thread ready below the holder keeps the attention up):
+# tools/qemu_icount.py counts it on ppc-be.
+add_executable(bench_safe_point bench_safe_point.c)
+wl_target_defaults(bench_safe_point)
+target_link_libraries(bench_safe_point PRIVATE wl_xboxrt)
+add_test(NAME bench_safe_point_runs COMMAND bench_safe_point 1000)
+set_tests_properties(bench_safe_point_runs PROPERTIES LABELS "unit;be")
+# A lock holder that lowers its own priority below a ready thread hands it the lock at its next safe
+# point, with quiet safe points and without (the switch fullsafe).
+wl_add_test(test_xboxrt_lower_priority SOURCES test_xboxrt_lower_priority.c LIBS wl_xboxrt LABELS unit be)
 # The page packer (the compressed page cache's): pages back byte for byte, bad bytes refused; its
 # cost per page for tools/qemu_icount.py on ppc-be.
 wl_add_test(test_xboxrt_page_pack SOURCES test_xboxrt_page_pack.c LIBS wl_xboxrt LABELS unit be)
@@ -69,23 +88,29 @@ wl_add_test(test_xboxrt_decode SOURCES test_xboxrt_decode.c LIBS wl_xboxrt LABEL
 # The capture bench (wl/xboxrt/bench.h): the capture test_xbox_nv2a_pixels writes, replayed through
 # the runtime's guest memory and GX backend by a title with no code of its own (bench_title.c) and
 # timed; then with 1 MB of guest frames, paged as the Wii pages, the textures checked through the
-# write watch.
-if(WL_PLATFORM STREQUAL "host" AND TARGET test_xbox_nv2a_pixels AND TARGET wl_xboxkrnl)
+# write watch. Built on ppc-be too, for tools/qemu_icount.py over a title's captures (run there by hand).
+if(NOT WL_PLATFORM STREQUAL "wii" AND TARGET wl_xboxrt_main)
     add_executable(xboxrt_bench_title bench_title.c)
     wl_target_defaults(xboxrt_bench_title)
     target_link_libraries(xboxrt_bench_title PRIVATE wl_xboxrt_main)
+endif()
+if(WL_PLATFORM STREQUAL "host" AND TARGET test_xbox_nv2a_pixels AND TARGET wl_xboxkrnl)
+    # (a title folder each: a run holds its hard disk's folder alone (wl_xb_hdd_lock), and one that
+    # finds it held stops, so the two on one folder failed whenever ctest -j ran them at once)
     set(bench_dir ${CMAKE_CURRENT_BINARY_DIR}/bench_title)
-    file(MAKE_DIRECTORY ${bench_dir}/hdd)
+    set(bench_paged_dir ${CMAKE_CURRENT_BINARY_DIR}/bench_title_paged)
+    file(MAKE_DIRECTORY ${bench_dir}/hdd ${bench_paged_dir}/hdd)
     set(nv2a_capture ${PROJECT_BINARY_DIR}/tests/xbox/nv2a_test.capture)
     add_test(NAME xboxrt_capture_bench COMMAND xboxrt_bench_title ${bench_dir})
-    add_test(NAME xboxrt_capture_bench_paged COMMAND xboxrt_bench_title ${bench_dir})
+    add_test(NAME xboxrt_capture_bench_paged COMMAND xboxrt_bench_title ${bench_paged_dir})
     set_tests_properties(xboxrt_capture_bench PROPERTIES ENVIRONMENT "WL_XB_PLAY=replay:${nv2a_capture} 3"
         PASS_REGULAR_EXPRESSION "run 3: 1 frames, 2 draws.*summary: 3 runs of 1 frames")
     set_tests_properties(xboxrt_capture_bench_paged PROPERTIES
         ENVIRONMENT "WL_XB_PLAY=replay:${nv2a_capture} 2;WL_XB_FRAME_KB=1024"
         PASS_REGULAR_EXPRESSION "summary: 2 runs of 1 frames.*by the write watch")
+    # (one at a time: they share the title folder, whose hard disk a second run finds in use)
     set_tests_properties(xboxrt_capture_bench xboxrt_capture_bench_paged PROPERTIES LABELS unit
-        FIXTURES_REQUIRED nv2a_capture FAIL_REGULAR_EXPRESSION "\\[E\\]\\[xbbench\\]|replay failed")
+        FIXTURES_REQUIRED nv2a_capture RESOURCE_LOCK xboxrt_bench_title FAIL_REGULAR_EXPRESSION "\\[E\\]\\[xbbench\\]|replay failed")
 endif()
 # The generated code's big-endian header (wl/xboxrt/recomp/recomp_types.h when the toolchain is in
 # the tree; another directory for trying one out).

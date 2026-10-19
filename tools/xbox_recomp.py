@@ -83,6 +83,12 @@ A title's own knowledge is data, passed with --config (JSON; relative paths are 
       "keep_preserved": false,               load ebx, esi and edi again after every call (the
                                              default true keeps them in the caller's locals after a
                                              call to a function proven to give them back, patch 0024)
+      "bounded_loops": false,                a safe point (RECOMP_BACKEDGE) on every backward jump (the
+                                             default true leaves it out of loops their own counter
+                                             ends: loop_bound.py, patch 0033)
+      "rodata_consts": false,                read every float and double constant from guest memory
+                                             (the default true writes one read from a fixed address
+                                             in read-only data as a literal: const_load.py, patch 0034)
       "hot_functions": "hot.txt" or ["sub_00052520", "0x00088B80"],   the functions compiled at
                                              -O2 (tu/recomp_tu_hot.c); a file is read for its
                                              sub_XXXXXXXX names and 0x addresses (a profile report
@@ -354,6 +360,10 @@ class Run:
             rcmd.append("--stack-disp")
         if c.get("keep_preserved", True) and c.get("reg_locals", True):
             rcmd.append("--keep-preserved")
+        if c.get("bounded_loops", True):
+            rcmd.append("--bounded-loops")
+        if c.get("rodata_consts", True):
+            rcmd.append("--rodata-consts")
         rin = [self.xbe, functions, disasm / "labels.json", func_id / "identified_functions.json", abi]
         if c.get("icall_sites"):
             rcmd += ["--icall-sites", str(self.cfg_path(c["icall_sites"]))]
@@ -582,7 +592,8 @@ def load_config(path):
     known = {"name", "seed_functions", "extra_sections", "text_only", "manual_functions",
              "coalesce_functions", "trace_functions", "split", "disasm_args", "func_id_args",
              "abi_args", "recomp_args", "icall_sites", "patches", "comment", "vertex_programs", "x87_locals",
-             "reg_locals", "mem_disp", "stack_disp", "keep_preserved", "hot_functions"}
+             "reg_locals", "mem_disp", "stack_disp", "keep_preserved", "bounded_loops", "rodata_consts",
+             "hot_functions"}
     unknown = sorted(set(cfg) - known)
     if unknown:
         raise Failure(f"{path}: unknown keys {unknown} (known: {sorted(known)})")

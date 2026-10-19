@@ -102,6 +102,8 @@ struct WlNv2a {
     uint8_t batch_mixed;    // vertices of another kind came too (logged, dropped)
     uint8_t batch_parts;    // parts already handed over
     uint32_t batch_loop_first[1]; // a line loop's first vertex (its slot), when it was handed in parts
+    // the least and greatest of batch_indices[0 .. batch_bounds_at) (0: none known), found as they came
+    uint32_t batch_bounds_at, batch_least, batch_last;
     // the Kelvin methods logged once as not interpreted (bit by method / 4)
     uint8_t unhandled_logged[WL_NV2A_K_METHODS / 32];
     uint8_t classes_logged[256];

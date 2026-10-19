@@ -48,8 +48,15 @@ typedef struct {
     uint32_t resolves;  // targets copied into their memory
     uint32_t skipped;   // targets left without a copy (no memory, a format or size that has none)
     uint32_t clears;    // wl_gx_target_clear quads
+    uint64_t clear_pixels; // ...their rectangles' pixels
     uint32_t squeezes;  // wl_gx_target_squeeze: finished pictures narrowed
     uint32_t depths;    // back buffer depths parked (each park's, or with lazy depth only those a target wrote over)
+    uint32_t bars_parks; // targets that took the EFB without a park: they draw only over the bars of a picture
+                         // drawn narrow (wl_gx_target_set_picture)
+    uint32_t bar_clears; // the bars of a picture drawn narrow blackened at the end of a frame (targets drew there)
+    // the bytes copied out of the EFB, by kind (wl_gx_tex_bytes of each copy): the back buffer's colour and
+    // depth parked, the targets resolved, the finished pictures narrowed
+    uint64_t park_bytes, depth_bytes, resolve_bytes, squeeze_bytes;
     size_t held;        // the bytes the park's blocks hold now, from the allocator (not reset: a census's)
 } WlGxTargetStats;
 
@@ -95,13 +102,30 @@ const WlGxTarget *wl_gx_target_use(const WlGxTarget *target);
 // The owner (the layer's copy of its descriptor), or NULL for the back buffer.
 const WlGxTarget *wl_gx_target_current(void);
 // The back buffer's colour as it was parked, while it is (a target has the EFB): a texture's image
-// in WL_GX_TEX_RGBA8 of *w by *h pixels (the part parked, from the EFB's origin), valid until the
+// in WL_GX_TEX_RGBA8 of *w by *h pixels (the part parked, from the EFB's origin, or from the picture's
+// first column: wl_gx_target_set_picture), valid until the
 // back buffer is put back. NULL when nothing is parked. For a caller that reads the picture it
 // was drawing as a texture while drawing into a target.
 const void *wl_gx_target_parked_colour(uint32_t *w, uint32_t *h);
+// The columns [x, x + w) of the back buffer that hold its picture, which its caller draws there narrow
+// itself (a 4:3 picture on a 16:9 screen: video_mode.h's pillarbox, drawn into the middle three quarters
+// instead of narrowed by wl_gx_target_squeeze); the rest of it (the bars) is black. Parks and restores
+// keep to those columns (a target that draws only over the bars, from the EFB's origin, parks nothing;
+// wl_gx_target_parked_colour is the picture's columns alone), and wl_gx_end_frame blackens the bars
+// when a target or a clear of another colour drew over them. w 0 (the default): all of the back buffer.
+// Taken at the next park; give it between frames.
+void wl_gx_target_set_picture(uint32_t x, uint32_t w);
+// The picture's columns (wl_gx_target_set_picture): false when it is all of the back buffer.
+bool wl_gx_target_picture(uint32_t *x, uint32_t *w);
+// Whether the columns beside the picture are shown (true, the default: the bars of a pillarbox, blackened as
+// wl_gx_target_set_picture says) or not (false: the display copy takes the picture's columns alone, so that
+// the rest of the EFB is free for targets and is never blackened).
+void wl_gx_target_set_bars_shown(bool shown);
 // Whole parks (off by default): a park keeps all of the back buffer, not only the part the target
 // coming can draw over, so that wl_gx_target_parked_colour has the whole picture so far, for a
-// caller that reads it as a texture while drawing into a smaller target. Taken at the next park.
+// caller that reads it as a texture while drawing into a smaller target. Taken at the next park, and
+// by a target taking the EFB from another while the back buffer is parked in part (it is put back and
+// parked again whole): a caller may turn it on for the targets that read the picture alone.
 void wl_gx_target_set_park_whole(bool on);
 // Lazy depth (off by default): a park copies the back buffer's colour alone, and its depth only when
 // a target is about to write depth (wl_gx_target_depth_write), so that targets drawn without a depth

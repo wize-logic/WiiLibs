@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Host stub of the GX layer (gx_host.h). Also the host's video info, which the renderer reads.
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "wl/platform/gx_direct.h"
 #include "wl/platform/gx_shadow.h"
 #include "wl/platform/gx_target_internal.h"
 #include "wl/platform/host/gx_host.h"
@@ -15,6 +17,7 @@ static bool g_renderer_set;
 static bool g_wide;
 static WlWidescreen g_widescreen = WL_WIDESCREEN_PILLARBOX;
 static bool g_validate = true;
+static uint64_t g_copy_bytes; // (WlGxStats.efb_copy_bytes)
 
 const WlHostGxState *wl_host_gx_state(void) {
     return &s;
@@ -58,9 +61,9 @@ static void r_copy(void *user, int x, int y, uint32_t w, uint32_t h, void *dst, 
     exempt(false);
 }
 
-static void r_restore(void *user, const void *colour, const void *depth, uint32_t w, uint32_t h) {
+static void r_restore(void *user, const void *colour, const void *depth, int x, uint32_t w, uint32_t h) {
     exempt(true);
-    g_inner.restore(user, colour, depth, w, h);
+    g_inner.restore(user, colour, depth, x, w, h);
     exempt(false);
 }
 
@@ -96,6 +99,12 @@ static void r_efb_alpha(void *user, bool on) {
     exempt(false);
 }
 
+static void r_display_rect(void *user, uint32_t src_x, uint32_t src_w, uint32_t dst_x) {
+    exempt(true);
+    g_inner.display_rect(user, src_x, src_w, dst_x);
+    exempt(false);
+}
+
 static void r_texture_invalidate(void *user) {
     exempt(true);
     g_inner.texture_invalidate(user);
@@ -105,6 +114,7 @@ static void r_texture_invalidate(void *user) {
 // the EFB's format as wl_gx_set_efb_alpha last chose it (kept across wl_gx_init, as the Wii's): a
 // renderer set later (the play harness's screenshots attach the software GX mid-run) is told it
 static bool g_efb_alpha;
+static void display_rect_tell(void);
 
 void wl_host_gx_set_renderer(const WlHostGxRenderer *renderer) {
     memset(&g_renderer, 0, sizeof g_renderer);
@@ -123,12 +133,14 @@ void wl_host_gx_set_renderer(const WlHostGxRenderer *renderer) {
         WRAP(peek_z);
         WRAP(efb_alpha);
         WRAP(texture_invalidate);
+        WRAP(display_rect);
 #undef WRAP
     }
     g_renderer_set = renderer != NULL;
     if (g_renderer_set && g_renderer.efb_alpha != NULL) {
         g_renderer.efb_alpha(g_renderer.user, g_efb_alpha);
     }
+    display_rect_tell(); // (a renderer set mid-run: the display copy's rectangle as it is)
 }
 
 const WlHostGxRenderer *wl_host_gx_renderer(void) {
@@ -286,6 +298,10 @@ void wl_gx_hang_where(unsigned slot, const char *name, uint32_t value) {
 WlResult wl_gx_init(void) {
     memset(&s, 0, sizeof s);
     s.ready = true;
+    // (WL_XB_WIDE: the console's 16:9 setting, as wl_host_gx_set_widescreen(true), for a title's host run)
+    if (getenv("WL_XB_WIDE") != NULL) {
+        g_wide = true;
+    }
     return WL_OK;
 }
 
@@ -321,10 +337,27 @@ void wl_gx_stats(WlGxStats *out) {
     out->tex_mtx_loads = s.texmtx_loads;
     out->gpu_waits = s.sync_calls + g_frame_waits;
     out->efb_copies = s.efb_copies + wl_host_gx_target_copies();
+    out->efb_copy_bytes = g_copy_bytes;
 }
 
 bool wl_gx_sync(void) {
     s.sync_calls++;
+    return true;
+}
+
+uint32_t wl_gx_fence(void) {
+    static uint32_t fences;
+
+    return ++fences != 0u ? fences : ++fences;
+}
+
+bool wl_gx_fence_passed(uint32_t fence) {
+    (void)fence;
+    return true;
+}
+
+bool wl_gx_fence_wait(uint32_t fence) {
+    (void)fence;
     return true;
 }
 
@@ -390,7 +423,7 @@ void wl_gx_begin_frame(uint32_t clear_rgba) {
     s.clear_rgba = clear_rgba;
     s.begin_frames++;
     s.in_frame = true;
-    wl_gx_target_frame_begun();
+    wl_gx_target_frame_begun(clear_rgba);
     if (g_renderer_set && g_renderer.frame_begin != NULL) {
         g_renderer.frame_begin(g_renderer.user, clear_rgba);
     }
@@ -420,17 +453,52 @@ bool wl_gx_shot_done(void) {
     return false;
 }
 
+// wl_gx_draw_narrow: the program draws the picture into the pillarbox's columns; with the display copy
+// narrow (as the Wii's: its source the EFB's last picture_width columns, shown at picture_x), into those
+static bool g_narrow, g_display_narrow;
+static uint32_t g_pic_x;
+
+static void display_rect_tell(void) {
+    if (g_renderer_set && g_renderer.display_rect != NULL) {
+        WlVideoInfo vi;
+        wl_platform_video_info(&vi);
+        g_renderer.display_rect(g_renderer.user, g_display_narrow ? g_pic_x : 0u,
+                                g_display_narrow ? vi.picture_width : 0u, g_display_narrow ? vi.picture_x : 0u);
+    }
+}
+
+bool wl_gx_draw_narrow(bool on) {
+    WlVideoInfo vi;
+    wl_platform_video_info(&vi);
+    g_narrow = on && vi.pillarbox && vi.picture_width != 0u && vi.picture_width < vi.fb_width &&
+               !wl_gx_bisect()->pillarbox;
+    g_display_narrow = g_narrow && !wl_gx_bisect()->narrow_mid && vi.picture_x % 16u == 0u &&
+                       vi.picture_width % 16u == 0u;
+    g_pic_x = g_display_narrow ? vi.fb_width - vi.picture_width : vi.picture_x;
+    wl_gx_target_set_picture(g_narrow ? g_pic_x : 0u, g_narrow ? vi.picture_width : 0u);
+    wl_gx_target_set_bars_shown(!g_display_narrow);
+    display_rect_tell();
+    return g_narrow;
+}
+
 uint32_t wl_gx_end_frame(void) {
     wl_gx_target_frame_ending();
     if (g_overlay != NULL) {
         wl_gx_reset_state();
+        if (g_narrow) {
+            // (the overlay into the picture's columns, as the console's)
+            uint32_t x, w;
+            (void)wl_gx_target_picture(&x, &w);
+            wl_gx_set_viewport((int)x, 0, (int)w, 480);
+            wl_gx_set_scissor((int)x, 0, (int)w, 480);
+        }
         g_overlay(g_overlay_user, 640u, 480u);
         wl_gx_reset_state();
     }
     {
         WlVideoInfo vi;
         wl_platform_video_info(&vi);
-        if (vi.pillarbox) {
+        if (vi.pillarbox && !g_narrow) {
             (void)wl_gx_target_squeeze(vi.picture_x, vi.picture_width);
         }
         if (g_renderer_set && g_renderer.frame_end != NULL) {
@@ -472,6 +540,7 @@ void wl_gx_copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat
     }
     s.efb_copies++;
     s.efb_copy_clears += clear ? 1u : 0u;
+    g_copy_bytes += wl_gx_tex_bytes(fmt, (uint32_t)w, (uint32_t)h);
     s.efb_copy_rect[0] = x;
     s.efb_copy_rect[1] = y;
     s.efb_copy_rect[2] = w;

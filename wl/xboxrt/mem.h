@@ -174,11 +174,34 @@ uint32_t wl_xb_read_cstr(uint32_t va, char *dst, uint32_t cap);
 
 // Whether [va, va + n) is guest memory a kernel call may touch: committed user pages, or the
 // window inside the RAM. (A device range is not.) The kernel checks the buffers it is handed with
-// it, so a bad guest pointer is a status code, not a host crash. The common case (a range inside
-// one user page found committed lately) is a few instructions; the rest goes to
-// wl_xb_range_ok_slow, the whole check, which answers every range alike.
-bool wl_xb_range_ok(uint32_t va, uint32_t n);
+// it, so a bad guest pointer is a status code, not a host crash. The common cases are inline, a few
+// instructions where it is called: a range inside one user page found committed lately (the kernel
+// checks every argument so: 2.4% of Halo's airlock fight on the Wii before the memo), and a range
+// inside the RAM's window (Halo keeps its objects and tags there, and its level runner checks every
+// field it reads: 1.4% of d40 in Dolphin as a call). The rest goes to wl_xb_range_ok_slow, the
+// whole check, which answers every range alike.
 bool wl_xb_range_ok_slow(uint32_t va, uint32_t n);
+// (mem.c's: user pages page_ok found committed lately, direct-mapped by page number, the page + 1
+// or 0; only a decommit makes a committed page fail, and it empties them. The window's bytes from
+// 0x80000000 once guest memory is ready, 0 before.)
+#define WL_XB_OK_PAGES 16u
+extern uint32_t g_xb_ok_pages[WL_XB_OK_PAGES];
+extern uint32_t g_xb_window_bytes;
+static inline bool wl_xb_range_ok(uint32_t va, uint32_t n) {
+    uint32_t vp = va >> WL_XB_PAGE_SHIFT;
+    // n - 1 below the bytes left in va's page: n is not 0, and the range neither wraps nor crosses a page
+    if (va < WL_XB_USER_LIMIT && n - 1u < WL_XB_PAGE - (va & (WL_XB_PAGE - 1u)) &&
+        g_xb_ok_pages[vp & (WL_XB_OK_PAGES - 1u)] == vp + 1u) {
+        return true;
+    }
+    // va's offset in the window below its RAM's bytes (so va is 0x80000000 up, and guest memory is
+    // ready), and n - 1 below the bytes left (n is not 0, and the range ends in that RAM)
+    uint32_t off = va - WL_XB_WINDOW;
+    if (off < g_xb_window_bytes && n - 1u < g_xb_window_bytes - off) {
+        return true;
+    }
+    return wl_xb_range_ok_slow(va, n);
+}
 
 // ---- Set-up ----------------------------------------------------------------------------------
 
@@ -220,6 +243,10 @@ typedef struct {
     // Wii only: a page's PTE is looked for in its whole group, as before 2026-10-18, not first in
     // the slot it was put in (the title folder's "ptescan").
     bool pte_scan;
+    // The write watch looks at every page of a range through the MMU, as before 2026-10-19, rather
+    // than at the pages' write epochs and only at the pages still mapped (the title folder's
+    // "oldwatch", WL_XB_OLDWATCH=1 on the host).
+    bool old_watch;
 } WlXbMemConfig;
 #define WL_XB_PAGE_CACHE_AUTO 0xFFFFFFFFu
 

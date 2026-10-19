@@ -450,6 +450,19 @@ bool wl_gx_shot_done(void);
 // overlay included, into the middle three quarters of the framebuffer, black around it, before the display
 // copy (wl_gx_target_squeeze): one EFB copy of 640x480 and one filtered quad a frame, and 1.2 MiB from the
 // render targets' allocator. The program draws 4:3 as ever; WlVideoInfo.pillarbox says it is done.)
+// A program that draws its picture narrow itself (its viewport and scissor in picture_width columns of the EFB,
+// its reads of the picture remapped) says so with wl_gx_draw_narrow(true): there is then no copy, the overlay
+// is drawn into those columns too, and the render targets' parks keep to them (gx_target.h). The columns are
+// the EFB's last picture_width (wl_gx_target_picture says which): the display copy takes those alone into the
+// XFB from column picture_x, its bars black and never written, so that render targets drawn from the EFB's
+// origin within the first fb_width - picture_width columns (160: Halo's 128x128 shadows) never touch the
+// picture, and nothing is parked or put back for them; the copy clears only its columns for the next frame.
+// With WlGxBisect.narrow_mid, the middle columns as shown (picture_x), the display copy whole, and end_frame
+// blackening the bars when a render target or a clear of another colour drew over them. Returns whether that
+// is how the frame is made: false without a pillarbox, or with WlGxBisect.pillarbox (the copy, the old way);
+// false for `on` false (the copy again). Give it between frames. A shot (wl_gx_shot_request) is then the
+// framebuffer as shown, bars and all.
+bool wl_gx_draw_narrow(bool on);
 // A frame overlay: `fn(user, width, height)` runs inside wl_gx_end_frame, after the frame's last draw and
 // before its display copy, so it draws over the finished image (a menu, a notice, a battery warning)
 // without the program's renderer knowing: it costs the frame one pointer test while none is set, and
@@ -480,6 +493,14 @@ bool wl_gx_frame_retired(uint32_t index);
 bool wl_gx_frame_wait(uint32_t index);
 // Flush the FIFO and wait for the GPU to finish everything submitted. False on timeout.
 bool wl_gx_sync(void);
+// A fence within a frame: a draw-sync token behind everything submitted so far (0 when GX is not
+// ready), for memory the GPU reads by address that the CPU means to write again before the frame
+// ends (a ring of vertices). wl_gx_fence_passed says whether the GPU is past it (true for 0 and on
+// the host, whose GPU draws as it is told), wl_gx_fence_wait waits for it (false on timeout). A token
+// is a raster state change: a direct draw after it wants wl_gx_direct_flush_after first.
+uint32_t wl_gx_fence(void);
+bool wl_gx_fence_passed(uint32_t fence);
+bool wl_gx_fence_wait(uint32_t fence);
 // Work for the processor while it waits for the GPU (end_frame's, wl_gx_sync's, a frame's wait):
 // `work` is called again and again while the GPU has not arrived, until it returns false (nothing
 // left for this wait); each call a short piece of work. A wait inside the work only waits. NULL:
@@ -647,6 +668,7 @@ typedef struct {
     uint32_t gpu_waits;       // times the processor waited for the GPU (end_frame, wl_gx_sync, wl_gx_frame_wait)
     uint32_t efb_copies;      // texture copies out of the EFB (render targets, parks, the squeeze); the GPU's
                               // pixel pipe syncs after each, the processor does not wait
+    uint64_t efb_copy_bytes;  // the bytes of wl_gx_copy_efb_texture's copies (the targets' are WlGxTargetStats')
 } WlGxStats;
 void wl_gx_stats(WlGxStats *out);
 

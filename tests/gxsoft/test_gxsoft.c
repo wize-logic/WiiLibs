@@ -3,8 +3,8 @@
 // fill rule at GX's sample point, culling by the screen's winding, the perspective projection's
 // clipping at the near plane, the depth test and its place against the alpha test, blending and the
 // EFB's formats, texture sampling (nearest, bilinear, repeat, CMPR, levels, one map read at two
-// coordinates), copies out of the EFB and the parked back buffer put back, the display copy, and
-// the state GX takes as it is flagged.
+// coordinates), copies out of the EFB and the parked back buffer put back, the display copy (a narrow
+// one's columns alone, shown and cleared), and the state GX takes as it is flagged.
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +15,7 @@
 #include "wl/platform/gx_direct.h"
 #include "wl/platform/gx_target.h"
 #include "wl/platform/host/gx_direct_host.h"
+#include "wl/platform/host/gx_host.h"
 #include "wl/platform/platform.h"
 #include "wl/platform/tev.h"
 
@@ -533,6 +534,27 @@ TEST cmpr_and_one_map_at_two_coordinates(void) {
     ASSERT_EQ_FMT(0xFF00FFFFu, px(56, 8), "%08x");
     // on the left both read red
     ASSERT_EQ(0xFF0000FFu, px(8, 8));
+    // coordinate 1 not sent but generated from coordinate 0's input (s, t as they are): both read
+    // the same texel, blue on the right (its own numbers, s 1, would read blue at the left too)
+    {
+        static const float same[2][4] = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}};
+        WlGxDirectLayout l = {1, 1, 0, 2, 0, 0, 0, 0, 0};
+        WlGxDirectVertex v[4];
+        unsigned n;
+
+        wl_gx_direct_layout(&l);
+        wl_gx_direct_texgen(1, WL_GX_DIRECT_TG_INPUT0, same);
+        v[0] = vtx(100, 0, -0.5f, 0xFFFFFFFFu, 0, 0);
+        v[1] = vtx(164, 0, -0.5f, 0xFFFFFFFFu, 1, 0);
+        v[2] = vtx(164, 64, -0.5f, 0xFFFFFFFFu, 1, 1);
+        v[3] = vtx(100, 64, -0.5f, 0xFFFFFFFFu, 0, 1);
+        for (n = 0; n < 4; n++) {
+            v[n].texcoord[1][0] = 1.0f;
+        }
+        wl_gx_direct_draw(WL_GX_DIRECT_QUADS, v, 4);
+        ASSERT_EQ_FMT(0x0000FFFFu, px(156, 8), "%08x");
+        ASSERT_EQ_FMT(0xFF0000FFu, px(108, 8), "%08x");
+    }
     free(image);
     end();
     PASS();
@@ -621,6 +643,59 @@ TEST what_gx_takes_as_it_is_is_flagged(void) {
     PASS();
 }
 
+// a pixel of the last frame shown, 0xRRGGBBAA
+static uint32_t shown(uint32_t x, uint32_t y) {
+    const uint8_t *p = g_frame + ((size_t)y * g_frame_w + x) * 4u;
+
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+// a 16:9 picture drawn narrow (wl_gx_draw_narrow): the display copy takes the EFB's columns 160..640
+// alone into the screen's 80..560, black beside them, and the frame's clear is of those columns alone
+// once the rectangle is as it was at the frame before (the first frame after a change clears all of
+// the EFB, as the copy before it did); off again, the display copy whole
+TEST a_narrow_display_copy_shows_and_clears_its_columns_alone(void) {
+    begin(0x000000FFu, false);
+    wl_host_gx_set_widescreen(true);
+    ASSERT(wl_gx_draw_narrow(true));
+    layout(1, 0);
+    quad(0, 0, 640, 480, 0.5f, 0x00FF00FFu, 0, 0);
+    (void)wl_gx_end_frame();
+    ASSERT_EQ(1u, g_frames);
+    ASSERT_EQ(640u, g_frame_w);
+    ASSERT_EQ_FMT(0x000000FFu, shown(79, 100), "%08x");
+    ASSERT_EQ_FMT(0x00FF00FFu, shown(80, 100), "%08x");
+    ASSERT_EQ_FMT(0x00FF00FFu, shown(559, 100), "%08x");
+    ASSERT_EQ_FMT(0x000000FFu, shown(560, 100), "%08x");
+    // (the frame after the change: all of it cleared)
+    wl_gx_begin_frame(0x0000FFFFu);
+    ASSERT_EQ_FMT(0x0000FFFFu, px(100, 100), "%08x");
+    ASSERT_EQ_FMT(0x0000FFFFu, px(400, 100), "%08x");
+    quad(0, 0, 640, 480, 0.5f, 0x00FF00FFu, 0, 0);
+    ASSERT_EQ_FMT(0x00FF00FFu, px(0, 100), "%08x");
+    (void)wl_gx_end_frame();
+    // (the next: the display copy's columns alone; the first 160, never shown, kept)
+    wl_gx_begin_frame(0x0000FFFFu);
+    ASSERT_EQ_FMT(0x00FF00FFu, px(0, 100), "%08x");
+    ASSERT_EQ_FMT(0x00FF00FFu, px(159, 479), "%08x");
+    ASSERT_EQ_FMT(0x0000FFFFu, px(160, 0), "%08x");
+    ASSERT_EQ_FMT(0x0000FFFFu, px(639, 479), "%08x");
+    (void)wl_gx_end_frame();
+    ASSERT_EQ_FMT(0x0000FFFFu, shown(80, 0), "%08x");
+    ASSERT_EQ_FMT(0x000000FFu, shown(60, 0), "%08x");
+    // off (a 4:3 screen): the display copy whole, and its clear all of the EFB at once
+    wl_host_gx_set_widescreen(false);
+    ASSERT(!wl_gx_draw_narrow(false));
+    wl_gx_begin_frame(0xFF0000FFu);
+    ASSERT_EQ_FMT(0xFF0000FFu, px(0, 100), "%08x");
+    ASSERT_EQ_FMT(0xFF0000FFu, px(400, 100), "%08x");
+    (void)wl_gx_end_frame();
+    ASSERT_EQ_FMT(0xFF0000FFu, shown(0, 0), "%08x");
+    ASSERT_EQ_FMT(0xFF0000FFu, shown(639, 479), "%08x");
+    end();
+    PASS();
+}
+
 SUITE(gxsoft_suite) {
     RUN_TEST(the_fill_rule_at_gx_sample_point);
     RUN_TEST(culling_by_the_screen_winding);
@@ -633,6 +708,7 @@ SUITE(gxsoft_suite) {
     RUN_TEST(cmpr_and_one_map_at_two_coordinates);
     RUN_TEST(render_target_copies_and_the_back_buffer_put_back);
     RUN_TEST(what_gx_takes_as_it_is_is_flagged);
+    RUN_TEST(a_narrow_display_copy_shows_and_clears_its_columns_alone);
 }
 
 GREATEST_MAIN_DEFS();

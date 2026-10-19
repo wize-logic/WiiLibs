@@ -331,6 +331,8 @@ void wl_xb_audio_config_default(WlXbAudioConfig *cfg) {
     cfg->hash_path = getenv("WL_XB_AUDIO_HASH");
     const char *off = getenv("WL_XB_AUDIO");
     cfg->off = off != NULL && strcmp(off, "0") == 0;
+    const char *plain = getenv("WL_XB_APU_PLAIN");
+    cfg->apu_plain = plain != NULL && strcmp(plain, "1") == 0;
 #endif
 }
 
@@ -350,6 +352,10 @@ WlResult wl_xb_audio_attach(const WlXbAudioConfig *cfg) {
     WlXboxApuConfig ac;
     wl_xbox_apu_config_default(&ac);
     ac.phys_ptr = phys_ptr;
+    ac.plain = g_cfg.apu_plain;
+    if (ac.plain) {
+        WL_LOG_I(TAG, "APU: the plain code paths (apuplain)");
+    }
 #if !defined(__wii__)
     if (g_cfg.hash_path != NULL && g_cfg.hash_path[0] != '\0') {
         g_hash = fopen(g_cfg.hash_path, "w");

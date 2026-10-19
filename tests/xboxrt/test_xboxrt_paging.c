@@ -251,6 +251,66 @@ TEST watch_survives_the_epoch_wrap(void) {
     PASS();
 }
 
+// The look answers from the pages' epochs and their summaries, the MMU asked only about the pages
+// still open: against a model (a store's time against a watch's), over watches of random parts of
+// a range that crosses summary words, with stores, reads, looks and arms mixed; and a look leaves
+// the pages it found unchanged closed.
+TEST watch_looks_agree_with_a_model(void) {
+    up();
+    enum { N = 20, WATCHES = 6 };
+    uint32_t phys = 0;
+    ASSERT_EQ(WL_OK, wl_xb_phys_alloc(N * PAGE, 0, 0xFFFFFFFFu, 0, &phys));
+    const uint32_t w = WL_XB_WINDOW | phys, p0 = phys >> 12;
+    fill(w, N, 12);
+    uint32_t t = 1, stored[N] = {0}, first[WATCHES], count[WATCHES], armed[WATCHES], stamp[WATCHES];
+    uint32_t x = 99u, looks = 0, written = 0;
+    for (uint32_t i = 0; i < WATCHES; i++) {
+        first[i] = (i * 7u) % N;
+        count[i] = 1u + (i * 5u) % (N - first[i]);
+        armed[i] = t++;
+        stamp[i] = wl_xb_phys_watch(phys + first[i] * PAGE, count[i] * PAGE);
+        ASSERT(stamp[i] != 0);
+    }
+    for (uint32_t step = 0; step < 3000u; step++) {
+        x = x * 1664525u + 1013904223u;
+        uint32_t i = (x >> 8) % WATCHES, k = (x >> 16) % N;
+        switch ((x >> 28) & 3u) {
+        case 0: // a store
+            wl_xb_wr32(w + k * PAGE + ((x >> 4) & 0xFFCu), step);
+            stored[k] = t++;
+            break;
+        case 1: // a read
+            (void)wl_xb_rd32(w + k * PAGE);
+            break;
+        case 2: { // a look
+            bool model = false;
+            for (uint32_t j = first[i]; j < first[i] + count[i]; j++) {
+                model |= stored[j] > armed[i];
+            }
+            bool got = wl_xb_phys_written(phys + first[i] * PAGE + 8u, count[i] * PAGE - 16u, stamp[i]);
+            ASSERT_EQ(model, got);
+            looks++;
+            written += got ? 1u : 0u;
+            if (!got) {
+                for (uint32_t j = first[i]; j < first[i] + count[i]; j++) {
+                    ASSERT_EQ(0u, g_xb_pg_open[(p0 + j) >> 5] & (1u << ((p0 + j) & 31u)));
+                }
+            }
+            break;
+        }
+        default: // armed again over a new part
+            first[i] = k;
+            count[i] = 1u + (x >> 4) % (N - k);
+            armed[i] = t++;
+            stamp[i] = wl_xb_phys_watch(phys + first[i] * PAGE, count[i] * PAGE);
+            ASSERT(stamp[i] != 0);
+        }
+    }
+    ASSERT(looks > 500u && written > 50u && written < looks - 50u);
+    ASSERT_EQ(WL_OK, wl_xb_phys_free(phys));
+    PASS();
+}
+
 // The freeze watch's reads (wl_xb_mem_peek, without the guest lock): a resident page's bytes, and
 // nothing (no fault, no swap-in) for a page swapped out or in swap I/O.
 TEST peeks_never_fault(void) {
@@ -1024,6 +1084,7 @@ SUITE(paging) {
     RUN_TEST(stores_are_watched);
     RUN_TEST(peeks_never_fault);
     RUN_TEST(watch_survives_the_epoch_wrap);
+    RUN_TEST(watch_looks_agree_with_a_model);
 #if !defined(WL_XBRT_PAGING_NO_SWAP)
     RUN_TEST(changed_pages_swap_out_and_back);
     RUN_TEST(clean_pages_read_back_go_for_nothing);

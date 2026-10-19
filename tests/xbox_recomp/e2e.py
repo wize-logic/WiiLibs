@@ -22,7 +22,9 @@ lifted three times: with the x87 state in memory at every operation, with --x87-
 x87_locals.py: the stack, control word and compare result in C locals inside a function), and with
 --x87-locals --reg-locals (the integer registers in locals too); and a fourth time with
 --keep-preserved as well (preserve.py: after a call to a function proven to give back ebx, esi and
-edi, the caller keeps them in its locals).
+edi, the caller keeps them in its locals). With --reg-locals the lifts also leave the safe point out of
+loops that end by themselves (--bounded-loops, loop_bound.py) and write float and double constants read
+from .rodata as literals (--rodata-consts, const_load.py).
 
     e2e.py --build DIR [--target ppc-be|host|both] [-k NAME]
 
@@ -58,7 +60,7 @@ PROGRAMS = {
     # different depths, rounding modes, compares, precision control 24
     "prog_x87_paths": dict(src="prog_x87_paths.S", flags=[], nout=62),
     # assembly: ebx/esi/edi across callees that keep the convention and callees that break it
-    "prog_preserve": dict(src="prog_preserve.S", flags=[], nout=20),
+    "prog_preserve": dict(src="prog_preserve.S", flags=[], nout=24),
 }
 SEEDS = [1, 12345, 0xDEADBEEF, 7, 0x80000000, 0x0F0F0F0F]
 # Programs (and why) that may not match on a target. Keep empty unless understood.
@@ -152,11 +154,21 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False
     image = (work / f"{name}.bin").read_bytes()
     text_end = max(a + s for a, s, _ in funcs)
     data_start = text_end  # .rodata follows .text directly (a jump table may sit at text_end + 3)
-    config._install(
-        [config.Section(".text", BASE, text_end - BASE, 0, text_end - BASE, True),
-         config.Section(".rdata", data_start, len(image) - (data_start - BASE), data_start - BASE,
-                        len(image) - (data_start - BASE), False)],
-        entry_point=BASE, kernel_thunk_addr=BASE, origin="e2e")
+    # the ELF's .rodata is read-only data (--rodata-consts folds float reads from it); what
+    # follows .text around it (.data, .bss) is not
+    ro = (data_start, data_start)
+    for line in run(["readelf", "-SW", f"{name}.elf"], cwd=work).splitlines():
+        p = line.replace("[", " ").replace("]", " ").split()
+        if len(p) > 5 and p[1] == ".rodata":
+            lo = max(int(p[3], 16), data_start)
+            ro = (lo, max(lo, int(p[3], 16) + int(p[5], 16)))
+    image_end = BASE + len(image)
+    sections = [config.Section(".text", BASE, text_end - BASE, 0, text_end - BASE, True)]
+    for lo, hi, read_only in ((data_start, ro[0], False), (ro[0], ro[1], True), (ro[1], image_end, False)):
+        if lo < hi:
+            sections.append(config.Section(".rdata" if read_only else ".data", lo, hi - lo, lo - BASE,
+                                           hi - lo, False, read_only=read_only))
+    config._install(sections, entry_point=BASE, kernel_thunk_addr=BASE, origin="e2e")
     # A *_false symbol stands for a false function start (one a disassembler took from an immediate).
     db = {}
     for a, s, sym in funcs:
@@ -170,6 +182,10 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False
     ft.mem_disp = reg_locals
     ft.stack_disp = reg_locals
     ft.keep_preserved = keep
+    # and its loops: no safe point where a loop's own counter ends it (loop_bound.py)
+    ft.bounded_loops = reg_locals
+    # and its float constants from read-only data as literals (const_load.py)
+    ft.rodata_consts = reg_locals
     # as tools.recomp does last: a called address inside a body gets a function of its own
     ft.discover_interior_entries()
     db = {a: info for a, info in ft.func_db.items() if a not in ft.owned_function_starts}

@@ -95,6 +95,14 @@ static struct {
     uint32_t fifo_peak_logged; // the highest 64 KiB step of the peak fill the log has been told
     uint32_t fb_w, efb_h;
     uint32_t pillar_x, pillar_w; // the picture narrowed into these columns by end_frame (0: not)
+    bool narrow;                 // ...drawn there by the program itself (wl_gx_draw_narrow): no copy
+    // ...into the EFB's last pillar_w columns (pic_x), the display copy taking those alone into the XFB at
+    // pillar_x (its bars never written: blackened once an XFB, bars_black), so that the render targets
+    // drawn from the EFB's origin within its first pic_x columns never touch the picture
+    bool display_narrow;
+    uint32_t pic_x;
+    void *bars_black[4]; // the XFBs whose bars are black since the display copy went narrow
+    unsigned bars_black_n;
     WlGxOverlayFn overlay;
     void *overlay_user;
     uint32_t known;
@@ -198,6 +206,7 @@ static int g_copy_filter = -1;
 static GXRModeObj *g_mode;
 
 static void display_filter(void);
+static void *display_dst(void *xfb);
 
 static void setup_copy(GXRModeObj *rm) {
     f32 ys = GX_GetYScaleFactor(rm->efbHeight, rm->xfbHeight);
@@ -429,6 +438,28 @@ bool wl_gx_sync(void) {
     return ok;
 }
 
+uint32_t wl_gx_fence(void) {
+    uint32_t t;
+
+    if (!g.ready) {
+        return 0;
+    }
+    t = send_token();
+    return t != 0u ? t : send_token();
+}
+
+bool wl_gx_fence_passed(uint32_t fence) {
+    // (the first token after init exactly, as wait_token has it; a fence 32768 tokens or more behind
+    // the last one sent, which the token register's 16 bits no longer tell from one ahead, as
+    // passed: the frames' own waits keep GX within a few frames of the processor)
+    return fence == 0u || !g.ready || g.token - fence >= 0x8000u ||
+           (g.token == 1u ? GX_GetDrawSync() == 1u : token_passed(fence));
+}
+
+bool wl_gx_fence_wait(uint32_t fence) {
+    return wl_gx_fence_passed(fence) || wait_token(fence);
+}
+
 void wl_gx_set_frame_overlap(bool on) {
     g.overlap = on;
 }
@@ -458,7 +489,7 @@ bool wl_gx_frame_wait(uint32_t index) {
 static void clear_efb(uint32_t rgba) {
     GX_SetCopyClear(unpack(rgba), MAX_Z24);
     display_filter();
-    GX_CopyDisp(wl_platform_video_back_buffer(), GX_TRUE); // the copy is overwritten by end_frame
+    GX_CopyDisp(display_dst(wl_platform_video_back_buffer()), GX_TRUE); // the copy is overwritten by end_frame
     g.clear_next = rgba;
     g.dirty = true;
 }
@@ -476,7 +507,7 @@ void wl_gx_begin_frame(uint32_t clear_rgba) {
     }
     g.clear_frame = clear_rgba;
     g.in_frame = true;
-    wl_gx_target_frame_begun();
+    wl_gx_target_frame_begun(clear_rgba);
 }
 
 void wl_gx_set_overlay(WlGxOverlayFn fn, void *user) {
@@ -489,16 +520,98 @@ void wl_gx_set_overlay(WlGxOverlayFn fn, void *user) {
 static void *volatile g_shot_request;
 static volatile bool g_shot_sent;
 static volatile uint32_t g_shot_token;
+static void *g_shot_widen; // the shot, copied narrow, to be widened once done (shot_widen)
 
 static void copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexFormat fmt, bool clear, bool invalidate);
 
 void wl_gx_shot_request(void *dst) {
     g_shot_sent = false;
+    g_shot_widen = NULL;
     g_shot_request = dst;
 }
 
+// A shot of a picture copied narrow (its columns alone, pillar_w wide) widened in place into the framebuffer's
+// width, the bars black: GX's RGBA8 tiles (4x4 pixels, 64 bytes), a row of tiles at a time from the last
+static void shot_widen(uint8_t *tiles) {
+    uint32_t narrow_row = g.pillar_w / 4u * 64u, wide_row = g.fb_w / 4u * 64u, left = g.pillar_x / 4u * 64u;
+    uint32_t rows = g.efb_h / 4u, r, i;
+    uint8_t black[64];
+    for (i = 0; i < 64u; i++) {
+        black[i] = i < 32u && (i & 1u) == 0u ? 0xFFu : 0u; // (A, R pairs then G, B: opaque black)
+    }
+    for (r = rows; r-- > 0;) {
+        uint8_t *row = tiles + (size_t)r * wide_row;
+        memmove(row + left, tiles + (size_t)r * narrow_row, narrow_row);
+        for (i = 0; i < left; i += 64u) {
+            memcpy(row + i, black, 64);
+        }
+        for (i = left + narrow_row; i < wide_row; i += 64u) {
+            memcpy(row + i, black, 64);
+        }
+    }
+    DCFlushRange(tiles, (size_t)rows * wide_row);
+}
+
 bool wl_gx_shot_done(void) {
-    return g_shot_sent && token_passed(g_shot_token);
+    if (!(g_shot_sent && token_passed(g_shot_token))) {
+        return false;
+    }
+    if (g_shot_widen != NULL) {
+        shot_widen(g_shot_widen);
+        g_shot_widen = NULL;
+    }
+    return true;
+}
+
+bool wl_gx_draw_narrow(bool on) {
+    g.narrow = on && g.pillar_w != 0u && !wl_gx_bisect()->pillarbox;
+    // (the display copy narrow: its source the picture's columns, its destination the XFB from the pillarbox's
+    // first column, 32-byte aligned, with the XFB's stride; the switch narrowmid: in the middle, copied whole)
+    g.display_narrow = g.narrow && !wl_gx_bisect()->narrow_mid && g.pillar_x % 16u == 0u && g.pillar_w % 16u == 0u &&
+                       g.pillar_w <= g.fb_w;
+    g.pic_x = g.display_narrow ? g.fb_w - g.pillar_w : g.pillar_x;
+    g.bars_black_n = 0;
+    if (g.ready) {
+        (void)wl_gx_sync(); // (a display copy queued with the old rectangle)
+        if (g.display_narrow) {
+            GX_SetDispCopySrc((u16)g.pic_x, 0, (u16)g.pillar_w, (u16)g.efb_h);
+        } else {
+            GX_SetDispCopySrc(0, 0, (u16)g.fb_w, (u16)g.efb_h);
+        }
+    }
+    wl_gx_target_set_picture(g.narrow ? g.pic_x : 0u, g.narrow ? g.pillar_w : 0u);
+    wl_gx_target_set_bars_shown(!g.display_narrow);
+    return g.narrow;
+}
+
+// Where the display copy writes in an XFB: its first column, or the pillarbox's with the display copy narrow
+// (whose bars are blackened the first time the XFB is used: they are never written by the copy, and may hold a
+// picture shown before it went narrow)
+static void *display_dst(void *xfb) {
+    unsigned i;
+    if (!g.display_narrow) {
+        return xfb;
+    }
+    for (i = 0; i < g.bars_black_n && g.bars_black[i] != xfb; i++) {
+    }
+    if (i == g.bars_black_n) {
+        // (the XFB is not on the screen nor queued: the processor's uncached stores, YUYV black two pixels a word)
+        uint32_t *row = xfb, stride = g.fb_w / 2u, lines = g_mode != NULL ? g_mode->xfbHeight : g.efb_h, y, x;
+        uint32_t right = (g.pillar_x + g.pillar_w) / 2u;
+        for (y = 0; y < lines; y++, row += stride) {
+            for (x = 0; x < g.pillar_x / 2u; x++) {
+                row[x] = 0x10801080u;
+            }
+            for (x = right; x < stride; x++) {
+                row[x] = 0x10801080u;
+            }
+        }
+        if (g.bars_black_n == sizeof g.bars_black / sizeof g.bars_black[0]) {
+            g.bars_black_n = 0;
+        }
+        g.bars_black[g.bars_black_n++] = xfb;
+    }
+    return (uint8_t *)xfb + g.pillar_x * 2u;
 }
 
 uint32_t wl_gx_end_frame(void) {
@@ -506,8 +619,13 @@ uint32_t wl_gx_end_frame(void) {
     VCHECK(g.in_frame, "end_frame outside a frame");
     wl_gx_target_frame_ending(); // (the back buffer has the EFB for the display copy)
     if (g.overlay != NULL) {
-        // (the program's overlay over the finished image: the state reset before it and after)
+        // (the program's overlay over the finished image: the state reset before it and after; into the
+        // picture's columns when the program draws it narrow, as the copy would have narrowed it)
         wl_gx_reset_state();
+        if (g.narrow) {
+            wl_gx_set_viewport((int)g.pic_x, 0, (int)g.pillar_w, (int)g.efb_h);
+            wl_gx_set_scissor((int)g.pic_x, 0, (int)g.pillar_w, (int)g.efb_h);
+        }
         g.overlay(g.overlay_user, g.fb_w, g.efb_h);
         wl_gx_reset_state();
     }
@@ -515,9 +633,16 @@ uint32_t wl_gx_end_frame(void) {
     if (shot != NULL) {
         // (the finished picture as the console drew it, before the narrowing: a screenshot)
         g_shot_request = NULL;
-        copy_efb_texture(0, 0, (int)g.fb_w, (int)g.efb_h, shot, WL_GX_TEX_RGBA8, false, true);
+        if (g.display_narrow) {
+            // (the picture's columns alone, widened with its bars when it is done: wl_gx_shot_done)
+            copy_efb_texture((int)g.pic_x, 0, (int)g.pillar_w, (int)g.efb_h, shot, WL_GX_TEX_RGBA8, false, true);
+            g_shot_widen = shot;
+        } else {
+            copy_efb_texture(0, 0, (int)g.fb_w, (int)g.efb_h, shot, WL_GX_TEX_RGBA8, false, true);
+            g_shot_widen = NULL;
+        }
     }
-    if (g.pillar_w != 0u) {
+    if (g.pillar_w != 0u && !g.narrow) {
         // (a 4:3 picture on a 16:9 screen: narrowed into the middle three quarters, with the bars black; the
         // video interface then widens the framebuffer to the screen)
         (void)wl_gx_target_squeeze(g.pillar_x, g.pillar_w);
@@ -550,7 +675,7 @@ uint32_t wl_gx_end_frame(void) {
     GX_Flush();
     void *xfb = wl_platform_video_back_buffer();
     display_filter();
-    GX_CopyDisp(xfb, GX_TRUE); // clears the EFB for the next frame
+    GX_CopyDisp(display_dst(xfb), GX_TRUE); // clears the EFB for the next frame (the copy's columns)
     g.clear_next = g.clear_frame;
     // The copy's token: the display queue shows the XFB once the GPU has passed it (polled at each
     // retrace), so neither the CPU nor the GPU waits for the display. Without overlap the CPU waits
@@ -631,6 +756,7 @@ static void copy_efb_texture(int x, int y, int w, int h, void *dst, WlGxTexForma
     wl_gx_wii_copy_filter(true); // (the display's again before the display copy: display_filter)
     GX_InvalidateTexAll();
     g.stats.efb_copies++;
+    g.stats.efb_copy_bytes += wl_gx_tex_bytes(fmt, (uint32_t)w, (uint32_t)h);
     g.dirty = true;
 }
 

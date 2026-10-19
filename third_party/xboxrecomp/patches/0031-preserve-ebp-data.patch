@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Sun, 18 Oct 2026 19:33:38 -0400
+Subject: [PATCH] recomp: --keep-preserved follows ebp used as a general
+ register
+
+Code built without frame pointers (MSVC's /Oy) moves a pointer into ebp and stores through it: mov ebp, ecx; mov [ebp+0x24], eax. preserve.py took ebp as an unknown frame there, so such a store could hit any frame, and the function and every caller up the chain preserved nothing. An ebp loaded from another register or from memory is now data, and a store through it is like a store through any other register, which the analysis already assumes misses the saved-register slots; an ebp made from esp stays a frame.
+---
+ tools/recomp/preserve.py      | 33 +++++++++++++++++++++++++++++----
+ tools/recomp/test_preserve.py | 13 +++++++++++++
+ 2 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/tools/recomp/preserve.py b/tools/recomp/preserve.py
+index 4ddc9a0..fc5b920 100644
+--- a/tools/recomp/preserve.py
++++ b/tools/recomp/preserve.py
+@@ -24,7 +24,10 @@ function's own control flow (labels and gotos, as x87_locals does):
+     makes it unknown, and nothing is then proven from it;
+   * ebp as an offset from the entry esp, after `ebp = esp + K`, or as the
+     frame it inherited (`ebp = g_ebp`, or `ebp = g_seh_ebp` in a function
+-    with no frame of its own), and what g_ebp and g_seh_ebp hold;
++    with no frame of its own), and what g_ebp and g_seh_ebp hold; or as data,
++    after `ebp = <another register or a load>` (code built without frame
++    pointers uses ebp as one more general register), when a store through
++    it is a store through a pointer like any other (below);
+   * which stack slots hold an entry value, and the stores that overwrite them:
+     a store at a known offset from esp or ebp kills the slots it overlaps; a
+     callee's stores kill the slots between its entry esp and the highest
+@@ -56,8 +59,8 @@ left is one fixpoint of the analysis, and so sound by induction on the depth
+ of the calls, for every call that returns.
+ 
+ What the analysis assumes of guest code: a store through a pointer that is not
+-esp or ebp (an address computed into another register) does not land in a
+-saved-register slot of a frame. Those slots are not objects a C program can
++esp or ebp (an address computed into another register, or moved from one into
++ebp) does not land in a saved-register slot of a frame. Those slots are not objects a C program can
+ name; the exceptions (setjmp, the SEH helpers, _alloca) work through esp and
+ ebp and are covered above. The register globals are per guest thread, and a
+ thread switch or interrupt work at a safe point (RECOMP_BACKEDGE) restores
+@@ -181,7 +184,8 @@ def _address_taken(code):
+ #   (off, ebp, gebp, gseh, orig, slots)
+ # off:   esp - entry esp, or None
+ # ebp:   a frame: ("f", k) entry esp + k; ("i",) what g_ebp held at the entry;
+-#        ("s",) what g_seh_ebp held at the entry; None unknown
++#        ("s",) what g_seh_ebp held at the entry; ("d",) data, a value from
++#        another register or memory (no frame); None unknown
+ # gebp:  what g_ebp holds, as a frame (("i",) at the entry)
+ # gseh:  what g_seh_ebp holds, as a frame (("s",) at the entry); a function
+ #        with no frame of its own starts with `ebp = g_seh_ebp`
+@@ -189,6 +193,7 @@ def _address_taken(code):
+ # slots: frozenset of (offset, register): a slot holding the register's entry value
+ 
+ _INHERITED = {("i",): "iw", ("s",): "isw"}
++_DATA = ("d",)
+ 
+ 
+ def _kill(slots, lo, hi):
+@@ -262,6 +267,18 @@ def _items_of(code):
+     return tuple(_items(code))
+ 
+ 
++def _loads_dropped(expr):
++    """expr with each guest memory load (MEMxx(...)) left out: what is left is
++    what the value is computed from, besides memory."""
++    out, i = [], 0
++    for m in _MEM.finditer(expr):
++        if m.start() < i:
++            continue
++        out.append(expr[i:m.start()])
++        i = _match_paren(expr, m.end() - 1)
++    return "".join(out) + expr[i:]
++
++
+ @functools.lru_cache(maxsize=None)
+ def _classify(raw):
+     """A statement's form, for _Fn.stmt (the same in every state)."""
+@@ -294,6 +311,9 @@ def _classify(raw):
+         dst, src = form.split("=")
+         if re.fullmatch(r"%s\s*=\s*%s" % (dst, src), t):
+             return (form,)
++    m = re.fullmatch(r"ebp\s*=(?!=)\s*(.+)", t)
++    if m and not re.search(r"\b(?:g_)?(?:esp|ebp|seh_ebp)\b", _loads_dropped(m.group(1))):
++        return ("ebp=data", t)
+     m = _CALL.fullmatch(t)
+     if m:
+         return ("call", m.group(1))
+@@ -334,6 +354,8 @@ class _Fn:
+         elif s[1] in _INHERITED:
+             self.inherited(s[1], frozenset((k,)))
+             return s
++        elif s[1] == _DATA:
++            return s  # through a pointer that is not a frame, as through any register
+         else:
+             at = None
+         if at is None:
+@@ -460,6 +482,9 @@ class _Fn:
+             return (off, ebp, ebp, gseh, orig, slots)
+         if kind == "g_seh_ebp=ebp":
+             return (off, ebp, gebp, ebp, orig, slots)
++        if kind == "ebp=data":
++            s = self.generic(s, op[1])
++            return None if s is None else (s[0], _DATA) + s[2:]
+         if kind == "call":
+             return self.call(s, op[1])
+         if kind == "name()" and op[1] in self.summaries:
+diff --git a/tools/recomp/test_preserve.py b/tools/recomp/test_preserve.py
+index 1a0c5ad..2faefc8 100644
+--- a/tools/recomp/test_preserve.py
++++ b/tools/recomp/test_preserve.py
+@@ -102,6 +102,19 @@ def test_a_store_over_the_saved_slot_loses_it():
+     assert "esi" in s.preserved
+ 
+ 
++def test_ebp_as_a_general_register_is_a_pointer_like_any_other():
++    # code built without frame pointers moves a pointer into ebp and stores through it:
++    # push esi; mov esi, 5; mov ebp, ecx; mov [ebp+0x24], eax; pop esi; ret
++    (s,), *_ = _summaries([[PUSH_ESI, MOV_ESI_5, b"\x8B\xE9", b"\x89\x45\x24", POP_ESI, RET]])
++    assert s.preserved == {"ebx", "esi", "edi"}
++    # the same with the pointer loaded into ebp from an argument: mov ebp, [esp+8]
++    (s,), *_ = _summaries([[PUSH_ESI, MOV_ESI_5, b"\x8B\x6C\x24\x08", b"\x89\x45\x00", POP_ESI, RET]])
++    assert s.preserved == {"ebx", "esi", "edi"}
++    # but ebp made from esp is a frame: lea ebp, [esp]; mov [ebp], eax overwrites the saved esi
++    (s,), *_ = _summaries([[PUSH_ESI, MOV_ESI_5, b"\x8D\x2C\x24", b"\x89\x45\x00", POP_ESI, RET]])
++    assert "esi" not in s.preserved
++
++
+ def test_an_indirect_call_preserves_nothing():
+     # push esi; call [eax]; pop esi; ret: the target is unknown
+     (s,), *_ = _summaries([[PUSH_ESI, b"\xFF\x10", POP_ESI, RET]])

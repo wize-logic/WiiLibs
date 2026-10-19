@@ -12,7 +12,9 @@
 // frame. With the write watch (the runtime's MMU) an array whose pages were not written since it was
 // made is as it was, its source not read; otherwise (no watch, or a capture running) its source is
 // hashed. An array found changed is converted again; one found changed twice is geometry the title
-// rewrites (a skinned or animated mesh) and is not kept: its draws are sent as before.
+// rewrites (a skinned or animated mesh) and is not kept: its draws are sent as before. A source of
+// more than one guest page is hashed page by page, so that a watch that fires for a page it shares
+// with data the title writes rehashes that page alone (WlNv2aVCacheConfig.whole_hash: all of it).
 #pragma once
 
 #include <stdbool.h>
@@ -64,6 +66,8 @@ typedef struct WlNv2aVCacheConfig {
     // optional: waits until the GPU has drawn everything sent (wl_gx_sync), so that the arrays given
     // back pending go at once when there is no room otherwise (NULL: they wait for the frame's end)
     void (*gpu_wait)(void);
+    // a source hashed whole at each check that reads it, never page by page
+    bool whole_hash;
 } WlNv2aVCacheConfig;
 
 typedef struct WlNv2aVCacheEntry {
@@ -73,10 +77,14 @@ typedef struct WlNv2aVCacheEntry {
     uint8_t type, size, kind;
     // which of its elements are converted: [first, first + count)
     uint32_t first, count;
-    // what they became (count elements of the kind's size), and the source's hash
+    // what they became (count elements of the kind's size), and the source's hash: whole, or each of
+    // its guest pages' (page_hash: `pages` of them, the first the page of the source's start; NULL:
+    // one page, or whole_hash)
     void *array;
     uint32_t bytes;
     uint64_t hash;
+    uint64_t *page_hash;
+    uint32_t pages;
     // bookkeeping
     uint32_t used_frame, checked_frame;
     uint32_t stamp;   // the write watch's over the source since it was checked (0: none)
@@ -87,6 +95,7 @@ typedef struct WlNv2aVCacheEntry {
 typedef struct WlNv2aVCacheStats {
     uint32_t lookups, hits, converted, reconverted, refused, evicted, failed;
     uint32_t checks, watched, hashed; // checks (an array's first use in a frame), by the watch, hashed
+    uint32_t page_checks;             // checks that hashed the pages the watch found written alone
     uint64_t hashed_bytes, converted_elements;
     uint32_t gpu_waits;               // the GPU waited for to free pending arrays (cfg.gpu_wait)
     size_t bytes, peak_bytes;         // arrays kept now, at most

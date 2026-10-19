@@ -229,6 +229,7 @@ static void pte_insert(uint32_t ea, uint32_t frame, uint32_t p, uint32_t rc) {
                 g[2 * i] = pte_w0(ea, h);
                 __asm__ volatile("sync" ::: "memory");
                 g_hint[a][p] = hint_of(index, i);
+                wl_xb_pg_opened(p);
                 return;
             }
         }
@@ -244,6 +245,7 @@ static void pte_insert(uint32_t ea, uint32_t frame, uint32_t p, uint32_t rc) {
     g[2 * i] = pte_w0(ea, 0);
     __asm__ volatile("sync" ::: "memory");
     g_hint[a][p] = hint_of(index, i);
+    wl_xb_pg_opened(p);
 }
 
 // The PTE for a touch of page `p` at `ea`: R set (it is being used now), C when the page is known
@@ -310,6 +312,42 @@ bool wl_xb_mmu_watch(uint32_t p) {
         }
     }
     return true;
+}
+
+uint32_t wl_xb_mmu_look(uint32_t p, bool seal) {
+    if (!g_hw_changed) {
+        return WL_XB_MMU_BLIND;
+    }
+    seal = seal && g_hw_ref; // (R tells whether a PTE was used since the last look)
+    bool mapped = false;
+    for (uint32_t a = 0; a < 2u; a++) {
+        volatile uint32_t *w0p = pte_of(p, a);
+        if (w0p == NULL) {
+            continue;
+        }
+        uint32_t w1 = w0p[1];
+        uint32_t ea = pte_ea(*w0p, pteg_index(w0p));
+        if (seal && (w1 & (PTE_R | PTE_C)) == 0) {
+            // not used since the last look: the PTE goes, so that the next touch faults (a store
+            // then maps the page again with C clear, and the look after sees it)
+            *w0p = 0;
+            __asm__ volatile("sync" ::: "memory");
+            tlbie(ea);
+            g_hint[a][p] = 0; // (no table search for it until it is mapped again)
+            continue;
+        }
+        mapped = true;
+        uint32_t clear = PTE_C | (seal ? PTE_R : 0u);
+        if ((w1 & clear) != 0) {
+            // C taken (a store seen) and R (into the clock's flags), both cleared in the table and
+            // the TLB entry dropped, so that the next store and the next use set them again
+            take_bits(p, w1);
+            w0p[1] = w1 & ~clear;
+            __asm__ volatile("sync" ::: "memory");
+            tlbie(ea);
+        }
+    }
+    return mapped ? 0u : WL_XB_MMU_SEALED;
 }
 
 void wl_xb_mmu_unmap(uint32_t p) {

@@ -92,8 +92,11 @@ enum {
     WL_XBOX_VSH_FUSED_FORMATS = 19
 };
 /* (perspective: 0 the screen's position, 1 perspective's, WL_XBOX_VSH_FUSED_XF the transform unit's: "o", "p"
-and "x" in a form's text) */
-enum { WL_XBOX_VSH_FUSED_XF = 2 };
+and "x" in a form's text; WL_XBOX_VSH_FUSED_WORLD, "w": the x, y and z of the temporary the program's
+clip-space position is made from (WlXboxVshWorldPosition), the clip-space w the program captures in place
+of one of them (WlXboxVshFused's world_slot), which GX's position matrix (the four constants and the
+viewport) transforms; the clip-space x, y and z not made) */
+enum { WL_XBOX_VSH_FUSED_XF = 2, WL_XBOX_VSH_FUSED_WORLD = 3 };
 enum {
     WL_XBOX_VSH_FUSED_STAGE_PLAIN,
     WL_XBOX_VSH_FUSED_STAGE_LINEAR,
@@ -108,7 +111,12 @@ enum {
     /* (a sphere map's made by GX's transform unit from the direction of unit length the form sends,
     as a projected coordinate's (s, t, q) are, after a lit form's normal: WlGxDirectLayout's
     texcoords_sphere; "U") */
-    WL_XBOX_VSH_FUSED_STAGE_SPHERE_XF
+    WL_XBOX_VSH_FUSED_STAGE_SPHERE_XF,
+    /* (made by GX's transform unit through a matrix from the one input register the program makes the
+    coordinate from, affinely (wl_xbox_vsh_texgen_source), its x and y as the fetch made them: sent once,
+    in the first such stage's coordinate, for every stage made from that register (the others not sent,
+    GX's texgen reading the first's input); the stage's output not made, not in the form's live; "M") */
+    WL_XBOX_VSH_FUSED_STAGE_INPUT
 };
 /* (a build whose forms may have sphere maps made by GX: its fused key's) */
 #define WL_XBOX_VSH_FUSED_SPHERE_XF 1
@@ -233,6 +241,19 @@ typedef struct WlXboxVshLightShape {
     WlXboxVshLight lights[WL_XBOX_VSH_LIGHTS];
 } WlXboxVshLightShape;
 
+/* A clip-space position GX's position matrix can make from a temporary
+(wl_xbox_vsh_world_position): each of its x, y, z and w, as the program
+captures it, a dph of the temporary (unswizzled, unnegated) and the constant
+c[constant[n]] (c[n - 96] in Direct3D's terms; unswizzled, unnegated, not
+relative), the temporary's x, y and z the same from the first of the four to
+the capture (to_end: to the program's end, no instruction writing them after) */
+typedef struct WlXboxVshWorldPosition {
+    /* (0: the position is not of the shape) */
+    unsigned char found, to_end;
+    unsigned char temporary;
+    unsigned char constant[4];
+} WlXboxVshWorldPosition;
+
 typedef struct WlXboxVshProgram {
     unsigned long count;
     /* (wl_xbox_vsh_hash: the generated programs' names) */
@@ -260,6 +281,8 @@ typedef struct WlXboxVshProgram {
     unsigned char captures_clip;
     /* its d0's light shape, as wl_xbox_vsh_light_shape finds it */
     WlXboxVshLightShape light;
+    /* its clip-space position's shape, as wl_xbox_vsh_world_position finds it */
+    WlXboxVshWorldPosition world;
     WlXboxVshInstruction instructions[WL_XBOX_VSH_MAX_INSTRUCTIONS];
     WlXboxVshStep steps[WL_XBOX_VSH_MAX_INSTRUCTIONS];
 } WlXboxVshProgram;
@@ -293,7 +316,8 @@ struct WlXboxVshOutput {
 /* a fused batch's (WlXboxVshFusedProc) state: what it reads, its scratch, where
 it writes. The floats a pair at an even index (8 bytes aligned) */
 enum {
-    /* pack: (each a pair) the viewport's scale, offset, 1 / the samples, 1/2,
+    /* pack: (each a pair) the viewport's scale and offset in samples (each
+    times 1 / the samples), 1 / the samples, 1/2,
     255, the depth's divisor (the depth's maximum, 1 for none) and 1, 1e-12
     and 0, each stage's 1 / its texture's size (1 when it is not linear),
     1 / 32767, 1 / 255, 1/2 and 1, 1 and 1, -1 and -1 */
@@ -332,6 +356,10 @@ struct WlXboxVshFused {
     /* the vertices' elements, and where each one's words go */
     const uint32_t *elements;
     uint32_t *const *words;
+    /* (a "w" form) the byte offset in the vertex of the world position's
+    component the clip-space w is sent in place of (4 k: GX's position matrix
+    recovers component k from w) */
+    uint32_t world_slot;
 };
 
 /* what a program's outputs depend on, found from its instructions alone
@@ -376,17 +404,28 @@ unsigned long wl_xbox_vsh_check(const uint32_t *instructions, unsigned long inst
 /* the light shape of a program's d0 (WlXboxVshLightShape): 1 and *shape
 filled, or 0 (shape->count 0) */
 int wl_xbox_vsh_light_shape(const WlXboxVshProgram *program, WlXboxVshLightShape *shape);
+/* the shape of a program's clip-space position (WlXboxVshWorldPosition): 1
+and *world filled, or 0 (world->found 0) */
+int wl_xbox_vsh_world_position(const WlXboxVshProgram *program, WlXboxVshWorldPosition *world);
 /* a copy of the program whose d0's r, g and b no instruction writes (the
 form that leaves them to GX's lighting: the instructions that made them then
 reach nothing) */
 void wl_xbox_vsh_light_unlit(const WlXboxVshProgram *program, WlXboxVshProgram *unlit);
 
 /* a fused form as text, as tools/xbox_vsh_codegen.c's --fused file lists them
-after the program's hash: "<live, hex> <p or o> <colours> <channels>[L]
+after the program's hash: "<live, hex> <p, o, x or w> <colours> <channels>[L]
 <stages> <formats>" (L: lit), the stages "-" or each "<n><N, L, P, Q, S, G, H or U>" (plain, linear,
 projective, both, sphere, projected, linear projected, sphere by GX), the formats "-" or each "<register>:<F1 ... F4,
 D3D, CMP, S1.n, UB.n>", comma-separated. _text gives the length (snprintf's),
 _parse the characters read (0: not a form; the key's every byte set) */
+/* the input register a fused form's stage of kind WL_XBOX_VSH_FUSED_STAGE_INPUT is made from: the one
+register (of at most two components in the form) its s and t read, affinely; -1 for none */
+int wl_xbox_vsh_texgen_source(const WlXboxVshDependencies *dependencies, const WlXboxVshFusedKey *key,
+                              unsigned stage);
+/* the constant registers (c[n - 96]) the instructions that reach the outputs `live`
+(WL_XBOX_VSH_LIVE_...) read, at most `most` of them into registers: their count, -1 when one
+is read by a0 or there are more (what those outputs are, for any vertex, is a function of them) */
+int wl_xbox_vsh_live_constants(const WlXboxVshProgram *program, unsigned live, unsigned char *registers, int most);
 int wl_xbox_vsh_fused_text(const WlXboxVshFusedKey *key, char *text, unsigned long size);
 int wl_xbox_vsh_fused_parse(const char *text, WlXboxVshFusedKey *key);
 

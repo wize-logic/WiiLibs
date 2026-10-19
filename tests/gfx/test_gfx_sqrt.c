@@ -238,8 +238,43 @@ TEST double_exact_matches_sqrt(void) {
         if (wl_double_bits(wl_sqrt_exact(x)) != wl_double_bits(platform_sqrt(x))) {
             differ++;
         }
+        if (wl_double_bits(wl_sqrt_wide(x)) != wl_double_bits(platform_sqrt(x))) {
+            differ++;
+        }
     }
     ASSERT_EQ_FMT(0ul, differ, "%lu");
+    PASS();
+}
+
+// wl_sqrt_near over its whole range [2^-500, 2^500], from the exact estimate and from ones 1/32 and 6% off: the
+// IEEE root whenever it decides, and undecided (0) never in these runs (about once in 2^37 roots)
+TEST double_near_is_exact_from_an_estimate_within_six_percent(void) {
+    static const double off[] = {1.0, 1.0 + 1.0 / 32.0, 1.0 - 1.0 / 32.0, 1.06, 0.94};
+    unsigned long differ = 0, undecided = 0;
+    for (unsigned which = 0; which < sizeof off / sizeof off[0]; which++) {
+        for (uint32_t i = 0; i < DOUBLES / 4; i++) {
+            uint64_t exponent = 1023 - 500 + rnd64() % 1001;
+            if (i % 4 == 0) {
+                exponent = 1023 + i / 4 % 2; // [1, 4)
+            }
+            if (i % 8 == 1) {
+                exponent = 1023 + (i / 8 % 2 ? 500 : -500); // the range's ends
+            }
+            double x = wl_bits_double((rnd64() & 0x000FFFFFFFFFFFFFull) | exponent << 52);
+            if (i % 16 == 3) {
+                double k = (double)((rnd64() >> 38) | 1u); // a square, or beside one
+                x = wl_bits_double(wl_double_bits(k * k) + (uint64_t)(int64_t)((int)(i / 16 % 5) - 2));
+            }
+            double root = wl_sqrt_near(x, off[which] / sqrt(x));
+            if (root == 0.0) {
+                undecided++;
+            } else if (wl_double_bits(root) != wl_double_bits(platform_sqrt(x))) {
+                differ++;
+            }
+        }
+    }
+    ASSERT_EQ_FMT(0ul, differ, "%lu");
+    ASSERT_EQ_FMT(0ul, undecided, "%lu");
     PASS();
 }
 
@@ -313,6 +348,7 @@ SUITE(gfx_sqrt_suite) {
     RUN_TEST(wrap_is_the_exact_root);
     RUN_TEST(double_exact_matches_sqrt);
     RUN_TEST(double_refine_is_exact_from_a_coarse_estimate);
+    RUN_TEST(double_near_is_exact_from_an_estimate_within_six_percent);
     RUN_TEST(double_squares_and_their_neighbours);
     RUN_TEST(double_special_values_are_ieees);
 }

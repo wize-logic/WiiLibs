@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Sun, 18 Oct 2026 20:07:07 -0400
+Subject: [PATCH] runtime: fist and frndint keep their wide path out of line
+
+recomp_fist and recomp_frndint round a value under 2^30 in integers and
+hand anything else to recomp_fist_wide / recomp_frndint_wide (floor, ceil,
+fmod, ldexp and the 64-bit conversion). All four were static inline, so a
+compiler inlined the wide path into a copy of the small one and then
+judged the result too big to inline at the call sites: a call per fist
+whose common case is a few instructions.
+
+The wide paths are now RECOMP_COLD (noinline, cold on GCC and Clang) and
+the small ones RECOMP_SMALL (always_inline), so the small path is inlined
+and its bits test folds at each site, and only a value out of range pays
+for a call. A runtime may define either macro first.
+---
+ templates/runtime/recomp_types.h | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index 2d10409..4bc5ece 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -343,7 +343,25 @@ static inline int32_t recomp_round_small(double value, uint16_t control) {
+         return t;
+     }
+ }
+-static inline double recomp_frndint_wide(double value, uint16_t control) {
++/* The rare wide path is kept out of line (RECOMP_COLD) and the small path
++ * inlined (RECOMP_SMALL) at every site, where its bits test folds: a call is
++ * the whole cost of a value out of range, and the common one has none. In
++ * code built for size the compiler decides (one copy, called). */
++#ifndef RECOMP_COLD
++#if defined(__GNUC__)
++#define RECOMP_COLD __attribute__((noinline, cold, unused))
++#else
++#define RECOMP_COLD
++#endif
++#endif
++#ifndef RECOMP_SMALL
++#if defined(__GNUC__) && !defined(__OPTIMIZE_SIZE__)
++#define RECOMP_SMALL inline __attribute__((always_inline))
++#else
++#define RECOMP_SMALL inline
++#endif
++#endif
++static RECOMP_COLD double recomp_frndint_wide(double value, uint16_t control) {
+     double rounded;
+     if (!isfinite(value)) return value;
+     switch((control>>10)&3) {
+@@ -359,7 +377,7 @@ static inline double recomp_frndint_wide(double value, uint16_t control) {
+     }
+     return rounded == 0.0 ? copysign(0.0, value) : rounded;
+ }
+-static inline double recomp_frndint(double value, uint16_t control) {
++static RECOMP_SMALL double recomp_frndint(double value, uint16_t control) {
+     if (value > -1073741824.0 && value < 1073741824.0) {
+         double rounded = (double)recomp_round_small(value, control);
+         return rounded == 0.0 ? copysign(0.0, value) : rounded;
+@@ -368,14 +386,14 @@ static inline double recomp_frndint(double value, uint16_t control) {
+ }
+ /* x87 integer stores use the guest RC bits, independently of host rounding.
+  * Masked invalid conversions store the signed integer-indefinite value. */
+-static inline int64_t recomp_fist_wide(double value, uint16_t control, unsigned bits) {
++static RECOMP_COLD int64_t recomp_fist_wide(double value, uint16_t control, unsigned bits) {
+     double rounded = recomp_frndint_wide(value, control);
+     double limit=ldexp(1.0,(int)bits-1);
+     if(!isfinite(rounded) || rounded < -limit || rounded >= limit)
+         return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
+     return (int64_t)rounded;
+ }
+-static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
++static RECOMP_SMALL int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
+     if (value > -1073741824.0 && value < 1073741824.0) {
+         int32_t r = recomp_round_small(value, control);
+         if (bits >= 32 || (r >= -(INT32_C(1) << (bits - 1)) && r < (INT32_C(1) << (bits - 1))))

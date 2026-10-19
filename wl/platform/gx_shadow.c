@@ -363,6 +363,10 @@ uint32_t wl_gx_shadow_layout_vertex_bytes(const WlGxDirectLayout *layout) {
     for (n = 0; n < 16; n++) {
         bytes += words[n] == 0 ? 0u : (layout->indexed & (1u << n)) ? 2u : 4u * words[n];
     }
+    // (the normal, binormal and tangent that carry them: three or nine floats, or one index for all)
+    if (projected != 0 && (layout->indexed & (1u << WL_GX_DIRECT_ARRAY_NORMAL))) {
+        return bytes + 2u;
+    }
     return bytes + 4u * (projected == 0 ? 0u : projected == 1u ? 3u : 9u);
 }
 

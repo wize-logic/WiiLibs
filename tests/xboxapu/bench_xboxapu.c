@@ -10,7 +10,8 @@
 // BENCH_VOICES=mute plays the same voices with every target at full attenuation (silent), and
 // BENCH_VOICES=pause pauses every voice once it is on: what the voices cost when they add nothing.
 // BENCH_VOICES=blink silences every voice on odd game ticks (a silent voice going on and coming
-// back as it would have played).
+// back as it would have played). BENCH_PLAIN=1 runs the model's plain code paths
+// (WlXboxApuConfig.plain), which must give the same checksums.
 //
 // With an expected checksum (hex), exits 1 when the checksum differs (ctest runs it so). Count
 // instructions with tools/qemu_icount.py on a ppc-be build (--base with fewer frames for the cost
@@ -262,6 +263,7 @@ static WlXboxApu *scene(bool sum) {
     wl_xbox_apu_config_default(&cfg);
     cfg.phys_ptr = phys_ptr;
     cfg.on_frame = sum ? on_frame : NULL;
+    cfg.plain = getenv("BENCH_PLAIN") != NULL;
     WlXboxApu *apu = wl_xbox_apu_create(&cfg);
     if (apu == NULL) {
         return NULL;

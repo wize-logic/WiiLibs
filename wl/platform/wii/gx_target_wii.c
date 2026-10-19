@@ -21,7 +21,7 @@ void wl_gx_target_be_copy_begin(void) {
     wl_gx_wii_copy_filter(false);
 }
 
-void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what, bool invalidate) {
+void wl_gx_target_be_copy(void *dst, uint32_t x, uint32_t w, uint32_t h, WlGxTargetCopy what, bool invalidate) {
     // (the depth copy is a texture of RGBA8's size)
     static const u8 format[] = {GX_TF_RGBA8, GX_TF_RGB565, GX_TF_Z24X8};
     static const WlGxTexFormat size_of[] = {WL_GX_TEX_RGBA8, WL_GX_TEX_RGB565, WL_GX_TEX_RGBA8};
@@ -31,7 +31,7 @@ void wl_gx_target_be_copy(void *dst, uint32_t w, uint32_t h, WlGxTargetCopy what
     if (invalidate) {
         wl_gpu_buffer_invalidate(dst, wl_gx_tex_bytes(size_of[what], w, h));
     }
-    GX_SetTexCopySrc(0, 0, (u16)w, (u16)h);
+    GX_SetTexCopySrc((u16)x, 0, (u16)w, (u16)h);
     GX_SetTexCopyDst((u16)w, (u16)h, format[what], GX_FALSE);
     GX_CopyTex(dst, GX_FALSE);
     GX_PixModeSync();
@@ -46,8 +46,8 @@ void wl_gx_target_be_copy_end(void) {
     wl_gx_wii_note_commands();
 }
 
-void wl_gx_target_be_scissor(uint32_t w, uint32_t h) {
-    GX_SetScissor(0, 0, w, h);
+void wl_gx_target_be_scissor(uint32_t x, uint32_t w, uint32_t h) {
+    GX_SetScissor(x, 0, w, h);
     wl_gx_invalidate_shadow();
 }
 
@@ -143,8 +143,8 @@ static void quad(float x0, float y0, float x1, float y1, const GXColor *colour, 
     wl_gx_wii_note_commands();
 }
 
-void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, uint32_t h, uint32_t back_w,
-                             uint32_t back_h) {
+void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t x, uint32_t w, uint32_t h,
+                             uint32_t back_w, uint32_t back_h) {
     GXTexObj colour_map, depth_map;
 
     GX_InvalidateTexAll();
@@ -158,7 +158,7 @@ void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, 
         GX_SetAlphaUpdate(GX_TRUE);
         GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
         GX_SetZCompLoc(GX_TRUE);
-        quad(0.0f, 0.0f, (float)w, (float)h, NULL, 0.0f, true, false, back_w, back_h);
+        quad((float)x, 0.0f, (float)(x + w), (float)h, NULL, 0.0f, true, false, back_w, back_h);
         return;
     }
     GX_InitTexObj(&depth_map, (void *)depth, (u16)w, (u16)h, GX_TF_Z24X8, GX_CLAMP, GX_CLAMP, GX_FALSE);
@@ -168,7 +168,7 @@ void wl_gx_target_be_restore(const void *colour, const void *depth, uint32_t w, 
     GX_SetColorUpdate(GX_TRUE);
     GX_SetAlphaUpdate(GX_TRUE);
     GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
-    quad(0.0f, 0.0f, (float)w, (float)h, NULL, 0.0f, true, true, back_w, back_h);
+    quad((float)x, 0.0f, (float)(x + w), (float)h, NULL, 0.0f, true, true, back_w, back_h);
 }
 
 void wl_gx_target_be_clear(bool colour, bool depth, uint32_t rgba, float z, int x, int y, int rw, int rh,

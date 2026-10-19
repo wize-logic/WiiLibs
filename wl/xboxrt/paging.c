@@ -53,6 +53,12 @@
 // harvests and clears the pages' C bits and takes the count as its stamp; a later look harvests
 // and clears them again and compares the epochs with the stamp. A watched page's PTE never carries
 // C ahead of a store (WL_XB_PG_WATCH), and a swap-out and read back keep its bytes and its epoch.
+// A look reads the epochs (a summary word for each 16 pages first) with interrupts on, and asks the
+// MMU only about the pages that still have a mapping a store passes unseen (g_xb_pg_open): a page
+// whose mappings are all gone faults at its next touch, and a store's fault leaves it mapped again.
+// The look takes a watched page's mappings away when they were not used since the last look (the
+// Wii: R clear), so the pages nothing touches between draws (textures and arrays the guest made
+// once) cost a load or two, and those the guest keeps using are looked at in the MMU as before.
 //
 // Locking: the tables change with the guest lock held, and on the Wii inside wl_xb_mmu_lock
 // (interrupts off) for each step, so a DSI on another thread (the service thread's pinned
@@ -86,6 +92,9 @@ uint16_t *g_xb_pg_slot;
 uint32_t g_xb_pg_frames;
 uint32_t *g_xb_pg_wgen;
 uint32_t g_xb_pg_epoch = 1; // (a test may move it to just before its wrap)
+uint32_t *g_xb_pg_wsum;
+uint32_t *g_xb_pg_open;
+static bool g_old_watch; // (WlXbMemConfig.old_watch: every page through the MMU)
 
 static uint16_t *g_owner;  // [frames + 1] the page holding each frame, + 1 (0: free)
 static uint16_t *g_free;   // a stack of free frames
@@ -1236,6 +1245,9 @@ uint32_t wl_xb_pg_watch(uint32_t p, uint32_t pages) {
         seen = wl_xb_mmu_watch(k) && seen;
         if ((uint32_t)(g_xb_pg_epoch - g_xb_pg_wgen[k]) >= WL_XB_PG_EPOCH_WINDOW) {
             g_xb_pg_wgen[k] = g_xb_pg_epoch; // too old to compare across the wrap: the present
+            g_xb_pg_wsum[k >> WL_XB_PG_WSUM_SHIFT] = g_xb_pg_epoch; // (still no older than its pages' epochs)
+        } else if ((uint32_t)(g_xb_pg_epoch - g_xb_pg_wsum[k >> WL_XB_PG_WSUM_SHIFT]) >= WL_XB_PG_EPOCH_WINDOW) {
+            g_xb_pg_wsum[k >> WL_XB_PG_WSUM_SHIFT] = g_xb_pg_epoch; // (too old to compare: the present)
         }
     }
     uint32_t stamp = g_xb_pg_epoch;
@@ -1263,10 +1275,8 @@ void wl_xb_pg_converted(uint32_t p, uint32_t pages) {
     wl_xb_mmu_unlock(lv);
 }
 
-bool wl_xb_pg_written(uint32_t p, uint32_t pages, uint32_t stamp) {
-    if (stamp == 0 || g_xb_pg_frames == 0 || pages == 0 || p >= g_xb_ram_pages || pages > g_xb_ram_pages - p) {
-        return true;
-    }
+// (as before 2026-10-19: every page's mappings looked at, the MMU lock held throughout)
+static __attribute__((noinline)) bool written_old(uint32_t p, uint32_t pages, uint32_t stamp) {
     uint32_t lv = wl_xb_mmu_lock();
     bool written = (uint32_t)(g_xb_pg_epoch - stamp) >= WL_XB_PG_EPOCH_WINDOW; // too old: may have been
     for (uint32_t k = p; k < p + pages && !written; k++) {
@@ -1275,6 +1285,78 @@ bool wl_xb_pg_written(uint32_t p, uint32_t pages, uint32_t stamp) {
     }
     wl_xb_mmu_unlock(lv);
     return written;
+}
+
+// Whether a page of [p, end) has a write epoch after `stamp`: the summaries of their runs of 16
+// pages, and a run's pages only when its summary is newer.
+static bool epochs_after(uint32_t p, uint32_t end, uint32_t stamp) {
+    const uint32_t sh = WL_XB_PG_WSUM_SHIFT;
+    for (uint32_t g = p >> sh, last = (end - 1u) >> sh; g <= last; g++) {
+        if ((int32_t)(g_xb_pg_wsum[g] - stamp) > 0) {
+            uint32_t k = g << sh > p ? g << sh : p, stop = (g + 1u) << sh < end ? (g + 1u) << sh : end;
+            for (; k < stop; k++) {
+                if ((int32_t)(g_xb_pg_wgen[k] - stamp) > 0) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// The open pages `bits` of word `w` of g_xb_pg_open looked at in the MMU, the lock held for the
+// word (at most 32 looks): their C bits harvested into their epochs, the mappings not used since the
+// last look gone.
+static __attribute__((noinline)) bool open_written(uint32_t w, uint32_t bits, uint32_t stamp) {
+    bool written = false;
+    uint32_t lv = wl_xb_mmu_lock();
+    while (bits != 0 && !written) {
+        uint32_t b = (uint32_t)__builtin_ctz(bits), k = (w << 5) | b;
+        bits &= bits - 1u;
+        g_xb_pg_flags[k] |= WL_XB_PG_WATCH; // (a page freed since lost it)
+        uint32_t r = wl_xb_mmu_look(k, (g_xb_pg_flags[k] & WL_XB_PG_PINNED) == 0);
+        if ((r & WL_XB_MMU_SEALED) != 0) {
+            g_xb_pg_open[w] &= ~(1u << b);
+        }
+        written = (r & WL_XB_MMU_BLIND) != 0 || (int32_t)(g_xb_pg_wgen[k] - stamp) > 0;
+    }
+    wl_xb_mmu_unlock(lv);
+    return written;
+}
+
+bool wl_xb_pg_written(uint32_t p, uint32_t pages, uint32_t stamp) {
+    if (stamp == 0 || g_xb_pg_frames == 0 || pages == 0 || p >= g_xb_ram_pages || pages > g_xb_ram_pages - p) {
+        return true;
+    }
+    if (g_old_watch) {
+        return written_old(p, pages, stamp);
+    }
+    if ((uint32_t)(g_xb_pg_epoch - stamp) >= WL_XB_PG_EPOCH_WINDOW) {
+        return true; // too old: may have been
+    }
+    // One pass, 32 pages (a word of g_xb_pg_open) at a time, with interrupts on: the word, then its
+    // pages' epochs (a store seen already answers), then the MMU for its pages still open. A page
+    // closed when its bit is read was closed by a look that found no mapping left, after taking
+    // every store before it into the epochs, and has had none since (a store faults and maps it
+    // again, which sets the bit), so its epoch read after the bit is all there is to know; an open
+    // page is looked at in the MMU, the lock held. A fault meanwhile only adds sightings and bits.
+    const uint32_t end = p + pages;
+    for (uint32_t w = p >> 5, last = (end - 1u) >> 5; w <= last; w++) {
+        uint32_t lo = w << 5 > p ? w << 5 : p, hi = (w + 1u) << 5 < end ? (w + 1u) << 5 : end;
+        uint32_t bits = __atomic_load_n(&g_xb_pg_open[w], __ATOMIC_RELAXED);
+        __atomic_signal_fence(__ATOMIC_ACQUIRE); // (the bit before the epochs; one core, or the guest lock)
+        if (epochs_after(lo, hi, stamp)) {
+            return true;
+        }
+        bits &= ~0u << (lo & 31u);
+        if ((hi & 31u) != 0) {
+            bits &= ~(~0u << (hi & 31u));
+        }
+        if (bits != 0 && open_written(w, bits, stamp)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void wl_xb_pg_zero_census(uint32_t *dirty_zero, uint32_t *clean_zero) {
@@ -1497,7 +1579,8 @@ size_t wl_xb_pg_host_bytes(void) {
         return 0;
     }
     size_t pages = g_xb_ram_pages;
-    return pages * (sizeof *g_xb_pg_flags + sizeof *g_xb_pg_frame + sizeof *g_xb_pg_slot + sizeof *g_xb_pg_wgen +
+    return (((pages - 1u) >> WL_XB_PG_WSUM_SHIFT) + 1u) * sizeof *g_xb_pg_wsum + (pages + 31u) / 32u * sizeof *g_xb_pg_open +
+           pages * (sizeof *g_xb_pg_flags + sizeof *g_xb_pg_frame + sizeof *g_xb_pg_slot + sizeof *g_xb_pg_wgen +
                     sizeof *g_foff + sizeof *g_evstamp + (g_conv_count != NULL ? sizeof *g_conv_count : 0u)) +
            (g_xb_pg_frames + 1u) * sizeof *g_owner + g_xb_pg_frames * sizeof *g_free +
            (g_slot_used != NULL ? (g_slots + 31u) / 32u * sizeof *g_slot_used : 0u) +
@@ -1518,10 +1601,17 @@ WlResult wl_xb_pg_init(const WlXbMemConfig *cfg, uint32_t frames) {
     g_xb_pg_wgen = calloc(pages, sizeof *g_xb_pg_wgen);
     g_foff = calloc(pages, sizeof *g_foff);
     g_evstamp = calloc(pages, sizeof *g_evstamp);
-    if (g_evstamp == NULL || g_xb_pg_flags == NULL || g_xb_pg_frame == NULL || g_xb_pg_slot == NULL || g_owner == NULL || g_free == NULL ||
+    g_xb_pg_wsum = calloc(((pages - 1u) >> WL_XB_PG_WSUM_SHIFT) + 1u, sizeof *g_xb_pg_wsum);
+    uint32_t *open = calloc((pages + 31u) / 32u, sizeof *g_xb_pg_open);
+    if (g_xb_pg_wsum == NULL || open == NULL || g_evstamp == NULL || g_xb_pg_flags == NULL || g_xb_pg_frame == NULL || g_xb_pg_slot == NULL || g_owner == NULL || g_free == NULL ||
         g_xb_pg_wgen == NULL || g_foff == NULL) {
         return WL_ERR_NOMEM;
     }
+    // (every page counts as mapped until its first look: what the backend mapped before the core
+    // started is not known here)
+    memset(open, 0xFF, (pages + 31u) / 32u * sizeof *open);
+    g_xb_pg_open = open;
+    g_old_watch = cfg->old_watch;
     if (!cfg->converted_ordinary) {
         g_conv_count = calloc(pages, sizeof *g_conv_count);
         if (g_conv_count == NULL) {

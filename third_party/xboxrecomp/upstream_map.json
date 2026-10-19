@@ -311,7 +311,19 @@
     "xboxrecomp_pytest",
     "xbox_recomp_conformance"
    ],
-   "notes": "patches 0006 (--runtime-header), 0013 (--x87-locals), 0014 (--reg-locals)"
+   "notes": "patches 0006 (--runtime-header), 0013 (--x87-locals), 0014 (--reg-locals), 0034 (--rodata-consts)"
+  },
+  {
+   "upstream": "tools/recomp/config.py",
+   "kind": "patched",
+   "wl": [
+    "third_party/xboxrecomp/patches/"
+   ],
+   "wl_tests": [
+    "xboxrecomp_pytest",
+    "xbox_recomp_e2e"
+   ],
+   "notes": "patch 0034 (Section.read_only from the XBE's flags: not writable, preloaded, not code; read_only_offset for const_load.py's --rodata-consts)"
   },
   {
    "upstream": "tools/recomp/test_lifter_fpu.py",

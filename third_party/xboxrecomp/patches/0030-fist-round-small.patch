@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <wizelogic@proton.me>
+Date: Sun, 18 Oct 2026 19:30:02 -0400
+Subject: [PATCH] runtime: fist and frndint round a value under 2^30 in
+ integers
+
+recomp_fist and recomp_frndint went through floor (and fmod for a half, under round-to-nearest), ldexp for the limit, and a 64-bit conversion, which a 32-bit host such as PowerPC makes in software: about 200 instructions a call there. A value of magnitude under 2^30 -- nearly every one a game stores -- is now truncated to int32 (exact and defined in that range), and the fraction it leaves, also exact, decides the rounding mode in one test. The rest take the old path, now recomp_fist_wide and recomp_frndint_wide. Results are the same bits for every input and control word.
+---
+ templates/runtime/recomp_types.h | 39 +++++++++++++++++++++++++++++---
+ 1 file changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index 13bba38..2d10409 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -326,7 +326,24 @@ static inline uint16_t recomp_fxam(double value) {
+  * so a frndint lifted as rint() made both of them round to nearest.
+  * NaN, the infinities and values already integral come back unchanged, and a
+  * zero result keeps the operand's sign, as FRNDINT's does. */
+-static inline double recomp_frndint(double value, uint16_t control) {
++/* The common case of both: |value| < 2^30, rounded in integers. The
++ * truncating conversion is exact (and defined) there, so is what it leaves
++ * over (value - t), and one test of that fraction decides each mode: no libm
++ * call, and no 64-bit conversion, which a 32-bit host makes in software. */
++static inline int32_t recomp_round_small(double value, uint16_t control) {
++    int32_t t = (int32_t)value;
++    double rest = value - (double)t;
++    switch((control>>10)&3) {
++    case 1: return t - (rest < 0.0);
++    case 2: return t + (rest > 0.0);
++    case 3: return t;
++    default:
++        if (rest > 0.5 || (rest == 0.5 && (t & 1))) return t + 1;
++        if (rest < -0.5 || (rest == -0.5 && (t & 1))) return t - 1;
++        return t;
++    }
++}
++static inline double recomp_frndint_wide(double value, uint16_t control) {
+     double rounded;
+     if (!isfinite(value)) return value;
+     switch((control>>10)&3) {
+@@ -342,15 +359,31 @@ static inline double recomp_frndint(double value, uint16_t control) {
+     }
+     return rounded == 0.0 ? copysign(0.0, value) : rounded;
+ }
++static inline double recomp_frndint(double value, uint16_t control) {
++    if (value > -1073741824.0 && value < 1073741824.0) {
++        double rounded = (double)recomp_round_small(value, control);
++        return rounded == 0.0 ? copysign(0.0, value) : rounded;
++    }
++    return recomp_frndint_wide(value, control);
++}
+ /* x87 integer stores use the guest RC bits, independently of host rounding.
+  * Masked invalid conversions store the signed integer-indefinite value. */
+-static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
+-    double rounded = recomp_frndint(value, control);
++static inline int64_t recomp_fist_wide(double value, uint16_t control, unsigned bits) {
++    double rounded = recomp_frndint_wide(value, control);
+     double limit=ldexp(1.0,(int)bits-1);
+     if(!isfinite(rounded) || rounded < -limit || rounded >= limit)
+         return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
+     return (int64_t)rounded;
+ }
++static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
++    if (value > -1073741824.0 && value < 1073741824.0) {
++        int32_t r = recomp_round_small(value, control);
++        if (bits >= 32 || (r >= -(INT32_C(1) << (bits - 1)) && r < (INT32_C(1) << (bits - 1))))
++            return r;
++        return -(INT64_C(1) << (bits - 1));
++    }
++    return recomp_fist_wide(value, control, bits);
++}
+ 
+ /* SSE scalar float -> int32 (cvtss2si, cvttss2si, cvtsd2si, cvttsd2si).
+  * truncate = 1 for the cvtt forms, which round toward zero; the others round

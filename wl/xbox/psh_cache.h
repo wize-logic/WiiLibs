@@ -22,7 +22,10 @@ enum {
     WL_XBOX_PSH_CACHE_WAYS = 8,
     /* the structures pushed out of the cache, remembered by their hash to
     count those translated again */
-    WL_XBOX_PSH_CACHE_EVICTED_HASHES = 256
+    WL_XBOX_PSH_CACHE_EVICTED_HASHES = 256,
+    /* the recent calls remembered by the caller's own words for them
+    (wl_xbox_psh_cache_recent), by a hash of the words */
+    WL_XBOX_PSH_CACHE_RECENT = 32
 };
 
 typedef struct WlXboxPshCacheCounts {
@@ -32,6 +35,9 @@ typedef struct WlXboxPshCacheCounts {
     /* draws whose program was kept as it was, and those whose program was
     kept with its constants changed */
     unsigned long found, patched;
+    /* of those found, the draws found by the caller's words for them
+    (wl_xbox_psh_cache_recent) */
+    unsigned long recent;
     /* the translations made to tell whether a program's constants can be
     changed in place (two a set of combiners), those that came out otherwise,
     and the sets found to be so */
@@ -74,6 +80,9 @@ typedef struct WlXboxPshCacheEntry {
     signed char konst_slots[WL_TEV_KONST_SLOTS];
     signed char preload_slots[WL_TEV_REG_COUNT];
     unsigned long changes;
+    /* counts each change of its key, constants or program (the recent calls
+    that found it hold for it while it is as they found it) */
+    uint32_t version;
     /* the way its translation took (wl_xbox_psh_translate_by_way) */
     int way;
     bool usable;
@@ -96,6 +105,15 @@ typedef struct WlXboxPshCache {
     uint32_t last_state[WL_XBOX_PSH_WORDS], last_extra;
     WlXboxPshTextures last_textures;
     WlXboxPshCacheEntry *last_entry;
+    /* the recent calls (wl_xbox_psh_cache_remember): the caller's words, the
+    extra word and the textures, and the entry they found as it was then (its
+    version); entry NULL: none */
+    struct {
+        uint32_t hash, version, extra;
+        WlXboxPshCacheEntry *entry;
+        uint32_t words[WL_XBOX_PSH_WORDS];
+        WlXboxPshTextures textures;
+    } recent[WL_XBOX_PSH_CACHE_RECENT];
     /* (the calls' own: the key looked up, the programs compared) */
     WlXboxPshCacheKey key;
     WlXboxPshProgram expected, trial, audit;
@@ -112,5 +130,15 @@ translated for this call. The program is kept until the next call. */
 const WlXboxPshProgram *wl_xbox_psh_cache_program(WlXboxPshCache *cache, const uint32_t *state,
                                                   uint32_t extra, const WlXboxPshTextures *textures,
                                                   bool *usable, bool *translated);
+/* The program wl_xbox_psh_cache_program gave a recent call whose caller had the same `words` (its
+own words for the combiner state, WL_XBOX_PSH_WORDS of them, as it had them before making `state`
+of them: a function of them alone), `extra` and `textures`, when it was remembered for them
+(wl_xbox_psh_cache_remember) and its entry has not changed since: what wl_xbox_psh_cache_program
+would give for that `state` now. NULL otherwise. The program is kept until the next call. */
+const WlXboxPshProgram *wl_xbox_psh_cache_recent(WlXboxPshCache *cache, const uint32_t *words, uint32_t extra,
+                                                 const WlXboxPshTextures *textures, bool *usable);
+/* the last wl_xbox_psh_cache_program's program remembered for the caller's words it made `state` of */
+void wl_xbox_psh_cache_remember(WlXboxPshCache *cache, const uint32_t *words, uint32_t extra,
+                                const WlXboxPshTextures *textures);
 /* the counts since wl_xbox_psh_cache_init */
 void wl_xbox_psh_cache_counts(const WlXboxPshCache *cache, WlXboxPshCacheCounts *counts);

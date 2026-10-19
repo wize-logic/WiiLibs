@@ -243,6 +243,21 @@ int main(void) {
     user_ok &= !wl_xb_phys_written(uphys, WL_XB_PAGE, stamp);
     wl_xb_wr32(big + 0x14u, 4u);
     check("watch_user_ea", user_ok && wl_xb_phys_written(uphys, WL_XB_PAGE, stamp));
+    // looks with nothing used between them take the PTEs away (R clear): a store then faults the
+    // page back in and is still seen, through the window and through the user EA, and a read is not
+    stamp = wl_xb_phys_watch(wphys, 4u * WL_XB_PAGE);
+    bool sealed = true;
+    for (uint32_t i = 0; i < 3u; i++) {
+        sealed &= !wl_xb_phys_written(wphys, 4u * WL_XB_PAGE, stamp);
+    }
+    sealed &= wl_xb_rd32(w + 3u * WL_XB_PAGE) == (0xD0000000u | 3u) && !wl_xb_phys_written(wphys, 4u * WL_XB_PAGE, stamp);
+    wl_xb_wr32(w + WL_XB_PAGE + 16u, 6u);
+    check("watch_sealed_store", sealed && wl_xb_phys_written(wphys + WL_XB_PAGE, WL_XB_PAGE, stamp) &&
+                                    !wl_xb_phys_written(wphys + 2u * WL_XB_PAGE, 2u * WL_XB_PAGE, stamp));
+    stamp = wl_xb_phys_watch(uphys, WL_XB_PAGE);
+    sealed = !wl_xb_phys_written(uphys, WL_XB_PAGE, stamp) && !wl_xb_phys_written(uphys, WL_XB_PAGE, stamp);
+    wl_xb_wr32(big + 0x18u, 7u);
+    check("watch_sealed_user_ea", sealed && wl_xb_phys_written(uphys, WL_XB_PAGE, stamp));
     if (pg1.swap_slots != 0) {
         // out to the swap file and read back, the pages unchanged: no store; a store before the
         // swap-out, seen after it

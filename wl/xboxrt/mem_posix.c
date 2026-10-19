@@ -124,6 +124,9 @@ static void set_prot(uint32_t p, uint32_t a, uint8_t prot, bool force) {
         abort();
     }
     g_prot[a][p] = prot;
+    if ((prot & PROT_WRITE) != 0) {
+        wl_xb_pg_opened(p); // (its stores are seen again once a look closes it)
+    }
 }
 
 void wl_xb_mmu_harvest(uint32_t p, bool clear_ref) {
@@ -145,6 +148,11 @@ bool wl_xb_mmu_watch(uint32_t p) {
         }
     }
     return true;
+}
+
+uint32_t wl_xb_mmu_look(uint32_t p, bool seal) {
+    (void)seal; // a page open for reading costs nothing to keep: only the writes fault
+    return wl_xb_mmu_watch(p) ? WL_XB_MMU_SEALED : WL_XB_MMU_BLIND;
 }
 
 void wl_xb_mmu_unmap(uint32_t p) {

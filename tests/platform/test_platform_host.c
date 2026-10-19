@@ -242,6 +242,47 @@ TEST gx_direct_stub_takes_a_normal_beside_a_sphere_map(void) {
     PASS();
 }
 
+// the same vertex made once and read back by index from arrays of the processor's words (a renderer's
+// made vertices: wl_gx_direct_array_words), the normal, binormal and tangent at one index
+TEST gx_direct_stub_reads_word_arrays_by_index(void) {
+    WlGxDirectLayout layout;
+    const WlHostGxDirect *d;
+    const float f[13] = {1, 2, 3, 0, 0, 1, 0.6f, 0.8f, 0, 0, 0, 0, 0};
+    uint32_t words[2][16];
+    const uint32_t slots[3] = {1, 0, 1};
+    unsigned v;
+
+    memset(words, 0, sizeof words);
+    memcpy(words[1], f, sizeof f);
+    words[1][12] = 0x11223344u;
+    memset(&layout, 0, sizeof layout);
+    layout.colors = 1;
+    layout.lit = 1;
+    layout.texcoords_projected = 1u << 3;
+    layout.texcoords_sphere = 1u << 3;
+    layout.indexed = 1u << WL_GX_DIRECT_ARRAY_POSITION | 1u << WL_GX_DIRECT_ARRAY_NORMAL | 1u << WL_GX_DIRECT_ARRAY_COLOR0;
+    wl_host_gx_direct_reset();
+    wl_gx_direct_layout(&layout);
+    wl_gx_direct_array_words(WL_GX_DIRECT_ARRAY_POSITION, words[0], sizeof words[0]);
+    wl_gx_direct_array_words(WL_GX_DIRECT_ARRAY_NORMAL, &words[0][3], sizeof words[0]);
+    wl_gx_direct_array_words(WL_GX_DIRECT_ARRAY_COLOR0, &words[0][12], sizeof words[0]);
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 3);
+    wl_gx_direct_vertices_index(slots, 0, 3, NULL, 0);
+    wl_gx_direct_primitive_end();
+    d = wl_host_gx_direct();
+    ASSERT_EQ(3u, d->count);
+    ASSERT_EQ(0u, d->wire_mismatches);
+    for (v = 0; v < 3; v += 2) {
+        ASSERT(d->vertices[v].position[2] == 3.0f && d->vertices[v].normal[2] == 1.0f);
+        ASSERT(d->vertices[v].texcoord[3][0] == 0.6f && d->vertices[v].texcoord[3][1] == 0.8f);
+        // (the colour's alpha: its lit channel's red, green and blue are the lighting's)
+        ASSERT_EQ(0x44, d->vertices[v].color[0][3]);
+    }
+    ASSERT(d->vertices[1].position[0] == 0.0f);
+    wl_host_gx_direct_reset();
+    PASS();
+}
+
 // a batch of vertices in one call, as the FIFO's words or as indices into arrays: recorded as the same
 // vertices one call each would make
 TEST gx_direct_stub_takes_batches_of_vertices(void) {
@@ -448,6 +489,7 @@ SUITE(host_suite) {
     RUN_TEST(gx_direct_stub_flushes_a_renderers_own_format);
     RUN_TEST(gx_direct_stub_takes_projected_coordinates_after_the_position);
     RUN_TEST(gx_direct_stub_takes_a_normal_beside_a_sphere_map);
+    RUN_TEST(gx_direct_stub_reads_word_arrays_by_index);
     RUN_TEST(gx_direct_stub_takes_batches_of_vertices);
     RUN_TEST(gx_direct_stub_takes_register_colours_and_position_indices);
     RUN_TEST(gx_direct_stub_checks_what_the_console_reads);

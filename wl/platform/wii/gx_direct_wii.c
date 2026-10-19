@@ -441,10 +441,11 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
         GX_SetVtxDesc(GX_VA_NRM, input_of(layout, WL_GX_DIRECT_ARRAY_NORMAL, 3));
         GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
     } else if (d.projected == 1u) {
-        GX_SetVtxDesc(GX_VA_NRM, input_of(layout, 0xFFu, 3));
+        GX_SetVtxDesc(GX_VA_NRM, input_of(layout, WL_GX_DIRECT_ARRAY_NORMAL, 3));
         GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
     } else if (d.projected > 1u) {
-        GX_SetVtxDesc(GX_VA_NBT, input_of(layout, 0xFFu, 9));
+        // (indexed: one index for the nine, GX_NRM_NBT's, not NBT3's three)
+        GX_SetVtxDesc(GX_VA_NBT, input_of(layout, WL_GX_DIRECT_ARRAY_NORMAL, 9));
         GX_SetVtxAttrFmt(DIRECT_FORMAT, GX_VA_NBT, GX_NRM_NBT, GX_F32, 0);
     }
     if (layout->colors >= 1 && !(layout->colors_register & 1u)) {
@@ -616,12 +617,13 @@ static inline void emit(const WlGxDirectVertex *v) {
     } else {
         GX_Position3f32(v->position[0], v->position[1], v->position[2]);
     }
-    if (d.layout.lit && (d.layout.indexed & (1u << WL_GX_DIRECT_ARRAY_NORMAL))) {
+    if ((d.layout.lit || d.layout.texcoords_projected) && (d.layout.indexed & (1u << WL_GX_DIRECT_ARRAY_NORMAL))) {
+        // (the normal, or the normal, binormal and tangent, at one index)
         GX_Normal1x16(0);
     } else if (d.layout.lit) {
         GX_Normal3f32(v->normal[0], v->normal[1], v->normal[2]);
     }
-    if (d.layout.texcoords_projected) {
+    if (d.layout.texcoords_projected && !(d.layout.indexed & (1u << WL_GX_DIRECT_ARRAY_NORMAL))) {
         unsigned sent = d.layout.lit ? 1u : 0u;
 
         // (the projected coordinates as the normal, or normal, binormal and tangent)
@@ -736,6 +738,11 @@ void wl_gx_direct_array(unsigned attribute, const void *data, uint32_t stride) {
     GX_SetArray(gx_attribute, (void *)data, (u8)stride);
     wl_gx_wii_hang_event('A', (uint32_t)(uintptr_t)data, gx_attribute << 8 | stride);
     wl_gx_wii_note_commands();
+}
+
+void wl_gx_direct_array_words(unsigned attribute, const void *data, uint32_t stride) {
+    // (the processor's words are GX's bytes: big-endian)
+    wl_gx_direct_array(attribute, data, stride);
 }
 
 void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t count) {
@@ -858,7 +865,10 @@ void wl_gx_direct_texgen(unsigned n, WlGxDirectTexSource source, const float m[2
     memcpy(matrix, m, sizeof d.texgen[n]);
     GX_LoadTexMtxImm(matrix, (u32)(GX_TEXMTX0 + 3u * n), GX_MTX2x4);
     GX_SetTexCoordGen((u16)(GX_TEXCOORD0 + n), GX_TG_MTX2x4,
-                      source == WL_GX_DIRECT_TG_POSITION ? (u32)GX_TG_POS : (u32)d.tex_input[n],
+                      source == WL_GX_DIRECT_TG_POSITION ? (u32)GX_TG_POS
+                      : source >= WL_GX_DIRECT_TG_INPUT0 && source < WL_GX_DIRECT_TG_INPUT0 + 8u
+                          ? (u32)d.tex_input[source - WL_GX_DIRECT_TG_INPUT0]
+                          : (u32)d.tex_input[n],
                       (u32)(GX_TEXMTX0 + 3u * n));
     wl_gx_shadow_fifo(WL_GX_FIFO_MATRIX, WL_GX_FIFO_TEXMTX_BYTES + WL_GX_FIFO_TEXGEN_BYTES);
     wl_gx_wii_note_commands();

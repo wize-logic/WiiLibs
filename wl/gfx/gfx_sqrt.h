@@ -182,30 +182,75 @@ static inline double wl_sqrt_refine(double value, double estimate) {
     return wl_bits_double(((uint64_t)1023 << 52) | (k & mantissa));
 }
 
-// sqrt, correctly rounded as newlib gives it: a zero (also -0) and +infinity are themselves; a negative is the
-// NaN newlib's (x - x) / (x - x) makes, a NaN or -infinity newlib's x * x + x. The value is scaled into
-// [1, 4) by an even power of two (a subnormal first by 2^54), its root scaled back by half of it.
+// sqrt by the integers, correctly rounded as newlib gives it, for every double: a zero (also -0) and +infinity
+// are themselves; a negative is the NaN newlib's (x - x) / (x - x) makes, a NaN or -infinity newlib's x * x + x.
+// The value is scaled into [1, 4) by an even power of two (a subnormal first by 2^54), its root scaled back by
+// half of it. Out of line (gfx_sqrt.c): wl_sqrt_exact's path for what wl_sqrt_near does not take.
+double wl_sqrt_wide(double x);
+
+// a * b + c and c - a * b, fused on PowerPC (fmadd, fnmsub: one rounding, one instruction), plain elsewhere. Only
+// a multiply-add whose product is exact, or whose rounding a proof allows either way, goes through these.
+static inline double wl_fp_madd(double a, double b, double c) {
+#if defined(__powerpc__) || defined(__PPC__)
+    return __builtin_fma(a, b, c);
+#else
+    return a * b + c;
+#endif
+}
+
+static inline double wl_fp_nmsub(double a, double b, double c) {
+#if defined(__powerpc__) || defined(__PPC__)
+    return -__builtin_fma(a, b, -c); // (fnmsub: the sign of a zero result is not c - a * b's, and no one looks)
+#else
+    return c - a * b;
+#endif
+}
+
+// The correctly rounded root of x in [2^-500, 2^500] from `estimate`, within 6% of 1 / sqrt(x), in doubles alone
+// (no scaling, no integers): or 0 where the steps cannot decide it (about one root in 2^37), which the integers
+// then do. With s the root, e the exponent of r = x y (2^e <= r < 2^(e+1)):
+// - Four steps of Newton's method leave y = (1 + eps) / s with |eps| < 2^-51 (from 6%: 2^-7.4, 2^-14.2, 2^-27.8,
+//   2^-55, and three roundings a step), so r = s (1 + d) with |d| < 2^-50.
+// - x - r^2 is found with one rounding. r + r 2^27 rounds r to a multiple of 2^(e-25) (2^(e-24) at the top of a
+//   binade), which minus r 2^27 is `high` (26 bits, or 2^(e+1)), and low = r - high (|low| <= 2^(e-25), on r's
+//   grid). high^2 and 2 high low are exact; x - high^2 is a multiple of 2^(2e-52) under 2^(2e-23) and then less
+//   2 high low a multiple of 2^(2e-77) under 2^(2e-48), both exact, and only the last step, less low^2, rounds
+//   (low^2 itself by 2^(2e-104) at most, at a binade's top, when it is not fused). A contracted multiply-add gives
+//   the same values, every other product being exact, so the result does not depend on -ffp-contract.
+// - The Newton step for the root itself, r + (x - r^2) y / 2, is then within 2^-99 s of s: its error is
+//   (x - r^2) / (2 s) times (2 / (2 + d) - (1 + eps)(1 + two roundings)), at most s 2.01 |d| / 2 (0.51 |d| +
+//   1.26 2^-50), plus 2^-105 s from low^2.
+// - Rounding is monotonic: r + (step - m) <= s <= r + (step + m) for m = r 2^-90 (each sum rounded by under
+//   2^-102 s), so when both round to the same double, s does too, and that double is the IEEE root.
+// With frsqrte's estimate, about sixty instructions on Broadway for the whole wl_sqrt_exact.
+static inline double wl_sqrt_near(double x, double estimate) {
+    double y = estimate, half = -0.5 * x;
+    y = y * wl_fp_madd(half, y * y, 1.5);
+    y = y * wl_fp_madd(half, y * y, 1.5);
+    y = y * wl_fp_madd(half, y * y, 1.5);
+    y = y * wl_fp_madd(half, y * y, 1.5);
+    double root = x * y, split = root * 134217728.0; // (2^27)
+    double high = (root + split) - split, low = root - high;
+    double residual = wl_fp_nmsub(low, low, wl_fp_nmsub(high + high, low, wl_fp_nmsub(high, high, x)));
+    double step = residual * (0.5 * y), margin = root * 0x1p-90;
+    double above = root + (step + margin), below = root + (step - margin);
+    return above == below ? above : 0.0;
+}
+
+// sqrt, correctly rounded as newlib gives it (see wl_sqrt_wide for the zeros, infinities and NaNs): the roots of
+// [2^-500, 2^500] from frsqrte's estimate by wl_sqrt_near, the rest and the undecided by wl_sqrt_wide. (A host
+// that keeps doubles in wider registers, FLT_EVAL_METHOD != 0, takes wl_sqrt_wide for all: the split needs
+// doubles rounded as doubles.)
 static inline double wl_sqrt_exact(double x) {
-    if (!(x > 0.0 && x <= 1.7976931348623157e308)) {
-        if (x == 0.0 || x > 0.0) {
-            return x; // zero or +infinity
+#if !defined(__FLT_EVAL_METHOD__) || __FLT_EVAL_METHOD__ == 0
+    if (x >= 0x1p-500 && x <= 0x1p500) {
+        double root = wl_sqrt_near(x, wl_rsqrt_estimate(x));
+        if (root != 0.0) {
+            return root;
         }
-        if (x != x || x < -1.7976931348623157e308) {
-            return x * x + x; // NaN or -infinity
-        }
-        return (x - x) / (x - x);
     }
-    int scale = 0;
-    if (x < 2.2250738585072014e-308) {
-        x *= 18014398509481984.0; // 2^54
-        scale = -27;
-    }
-    uint64_t bits = wl_double_bits(x);
-    int exponent = (int)(bits >> 52) - 1023;
-    int half = exponent >= 0 ? exponent / 2 : -((1 - exponent) / 2); // (the floor of exponent / 2)
-    double value = wl_bits_double((bits & (((uint64_t)1 << 52) - 1)) | ((uint64_t)(1023 + exponent - 2 * half) << 52));
-    double root = wl_sqrt_refine(value, wl_rsqrt_estimate(value));
-    return root * wl_bits_double((uint64_t)(1023 + half + scale) << 52);
+#endif
+    return wl_sqrt_wide(x);
 }
 
 // A program that links with -Wl,--wrap=sqrtf sends every call of sqrtf, the libraries' too, to __wrap_sqrtf,

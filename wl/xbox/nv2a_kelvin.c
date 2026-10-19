@@ -1002,6 +1002,27 @@ static void draw_counted(WlNv2a *dev, WlNv2aDraw *draw) {
     k->dirty = 0;
 }
 
+static bool g_index_bounds = true;
+
+void wl_nv2a_set_index_bounds(bool on) {
+    g_index_bounds = on;
+}
+
+// indices [at, at + n) of the batch, whose least and greatest are `least` and `last`, came: the
+// bounds kept go on over them when they reach `at`
+static inline void bounds_add(WlNv2a *dev, uint32_t at, uint32_t n, uint32_t least, uint32_t last) {
+    if (dev->batch_bounds_at != at || n == 0) {
+        return;
+    }
+    if (at != 0) {
+        least = dev->batch_least < least ? dev->batch_least : least;
+        last = dev->batch_last > last ? dev->batch_last : last;
+    }
+    dev->batch_least = least;
+    dev->batch_last = last;
+    dev->batch_bounds_at = at + n;
+}
+
 // hands over `count` of the batch's vertices (from the start), as one draw
 static void batch_draw(WlNv2a *dev, uint32_t primitive, uint32_t count, bool continues) {
     WlNv2aKelvin *k = &dev->kelvin;
@@ -1019,9 +1040,15 @@ static void batch_draw(WlNv2a *dev, uint32_t primitive, uint32_t count, bool con
     draw.count = count;
     switch (dev->batch_source) {
     case WL_NV2A_SOURCE_ARRAYS: {
-        uint32_t least = 0xFFFFFFFFu, last = 0, i;
+        uint32_t least = 0xFFFFFFFFu, last = 0, i = 0;
 
-        for (i = 0; i < count; i++) {
+        // (those found as they came, then the rest)
+        if (g_index_bounds && dev->batch_bounds_at != 0 && dev->batch_bounds_at <= count) {
+            least = dev->batch_least;
+            last = dev->batch_last;
+            i = dev->batch_bounds_at;
+        }
+        for (; i < count; i++) {
             uint32_t index = dev->batch_indices[i];
 
             least = index < least ? index : least;
@@ -1051,6 +1078,7 @@ static void batch_keep(WlNv2a *dev, uint32_t from, uint32_t keep, uint32_t inlin
     case WL_NV2A_SOURCE_ARRAYS:
         memmove(dev->batch_indices, dev->batch_indices + from, keep * sizeof *dev->batch_indices);
         dev->batch_index_count = keep;
+        dev->batch_bounds_at = 0;
         break;
     case WL_NV2A_SOURCE_INLINE:
         memmove(dev->batch_inline, dev->batch_inline + (size_t)from * inline_stride, (size_t)keep * inline_stride);
@@ -1067,6 +1095,7 @@ static void batch_copy_vertex(WlNv2a *dev, uint32_t to, uint32_t from, uint32_t 
     switch (dev->batch_source) {
     case WL_NV2A_SOURCE_ARRAYS:
         dev->batch_indices[to] = dev->batch_indices[from];
+        dev->batch_bounds_at = 0;
         break;
     case WL_NV2A_SOURCE_INLINE:
         memmove(dev->batch_inline + (size_t)to * inline_stride, dev->batch_inline + (size_t)from * inline_stride,
@@ -1080,6 +1109,7 @@ static void batch_copy_vertex(WlNv2a *dev, uint32_t to, uint32_t from, uint32_t 
 
 static void batch_reset(WlNv2a *dev) {
     dev->batch_index_count = 0;
+    dev->batch_bounds_at = 0;
     dev->batch_inline_bytes = 0;
     dev->batch_immediate_count = 0;
     dev->batch_parts = 0;
@@ -1576,6 +1606,9 @@ void wl_nv2a_kelvin_method(WlNv2a *dev, uint32_t method, uint32_t param) {
                 for (i = 0; i < count; i++) {
                     to[i] = first + i;
                 }
+                if (g_index_bounds) {
+                    bounds_add(dev, dev->batch_index_count, count, first, first + count - 1u);
+                }
                 dev->batch_index_count += count;
                 break;
             }
@@ -1729,13 +1762,26 @@ static inline __attribute__((always_inline)) uint32_t methods_run(WlNv2a *dev, c
         if (count != 0 && count <= (WL_NV2A_BATCH_INDICES - at) / halves) {
             // (room for the whole run: no flush to test for, and the method's value the last word's)
             const uint8_t *w = words;
-            uint32_t left = count, part;
+            uint32_t left = count, part, from = at, least = 0xFFFFFFFFu, last = 0;
 
             // (a line of words at a time, the line WL_NV2A_PUSH_AHEAD on asked for first; without the
-            // prefetch, the whole run in one)
+            // prefetch, the whole run in one. The run's least and greatest index as they come, a pair's
+            // lesser against the least and its greater against the greatest: batch_draw's pass then
+            // left out)
             for (; left != 0; left -= part) {
                 part = push_part(w, left);
-                if (halves == 2u) {
+                if (halves == 2u && g_index_bounds) {
+                    for (n = 0; n < part; n++, w += 4) {
+                        uint32_t param = wl_rd_le32(w), lo = param & 0xFFFFu, hi = param >> 16;
+                        uint32_t lesser = lo < hi ? lo : hi, greater = lo ^ hi ^ lesser;
+
+                        indices[at] = lo;
+                        indices[at + 1u] = hi;
+                        at += 2u;
+                        least = lesser < least ? lesser : least;
+                        last = greater > last ? greater : last;
+                    }
+                } else if (halves == 2u) {
                     for (n = 0; n < part; n++, w += 4) {
                         uint32_t param = wl_rd_le32(w);
 
@@ -1748,6 +1794,9 @@ static inline __attribute__((always_inline)) uint32_t methods_run(WlNv2a *dev, c
                         indices[at++] = wl_rd_le32(w);
                     }
                 }
+            }
+            if (halves == 2u && g_index_bounds) {
+                bounds_add(dev, from, at - from, least, last);
             }
             k->raw[method >> 2] = wl_rd_le32(words + 4u * (count - 1u));
             dev->batch_index_count = at;

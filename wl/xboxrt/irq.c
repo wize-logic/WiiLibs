@@ -592,8 +592,10 @@ static void status_report(void) {
         WlXbThreadStats ts;
         wl_xb_thread_stats(&ts);
         // a holder at DISPATCH_LEVEL keeps the lock (thread.h, wl_xb_safe_point): how often it did
-        WL_LOG_I(TAG, "scheduling: %u handoffs, %u yields at safe points, %u kept at a raised IRQL, %u waits",
-                 (unsigned)ts.handoffs, (unsigned)ts.safe_yields, (unsigned)ts.raised_holds, (unsigned)ts.waits);
+        WL_LOG_I(TAG, "scheduling: %u handoffs, %u yields at safe points, %u kept at a raised IRQL, %u waits; %u safe "
+                 "points, %u quiet windows",
+                 (unsigned)ts.handoffs, (unsigned)ts.safe_yields, (unsigned)ts.raised_holds, (unsigned)ts.waits,
+                 (unsigned)ts.safe_points, (unsigned)ts.quiet_windows);
     }
     // what the guest's frame clock lost: vertical blanks merged into a pending one, periods skipped
     static WlXbServiceStats last;
@@ -724,6 +726,7 @@ static void *service_main(void *arg) {
         update_tick();
         now = wl_platform_time_us();
         ticks_due(now, now);
+        wl_xb_thread_quiet_due(now); // (a quiet window's end: the holder's next safe point looks again)
         if (now >= next_status) {
             next_status = now + 10000000u;
             status_report();
