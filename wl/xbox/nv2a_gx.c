@@ -467,7 +467,21 @@ static const struct {
     {"oldfetch", "WL_XB_OLDFETCH", SWITCH_OLD_FETCH},
 };
 
+// The second word of switches (the first's 32 bits are used up): the same files and variables, read into
+// g_switches2_off and asked through switched_on2()
+enum {
+    SWITCH2_RESERVED = 1u << 0, // (no switch yet: the next cut takes bit 0 and this line goes)
+};
+
+static const struct {
+    const char *file, *env;
+    unsigned bit;
+} k_switches2[] = {
+    {NULL, NULL, 0}, // (an empty table has no size in C; the first real switch replaces this entry)
+};
+
 static unsigned g_switches_off;
+static unsigned g_switches2_off;
 // (WL_XB_FITVERIFY on the host: projection_fit's kept fits checked against the vertices' at each use)
 static bool g_fit_verify;
 
@@ -482,10 +496,26 @@ void wl_nv2a_gx_set_switches(const char *title_dir) {
             WL_LOG_I(TAG, "draw path: %s (a cut off)", k_switches[i].file);
         }
     }
+    g_switches2_off = 0;
+    for (size_t i = 0; i < sizeof k_switches2 / sizeof k_switches2[0]; i++) {
+        if (k_switches2[i].file == NULL) {
+            continue;
+        }
+        snprintf(path, sizeof path, "%s/%s", title_dir, k_switches2[i].file);
+        if (wl_platform_fs_exists(path)) {
+            g_switches2_off |= k_switches2[i].bit;
+            WL_LOG_I(TAG, "draw path: %s (a cut off)", k_switches2[i].file);
+        }
+    }
+    (void)switched_on2; // (until the first switch of the second word asks it)
 }
 
 static bool switched_on(unsigned bit) {
     return (g_switches_off & bit) == 0;
+}
+
+static bool switched_on2(unsigned bit) {
+    return (g_switches2_off & bit) == 0;
 }
 
 // A render target's image: a free piece of the textures' arena when it has one (no texture evicted
@@ -515,6 +545,11 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     for (size_t i = 0; i < sizeof k_switches / sizeof k_switches[0]; i++) {
         if (getenv(k_switches[i].env) != NULL) {
             g_switches_off |= k_switches[i].bit;
+        }
+    }
+    for (size_t i = 0; i < sizeof k_switches2 / sizeof k_switches2[0]; i++) {
+        if (k_switches2[i].env != NULL && getenv(k_switches2[i].env) != NULL) {
+            g_switches2_off |= k_switches2[i].bit;
         }
     }
 #endif
