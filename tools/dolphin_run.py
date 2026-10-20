@@ -836,6 +836,9 @@ def main() -> int:
         print(line)
     for line in dolphin_messages(log):
         print(f"dolphin: {line}")
+    # the wall-clock length: an unthrottled run of a fixed workload (a capture bench) is compared by it, since the
+    # title's own clocks count emulated time and cannot see Dolphin's core mode or settings
+    print(f"dolphin_run.py: the run took {time.monotonic() - started:.1f} s of wall-clock time")
     if fail is not None and any(fail.search(line) for line in lines):
         failed = True
     if failed:

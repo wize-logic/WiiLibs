@@ -158,8 +158,11 @@ static uint8_t stage_calls(const WlTevStage *now, const WlTevStage *was, bool kn
     return send;
 }
 
+// (in place: the Wii's processor has no instruction for it, and __builtin_popcount is libgcc's call)
 static unsigned bits(uint32_t v) {
-    return (unsigned)__builtin_popcount(v);
+    v -= (v >> 1) & 0x55555555u;
+    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+    return (unsigned)((((v + (v >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24);
 }
 
 void wl_tev_shadow_plan(const WlTevProgram *p, uint32_t flags, WlTevSend *out) {

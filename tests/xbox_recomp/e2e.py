@@ -25,9 +25,10 @@ x87_locals.py: the stack, control word and compare result in C locals inside a f
 edi, the caller keeps them in its locals; and around a call writes back and reloads only the registers
 the callee touches, --callee-regs, and keeps the caller's x87 positions across a callee whose x87
 stack use is balanced, --x87-balanced; and keeps a function's own stack slots that nothing else
-reaches in C locals, --stack-locals). With --reg-locals the lifts also leave the safe point out of
-loops that end by themselves (--bounded-loops, loop_bound.py) and write float and double constants read
-from .rodata as literals (--rodata-consts, const_load.py).
+reaches in C locals, --stack-locals, with each callee's constant esp effect, --stack-deltas, and only
+the slots a callee can reach written back around its call, --stack-reach). With --reg-locals the lifts
+also leave the safe point out of loops that end by themselves (--bounded-loops, loop_bound.py) and write
+float and double constants read from .rodata as literals (--rodata-consts, const_load.py).
 
     e2e.py --build DIR [--target ppc-be|host|both] [-k NAME]
 
@@ -152,7 +153,7 @@ def build_image(name, spec, work: Path):
 
 def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False, keep=False):
     """Lift every function with the patched pipeline's FunctionTranslator; write gen/."""
-    from tools.recomp import config, preserve
+    from tools.recomp import config, preserve, stack_locals
     from tools.recomp.translator import FunctionTranslator, Pending
     image = (work / f"{name}.bin").read_bytes()
     text_end = max(a + s for a, s, _ in funcs)
@@ -188,6 +189,8 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False
     ft.callee_regs = keep  # around a call, only what the callee touches (touched.py)
     ft.x87_balanced = keep  # and the x87 positions kept across a balanced callee (touched.balanced)
     ft.stack_locals = keep  # and a function's own stack slots in C locals (stack_locals.py)
+    ft.stack_deltas = keep  # with each callee's esp effect when it moves esp by constants (ret_deltas)
+    ft.stack_reach = keep  # and only the slots a callee can reach synced around its call (arg_windows)
     # and its loops: no safe point where a loop's own counter ends it (loop_bound.py)
     ft.bounded_loops = reg_locals
     # and its float constants from read-only data as literals (const_load.py)
@@ -209,6 +212,11 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False
     if pending:  # as BatchTranslator.finish_pending: the whole program first
         ft.summaries = preserve.analyse(pending)
         ft.kept = preserve.preserved_by_name(ft.summaries)
+        if ft.stack_locals:  # each callee's esp effect and reach (ret_deltas, arg_windows)
+            ft.ret_deltas = stack_locals.ret_deltas(pending, exact=ft.stack_deltas)
+            if ft.stack_reach:
+                ft.arg_windows = stack_locals.arg_windows(pending, ft.summaries, ft.kept, ft.ret_deltas,
+                                                          carry=ft.stack_deltas)
         chunks = [ft.finish_function(c.lines, c.has_fpu) if isinstance(c, Pending) else c for c in chunks]
         ft.x87_stats["kept across calls"] = sum(c.count("kept across the call") for c in chunks)
     unimpl = {k: len(v) for k, v in ft.lifter.unimplemented.items()}

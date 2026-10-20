@@ -688,7 +688,7 @@ static uint32_t rnd(void) {
 
 enum { SLOTS = 16 };
 
-TEST fetch_plan_matches_the_fetch_of_each_vertex(void) {
+static enum greatest_test_res fetch_plan_run(void) {
     static const uint8_t types[] = {WL_NV2A_VTX_UB_D3D, WL_NV2A_VTX_S1,   WL_NV2A_VTX_F,
                                     WL_NV2A_VTX_UB_OGL, WL_NV2A_VTX_S32K, WL_NV2A_VTX_CMP};
     static uint8_t data[64 * 1024];
@@ -765,6 +765,54 @@ TEST fetch_plan_matches_the_fetch_of_each_vertex(void) {
         }
     }
     PASS();
+}
+
+// an attribute's decode by the fetch's tables and conversions (wl_nv2a_set_push_cuts4) gives the values
+// of the decode as wave 4 left it, to the bit: every type and size over random bytes, each short and
+// packed field among them
+TEST attrib_decode_matches_the_plain_decode(void) {
+    static const uint8_t types[] = {WL_NV2A_VTX_UB_D3D, WL_NV2A_VTX_S1,   WL_NV2A_VTX_F,  3u,
+                                    WL_NV2A_VTX_UB_OGL, WL_NV2A_VTX_S32K, WL_NV2A_VTX_CMP, 7u};
+    static const uint8_t sizes[] = {0, 1, 2, 3, 4, 5, 7, 15};
+    uint8_t data[16];
+    float want[4], got[4];
+    unsigned trial, t, z, c;
+
+    for (trial = 0; trial < 66000; trial++) {
+        for (c = 0; c < sizeof data; c++) {
+            data[c] = (uint8_t)rnd();
+        }
+        if (trial < 65536) {
+            // (each short, and so each 11- and 10-bit field)
+            data[0] = (uint8_t)trial;
+            data[1] = (uint8_t)(trial >> 8);
+        }
+        for (t = 0; t < sizeof types; t++) {
+            for (z = 0; z < sizeof sizes; z++) {
+                wl_nv2a_set_push_cuts4(false);
+                wl_nv2a_attrib_decode(types[t], sizes[z], data, want);
+                wl_nv2a_set_push_cuts4(true);
+                wl_nv2a_attrib_decode(types[t], sizes[z], data, got);
+                ASSERT_MEM_EQm("a decoded attribute", want, got, sizeof want);
+            }
+        }
+    }
+    PASS();
+}
+
+// the plan of now (the attributes asked for alone, formats from a table, unnormalized shorts by their
+// bits) and the plan as wave 4 left it (wl_nv2a_set_push_cuts4(false)), each against the fetch of a vertex
+TEST fetch_plan_matches_the_fetch_of_each_vertex(void) {
+    enum greatest_test_res result;
+
+    wl_nv2a_set_push_cuts4(true);
+    result = fetch_plan_run();
+    if (result == GREATEST_TEST_RES_PASS) {
+        wl_nv2a_set_push_cuts4(false);
+        result = fetch_plan_run();
+    }
+    wl_nv2a_set_push_cuts4(true);
+    return result;
 }
 
 // ---- the push buffer's runs against a method at a time -----------------------------------------------
@@ -971,6 +1019,11 @@ static uint32_t log_arrays(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *
     unsigned a;
 
     (void)k;
+    h = log_word(h, (uint32_t)draw->primitive | (uint32_t)draw->source << 8 | (uint32_t)draw->continues << 16 |
+                        (uint32_t)(draw->immediate != NULL) << 24 | (uint32_t)(draw->inline_data != NULL) << 25 |
+                        (uint32_t)(draw->indices != NULL) << 26);
+    h = log_word(h, draw->count);
+    h = log_word(h, draw->inline_stride);
     h = log_word(h, draw->streamed);
     h = log_word(h, draw->index_base);
     h = log_word(h, draw->index_last);
@@ -990,8 +1043,9 @@ static uint32_t log_arrays(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *
 // random array offsets (either vertex DMA, now and then past RAM), formats (strides up to 24 bits),
 // the same values written again, the second vertex DMA bound to another object, and draws of 16- and
 // 32-bit indices (some so large that index times stride passes 4 GiB): the draws' arrays are those of
-// the layout made at each draw
-static enum greatest_test_res kept_layout_run(bool kept, uint32_t *hash, unsigned *draws) {
+// the layout made at each draw; inline and immediate draws among them (a draw kept between draws
+// leaves no attribute of the last one's arrays: wl_nv2a_set_push_cuts4)
+static enum greatest_test_res kept_layout_run(bool kept, bool kept_draw, uint32_t *hash, unsigned *draws) {
     static const uint8_t types[] = {WL_NV2A_VTX_UB_D3D, WL_NV2A_VTX_S1, WL_NV2A_VTX_F, WL_NV2A_VTX_UB_OGL,
                                     WL_NV2A_VTX_S32K, WL_NV2A_VTX_CMP};
     ArraysLog log = {NULL, 0, 0, 2166136261u};
@@ -1003,6 +1057,7 @@ static enum greatest_test_res kept_layout_run(bool kept, uint32_t *hash, unsigne
     backend.user = &log;
     backend.draw = log_arrays;
     wl_nv2a_set_push_cuts3(kept);
+    wl_nv2a_set_push_cuts4(kept_draw);
     g_rng = 0x2545F491u;
     ASSERT(t_create(&g, &backend) != NULL);
     log.ram = g.ram;
@@ -1013,9 +1068,16 @@ static enum greatest_test_res kept_layout_run(bool kept, uint32_t *hash, unsigne
         if (what < 4u) {
             uint32_t offset = rnd() % 8u == 0 ? rnd() : rnd() % T_RAM;
 
+            if (rnd() % 2u == 0) {
+                // (beside another array's start: one buffer's interleaved arrays, looked up as one span)
+                offset = wl_nv2a_k(wl_nv2a_kelvin(g.dev), WL_NV2A_K_SET_VERTEX_DATA_ARRAY_OFFSET + 4 * (rnd() % 16u)) +
+                         rnd() % 40u - 8u;
+            }
             t_m1(&g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_OFFSET + 4 * a, offset);
         } else if (what < 8u) {
-            uint32_t size = rnd() % 5u, stride = rnd() % 8u == 0 ? rnd() & 0xFFFFFFu : rnd() % 64u;
+            uint32_t size = rnd() % 5u, stride = rnd() % 8u == 0   ? rnd() & 0xFFFFFFu
+                                                 : rnd() % 2u == 0 ? 32u
+                                                                   : rnd() % 64u;
 
             t_m1(&g, WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT + 4 * a,
                  format_word(types[rnd() % sizeof types], size, stride));
@@ -1025,6 +1087,28 @@ static enum greatest_test_res kept_layout_run(bool kept, uint32_t *hash, unsigne
                  wl_nv2a_k(wl_nv2a_kelvin(g.dev), WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT + 4 * a));
         } else if (what == 9u) {
             t_m1(&g, WL_NV2A_K_SET_CONTEXT_DMA_VERTEX_B, rnd() % 2u == 0 ? 0xD0000000u : 0xD0000001u);
+        } else if (what == 10u) {
+            // (an inline draw of the formats as they are: whole vertices of its words, points)
+            uint32_t words = 1u + rnd() % 48u, i;
+
+            t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_POINTS);
+            t_word(&g, WL_NV2A_CMD_NON_INCREASING | (words << 18) | WL_NV2A_K_INLINE_ARRAY);
+            for (i = 0; i < words; i++) {
+                t_word(&g, rnd());
+            }
+            t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
+        } else if (what == 11u) {
+            // (an immediate draw)
+            uint32_t n = 1u + rnd() % 3u, i;
+
+            t_m1(&g, WL_NV2A_K_SET_BEGIN_END, WL_NV2A_PRIM_POINTS);
+            for (i = 0; i < n; i++) {
+                t_method(&g, WL_NV2A_K_SET_VERTEX3F, 3);
+                t_word(&g, t_f(1.0f));
+                t_word(&g, t_f(2.0f));
+                t_word(&g, t_f((float)i));
+            }
+            t_m1(&g, WL_NV2A_K_SET_BEGIN_END, 0);
         } else {
             uint32_t base = rnd() % 4u == 0 ? rnd() : rnd() % 4096u, n = 1u + rnd() % 12u, i;
 
@@ -1051,20 +1135,27 @@ static enum greatest_test_res kept_layout_run(bool kept, uint32_t *hash, unsigne
 }
 
 TEST kept_layout_matches_a_layout_each_draw(void) {
-    uint32_t kept_hash = 0, each_hash = 0;
-    unsigned kept_draws = 0, each_draws = 0;
-    enum greatest_test_res result = kept_layout_run(true, &kept_hash, &kept_draws);
+    uint32_t kept_hash = 0, each_hash = 0, zeroed_hash = 0;
+    unsigned kept_draws = 0, each_draws = 0, zeroed_draws = 0;
+    enum greatest_test_res result = kept_layout_run(true, true, &kept_hash, &kept_draws);
 
     if (result == GREATEST_TEST_RES_PASS) {
-        result = kept_layout_run(false, &each_hash, &each_draws);
+        result = kept_layout_run(false, true, &each_hash, &each_draws);
+    }
+    if (result == GREATEST_TEST_RES_PASS) {
+        // (the draw zeroed whole at each draw, as wave 4 left it)
+        result = kept_layout_run(true, false, &zeroed_hash, &zeroed_draws);
     }
     wl_nv2a_set_push_cuts3(true);
+    wl_nv2a_set_push_cuts4(true);
     if (result != GREATEST_TEST_RES_PASS) {
         return result;
     }
     ASSERT(kept_draws > 500);
     ASSERT_EQ(each_draws, kept_draws);
     ASSERT_EQ(each_hash, kept_hash);
+    ASSERT_EQ(zeroed_draws, kept_draws);
+    ASSERT_EQ(zeroed_hash, kept_hash);
     PASS();
 }
 
@@ -1142,6 +1233,7 @@ SUITE(kelvin_suite) {
     RUN_TEST(every_input_of_the_pixel_program_dirties_it);
     RUN_TEST(surface_decoded);
     RUN_TEST(fetch_plan_matches_the_fetch_of_each_vertex);
+    RUN_TEST(attrib_decode_matches_the_plain_decode);
     RUN_TEST1(pushed_runs_match_a_method_at_a_time, 0);
     RUN_TEST1(pushed_runs_match_a_method_at_a_time, 1);
     RUN_TEST1(pushed_runs_match_a_method_at_a_time, 2);

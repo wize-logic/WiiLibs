@@ -423,6 +423,11 @@ enum {
     // "texbudget1": a frame's textures made at their lookups up to the configuration's frame_budget as given (1 MB);
     // else twice it, the time it took before wave 4's cheaper conversions (card 15: 1299 KB in 29 ms at the worst)
     SWITCH_TEX_BUDGET1 = 1u << 23,
+    SWITCH_OLD_PUSH4 = 1u << 27, // "oldpush4": batch_draw's draw zeroed whole, the fetch's plan as before (push_cuts4)
+    // "fenceflush": the ring's fence asks for the transform unit's flush before the next draw itself (made_fence),
+    // as before gx-ring2; else the fence's token asks for it where it is sent (gx_wii.c's send_token)
+    SWITCH_FENCE_FLUSH = 1u << 28,
+    SWITCH_OLD_SLOTS = 1u << 29, // "oldslots": every made vertex's words noted, its tables through gx (made_slots)
 };
 
 static const struct {
@@ -453,6 +458,9 @@ static const struct {
     {"oldpush3", "WL_XB_OLDPUSH3", SWITCH_OLD_PUSH3},
     {"texplain2", "WL_XB_TEXPLAIN2", SWITCH_TEX_PLAIN2},
     {"texbudget1", "WL_XB_TEXBUDGET1", SWITCH_TEX_BUDGET1},
+    {"oldpush4", "WL_XB_OLDPUSH4", SWITCH_OLD_PUSH4},
+    {"fenceflush", "WL_XB_FENCEFLUSH", SWITCH_FENCE_FLUSH},
+    {"oldslots", "WL_XB_OLDSLOTS", SWITCH_OLD_SLOTS},
 };
 
 static unsigned g_switches_off;
@@ -548,6 +556,7 @@ WlNv2aGx *wl_nv2a_gx_create(const WlNv2aGxConfig *cfg) {
     wl_nv2a_set_index_bounds(switched_on(SWITCH_NO_INDEX_BOUNDS));
     wl_nv2a_set_push_cuts(switched_on(SWITCH_OLD_PUSH2));
     wl_nv2a_set_push_cuts3(switched_on(SWITCH_OLD_PUSH3));
+    wl_nv2a_set_push_cuts4(switched_on(SWITCH_OLD_PUSH4));
     wl_nv2a_vcache_init(&gx->vertices, &vertices);
     wl_nv2a_pipeline_init(&gx->pipeline, gx->cfg.natives, gx->cfg.native_count);
     gx->pipeline.decoded = gx->cfg.program_decoded;
@@ -3264,7 +3273,10 @@ static bool made_possible(const WlNv2aGx *gx, uint32_t count) {
            (uint64_t)slots * sizeof(PackedVertex) + 32u <= MADE_RING_BYTES / 2u;
 }
 
-// a fence behind what was sent, for the chunks given (and the next draw flushed first: a token)
+// a fence behind what was sent, for the chunks given. Its token is a raster state change, which the next
+// draw must follow flushed: the token asks for the flush where it is sent, at once or put off to a later
+// batch (gx_wii.c's send_token, as the host's model has it), so a flush asked for here was spent on the
+// next primitive before the token (the switch "fenceflush" still asks)
 static void made_fence(WlNv2aGx *gx, uint32_t chunks) {
     uint32_t t;
     unsigned c;
@@ -3273,7 +3285,9 @@ static void made_fence(WlNv2aGx *gx, uint32_t chunks) {
         return;
     }
     t = wl_gx_fence();
-    wl_gx_direct_flush_after();
+    if (!switched_on(SWITCH_FENCE_FLUSH)) {
+        wl_gx_direct_flush_after();
+    }
     for (c = 0; c < MADE_CHUNKS; c++) {
         if (chunks & (1u << c)) {
             gx->made.fence[c] = t;
@@ -3405,7 +3419,60 @@ static inline PackedVertex *made_slot(const WlNv2aGx *gx, uint32_t at) {
 // The batch's slots: an indexed draw's vertex kept by its index (the memo) is the slot made for it
 // before, the others each a new slot (a function of its index: the same whatever the memo held).
 // The vertices to make (their elements, their slots) as vertices_make's memo has them; their count.
-static unsigned made_slots(WlNv2aGx *gx, const WlNv2aDraw *draw, uint32_t first, uint32_t count, bool indexed) {
+// A vertex's words (gx->batch.words: batch_vertex's) are wanted only where they are read: the first
+// batch (made_arrays has not yet said whether GX reads the slots), a draw whose slots GX does not read
+// (their words sent) and one whose landings are kept; else a kept vertex is its slot's number alone
+// (the switch "oldslots" writes them all, the batch's tables through gx at each vertex, as before)
+static inline __attribute__((always_inline)) unsigned made_slots_indexed(WlNv2aGx *gx, const WlNv2aDraw *draw,
+                                                                         uint32_t first, uint32_t count,
+                                                                         const bool want_words) {
+    char *const base = (char *)gx->made.base;
+    const size_t stride = gx->made.stride;
+    uint32_t next = gx->made.next, *const slot_of = gx->made.index;
+    const uint32_t **const words = gx->batch.words;
+    const uint32_t *indices = draw->indices + first;
+    const uint32_t stamp = gx->memo_stamp, index_base = draw->index_base;
+    struct WlNv2aGxMemo *const memo = gx->memo;
+    uint16_t *const made_memo = gx->made.memo;
+    uint32_t *elements = gx->batch.elements;
+    uint32_t **words_made = gx->batch.words_made;
+    PackedVertex **run_vertices = gx->batch.run_vertices;
+    char *fresh = base + next * stride; // (the next new slot's bytes)
+    unsigned n;
+
+    for (n = 0; n < count; n++) {
+        uint32_t index = indices[n], slot = index & (MEMO - 1u), at;
+        struct WlNv2aGxMemo *m = &memo[slot];
+
+        if (m->stamp == stamp && m->index == index) {
+            at = made_memo[slot];
+            if (want_words) {
+                words[n] = (const uint32_t *)(const void *)(base + at * stride);
+            }
+        } else {
+            // (a slot's vertex stays where it is when another index takes the memo's place)
+            char *vertex = fresh;
+
+            fresh += stride;
+            m->stamp = stamp;
+            m->index = index;
+            at = next++;
+            made_memo[slot] = (uint16_t)at;
+            *elements++ = index - index_base;
+            *words_made++ = (uint32_t *)(void *)vertex;
+            *run_vertices++ = (PackedVertex *)(void *)vertex;
+            if (want_words) {
+                words[n] = (const uint32_t *)(const void *)vertex;
+            }
+        }
+        slot_of[n] = at;
+    }
+    gx->made.next = next;
+    return (unsigned)(elements - gx->batch.elements);
+}
+
+static unsigned made_slots(WlNv2aGx *gx, const WlNv2aDraw *draw, uint32_t first, uint32_t count, bool indexed,
+                           bool want_words) {
     char *const base = (char *)gx->made.base;
     const size_t stride = gx->made.stride;
     uint32_t next = gx->made.next, *const slot_of = gx->made.index;
@@ -3413,7 +3480,11 @@ static unsigned made_slots(WlNv2aGx *gx, const WlNv2aDraw *draw, uint32_t first,
     unsigned runs = 0, n;
 
     gx->made.batch_first = next;
-    if (indexed) {
+    if (indexed && switched_on(SWITCH_OLD_SLOTS)) {
+        runs = want_words ? made_slots_indexed(gx, draw, first, count, true)
+                          : made_slots_indexed(gx, draw, first, count, false);
+        next = gx->made.next;
+    } else if (indexed) {
         const uint32_t *indices = draw->indices + first;
         const uint32_t stamp = gx->memo_stamp, index_base = draw->index_base;
         struct WlNv2aGxMemo *const memo = gx->memo;
@@ -3485,11 +3556,19 @@ static void made_flush(WlNv2aGx *gx) {
     WL_ASSERT(gx->made.next <= gx->made.limit);
 }
 
+// the bits set in a byte's mask (a stage's or a coordinate's): two nibbles looked up, where the Wii's
+// processor has no instruction for it and __builtin_popcount is libgcc's call
+static inline unsigned mask_bits8(uint32_t mask) {
+    static const uint8_t nibble[16] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
+
+    return (unsigned)nibble[mask & 15u] + nibble[(mask >> 4) & 15u];
+}
+
 // The attributes a layout sends, each read from the slots (WlGxDirectLayout.indexed), and the word
 // each starts at (place, NULL: not wanted); the words a vertex has
 static unsigned made_places(const WlGxDirectLayout *layout, uint16_t *indexed_out, uint8_t *place) {
     uint8_t unused[WL_GX_DIRECT_ARRAY_NORMAL + 1];
-    unsigned at = 3, n, groups = (unsigned)__builtin_popcount(layout->texcoords_projected) + (layout->lit ? 1u : 0u);
+    unsigned at = 3, n, groups = mask_bits8(layout->texcoords_projected) + (layout->lit ? 1u : 0u);
     uint16_t indexed = 1u << WL_GX_DIRECT_ARRAY_POSITION;
 
     if (place == NULL) {
@@ -3593,7 +3672,9 @@ static bool vertices_make(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2aDraw 
         if (gx->made.stride == 0) {
             made_place(gx, made_stride(gx, plan, layout != NULL));
         }
-        runs = made_slots(gx, draw, first, count, indexed);
+        // (the words wanted: made_slots)
+        runs = made_slots(gx, draw, first, count, indexed,
+                          layout != NULL || !gx->made.indexed || plan->landing || !switched_on(SWITCH_OLD_SLOTS));
     } else if (indexed) {
         const uint32_t *indices = draw->indices + first;
         const uint32_t stamp = gx->memo_stamp, index_base = draw->index_base;
@@ -5460,7 +5541,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
         lit = skin_lit(gx, k, &plan, &lighting);
         if (lit) {
             layout.lit = 1u;
-            plan.words += sphere_lit_words((unsigned)__builtin_popcount(plan.sphere_xf));
+            plan.words += sphere_lit_words(mask_bits8(plan.sphere_xf));
         }
         // (the world position's form decided before the layout: GX's texgen may make coordinates)
         world = world_xf_plan(gx, k, draw, &plan, &xf);

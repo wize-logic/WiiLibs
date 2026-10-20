@@ -80,6 +80,11 @@ static int pr_world_spill;
 static int pr_program_world;    /* (fused, "w") the world position's temporary */
 static int pr_texgen_from[4];   /* (fused) each stage's input register, for GX's texgen ("M"; -1: none) */
 static int pr_world_w;          /* (fused, "w") the clip-space w (both halves) as the program captures it */
+/* (fused: GX's vertex's address (%[ad]) taken where the program's own part starts, not in the
+epilogue, so a "w" form's world position goes there where the program captures the clip-space
+position, its registers free from there on, and is not copied through the output's scratch.
+pr_early_off: in the epilogue, as before: xbox_vsh_codegen --no-early) */
+static int pr_early_off, pr_early;
 static void pr_sweep(void);
 static int pr_fused_op(const char *name, int a, int b, int c);
 static void pr_fused_store(int value, const char *format, ...);
@@ -98,6 +103,11 @@ that costs less, weighted or not. pr_weights_off: never weighted, as before: xbo
 static int pr_use_weight = 4, pr_weighted, pr_weights_off, pr_prefix_first, pr_prefix_end;
 /* (fused: loads past the limit hoisted too, each where the registers still allow it: pr_program's) */
 static unsigned char pr_hoist_extra[PR_KEYS];
+/* (fused: then each load left in the loop hoisted in place of one that is, where the loop costs less
+(pr_loop_cost): the registers go to the loads that save the most, not to the most counted. pr_swap_off:
+not, as before: xbox_vsh_codegen --no-swap) */
+static int pr_swap_off;
+static long pr_loop_cost(void);
 
 /* the floats %[k] points at (wl_xbox_vsh_pairs_k in the generated file) */
 enum {
@@ -1580,11 +1590,13 @@ static void pr_instruction(const WlXboxVshInstruction *in, int mode) {
 
         pr_world_w = pr_fused_op("ps_merge11", pr_half(12, 1), pr_half(12, 1), -1);
         if (pr_world_spill) {
+            const char *to = pr_early ? "%[ad]" : "%[o]";
+
             values[0] = pr_half(pr_program_world, 0);
-            pr_op(0, 0, 1, values, "psq_st @0, 0(%%[o]), 0, 0");
+            pr_op(0, 0, 1, values, "psq_st @0, 0(%s), 0, 0", to);
             values[0] = pr_half(pr_program_world, 1);
-            pr_op(0, 0, 1, values, "stfs @0, 8(%%[o])");
-            pr_fused_store(pr_world_w, "stfsx @0, %%[o], %%[ws]");
+            pr_op(0, 0, 1, values, "stfs @0, 8(%s)", to);
+            pr_fused_store(pr_world_w, "stfsx @0, %s, %%[ws]", to);
         }
     }
     if (in->captures_clip && (mode & WRITE_OUTPUTS) && !(pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD)) {
@@ -2121,6 +2133,20 @@ static int pr_fused_new(const char *format, ...) {
     return value;
 }
 
+/* (fused) whether value is %[k]'s 0 in both lanes (a load of it, as a pair or in both lanes) */
+static int pr_fold_off;
+
+static int pr_is_zero(int value) {
+    int n;
+
+    if (pr_fold_off)
+        return 0;
+    for (n = 0; n < pr_cache_count; n++)
+        if (pr_cache[n].value == value && (strcmp(pr_cache[n].key, "%[k] 0 0") == 0 || strcmp(pr_cache[n].key, "%[k] 1 0") == 0))
+            return 1;
+    return 0;
+}
+
 /* d = op(a, b[, c]) */
 static int pr_fused_op(const char *name, int a, int b, int c) {
     int values[4] = {pr_new(), a, b, c};
@@ -2449,8 +2475,10 @@ static void pr_fused_epilogue(void) {
     char other[24], done[24];
     int word = 3, n;
 
-    pr_text("lwz %%[ad], 0*%%[ptr](%%[w])");
-    pr_text("addi %%[w], %%[w], %%[ptr]");
+    if (!pr_early) {
+        pr_text("lwz %%[ad], 0*%%[ptr](%%[w])");
+        pr_text("addi %%[w], %%[w], %%[ptr]");
+    }
     /* the position: (x w, y w, -w) in pixels from the clip-space position
     the program captured, else the screen-space position and the depth */
     pr_new_label(other, sizeof(other));
@@ -2461,6 +2489,8 @@ static void pr_fused_epilogue(void) {
             pr_text("lwz 0, %d(%%[v])", 4 * n);
             pr_text("stw 0, %d(%%[ad])", 4 * n);
         }
+    } else if (key->perspective == WL_XBOX_VSH_FUSED_WORLD && pr_world_spill && pr_early) {
+        /* (stored to the vertex where the program captured) */
     } else if (key->perspective == WL_XBOX_VSH_FUSED_WORLD && pr_world_spill) {
         /* (the transform unit's from the world position, stored where the program captured) */
         for (n = 0; n < 3; n++) {
@@ -2591,7 +2621,8 @@ static void pr_fused_epilogue(void) {
         }
     }
     /* the colours: each component's byte, value * 255 + 1/2 cut down (a lit
-    form's d0 its alpha alone: r, g and b whatever the output held) */
+    form's d0 its alpha alone: r, g and b whatever the output held; a value that is %[k]'s 0, the
+    output's start value or a write of it, 0 itself, its bytes 0: pr_fold_off, not, as before) */
     for (n = 0; n < key->colors; n++, word++) {
         const char *field = n == 0 ? "%[od0]" : "%[od1]";
         int half;
@@ -2605,15 +2636,21 @@ static void pr_fused_epilogue(void) {
             /* (the alpha's byte alone, at the word's last byte: GX lights r, g and b) */
             int value = pr_fused_output(1, field, 12);
 
-            value = pr_fused_op("ps_madd", value, pr_fused_pack(0, WL_XBOX_VSH_FUSED_255),
-                                pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF));
-            value = pr_fused_op("ps_sel", value, value, pr_k(0, PRK_ZERO));
+            if (!pr_is_zero(value)) {
+                value = pr_fused_op("ps_madd", value, pr_fused_pack(0, WL_XBOX_VSH_FUSED_255),
+                                    pr_fused_pack(0, WL_XBOX_VSH_FUSED_HALF));
+                value = pr_fused_op("ps_sel", value, value, pr_k(0, PRK_ZERO));
+            }
             pr_fused_store(value, "psq_st @0, %d(%%[ad]), 1, 6", 4 * word + 3);
             continue;
         }
         for (half = 0; half < 2; half++) {
             int value = pr_fused_output(0, field, 8 * half);
 
+            if (pr_is_zero(value)) {
+                pr_fused_store(value, "psq_st @0, %d(%%[ad]), 0, 6", 4 * word + 2 * half);
+                continue;
+            }
             /* (fused: a byte apart from the general path's two roundings only where value * 255
                + 1/2 is within an ulp of a whole number) */
             value = pr_fused_op("ps_madd", value, pr_fused_pack(0, WL_XBOX_VSH_FUSED_255),
@@ -2768,6 +2805,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     pr_new();
     pr_needs = ~0u;
     pr_fused_captured = 0;
+    pr_early = pr_fuse && !pr_early_off;
     pr_forward_reset();
     /* (fused: live is the form's, each instruction always written or left out) */
     if (pr_fuse) {
@@ -2954,6 +2992,10 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
                     }
         }
         pr_place_label(made);
+        if (pr_early) {
+            pr_text("lwz %%[ad], 0*%%[ptr](%%[w])");
+            pr_text("addi %%[w], %%[w], %%[ptr]");
+        }
         pr_use_weight = 4;
         pr_prefix_end = pr_body_count;
         pr_forward_on = 1;
@@ -2996,6 +3038,10 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
     } else {
         pr_first[0] = 0;
         pr_place_label(made);
+        if (pr_early) {
+            pr_text("lwz %%[ad], 0*%%[ptr](%%[w])");
+            pr_text("addi %%[w], %%[w], %%[ptr]");
+        }
         pr_forward_on = 1;
     }
     for (index = start; index < program->count && !pr_failed; index++) {
@@ -3358,6 +3404,37 @@ static int pr_program_once(const WlXboxVshProgram *program, const unsigned *need
             if (!(pr_generate(program, needs, reused, prefix, &compares) && pr_allocate(&used)))
                 return 0;
         }
+    }
+    if (pr_fuse && !pr_swap_off && pr_key_count > 0) {
+        unsigned char kept[PR_KEYS];
+        long best = pr_loop_cost(), cost;
+        int i, j;
+
+        for (n = 0; n < pr_key_count; n++)
+            pr_hoist_extra[n] = (unsigned char)(n < pr_hoist_limit || pr_hoist_extra[n]);
+        pr_hoist_limit = 0;
+        memcpy(kept, pr_hoist_extra, sizeof(kept));
+        for (j = 0; j < pr_key_count; j++) {
+            if (kept[j])
+                continue;
+            for (i = pr_key_count - 1; i >= 0; i--) {
+                if (!kept[i])
+                    continue;
+                pr_hoist_extra[i] = 0;
+                pr_hoist_extra[j] = 1;
+                if (pr_generate(program, needs, reused, prefix, &compares) && pr_allocate(&used) &&
+                    (cost = pr_loop_cost()) < best) {
+                    best = cost;
+                    kept[i] = 0;
+                    kept[j] = 1;
+                    break;
+                }
+                pr_hoist_extra[i] = 1;
+                pr_hoist_extra[j] = 0;
+            }
+        }
+        if (!(pr_generate(program, needs, reused, prefix, &compares) && pr_allocate(&used)))
+            return 0;
     }
     pr_used = used;
     return 1;

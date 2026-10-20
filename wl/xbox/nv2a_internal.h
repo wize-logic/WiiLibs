@@ -104,6 +104,10 @@ struct WlNv2a {
     uint32_t batch_loop_first[1]; // a line loop's first vertex (its slot), when it was handed in parts
     // the least and greatest of batch_indices[0 .. batch_bounds_at) (0: none known), found as they came
     uint32_t batch_bounds_at, batch_least, batch_last;
+    // (the draw batch_draw hands over, kept between draws (wl_nv2a_set_push_cuts4): its attributes' entries
+    // zero but those in batch_draw_attribs, which the next draw writes again or zeroes)
+    WlNv2aDraw batch_draw;
+    uint32_t batch_draw_attribs;
     // the Kelvin methods logged once as not interpreted (bit by method / 4)
     uint8_t unhandled_logged[WL_NV2A_K_METHODS / 32];
     uint8_t classes_logged[256];

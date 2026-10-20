@@ -103,6 +103,13 @@ A title's own knowledge is data, passed with --config (JSON; relative paths are 
                                              can reach in a C local, written to memory before a call
                                              and, for the caller's slots, at a return: stack_locals.py,
                                              patch 0038)
+      "stack_deltas": false,                 with stack_locals: a callee that moves esp by constants
+                                             has no known effect on its caller's esp, and the carry of
+                                             `sub esp, K` counts as a frame address (patch 0039)
+      "stack_reach": false,                  with stack_locals: every slot goes to memory before each
+                                             call and back after it (the default true moves only the
+                                             slots a callee given no frame address can reach: below
+                                             the end of its arguments; patch 0039)
       "hot_functions": "hot.txt" or ["sub_00052520", "0x00088B80"],   the functions compiled at
                                              -O2 (tu/recomp_tu_hot.c); a file is read for its
                                              sub_XXXXXXXX names and 0x addresses (a profile report
@@ -384,6 +391,10 @@ class Run:
                 rcmd.append("--x87-balanced")
         if c.get("stack_locals", True):
             rcmd.append("--stack-locals")
+            if c.get("stack_deltas", True):
+                rcmd.append("--stack-deltas")
+            if c.get("stack_reach", True):
+                rcmd.append("--stack-reach")
         rin = [self.xbe, functions, disasm / "labels.json", func_id / "identified_functions.json", abi]
         if c.get("icall_sites"):
             rcmd += ["--icall-sites", str(self.cfg_path(c["icall_sites"]))]
@@ -613,7 +624,7 @@ def load_config(path):
              "coalesce_functions", "trace_functions", "split", "disasm_args", "func_id_args",
              "abi_args", "recomp_args", "icall_sites", "patches", "comment", "vertex_programs", "x87_locals",
              "reg_locals", "mem_disp", "stack_disp", "keep_preserved", "bounded_loops", "rodata_consts",
-             "callee_regs", "x87_balanced", "stack_locals", "hot_functions"}
+             "callee_regs", "x87_balanced", "stack_locals", "stack_deltas", "stack_reach", "hot_functions"}
     unknown = sorted(set(cfg) - known)
     if unknown:
         raise Failure(f"{path}: unknown keys {unknown} (known: {sorted(known)})")

@@ -34,7 +34,7 @@ void wl_log_write(WlLogLevel level, const char *tag, const char *fmt, ...) {
         g_sink(g_sink_user, level, tag, msg);
         return;
     }
-#if !defined(__PPC__)
+#if !defined(__PPC__) || defined(__linux__) // (ppc-be under qemu-user logs too; the Wii has its sink)
     (void)fprintf(stderr, "[%c][%s] %s\n", letters[level], tag, msg);
 #else
     (void)letters;

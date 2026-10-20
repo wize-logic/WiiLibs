@@ -253,6 +253,12 @@ void wl_nv2a_set_push_cuts(bool on);
 // Broadway, the viewport's words straight to their constants; false: as wave 4's first six left them (a file "oldpush3", WL_XB_OLDPUSH3), for an
 // A/B. A span whose start passes 4 GiB is refused either way.
 void wl_nv2a_set_push_cuts3(bool on);
+// true (the default): batch_draw's draw kept between draws (its header and its arrays' entries written
+// again, not the whole draw zeroed), the fetch's plan made from the attributes asked for alone with its
+// formats from a table and unnormalized shorts converted by their bits, the current values written a
+// word at a time; false: as wave 4 left them (a file "oldpush4", WL_XB_OLDPUSH4), for an A/B. What is
+// fetched and drawn is the same, to the bit.
+void wl_nv2a_set_push_cuts4(bool on);
 static inline bool wl_nv2a_prefetching(void) {
     return WL_NV2A_PREFETCHES && wl_nv2a_prefetch_on;
 }

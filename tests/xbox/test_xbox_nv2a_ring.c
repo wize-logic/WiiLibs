@@ -63,7 +63,7 @@ static int ring_draw(uint32_t pos, uint32_t stride, uint32_t count, unsigned rep
     memset(ring + end, GUARD_BYTE, GUARD);
     for (first = 0; first < count; first += run, batch++) {
         run = count - first < WL_XBOX_VSH_BATCH ? count - first : WL_XBOX_VSH_BATCH;
-        (void)made_slots(g_gx, &draw, first, run, repeat != 0);
+        (void)made_slots(g_gx, &draw, first, run, repeat != 0, first == 0);
         for (n = 0; n < run; n++) {
             if (g_gx->made.index[n] >= g_gx->made.limit || g_gx->made.index[n] > 0xFFFFu) {
                 return batch;

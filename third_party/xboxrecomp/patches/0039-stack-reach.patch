@@ -1,0 +1,570 @@
+From ba76a093bb40a2fcea1a74b6a701d7f7c71abd1b Mon Sep 17 00:00:00 2001
+From: wize-logic <bcolb7@protonmail.com>
+Date: Mon, 19 Oct 2026 17:40:35 -0400
+Subject: [PATCH] recomp: --stack-deltas and --stack-reach for --stack-locals
+
+--stack-deltas: ret_deltas' test for a function that sets esp from something
+other than its frame let `esp = esp - 0x14` through (\s* backed off a space
+before the lookahead), so every function with a frame lost its esp effect and
+its callers their esp; and the carry `sub esp, K` computes is not a frame
+address.
+
+--stack-reach: arg_windows gives each function's reach above its entry esp
+(its return address and the stack arguments it names), for a function the
+walk follows that passes on no address in its arguments, reads no inherited
+frame and makes no tail jump. A call that gives its callee no frame address
+then writes back and reloads only the slots below the callee's reach; the
+others stay in their locals across it.
+---
+ tools/recomp/__main__.py         |  10 ++
+ tools/recomp/stack_locals.py     | 112 ++++++++++++---
+ tools/recomp/test_stack_reach.py | 230 +++++++++++++++++++++++++++++++
+ tools/recomp/translator.py       |  16 ++-
+ 4 files changed, 347 insertions(+), 21 deletions(-)
+ create mode 100644 tools/recomp/test_stack_reach.py
+
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 25ed750..7b100db 100644
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -321,6 +321,14 @@ def main():
+                              "(their address never leaves the function but to a call) in C "
+                              "locals, written to guest memory before a call and at a return "
+                              "(stack_locals.py)")
++    parser.add_argument("--stack-deltas", action="store_true",
++                        help="With --stack-locals: a callee that moves esp by constants has a "
++                             "known effect on its caller's esp, and the carry `sub esp, K` sets "
++                             "is not a frame address (stack_locals.ret_deltas)")
++    parser.add_argument("--stack-reach", action="store_true",
++                        help="With --stack-locals: a call that gives its callee no frame address "
++                             "writes back and reloads only the slots the callee can reach: those "
++                             "below its arguments' end (stack_locals.arg_windows)")
+     parser.add_argument("--seh-prolog", metavar="ADDR",
+                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
+     parser.add_argument("--seh-epilog", metavar="ADDR",
+@@ -407,6 +415,8 @@ def main():
+     translator.translator.callee_regs = args.callee_regs
+     translator.translator.x87_balanced = args.x87_balanced
+     translator.translator.stack_locals = args.stack_locals
++    translator.translator.stack_deltas = args.stack_deltas
++    translator.translator.stack_reach = args.stack_reach
+     translator.translator.mem_disp = args.mem_disp
+     translator.translator.stack_disp = args.stack_disp
+ 
+diff --git a/tools/recomp/stack_locals.py b/tools/recomp/stack_locals.py
+index 3ed6f7c..a5629b3 100644
+--- a/tools/recomp/stack_locals.py
++++ b/tools/recomp/stack_locals.py
+@@ -72,7 +72,7 @@ from .x87_locals import (_NotLocal, _items, _match_paren, _nodes, _function_boun
+                          _calls, _reg_written, _TRANSPARENT, _KEYWORDS, _FP_MACROS)
+ from .preserve import NEVER, _address_taken
+ 
+-__all__ = ["localise_stack", "ret_deltas", "STACK_LOCALS_PREFIX"]
++__all__ = ["localise_stack", "ret_deltas", "arg_windows", "STACK_LOCALS_PREFIX"]
+ 
+ STACK_LOCALS_PREFIX = "_sl_"
+ 
+@@ -140,9 +140,14 @@ class _Decline(_NotLocal):
+ 
+ _RET = re.compile(r"\besp \+= (\d+); return; /\* ret\b")
+ _ESP_SET = re.compile(r"\b" + "(?:g_)?" + r"esp\s*=(?!=)\s*(?!(?:g_)?esp\b|ebp\b)|POP32\(\s*esp\s*,\s*esp\s*\)")
++# The same, right: the lookahead takes the spaces itself (`\s*` before it
++# backs off a space and lets `esp = esp - 0x14`, a frame's allocation, through
++# as a set from something else; with --stack-deltas).
++_ESP_SET_EXACT = re.compile(r"\b" + "(?:g_)?" + r"esp\s*=(?!=)(?!\s*(?:g_)?esp\b|\s*ebp\b)|"
++                            r"POP32\(\s*esp\s*,\s*esp\s*\)")
+ 
+ 
+-def ret_deltas(functions):
++def ret_deltas(functions, exact=False):
+     """{name: esp after its return minus esp at its entry} for each function
+     whose every return is a `ret` (esp += 4 + n; return) with the same n and
+     which sets esp only from esp or ebp (its frame): by the calling convention
+@@ -150,7 +155,9 @@ def ret_deltas(functions):
+     where it can follow every call; this covers a function whose esp it loses
+     (after an indirect call), for its callers. A function that moves its
+     caller's esp (_alloca's probe, the SEH prolog) sets esp from another
+-    register or from memory, and gets nothing."""
++    register or from memory, and gets nothing. exact (--stack-deltas): a
++    function that moves esp by a constant (`esp = esp - 0x14`) counts too."""
++    esp_set = _ESP_SET_EXACT if exact else _ESP_SET
+     out = {}
+     for name, lines in functions.items():
+         ks, ok = set(), True
+@@ -161,7 +168,7 @@ def ret_deltas(functions):
+                     ok = False
+                     break
+                 ks.add(int(m.group(1)))
+-            elif _ESP_SET.search(_protect(line)[0]):
++            elif esp_set.search(_protect(line)[0]):
+                 ok = False
+                 break
+         if ok and len(ks) == 1:
+@@ -294,10 +301,14 @@ class _Walk:
+     recording) the accesses, and for each node the decision for each access in
+     it in textual order (None: guest memory; ("slot", o): the slot at o)."""
+ 
+-    def __init__(self, summaries, kept, deltas):
++    def __init__(self, summaries, kept, deltas, windows=None):
+         self.summaries = summaries
+         self.kept = kept
+         self.deltas = deltas
++        self.windows = windows or {}
++        self.carry = False
++        self.call_tops = {}       # node -> for each call in it, entry esp + what of the frame the callee may reach (None: all)
++        self.args_escape = False  # an address in the arguments (or one not known) went to a callee
+         self.record = False
+         self.prologue = False
+         self.accesses = []
+@@ -533,6 +544,8 @@ class _Walk:
+                          r"(?:=|\+=|-=|\|=|&=|\^=)(?!=)\s*(.*)", t, re.S)
+         if m and m.group(1) in ("_fa", "_fb", "_fas", "_fbs"):
+             return st  # a flag temporary: compared, never an address
++        if m and m.group(1) == "_cf" and self.carry:
++            return st  # the carry: 0 or 1 (`_cf = esp < 0x4E0` for `sub esp, 0x4E0`; --stack-deltas)
+         if m and m.group(1) == "_icall_esp" and m.group(2).strip() == "g_esp":
+             return st  # what an indirect call's failure path puts back
+         if m and m.group(1) not in ("g_ebp", "g_seh_ebp") and _framey(self.value(m.group(2), st)):
+@@ -597,14 +610,23 @@ class _Walk:
+         if names <= _BOOKKEEPING:
+             return st
+         self.sync_seen = True
+-        escaped = any(_framey(v) for v in st.regs.values()) or (
+-            st.off is not None and any(_framey(v) and st.off <= o < st.off + 64
+-                                       for o, v in st.slots.items()))
+         m = re.fullmatch(r"RECOMP_ABI_CALL\(\s*0x[0-9A-Fa-f]+u?\s*,\s*(\w+)\s*\)", t)
+         callee = m.group(1) if m else None
+         if callee is None:
+             m = re.fullmatch(r"(\w+)\(\s*\)", t)
+-            callee = m.group(1) if m and (m.group(1) in self.summaries or m.group(1) in self.deltas) else None
++            callee = m.group(1) if m and (m.group(1) in self.summaries or m.group(1) in self.deltas
++                                          or m.group(1) in self.windows) else None
++        window = self.windows.get(callee) if callee else None
++        reach = max(64, window or 0)
++        given = [v for v in st.regs.values() if _framey(v)]
++        if st.off is not None:
++            given += [v for o, v in st.slots.items() if _framey(v) and st.off <= o < st.off + reach]
++        escaped = bool(given)
++        if any(v == _T or v[1] >= 0 for v in given):
++            self.args_escape = True
++        if self.record:
++            self.call_tops.setdefault(self.node, []).append(
++                None if escaped or st.off is None or window is None else st.off + window)
+         if callee is None:
+             m = re.fullmatch(r"(RECOMP_ICALL_SAFE(?:_AT)?(?:_CC)?|RECOMP_ITAIL)\s*\(", t[:t.find("(") + 1])
+             if m:
+@@ -723,21 +745,54 @@ def _at(d):
+     return "esp + 0x%X" % d if d >= 0 else "esp - 0x%X" % -d
+ 
+ 
+-def localise_stack(lines, summaries=None, kept=None, deltas=None, min_accesses=2):
++def localise_stack(lines, summaries=None, kept=None, deltas=None, min_accesses=2, windows=None, carry=False):
+     """lines: one function as translate_function emits it (before x87_locals).
+     summaries: preserve.py's {name: Summary} (each callee's effect on esp);
+     kept: {name: the register globals a call to it gives back}; deltas:
+-    ret_deltas' {name: esp effect} where summaries have none. Returns (lines,
+-    None, slots kept in locals, accesses rewritten), or (lines unchanged, the
++    ret_deltas' {name: esp effect} where summaries have none; windows:
++    arg_windows' {name: bytes above its entry esp it may reach}, which keeps
++    the slots out of a callee's reach in their locals across the call (None:
++    every slot goes to memory and back at every call); carry: the carry flag
++    computed from esp is not a frame address (--stack-deltas). Returns (lines, None,
++    slots kept in locals, accesses rewritten), or (lines unchanged, the
+     reason, 0, 0)."""
+     try:
+-        out, n_slots, n_acc = _localise(lines, summaries or {}, kept or {}, deltas or {}, min_accesses)
++        out, n_slots, n_acc = _localise(lines, summaries or {}, kept or {}, deltas or {}, min_accesses,
++                                        windows, carry)
+         return out, None, n_slots, n_acc
+     except _NotLocal as e:
+         return lines, str(e), 0, 0
+ 
+ 
+-def _localise(lines, summaries, kept, deltas, min_accesses):
++# A way out that hands this function's frame to other code: a jump to another
++# function (by name or by address) or a fall into the next one.
++_TAIL = re.compile(r"\bRECOMP_ITAIL\b|return; /\* (?:manual )?tail jmp|return; /\* fallthrough")
++
++
++def arg_windows(functions, summaries=None, kept=None, deltas=None, carry=False):
++    """{name: how many bytes above its entry esp the function may read or
++    write} -- its return address and the stack arguments its own accesses
++    name -- for each function the walk follows to the end, that is given no
++    address in its arguments' part of the frame to pass on, reads no frame
++    through an inherited ebp and leaves by no tail jump. A caller whose call
++    gives it no frame address then knows the callee cannot reach the slots
++    above that: they stay in their locals across the call."""
++    out = {}
++    for name, lines in functions.items():
++        if any(_TAIL.search(line) for line in lines):
++            continue
++        try:
++            walk = _analyse(lines, summaries or {}, kept or {}, deltas or {}, None, carry)[0]
++        except _NotLocal:
++            continue
++        if walk.args_aliased or walk.args_escape:
++            continue
++        out[name] = max([4] + [a.o + a.size for a in walk.accesses if a.o + a.size > 0])
++    return out
++
++
++def _analyse(lines, summaries, kept, deltas, windows, carry):
++    """The walk over the body to its fixpoint, then once more recording."""
+     bounds = _function_bounds(lines)
+     if bounds is None:
+         raise _Decline("no body")
+@@ -765,7 +820,8 @@ def _localise(lines, summaries, kept, deltas, min_accesses):
+         calls = {c for c in _calls(n.code) if c not in _ACCESS} - _BOOKKEEPING
+         syncs.append("call" if calls else "return" if re.search(r"\breturn\b", n.code) else False)
+ 
+-    walk = _Walk(summaries, kept, deltas)
++    walk = _Walk(summaries, kept, deltas, windows)
++    walk.carry = carry
+ 
+     def visit(x, st, edges):
+         n = nodes[x]
+@@ -805,6 +861,12 @@ def _localise(lines, summaries, kept, deltas, min_accesses):
+     # once more in order, recording, with those states
+     walk.record = True
+     state_out = [visit(x, state_in[x], []) for x in range(len(nodes))]
++    return walk, nodes, labels, first_label, syncs, state_in, state_out
++
++
++def _localise(lines, summaries, kept, deltas, min_accesses, windows, carry):
++    walk, nodes, labels, first_label, syncs, state_in, state_out = _analyse(lines, summaries, kept, deltas,
++                                                                            windows, carry)
+ 
+     # the slots kept in locals
+     by_slot = {}
+@@ -828,6 +890,16 @@ def _localise(lines, summaries, kept, deltas, min_accesses):
+     if not chosen:
+         raise _Decline("no slot to keep")
+ 
++    # at each call, the slots the callee may reach: below its entry esp plus its
++    # window (all of them where the window is not known or a frame address went)
++    every = frozenset(chosen)
++    reach = {}
++    for x, tops in walk.call_tops.items():
++        if None in tops or re.search(r"\breturn\b", nodes[x].code):
++            reach[x] = every  # (a call and a return: the caller's slots go back too)
++        else:
++            reach[x] = frozenset(o for o in chosen if o < max(tops))
++
+     # what may have been written since memory was last current, where each node starts
+     writes = {}
+     for a in walk.accesses:
+@@ -842,7 +914,7 @@ def _localise(lines, summaries, kept, deltas, min_accesses):
+         n = nodes[x]
+         if n.kind not in ("label", "pp"):
+             if syncs[x] == "call":
+-                d = frozenset()
++                d = d - reach.get(x, every)
+             elif syncs[x] == "return":
+                 d = frozenset(o for o in d if o < 4)
+             d = d | frozenset(writes.get(x, ()))
+@@ -879,6 +951,8 @@ def _localise(lines, summaries, kept, deltas, min_accesses):
+         d = dirty[x] or frozenset()
+         if syncs[x] == "return":
+             d = frozenset(o for o in d if o >= 4)
++        else:
++            d = d & reach.get(x, every)
+         if d:
+             if state_in[x].off is None:
+                 raise _Decline("a call or return where esp is not known")
+@@ -887,8 +961,10 @@ def _localise(lines, summaries, kept, deltas, min_accesses):
+         if syncs[x] == "call" and state_out[x] is not None:
+             if state_out[x].off is None:
+                 raise _Decline("esp not known after a call")
+-            after.setdefault(n.last, []).append("    %s /* and back */" % " ".join(
+-                load(o, state_out[x].off) for o in slots))
++            back = [o for o in slots if o in reach.get(x, every)]
++            if back:
++                after.setdefault(n.last, []).append("    %s /* and back */" % " ".join(
++                    load(o, state_out[x].off) for o in back))
+ 
+     out = list(lines)
+     n_acc = 0
+diff --git a/tools/recomp/test_stack_reach.py b/tools/recomp/test_stack_reach.py
+new file mode 100644
+index 0000000..1e15421
+--- /dev/null
++++ b/tools/recomp/test_stack_reach.py
+@@ -0,0 +1,230 @@
++"""
++--stack-deltas and --stack-reach for --stack-locals (stack_locals.py).
++
++ret_deltas(exact=True) gives a function that moves esp by constants its
++effect on its caller's esp; the carry `sub esp, K` computes is no frame
++address. arg_windows gives each function the walk follows how far above its
++entry esp it may reach; a call that hands its callee no frame address then
++writes back and reloads only the slots below that reach. These checks lift
++small x86 functions (test_preserve's harness), look at the windows and at the
++text, and compile and run each case both ways (test_stack_locals' harness).
++"""
++
++import os
++import re
++import shutil
++import struct
++import sys
++import tempfile
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
++
++from tools.recomp import preserve  # noqa: E402
++from tools.recomp.stack_locals import localise_stack, ret_deltas, arg_windows  # noqa: E402
++from tools.recomp.test_preserve import _lift  # noqa: E402
++from tools.recomp.test_stack_locals import _compile_run  # noqa: E402
++
++
++def _h(s):
++    return bytes.fromhex(s.replace(" ", ""))
++
++
++RET = _h("C3")
++RET_4 = _h("C20400")           # ret 4
++SUB_ESP_10 = _h("83EC10")      # sub esp, 0x10
++ADD_ESP_10 = _h("83C410")      # add esp, 0x10
++ADD_ESP_4 = _h("83C404")       # add esp, 4
++JB_NEXT = _h("7200")           # jb $+2 (reads the carry of what came before)
++ST_0_EAX = _h("890424")        # mov [esp], eax
++LD_EDX_0 = _h("8B1424")        # mov edx, [esp]
++ST_4_EAX = _h("89442404")      # mov [esp+4], eax
++LD_EDX_4 = _h("8B542404")      # mov edx, [esp+4]
++ADD_4_EAX = _h("01442404")     # add [esp+4], eax
++ST_8_ECX = _h("894C2408")      # mov [esp+8], ecx
++LD_EAX_8 = _h("8B442408")      # mov eax, [esp+8]
++ADD_8_EDX = _h("01542408")     # add [esp+8], edx
++LEA_ECX_8 = _h("8D4C2408")     # lea ecx, [esp+8]
++LEA_EAX_4 = _h("8D442404")     # lea eax, [esp+4]
++PUSH_EAX, PUSH_ECX = _h("50"), _h("51")
++# leaves
++READS_ARG = [_h("8B442404"), RET]                                   # mov eax, [esp+4]
++WRITES_ARG = [_h("8B442404"), _h("89542404"), _h("8B4C2404"), RET]  # its argument read, rewritten, read
++WRITES_2ND = [_h("8B442408"), _h("01542408"), RET]                  # mov eax, [esp+8]; add [esp+8], edx
++WRITES_PTR = [_h("8B442404"), _h("C700AA000000"), RET]              # *(arg) = 0xAA
++NO_ARGS = [_h("B807000000"), RET]                                   # mov eax, 7
++
++
++def _call(i):
++    return ("call", i)
++
++
++def _names_lines(funcs):
++    t, pend, names = _lift(funcs)
++    return t, pend, names, {names[i]: p.lines for i, p in pend.items()}
++
++
++def _run_pass(funcs, reach=True, exact=True):
++    t, pend, names, lines = _names_lines(funcs)
++    s = preserve.analyse(lines)
++    kept = preserve.preserved_by_name(s)
++    deltas = ret_deltas(lines, exact=exact)
++    windows = arg_windows(lines, s, kept, deltas, carry=exact) if reach else None
++    out = {n: localise_stack(pend[i].lines, s, kept, deltas, windows=windows, carry=exact)
++           for i, n in enumerate(names)}
++    return pend, names, out, windows
++
++
++def _windows(funcs):
++    return _run_pass(funcs)[3]
++
++
++def _body(lines):
++    return "\n".join(lines)
++
++
++# ------------------------------------------------------------ ret_deltas
++
++def test_a_frame_moved_by_constants_has_a_delta_only_when_exact():
++    # sub esp,0x10; add esp,0x10; ret 4: esp after the return is entry + 8
++    _, _, names, lines = _names_lines([[SUB_ESP_10, ADD_ESP_10, RET_4]])
++    assert ret_deltas(lines, exact=True) == {names[0]: 8}
++    assert names[0] not in ret_deltas(lines)  # 0038's test let `esp = esp - 0x10` count as a foreign set
++
++
++def test_esp_set_from_elsewhere_has_no_delta_even_when_exact():
++    # mov esp, eax; ret: the caller's esp is not known
++    _, _, names, lines = _names_lines([[_h("8BE0"), RET]])
++    assert names[0] not in ret_deltas(lines, exact=True)
++
++
++def test_the_carry_of_sub_esp_is_no_frame_address():
++    # sub esp,0x10; jb +0; the slot at entry - 0xc spilled and read twice
++    f = [SUB_ESP_10, JB_NEXT, ST_4_EAX, LD_EDX_4, LD_EDX_4, ADD_ESP_10, RET]
++    _, _, out, _ = _run_pass([f], reach=False, exact=False)
++    assert out[_lift([f])[2][0]][1] == "a frame address in a temporary"
++    _, names, out, _ = _run_pass([f], reach=False, exact=True)
++    assert out[names[0]][1] is None, out[names[0]][1]
++
++
++# ------------------------------------------------------------ arg_windows
++
++def test_a_leaf_reaches_its_return_address_and_its_arguments():
++    w = _windows([READS_ARG, NO_ARGS, WRITES_2ND])
++    assert sorted(w.values()) == [4, 8, 12]
++
++
++def test_a_tail_jump_has_no_window():
++    # mov eax,[esp+8]; jmp f0: f0 runs on this function's frame
++    jmp = b"\xE9" + struct.pack("<i", 0 - (len(_h("8B442404")) + 1 + 4 + 5))
++    funcs = [READS_ARG, [LD_EAX_8, jmp]]
++    _, _, names, _ = _names_lines(funcs)
++    w = _windows(funcs)
++    assert names[0] in w and names[1] not in w, w
++
++
++def test_an_argument_address_passed_on_has_no_window():
++    # lea eax,[esp+4]; push eax; call f1; add esp,4; ret: f1 may reach the caller's frame through it
++    funcs = [[LEA_EAX_4, PUSH_EAX, _call(1), ADD_ESP_4, RET], READS_ARG]
++    _, _, names, _ = _names_lines(funcs)
++    w = _windows(funcs)
++    assert names[0] not in w and w.get(names[1]) == 8, w
++
++
++def test_an_inherited_frame_has_no_window():
++    # mov eax,[ebp+8]; ret: ebp is the caller's, whatever it points at
++    funcs = [[_h("8B4508"), RET]]
++    _, _, names, _ = _names_lines(funcs)
++    assert names[0] not in _windows(funcs)
++
++
++# ------------------------------------------------------------ the calls
++
++def test_a_slot_out_of_the_callees_reach_stays_in_its_local():
++    # sub esp,0x10; mov [esp+8],ecx; call f1 (no arguments); mov eax,[esp+8]; add [esp+8],edx...
++    caller = [SUB_ESP_10, ST_8_ECX, _call(1), LD_EAX_8, ADD_8_EDX, LD_EAX_8, ADD_ESP_10, RET]
++    pend, names, out, _ = _run_pass([caller, NO_ARGS])
++    lines, why, n_slots, _ = out[names[0]]
++    assert why is None and n_slots == 1, why
++    text = _body(lines)
++    assert "to memory */" not in text and "/* and back */" not in text, text
++    # without --stack-reach the slot goes to memory and back
++    _, _, out, _ = _run_pass([caller, NO_ARGS], reach=False)
++    text = _body(out[names[0]][0])
++    assert "MEM32(esp + 0x8) = _sl_m8; /* the slots written since, to memory */" in text, text
++    assert "_sl_m8 = MEM32(esp + 0x8); /* and back */" in text, text
++
++
++def test_a_slot_in_the_callees_arguments_still_goes_to_memory_and_back():
++    # sub esp,0x10; mov [esp],eax; mov [esp+8],ecx; call f1 (reads [esp+4] = the caller's [esp]):
++    # the slot at entry - 0x10 is f1's argument, the one at entry - 8 is out of its reach
++    caller = [SUB_ESP_10, ST_0_EAX, ST_8_ECX, _call(1), LD_EAX_8, LD_EDX_0, LD_EAX_8, LD_EDX_0, ADD_ESP_10, RET]
++    _, names, out, w = _run_pass([caller, READS_ARG])
++    assert w[names[1]] == 8
++    lines, why, n_slots, _ = out[names[0]]
++    assert why is None and n_slots == 2, why
++    text = _body(lines)
++    assert "MEM32(esp + 0x0) = _sl_m10; /* the slots written since, to memory */" in text, text
++    assert "_sl_m10 = MEM32(esp + 0x0); /* and back */" in text, text
++    assert not re.search(r"MEM32\(esp \+ 0x8\) = _sl_m8|_sl_m8 = MEM32\(esp \+ 0x8\);", text), text
++
++
++def test_a_callee_given_a_frame_address_reaches_every_slot():
++    # lea ecx,[esp+8]; push ecx; call f1: f1 writes through it, whatever its window
++    caller = [SUB_ESP_10, ST_8_ECX, ST_4_EAX, LEA_ECX_8, PUSH_ECX, _call(1), ADD_ESP_4, LD_EAX_8, LD_EDX_4,
++              LD_EAX_8, LD_EDX_4, ADD_ESP_10, RET]
++    _, names, out, w = _run_pass([caller, WRITES_PTR])
++    assert w[names[1]] == 8
++    lines, why, _, _ = out[names[0]]
++    assert why is None, why
++    text = _body(lines)
++    i_call = text.index("RECOMP_ABI_CALL")
++    assert "_sl_m8" in text[i_call:text.index("/* and back */", i_call)], text
++
++
++# ------------------------------------------------------------ run both ways
++
++CASES = [
++    # one slot the callee's argument (it rewrites it), one out of its reach
++    [[SUB_ESP_10, ST_0_EAX, ST_8_ECX, _call(1), LD_EAX_8, ADD_8_EDX, LD_EDX_0, LD_EAX_8, ADD_ESP_10, RET],
++     WRITES_ARG],
++    # the callee's second argument is the caller's [esp+4] at the call: on the edge of its reach
++    [[SUB_ESP_10, ST_4_EAX, ST_8_ECX, _call(1), LD_EDX_4, ADD_4_EAX, LD_EAX_8, ADD_8_EDX, LD_EDX_4, LD_EAX_8,
++      ADD_ESP_10, RET],
++     WRITES_2ND],
++    # two calls with a slot changed between them, out of reach of both
++    [[SUB_ESP_10, ST_8_ECX, ST_4_EAX, _call(1), ADD_8_EDX, LD_EAX_8, _call(1), ADD_8_EDX, LD_EAX_8, LD_EDX_4,
++      ADD_ESP_10, RET],
++     NO_ARGS],
++    # the callee is given the slot's address and writes it
++    [[SUB_ESP_10, ST_8_ECX, LEA_ECX_8, PUSH_ECX, _call(1), ADD_ESP_4, LD_EAX_8, LD_EAX_8, ADD_ESP_10, RET],
++     WRITES_PTR],
++    # the callee passes its own argument's address on: no window, every slot synced
++    [[SUB_ESP_10, ST_0_EAX, ST_8_ECX, _call(1), LD_EAX_8, ADD_8_EDX, LD_EDX_0, LD_EAX_8, ADD_ESP_10, RET],
++     [LEA_EAX_4, PUSH_EAX, _call(2), ADD_ESP_4, RET], WRITES_PTR],
++]
++
++
++@pytest.mark.parametrize("funcs", CASES)
++def test_the_reach_computes_what_the_memory_model_computes(funcs):
++    if not (shutil.which("gcc") or shutil.which("clang")):
++        pytest.skip("C compiler unavailable")
++    pend, names, out, _ = _run_pass(funcs)
++    assert out[names[0]][1] is None, out[names[0]][1]
++    protos = "".join("static void %s(void);\n" % n for n in names)
++    plain = protos + "\n".join(_body(p.lines) for p in pend.values())
++    done = protos + "\n".join(_body(out[n][0]) for n in names)
++    with tempfile.TemporaryDirectory() as tmp:
++        a = _compile_run(plain, names[0], tmp, "plain")
++        b = _compile_run(done, names[0], tmp, "reach")
++    assert a == b, (a, b)
++
++
++if __name__ == "__main__":
++    for name, fn in sorted(globals().items()):
++        if name.startswith("test_") and name != "test_the_reach_computes_what_the_memory_model_computes":
++            fn()
++    for c in CASES:
++        test_the_reach_computes_what_the_memory_model_computes(c)
++    print("ok")
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 9955619..41b5691 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -30,7 +30,7 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
+                      detect_setjmp_helpers, _func_ident, _operand_width)
+ from .x87_locals import localise_x87
+-from .stack_locals import localise_stack, ret_deltas
++from .stack_locals import localise_stack, ret_deltas, arg_windows
+ from . import preserve
+ from . import touched
+ 
+@@ -547,6 +547,13 @@ class FunctionTranslator:
+         # reach in C locals, written to memory only where it may be read
+         # (--stack-locals); summaries: preserve.py's, for each callee's effect on esp
+         self.stack_locals = False
++        # --stack-deltas: ret_deltas counts a function that moves esp by a
++        # constant, and the carry from `sub esp, K` is no frame address;
++        # --stack-reach: arg_windows' reach of each callee keeps the slots out
++        # of it in their locals across the call
++        self.stack_deltas = False
++        self.stack_reach = False
++        self.arg_windows = {}
+         self.summaries = {}
+         self.ret_deltas = {}
+         self.stack_stats = {}
+@@ -3141,7 +3148,8 @@ class FunctionTranslator:
+         """The passes over a translated body's C text: stack_locals, x87_locals
+         (with the callees preserve.py proved, self.kept), then mem_disp."""
+         if self.stack_locals:
+-            out, why, n_slots, n_acc = localise_stack(lines, self.summaries, self.kept, self.ret_deltas)
++            out, why, n_slots, n_acc = localise_stack(lines, self.summaries, self.kept, self.ret_deltas,
++                                                      windows=self.arg_windows, carry=self.stack_deltas)
+             key = why or "in locals"
+             self.stack_stats[key] = self.stack_stats.get(key, 0) + 1
+             if why is None:
+@@ -3496,7 +3504,9 @@ class BatchTranslator:
+         t.kept = preserve.preserved_by_name(summaries)
+         t.summaries = summaries
+         if t.stack_locals:
+-            t.ret_deltas = ret_deltas(pending)
++            t.ret_deltas = ret_deltas(pending, exact=t.stack_deltas)
++            if t.stack_reach:
++                t.arg_windows = arg_windows(pending, summaries, t.kept, t.ret_deltas, carry=t.stack_deltas)
+         if t.callee_regs:
+             t.touched = touched.analyse(pending)
+             if t.x87_balanced:

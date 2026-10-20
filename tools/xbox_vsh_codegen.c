@@ -20,7 +20,9 @@
 //
 // usage: xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] [--no-pairs]
 //            [--spill] [--no-forward] [--no-alias] [--no-weights]
-//            [--no-r12] [--no-sweep] [--no-splat] [--fused forms.txt] microcode.inc output.c [table]
+//            [--no-r12] [--no-sweep] [--no-splat] [--no-early] [--no-swap] [--no-fold]
+//            [--fused forms.txt] microcode.inc output.c
+//            [table]
 //   (table: the name of the table, default xbox_vsh_natives, and of its count, <table>_count;
 //   --if-exists: a microcode file that is not there has no programs, an empty table; --accessor:
 //   also a function of that name, const WlXboxVshNative *name(unsigned long *count), that gives
@@ -40,7 +42,11 @@
 //   with the rest, as before; --no-r12: a "w" form whose operands leave no room for its world
 //   slot's loads the slot at each use, as before, not into r12 once; --no-sweep: a fused
 //   loop's operations whose results nothing reads left in, as before; --no-splat: a MUL's or MAD's
-//   operand that is one lane twice merged, not the ps_muls or ps_madds of that lane, as before))
+//   operand that is one lane twice merged, not the ps_muls or ps_madds of that lane, as before;
+//   --no-early: a fused loop's GX vertex address taken in its epilogue, a "w" form's world position
+//   kept in registers to the end (or stored to the output's scratch and copied), as before;
+//   --no-swap: a fused loop's hoisted loads the most counted that fit, none swapped for one that
+//   saves more, as before; --no-fold: a colour that is 0 made into its bytes as any other, as before))
 
 #include "../wl/xbox/vsh.c"
 
@@ -1471,8 +1477,14 @@ static int fused_program(const WlXboxVshProgram *program, const unsigned *needs,
                          const ReusePrefix *prefix) {
     int first = *reused, made;
 
-    pr_world_spill = 0;
+    /* (with the vertex's address early, stored where captured first: its registers free from there) */
+    pr_world_spill = !pr_early_off && pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD;
     made = fused_program_once(program, needs, reused, prefix);
+    if (!made && pr_world_spill) {
+        *reused = first;
+        pr_world_spill = 0;
+        made = fused_program_once(program, needs, reused, prefix);
+    }
     if (made || !pr_fuse || pr_fuse->perspective != WL_XBOX_VSH_FUSED_WORLD)
         return made;
     pr_world_spill = 1;
@@ -1575,6 +1587,12 @@ int main(int argc, char **argv) {
             pr_sweep_off = 1;
         } else if (strcmp(argv[1], "--no-splat") == 0) {
             pr_splat_off = 1;
+        } else if (strcmp(argv[1], "--no-early") == 0) {
+            pr_early_off = 1;
+        } else if (strcmp(argv[1], "--no-swap") == 0) {
+            pr_swap_off = 1;
+        } else if (strcmp(argv[1], "--no-fold") == 0) {
+            pr_fold_off = 1;
         } else if (strcmp(argv[1], "--colors-positions") == 0) {
             colors_positions = 1;
         } else if (strcmp(argv[1], "--accessor") == 0 && argc > 2) {

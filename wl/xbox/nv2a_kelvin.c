@@ -58,9 +58,27 @@ uint32_t wl_nv2a_attrib_bytes(uint8_t type, uint8_t size) {
     }
 }
 
+// (the draws' cuts of wave 5: batch_draw's draw kept between draws, its attributes written again
+// alone (layout_arrays_kept); the fetch's plan made from the attributes asked for alone, its formats from
+// a table, unnormalized shorts converted by their bits, the current values written a word at a time
+// (wl_nv2a_fetch_plan, wl_nv2a_fetch_constants); an attribute's decode by the fetch's tables and
+// conversions (attrib_decode_cut); false: as wave 4 left them, a file "oldpush4" in the title's folder,
+// WL_XB_OLDPUSH4 on the host and in the replay)
+static bool g_push_cuts4 = true;
+
+void wl_nv2a_set_push_cuts4(bool on) {
+    g_push_cuts4 = on;
+}
+
+static void attrib_decode_cut(uint8_t type, uint8_t size, const uint8_t *data, float out[4]);
+
 void wl_nv2a_attrib_decode(uint8_t type, uint8_t size, const uint8_t *data, float out[4]) {
     unsigned i;
 
+    if (g_push_cuts4) {
+        attrib_decode_cut(type, size, data, out);
+        return;
+    }
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
     switch (type) {
@@ -162,6 +180,7 @@ enum {
     FETCH_CMP,
     FETCH_S1,    // (size 1 to 4)
     FETCH_UB,    // bytes in order, normalized (size 1 to 4)
+    FETCH_S32K,  // shorts as they are (size 1 to 4; wl_nv2a_set_push_cuts4's, else FETCH_GENERIC)
     FETCH_GENERIC // wl_nv2a_attrib_decode's
 };
 
@@ -171,6 +190,26 @@ enum {
 // a subtraction of a magic double.)
 static float g_byte_float[256], g_cmp11_float[2048], g_cmp10_float[1024];
 static bool g_fetch_tables;
+// (each type's and size's FETCH_*, wl_nv2a_set_push_cuts4's: by the type's and size's 4 bits)
+static uint8_t g_fetch_format[16][16];
+
+// an attribute's FETCH_* (s32k: FETCH_S32K for its shorts, else FETCH_GENERIC)
+static uint8_t fetch_format_of(uint8_t type, uint8_t size, bool s32k) {
+    if (type == WL_NV2A_VTX_F && size >= 1 && size <= 4) {
+        return (uint8_t)(FETCH_F1 + size - 1u);
+    } else if (type == WL_NV2A_VTX_UB_D3D && size == 4) {
+        return FETCH_D3DCOLOR;
+    } else if (type == WL_NV2A_VTX_CMP) {
+        return FETCH_CMP;
+    } else if (type == WL_NV2A_VTX_S1 && size >= 1 && size <= 4) {
+        return FETCH_S1;
+    } else if ((type == WL_NV2A_VTX_UB_OGL || type == WL_NV2A_VTX_UB_D3D) && size >= 1 && size <= 4) {
+        return FETCH_UB;
+    } else if (s32k && type == WL_NV2A_VTX_S32K && size >= 1 && size <= 4) {
+        return FETCH_S32K;
+    }
+    return FETCH_GENERIC;
+}
 
 static void fetch_tables_make(void) {
     unsigned i;
@@ -185,6 +224,9 @@ static void fetch_tables_make(void) {
     }
     for (i = 0; i < 1024; i++) {
         g_cmp10_float[i] = normalized(sign_extend(i, 10), 511.0f);
+    }
+    for (i = 0; i < 256; i++) {
+        g_fetch_format[i >> 4][i & 15u] = fetch_format_of((uint8_t)(i >> 4), (uint8_t)(i & 15u), true);
     }
     g_fetch_tables = true;
 }
@@ -250,6 +292,38 @@ void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetch
     if (draw->source == WL_NV2A_SOURCE_IMMEDIATE) {
         return;
     }
+    if (g_push_cuts4) {
+        // (the attributes asked for alone, in order: a draw reads a few of the sixteen)
+        uint32_t want = attributes & ((1u << WL_NV2A_ATTRIBS) - 1u);
+        bool arrays = draw->source == WL_NV2A_SOURCE_ARRAYS;
+        unsigned n = 0;
+
+        plan->constants = want & ~draw->streamed;
+        for (want &= draw->streamed; want != 0; want &= want - 1u) {
+            const WlNv2aAttrib *attrib;
+
+            a = (unsigned)__builtin_ctz(want);
+            attrib = &draw->attribs[a];
+            plan->streamed[n].attribute = (uint8_t)a;
+            plan->streamed[n].type = attrib->type;
+            plan->streamed[n].size = attrib->size;
+            plan->streamed[n].format = g_fetch_format[attrib->type & 15u][attrib->size & 15u];
+            if (arrays) {
+                plan->streamed[n].data = attrib->data;
+                plan->streamed[n].stride = attrib->stride;
+                if (WL_NV2A_PREFETCHES) {
+                    prefetch_area_add(plan, attrib->data, attrib->stride,
+                                      wl_nv2a_attrib_bytes(attrib->type, attrib->size));
+                }
+            } else {
+                plan->streamed[n].data = draw->inline_data + attrib->inline_offset;
+                plan->streamed[n].stride = draw->inline_stride;
+            }
+            n++;
+        }
+        plan->count = (uint8_t)n;
+        return;
+    }
     for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
         const WlNv2aAttrib *attrib = &draw->attribs[a];
 
@@ -273,20 +347,7 @@ void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetch
             plan->streamed[plan->count].data = draw->inline_data + attrib->inline_offset;
             plan->streamed[plan->count].stride = draw->inline_stride;
         }
-        if (attrib->type == WL_NV2A_VTX_F && attrib->size >= 1 && attrib->size <= 4) {
-            plan->streamed[plan->count].format = (uint8_t)(FETCH_F1 + attrib->size - 1u);
-        } else if (attrib->type == WL_NV2A_VTX_UB_D3D && attrib->size == 4) {
-            plan->streamed[plan->count].format = FETCH_D3DCOLOR;
-        } else if (attrib->type == WL_NV2A_VTX_CMP) {
-            plan->streamed[plan->count].format = FETCH_CMP;
-        } else if (attrib->type == WL_NV2A_VTX_S1 && attrib->size >= 1 && attrib->size <= 4) {
-            plan->streamed[plan->count].format = FETCH_S1;
-        } else if ((attrib->type == WL_NV2A_VTX_UB_OGL || attrib->type == WL_NV2A_VTX_UB_D3D) && attrib->size >= 1 &&
-                   attrib->size <= 4) {
-            plan->streamed[plan->count].format = FETCH_UB;
-        } else {
-            plan->streamed[plan->count].format = FETCH_GENERIC;
-        }
+        plan->streamed[plan->count].format = fetch_format_of(attrib->type, attrib->size, false);
         plan->count++;
     }
 }
@@ -295,6 +356,21 @@ void wl_nv2a_fetch_constants(const WlNv2aFetchPlan *plan, const WlNv2aKelvin *k,
                              unsigned count) {
     unsigned a, n;
 
+    if (g_push_cuts4) {
+        uint32_t left;
+
+        // (each value's four words loaded once and stored into every set, as they are)
+        for (left = plan->constants & ((1u << WL_NV2A_ATTRIBS) - 1u); left != 0; left &= left - 1u) {
+            uint32_t w[4];
+
+            a = (unsigned)__builtin_ctz(left);
+            memcpy(w, k->current[a], sizeof w);
+            for (n = 0; n < count; n++) {
+                memcpy(inputs[n][a], w, sizeof w);
+            }
+        }
+        return;
+    }
     for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
         if (plan->constants & (1u << a)) {
             for (n = 0; n < count; n++) {
@@ -325,14 +401,38 @@ static inline __attribute__((always_inline)) void fetch_s1(const uint8_t *base, 
         const uint8_t *data = base + (size_t)elements[n] * stride;
         float *out = in[n][attribute];
 
-        out[1] = out[2] = 0.0f;
-        out[3] = 1.0f;
+        float v[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+
         for (c = 0; c < size; c++) {
             // (normalized's own operations, the integer made a float by its bits)
             float result = small_int_float((int16_t)wl_rd_le16(data + 2 * c)) * (1.0f / 32767.0f);
 
-            out[c] = result < -1.0f ? -1.0f : result;
+            v[c] = result < -1.0f ? -1.0f : result;
         }
+        // (the values read before any is stored: a store to out could be the data's bytes for all the
+        // compiler knows, and each component left out was stored and then stored again)
+        out[0] = v[0], out[1] = v[1], out[2] = v[2], out[3] = v[3];
+    }
+}
+
+// shorts as they are (WL_NV2A_VTX_S32K), `size` (1 to 4) of them a vertex: (float) of a short, exactly
+static inline __attribute__((always_inline)) void fetch_s32k(const uint8_t *base, uint32_t stride,
+                                                               const uint32_t *elements, uint32_t run,
+                                                               float (*in)[WL_NV2A_ATTRIBS][4], unsigned attribute,
+                                                               unsigned size) {
+    uint32_t n;
+    unsigned c;
+
+    for (n = 0; n < run; n++) {
+        const uint8_t *data = base + (size_t)elements[n] * stride;
+        float *out = in[n][attribute];
+
+        float v[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+
+        for (c = 0; c < size; c++) {
+            v[c] = small_int_float((int16_t)wl_rd_le16(data + 2 * c));
+        }
+        out[0] = v[0], out[1] = v[1], out[2] = v[2], out[3] = v[3];
     }
 }
 
@@ -347,11 +447,73 @@ static inline __attribute__((always_inline)) void fetch_ub(const uint8_t *base, 
         const uint8_t *data = base + (size_t)elements[n] * stride;
         float *out = in[n][attribute];
 
-        out[1] = out[2] = 0.0f;
-        out[3] = 1.0f;
+        float v[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+
         for (c = 0; c < size; c++) {
-            out[c] = g_byte_float[data[c]];
+            v[c] = g_byte_float[data[c]];
         }
+        out[0] = v[0], out[1] = v[1], out[2] = v[2], out[3] = v[3];
+    }
+}
+
+// wl_nv2a_attrib_decode's values, to the bit, by the fetch's means: bytes and the packed normal's fields
+// from the tables, shorts made floats by their bits (small_int_float), a size's components unrolled
+static void attrib_decode_cut(uint8_t type, uint8_t size, const uint8_t *data, float out[4]) {
+    unsigned i, n = size < 4u ? size : 4u;
+
+    if (!g_fetch_tables) {
+        fetch_tables_make();
+    }
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+    switch (type) {
+    case WL_NV2A_VTX_UB_D3D:
+        if (size == 4) {
+            out[0] = g_byte_float[data[2]];
+            out[1] = g_byte_float[data[1]];
+            out[2] = g_byte_float[data[0]];
+            out[3] = g_byte_float[data[3]];
+            break;
+        }
+        // fall through
+    case WL_NV2A_VTX_UB_OGL:
+        for (i = 0; i < n; i++) {
+            out[i] = g_byte_float[data[i]];
+        }
+        break;
+    case WL_NV2A_VTX_S1:
+        for (i = 0; i < n; i++) {
+            float result = small_int_float((int16_t)wl_rd_le16(data + 2 * i)) * (1.0f / 32767.0f);
+
+            out[i] = result < -1.0f ? -1.0f : result;
+        }
+        break;
+    case WL_NV2A_VTX_S32K:
+        for (i = 0; i < n; i++) {
+            out[i] = small_int_float((int16_t)wl_rd_le16(data + 2 * i));
+        }
+        break;
+    case WL_NV2A_VTX_F:
+        if (size == 7) {
+            store_word(&out[0], data);
+            store_word(&out[1], data + 4);
+            store_word(&out[3], data + 8);
+            break;
+        }
+        for (i = 0; i < n; i++) {
+            store_word(&out[i], data + 4 * i);
+        }
+        break;
+    case WL_NV2A_VTX_CMP: {
+        uint32_t word = wl_rd_le32(data);
+
+        out[0] = g_cmp11_float[word & 0x7FFu];
+        out[1] = g_cmp11_float[(word >> 11) & 0x7FFu];
+        out[2] = g_cmp10_float[word >> 22];
+        break;
+    }
+    default:
+        break;
     }
 }
 
@@ -367,6 +529,7 @@ unsigned wl_nv2a_fetch_fused_format(const WlNv2aFetchPlan *plan, unsigned i) {
     case FETCH_CMP: return WL_XBOX_VSH_FUSED_CMP;
     case FETCH_S1: return size >= 1u && size <= 4u ? WL_XBOX_VSH_FUSED_S1 + size - 1u : WL_XBOX_VSH_FUSED_FORMATS;
     case FETCH_UB: return size >= 1u && size <= 4u ? WL_XBOX_VSH_FUSED_UB + size - 1u : WL_XBOX_VSH_FUSED_FORMATS;
+    case FETCH_S32K: return WL_XBOX_VSH_FUSED_S32K + size - 1u;
     default:
         return plan->streamed[i].type == WL_NV2A_VTX_S32K && size >= 1u && size <= 4u ? WL_XBOX_VSH_FUSED_S32K + size - 1u
                                                                                       : WL_XBOX_VSH_FUSED_FORMATS;
@@ -485,6 +648,14 @@ void wl_nv2a_fetch_elements(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw,
                 case 2: fetch_ub(base, stride, elements, run, in, attribute, 2); break;
                 case 3: fetch_ub(base, stride, elements, run, in, attribute, 3); break;
                 default: fetch_ub(base, stride, elements, run, in, attribute, 4); break;
+                }
+                break;
+            case FETCH_S32K:
+                switch (size) {
+                case 1: fetch_s32k(base, stride, elements, run, in, attribute, 1); break;
+                case 2: fetch_s32k(base, stride, elements, run, in, attribute, 2); break;
+                case 3: fetch_s32k(base, stride, elements, run, in, attribute, 3); break;
+                default: fetch_s32k(base, stride, elements, run, in, attribute, 4); break;
                 }
                 break;
             default:
@@ -1080,6 +1251,105 @@ static uint32_t layout_arrays(WlNv2a *dev, uint32_t least, uint32_t last, WlNv2a
     return streamed;
 }
 
+// layout_arrays' work into the kept draw's attributes: each array's entry written whole, the entries
+// of the last draw's arrays that are not this one's zeroed (batch_draw_attribs: those that may not be zero);
+// the interleaved arrays of one buffer looked up in guest memory once (not while a capture records each
+// array's bytes)
+static uint32_t layout_arrays_kept(WlNv2a *dev, uint32_t least, uint32_t last) {
+    WlNv2aKelvin *k = &dev->kelvin;
+    WlNv2aAttrib *attribs = dev->batch_draw.attribs;
+    uint32_t streamed = 0, written = 0, stale;
+    unsigned i, j, n;
+
+    if (!k->layout_ok) {
+        layout_make(k);
+    } else if (k->dirty & WL_NV2A_DIRTY_ARRAYS) {
+        const uint32_t *formats = &k->raw[WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT >> 2];
+        uint32_t differ = 0;
+
+        for (i = 0; i < WL_NV2A_ATTRIBS; i++) {
+            differ |= formats[i] ^ k->layout_formats[i];
+        }
+        if (differ != 0) {
+            layout_make(k);
+        } else {
+            for (i = 0, n = k->layout_count; i < n; i++) {
+                k->layout[i].start = array_start(k, k->layout[i].attrib);
+            }
+        }
+    }
+    for (i = 0, n = k->layout_count; i < n; i = j) {
+        uint32_t stride = k->layout[i].stride;
+        uint64_t first = k->layout[i].start, lo = first, top = first + k->layout[i].bytes, from = 0;
+        const uint8_t *host = NULL;
+        unsigned m;
+
+        // (the arrays of one buffer, interleaved: of the same stride, each starting within a stride of the
+        // first, are one span of guest memory, asked for once; whether they are does not hang on the
+        // indices, which move them all alike)
+        for (j = i + 1; j < n && k->layout[j].stride == stride; j++) {
+            uint64_t start = k->layout[j].start, end = start + k->layout[j].bytes;
+
+            if (start + stride <= first || start >= first + stride) {
+                break;
+            }
+            lo = start < lo ? start : lo;
+            top = end > top ? end : top;
+        }
+        // (within guest RAM as it is, not a mirror: the span is found, or each array's own refusal logged)
+        if (j - i > 1 && dev->capture == NULL) {
+            uint64_t end;
+
+            from = lo + (uint64_t)least * stride;
+            end = from + (uint64_t)(last - least) * stride + (top - lo);
+            if (end <= dev->ram_bytes) {
+                host = wl_nv2a_phys(dev, (uint32_t)from, (uint32_t)(end - from));
+            }
+        }
+        for (m = i; m < j; m++) {
+            unsigned a = k->layout[m].attrib;
+            WlNv2aAttrib *at = &attribs[a];
+            uint32_t phys;
+
+            written |= 1u << a;
+            if (host != NULL) {
+                // (its start's distance from the span's, less than a stride)
+                uint32_t offset = (uint32_t)k->layout[m].start - (uint32_t)lo;
+
+                at->data = host + offset;
+                phys = (uint32_t)from + offset;
+            } else {
+                at->data = array_span(dev, a, k->layout[m].start, stride, k->layout[m].bytes, least, last, &phys);
+                if (at->data == NULL) {
+                    memset(at, 0, sizeof *at);
+                    continue;
+                }
+            }
+            at->phys = phys;
+            at->type = k->layout[m].type;
+            at->size = k->layout[m].size;
+            at->stride = stride;
+            at->inline_offset = 0;
+            streamed |= 1u << a;
+        }
+    }
+    for (stale = dev->batch_draw_attribs & ~written; stale != 0; stale &= stale - 1u) {
+        memset(&attribs[__builtin_ctz(stale)], 0, sizeof attribs[0]);
+    }
+    dev->batch_draw_attribs = written;
+    return streamed;
+}
+
+// the kept draw's attributes all zero (an immediate draw's)
+static void draw_attribs_clear(WlNv2a *dev) {
+    uint32_t stale;
+
+    for (stale = dev->batch_draw_attribs; stale != 0; stale &= stale - 1u) {
+        memset(&dev->batch_draw.attribs[__builtin_ctz(stale)], 0, sizeof dev->batch_draw.attribs[0]);
+    }
+    dev->batch_draw_attribs = 0;
+}
+
 static void draw_counted(WlNv2a *dev, WlNv2aDraw *draw) {
     WlNv2aKelvin *k = &dev->kelvin;
     uint32_t pixels = 0;
@@ -1127,6 +1397,66 @@ static inline void bounds_add(WlNv2a *dev, uint32_t at, uint32_t n, uint32_t lea
     dev->batch_bounds_at = at + n;
 }
 
+// the least and greatest of the batch's first `count` indices (those found as they came, then the rest)
+static inline void batch_bounds(const WlNv2a *dev, uint32_t count, uint32_t *least_out, uint32_t *last_out) {
+    uint32_t least = 0xFFFFFFFFu, last = 0, i = 0;
+
+    if (g_index_bounds && dev->batch_bounds_at != 0 && dev->batch_bounds_at <= count) {
+        least = dev->batch_least;
+        last = dev->batch_last;
+        i = dev->batch_bounds_at;
+    }
+    for (; i < count; i++) {
+        uint32_t index = dev->batch_indices[i];
+
+        least = index < least ? index : least;
+        last = index > last ? index : last;
+    }
+    *least_out = least;
+    *last_out = last;
+}
+
+// batch_draw's work in the kept draw (dev->batch_draw): no draw zeroed whole, its header written field by field
+// and its attributes as the source needs (an inline draw's all written by inline_layout)
+static void batch_draw_kept(WlNv2a *dev, uint32_t primitive, uint32_t count, bool continues) {
+    WlNv2aKelvin *k = &dev->kelvin;
+    WlNv2aDraw *draw = &dev->batch_draw;
+
+    draw->primitive = (uint8_t)primitive;
+    draw->source = dev->batch_source;
+    draw->continues = continues;
+    draw->count = count;
+    draw->indices = NULL;
+    draw->index_base = draw->index_last = 0;
+    draw->inline_data = NULL;
+    draw->inline_stride = 0;
+    draw->immediate = NULL;
+    draw->serial = 0;
+    switch (dev->batch_source) {
+    case WL_NV2A_SOURCE_ARRAYS: {
+        uint32_t least, last;
+
+        batch_bounds(dev, count, &least, &last);
+        draw->indices = dev->batch_indices;
+        draw->index_base = least;
+        draw->index_last = last;
+        draw->streamed = layout_arrays_kept(dev, least, last);
+        break;
+    }
+    case WL_NV2A_SOURCE_INLINE:
+        draw->inline_data = dev->batch_inline;
+        draw->inline_stride = inline_layout(k, draw->attribs, &draw->streamed);
+        dev->batch_draw_attribs = draw->streamed;
+        break;
+    default:
+        draw_attribs_clear(dev);
+        draw->immediate = (const float (*)[WL_NV2A_ATTRIBS][4])dev->batch_immediate;
+        draw->streamed = (1u << WL_NV2A_ATTRIBS) - 1u;
+        break;
+    }
+    draw_counted(dev, draw);
+}
+
 // hands over `count` of the batch's vertices (from the start), as one draw
 static void batch_draw(WlNv2a *dev, uint32_t primitive, uint32_t count, bool continues) {
     WlNv2aKelvin *k = &dev->kelvin;
@@ -1135,6 +1465,10 @@ static void batch_draw(WlNv2a *dev, uint32_t primitive, uint32_t count, bool con
 
     wl_nv2a_prim_info(primitive, &info);
     if (count < info.first) {
+        return;
+    }
+    if (g_push_cuts4) {
+        batch_draw_kept(dev, primitive, count, continues);
         return;
     }
     memset(&draw, 0, sizeof draw);
