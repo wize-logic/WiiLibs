@@ -280,7 +280,8 @@ the audio processor's frames, the play harness's presses) is then virtual:
 
 - it moves on by a fixed cost at each safe point of the lock's holder: 40 ns a backward jump (the
   back-edge hook: `g_xb_attention` stays set, so every backward jump is one), 400 ns a kernel call
-  or `rdtsc`, 400 ns a device access (`WL_XB_DET_NS=<jump>,<call>,<device>` on the host);
+  or `rdtsc`, 400 ns a device access (`WL_XB_DET_NS=<jump>,<call>,<device>` on the host), kept as
+  microseconds and the nanoseconds below one (`det_clock.h`: no 64-bit division at a safe point);
 - when every guest thread waits, it jumps to what is due next (a vertical blank, a timer, a wait's
   timeout, a device's tick);
 - the service thread does no work of its own: the vertical blank, ticks and timers come due at the
@@ -613,6 +614,7 @@ and the host's GX follow) and the rest of `boot.c` (memory, threads, the GPU's o
 | `noringfit` | `WL_XB_NORINGFIT` | wave 4 | the made vertices' ring slots sized to the draw's words (`made_stride`): 88 bytes, whatever the draw |
 | `fenceflush` | `WL_XB_FENCEFLUSH` | 2026-10-19 (gx-ring2) | the ring's fence asks for the transform unit's flush itself (`made_fence`), spent before its token, which asks for its own (`send_token`) |
 | `oldslots` | `WL_XB_OLDSLOTS` | 2026-10-19 (gx-ring2) | every made vertex's words noted at each batch and its tables written through the backend (`made_slots`), as before |
+| `oldslots2` | `WL_XB_OLDSLOTS2` | 2026-10-20 (draw-path3) | a new slot's vertex noted twice at each batch, in `words_made` and `run_vertices` (`made_slots`), as before; else the general way (`vertices_general`, the batches no fused form runs) fills `run_vertices` itself |
 | `noparkretake` | `WL_XB_NOPARKRETAKE` | wave 4 | a target that took the EFB with a clear and then reads the picture given the EFB again (`target_retake`), so the picture parks whole: not (parked in part, the first blur of each size without it for a frame) |
 | `notgkeep` | `WL_XB_NOTGKEEP` | wave 4 | `texgen_xf_plan`'s probe outputs kept by the values of the constants their instructions read (a skinned program's coordinates read no bone): kept by the constants' generation alone, the probes run again at each change of the constants (a skinned draw's every draw) |
 | `noxtexgen` | `WL_XB_NOXTEXGEN` | wave 4 | an "x" form's coordinates made by GX's texgen from an input ("M" stages, `xf_position_layout`): the processor's |
@@ -623,6 +625,7 @@ and the host's GX follow) and the rest of `boot.c` (memory, threads, the GPU's o
 | `oldpush4` | `WL_XB_OLDPUSH4` (the replay too) | wave 5 | a draw's record kept between draws (its header and its arrays' entries written again, the rest left zero) and the fetch's plan made from the attributes asked for alone (formats from a table, unnormalized shorts converted by their bits, the current values written a word at a time): the record zeroed whole at each draw, the plan by a pass over the sixteen attributes (what is fetched and drawn is the same) |
 | `olddevpoint` | `WL_XB_OLDDEVPOINT` | wave 4 | a device access's safe point cut short (`wl_xb_device_safe_point`): nothing after a read with the attention down and no line up, only the device's line looked at in a quiet window: the whole safe point every time |
 | `oldservice` | `WL_XB_OLDSERVICE` | wave 4 | the service thread queued for the lock sent back to its sleep unqueued when the holder's poll has just run its work (`yield_if_due`): given the lock anyway, finding nothing to do |
+| `oldfetch` | `WL_XB_OLDFETCH` (the replay too) | wave 6 | a draw's vertices fetched a vertex at a time with its attributes together when their formats are one of the fetch's sets of one stride (`fetch_rows`: the skinned positions the projection's probes fetch, the skinned and static vertices; the element's offset found once, the index read straight into it), and the vertex arrays' formats compared only when one of them was written (`WL_NV2A_DIRTY_ARRAY_FORMATS`; an offset alone moves the starts), the layout's dirty groups kept over a draw without arrays: an attribute at a time for all the vertices, the formats compared at every move of an array (what is fetched and drawn is the same) |
 <!-- a new switch: its row here (tests/tools/check_switch_docs.py fails until it has one) -->
 
 **Build-time switches** (the title's config for `tools/xbox_recomp.py`, Halo's `halo.json`; the tool's
@@ -638,6 +641,9 @@ Wave 4's patch 0035 (the registers in locals where the x87 stack does not fit) g
 | `stack_locals` | wave 4 (patch 0038) | a function's own stack slots whose address never escapes are kept in C locals, written to guest memory before a call and at a return for the caller's slots; a function that indexes a local array, stores a frame address outside the frame or loses track of esp is left as it was |
 | `stack_deltas` | wave 5 (patch 0039) | with `stack_locals`: a callee that moves esp only by constants gives its caller its esp after the call (0038's test took `esp = esp - K` for a set from elsewhere, and the caller lost esp), and the carry `sub esp, K` computes is not taken for a frame address (`ret_deltas`) |
 | `stack_reach` | wave 5 (patch 0039) | with `stack_locals`: a call that hands its callee no frame address writes back and reloads only the slots the callee can reach (below the end of its arguments, `arg_windows`); the others stay in their locals across it (with `false`, every slot goes to memory before each call and back after it) |
+| `stack_icall` | wave 6 (patch 0041) | with `stack_locals`: after an indirect call the caller does not clean up after, esp is taken back where the call's arguments started (the callee cleans them, as the call's failure path assumes), and the function is kept only when every return then finds esp at its return address and nothing sets esp from elsewhere first, else it is walked again without (with `false`, esp is lost there and the function keeps its slots in memory) |
+| `stack_align` | wave 6 (patch 0041) | with `stack_locals`: `and esp, -2^k` (an aligned frame) starts a second base, the slots below the aligned esp kept in locals and loaded after the `and`, no access allowed between the two bases (with `false`, esp is lost there) |
+| `stack_alloca` | wave 6 (patch 0041) | with `stack_locals`: a call to the alloca probe (`alloca_probes`: its 16-byte body) with a constant eax moves esp by -eax (with `false`, esp is lost there) |
 
 **Runs chosen by the command line, and the network** (`runopts.h`, `wl/platform/net_stream.h`). A Homebrew
 Channel loader passes arguments after the DOL, so each run can be chosen from the PC with no change to the SD
@@ -679,6 +685,7 @@ small files). With `netrun.txt` and no PC command line, a Dolphin run sends its 
 | `WL_XB_DETERMINISTIC` | anything but empty or `0`: the deterministic mode |
 | `WL_XB_HDD_LOCKED` | `1`: the harness holds the hard disk folder's lock for the run (`wl_xb_hdd_lock` is not taken) |
 | `WL_XB_DET_NS` | `<backward jump>,<kernel call>,<device access>` nanoseconds of virtual time (default 40,400,400) |
+| `WL_XB_GXSTUB` | `count` (the host's GX stub, wl/platform's `host/gx_direct_host.h`): the vertices counted, checked for size and stored as the Wii's layer stores them into the FIFO, not decoded, so a ppc-be count of a title (`tools/qemu_icount.py`, a TCG plugin) is the Wii's work; no software GX picture or capture PNG then |
 | `WL_XB_FRAME_MB`, `WL_XB_FRAME_KB` | a frame limit for guest memory, paged as the Wii pages (KB wins) |
 | `WL_XB_TEXTURE_MB` | the textures' arena (the Wii's is `texture_bytes`) |
 | `WL_XB_HEAP_MB`, `WL_XB_HEAP_KB` | caps the host's heap from the guest memory's creation on, as the Wii's is (`14` imitates it; the software GX and recorders are not counted) |

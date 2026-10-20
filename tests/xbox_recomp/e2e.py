@@ -191,6 +191,8 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False
     ft.stack_locals = keep  # and a function's own stack slots in C locals (stack_locals.py)
     ft.stack_deltas = keep  # with each callee's esp effect when it moves esp by constants (ret_deltas)
     ft.stack_reach = keep  # and only the slots a callee can reach synced around its call (arg_windows)
+    # and esp followed past indirect calls, aligned frames and the alloca probe (stack_locals.Frames)
+    ft.stack_icall = ft.stack_align = ft.stack_alloca = keep
     # and its loops: no safe point where a loop's own counter ends it (loop_bound.py)
     ft.bounded_loops = reg_locals
     # and its float constants from read-only data as literals (const_load.py)
@@ -214,9 +216,11 @@ def lift(name, work: Path, funcs, pipe: Path, x87_locals=False, reg_locals=False
         ft.kept = preserve.preserved_by_name(ft.summaries)
         if ft.stack_locals:  # each callee's esp effect and reach (ret_deltas, arg_windows)
             ft.ret_deltas = stack_locals.ret_deltas(pending, exact=ft.stack_deltas)
+            ft.stack_frames = stack_locals.Frames(ft.stack_icall, ft.stack_align,
+                                                  stack_locals.alloca_probes(pending) if ft.stack_alloca else ())
             if ft.stack_reach:
                 ft.arg_windows = stack_locals.arg_windows(pending, ft.summaries, ft.kept, ft.ret_deltas,
-                                                          carry=ft.stack_deltas)
+                                                          carry=ft.stack_deltas, frames=ft.stack_frames)
         chunks = [ft.finish_function(c.lines, c.has_fpu) if isinstance(c, Pending) else c for c in chunks]
         ft.x87_stats["kept across calls"] = sum(c.count("kept across the call") for c in chunks)
     unimpl = {k: len(v) for k, v in ft.lifter.unimplemented.items()}

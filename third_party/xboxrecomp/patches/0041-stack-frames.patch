@@ -1,0 +1,730 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <bcolb7@protonmail.com>
+Date: Tue, 20 Oct 2026 00:35:11 -0400
+Subject: [PATCH] recomp: --stack-icall, --stack-align and --stack-alloca for
+ --stack-locals
+
+stack_locals loses esp, and keeps every slot of the function in memory, at
+three forms MSVC's code has often:
+
+* an indirect call the caller does not clean up after (RECOMP_ICALL_SAFE,
+  not _CC): with --stack-icall esp is taken back where the call's arguments
+  started (_icall_esp, the callee cleaning them, as the call's failure path
+  already assumes). The hypothesis is checked: every return must find esp at
+  its return address (`esp += K; return` with esp K above the entry), and
+  nothing may set esp from elsewhere (`mov esp, ebp`) before; else the
+  function is walked again without it. Such a callee reaches its return
+  address and the arguments it cleans (as arg_windows' callees), so the
+  slots above them stay in their locals across the call;
+* `and esp, -2^k` (an aligned frame): with --stack-align the slots below
+  the aligned esp are named from a second base, ALIGN_GAP below the entry's;
+  no access may land between the two (an ebp - K access), only the second
+  base's slots are kept, loaded after the `and`;
+* a call to the alloca probe (_alloca_probe, found by its 16-byte body,
+  alloca_probes): with --stack-alloca a constant eax given to it moves esp by
+  -eax.
+
+In Halo 446 functions lost esp at an indirect call, 120 at `and esp, -8`
+and 38 at the probe. Each option is off by default; test_stack_frames.py
+lifts each form, checks the reasons and text, and compiles and runs the
+cases both ways.
+---
+ tools/recomp/__main__.py          |  13 ++
+ tools/recomp/stack_locals.py      | 200 ++++++++++++++++++++++++++---
+ tools/recomp/test_stack_frames.py | 204 ++++++++++++++++++++++++++++++
+ tools/recomp/translator.py        |  16 ++-
+ 4 files changed, 410 insertions(+), 23 deletions(-)
+ create mode 100644 tools/recomp/test_stack_frames.py
+
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 7b100db..92b6903 100644
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -329,6 +329,16 @@ def main():
+                         help="With --stack-locals: a call that gives its callee no frame address "
+                              "writes back and reloads only the slots the callee can reach: those "
+                              "below its arguments' end (stack_locals.arg_windows)")
++    parser.add_argument("--stack-icall", action="store_true",
++                        help="With --stack-locals: an indirect call the caller does not clean up "
++                             "after leaves esp where its arguments started (the callee cleans "
++                             "them), checked against every return of the function (stack_locals.Frames)")
++    parser.add_argument("--stack-align", action="store_true",
++                        help="With --stack-locals: `and esp, -2^k` (an aligned frame) starts a "
++                             "second base for the slots below it (stack_locals.Frames)")
++    parser.add_argument("--stack-alloca", action="store_true",
++                        help="With --stack-locals: a call to the alloca probe with a constant eax "
++                             "moves esp by -eax (stack_locals.alloca_probes)")
+     parser.add_argument("--seh-prolog", metavar="ADDR",
+                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
+     parser.add_argument("--seh-epilog", metavar="ADDR",
+@@ -417,6 +427,9 @@ def main():
+     translator.translator.stack_locals = args.stack_locals
+     translator.translator.stack_deltas = args.stack_deltas
+     translator.translator.stack_reach = args.stack_reach
++    translator.translator.stack_icall = args.stack_icall
++    translator.translator.stack_align = args.stack_align
++    translator.translator.stack_alloca = args.stack_alloca
+     translator.translator.mem_disp = args.mem_disp
+     translator.translator.stack_disp = args.stack_disp
+ 
+diff --git a/tools/recomp/stack_locals.py b/tools/recomp/stack_locals.py
+index 56036f9..08be579 100644
+--- a/tools/recomp/stack_locals.py
++++ b/tools/recomp/stack_locals.py
+@@ -39,7 +39,9 @@ observed:
+ 
+ A function keeps all its slots in memory when the pass cannot tell where an
+ access lands: an access at esp + K where esp is not known (after a call by
+-address or an indirect call that cleans the stack itself, `and esp, -8`), an
++address or an indirect call that cleans the stack itself, `and esp, -8`,
++unless Frames follows them: an indirect callee cleaning its arguments checked
++at every return, a second base below an aligned esp, the alloca probe), an
+ access through a frame pointer whose offset is not known (a local array
+ indexed by a register, a pointer that is a frame address on one path only), a
+ frame address stored outside the frame or passed to anything but a guest
+@@ -72,7 +74,7 @@ from .x87_locals import (_NotLocal, _items, _match_paren, _nodes, _function_boun
+                          _calls, _reg_written, _TRANSPARENT, _KEYWORDS, _FP_MACROS)
+ from .preserve import NEVER, _address_taken
+ 
+-__all__ = ["localise_stack", "ret_deltas", "arg_windows", "STACK_LOCALS_PREFIX"]
++__all__ = ["localise_stack", "ret_deltas", "arg_windows", "alloca_probes", "Frames", "STACK_LOCALS_PREFIX"]
+ 
+ STACK_LOCALS_PREFIX = "_sl_"
+ 
+@@ -137,6 +139,68 @@ class _Decline(_NotLocal):
+     pass
+ 
+ 
++class Frames:
++    """The frames the walk follows beyond its own (each off by default):
++    icall (--stack-icall): an indirect call that the caller does not clean
++    up after (RECOMP_ICALL_SAFE, not _CC) leaves esp where its arguments
++    started (_icall_esp), as its callee cleaning them would; the function
++    is taken only if every return then finds esp at its return address
++    (`esp += K; return` with esp K above the entry) and nothing sets esp
++    from elsewhere before, else it is walked again without; align
++    (--stack-align): `and esp, -2^k` starts a second base (the slots below
++    the aligned esp), ALIGN_GAP below the entry's names, and no access may
++    land between the two; probes (--stack-alloca): the alloca probes
++    (alloca_probes) a call to which with a constant eax moves esp by -eax."""
++
++    def __init__(self, icall=False, align=False, probes=()):
++        self.icall, self.align, self.probes = icall, align, frozenset(probes)
++
++    def without_icall(self):
++        return Frames(False, self.align, self.probes)
++
++
++_Frames = Frames
++# How far below the entry's slot names the slots of an aligned frame are named.
++ALIGN_GAP = 0x1000000
++
++# The alloca probe as MSVC's CRT has it for the Xbox (_alloca_probe, 16
++# bytes): test eax, eax; je ret; neg eax; add eax, esp; add eax, 4; xchg
++# eax, esp; mov eax, [eax]; push eax; ret -- esp drops by eax over the call.
++_PROBE = [r"if \(CMP_EQ\(_fa, _fb\)\) goto (\w+)", r"eax = \(uint32_t\)\((?:-\(int32_t\)eax|0u - \(uint32_t\)\(eax\))\)",
++          r"eax = eax \+ esp", r"eax = eax \+ 4", r"\{ uint32_t _tmp = esp", r"esp = eax",
++          r"eax = _tmp; \}", r"eax = MEM32\(eax\)", r"PUSH32\(esp, eax\)", r"esp \+= 4; return"]
++_SKIP = ("_fa ", "_fb ", "_fas ", "_fbs ", "_cf ", "int _flags", "uint32_t _fa", "int32_t _fas", "(void)_fa", "*",
++         "/*", "void ")
++
++
++def alloca_probes(functions):
++    """The names of the functions whose body is the alloca probe above
++    (`test eax, eax` first: only its flag temporaries), the je to its ret."""
++    out = set()
++    for name, lines in functions.items():
++        body, label, ret_label = [], None, None
++        for line in lines:
++            t = re.sub(r"/\*.*?\*/", "", line).strip()
++            if t in ("{", "}") or not t or t.startswith(_SKIP):
++                continue
++            m = re.fullmatch(r"(\w+):\s*;", t)
++            if m:
++                label = m.group(1)
++                continue
++            t = t.rstrip(";").strip()
++            if t == "esp += 4; return":
++                ret_label = label
++            body.append(t)
++            if len(body) > len(_PROBE):
++                break
++        if len(body) != len(_PROBE):
++            continue
++        ms = [re.fullmatch(r, b) for r, b in zip(_PROBE, body)]
++        if all(ms) and ms[0].group(1) == ret_label:
++            out.add(name)
++    return out
++
++
+ _RET = re.compile(r"\besp \+= (\d+); return; /\* ret\b")
+ _ESP_SET = re.compile(r"\b" + "(?:g_)?" + r"esp\s*=(?!=)\s*(?!(?:g_)?esp\b|ebp\b)|POP32\(\s*esp\s*,\s*esp\s*\)")
+ # The same, right: the lookahead takes the spaces itself (`\s*` before it
+@@ -242,21 +306,26 @@ def _top_terms(e):
+ 
+ 
+ class _State:
+-    __slots__ = ("off", "regs", "slots")
++    __slots__ = ("off", "regs", "slots", "icall", "hyp", "eaxk")
+ 
+-    def __init__(self, off, regs, slots):
++    def __init__(self, off, regs, slots, icall=None, hyp=False, eaxk=None):
+         self.off = off      # esp - entry esp, or None
+         self.regs = regs    # register -> value (None left out)
+         self.slots = slots  # slot offset -> value it holds (None left out)
++        self.icall = icall  # off where the next indirect call's arguments start (_icall_esp), or None
++        self.hyp = hyp      # off rests on an indirect callee cleaning its arguments (not yet checked)
++        self.eaxk = eaxk    # the constant eax holds, or None (an alloca probe's size)
+ 
+     def key(self):
+         return (self.off, tuple(sorted(self.regs.items(), key=str)),
+-                tuple(sorted(self.slots.items(), key=str)))
++                tuple(sorted(self.slots.items(), key=str)), self.icall, self.hyp, self.eaxk)
+ 
+     def copy(self):
+-        return _State(self.off, dict(self.regs), dict(self.slots))
++        return _State(self.off, dict(self.regs), dict(self.slots), self.icall, self.hyp, self.eaxk)
+ 
+     def set_reg(self, r, v):
++        if r == "eax":
++            self.eaxk = None
+         if v is None:
+             self.regs.pop(r, None)
+         else:
+@@ -285,7 +354,8 @@ def _join(a, b):
+         v = _vjoin(a.slots.get(o), b.slots.get(o)) if off is not None else _T
+         if v is not None:
+             slots[o] = v
+-    return _State(off, regs, slots)
++    return _State(off, regs, slots, a.icall if a.icall == b.icall else None, a.hyp or b.hyp,
++                  a.eaxk if a.eaxk == b.eaxk else None)
+ 
+ 
+ class _Access:
+@@ -316,6 +386,12 @@ class _Walk:
+         self.node = None
+         self.node_sync = False
+         self.sync_seen = False
++        self.frames = _Frames()
++        self.hyp_used = False     # an indirect call's esp was taken on the hypothesis
++        self.hyp_failed = False   # and a return or an esp set did not bear it out
++        self.last_add = None      # K of the statement before, when it was `esp += K`
++        self.bands = []           # (lo, hi): offsets no access may touch (an aligned frame's gap)
++        self.aligned = {}         # node -> off after its `and esp, -2^k`
+ 
+     # ------------------------------------------------------------ values
+     def esp_value(self, st):
+@@ -452,6 +528,7 @@ class _Walk:
+         t = t.strip()
+         if not t or t == "(void)0":
+             return st
++        prev_add, self.last_add = self.last_add, None
+         if re.match(r"if\s*\(", t):
+             i = t.index("(")
+             j = _match_paren(t, i)
+@@ -463,6 +540,8 @@ class _Walk:
+             return None
+         if t == "return":
+             self.sync_seen = True
++            if st.hyp and (prev_add is None or st.off != prev_add):
++                self.hyp_failed = True  # not a `ret` with esp back at the return address
+             return None
+         return self.expr(t, st, cond)
+ 
+@@ -512,8 +591,24 @@ class _Walk:
+             if cond:
+                 raise _Decline("esp moved in a conditional")
+             op, rhs = m.group(1), m.group(2)
++            am = re.fullmatch(_G + r"esp\s*&\s*(" + _NUM + r")", rhs.strip()) if op == "=" else None
++            if am and self.frames.align and st.off is not None:
++                mask = _num(am.group(1)) & 0xFFFFFFFF
++                align = (-mask) & 0xFFFFFFFF
++                if 8 <= align <= 4096 and align & (align - 1) == 0:
++                    # esp = A, A within align - 4 below esp: the slots below A
++                    # are named from A, ALIGN_GAP below the entry's (--stack-align)
++                    if (st.off - ALIGN_GAP, st.off) not in self.bands:
++                        self.bands.append((st.off - ALIGN_GAP, st.off))
++                    st.off -= ALIGN_GAP
++                    self.aligned[self.node] = st.off
++                    return st
++            if st.hyp and op == "=" and not re.match(_G + r"esp\b", rhs.strip()):
++                self.hyp_failed = True  # esp from elsewhere: the hypothesis can no longer be checked
+             v = self.value(rhs if op == "=" else "esp %s (%s)" % (op[0], rhs), st)
+             st.off = v[1] if isinstance(v, tuple) else None
++            if op == "+=" and st.off is not None and re.fullmatch(_NUM, rhs.strip()):
++                self.last_add = _num(rhs.strip())
+             return st
+         m = re.fullmatch(r"(?:(?:uint32_t|int32_t)\s+)?" + _G + r"(eax|ecx|edx|ebx|esi|edi|ebp)\s*"
+                          r"(=|\+=|-=|\|=|&=|\^=|<<=|>>=|\*=)(?!=)\s*(.*)", t, re.S)
+@@ -529,6 +624,8 @@ class _Walk:
+             else:
+                 v = _T if _framey(st.regs.get(r)) or _framey(self.anything(rhs, st)) else None
+             st.set_reg(r, _vjoin(v, st.regs.get(r)) if cond else v)
++            if r == "eax" and op == "=" and not cond and re.fullmatch(_NUM, rhs.strip()):
++                st.eaxk = _num(rhs.strip()) & 0xFFFFFFFF
+             return st
+         m = re.fullmatch(_G + r"(eax|ecx|edx|ebx|esi|edi|ebp)\s*(\+\+|--)|(\+\+|--)\s*" + _G +
+                          r"(eax|ecx|edx|ebx|esi|edi|ebp)", t)
+@@ -546,6 +643,7 @@ class _Walk:
+         if m and m.group(1) == "_cf" and self.carry:
+             return st  # the carry: 0 or 1 (`_cf = esp < 0x4E0` for `sub esp, 0x4E0`; --stack-deltas)
+         if m and m.group(1) == "_icall_esp" and m.group(2).strip() == "g_esp":
++            st.icall = st.off if self.frames.icall else None
+             return st  # what an indirect call's failure path puts back
+         if m and m.group(1) not in ("g_ebp", "g_seh_ebp") and _framey(self.value(m.group(2), st)):
+             raise _Decline("a frame address in a temporary")
+@@ -616,6 +714,10 @@ class _Walk:
+             callee = m.group(1) if m and (m.group(1) in self.summaries or m.group(1) in self.deltas
+                                           or m.group(1) in self.windows) else None
+         window = self.windows.get(callee) if callee else None
++        icall_hyp = (callee is None and self.frames.icall and st.icall is not None and st.off is not None
++                     and re.match(r"RECOMP_ICALL_SAFE(?:_AT)?\s*\(", t))
++        if icall_hyp:
++            window = st.icall - st.off  # a callee cleaning its arguments reaches its return address and them
+         reach = max(64, window or 0)
+         given = [v for v in st.regs.values() if _framey(v)]
+         if st.off is not None:
+@@ -623,6 +725,9 @@ class _Walk:
+         escaped = bool(given)
+         if any(v == _T or v[1] >= 0 for v in given):
+             self.args_escape = True
++        if window is not None and st.off is not None and any(
++                st.off < hi and lo < st.off + window for lo, hi in self.bands):
++            window = None  # the callee's arguments run into an aligned frame's gap
+         if self.record:
+             self.call_tops.setdefault(self.node, []).append(
+                 None if escaped or st.off is None or window is None else st.off + window)
+@@ -635,12 +740,20 @@ class _Walk:
+             else:
+                 self.check_escape(t, st)
+         s = self.summaries.get(callee) if callee else None
+-        if s is not None and (s.delta == NEVER or isinstance(s.delta, int)):
++        after = None
++        if callee is not None and callee in self.frames.probes and st.eaxk is not None \
++                and st.eaxk < 0x1000000 and st.off is not None:
++            delta = 4 - st.eaxk  # an alloca probe: esp -= eax over the call (--stack-alloca)
++        elif s is not None and (s.delta == NEVER or isinstance(s.delta, int)):
+             delta = s.delta
+         elif callee in self.deltas:
+             delta = self.deltas[callee]
+         elif re.match(r"RECOMP_ICALL_SAFE(?:_AT)?_CC\s*\(", t):
+             delta = 4
++        elif icall_hyp:
++            # the callee cleans its arguments: esp back where they started, as
++            # the call's failure path puts it; every return checks it (--stack-icall)
++            delta, after = 0, st.icall
+         else:
+             delta = None
+         if delta == NEVER:
+@@ -655,6 +768,10 @@ class _Walk:
+             if "g_" + r not in kept:
+                 st.set_reg(r, _T if escaped else None)
+         st.off = None if (st.off is None or delta is None) else st.off + delta
++        if after is not None:
++            st.off, st.hyp = after, True
++            self.hyp_used = True
++        st.icall = None
+         return st
+ 
+     # ------------------------------------------------------------ sequences
+@@ -744,7 +861,8 @@ def _at(d):
+     return "esp + 0x%X" % d if d >= 0 else "esp - 0x%X" % -d
+ 
+ 
+-def localise_stack(lines, summaries=None, kept=None, deltas=None, min_accesses=2, windows=None, carry=False):
++def localise_stack(lines, summaries=None, kept=None, deltas=None, min_accesses=2, windows=None, carry=False,
++                   frames=None):
+     """lines: one function as translate_function emits it (before x87_locals).
+     summaries: preserve.py's {name: Summary} (each callee's effect on esp);
+     kept: {name: the register globals a call to it gives back}; deltas:
+@@ -754,10 +872,10 @@ def localise_stack(lines, summaries=None, kept=None, deltas=None, min_accesses=2
+     every slot goes to memory and back at every call); carry: the carry flag
+     computed from esp is not a frame address (--stack-deltas). Returns (lines, None,
+     slots kept in locals, accesses rewritten), or (lines unchanged, the
+-    reason, 0, 0)."""
++    reason, 0, 0). frames: the Frames the walk follows beyond its own."""
+     try:
+         out, n_slots, n_acc = _localise(lines, summaries or {}, kept or {}, deltas or {}, min_accesses,
+-                                        windows, carry)
++                                        windows, carry, frames or Frames())
+         return out, None, n_slots, n_acc
+     except _NotLocal as e:
+         return lines, str(e), 0, 0
+@@ -768,7 +886,7 @@ def localise_stack(lines, summaries=None, kept=None, deltas=None, min_accesses=2
+ _TAIL = re.compile(r"\bRECOMP_ITAIL\b|return; /\* (?:manual )?tail jmp|return; /\* fallthrough")
+ 
+ 
+-def arg_windows(functions, summaries=None, kept=None, deltas=None, carry=False):
++def arg_windows(functions, summaries=None, kept=None, deltas=None, carry=False, frames=None):
+     """{name: how many bytes above its entry esp the function may read or
+     write} -- its return address and the stack arguments its own accesses
+     name -- for each function the walk follows to the end, that is given no
+@@ -781,7 +899,7 @@ def arg_windows(functions, summaries=None, kept=None, deltas=None, carry=False):
+         if any(_TAIL.search(line) for line in lines):
+             continue
+         try:
+-            walk = _analyse(lines, summaries or {}, kept or {}, deltas or {}, None, carry)[0]
++            walk = _analyse(lines, summaries or {}, kept or {}, deltas or {}, None, carry, frames or Frames())[0]
+         except _NotLocal:
+             continue
+         if walk.args_aliased or walk.args_escape:
+@@ -790,8 +908,23 @@ def arg_windows(functions, summaries=None, kept=None, deltas=None, carry=False):
+     return out
+ 
+ 
+-def _analyse(lines, summaries, kept, deltas, windows, carry):
+-    """The walk over the body to its fixpoint, then once more recording."""
++def _analyse(lines, summaries, kept, deltas, windows, carry, frames):
++    """The walk over the body to its fixpoint, then once more recording; again
++    without the indirect calls' hypothesis when it was taken and not borne out."""
++    try:
++        res = _analyse_once(lines, summaries, kept, deltas, windows, carry, frames)
++    except _HypDecline:
++        return _analyse_once(lines, summaries, kept, deltas, windows, carry, frames.without_icall())
++    if res[0].hyp_failed:
++        return _analyse_once(lines, summaries, kept, deltas, windows, carry, frames.without_icall())
++    return res
++
++
++class _HypDecline(_NotLocal):
++    pass
++
++
++def _analyse_once(lines, summaries, kept, deltas, windows, carry, frames):
+     bounds = _function_bounds(lines)
+     if bounds is None:
+         raise _Decline("no body")
+@@ -821,6 +954,7 @@ def _analyse(lines, summaries, kept, deltas, windows, carry):
+ 
+     walk = _Walk(summaries, kept, deltas, windows)
+     walk.carry = carry
++    walk.frames = frames
+ 
+     def visit(x, st, edges):
+         n = nodes[x]
+@@ -837,6 +971,21 @@ def _analyse(lines, summaries, kept, deltas, windows, carry):
+     # the states where each node starts: a fixpoint over the gotos
+     state_in = [None] * len(nodes)
+     state_in[0] = _State(0, {}, {})
++    try:
++        state_out = _fixpoint(walk, nodes, labels, visit, state_in)
++    except _NotLocal as e:
++        if walk.hyp_used:
++            raise _HypDecline(str(e))
++        raise
++    if len(walk.bands) > 1 or len(walk.aligned) > 1:
++        raise _Decline("two aligned frames")
++    for a in walk.accesses:
++        if any(a.o < hi and lo < a.o + a.size for lo, hi in walk.bands):
++            raise _Decline("an access between an aligned frame and its entry's")
++    return walk, nodes, labels, first_label, syncs, state_in, state_out
++
++
++def _fixpoint(walk, nodes, labels, visit, state_in):
+     work, steps = [0], 0
+     while work:
+         steps += 1
+@@ -859,13 +1008,12 @@ def _analyse(lines, summaries, kept, deltas, windows, carry):
+ 
+     # once more in order, recording, with those states
+     walk.record = True
+-    state_out = [visit(x, state_in[x], []) for x in range(len(nodes))]
+-    return walk, nodes, labels, first_label, syncs, state_in, state_out
++    return [visit(x, state_in[x], []) for x in range(len(nodes))]
+ 
+ 
+-def _localise(lines, summaries, kept, deltas, min_accesses, windows, carry):
++def _localise(lines, summaries, kept, deltas, min_accesses, windows, carry, frames):
+     walk, nodes, labels, first_label, syncs, state_in, state_out = _analyse(lines, summaries, kept, deltas,
+-                                                                            windows, carry)
++                                                                            windows, carry, frames)
+ 
+     # the slots kept in locals
+     by_slot = {}
+@@ -883,6 +1031,8 @@ def _localise(lines, summaries, kept, deltas, min_accesses, windows, carry):
+             continue
+         if any((a.o, a.size) != (o, size) for a in walk.accesses if a.o < o + size and o < a.o + a.size):
+             continue
++        if walk.bands and o + size > walk.bands[0][0]:
++            continue  # named from the entry: after the and, no esp + K reaches it
+         ctype, pun = _local_type({a.kind for a in accs}, size)
+         if ctype is not None:
+             chosen[o] = (size, ctype, pun)
+@@ -943,7 +1093,17 @@ def _localise(lines, summaries, kept, deltas, min_accesses, windows, carry):
+     entry = nodes[first_label].first
+     before.setdefault(entry, []).append("    %s /* the frame's slots in locals (stack_locals) */" % " ".join(
+         "%s %s;" % (chosen[o][1], _name(o)) for o in slots))
+-    before[entry].append("    %s /* from memory at the entry */" % " ".join(load(o, 0) for o in slots))
++    lo = walk.bands[0][0] if walk.bands else None
++    at_entry = [o for o in slots if lo is None or o >= lo]
++    if at_entry:
++        before[entry].append("    %s /* from memory at the entry */" % " ".join(load(o, 0) for o in at_entry))
++    for x, off in walk.aligned.items():
++        li = next((i for i in range(nodes[x].first, nodes[x].last + 1)
++                   if re.search(r"\b" + _G + r"esp\s*=\s*" + _G + r"esp\s*&", _protect(lines[i])[0])), None)
++        if li is None:
++            raise _Decline("an aligned frame of another form")
++        after.setdefault(li, []).append("    %s /* from memory at the aligned esp */" % " ".join(
++            load(o, off) for o in slots if o < lo))
+     for x, n in enumerate(nodes):
+         if not syncs[x] or state_in[x] is None:
+             continue
+diff --git a/tools/recomp/test_stack_frames.py b/tools/recomp/test_stack_frames.py
+new file mode 100644
+index 0000000..198a2ae
+--- /dev/null
++++ b/tools/recomp/test_stack_frames.py
+@@ -0,0 +1,204 @@
++"""
++--stack-icall, --stack-align and --stack-alloca for --stack-locals
++(stack_locals.Frames, stack_locals.alloca_probes).
++
++Without them the walk loses esp after an indirect call that the caller does
++not clean up after, after `and esp, -2^k` and after a call to the alloca
++probe, and the function keeps every slot in memory. These checks lift small
++x86 functions (test_preserve's harness), look at the reasons and the text,
++and compile and run each case both ways (test_stack_locals' harness, with
++the indirect calls dispatched by address).
++"""
++
++import os
++import shutil
++import struct
++import sys
++import tempfile
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
++
++from tools.recomp import preserve  # noqa: E402
++from tools.recomp.stack_locals import (localise_stack, ret_deltas, arg_windows, alloca_probes,  # noqa: E402
++                                       Frames)
++from tools.recomp.test_preserve import _lift, BASE  # noqa: E402
++from tools.recomp.test_stack_locals import _compile_run  # noqa: E402
++
++
++def _h(s):
++    return bytes.fromhex(s.replace(" ", ""))
++
++
++RET, RET_4 = _h("C3"), _h("C20400")
++# the alloca probe: test eax,eax; je ret; neg eax; add eax,esp; add eax,4; xchg eax,esp; mov eax,[eax]; push eax; ret
++PROBE = [_h("85C0 740B F7D8 03C4 83C004 94 8B00 50 C3")]
++# the same without its `add eax, 4`: esp would not move by eax
++NOT_PROBE = [_h("85C0 7408 F7D8 03C4 94 8B00 50 C3")]
++PUSH_EBP, MOV_EBP_ESP, POP_EBP, MOV_ESP_EBP = _h("55"), _h("8BEC"), _h("5D"), _h("8BE5")
++AND_ESP_8 = _h("83E4F8")          # and esp, -8
++MOV_EAX_20 = _h("B820000000")     # mov eax, 0x20
++ST_8_ECX = _h("894C2408")         # mov [esp+8], ecx
++LD_EAX_8 = _h("8B442408")         # mov eax, [esp+8]
++ADD_8_EDX = _h("01542408")        # add [esp+8], edx
++LD_EDX_ARG = _h("8B5508")         # mov edx, [ebp+8]: the argument, from the entry's base
++ST_EBPM4_EDX = _h("8955FC")       # mov [ebp-4], edx: between the aligned esp and the entry's frame
++SUB_ESP_8, ADD_ESP_8, ADD_ESP_C = _h("83EC08"), _h("83C408"), _h("83C40C")
++ST_4_ECX = _h("894C2404")         # mov [esp+4], ecx
++LD_EDX_4 = _h("8B542404")         # mov edx, [esp+4]
++ADD_4_EDX = _h("01542404")        # add [esp+4], edx
++PUSH_EAX, CALL_EAX = _h("50"), _h("FFD0")
++
++
++def _call(i):
++    return ("call", i)
++
++
++def _mov_eax_fn(i):
++    return ("fn", i)
++
++
++def _resolve(funcs):
++    """funcs with each ("fn", i) part made `mov eax, <function i's address>`."""
++    sizes = [sum(5 if isinstance(p, tuple) else len(p) for p in f) for f in funcs]
++    starts = [BASE + sum(sizes[:i]) for i in range(len(funcs))]
++    return [[b"\xB8" + struct.pack("<I", starts[p[1]]) if isinstance(p, tuple) and p[0] == "fn" else p
++             for p in f] for f in funcs]
++
++
++def _run_pass(funcs, frames):
++    t, pend, names = _lift(_resolve(funcs))
++    lines = {names[i]: p.lines for i, p in pend.items()}
++    s = preserve.analyse(lines)
++    kept = preserve.preserved_by_name(s)
++    deltas = ret_deltas(lines, exact=True)
++    if frames == "all":
++        frames = Frames(True, True, alloca_probes(lines))
++    windows = arg_windows(lines, s, kept, deltas, carry=True, frames=frames)
++    out = {n: localise_stack(pend[i].lines, s, kept, deltas, windows=windows, carry=True, frames=frames)
++           for i, n in enumerate(names)}
++    return pend, names, out
++
++
++def _body(lines):
++    return "\n".join(lines)
++
++
++# ------------------------------------------------------------ the alloca probe
++
++def test_the_alloca_probe_is_found_by_its_body():
++    _, pend, names = _lift([PROBE, NOT_PROBE, [RET]])
++    lines = {names[i]: p.lines for i, p in pend.items()}
++    assert alloca_probes(lines) == {names[0]}
++
++
++# an aligned frame with an alloca'd part: push ebp; mov ebp,esp; and esp,-8; mov eax,0x20; call probe;
++# a slot spilled and read below the aligned esp; the argument read through ebp
++ALIGNED = [PUSH_EBP, MOV_EBP_ESP, AND_ESP_8, MOV_EAX_20, _call(1), ST_8_ECX, LD_EAX_8, ADD_8_EDX, LD_EAX_8,
++           LD_EDX_ARG, MOV_ESP_EBP, POP_EBP, RET]
++
++
++def test_an_aligned_frame_keeps_its_slots_with_align_and_alloca():
++    _, names, out = _run_pass([ALIGNED, PROBE], Frames())
++    assert out[names[0]][1] is not None
++    _, names, out = _run_pass([ALIGNED, PROBE], "all")
++    lines, why, n_slots, _ = out[names[0]]
++    assert why is None and n_slots == 1, why
++    text = _body(lines)
++    assert "/* from memory at the aligned esp */" in text, text
++    assert "from memory at the entry" not in text, text  # no slot of the entry's is kept after the and
++    assert "MEM32(ebp + 8)" in text, text                 # the argument stays in memory
++
++
++def test_an_aligned_frame_without_the_probe_option_loses_esp_at_the_call():
++    _, names, out = _run_pass([ALIGNED, PROBE], Frames(align=True))
++    assert out[names[0]][1] is not None
++
++
++def test_an_access_between_the_aligned_esp_and_the_entrys_frame_declines():
++    f = [PUSH_EBP, MOV_EBP_ESP, AND_ESP_8, MOV_EAX_20, _call(1), ST_8_ECX, LD_EAX_8, ADD_8_EDX, LD_EAX_8,
++         ST_EBPM4_EDX, MOV_ESP_EBP, POP_EBP, RET]
++    _, names, out = _run_pass([f, PROBE], "all")
++    assert out[names[0]][1] == "an access between an aligned frame and its entry's", out[names[0]][1]
++
++
++# ------------------------------------------------------------ indirect calls
++
++# sub esp,8; mov [esp+4],ecx; push eax; mov eax,f; call eax (f: ret 4); the slot read and changed after
++ICALLER = [SUB_ESP_8, ST_4_ECX, PUSH_EAX, _mov_eax_fn(1), CALL_EAX, LD_EDX_4, ADD_4_EDX, LD_EDX_4, ADD_ESP_8, RET]
++STDCALL = [RET_4]
++# a callee cleaning its argument that reads, rewrites and reads it: mov eax,[esp+4]; mov [esp+4],edx; ret 4
++STDCALL_RW = [_h("8B442404"), _h("89542404"), _h("8B4C2404"), RET_4]
++
++
++def test_an_indirect_callee_cleaning_its_arguments_keeps_the_callers_slots():
++    _, names, out = _run_pass([ICALLER, STDCALL], Frames())
++    assert out[names[0]][1] == "an access at esp + K where esp is not known", out[names[0]][1]
++    _, names, out = _run_pass([ICALLER, STDCALL], Frames(icall=True))
++    lines, why, n_slots, _ = out[names[0]]
++    assert why is None and n_slots == 1, why
++    text = _body(lines)
++    # the callee cleans 4 bytes of arguments: it reaches its return address and them, not the slot
++    assert "to memory */" not in text and "/* and back */" not in text, text
++
++
++def test_a_return_that_does_not_bear_the_hypothesis_out_walks_again_without():
++    # the same, but the caller cleans the argument later (add esp, 0xC): at the ret esp is 4 too high
++    # on the hypothesis, so the function is walked again without it
++    f = [SUB_ESP_8, ST_4_ECX, PUSH_EAX, _mov_eax_fn(1), CALL_EAX, LD_EDX_4, ADD_4_EDX, LD_EDX_4, ADD_ESP_C, RET]
++    _, names, out = _run_pass([f, [RET]], Frames(icall=True))
++    assert out[names[0]][1] == "an access at esp + K where esp is not known", out[names[0]][1]
++
++
++def test_esp_set_from_ebp_after_the_hypothesis_walks_again_without():
++    # push ebp; mov ebp,esp; sub esp,8; ... call eax; ...; mov esp,ebp; pop ebp; ret: not checked at a ret
++    f = [PUSH_EBP, MOV_EBP_ESP, SUB_ESP_8, ST_4_ECX, PUSH_EAX, _mov_eax_fn(1), CALL_EAX, LD_EDX_4, ADD_4_EDX,
++         LD_EDX_4, MOV_ESP_EBP, POP_EBP, RET]
++    _, names, out = _run_pass([f, STDCALL], Frames(icall=True))
++    assert out[names[0]][1] is not None
++
++
++# ------------------------------------------------------------ run both ways
++
++ICALL_HARNESS = r"""
++#define RECOMP_ICALL_SAFE_AT(va, saved, site) recomp_test_icall(va)
++#define RECOMP_ICALL_SAFE(va, saved) recomp_test_icall(va)
++static void recomp_test_icall(uint32_t va);
++"""
++
++CASES = [
++    [ALIGNED, PROBE],
++    [ICALLER, STDCALL],
++    [ICALLER, STDCALL_RW],
++    # an alloca'd frame's slot across two calls, one of them indirect (mov eax,0x20; call probe; ...;
++    # add esp,0x20; ret)
++    [[MOV_EAX_20, _call(1), ST_8_ECX, PUSH_EAX, _mov_eax_fn(2), CALL_EAX, ADD_8_EDX, LD_EAX_8, ADD_8_EDX,
++      LD_EAX_8, _h("83C420"), RET], PROBE, STDCALL],
++]
++
++
++@pytest.mark.parametrize("funcs", CASES)
++def test_the_frames_compute_what_the_memory_model_computes(funcs):
++    if not (shutil.which("gcc") or shutil.which("clang")):
++        pytest.skip("C compiler unavailable")
++    pend, names, out = _run_pass(funcs, "all")
++    assert out[names[0]][1] is None, out[names[0]][1]
++    protos = ICALL_HARNESS + "".join("static void %s(void);\n" % n for n in names)
++    disp = "static void recomp_test_icall(uint32_t va) {\n%s}\n" % "".join(
++        "    if (va == 0x%sU) { %s(); return; }\n" % (n[4:], n) for n in names)
++    plain = protos + "\n".join(_body(p.lines) for p in pend.values()) + disp
++    done = protos + "\n".join(_body(out[n][0]) for n in names) + disp
++    with tempfile.TemporaryDirectory() as tmp:
++        a = _compile_run(plain, names[0], tmp, "plain")
++        b = _compile_run(done, names[0], tmp, "frames")
++    assert a == b, (a, b)
++
++
++if __name__ == "__main__":
++    for name, fn in sorted(globals().items()):
++        if name.startswith("test_") and name != "test_the_frames_compute_what_the_memory_model_computes":
++            fn()
++    for c in CASES:
++        test_the_frames_compute_what_the_memory_model_computes(c)
++    print("ok")
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 40b971c..23fb9f1 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -30,7 +30,7 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
+                      detect_setjmp_helpers, _func_ident, _operand_width)
+ from .x87_locals import localise_x87
+-from .stack_locals import localise_stack, ret_deltas, arg_windows
++from .stack_locals import localise_stack, ret_deltas, arg_windows, alloca_probes, Frames
+ from . import preserve
+ from . import touched
+ 
+@@ -556,6 +556,12 @@ class FunctionTranslator:
+         # of it in their locals across the call
+         self.stack_deltas = False
+         self.stack_reach = False
++        # --stack-icall, --stack-align, --stack-alloca: the frames the walk
++        # follows past an indirect call, an aligned esp and the alloca probe
++        self.stack_icall = False
++        self.stack_align = False
++        self.stack_alloca = False
++        self.stack_frames = Frames()
+         self.arg_windows = {}
+         self.summaries = {}
+         self.ret_deltas = {}
+@@ -3494,7 +3500,8 @@ class FunctionTranslator:
+         (with the callees preserve.py proved, self.kept), then mem_disp."""
+         if self.stack_locals:
+             out, why, n_slots, n_acc = localise_stack(lines, self.summaries, self.kept, self.ret_deltas,
+-                                                      windows=self.arg_windows, carry=self.stack_deltas)
++                                                      windows=self.arg_windows, carry=self.stack_deltas,
++                                                      frames=self.stack_frames)
+             key = why or "in locals"
+             self.stack_stats[key] = self.stack_stats.get(key, 0) + 1
+             if why is None:
+@@ -3850,8 +3857,11 @@ class BatchTranslator:
+         t.summaries = summaries
+         if t.stack_locals:
+             t.ret_deltas = ret_deltas(pending, exact=t.stack_deltas)
++            t.stack_frames = Frames(t.stack_icall, t.stack_align,
++                                    alloca_probes(pending) if t.stack_alloca else ())
+             if t.stack_reach:
+-                t.arg_windows = arg_windows(pending, summaries, t.kept, t.ret_deltas, carry=t.stack_deltas)
++                t.arg_windows = arg_windows(pending, summaries, t.kept, t.ret_deltas, carry=t.stack_deltas,
++                                            frames=t.stack_frames)
+         if t.callee_regs:
+             t.touched = touched.analyse(pending)
+             if t.x87_balanced:

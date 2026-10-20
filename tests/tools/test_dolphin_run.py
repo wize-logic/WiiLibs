@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Tests for the parts of tools/dolphin_run.py that need no Dolphin: which files of the card a run
 changed (card_changes) and their copy out (copy_out, --sd-out), the copy in of the card (copy_tree), and
-when a run ends early (RunWatch), and the command line's refusal of --sd-out without --sd."""
+when a run ends early (RunWatch), the wall-clock stamps of marked lines (LineStamps, --stamp), and the command
+line's refusal of --sd-out without --sd."""
 
 import os
 import re
@@ -145,6 +146,55 @@ class RunWatchTests(unittest.TestCase):
             watch.update(["status"] * (second + 1), float(second))
         self.assertFalse(watch.failed)
         self.assertEqual(1800.0, watch.deadline)
+
+
+class LineStampTests(unittest.TestCase):
+    BENCH = re.compile(r"run 1 frame 0:|summary: [0-9]")
+
+    def test_each_matching_line_is_stamped_once_when_it_first_appears(self):
+        stamps = dolphin_run.LineStamps(self.BENCH, 100.0)
+        lines = ["[I][xboot] boot", "[I][xbbench] run 1 frame 0: 4.6 ms"]
+        stamps.update(lines[:1], 110.0)
+        stamps.update(lines, 130.25)
+        stamps.update(lines, 131.0)  # (seen before: not stamped again)
+        lines += ["[I][xbbench] run 2 frame 0: 2.3 ms", "[I][xbbench] summary: 20 runs of 2 frames",
+                  "[I][xbbench] summary: mean 1 2 3"]
+        stamps.update(lines, 165.75)
+        self.assertEqual([30.25, 65.75], [seconds for seconds, _, _, _ in stamps.stamps])
+        report = stamps.report()
+        self.assertIn("stamp    30.25 s: [I][xbbench] run 1 frame 0: 4.6 ms", report[0])
+        self.assertIn("(+35.50): [I][xbbench] summary: 20 runs", report[1])
+        self.assertEqual("stamps: 2 lines, 35.50 s from the first to the last", report[2])
+
+    def test_a_line_seen_only_at_the_end_is_marked(self):
+        stamps = dolphin_run.LineStamps(self.BENCH, 0.0)
+        stamps.update(["[I][xbbench] summary: 1 runs"], 9.0, late=True)
+        self.assertIn("after the run's end", stamps.report()[0])
+        self.assertEqual(["stamps: no line matched --stamp"], dolphin_run.LineStamps(self.BENCH, 0.0).report())
+
+    def test_a_line_still_being_written_waits_for_its_end(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "dolphin.log"
+            log.write_text("00:00:000 Core/HLE: N[OSREPORT]: [I][xbbench] run 1 frame 0: 4.6 ms\n"
+                           "00:01:000 Core/HLE: N[OSREPORT]: [I][xbbench] summ")
+            self.assertEqual(1, len(dolphin_run.complete_lines(log)))
+            self.assertEqual(2, len(dolphin_run.complete_lines(log, whole=True)))
+            with log.open("a") as out:
+                out.write("ary: 20 runs\n")
+            lines = dolphin_run.complete_lines(log)
+            self.assertEqual(2, len(lines))
+            self.assertEqual([], dolphin_run.complete_lines(Path(temp) / "none.log"))
+            # (Dolphin's own stamps: the bench's part by its log's clock, to the millisecond)
+            stamps = dolphin_run.LineStamps(self.BENCH, 0.0)
+            stamps.update(lines, 3.0)
+            self.assertEqual("[I][xbbench] summary: 20 runs", stamps.stamps[1][2])
+            self.assertIn("(Dolphin's log clock: 1.000 s)", stamps.report()[-1])
+
+    def test_the_log_clock_turns_over_the_hour(self):
+        stamps = dolphin_run.LineStamps(self.BENCH, 0.0)
+        stamps.update(["59:58:500 Core/HLE: N[OSREPORT]: run 1 frame 0: 1 ms",
+                       "00:30:250 Core/HLE: N[OSREPORT]: summary: 20 runs"], 40.0)
+        self.assertIn("log clock +31.750", stamps.report()[1])
 
 
 class GfxIniTests(unittest.TestCase):

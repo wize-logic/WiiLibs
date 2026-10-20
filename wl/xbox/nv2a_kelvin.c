@@ -70,6 +70,16 @@ void wl_nv2a_set_push_cuts4(bool on) {
     g_push_cuts4 = on;
 }
 
+// (the fetch's cuts of wave 6: a vertex's attributes fetched together when their formats are one of
+// the sets fetch_rows knows (WlNv2aFetchPlan.rows), the arrays' formats compared only when one was
+// written; false: as wave 5 left them, a file "oldfetch" in the title's folder, WL_XB_OLDFETCH on the
+// host and in the replay)
+static bool g_fetch_cuts = true;
+
+void wl_nv2a_set_fetch_cuts(bool on) {
+    g_fetch_cuts = on;
+}
+
 static void attrib_decode_cut(uint8_t type, uint8_t size, const uint8_t *data, float out[4]);
 
 void wl_nv2a_attrib_decode(uint8_t type, uint8_t size, const uint8_t *data, float out[4]) {
@@ -193,6 +203,35 @@ static bool g_fetch_tables;
 // (each type's and size's FETCH_*, wl_nv2a_set_push_cuts4's: by the type's and size's 4 bits)
 static uint8_t g_fetch_format[16][16];
 
+// an attribute's format and size together, as fetch_rows takes them (ROW_NONE: one it does not)
+enum {
+    ROW_NONE,
+    ROW_F1, ROW_F2, ROW_F3, ROW_F4,
+    ROW_D3DCOLOR,
+    ROW_CMP,
+    ROW_S1_1, ROW_S1_2, ROW_S1_3, ROW_S1_4,
+    ROW_UB_1, ROW_UB_2, ROW_UB_3, ROW_UB_4,
+    ROW_S32K_1, ROW_S32K_2, ROW_S32K_3, ROW_S32K_4,
+    ROW_BITS = 5
+};
+// (by the type's and size's 4 bits, as g_fetch_format)
+static uint8_t g_fetch_row[16][16];
+
+static uint8_t fetch_row_of(uint8_t format, uint8_t size) {
+    switch (format) {
+    case FETCH_F1: return ROW_F1;
+    case FETCH_F2: return ROW_F2;
+    case FETCH_F3: return ROW_F3;
+    case FETCH_F4: return ROW_F4;
+    case FETCH_D3DCOLOR: return ROW_D3DCOLOR;
+    case FETCH_CMP: return ROW_CMP;
+    case FETCH_S1: return (uint8_t)(ROW_S1_1 + size - 1u);
+    case FETCH_UB: return (uint8_t)(ROW_UB_1 + size - 1u);
+    case FETCH_S32K: return (uint8_t)(ROW_S32K_1 + size - 1u);
+    default: return ROW_NONE;
+    }
+}
+
 // an attribute's FETCH_* (s32k: FETCH_S32K for its shorts, else FETCH_GENERIC)
 static uint8_t fetch_format_of(uint8_t type, uint8_t size, bool s32k) {
     if (type == WL_NV2A_VTX_F && size >= 1 && size <= 4) {
@@ -227,6 +266,7 @@ static void fetch_tables_make(void) {
     }
     for (i = 0; i < 256; i++) {
         g_fetch_format[i >> 4][i & 15u] = fetch_format_of((uint8_t)(i >> 4), (uint8_t)(i & 15u), true);
+        g_fetch_row[i >> 4][i & 15u] = fetch_row_of(g_fetch_format[i >> 4][i & 15u], (uint8_t)(i & 15u));
     }
     g_fetch_tables = true;
 }
@@ -238,6 +278,43 @@ static inline float small_int_float(int value) {
 
     memcpy(&f, &bits, sizeof f);
     return f - 12582912.0f;
+}
+
+// the sets of formats fetch_rows fetches a vertex at a time (WlNv2aFetchPlan.rows), each streamed
+// attribute's ROW_* in order after a leading 1 (fetch_plan's signature): Halo's skinned positions (the
+// projection's probes: position, blend indices and weight), its skinned and static vertices
+#define ROWS1(a) (1u << ROW_BITS | (unsigned)(a))
+#define ROWS2(a, b) (ROWS1(a) << ROW_BITS | (unsigned)(b))
+#define ROWS3(a, b, c) (ROWS2(a, b) << ROW_BITS | (unsigned)(c))
+#define ROWS4(a, b, c, d) (ROWS3(a, b, c) << ROW_BITS | (unsigned)(d))
+#define ROWS5(a, b, c, d, e) (ROWS4(a, b, c, d) << ROW_BITS | (unsigned)(e))
+enum {
+    ROWS_NONE,
+    ROWS_SKIN_POSITION, // F3, UB.2, S1.1
+    ROWS_SKIN_POSITION_UV, // F3, S1.2, UB.2, S1.1
+    ROWS_SKIN, // F3, CMP, S1.2, UB.2, S1.1
+    ROWS_SKIN_NO_UV, // F3, CMP, UB.2, S1.1
+    ROWS_F3, // F3
+    ROWS_F3_UV, // F3, S1.2
+    ROWS_STATIC, // F3, F2, D3DCOLOR
+    ROWS_BYTES, // UB.3, S32K.1, UB.3
+    ROWS_KINDS,
+    // (more attributes than a signature holds)
+    ROWS_MAX_ATTRIBUTES = 31 / ROW_BITS
+};
+
+static uint8_t fetch_rows_kind(uint32_t signature) {
+    switch (signature) {
+    case ROWS3(ROW_F3, ROW_UB_2, ROW_S1_1): return ROWS_SKIN_POSITION;
+    case ROWS4(ROW_F3, ROW_S1_2, ROW_UB_2, ROW_S1_1): return ROWS_SKIN_POSITION_UV;
+    case ROWS5(ROW_F3, ROW_CMP, ROW_S1_2, ROW_UB_2, ROW_S1_1): return ROWS_SKIN;
+    case ROWS4(ROW_F3, ROW_CMP, ROW_UB_2, ROW_S1_1): return ROWS_SKIN_NO_UV;
+    case ROWS1(ROW_F3): return ROWS_F3;
+    case ROWS2(ROW_F3, ROW_S1_2): return ROWS_F3_UV;
+    case ROWS3(ROW_F3, ROW_F2, ROW_D3DCOLOR): return ROWS_STATIC;
+    case ROWS3(ROW_UB_3, ROW_S32K_1, ROW_UB_3): return ROWS_BYTES;
+    default: return ROWS_NONE;
+    }
 }
 
 bool wl_nv2a_prefetch_on = true;
@@ -289,6 +366,7 @@ void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetch
     plan->indices = draw->indices;
     plan->index_base = draw->index_base;
     plan->prefetch_count = 0;
+    plan->rows = ROWS_NONE;
     if (draw->source == WL_NV2A_SOURCE_IMMEDIATE) {
         return;
     }
@@ -297,6 +375,8 @@ void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetch
         uint32_t want = attributes & ((1u << WL_NV2A_ATTRIBS) - 1u);
         bool arrays = draw->source == WL_NV2A_SOURCE_ARRAYS;
         unsigned n = 0;
+        // (the formats' signature for fetch_rows_kind, and whether the strides differ)
+        uint32_t signature = 1, strides = 0;
 
         plan->constants = want & ~draw->streamed;
         for (want &= draw->streamed; want != 0; want &= want - 1u) {
@@ -308,9 +388,11 @@ void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetch
             plan->streamed[n].type = attrib->type;
             plan->streamed[n].size = attrib->size;
             plan->streamed[n].format = g_fetch_format[attrib->type & 15u][attrib->size & 15u];
+            signature = signature << ROW_BITS | g_fetch_row[attrib->type & 15u][attrib->size & 15u];
             if (arrays) {
                 plan->streamed[n].data = attrib->data;
                 plan->streamed[n].stride = attrib->stride;
+                strides |= attrib->stride ^ plan->streamed[0].stride;
                 if (WL_NV2A_PREFETCHES) {
                     prefetch_area_add(plan, attrib->data, attrib->stride,
                                       wl_nv2a_attrib_bytes(attrib->type, attrib->size));
@@ -322,6 +404,8 @@ void wl_nv2a_fetch_plan(const WlNv2aDraw *draw, uint32_t attributes, WlNv2aFetch
             n++;
         }
         plan->count = (uint8_t)n;
+        // (an inline draw's attributes are all of its one stride)
+        plan->rows = g_fetch_cuts && strides == 0 && n <= ROWS_MAX_ATTRIBUTES ? fetch_rows_kind(signature) : ROWS_NONE;
         return;
     }
     for (a = 0; a < WL_NV2A_ATTRIBS; a++) {
@@ -456,6 +540,162 @@ static inline __attribute__((always_inline)) void fetch_ub(const uint8_t *base, 
     }
 }
 
+// one attribute of a vertex by its ROW_* (a constant where it is inlined): the values the attribute
+// loops of wl_nv2a_fetch_elements give, to the bit (the components read before any is stored)
+static inline __attribute__((always_inline)) void fetch_row(unsigned row, const uint8_t *data, float *out) {
+    float v[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    unsigned c, size;
+
+    switch (row) {
+    // (the words as they are: no trip through a float register)
+    case ROW_F1: {
+        uint32_t w0 = wl_rd_le32(data);
+
+        memcpy(&out[0], &w0, sizeof w0);
+        out[1] = out[2] = 0.0f;
+        out[3] = 1.0f;
+        return;
+    }
+    case ROW_F2: {
+        uint32_t w0 = wl_rd_le32(data), w1 = wl_rd_le32(data + 4);
+
+        memcpy(&out[0], &w0, sizeof w0);
+        memcpy(&out[1], &w1, sizeof w1);
+        out[2] = 0.0f;
+        out[3] = 1.0f;
+        return;
+    }
+    case ROW_F3: {
+        uint32_t w0 = wl_rd_le32(data), w1 = wl_rd_le32(data + 4), w2 = wl_rd_le32(data + 8);
+
+        memcpy(&out[0], &w0, sizeof w0);
+        memcpy(&out[1], &w1, sizeof w1);
+        memcpy(&out[2], &w2, sizeof w2);
+        out[3] = 1.0f;
+        return;
+    }
+    case ROW_F4: {
+        uint32_t w0 = wl_rd_le32(data), w1 = wl_rd_le32(data + 4), w2 = wl_rd_le32(data + 8),
+                 w3 = wl_rd_le32(data + 12);
+
+        memcpy(&out[0], &w0, sizeof w0);
+        memcpy(&out[1], &w1, sizeof w1);
+        memcpy(&out[2], &w2, sizeof w2);
+        memcpy(&out[3], &w3, sizeof w3);
+        return;
+    }
+    case ROW_D3DCOLOR:
+        v[0] = g_byte_float[data[2]];
+        v[1] = g_byte_float[data[1]];
+        v[2] = g_byte_float[data[0]];
+        v[3] = g_byte_float[data[3]];
+        break;
+    case ROW_CMP: {
+        uint32_t word = wl_rd_le32(data);
+
+        v[0] = g_cmp11_float[word & 0x7FFu];
+        v[1] = g_cmp11_float[(word >> 11) & 0x7FFu];
+        v[2] = g_cmp10_float[word >> 22];
+        break;
+    }
+    case ROW_S1_1:
+    case ROW_S1_2:
+    case ROW_S1_3:
+    case ROW_S1_4:
+        size = row - ROW_S1_1 + 1u;
+        for (c = 0; c < size; c++) {
+            float result = small_int_float((int16_t)wl_rd_le16(data + 2 * c)) * (1.0f / 32767.0f);
+
+            v[c] = result < -1.0f ? -1.0f : result;
+        }
+        break;
+    case ROW_UB_1:
+    case ROW_UB_2:
+    case ROW_UB_3:
+    case ROW_UB_4:
+        size = row - ROW_UB_1 + 1u;
+        for (c = 0; c < size; c++) {
+            v[c] = g_byte_float[data[c]];
+        }
+        break;
+    case ROW_S32K_1:
+    case ROW_S32K_2:
+    case ROW_S32K_3:
+    case ROW_S32K_4:
+        size = row - ROW_S32K_1 + 1u;
+        for (c = 0; c < size; c++) {
+            v[c] = small_int_float((int16_t)wl_rd_le16(data + 2 * c));
+        }
+        break;
+    default:
+        break;
+    }
+    out[0] = v[0], out[1] = v[1], out[2] = v[2], out[3] = v[3];
+}
+
+// `count` vertices of a plan whose formats are r0 .. r4 (constants, ROW_NONE past the last), a vertex
+// at a time: its element's offset in the one stride found once, each attribute read at its own start
+// from it. Each vertex's element is elements[n], or when `gather` its index's (indices[elements[n]] less
+// index_base: wl_nv2a_fetch_element's, the index read straight in)
+static inline __attribute__((always_inline)) void fetch_rows(const WlNv2aFetchPlan *plan, bool gather,
+                                                              const uint32_t *elements, uint32_t count,
+                                                              float (*inputs)[WL_NV2A_ATTRIBS][4], unsigned r0,
+                                                              unsigned r1, unsigned r2, unsigned r3, unsigned r4) {
+    const uint32_t stride = plan->streamed[0].stride, *indices = plan->indices, base = plan->index_base;
+    const uint8_t *d0 = plan->streamed[0].data, *d1 = r1 ? plan->streamed[1].data : NULL,
+                  *d2 = r2 ? plan->streamed[2].data : NULL, *d3 = r3 ? plan->streamed[3].data : NULL,
+                  *d4 = r4 ? plan->streamed[4].data : NULL;
+    const unsigned a0 = plan->streamed[0].attribute, a1 = r1 ? plan->streamed[1].attribute : 0u,
+                   a2 = r2 ? plan->streamed[2].attribute : 0u, a3 = r3 ? plan->streamed[3].attribute : 0u,
+                   a4 = r4 ? plan->streamed[4].attribute : 0u;
+    uint32_t n;
+
+    for (n = 0; n < count; n++) {
+        size_t offset = (size_t)(gather ? indices[elements[n]] - base : elements[n]) * stride;
+        float (*in)[4] = inputs[n];
+
+        fetch_row(r0, d0 + offset, in[a0]);
+        if (r1) {
+            fetch_row(r1, d1 + offset, in[a1]);
+        }
+        if (r2) {
+            fetch_row(r2, d2 + offset, in[a2]);
+        }
+        if (r3) {
+            fetch_row(r3, d3 + offset, in[a3]);
+        }
+        if (r4) {
+            fetch_row(r4, d4 + offset, in[a4]);
+        }
+    }
+}
+
+// fetch_rows by the plan's kind (false: none)
+static bool fetch_rows_by_kind(const WlNv2aFetchPlan *plan, bool gather, const uint32_t *elements, uint32_t count,
+                               float (*inputs)[WL_NV2A_ATTRIBS][4]) {
+#define FETCH_ROWS(kind, r0, r1, r2, r3, r4)                                                                           \
+    case kind:                                                                                                         \
+        if (gather) {                                                                                                  \
+            fetch_rows(plan, true, elements, count, inputs, r0, r1, r2, r3, r4);                                       \
+        } else {                                                                                                       \
+            fetch_rows(plan, false, elements, count, inputs, r0, r1, r2, r3, r4);                                      \
+        }                                                                                                              \
+        return true;
+    switch (plan->rows) {
+        FETCH_ROWS(ROWS_SKIN_POSITION, ROW_F3, ROW_UB_2, ROW_S1_1, ROW_NONE, ROW_NONE)
+        FETCH_ROWS(ROWS_SKIN_POSITION_UV, ROW_F3, ROW_S1_2, ROW_UB_2, ROW_S1_1, ROW_NONE)
+        FETCH_ROWS(ROWS_SKIN, ROW_F3, ROW_CMP, ROW_S1_2, ROW_UB_2, ROW_S1_1)
+        FETCH_ROWS(ROWS_SKIN_NO_UV, ROW_F3, ROW_CMP, ROW_UB_2, ROW_S1_1, ROW_NONE)
+        FETCH_ROWS(ROWS_F3, ROW_F3, ROW_NONE, ROW_NONE, ROW_NONE, ROW_NONE)
+        FETCH_ROWS(ROWS_F3_UV, ROW_F3, ROW_S1_2, ROW_NONE, ROW_NONE, ROW_NONE)
+        FETCH_ROWS(ROWS_STATIC, ROW_F3, ROW_F2, ROW_D3DCOLOR, ROW_NONE, ROW_NONE)
+        FETCH_ROWS(ROWS_BYTES, ROW_UB_3, ROW_S32K_1, ROW_UB_3, ROW_NONE, ROW_NONE)
+    default:
+        return false;
+    }
+#undef FETCH_ROWS
+}
+
 // wl_nv2a_attrib_decode's values, to the bit, by the fetch's means: bytes and the packed normal's fields
 // from the tables, shorts made floats by their bits (small_int_float), a size's components unrolled
 static void attrib_decode_cut(uint8_t type, uint8_t size, const uint8_t *data, float out[4]) {
@@ -554,6 +794,9 @@ void wl_nv2a_fetch_elements(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw,
         for (n = 0; n < count; n++) {
             memcpy(inputs[n], draw->immediate[all_elements[n]], sizeof(float) * WL_NV2A_ATTRIBS * 4);
         }
+        return;
+    }
+    if (plan->rows != ROWS_NONE && fetch_rows_by_kind(plan, false, all_elements, count, inputs)) {
         return;
     }
     for (done = 0; done < count; done += run) {
@@ -674,6 +917,12 @@ void wl_nv2a_fetch_vertices(const WlNv2aFetchPlan *plan, const WlNv2aDraw *draw,
     uint32_t elements[WL_NV2A_FETCH_BATCH];
     uint32_t n, done, run;
 
+    // (an array's indices read straight into the vertices' offsets; an inline draw's vertices are its elements)
+    if (plan->rows != ROWS_NONE &&
+        fetch_rows_by_kind(plan, plan->source == WL_NV2A_SOURCE_ARRAYS && plan->indices != NULL, vertices, count,
+                           inputs)) {
+        return;
+    }
     for (done = 0; done < count; done += run) {
         run = count - done < WL_NV2A_FETCH_BATCH ? count - done : WL_NV2A_FETCH_BATCH;
         for (n = 0; n < run; n++) {
@@ -872,6 +1121,9 @@ static uint32_t dirty_group(uint32_t method) {
     }
     if (method >= 0x1B00 && method < 0x1C00) {
         return WL_NV2A_DIRTY_TEXTURES;
+    }
+    if (method >= WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT && method < WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT + 0x40) {
+        return WL_NV2A_DIRTY_ARRAYS | WL_NV2A_DIRTY_ARRAY_FORMATS;
     }
     if (method >= 0x1720 && method <= 0x179C) {
         return WL_NV2A_DIRTY_ARRAYS;
@@ -1208,22 +1460,42 @@ static void layout_make(WlNv2aKelvin *k) {
     k->layout_ok = 1;
 }
 
+// the layout's dirty groups for a draw of arrays, taken: this draw's and those kept over the draws without
+// arrays since (draw_counted); as wave 5 left them, WL_NV2A_DIRTY_ARRAYS alone means the formats may
+// have changed too, and the draws without arrays keep none
+static inline uint32_t layout_dirty_take(WlNv2aKelvin *k) {
+    uint32_t dirty;
+
+    if (!g_fetch_cuts) {
+        return k->dirty & WL_NV2A_DIRTY_ARRAYS ? WL_NV2A_DIRTY_ARRAYS | WL_NV2A_DIRTY_ARRAY_FORMATS : 0u;
+    }
+    dirty = (k->dirty | k->layout_dirty) & (WL_NV2A_DIRTY_ARRAYS | WL_NV2A_DIRTY_ARRAY_FORMATS);
+    k->layout_dirty = 0;
+    k->dirty &= ~dirty;
+    return dirty;
+}
+
 // arrays_layout's work from the layout kept, into attributes already zero
 static uint32_t layout_arrays(WlNv2a *dev, uint32_t least, uint32_t last, WlNv2aAttrib attribs[WL_NV2A_ATTRIBS]) {
     WlNv2aKelvin *k = &dev->kelvin;
     uint32_t streamed = 0;
     unsigned i, n;
 
+    uint32_t dirty = layout_dirty_take(k);
+
     if (!k->layout_ok) {
         layout_make(k);
-    } else if (k->dirty & WL_NV2A_DIRTY_ARRAYS) {
+    } else if (dirty & WL_NV2A_DIRTY_ARRAYS) {
         // (a title moves its arrays far more often than it changes their formats: the formats compared,
         // and when they are the same the enabled arrays' starts alone made again)
         const uint32_t *formats = &k->raw[WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT >> 2];
         uint32_t differ = 0;
 
-        for (i = 0; i < WL_NV2A_ATTRIBS; i++) {
-            differ |= formats[i] ^ k->layout_formats[i];
+        // (an offset or a vertex DMA alone: the formats as they were)
+        if (dirty & WL_NV2A_DIRTY_ARRAY_FORMATS) {
+            for (i = 0; i < WL_NV2A_ATTRIBS; i++) {
+                differ |= formats[i] ^ k->layout_formats[i];
+            }
         }
         if (differ != 0) {
             layout_make(k);
@@ -1261,14 +1533,19 @@ static uint32_t layout_arrays_kept(WlNv2a *dev, uint32_t least, uint32_t last) {
     uint32_t streamed = 0, written = 0, stale;
     unsigned i, j, n;
 
+    uint32_t dirty = layout_dirty_take(k);
+
     if (!k->layout_ok) {
         layout_make(k);
-    } else if (k->dirty & WL_NV2A_DIRTY_ARRAYS) {
+    } else if (dirty & WL_NV2A_DIRTY_ARRAYS) {
         const uint32_t *formats = &k->raw[WL_NV2A_K_SET_VERTEX_DATA_ARRAY_FORMAT >> 2];
         uint32_t differ = 0;
 
-        for (i = 0; i < WL_NV2A_ATTRIBS; i++) {
-            differ |= formats[i] ^ k->layout_formats[i];
+        // (an offset or a vertex DMA alone: the formats as they were)
+        if (dirty & WL_NV2A_DIRTY_ARRAY_FORMATS) {
+            for (i = 0; i < WL_NV2A_ATTRIBS; i++) {
+                differ |= formats[i] ^ k->layout_formats[i];
+            }
         }
         if (differ != 0) {
             layout_make(k);
@@ -1373,6 +1650,8 @@ static void draw_counted(WlNv2a *dev, WlNv2aDraw *draw) {
     if (wl_nv2a_k(k, WL_NV2A_K_SET_ZPASS_PIXEL_COUNT_ENABLE)) {
         k->zpass_pixels += pixels;
     }
+    // (a draw without arrays leaves the layout's groups for the next with them: layout_dirty_take)
+    k->layout_dirty = (uint8_t)(k->layout_dirty | (k->dirty & (WL_NV2A_DIRTY_ARRAYS | WL_NV2A_DIRTY_ARRAY_FORMATS)));
     k->dirty = 0;
 }
 

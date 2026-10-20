@@ -14,6 +14,7 @@
 #include "wl/platform/mem_census.h"
 #include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/crash.h"
+#include "wl/xboxrt/det_clock.h"
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
 #include "wl/xboxrt/mem_internal.h"
@@ -57,10 +58,10 @@ volatile uint32_t g_xb_det_work;
 
 // The deterministic mode (thread.h). The virtual clock starts at 1 s, so that no deadline made
 // from it is 0 (none); it is written only by the lock's holder.
-#define DET_START_NS 1000000000ull
+#define DET_START_US 1000000u
 static bool g_det;
 static bool g_preempt; // WlXbThreadConfig.preempt, never in the deterministic mode
-static volatile uint64_t g_vt_ns = DET_START_NS;
+static volatile WlXbDetClock g_vt = {DET_START_US, 0}; // (det_clock.h: no 64-bit division at a safe point)
 static uint64_t g_det_next_us;          // the holder looks at the clock's events from then on
 static uint32_t g_det_backedge_ns, g_det_call_ns, g_det_device_ns;
 static WlXbThread *volatile g_idle;     // the idle thread (the service thread)
@@ -95,16 +96,16 @@ bool wl_xb_deterministic(void) {
 }
 
 uint64_t wl_xb_time_us(void) {
-    return g_det ? g_vt_ns / 1000u : wl_platform_time_us();
+    return g_det ? g_vt.us : wl_platform_time_us();
 }
 
 uint64_t wl_xb_time_ns(void) {
-    return g_det ? g_vt_ns : wl_platform_time_us() * 1000u;
+    return g_det ? wl_xb_det_clock_ns(&g_vt) : wl_platform_time_us() * 1000u;
 }
 
 void wl_xb_time_spend_us(uint32_t us) {
     if (g_det) {
-        g_vt_ns += (uint64_t)us * 1000u;
+        wl_xb_det_clock_add_us(&g_vt, us);
     }
 }
 
@@ -722,11 +723,11 @@ static void det_point(uint32_t ns, bool levels) {
     if (self == NULL || self->host_tid != wl_platform_thread_self_id()) {
         return; // not the holder
     }
-    g_vt_ns += ns;
+    wl_xb_det_clock_add_ns(&g_vt, ns);
     if (self->kernel_depth != 0 || self->is_service || wl_xb_in_service()) {
         return;
     }
-    uint64_t now = g_vt_ns / 1000u;
+    uint64_t now = g_vt.us;
     if (!levels && now < g_det_next_us && g_xb_det_work == 0 && g_ready == NULL) {
         return;
     }
@@ -821,7 +822,7 @@ bool wl_xb_det_idle_take(WlXbThread *self, uint32_t timeout_ms) {
 }
 
 int wl_xb_det_idle_step(void) {
-    uint64_t now = g_vt_ns / 1000u;
+    uint64_t now = g_vt.us;
     uint64_t next = wl_xb_det_service_due(now);
     uint64_t w = det_expire(now);
     if (w < next) {
@@ -840,7 +841,7 @@ int wl_xb_det_idle_step(void) {
     if (next <= now) {
         next = now + 1u;
     }
-    g_vt_ns = next * 1000u;
+    wl_xb_det_clock_set_us(&g_vt, next);
     return 0;
 }
 

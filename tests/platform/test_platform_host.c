@@ -479,6 +479,108 @@ TEST audio_stub_renders_through_the_fill_callback(void) {
     PASS();
 }
 
+// the count-only mode (wl_host_gx_direct_count_only): the same counts and the same findings as the
+// decoding, vertex by vertex or in batches, sent as words or through indices, a vertex of the wrong size
+// and a short primitive among them; no vertex made, so no hook called
+typedef struct {
+    uint64_t wire_bytes;
+    uint32_t mismatches, first_draw, first_sent, first_read, indexed, short_draws, draws, vertices, hooked;
+} StubCounts;
+
+static uint32_t g_hooked;
+
+static void count_hook(void *user, WlGxDirectPrim prim, const WlGxDirectVertex *vertices, uint32_t count) {
+    (void)user;
+    (void)prim;
+    (void)vertices;
+    g_hooked += count;
+}
+
+static StubCounts stub_draws(bool count_only) {
+    WlGxDirectLayout layout;
+    const WlHostGxDirect *d;
+    WlGxDirectVertex made[2];
+    uint32_t w0[4] = {0, 0, 0, 0x11223344u}, w1[4] = {0, 0, 0, 0x55667788u};
+    const uint32_t *batch[2] = {w0, w1};
+    static const uint32_t indices[3] = {12, 10, 11};
+    static const uint8_t positions[3 * 12];
+    const uint32_t color = 0x01020304u, texcoords[2][2] = {{1, 2}, {3, 4}};
+    const uint32_t *tex_batch[2] = {texcoords[0], texcoords[1]};
+    StubCounts c;
+
+    memset(made, 0, sizeof made);
+    wl_host_gx_direct_reset();
+    wl_host_gx_direct_count_only(count_only);
+    g_hooked = 0;
+    wl_host_gx_direct_hook(count_hook, NULL);
+    memset(&layout, 0, sizeof layout);
+    layout.colors = 1;
+    wl_gx_direct_layout(&layout);
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 2);
+    wl_gx_direct_vertices_words(batch, 2, 4);
+    wl_gx_direct_primitive_end();
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 3); // (a vertex short of its colour, one missing)
+    wl_gx_direct_vertex_words(w0, 4);
+    wl_gx_direct_vertex_words(w1, 3);
+    wl_gx_direct_primitive_end();
+    memset(&layout, 0, sizeof layout);
+    layout.colors = 1;
+    layout.indexed = 1u << WL_GX_DIRECT_ARRAY_POSITION;
+    wl_gx_direct_layout(&layout);
+    wl_gx_direct_array(WL_GX_DIRECT_ARRAY_POSITION, positions, 12);
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 4);
+    wl_gx_direct_vertices_index(indices, 10, 3, &color, 1);
+    wl_gx_direct_vertex_index(1, &color, 1);
+    wl_gx_direct_primitive_end();
+    memset(&layout, 0, sizeof layout);
+    layout.texcoords = 1;
+    layout.indexed = 1u << WL_GX_DIRECT_ARRAY_POSITION;
+    wl_gx_direct_layout(&layout);
+    wl_gx_direct_primitive_begin(WL_GX_DIRECT_POINTS, 2);
+    wl_gx_direct_vertices_position_index(indices, 10, 1, 2, tex_batch, 0, 2);
+    wl_gx_direct_primitive_end();
+    wl_gx_direct_draw(WL_GX_DIRECT_POINTS, made, 2);
+    d = wl_host_gx_direct();
+    c.wire_bytes = d->wire_bytes;
+    c.mismatches = d->wire_mismatches;
+    c.first_draw = d->wire_first_draw;
+    c.first_sent = d->wire_first_sent;
+    c.first_read = d->wire_first_read;
+    c.indexed = d->indexed_vertices;
+    c.short_draws = d->short_draws;
+    c.draws = d->stats.draws;
+    c.vertices = d->stats.vertices;
+    c.hooked = g_hooked;
+    wl_host_gx_direct_hook(NULL, NULL);
+    wl_host_gx_direct_count_only(false);
+    wl_host_gx_direct_reset();
+    return c;
+}
+
+TEST gx_direct_stub_counts_without_decoding(void) {
+    StubCounts decoded = stub_draws(false), counted = stub_draws(true);
+
+    ASSERT_EQ(2u * 16u + 16u + 12u + 4u * 6u + 2u * 10u, decoded.wire_bytes);
+    ASSERT_EQ(1u, decoded.mismatches);
+    ASSERT_EQ(2u, decoded.first_draw);
+    ASSERT_EQ(12u, decoded.first_sent);
+    ASSERT_EQ(16u, decoded.first_read);
+    ASSERT_EQ(1u, decoded.short_draws);
+    ASSERT_EQ(6u, decoded.indexed);
+    ASSERT_EQ(2u + 2u + 4u + 2u + 2u, decoded.hooked);
+    ASSERT_EQ(decoded.wire_bytes, counted.wire_bytes);
+    ASSERT_EQ(decoded.mismatches, counted.mismatches);
+    ASSERT_EQ(decoded.first_draw, counted.first_draw);
+    ASSERT_EQ(decoded.first_sent, counted.first_sent);
+    ASSERT_EQ(decoded.first_read, counted.first_read);
+    ASSERT_EQ(decoded.indexed, counted.indexed);
+    ASSERT_EQ(decoded.short_draws, counted.short_draws);
+    ASSERT_EQ(decoded.draws, counted.draws);
+    ASSERT_EQ(decoded.vertices, counted.vertices);
+    ASSERT_EQ(0u, counted.hooked);
+    PASS();
+}
+
 SUITE(host_suite) {
     RUN_TEST(system_events_latch_and_clear);
     RUN_TEST(log_ring_keeps_the_last_lines);
@@ -491,6 +593,7 @@ SUITE(host_suite) {
     RUN_TEST(gx_direct_stub_takes_a_normal_beside_a_sphere_map);
     RUN_TEST(gx_direct_stub_reads_word_arrays_by_index);
     RUN_TEST(gx_direct_stub_takes_batches_of_vertices);
+    RUN_TEST(gx_direct_stub_counts_without_decoding);
     RUN_TEST(gx_direct_stub_takes_register_colours_and_position_indices);
     RUN_TEST(gx_direct_stub_checks_what_the_console_reads);
     RUN_TEST(audio_stub_renders_through_the_fill_callback);

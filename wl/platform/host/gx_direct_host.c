@@ -10,6 +10,24 @@
 #include "wl/platform/host/gx_renderer_host.h"
 #include "wl/platform/host/tev_host.h"
 
+// The count-only mode's pipe (gx_direct_host.h): one word of memory taking the stores the Wii's layer
+// makes into the write-gather pipe (wii/gx_direct_wii.c), through the same loops, so that a ppc-be count
+// has the Wii's writes in it
+typedef union {
+    volatile uint16_t U16;
+    volatile uint32_t U32;
+    volatile double F64;
+} WlHostPipe;
+#define WL_PIPE_T WlHostPipe *
+#define WL_PIPE_W32(pipe, v) ((pipe)->U32 = (v))
+#define WL_PIPE_W16(pipe, v) ((pipe)->U16 = (v))
+#if defined(__powerpc__) && !defined(__powerpc64__)
+#define WL_PIPE_PPC_FP64 // (lfd and stfd, as the Wii)
+#endif
+#include "wl/platform/gx_pipe_words.h"
+static WlHostPipe g_pipe_word;
+static WlHostPipe *volatile g_pipe = &g_pipe_word; // (read once a call, as the Wii's wgPipe)
+
 static WlHostGxDirect s;
 static bool g_flush_due, g_flush_off, g_layout_known;
 // the console's commands counted alike (gx_shadow.h): the position matrix as loaded (identity or not),
@@ -29,6 +47,15 @@ static void (*g_hook)(void *user, WlGxDirectPrim prim, const WlGxDirectVertex *v
 static void *g_hook_user;
 // bit n: array n's elements are the processor's words (wl_gx_direct_array_words), not GX's bytes
 static uint16_t g_array_words;
+// the count-only mode (gx_direct_host.h): -1 until the environment is read; the primitive's (at its
+// start), and its layout's wire as wire_bytes gives it, worked out once a primitive in that mode
+static int g_count_mode = -1;
+static bool g_counting, g_wire_describable, g_wire_stale = true;
+static uint32_t g_wire_read, g_wire_indexes;
+// ...and the order of an indexed vertex's stores, as the Wii's layer notes it (input_of): 0 an index,
+// else that many words
+static uint8_t g_order[WL_GX_VA_ATTRIBUTES];
+static unsigned g_order_count;
 
 const WlHostGxDirect *wl_host_gx_direct(void) {
     return &s;
@@ -97,6 +124,7 @@ void wl_gx_direct_layout(const WlGxDirectLayout *layout) {
     for (n = 0; n < 8; n++) {
         s.texgen[n].set = false;
     }
+    g_wire_stale = true;
     g_layout_known = true;
     s.stats.layouts++;
     {
@@ -113,6 +141,59 @@ void wl_platform_heap_exempt(bool on) __attribute__((weak));
 static WlGxDirectVertex *g_vertices;
 static uint32_t g_capacity, g_expected, g_received;
 static bool g_in_primitive;
+static uint32_t wire_bytes(const WlGxDirectLayout *layout, bool *describable, uint32_t *indexes);
+
+static void order_note(const WlGxDirectLayout *layout, unsigned attribute, uint8_t words) {
+    if (g_order_count >= WL_GX_VA_ATTRIBUTES) {
+        return;
+    }
+    if (layout->indexed & (1u << attribute)) {
+        g_order[g_order_count++] = 0;
+    } else if (g_order_count != 0 && g_order[g_order_count - 1] != 0) {
+        g_order[g_order_count - 1] = (uint8_t)(g_order[g_order_count - 1] + words);
+    } else {
+        g_order[g_order_count++] = words;
+    }
+}
+
+// the order of the layout's attributes as the Wii's layer describes them (wl_gx_direct_layout there)
+static void wire_order(const WlGxDirectLayout *layout) {
+    unsigned n, projected = layout->lit ? 1u : 0u;
+
+    g_order_count = 0;
+    order_note(layout, WL_GX_DIRECT_ARRAY_POSITION, 3);
+    for (n = 0; n < 8; n++) {
+        projected += (layout->texcoords_projected >> n) & 1u;
+    }
+    if (projected == 1u) {
+        order_note(layout, WL_GX_DIRECT_ARRAY_NORMAL, 3);
+    } else if (projected > 1u) {
+        order_note(layout, WL_GX_DIRECT_ARRAY_NORMAL, 9);
+    }
+    for (n = 0; n < 2u; n++) {
+        if (layout->colors > n && !(layout->colors_register & (1u << n))) {
+            order_note(layout, WL_GX_DIRECT_ARRAY_COLOR0 + n, 1);
+        }
+    }
+    for (n = 0; n < 8; n++) {
+        if (layout->texcoords & (1u << n)) {
+            order_note(layout, WL_GX_DIRECT_ARRAY_TEXCOORD0 + n, (layout->texcoord_s & (1u << n)) ? 1 : 2);
+        }
+    }
+}
+
+void wl_host_gx_direct_count_only(bool on) {
+    g_count_mode = on ? 1 : 0;
+}
+
+bool wl_host_gx_direct_counting(void) {
+    if (g_count_mode < 0) {
+        const char *mode = getenv("WL_XB_GXSTUB");
+
+        g_count_mode = mode != NULL && strcmp(mode, "count") == 0 ? 1 : 0;
+    }
+    return g_count_mode != 0;
+}
 
 void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     bool flush;
@@ -146,6 +227,12 @@ void wl_gx_direct_primitive_begin(WlGxDirectPrim prim, uint32_t count) {
     s.stats.flushes += flush ? 1u : 0u;
     g_flush_due = false;
     g_in_primitive = true;
+    g_counting = wl_host_gx_direct_counting();
+    if (g_counting && g_wire_stale) {
+        g_wire_read = wire_bytes(&s.layout, &g_wire_describable, &g_wire_indexes);
+        wire_order(&s.layout);
+        g_wire_stale = false;
+    }
     // (the console's flush strip counted with the primitive: of its state, in its batch, gx_direct_wii.c)
     wl_gx_shadow_fifo(WL_GX_FIFO_VERTEX, 3u + count * g_vertex_bytes + (flush ? 3u + 8u * g_vertex_bytes : 0u));
     g_expected = count;
@@ -201,6 +288,10 @@ static uint8_t lit_component(const float normal[3], unsigned channel, unsigned c
 }
 
 void wl_gx_direct_vertex(const WlGxDirectVertex *vertex) {
+    if (g_counting) {
+        g_received += g_in_primitive && g_received < g_expected ? 1u : 0u;
+        return;
+    }
     if (g_in_primitive && g_received < g_expected) {
         g_vertices[g_received] = *vertex;
         if (s.layout.lit) {
@@ -270,25 +361,68 @@ static uint32_t wire_bytes(const WlGxDirectLayout *layout, bool *describable, ui
     return bytes;
 }
 
-static void wire_check(uint32_t sent) {
-    bool describable;
-    uint32_t indexes, read = wire_bytes(&s.layout, &describable, &indexes);
-
-    if (sent == read && describable) {
+// n vertices of `sent` bytes each against the `read` GX would take for each
+static void wire_note(uint32_t sent, uint32_t read, bool describable, uint32_t n) {
+    s.wire_bytes += (uint64_t)sent * n;
+    if ((sent == read && describable) || n == 0) {
         return;
     }
-    if (s.wire_mismatches++ == 0) {
+    if (s.wire_mismatches == 0) {
         s.wire_first_draw = s.stats.draws;
         s.wire_first_sent = sent;
         s.wire_first_read = describable ? read : 0;
         s.wire_first_layout = s.layout;
     }
+    s.wire_mismatches += n;
+}
+
+static void wire_check(uint32_t sent) {
+    bool describable;
+    uint32_t indexes, read = wire_bytes(&s.layout, &describable, &indexes);
+
+    wire_note(sent, read, describable, 1);
+}
+
+// the count-only mode's n vertices of `count` words each, sent as words (indexed: through indices, an
+// index for each indexed attribute and then the words while they last), counted and checked as the
+// decoding does vertex by vertex
+static void count_vertices(uint32_t n, uint32_t count, bool indexed) {
+    uint32_t sent, room;
+
+    if (!g_in_primitive || n == 0) {
+        return;
+    }
+    if (indexed) {
+        uint32_t direct = g_wire_read > g_wire_indexes * 2u ? (g_wire_read - g_wire_indexes * 2u) / 4u : 0;
+
+        sent = g_wire_indexes * 2u + 4u * (count < direct ? count : direct);
+        s.indexed_vertices += n;
+    } else {
+        sent = count * 4u;
+    }
+    wire_note(sent, g_wire_read, g_wire_describable, n);
+    if (!indexed && count < 3) {
+        return; // (no vertex made of fewer than a position's words)
+    }
+    room = g_expected - g_received;
+    g_received += n < room ? n : room;
 }
 
 void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
     WlGxDirectVertex v;
     uint32_t i = 3, n;
 
+    if (g_counting) {
+        if (g_in_primitive) {
+            if (g_bisect.pipe32) {
+                wl_gx_pipe_words(g_pipe, words, count);
+            } else {
+                wl_gx_pipe_words64(g_pipe, words, count);
+            }
+        }
+        count_vertices(1, count, false);
+        return;
+    }
     // (the words back into a vertex, by the layout, as the FIFO would read them)
     memset(&v, 0, sizeof v);
     if (g_in_primitive) {
@@ -348,6 +482,17 @@ void wl_gx_direct_vertex_words(const uint32_t *words, uint32_t count) {
 void wl_gx_direct_vertices_words(const uint32_t *const *vertices, uint32_t n, uint32_t count) {
     uint32_t v;
 
+    if (g_counting) {
+        if (g_in_primitive) {
+            if (g_bisect.pipe32) {
+                wl_gx_pipe_vertices(g_pipe, vertices, n, count);
+            } else {
+                wl_gx_pipe_vertices64(g_pipe, vertices, n, count);
+            }
+        }
+        count_vertices(n, count, false);
+        return;
+    }
     for (v = 0; v < n; v++) {
         wl_gx_direct_vertex_words(vertices[v], count);
     }
@@ -357,6 +502,17 @@ void wl_gx_direct_vertices_index(const uint32_t *indices, uint32_t base, uint32_
                                  uint32_t count) {
     uint32_t v;
 
+    if (g_counting) {
+        if (g_in_primitive) {
+            if (g_bisect.pipe32) {
+                wl_gx_pipe_vertices_index(g_pipe, g_order, g_order_count, indices, base, n, words, count);
+            } else {
+                wl_gx_pipe_vertices_index64(g_pipe, g_order, g_order_count, indices, base, n, words, count);
+            }
+        }
+        count_vertices(n, count, true);
+        return;
+    }
     for (v = 0; v < n; v++) {
         wl_gx_direct_vertex_index((uint16_t)(indices != NULL ? indices[v] - base : v), words, count);
     }
@@ -411,6 +567,25 @@ void wl_gx_direct_vertex_index(uint16_t index, const uint32_t *words, uint32_t c
     const uint8_t *e;
     uint32_t i = 0, n;
 
+    if (g_counting) {
+        if (g_in_primitive) {
+            WlHostPipe *pipe = g_pipe;
+            uint32_t left = count;
+            unsigned k;
+
+            for (k = 0; k < g_order_count; k++) {
+                if (g_order[k] == 0) {
+                    pipe->U16 = index;
+                    continue;
+                }
+                for (n = 0; n < g_order[k] && left != 0; n++, left--) {
+                    pipe->U32 = *words++;
+                }
+            }
+        }
+        count_vertices(1, count, true);
+        return;
+    }
     // (the vertex as GX would read it: an indexed attribute from its array, the others' words)
     memset(&v, 0, sizeof v);
     if (g_in_primitive) {
@@ -540,6 +715,22 @@ void wl_gx_direct_vertices_position_index(const uint32_t *indices, uint32_t base
                                           const uint32_t *const *vertices, uint32_t skip, uint32_t count) {
     uint32_t v;
 
+    if (g_counting) {
+        if (g_in_primitive) {
+            WlHostPipe *pipe = g_pipe;
+
+            for (v = 0; v < n; v++) {
+                pipe->U16 = (uint16_t)(indices != NULL ? indices[first + v] - base : first + v);
+                if (g_bisect.pipe32) {
+                    wl_gx_pipe_words(pipe, vertices[v] + skip, count);
+                } else {
+                    wl_gx_pipe_words64(pipe, vertices[v] + skip, count);
+                }
+            }
+        }
+        count_vertices(n, count, true);
+        return;
+    }
     for (v = 0; v < n; v++) {
         wl_gx_direct_vertex_index((uint16_t)(indices != NULL ? indices[first + v] - base : first + v), vertices[v] + skip,
                                   count);
@@ -557,6 +748,9 @@ void wl_gx_direct_primitive_end(void) {
     g_in_primitive = false;
     if (g_received != g_expected) {
         s.short_draws++;
+    }
+    if (g_counting) {
+        return; // (no vertices made: nothing to draw)
     }
     if (g_hook != NULL) {
         g_hook(g_hook_user, s.prim, g_vertices, g_received);

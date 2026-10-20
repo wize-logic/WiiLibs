@@ -21,6 +21,20 @@ there (not from dolphin-emu-nogui).
 
 What the program wrote to the card (a log file, a save) is in the run's copy of the card, which Dolphin
 writes back when the emulation stops; --sd-out DIR copies out of it what is new or changed since --sd.
+
+--stamp REGEX prints, at the end, the wall-clock second (from Dolphin's start) at which each OSREPORT line
+matching it first reached the log, and the seconds since the stamp before: the log is read four times a
+second while --stamp is given, so a stamp is at most about a quarter second late. Beside it, the same
+difference by Dolphin's own stamp on its log lines (the host's clock, to the millisecond, no poll in it):
+the number to compare. A recompiled title's
+clocks count emulated time (a capture bench's milliseconds are the same in every Dolphin setting), and a
+whole run's wall clock swings by ten seconds with the boot and the card's copy, so an unthrottled run of a
+fixed workload is timed by its own lines instead: the capture bench from its first frame to its summary,
+
+  tools/dolphin_run.py halo.dol --mmu --unthrottled --sd SD --stamp 'run 1 frame 0:|summary: [0-9]' ...
+
+(the bench's part: the summary's stamp less the first frame's), a play script by its step lines. A line
+that first appeared after the run's end (written as Dolphin closed) is marked so.
 """
 
 import argparse
@@ -599,6 +613,64 @@ class RunWatch:
         return ""
 
 
+# Dolphin's own stamp on a log line: the host's wall clock as minutes, seconds and milliseconds of the hour
+LOG_CLOCK = re.compile(r"^(\d+):(\d\d):(\d\d\d) ")
+
+
+class LineStamps:
+    """--stamp: the wall-clock second at which each log line matching `pattern` first appeared, counted from
+    `started`, and Dolphin's own stamp on it (its log's clock, to the millisecond: no poll in it). update() is
+    given the log's complete OSREPORT lines as Dolphin wrote them (complete_lines: a line still being written
+    is left for the next look) and the time; report() gives the lines to print"""
+
+    def __init__(self, pattern, started: float):
+        self.pattern, self.started = pattern, started
+        self.seen = 0
+        self.stamps = []  # (seconds, Dolphin's clock in seconds of the hour or None, line, after the run's end)
+
+    def update(self, lines, now: float, late: bool = False) -> None:
+        for raw in lines[self.seen:]:
+            line = raw.split("]: ", 1)[-1]
+            if self.pattern.search(line):
+                clock = LOG_CLOCK.match(raw)
+                at = int(clock[1]) * 60 + int(clock[2]) + int(clock[3]) / 1000 if clock else None
+                self.stamps.append((now - self.started, at, line, late))
+        self.seen = max(self.seen, len(lines))
+
+    def report(self):
+        out, before = [], None
+        for seconds, at, line, late in self.stamps:
+            since = ""
+            if before is not None:
+                since = f" (+{seconds - before[0]:.2f}"
+                if at is not None and before[1] is not None:
+                    since += f"; log clock +{(at - before[1]) % 3600:.3f}"
+                since += ")"
+            mark = " (after the run's end: at most)" if late else ""
+            out.append(f"stamp {seconds:8.2f} s{since}{mark}: {line}")
+            before = (seconds, at)
+        if len(self.stamps) >= 2:
+            first, last = self.stamps[0], self.stamps[-1]
+            span = f"stamps: {len(self.stamps)} lines, {last[0] - first[0]:.2f} s from the first to the last"
+            if first[1] is not None and last[1] is not None:
+                span += f" (Dolphin's log clock: {(last[1] - first[1]) % 3600:.3f} s)"
+            out.append(span)
+        elif not self.stamps:
+            out.append("stamps: no line matched --stamp")
+        return out
+
+
+def complete_lines(log: Path, whole: bool = False):
+    """the OSREPORT lines of the log as Dolphin wrote them (its stamp first), without a last line that is
+    still being written (unless `whole`: Dolphin has stopped)"""
+    if not log.exists():
+        return []
+    text = log.read_text(errors="replace")
+    if not whole and not text.endswith("\n"):
+        text = text[:text.rfind("\n") + 1]
+    return [line for line in text.splitlines() if "OSREPORT" in line]
+
+
 def osreport_lines(log: Path):
     if not log.exists():
         return []
@@ -657,6 +729,9 @@ def main() -> int:
     parser.add_argument("--config", action="append", default=[], metavar="SYSTEM.SECTION.KEY=VALUE",
                         help="a Dolphin setting for this run (Dolphin's -C), e.g. Dolphin.Core.RAMOverrideEnable=True; "
                              "repeatable")
+    parser.add_argument("--stamp", metavar="REGEX",
+                        help="print the wall-clock second (from Dolphin's start) at which each OSREPORT line matching "
+                             "this first appeared: an unthrottled bench timed by its own lines, not by the boot")
     parser.add_argument("--name", default="wl-dolphin", help="the work folder's name under %%TEMP%%")
     parser.add_argument("--break", dest="break_at", action="append", default=[], metavar="SYMBOL",
                         help="with --backtrace: stop there (exit, abort, a function); the backtrace is then "
@@ -745,7 +820,10 @@ def main() -> int:
     started = time.monotonic()
     deadline = started + args.seconds
     watch = RunWatch(fail, args.fail_grace, args.idle, started, deadline)
+    stamps = LineStamps(re.compile(args.stamp), started) if args.stamp else None
     while time.monotonic() < watch.deadline and process.poll() is None:
+        if stamps is not None:
+            stamps.update(complete_lines(log), time.monotonic())
         lines = osreport_lines(log)
         note = watch.update(lines, time.monotonic())
         if note:
@@ -757,8 +835,16 @@ def main() -> int:
             seen_until = True
             time.sleep(2)  # the frame after it reaches the screen
             break
-        time.sleep(1)
+        if stamps is not None:
+            # (four looks a second: a stamp a quarter second late at most)
+            for _ in range(4):
+                time.sleep(0.25)
+                stamps.update(complete_lines(log), time.monotonic())
+        else:
+            time.sleep(1)
 
+    if stamps is not None:
+        stamps.update(complete_lines(log), time.monotonic())
     exited = process.poll() is not None
     if exited and not seen_until:
         print(f"dolphin_run.py: Dolphin exited by itself after {time.monotonic() - started:.0f} s (the program "
@@ -836,6 +922,10 @@ def main() -> int:
         print(line)
     for line in dolphin_messages(log):
         print(f"dolphin: {line}")
+    if stamps is not None:
+        stamps.update(complete_lines(log, whole=True), time.monotonic(), late=True)
+        for line in stamps.report():
+            print(f"dolphin_run.py: {line}")
     # the wall-clock length: an unthrottled run of a fixed workload (a capture bench) is compared by it, since the
     # title's own clocks count emulated time and cannot see Dolphin's core mode or settings
     print(f"dolphin_run.py: the run took {time.monotonic() - started:.1f} s of wall-clock time")

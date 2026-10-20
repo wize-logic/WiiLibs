@@ -48,6 +48,9 @@ typedef struct WlHostGxDirect {
     // console the command processor then reads vertex data as commands, or commands as vertex data:
     // a hung GPU), and the first such vertex's draw (s.stats.draws then), layout, bytes sent and read
     uint32_t wire_mismatches, wire_first_draw, wire_first_sent, wire_first_read;
+    // the bytes of the vertices sent inside primitives (what the Wii's layer writes to the FIFO for them),
+    // counted alike in both modes (wl_host_gx_direct_count_only)
+    uint64_t wire_bytes;
     // primitives with each finding of wl_gx_check_draw (by its bit's number), in the state the Wii's
     // layer would give GX (wl_gx_direct_layout_outputs, the last TEV program, the maps loaded), and
     // the first such primitive (s.stats.draws then)
@@ -80,3 +83,12 @@ void wl_host_gx_direct_hook(void (*hook)(void *user, WlGxDirectPrim prim, const 
 // the vertex descriptor GX would hold (GX_GetVtxDescv's list), for a test of the flush before a
 // renderer's own vertex formats: the host has no GX_SetVtxDesc
 void wl_host_gx_direct_descriptor(const WlGxVtxDesc *desc, unsigned count);
+// The count-only mode: the vertices sent are counted (wire_bytes, stats, indexed_vertices, short_draws),
+// checked for shape (wire_mismatches) and written as the Wii's layer writes them to the FIFO (the same
+// loops, gx_pipe_words.h, into one word of memory), but not decoded back into WlGxDirectVertex, so no
+// hook or renderer is called and `vertices` is not kept. Decoding every vertex is a quarter of a ppc-be
+// count of a title where the Wii only writes the FIFO's words; in this mode the count is the Wii's work.
+// Off by default (gxsoft, the goldens and the tests read the vertices); on from the first primitive
+// when the environment has WL_XB_GXSTUB=count, or set here (a test). wl_host_gx_direct_reset keeps it.
+void wl_host_gx_direct_count_only(bool on);
+bool wl_host_gx_direct_counting(void);

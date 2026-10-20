@@ -165,6 +165,13 @@ static unsigned bits(uint32_t v) {
     return (unsigned)((((v + (v >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24);
 }
 
+// (a byte's bits: two nibbles looked up, cheaper than bits' arithmetic for the TEV's masks)
+static inline unsigned bits8(uint32_t v) {
+    static const uint8_t nibble[16] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
+
+    return (unsigned)nibble[v & 15u] + nibble[(v >> 4) & 15u];
+}
+
 void wl_tev_shadow_plan(const WlTevProgram *p, uint32_t flags, WlTevSend *out) {
     bool changes = (flags & WL_TEV_APPLY_CHANGES) != 0;
     uint32_t swaps_used = 0;
@@ -220,6 +227,7 @@ void wl_tev_shadow_plan(const WlTevProgram *p, uint32_t flags, WlTevSend *out) {
     for (i = 0; i < p->stage_count; i++) {
         const WlTevStage *now = &p->stages[i];
         WlTevStage moved;
+        uint8_t send;
 
         if (now->texmap < WL_GX_SHADOW_TEXMAPS && s.map_x[now->texmap] != 0) {
             // (the map its texture went to: gx_shadow.h's cache)
@@ -227,20 +235,28 @@ void wl_tev_shadow_plan(const WlTevProgram *p, uint32_t flags, WlTevSend *out) {
             moved.texmap = (uint8_t)(now->texmap ^ s.map_x[now->texmap]);
             now = &moved;
         }
-        calls += 8u;
-        out->stages[i] = changes ? stage_calls(now, &s.stages[i], (s.stages_known & (1u << i)) != 0)
-                                 : (uint8_t)WL_TEV_SEND_STAGE;
-        s.stages[i] = *now;
-        s.stages_known |= (uint16_t)(1u << i);
-        sent += bits(out->stages[i]);
+        send = changes ? stage_calls(now, &s.stages[i], (s.stages_known & (1u << i)) != 0)
+                       : (uint8_t)WL_TEV_SEND_STAGE;
+        out->stages[i] = send;
+        // (no call: the stage held is this one, byte for byte, stage_calls' every field compared)
+        if (send != 0) {
+            s.stages[i] = *now;
+            s.stages_known |= (uint16_t)(1u << i);
+            sent += bits8(send);
+        }
     }
+    calls += 8u * p->stage_count;
     s.maps_moved = false; // (the stages read the maps their textures are on)
-    sent += bits(out->swaps) + bits(out->konst) + bits(out->preload) + (out->stage_count ? 1u : 0u);
-    s.calls += calls;
-    s.sent += sent;
-    // (a stage's call one BP write; a swap table and a konst colour two, a preloaded register four:
-    // GX_SetTevColor writes its second half three times)
-    fifo_add(WL_GX_FIFO_TEV, BP_BYTES * (sent + bits(out->swaps) + bits(out->konst) + 3u * bits(out->preload)));
+    {
+        const unsigned swaps = bits8(out->swaps), konst = bits8(out->konst), preload = bits8(out->preload);
+
+        sent += swaps + konst + preload + (out->stage_count ? 1u : 0u);
+        s.calls += calls;
+        s.sent += sent;
+        // (a stage's call one BP write; a swap table and a konst colour two, a preloaded register four:
+        // GX_SetTevColor writes its second half three times)
+        fifo_add(WL_GX_FIFO_TEV, BP_BYTES * (sent + swaps + konst + 3u * preload));
+    }
 }
 
 bool wl_gx_shadow_tlut_differs(uint32_t slot, const void *entries, uint32_t bytes, uint8_t format) {

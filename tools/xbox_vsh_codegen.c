@@ -21,6 +21,7 @@
 // usage: xbox_vsh_codegen [--if-exists] [--accessor name] [--colors-positions] [--no-pairs]
 //            [--spill] [--no-forward] [--no-alias] [--no-weights]
 //            [--no-r12] [--no-sweep] [--no-splat] [--no-early] [--no-swap] [--no-fold]
+//            [--no-defaults] [--no-resident] [--no-rsq-half] [--no-dead-spills]
 //            [--fused forms.txt] microcode.inc output.c
 //            [table]
 //   (table: the name of the table, default xbox_vsh_natives, and of its count, <table>_count;
@@ -46,7 +47,14 @@
 //   --no-early: a fused loop's GX vertex address taken in its epilogue, a "w" form's world position
 //   kept in registers to the end (or stored to the output's scratch and copied), as before;
 //   --no-swap: a fused loop's hoisted loads the most counted that fit, none swapped for one that
-//   saves more, as before; --no-fold: a colour that is 0 made into its bytes as any other, as before))
+//   saves more, as before; --no-fold: a colour that is 0 made into its bytes as any other, as before;
+//   --no-defaults: a fused batch's default outputs stored to its scratch at each call though its
+//   epilogue never reads them, as before; --no-resident: a skinned fused loop's constants that the
+//   prefix does not read loaded at each vertex where they are not hoisted, not once at the prefix's
+//   end into a register the prefix alone borrows, as before; --no-rsq-half: RSQ's estimate for 0,
+//   infinity and NaN taken again from |x|, held over its steps, not from |x| / 2, as before;
+//   --no-dead-spills: a skinned form's prefix halves stored to the slot though no load reads them
+//   back, as before))
 
 #include "../wl/xbox/vsh.c"
 
@@ -1593,6 +1601,14 @@ int main(int argc, char **argv) {
             pr_swap_off = 1;
         } else if (strcmp(argv[1], "--no-fold") == 0) {
             pr_fold_off = 1;
+        } else if (strcmp(argv[1], "--no-defaults") == 0) {
+            pr_defaults_off = 1;
+        } else if (strcmp(argv[1], "--no-resident") == 0) {
+            pr_resident_off = 1;
+        } else if (strcmp(argv[1], "--no-rsq-half") == 0) {
+            pr_rsq_off = 1;
+        } else if (strcmp(argv[1], "--no-dead-spills") == 0) {
+            pr_dead_spills_off = 1;
         } else if (strcmp(argv[1], "--colors-positions") == 0) {
             colors_positions = 1;
         } else if (strcmp(argv[1], "--accessor") == 0 && argc > 2) {

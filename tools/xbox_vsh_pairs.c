@@ -34,6 +34,8 @@ typedef struct {
     int fetched;     /* (fused) an input made by the prologue, read from its register (pr_fetched_*) */
     int lane_of;     /* both lanes lane lane_of & 1 of value lane_of >> 1 (a ps_merge00 or 11 of it), + 1;
                         0: none */
+    int resident;    /* (fused, reused) a constant loaded at the prefix's end: its register the prefix's
+                        alone from the again label to there (pr_resident) */
 } PrValue;
 
 typedef struct {
@@ -108,6 +110,51 @@ static unsigned char pr_hoist_extra[PR_KEYS];
 not, as before: xbox_vsh_codegen --no-swap) */
 static int pr_swap_off;
 static long pr_loop_cost(void);
+static long pr_cost(int prefix);
+/* (fused, reused: a constant only the part after the prefix reads, loaded at the prefix's end, not
+before the loop, where the prefix runs (pr_resident[key]): its register is free from the again
+label to there, so the prefix's temporaries borrow it, and kept from there round the loop to the
+next prefix, which most vertices skip. pr_region: where the code being written runs (0 the
+prologue and the compare, 1 the prefix, 2 the rest); pr_key_regions: each key's (bit n: region n),
+from the counting pass. pr_resident_off: each such constant hoisted or loaded at each vertex, as
+before: xbox_vsh_codegen --no-resident) */
+static unsigned char pr_resident[PR_KEYS], pr_key_regions[PR_KEYS];
+static int pr_region, pr_resident_off;
+/* (RSQ's estimate for 0, infinity and NaN taken again from |x| / 2, not |x|: a register fewer over its
+steps. pr_rsq_off: from |x|, as before: xbox_vsh_codegen --no-rsq-half) */
+static int pr_rsq_off;
+/* (pr_spill: a half the prefix stores to the slot that no load reads back, once pr_sweep has taken out
+the loads nothing reads, left out. pr_dead_spills_off: stored, as before: xbox_vsh_codegen
+--no-dead-spills) */
+static int pr_dead_spills_off;
+
+static void pr_dead_spills(void) {
+    int n, k, kept = 0, at;
+    char load[32];
+
+    if (pr_dead_spills_off)
+        return;
+    for (n = 0; n < pr_body_count; n++) {
+        if (strncmp(pr_body[n].text, "psq_st @0, ", 11) != 0 || !strstr(pr_body[n].text, "(%[slot]), 0, 0") ||
+            (at = atoi(pr_body[n].text + 11)) < PR_SPILL_AT)
+            continue;
+        snprintf(load, sizeof(load), ", %d(%%[slot]), 0, 0", at);
+        for (k = 0; k < pr_body_count; k++)
+            if (strncmp(pr_body[k].text, "psq_l ", 6) == 0 && strstr(pr_body[k].text, load))
+                break;
+        if (k == pr_body_count)
+            pr_body[n].text[0] = 0;
+    }
+    for (n = 0; n < pr_body_count; n++)
+        if (pr_body[n].text[0])
+            pr_body[kept++] = pr_body[n];
+    pr_body_count = kept;
+}
+typedef struct {
+    int kind, offset;
+    char base[16];
+} PrKeyLoad;
+static PrKeyLoad pr_key_loads[PR_KEYS];
 
 /* the floats %[k] points at (wl_xbox_vsh_pairs_k in the generated file) */
 enum {
@@ -359,9 +406,15 @@ static int pr_load(int kind, const char *base, int offset, int hoistable) {
             k = pr_key_count++;
             snprintf(pr_keys[k], sizeof(pr_keys[k]), "%s", key);
             pr_key_uses[k] = 0;
+            pr_key_regions[k] = 0;
+            pr_key_loads[k].kind = kind;
+            pr_key_loads[k].offset = offset;
+            snprintf(pr_key_loads[k].base, sizeof(pr_key_loads[k].base), "%s", base);
         }
-        if (k >= 0 && pr_counting)
+        if (k >= 0 && pr_counting) {
             pr_key_uses[k] += pr_use_weight;
+            pr_key_regions[k] |= (unsigned char)(1u << pr_region);
+        }
         if (k >= 0 && !pr_counting && (k < pr_hoist_limit || pr_hoist_extra[k]))
             pre = 1;
     }
@@ -383,6 +436,41 @@ static int pr_load(int kind, const char *base, int offset, int hoistable) {
         pr_cache[pr_cache_count - 1].hoisted = 1;
     }
     return value;
+}
+
+/* (pr_resident: the constants loaded at the prefix's end, each kept as a hoisted one is) */
+static void pr_resident_loads(void) {
+    char key[sizeof(pr_cache[0].key)];
+    int k, value;
+
+    if (pr_counting || pr_resident_off)
+        return;
+    for (k = 0; k < pr_key_count; k++) {
+        const char *base = pr_key_loads[k].base;
+        int kind = pr_key_loads[k].kind, offset = pr_key_loads[k].offset;
+
+        if (!pr_resident[k])
+            continue;
+        value = pr_new();
+        pr_values[value].fresh = 0;
+        pr_values[value].resident = 1;
+        if (kind == 1) {
+            pr_op(0, 1, 1, &value, "lfs @0, %d(%s)", offset, base);
+            pr_values[value].splat = 1;
+        } else if (kind == 3) {
+            pr_op(0, 1, 1, &value, "lfd @0, %d(%s)", offset, base);
+        } else {
+            pr_op(0, 1, 1, &value, "psq_l @0, %d(%s), %d, 0", offset, base, kind == 2);
+        }
+        /* (a copy: a key of the table's, bounded as a cache's) */
+        memcpy(key, pr_keys[k], sizeof(key));
+        key[sizeof(key) - 1] = 0;
+        pr_remember(key, value);
+        if (pr_cache_count > 0 && pr_cache[pr_cache_count - 1].value == value) {
+            pr_cache[pr_cache_count - 1].needs = ~0u;
+            pr_cache[pr_cache_count - 1].hoisted = 1;
+        }
+    }
 }
 
 /* a value kept for later instructions (valid where the block it was made in runs) */
@@ -1243,7 +1331,9 @@ static void pr_ilu(const WlXboxVshInstruction *in, unsigned needed, PrLane resul
         values[0] = s;
         pr_op(0, 0, 1, values, "fcmpu 0, @0, @0");
         pr_text("bnu %s", done);
-        values[1] = a;
+        /* (from |x| / 2, which is 0, infinity or NaN where |x| is, so that |x| is not held over the
+        steps; but the least denormal, which halves to 0) */
+        values[1] = pr_rsq_off ? a : h;
         pr_op(0, 1, 2, values, "frsqrte @0, @1");
         pr_op(0, 1, 1, values, "frsp @0, @0");
         pr_place_label(done);
@@ -1843,6 +1933,25 @@ static void pr_liveness(const WlXboxVshProgram *program, const unsigned *needs, 
 
 /* (each output's components the instructions write, bit 3 x: pr_defaults') */
 static unsigned pr_written[8];
+/* (fused: the default stores of the outputs' fields, each its op in pr_body and its bytes in
+WlXboxVshOutput, so that a store the epilogue never loads back is left out (pr_defaults_finish);
+group: the "li 0"/"lis 0" op the stw's word came from, -1 for a psq_st. pr_defaults_off: every one
+stored at each call, as before: xbox_vsh_codegen --no-defaults) */
+enum { PR_DEFAULTS = 48 };
+static struct {
+    int op, offset, size, group;
+} pr_default_ops[PR_DEFAULTS];
+static int pr_default_count, pr_defaults_off;
+
+static void pr_default_op(const char *field, int component, int size, int group) {
+    if (!pr_fuse || pr_default_count >= PR_DEFAULTS)
+        return;
+    pr_default_ops[pr_default_count].op = pr_body_count - 1;
+    pr_default_ops[pr_default_count].offset = pr_field_offset(field) + 4 * component;
+    pr_default_ops[pr_default_count].size = size;
+    pr_default_ops[pr_default_count].group = group;
+    pr_default_count++;
+}
 
 /* the outputs' components no instruction writes, as live_defaults */
 static void pr_defaults(const WlXboxVshProgram *program) {
@@ -1872,6 +1981,7 @@ static void pr_defaults(const WlXboxVshProgram *program) {
             written[4 + in->output_address - _output_t0] |= in->output_mask;
     }
     memcpy(pr_written, written, sizeof(pr_written));
+    pr_default_count = 0;
     /* (two lanes at once: (0, 0) and (0, 1) as pairs; a lane alone from r0) */
     {
         int pairs[2], values[1];
@@ -1883,6 +1993,7 @@ static void pr_defaults(const WlXboxVshProgram *program) {
                 if (!(written[which] & (0xcu >> component))) {
                     values[0] = pairs[component == 2];
                     pr_op(0, 0, 1, values, "psq_st @0, %s+%d(%%[o]), 0, 0", names[which], 4 * component);
+                    pr_default_op(names[which], component, 8, -1);
                     written[which] |= 0xcu >> component;
                 }
         if (!captured) {
@@ -1892,7 +2003,7 @@ static void pr_defaults(const WlXboxVshProgram *program) {
         }
     }
     for (one = 0; one < 2; one++) {
-        int first = 1;
+        int first = 1, group = -1;
 
         for (which = 0; which < 8 + 2; which++)
             for (component = 0; component < 4; component++) {
@@ -1902,15 +2013,46 @@ static void pr_defaults(const WlXboxVshProgram *program) {
 
                 if (!wanted)
                     continue;
-                if (first)
+                if (first) {
                     pr_text(one ? "lis 0, 0x3f80" : "li 0, 0");
+                    group = pr_body_count - 1;
+                }
                 first = 0;
-                if (which < 8)
+                if (which < 8) {
                     pr_text("stw 0, %s+%d(%%[o])", names[which], 4 * component);
-                else
+                    pr_default_op(names[which], component, 4, group);
+                } else
                     pr_text("stw 0, %s(%%[o])", which == 8 ? "%[ofog]" : "%[ocaptured]");
             }
     }
+}
+
+/* (fused, once the epilogue is written: the default stores whose bytes it never loads left out, and
+a group's "li 0" or "lis 0" with its last stw; before pr_forward_finish, which takes the ops out) */
+static void pr_defaults_finish(void) {
+    int n, b, g;
+
+    if (pr_defaults_off)
+        return;
+    for (n = 0; n < pr_default_count; n++) {
+        int read = 0;
+
+        for (b = pr_default_ops[n].offset; b < pr_default_ops[n].offset + pr_default_ops[n].size; b++)
+            read |= b >= (int)sizeof(pr_forward_read) || pr_forward_read[b];
+        if (!read)
+            pr_body[pr_default_ops[n].op].text[0] = 0;
+    }
+    for (n = 0; n < pr_default_count; n++) {
+        int kept = 0;
+
+        if ((g = pr_default_ops[n].group) < 0 || !pr_body[g].text[0])
+            continue;
+        for (b = 0; b < pr_default_count; b++)
+            kept |= pr_default_ops[b].group == g && pr_body[pr_default_ops[b].op].text[0];
+        if (!kept)
+            pr_body[g].text[0] = 0;
+    }
+    pr_default_count = 0;
 }
 
 /* ---- fused batches (WlXboxVshFusedProc) ----
@@ -2795,6 +2937,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
 
     pr_value_count = pr_pre_count = pr_body_count = pr_cache_count = 0;
     pr_prefix_first = pr_prefix_end = 0;
+    pr_region = 0;
     pr_failed = 0;
     pr_label = 0;
     pr_ra_key[0] = 0;
@@ -2949,6 +3092,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         pr_place_label(again);
         pr_use_weight = pr_weighted ? 2 : 4;
         pr_prefix_first = pr_body_count;
+        pr_region = 1;
         if (pr_raw_on) {
             /* (what the prologue loaded is not there for the first vertex, which comes from the
             other) */
@@ -2991,7 +3135,9 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
                         pr_op(0, 0, 1, values, "psq_st @0, %d(%%[slot]), 0, 0", PR_SPILL_AT + 8 * spilled++);
                     }
         }
+        pr_resident_loads();
         pr_place_label(made);
+        pr_region = 2;
         if (pr_early) {
             pr_text("lwz %%[ad], 0*%%[ptr](%%[w])");
             pr_text("addi %%[w], %%[w], %%[ptr]");
@@ -3106,6 +3252,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
             pr_world_values[1] = pr_half(program->world.temporary, 1);
         }
         pr_fused_epilogue();
+        pr_defaults_finish();
         pr_forward_finish();
         /* (the inputs' two sets swapped: this vertex's are the vertex before's; not when the
         prefix's compare reads the copied bytes, and nothing reads the vertex before's inputs) */
@@ -3118,6 +3265,8 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         pr_fused_end();
         if (!pr_failed)
             pr_sweep();
+        if (!pr_failed && pr_spill)
+            pr_dead_spills();
         return !pr_failed;
     }
     pr_defaults(program);
@@ -3276,10 +3425,49 @@ static void pr_sweep(void) {
 }
 
 /* registers for the values (a linear scan); 0 when there are too few */
+/* (pr_allocate with resident values: each register's positions held, a bit each, and a value given
+the first register none of its positions is held in: a resident one holds its register but from the
+again label to its load) */
+static int pr_allocate_holes(const int *order, int count, unsigned *used, int loop_start, int end) {
+    enum { WORDS = (2 * PR_OPS + 1 + 63) / 64 };
+    static unsigned long long held[32][WORDS];
+    int n, k, w;
+
+    if (end + 1 > 64 * WORDS)
+        return 0;
+    memset(held, 0, sizeof(held));
+    *used = 0;
+    for (n = 0; n < count; n++) {
+        PrValue *v = &pr_values[order[n]];
+        unsigned long long mine[WORDS];
+        int from = v->first, to = v->loop || v->resident ? end + 1 : v->last > v->first ? v->last : v->first + 1, b;
+
+        memset(mine, 0, sizeof(mine));
+        for (b = from; b < to; b++)
+            mine[b >> 6] |= 1ull << (b & 63);
+        if (v->resident)
+            for (b = loop_start; b < loop_start + pr_prefix_first; b++)
+                mine[b >> 6] |= 1ull << (b & 63);
+        for (k = 0; k < 32; k++) {
+            for (w = 0; w < WORDS && !(held[k][w] & mine[w]); w++)
+                ;
+            if (w == WORDS)
+                break;
+        }
+        if (k == 32)
+            return 0;
+        for (w = 0; w < WORDS; w++)
+            held[k][w] |= mine[w];
+        v->phys = k;
+        *used |= 1u << k;
+    }
+    return 1;
+}
+
 static int pr_allocate(unsigned *used) {
     static int order[PR_VALUES];
     int position = 0, n, k, count = 0, loop_start = pr_pre_count, end = pr_pre_count + pr_body_count;
-    int busy[32];
+    int busy[32], residents = 0;
 
     for (n = 0; n < pr_value_count; n++) {
         pr_values[n].first = pr_values[n].last = -1;
@@ -3308,6 +3496,19 @@ static int pr_allocate(unsigned *used) {
             v->last = end;
         }
     }
+    for (n = 0; n < pr_value_count; n++) {
+        if (pr_values[n].resident) {
+            PrValue *v = &pr_values[n];
+
+            /* (never a web's: pr_adopt copies a value the cache holds as hoisted) */
+            if (pr_root(n) != n)
+                return 0;
+            if (v->first < 0)
+                continue;
+            v->last = end;
+            residents = 1;
+        }
+    }
     for (n = 0; n < pr_value_count; n++)
         if (pr_root(n) == n && pr_values[n].first >= 0)
             order[count++] = n;
@@ -3319,6 +3520,8 @@ static int pr_allocate(unsigned *used) {
             order[k] = order[k - 1];
         order[k] = v;
     }
+    if (residents)
+        return pr_allocate_holes(order, count, used, loop_start, end);
     for (k = 0; k < 32; k++)
         busy[k] = -1;
     *used = 0;
@@ -3364,6 +3567,7 @@ static int pr_program_once(const WlXboxVshProgram *program, const unsigned *need
     pr_counting = 1;
     pr_hoist_limit = 0;
     memset(pr_hoist_extra, 0, sizeof(pr_hoist_extra));
+    memset(pr_resident, 0, sizeof(pr_resident));
     if (!pr_generate(program, needs, reused, prefix, &compares)) {
         pr_counting = 0;
         return 0;
@@ -3372,14 +3576,20 @@ static int pr_program_once(const WlXboxVshProgram *program, const unsigned *need
     for (n = 1; n < pr_key_count; n++) {
         char key[80];
         int uses = pr_key_uses[n];
+        unsigned char regions = pr_key_regions[n];
+        PrKeyLoad load = pr_key_loads[n];
 
         snprintf(key, sizeof(key), "%s", pr_keys[n]);
         for (k = n; k > 0 && pr_key_uses[k - 1] < uses; k--) {
             memcpy(pr_keys[k], pr_keys[k - 1], sizeof(pr_keys[k]));
             pr_key_uses[k] = pr_key_uses[k - 1];
+            pr_key_regions[k] = pr_key_regions[k - 1];
+            pr_key_loads[k] = pr_key_loads[k - 1];
         }
         memcpy(pr_keys[k], key, sizeof(key));
         pr_key_uses[k] = uses;
+        pr_key_regions[k] = regions;
+        pr_key_loads[k] = load;
     }
     for (limit = pr_key_count; limit >= 0; limit--) {
         pr_hoist_limit = limit;
@@ -3436,6 +3646,49 @@ static int pr_program_once(const WlXboxVshProgram *program, const unsigned *need
         if (!(pr_generate(program, needs, reused, prefix, &compares) && pr_allocate(&used)))
             return 0;
     }
+    if (pr_fuse && reused && !pr_resident_off && pr_prefix_first < pr_prefix_end && pr_key_count > 0) {
+        /* (pr_resident: each constant only the rest reads, not hoisted, loaded at the prefix's end where
+        the registers allow it; then each hoisted one only the prefix reads loaded where the prefix runs,
+        so that one of those has its register: cheaper by pr_cost with the prefix's ops three sixteenths,
+        about the share of a skinned mesh's vertices that run it) */
+        long best, cost;
+        int i, j;
+
+        for (n = 0; n < pr_key_count; n++)
+            pr_hoist_extra[n] = (unsigned char)(n < pr_hoist_limit || pr_hoist_extra[n]);
+        pr_hoist_limit = 0;
+        if (!(pr_generate(program, needs, reused, prefix, &compares) && pr_allocate(&used)))
+            return 0;
+        best = pr_cost(3);
+        for (j = 0; j < pr_key_count; j++) {
+            if (pr_hoist_extra[j] || pr_key_regions[j] != 4)
+                continue;
+            pr_resident[j] = 1;
+            if (pr_generate(program, needs, reused, prefix, &compares) && pr_allocate(&used) && (cost = pr_cost(3)) < best)
+                best = cost;
+            else
+                pr_resident[j] = 0;
+        }
+        for (i = 0; i < pr_key_count; i++) {
+            if (!pr_hoist_extra[i] || pr_key_regions[i] != 2)
+                continue;
+            for (j = 0; j < pr_key_count; j++) {
+                if (pr_hoist_extra[j] || pr_resident[j] || pr_key_regions[j] != 4)
+                    continue;
+                pr_hoist_extra[i] = 0;
+                pr_resident[j] = 1;
+                if (pr_generate(program, needs, reused, prefix, &compares) && pr_allocate(&used) &&
+                    (cost = pr_cost(3)) < best) {
+                    best = cost;
+                    break;
+                }
+                pr_hoist_extra[i] = 1;
+                pr_resident[j] = 0;
+            }
+        }
+        if (!(pr_generate(program, needs, reused, prefix, &compares) && pr_allocate(&used)))
+            return 0;
+    }
     pr_used = used;
     return 1;
 }
@@ -3450,6 +3703,20 @@ static long pr_loop_cost(void) {
 
         if (length && pr_body[n].text[length - 1] != ':')
             cost += n >= pr_prefix_first && n < pr_prefix_end ? 2 : 4;
+    }
+    return cost;
+}
+
+/* (the same with a reused prefix's ops weighing prefix in 16ths of the rest's) */
+static long pr_cost(int prefix) {
+    long cost = 0;
+    int n;
+
+    for (n = 0; n < pr_body_count; n++) {
+        size_t length = strlen(pr_body[n].text);
+
+        if (length && pr_body[n].text[length - 1] != ':')
+            cost += n >= pr_prefix_first && n < pr_prefix_end ? prefix : 16;
     }
     return cost;
 }

@@ -110,6 +110,17 @@ A title's own knowledge is data, passed with --config (JSON; relative paths are 
                                              call and back after it (the default true moves only the
                                              slots a callee given no frame address can reach: below
                                              the end of its arguments; patch 0039)
+      "stack_icall": false,                  with stack_locals: esp is lost after an indirect call the
+                                             caller does not clean up after (the default true takes it
+                                             back where the arguments started, as a callee cleaning
+                                             them leaves it, and keeps the function only when every
+                                             return bears that out; patch 0041)
+      "stack_align": false,                  with stack_locals: esp is lost at `and esp, -2^k` (the
+                                             default true names the slots below the aligned esp from a
+                                             second base; patch 0041)
+      "stack_alloca": false,                 with stack_locals: esp is lost at a call to the alloca
+                                             probe (the default true moves it by the constant eax the
+                                             call is given; patch 0041)
       "hot_functions": "hot.txt" or ["sub_00052520", "0x00088B80"],   the functions compiled at
                                              -O2 (tu/recomp_tu_hot.c); a file is read for its
                                              sub_XXXXXXXX names and 0x addresses (a profile report
@@ -395,6 +406,12 @@ class Run:
                 rcmd.append("--stack-deltas")
             if c.get("stack_reach", True):
                 rcmd.append("--stack-reach")
+            if c.get("stack_icall", True):
+                rcmd.append("--stack-icall")
+            if c.get("stack_align", True):
+                rcmd.append("--stack-align")
+            if c.get("stack_alloca", True):
+                rcmd.append("--stack-alloca")
         rin = [self.xbe, functions, disasm / "labels.json", func_id / "identified_functions.json", abi]
         if c.get("icall_sites"):
             rcmd += ["--icall-sites", str(self.cfg_path(c["icall_sites"]))]
@@ -624,7 +641,8 @@ def load_config(path):
              "coalesce_functions", "trace_functions", "split", "disasm_args", "func_id_args",
              "abi_args", "recomp_args", "icall_sites", "patches", "comment", "vertex_programs", "x87_locals",
              "reg_locals", "mem_disp", "stack_disp", "keep_preserved", "bounded_loops", "rodata_consts",
-             "callee_regs", "x87_balanced", "stack_locals", "stack_deltas", "stack_reach", "hot_functions"}
+             "callee_regs", "x87_balanced", "stack_locals", "stack_deltas", "stack_reach", "stack_icall", "stack_align",
+             "stack_alloca", "hot_functions"}
     unknown = sorted(set(cfg) - known)
     if unknown:
         raise Failure(f"{path}: unknown keys {unknown} (known: {sorted(known)})")

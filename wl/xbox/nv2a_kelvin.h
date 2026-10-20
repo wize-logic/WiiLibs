@@ -44,7 +44,9 @@ enum {
     WL_NV2A_DIRTY_RASTER = 1u << 1, // blend, depth, alpha test, cull, masks, stencil, fog
     WL_NV2A_DIRTY_COMBINERS = 1u << 2,
     WL_NV2A_DIRTY_TEXTURES = 1u << 3,
-    WL_NV2A_DIRTY_PROGRAM = 1u << 4,
+    // the vertex arrays' formats (set with WL_NV2A_DIRTY_ARRAYS, which an array's offset or a vertex DMA
+    // sets alone): the arrays' layout compares its formats only then (wl_nv2a_set_fetch_cuts)
+    WL_NV2A_DIRTY_ARRAY_FORMATS = 1u << 4,
     WL_NV2A_DIRTY_CONSTANTS = 1u << 5,
     WL_NV2A_DIRTY_VIEWPORT = 1u << 6,
     WL_NV2A_DIRTY_ARRAYS = 1u << 7,
@@ -52,7 +54,9 @@ enum {
     // what the pixel program is made from (wl_nv2a_psh_words and wl_nv2a_psh_textures read): the
     // combiners and their stage programs, the fog's switch and colour
     WL_NV2A_DIRTY_PIXEL = 1u << 9,
-    WL_NV2A_DIRTY_ALL = 0x3FFu
+    // (above the groups the method table gives, bits 0-9: the program's changes are set where they are made)
+    WL_NV2A_DIRTY_PROGRAM = 1u << 10,
+    WL_NV2A_DIRTY_ALL = 0x7FFu
 };
 
 struct WlNv2aKelvin {
@@ -90,6 +94,9 @@ struct WlNv2aKelvin {
     } layout[WL_NV2A_ATTRIBS];
     uint32_t layout_formats[WL_NV2A_ATTRIBS];
     uint8_t layout_count, layout_ok;
+    // (the layout's dirty groups, WL_NV2A_DIRTY_ARRAYS and _ARRAY_FORMATS, kept over a draw that made no
+    // layout, an inline or immediate one, for the next draw of arrays: wl_nv2a_set_fetch_cuts)
+    uint8_t layout_dirty;
 };
 
 // a method's word, and as a float
@@ -197,6 +204,10 @@ enum { WL_NV2A_PREFETCH_AREAS = 2 };
 typedef struct WlNv2aFetchPlan {
     uint8_t source; // WL_NV2A_SOURCE_*
     uint8_t count;  // streamed attributes
+    // (the streamed attributes' formats in order, when they are one of the fetch's own sets of one
+    // stride: a vertex's attributes fetched together, its element's offset found once (0: an
+    // attribute at a time); wl_nv2a_set_fetch_cuts)
+    uint8_t rows;
     struct {
         const uint8_t *data; // vertex 0's (ARRAYS: index index_base's; INLINE: the first vertex's)
         uint32_t stride;
@@ -259,6 +270,13 @@ void wl_nv2a_set_push_cuts3(bool on);
 // word at a time; false: as wave 4 left them (a file "oldpush4", WL_XB_OLDPUSH4), for an A/B. What is
 // fetched and drawn is the same, to the bit.
 void wl_nv2a_set_push_cuts4(bool on);
+// true (the default): a draw's vertices fetched a vertex at a time with its attributes together when
+// their formats are one of the fetch's sets of one stride (the skinned positions and vertices, the
+// element's offset found once, the index read straight into it), and the arrays' formats compared
+// only when one of them was written (WL_NV2A_DIRTY_ARRAY_FORMATS), the layout's dirty groups kept
+// over a draw without arrays; false: as wave 5 left them (a file "oldfetch", WL_XB_OLDFETCH), for an
+// A/B. What is fetched and drawn is the same, to the bit.
+void wl_nv2a_set_fetch_cuts(bool on);
 static inline bool wl_nv2a_prefetching(void) {
     return WL_NV2A_PREFETCHES && wl_nv2a_prefetch_on;
 }
