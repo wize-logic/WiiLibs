@@ -51,10 +51,10 @@ index 23c9c12..634ff27 100644
      for name, fn in sorted(globals().items()):
          if name.startswith("test_"):
 diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
-index b11e048..39a1e7c 100644
+index 21017e1..5e47d18 100644
 --- a/tools/recomp/x87_locals.py
 +++ b/tools/recomp/x87_locals.py
-@@ -753,18 +753,26 @@ _SIMD_GLOBALS = frozenset("g_" + r for r in _SIMD_REGS)
+@@ -752,18 +752,26 @@ _SIMD_GLOBALS = frozenset("g_" + r for r in _SIMD_REGS)
  _REG_KEPT = frozenset(("g_ebx", "g_esi", "g_edi"))  # the registers a call may give back
  
  
@@ -84,7 +84,7 @@ index b11e048..39a1e7c 100644
              ends.add(x)
      return ends
  
-@@ -776,7 +784,7 @@ def _flow(nodes, labels, plan, x87=True, regs=False, skip=frozenset()):
+@@ -775,7 +783,7 @@ def _flow(nodes, labels, plan, x87=True, regs=False, skip=frozenset()):
      rewrites, positions, scalars = {}, set(), set()
      end_state = [None]
      work = []

@@ -38,293 +38,29 @@ otherwise held every lane they wrote live around the whole loop.
 The same expressions
 compute the same values; only the loads and stores go away.
 ---
+ tools/recomp/__main__.py        |   2 +-
+ tools/recomp/test_reg_locals.py |  57 ++++++++++++++++
+ tools/recomp/x87_locals.py      | 117 ++++++++++++++++++++++++++------
+ 3 files changed, 153 insertions(+), 23 deletions(-)
 
-diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
---- a/tools/recomp/x87_locals.py
-+++ b/tools/recomp/x87_locals.py
-@@ -100,16 +100,26 @@
-     "g_fp_cmp": ("cmp", "int"),
-     "g_fp_cc": ("cc", "uint16_t"),
- }
--# The integer registers the generated code keeps in globals (`eax` is a macro
--# for g_eax; ebp is already a local of each function).
-+# The registers the generated code keeps in globals (`eax` is a macro for
-+# g_eax; ebp is already a local of each function): the integer registers, and
-+# the SSE and MMX registers (`xmm0` for g_xmm0, `mm0` for g_mm0), unions the
-+# header's XMM_*/MMX_* helpers take and return by value. In globals, every
-+# SIMD operation stored its result and the next one loaded it again (a guest
-+# store may alias them), which was most of the code of SSE and MMX loops.
- _REGS = ("eax", "ecx", "edx", "ebx", "esp", "esi", "edi")
-+_SIMD_REGS = tuple("xmm%d" % i for i in range(8)) + tuple("mm%d" % i for i in range(8))
- _REG_SCALARS = {"g_" + r: (r, "uint32_t") for r in _REGS}
-+_REG_SCALARS.update({"g_" + r: (r, "RecompXmm" if r.startswith("x") else "RecompMmx")
-+                     for r in _SIMD_REGS})
-+_REG_ALT = "eax|ecx|edx|ebx|esp|esi|edi|xmm[0-7]|mm[0-7]"
- _SCALARS = dict(_X87_SCALARS, **_REG_SCALARS)
- # Macros that assign to a register passed to them (the argument positions).
--_REG_WRITERS = {"SET_LO8": (0,), "SET_HI8": (0,), "SET_LO16": (0,), "PUSH32": (0,), "POP32": (0, 1)}
-+_REG_WRITERS = {"SET_LO8": (0,), "SET_HI8": (0,), "SET_LO16": (0,), "PUSH32": (0,), "POP32": (0, 1),
-+                "XMM_LOAD_LOW": (0,), "XMM_LOAD_HIGH": (0,)}
- # All-capitals macros that only read the registers passed to them. A register
- # passed to any other all-capitals name counts as written (a lower-case name is
--# a function: its arguments are values).
-+# a function: its arguments are values), except the SIMD helpers (XMM_*,
-+# MMX_*): they take their operands by value, and only _REG_WRITERS' assign one.
- _REG_READERS = frozenset("""
-     MEM8 MEM16 MEM32 MEM64 SMEM8 SMEM16 SMEM32 SMEM64 MEMF MEMD MEMF_SET MEMD_SET XBOX_PTR
-     LO8 HI8 LO16 SX8 SX16 ZX8 ZX16
-@@ -132,7 +142,7 @@
-     r"|\(\s*g_fp_top\s*&\s*7u?\s*\)"
-     r"|\bRECOMP_FP_PC\s*\("
-     r"|\b(?P<sc>g_fp_control_word|g_fp_cmp|g_fp_cc)\b"
--    r"|\b(?:g_)?(?P<rg>eax|ecx|edx|ebx|esp|esi|edi)\b")
-+    r"|\b(?:g_)?(?P<rg>" + _REG_ALT + r")\b")
- _WRITE_AFTER = re.compile(r"\s*(=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)")
- _WRITE_BEFORE = re.compile(r"(\+\+|--)\s*$")
- _CONTROL = re.compile(r"\b(if|else|for|while|do|switch|case|default|goto|return|break|continue)\b"
-@@ -268,7 +278,7 @@
-         if name in _KEYWORDS or name in _TRANSPARENT or name in _FP_MACROS:
-             continue
-         if name.startswith(("XMM_", "MMX_")):
--            continue  # the header's inline SIMD helpers: guest memory and g_xmm*/g_mm* only
-+            continue  # the header's inline SIMD helpers: guest memory and their operands only
-         names.add(name)
-     return names
- 
-@@ -285,13 +295,20 @@
-     return X87_LOCALS_PREFIX + _SCALARS[g][0]
- 
- 
--_REG_TOKEN = re.compile(r"\b(?:g_)?(eax|ecx|edx|ebx|esp|esi|edi)\b")
-+_REG_TOKEN = re.compile(r"\b(?:g_)?(" + _REG_ALT + r")\b")
-+# A member or lane of a SIMD register (xmm0.f[0], mm1.q): assigning it assigns
-+# the register.
-+_MEMBER = re.compile(r"(?:\s*\.\s*\w+(?:\s*\[[^\]]*\])*)+")
- 
- 
- def _reg_written(text, start, end):
-     """Whether the register token text[start:end] may be assigned: an
--    assignment or ++/-- on it, or an argument of a macro that may assign it
--    (looked for through grouping parentheses, casts and subscripts)."""
-+    assignment or ++/-- on it (or on one of its members), or an argument of a
-+    macro that may assign it (looked for through grouping parentheses, casts
-+    and subscripts)."""
-+    member = _MEMBER.match(text, end)
-+    if member:
-+        end = member.end()
-     if _WRITE_AFTER.match(text, end) or _WRITE_BEFORE.search(text[:start]):
-         return True
-     depth, arg, i = 0, 0, start - 1
-@@ -309,7 +326,7 @@
-             if name and name not in _KEYWORDS:
-                 if name in _REG_WRITERS:
-                     return arg in _REG_WRITERS[name]
--                if name in _REG_READERS or not name.isupper():
-+                if name in _REG_READERS or not name.isupper() or name.startswith(("XMM_", "MMX_")):
-                     return False
-                 return True  # an unknown macro: it may assign its argument
-             arg = 0  # a grouping: the expression it is part of is an argument further out
-@@ -319,16 +336,16 @@
- 
- def _unary_amp_reg(code):
-     """A register (or x87 state) whose address is taken."""
--    for m in re.finditer(r"(?<!&)&(?!&)\s*(?:g_)?(eax|ecx|edx|ebx|esp|esi|edi|fp_\w+|g_fp_\w+)\b", code):
-+    for m in re.finditer(r"(?<!&)&(?!&)\s*\(?\s*(?:g_)?(" + _REG_ALT + r"|fp_\w+|g_fp_\w+)\b", code):
-         prev = code[:m.start()].rstrip()
-         if not prev or not (prev[-1].isalnum() or prev[-1] in "_)]"):
-             return True
-     return False
- 
- 
--def _rewrite(code, k, x87=True, regs=False):
-+def _rewrite(code, k, x87=True, regs=False, skip=frozenset()):
-     """Rewrite one statement line at static depth k (x87: the stack and its
--    scalars; regs: the integer registers).
-+    scalars; regs: the integer and SIMD registers).
- 
-     Returns (code, k_out, written positions, read positions, scalars written,
-     scalars used) or None when the line has to run against memory."""
-@@ -349,6 +366,10 @@
-                 return "".join(out), k
-             out.append(text[i:m.start()])
-             tok = m.group(0)
-+            if m.group("rg") and m.group("rg") in skip:
-+                out.append(tok)  # this register stays in its global
-+                i = m.end()
-+                continue
-             if m.group("rg"):
-                 if not regs:
-                     out.append(tok)
-@@ -528,7 +549,7 @@
- 
- def localise_x87(lines, macros, undefs, x87=True, regs=False):
-     """lines: one function as translate_function emits it. Returns (lines,
--    None) with the x87 state (x87) and the integer registers (regs) in locals,
-+    None) with the x87 state (x87) and the registers (regs) in locals,
-     or (lines unchanged, reason)."""
-     try:
-         return _localise(lines, macros, undefs, x87, regs), None
-@@ -544,6 +565,29 @@
-     except ValueError:
-         return None
-     return (lo, hi) if lo <= hi else None
-+
-+
-+_SIMD_TOKEN = re.compile(r"\b(?:g_)?(xmm[0-7]|mm[0-7])\b")
-+
-+
-+def _simd_kept_in_memory(text):
-+    """The SIMD registers a body first names other than by assigning the whole
-+    register (xmm0 = ...): read, written in part (a lane, XMM_LOAD_HIGH) or
-+    passed on. In a local, such a register would be loaded where the body
-+    starts and its lanes held until the write-back, through every guest
-+    access, for a few operations on it; it stays in its global instead. A
-+    register first assigned whole costs nothing to load: the load is dead."""
-+    first = {}
-+    for line in text.splitlines():
-+        code = _protect(line)[0]
-+        for m in _SIMD_TOKEN.finditer(code):
-+            name = m.group(1)
-+            if name not in first:
-+                rhs = re.match(r"\s*=(?!=)([^;]*)", code[m.end():])
-+                first[name] = (re.match(r"\s*$|.*[;{}]\s*$", code[:m.start()]) is not None
-+                               and rhs is not None
-+                               and not re.search(r"\b(?:g_)?%s\b" % name, rhs.group(1)))
-+    return frozenset(name for name, whole in first.items() if not whole)
- 
- 
- def _localise(lines, macros, undefs, x87=True, regs=False):
-@@ -558,6 +602,7 @@
-         raise _NotLocal("the names are taken")
-     nodes = _nodes(lines, lo, hi)
-     labels = {n.label: x for x, n in enumerate(nodes) if n.kind == "label"}
-+    skip = _simd_kept_in_memory(text) if regs else frozenset()
- 
-     # classify
-     for n in nodes:
-@@ -565,7 +610,7 @@
-             continue
-         fp = x87 and bool(_LEFTOVER.search(n.code) or re.search(
-             r"\b(RECOMP_FP_PC|g_fp_control_word|g_fp_cmp|g_fp_cc)\b", n.code))
--        rg = regs and bool(_REG_TOKEN.search(n.code))
-+        rg = regs and any(m.group(1) not in skip for m in _REG_TOKEN.finditer(n.code))
-         n.x87 = fp
-         calls = _calls(n.code)
-         leaves = bool(re.search(r"\breturn\b", n.code))
-@@ -588,14 +633,14 @@
- 
-     # Statements this pass cannot rewrite run against memory.
-     for n in nodes:
--        if n.kind == "fp" and _rewrite(n.code, 0, x87, regs) is None:
-+        if n.kind == "fp" and _rewrite(n.code, 0, x87, regs, skip) is None:
-             if n.gotos:
-                 raise _NotLocal("a goto in a statement this pass cannot rewrite")
-             n.kind = "sync"
-         elif n.kind == "rregion":
-             parts = []
-             for li in range(n.first, n.last + 1):
--                r = _rewrite(_protect(lines[li])[0], 0, False, regs)
-+                r = _rewrite(_protect(lines[li])[0], 0, False, regs, skip)
-                 if r is None:
-                     break
-                 parts.append(r)
-@@ -611,7 +656,7 @@
-     plan = _Plan()
-     while True:
-         try:
--            flow = _flow(nodes, labels, plan, x87, regs)
-+            flow = _flow(nodes, labels, plan, x87, regs, skip)
-             break
-         except _Restart:
-             continue
-@@ -668,13 +713,33 @@
-     return out
- 
- 
--def _flow(nodes, labels, plan, x87=True, regs=False):
-+_SIMD_GLOBALS = frozenset("g_" + r for r in _SIMD_REGS)
-+
-+
-+def _block_ends(nodes):
-+    """The statements that end a straight run of code: the next node is a
-+    label or branches. A SIMD register written in the run is written back
-+    there, not held to the next call or return: a few SSE operations inside a
-+    scalar loop otherwise kept the lanes of every register they wrote live
-+    around the whole loop (spilled), and the next write of the register is
-+    usually a whole one, which needs nothing of the old value."""
-+    ends = set()
-+    for x, n in enumerate(nodes[:-1]):
-+        nxt = nodes[x + 1]
-+        if (n.kind in ("fp", "rregion", "plain") and not n.gotos and not n.terminal
-+                and (nxt.kind == "label" or nxt.gotos)):
-+            ends.add(x)
-+    return ends
-+
-+
-+def _flow(nodes, labels, plan, x87=True, regs=False, skip=frozenset()):
-     """The state before and after each node (None where unreachable)."""
-     state_in = [None] * len(nodes)
-     state_out = [None] * len(nodes)
-     rewrites, positions, scalars = {}, set(), set()
-     end_state = [None]
-     work = []
-+    block_ends, flushes = _block_ends(nodes), {}
-     if nodes:
-         state_in[0] = _edge_state(MEM, 0, plan)  # function entry: memory is the truth
-         work.append(0)
-@@ -691,7 +756,7 @@
-             r = rewrites.get(x)
-             if r is None or r[0] != s[0]:
-                 if n.kind == "fp":
--                    one = _rewrite(n.code, s[0], x87, regs)
-+                    one = _rewrite(n.code, s[0], x87, regs, skip)
-                     r = (s[0], ([one[0]],) + one[1:])
-                 else:  # the lines of a block: registers only, the depth does not move
-                     parts = n.code
-@@ -705,6 +770,10 @@
-             out = (k2, s[1] | frozenset(wr), s[2], s[3] | frozenset(swr))
-         else:  # sync: written back before it (see _emit); memory is the truth after
-             out = MEM
-+        if out not in (None, MEM) and x in block_ends and out[3] & _SIMD_GLOBALS:
-+            # SIMD registers written in the block go back where it ends (see _block_ends)
-+            flushes[x] = out[3] & _SIMD_GLOBALS
-+            out = (out[0], out[1], out[2], out[3] - _SIMD_GLOBALS)
-         state_out[x] = out
-         succ = [labels[g] for g in n.gotos] if n.kind != "label" else []
-         if not n.terminal:
-@@ -725,7 +794,7 @@
-                 state_in[y] = new
-                 work.append(y)
-     x87_seen = any(n.x87 and state_in[x] is not None and n.kind == "fp" for x, n in enumerate(nodes))
--    return dict(state_in=state_in, state_out=state_out, rewrites=rewrites,
-+    return dict(state_in=state_in, state_out=state_out, rewrites=rewrites, flushes=flushes,
-                 positions=positions, scalars=scalars, end_state=end_state[0], x87_seen=x87_seen)
- 
- 
-@@ -771,7 +840,8 @@
-     if pos:
-         decls.append("double " + ", ".join("%s = 0.0" % _slot(p) for p in pos) + ";")
-     for g in used:
--        decls.append("%s %s = 0;" % (_SCALARS[g][1], _scalar(g)))
-+        ctype = _SCALARS[g][1]
-+        decls.append("%s %s = %s;" % (ctype, _scalar(g), "{ 0 }" if ctype.startswith("Recomp") else "0"))
-     what = "state" if regs else "x87 state"
-     out.append("    " + " ".join(decls) + " /* the %s of this body (x87_locals) */" % what)
-     out.append("    #define %s do { %s } while (0) /* memory to locals */" % (load_macro, load))
-@@ -817,6 +887,9 @@
-                     out.append(re.match(r"\s*", lines[li]).group(0) + restore(code).strip())
-             else:
-                 out.extend(lines[n.first:n.last + 1])
-+        if x in flow["flushes"]:
-+            out.append(indent + " ".join("%s = %s;" % (g, _scalar(g)) for g in _SCALARS
-+                                         if g in flow["flushes"][x]) + " /* SIMD registers to memory */")
-         if not n.terminal and x + 1 < len(nodes):
-             c = on_edge(state_out[x], x + 1)
-             if c:
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 483d395..594f4e6 100644
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -289,7 +289,7 @@ def main():
+                         help="Write a guest access with a small constant displacement as "
+                              "MEMxx_D(base, disp), so a runtime can map base once (mem_disp.py)")
+     parser.add_argument("--reg-locals", action="store_true",
+-                        help="Keep each function's integer registers (eax..edi, esp) "
++                        help="Keep each function's registers (eax..edi, esp, xmm0..7, mm0..7) "
+                              "in C locals too, written back to the g_* globals only "
+                              "where control leaves the function (x87_locals.py)")
+     parser.add_argument("--seh-prolog", metavar="ADDR",
 diff --git a/tools/recomp/test_reg_locals.py b/tools/recomp/test_reg_locals.py
+index 861c086..23c9c12 100644
 --- a/tools/recomp/test_reg_locals.py
 +++ b/tools/recomp/test_reg_locals.py
-@@ -146,6 +146,63 @@
+@@ -146,6 +146,63 @@ def test_a_statement_that_calls_out_runs_on_the_globals():
      assert text.index("_LOCALS_LOAD();", call) < text.index("_r_ecx = _r_eax;"), text
  
  
@@ -388,18 +124,286 @@ diff --git a/tools/recomp/test_reg_locals.py b/tools/recomp/test_reg_locals.py
  if __name__ == "__main__":
      for name, fn in sorted(globals().items()):
          if name.startswith("test_"):
-diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
---- a/tools/recomp/__main__.py
-+++ b/tools/recomp/__main__.py
-@@ -289,7 +289,7 @@
-                         help="Write a guest access with a small constant displacement as "
-                              "MEMxx_D(base, disp), so a runtime can map base once (mem_disp.py)")
-     parser.add_argument("--reg-locals", action="store_true",
--                        help="Keep each function's integer registers (eax..edi, esp) "
-+                        help="Keep each function's registers (eax..edi, esp, xmm0..7, mm0..7) "
-                              "in C locals too, written back to the g_* globals only "
-                              "where control leaves the function (x87_locals.py)")
-     parser.add_argument("--seh-prolog", metavar="ADDR",
--- 
-2.43.0
-
+diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
+index bd3a62a..097d890 100644
+--- a/tools/recomp/x87_locals.py
++++ b/tools/recomp/x87_locals.py
+@@ -99,16 +99,26 @@ _X87_SCALARS = {  # global -> (local suffix, C type)
+     "g_fp_cmp": ("cmp", "int"),
+     "g_fp_cc": ("cc", "uint16_t"),
+ }
+-# The integer registers the generated code keeps in globals (`eax` is a macro
+-# for g_eax; ebp is already a local of each function).
++# The registers the generated code keeps in globals (`eax` is a macro for
++# g_eax; ebp is already a local of each function): the integer registers, and
++# the SSE and MMX registers (`xmm0` for g_xmm0, `mm0` for g_mm0), unions the
++# header's XMM_*/MMX_* helpers take and return by value. In globals, every
++# SIMD operation stored its result and the next one loaded it again (a guest
++# store may alias them), which was most of the code of SSE and MMX loops.
+ _REGS = ("eax", "ecx", "edx", "ebx", "esp", "esi", "edi")
++_SIMD_REGS = tuple("xmm%d" % i for i in range(8)) + tuple("mm%d" % i for i in range(8))
+ _REG_SCALARS = {"g_" + r: (r, "uint32_t") for r in _REGS}
++_REG_SCALARS.update({"g_" + r: (r, "RecompXmm" if r.startswith("x") else "RecompMmx")
++                     for r in _SIMD_REGS})
++_REG_ALT = "eax|ecx|edx|ebx|esp|esi|edi|xmm[0-7]|mm[0-7]"
+ _SCALARS = dict(_X87_SCALARS, **_REG_SCALARS)
+ # Macros that assign to a register passed to them (the argument positions).
+-_REG_WRITERS = {"SET_LO8": (0,), "SET_HI8": (0,), "SET_LO16": (0,), "PUSH32": (0,), "POP32": (0, 1)}
++_REG_WRITERS = {"SET_LO8": (0,), "SET_HI8": (0,), "SET_LO16": (0,), "PUSH32": (0,), "POP32": (0, 1),
++                "XMM_LOAD_LOW": (0,), "XMM_LOAD_HIGH": (0,)}
+ # All-capitals macros that only read the registers passed to them. A register
+ # passed to any other all-capitals name counts as written (a lower-case name is
+-# a function: its arguments are values).
++# a function: its arguments are values), except the SIMD helpers (XMM_*,
++# MMX_*): they take their operands by value, and only _REG_WRITERS' assign one.
+ _REG_READERS = frozenset("""
+     MEM8 MEM16 MEM32 MEM64 SMEM8 SMEM16 SMEM32 SMEM64 MEMF MEMD MEMF_SET MEMD_SET XBOX_PTR
+     LO8 HI8 LO16 SX8 SX16 ZX8 ZX16
+@@ -131,7 +141,7 @@ _TOKEN = re.compile(
+     r"|\(\s*g_fp_top\s*&\s*7u?\s*\)"
+     r"|\bRECOMP_FP_PC\s*\("
+     r"|\b(?P<sc>g_fp_control_word|g_fp_cmp|g_fp_cc)\b"
+-    r"|\b(?:g_)?(?P<rg>eax|ecx|edx|ebx|esp|esi|edi)\b")
++    r"|\b(?:g_)?(?P<rg>" + _REG_ALT + r")\b")
+ _WRITE_AFTER = re.compile(r"\s*(=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)")
+ _WRITE_BEFORE = re.compile(r"(\+\+|--)\s*$")
+ _CONTROL = re.compile(r"\b(if|else|for|while|do|switch|case|default|goto|return|break|continue)\b"
+@@ -267,7 +277,7 @@ def _calls(code):
+         if name in _KEYWORDS or name in _TRANSPARENT or name in _FP_MACROS:
+             continue
+         if name.startswith(("XMM_", "MMX_")):
+-            continue  # the header's inline SIMD helpers: guest memory and g_xmm*/g_mm* only
++            continue  # the header's inline SIMD helpers: guest memory and their operands only
+         names.add(name)
+     return names
+ 
+@@ -284,13 +294,20 @@ def _scalar(g):
+     return X87_LOCALS_PREFIX + _SCALARS[g][0]
+ 
+ 
+-_REG_TOKEN = re.compile(r"\b(?:g_)?(eax|ecx|edx|ebx|esp|esi|edi)\b")
++_REG_TOKEN = re.compile(r"\b(?:g_)?(" + _REG_ALT + r")\b")
++# A member or lane of a SIMD register (xmm0.f[0], mm1.q): assigning it assigns
++# the register.
++_MEMBER = re.compile(r"(?:\s*\.\s*\w+(?:\s*\[[^\]]*\])*)+")
+ 
+ 
+ def _reg_written(text, start, end):
+     """Whether the register token text[start:end] may be assigned: an
+-    assignment or ++/-- on it, or an argument of a macro that may assign it
+-    (looked for through grouping parentheses, casts and subscripts)."""
++    assignment or ++/-- on it (or on one of its members), or an argument of a
++    macro that may assign it (looked for through grouping parentheses, casts
++    and subscripts)."""
++    member = _MEMBER.match(text, end)
++    if member:
++        end = member.end()
+     if _WRITE_AFTER.match(text, end) or _WRITE_BEFORE.search(text[:start]):
+         return True
+     depth, arg, i = 0, 0, start - 1
+@@ -308,7 +325,7 @@ def _reg_written(text, start, end):
+             if name and name not in _KEYWORDS:
+                 if name in _REG_WRITERS:
+                     return arg in _REG_WRITERS[name]
+-                if name in _REG_READERS or not name.isupper():
++                if name in _REG_READERS or not name.isupper() or name.startswith(("XMM_", "MMX_")):
+                     return False
+                 return True  # an unknown macro: it may assign its argument
+             arg = 0  # a grouping: the expression it is part of is an argument further out
+@@ -318,16 +335,16 @@ def _reg_written(text, start, end):
+ 
+ def _unary_amp_reg(code):
+     """A register (or x87 state) whose address is taken."""
+-    for m in re.finditer(r"(?<!&)&(?!&)\s*(?:g_)?(eax|ecx|edx|ebx|esp|esi|edi|fp_\w+|g_fp_\w+)\b", code):
++    for m in re.finditer(r"(?<!&)&(?!&)\s*\(?\s*(?:g_)?(" + _REG_ALT + r"|fp_\w+|g_fp_\w+)\b", code):
+         prev = code[:m.start()].rstrip()
+         if not prev or not (prev[-1].isalnum() or prev[-1] in "_)]"):
+             return True
+     return False
+ 
+ 
+-def _rewrite(code, k, x87=True, regs=False):
++def _rewrite(code, k, x87=True, regs=False, skip=frozenset()):
+     """Rewrite one statement line at static depth k (x87: the stack and its
+-    scalars; regs: the integer registers).
++    scalars; regs: the integer and SIMD registers).
+ 
+     Returns (code, k_out, written positions, read positions, scalars written,
+     scalars used) or None when the line has to run against memory."""
+@@ -348,6 +365,10 @@ def _rewrite(code, k, x87=True, regs=False):
+                 return "".join(out), k
+             out.append(text[i:m.start()])
+             tok = m.group(0)
++            if m.group("rg") and m.group("rg") in skip:
++                out.append(tok)  # this register stays in its global
++                i = m.end()
++                continue
+             if m.group("rg"):
+                 if not regs:
+                     out.append(tok)
+@@ -527,7 +548,7 @@ def _nodes(lines, lo, hi):
+ 
+ def localise_x87(lines, macros, undefs, x87=True, regs=False):
+     """lines: one function as translate_function emits it. Returns (lines,
+-    None) with the x87 state (x87) and the integer registers (regs) in locals,
++    None) with the x87 state (x87) and the registers (regs) in locals,
+     or (lines unchanged, reason)."""
+     try:
+         return _localise(lines, macros, undefs, x87, regs), None
+@@ -545,6 +566,29 @@ def _function_bounds(lines):
+     return (lo, hi) if lo <= hi else None
+ 
+ 
++_SIMD_TOKEN = re.compile(r"\b(?:g_)?(xmm[0-7]|mm[0-7])\b")
++
++
++def _simd_kept_in_memory(text):
++    """The SIMD registers a body first names other than by assigning the whole
++    register (xmm0 = ...): read, written in part (a lane, XMM_LOAD_HIGH) or
++    passed on. In a local, such a register would be loaded where the body
++    starts and its lanes held until the write-back, through every guest
++    access, for a few operations on it; it stays in its global instead. A
++    register first assigned whole costs nothing to load: the load is dead."""
++    first = {}
++    for line in text.splitlines():
++        code = _protect(line)[0]
++        for m in _SIMD_TOKEN.finditer(code):
++            name = m.group(1)
++            if name not in first:
++                rhs = re.match(r"\s*=(?!=)([^;]*)", code[m.end():])
++                first[name] = (re.match(r"\s*$|.*[;{}]\s*$", code[:m.start()]) is not None
++                               and rhs is not None
++                               and not re.search(r"\b(?:g_)?%s\b" % name, rhs.group(1)))
++    return frozenset(name for name, whole in first.items() if not whole)
++
++
+ def _localise(lines, macros, undefs, x87=True, regs=False):
+     bounds = _function_bounds(lines) if regs else _body_bounds(lines, macros, undefs)
+     if bounds is None:
+@@ -557,6 +601,7 @@ def _localise(lines, macros, undefs, x87=True, regs=False):
+         raise _NotLocal("the names are taken")
+     nodes = _nodes(lines, lo, hi)
+     labels = {n.label: x for x, n in enumerate(nodes) if n.kind == "label"}
++    skip = _simd_kept_in_memory(text) if regs else frozenset()
+ 
+     # classify
+     for n in nodes:
+@@ -564,7 +609,7 @@ def _localise(lines, macros, undefs, x87=True, regs=False):
+             continue
+         fp = x87 and bool(_LEFTOVER.search(n.code) or re.search(
+             r"\b(RECOMP_FP_PC|g_fp_control_word|g_fp_cmp|g_fp_cc)\b", n.code))
+-        rg = regs and bool(_REG_TOKEN.search(n.code))
++        rg = regs and any(m.group(1) not in skip for m in _REG_TOKEN.finditer(n.code))
+         n.x87 = fp
+         calls = _calls(n.code)
+         leaves = bool(re.search(r"\breturn\b", n.code))
+@@ -587,14 +632,14 @@ def _localise(lines, macros, undefs, x87=True, regs=False):
+ 
+     # Statements this pass cannot rewrite run against memory.
+     for n in nodes:
+-        if n.kind == "fp" and _rewrite(n.code, 0, x87, regs) is None:
++        if n.kind == "fp" and _rewrite(n.code, 0, x87, regs, skip) is None:
+             if n.gotos:
+                 raise _NotLocal("a goto in a statement this pass cannot rewrite")
+             n.kind = "sync"
+         elif n.kind == "rregion":
+             parts = []
+             for li in range(n.first, n.last + 1):
+-                r = _rewrite(_protect(lines[li])[0], 0, False, regs)
++                r = _rewrite(_protect(lines[li])[0], 0, False, regs, skip)
+                 if r is None:
+                     break
+                 parts.append(r)
+@@ -610,7 +655,7 @@ def _localise(lines, macros, undefs, x87=True, regs=False):
+     plan = _Plan()
+     while True:
+         try:
+-            flow = _flow(nodes, labels, plan, x87, regs)
++            flow = _flow(nodes, labels, plan, x87, regs, skip)
+             break
+         except _Restart:
+             continue
+@@ -667,13 +712,33 @@ def _edge_state(out, y, plan):
+     return out
+ 
+ 
+-def _flow(nodes, labels, plan, x87=True, regs=False):
++_SIMD_GLOBALS = frozenset("g_" + r for r in _SIMD_REGS)
++
++
++def _block_ends(nodes):
++    """The statements that end a straight run of code: the next node is a
++    label or branches. A SIMD register written in the run is written back
++    there, not held to the next call or return: a few SSE operations inside a
++    scalar loop otherwise kept the lanes of every register they wrote live
++    around the whole loop (spilled), and the next write of the register is
++    usually a whole one, which needs nothing of the old value."""
++    ends = set()
++    for x, n in enumerate(nodes[:-1]):
++        nxt = nodes[x + 1]
++        if (n.kind in ("fp", "rregion", "plain") and not n.gotos and not n.terminal
++                and (nxt.kind == "label" or nxt.gotos)):
++            ends.add(x)
++    return ends
++
++
++def _flow(nodes, labels, plan, x87=True, regs=False, skip=frozenset()):
+     """The state before and after each node (None where unreachable)."""
+     state_in = [None] * len(nodes)
+     state_out = [None] * len(nodes)
+     rewrites, positions, scalars = {}, set(), set()
+     end_state = [None]
+     work = []
++    block_ends, flushes = _block_ends(nodes), {}
+     if nodes:
+         state_in[0] = _edge_state(MEM, 0, plan)  # function entry: memory is the truth
+         work.append(0)
+@@ -690,7 +755,7 @@ def _flow(nodes, labels, plan, x87=True, regs=False):
+             r = rewrites.get(x)
+             if r is None or r[0] != s[0]:
+                 if n.kind == "fp":
+-                    one = _rewrite(n.code, s[0], x87, regs)
++                    one = _rewrite(n.code, s[0], x87, regs, skip)
+                     r = (s[0], ([one[0]],) + one[1:])
+                 else:  # the lines of a block: registers only, the depth does not move
+                     parts = n.code
+@@ -704,6 +769,10 @@ def _flow(nodes, labels, plan, x87=True, regs=False):
+             out = (k2, s[1] | frozenset(wr), s[2], s[3] | frozenset(swr))
+         else:  # sync: written back before it (see _emit); memory is the truth after
+             out = MEM
++        if out not in (None, MEM) and x in block_ends and out[3] & _SIMD_GLOBALS:
++            # SIMD registers written in the block go back where it ends (see _block_ends)
++            flushes[x] = out[3] & _SIMD_GLOBALS
++            out = (out[0], out[1], out[2], out[3] - _SIMD_GLOBALS)
+         state_out[x] = out
+         succ = [labels[g] for g in n.gotos] if n.kind != "label" else []
+         if not n.terminal:
+@@ -724,7 +793,7 @@ def _flow(nodes, labels, plan, x87=True, regs=False):
+                 state_in[y] = new
+                 work.append(y)
+     x87_seen = any(n.x87 and state_in[x] is not None and n.kind == "fp" for x, n in enumerate(nodes))
+-    return dict(state_in=state_in, state_out=state_out, rewrites=rewrites,
++    return dict(state_in=state_in, state_out=state_out, rewrites=rewrites, flushes=flushes,
+                 positions=positions, scalars=scalars, end_state=end_state[0], x87_seen=x87_seen)
+ 
+ 
+@@ -770,7 +839,8 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow, regs=False):
+     if pos:
+         decls.append("double " + ", ".join("%s = 0.0" % _slot(p) for p in pos) + ";")
+     for g in used:
+-        decls.append("%s %s = 0;" % (_SCALARS[g][1], _scalar(g)))
++        ctype = _SCALARS[g][1]
++        decls.append("%s %s = %s;" % (ctype, _scalar(g), "{ 0 }" if ctype.startswith("Recomp") else "0"))
+     what = "state" if regs else "x87 state"
+     out.append("    " + " ".join(decls) + " /* the %s of this body (x87_locals) */" % what)
+     out.append("    #define %s do { %s } while (0) /* memory to locals */" % (load_macro, load))
+@@ -816,6 +886,9 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow, regs=False):
+                     out.append(re.match(r"\s*", lines[li]).group(0) + restore(code).strip())
+             else:
+                 out.extend(lines[n.first:n.last + 1])
++        if x in flow["flushes"]:
++            out.append(indent + " ".join("%s = %s;" % (g, _scalar(g)) for g in _SCALARS
++                                         if g in flow["flushes"][x]) + " /* SIMD registers to memory */")
+         if not n.terminal and x + 1 < len(nodes):
+             c = on_edge(state_out[x], x + 1)
+             if c:

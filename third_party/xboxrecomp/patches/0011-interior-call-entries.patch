@@ -85,7 +85,7 @@ index 260b911..0fc897b 100644
      assert f"loc_{B_BODY:08X}: ;" not in code, code
      assert "imul" not in code
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 95789a6..0393cd3 100644
+index 83949a0..4e2fea2 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
 @@ -491,6 +491,7 @@ class FunctionTranslator:
@@ -94,9 +94,9 @@ index 95789a6..0393cd3 100644
          self.jump_table_entry_starts = set()
 +        self.interior_entry_starts = set()
          self._recovered_cfg = {}
-         self._ownership_ready = False
- 
-@@ -1311,6 +1312,9 @@ class FunctionTranslator:
+         # Callbacks accepted on an immediate alone, whose own edges stay weak.
+         self._weak_function_starts = set()
+@@ -1657,6 +1658,9 @@ class FunctionTranslator:
      # and direct edges. A range also holds bytes nothing reaches (a jump
      # table decoded as instructions), and their "jumps" are not followed.
      #
@@ -106,7 +106,7 @@ index 95789a6..0393cd3 100644
      # Upper bound on the instructions one function gains from outside its
      # range. The real reach is the rest of one function; the cap only stops a
      # jump decoded from data from lifting a section's worth of garbage.
-@@ -1512,9 +1516,83 @@ class FunctionTranslator:
+@@ -1858,9 +1862,83 @@ class FunctionTranslator:
                  work.append(following)
          return ([absorbed[addr] for addr in sorted(absorbed)], tables, calls)
  
@@ -191,7 +191,7 @@ index 95789a6..0393cd3 100644
          cache = getattr(self, "_absorb_cache", None)
          if cache is not None and start in cache:
              return cache[start][:2]
-@@ -3143,6 +3221,7 @@ class BatchTranslator:
+@@ -3490,6 +3568,7 @@ class BatchTranslator:
              self.translator.discover_static_indirect_targets()
          self.translator.discover_cfg_ownership()
          self.translator.discover_jump_table_entries()

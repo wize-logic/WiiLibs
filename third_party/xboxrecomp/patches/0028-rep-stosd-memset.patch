@@ -11,10 +11,10 @@ Subject: [PATCH] recomp: rep stosd of a byte-uniform value forwards over
  create mode 100644 tools/recomp/test_rep_stosd_fill.py
 
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index a8a23b6..02fe199 100644
+index 01c73c9..f5338b6 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
-@@ -3228,11 +3228,19 @@ class Lifter:
+@@ -3214,11 +3214,19 @@ class Lifter:
                      " MEM8(edi - _i) = LO8(eax); edi -= ecx; }",
                      "ecx = 0; /* rep stosb */"]
          if "stosd" in m:

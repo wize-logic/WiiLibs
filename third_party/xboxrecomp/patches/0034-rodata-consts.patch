@@ -265,7 +265,7 @@ index 0000000..fe823b2
 +    assert not config._read_only("BINKDATA", 0x5)
 +    assert not config._read_only(".text", 0x6)
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 0d856b4..2a36963 100644
+index 20e588a..cd73beb 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
 @@ -24,6 +24,7 @@ from .config import va_to_file_offset, is_code_address
@@ -276,7 +276,7 @@ index 0d856b4..2a36963 100644
  from .loop_bound import bounded_loop_headers
  from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                       _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
-@@ -526,6 +527,10 @@ class FunctionTranslator:
+@@ -529,6 +530,10 @@ class FunctionTranslator:
          # loop_bound.py: a back edge of a loop that ends by itself (a counted
          # loop, a scan to a bound) is a plain goto (--bounded-loops)
          self.bounded_loops = False
@@ -287,7 +287,7 @@ index 0d856b4..2a36963 100644
          self.kept = {}
          self.preserve_stats = {}
          self.kept_sites = 0
-@@ -3126,6 +3131,10 @@ class FunctionTranslator:
+@@ -3471,6 +3476,10 @@ class FunctionTranslator:
              if self.kept:
                  self.kept_sites += sum(line.count("kept across the call") for line in lines)
  

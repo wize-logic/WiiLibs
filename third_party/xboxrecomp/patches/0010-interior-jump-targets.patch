@@ -60,10 +60,10 @@ bytes).
  create mode 100644 tools/recomp/test_interior_targets.py
 
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index c5114c7..cad8da9 100644
+index cccbff1..67a168a 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
-@@ -1408,6 +1408,22 @@ class Lifter:
+@@ -1421,6 +1421,22 @@ class Lifter:
          # Addresses loaded as immediates into a register inside the current
          # function, used to resolve `jmp <reg>`. See _lift_jmp.
          self.imm_code_refs = set()
@@ -86,7 +86,7 @@ index c5114c7..cad8da9 100644
  
      def _call_target_name(self, addr):
          """Get the name for a call target address.
-@@ -2600,7 +2616,14 @@ class Lifter:
+@@ -2635,7 +2651,14 @@ class Lifter:
              f" return;", 1)
  
      def _is_external_target(self, addr):
@@ -102,7 +102,7 @@ index c5114c7..cad8da9 100644
          return not (self.func_start <= addr < self.func_end)
  
      def _read_jump_table(self, table_va, max_entries=256):
-@@ -2655,6 +2678,13 @@ class Lifter:
+@@ -2690,6 +2713,13 @@ class Lifter:
          # none of them, the indexed jump became an unresolvable indirect call,
          # and sprintf silently produced the wrong string.
          inside = self._leading_arms(targets)
@@ -116,7 +116,7 @@ index c5114c7..cad8da9 100644
          # Two arms is the smallest thing worth calling a switch; one is more
          # likely a coincidence than a jump table.
          if len(inside) >= 2:
-@@ -2692,7 +2722,7 @@ class Lifter:
+@@ -2727,7 +2757,7 @@ class Lifter:
          """Entries up to the first one outside the current function."""
          inside = []
          for target in targets:
@@ -125,7 +125,7 @@ index c5114c7..cad8da9 100644
                  break
              inside.append(target)
          return inside
-@@ -2763,7 +2793,7 @@ class Lifter:
+@@ -2798,7 +2828,7 @@ class Lifter:
              # the same shape the memory-operand switch above emits.
              if ops[0].type == "reg" and self.imm_code_refs:
                  inside = sorted(t for t in self.imm_code_refs
@@ -307,7 +307,7 @@ index 0000000..260b911
 +    assert f"loc_{B_BODY:08X}: ;" not in code, code
 +    assert "imul" not in code
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index c98dca7..95789a6 100644
+index ab19551..83949a0 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
 @@ -437,6 +437,16 @@ def load_label_db(labels_json_path):
@@ -327,7 +327,7 @@ index c98dca7..95789a6 100644
  class FunctionTranslator:
      """Translates individual x86 functions to C source code."""
  
-@@ -1275,6 +1285,244 @@ class FunctionTranslator:
+@@ -1621,6 +1631,244 @@ class FunctionTranslator:
                      cfg_targets.update(targets)
                  return instructions, jump_tables, cfg_targets
  
@@ -572,7 +572,7 @@ index c98dca7..95789a6 100644
      def _stub_ret_bytes(self, addr, max_insns=48):
          """Bytes the code at `addr` would have popped beyond the return address.
  
-@@ -1968,7 +2216,14 @@ class FunctionTranslator:
+@@ -2314,7 +2562,14 @@ class FunctionTranslator:
                  debug_slide_bypasses, switch_leaders)
  
      def decode_function(self, start, end):
@@ -588,7 +588,7 @@ index c98dca7..95789a6 100644
          recovered = self._recovered_cfg.get(start)
          if recovered:
              end = recovered["end"]
-@@ -2026,10 +2281,50 @@ class FunctionTranslator:
+@@ -2372,10 +2627,50 @@ class FunctionTranslator:
  
          self.lifter.imm_code_refs = imm_refs
  
@@ -641,7 +641,7 @@ index c98dca7..95789a6 100644
              stop_mnemonics=("ud2", "hlt", "iret", "iretd")
              if coalesced else ("iret", "iretd"))
          block_starts = {block.start for block in blocks}
-@@ -2074,6 +2369,11 @@ class FunctionTranslator:
+@@ -2420,6 +2715,11 @@ class FunctionTranslator:
          name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
          size = end - start
          instructions, blocks = self.decode_function(start, end)
@@ -653,7 +653,7 @@ index c98dca7..95789a6 100644
          # Classify the actual immediately following guest instruction;
          # generated ADD snapshots must not hide caller cleanup.
          self.lifter.caller_cleanup_sites = {
-@@ -2105,7 +2405,7 @@ class FunctionTranslator:
+@@ -2451,7 +2751,7 @@ class FunctionTranslator:
          # Determine which registers are used
          used_regs = self._find_used_registers(instructions)
          used_xmm = self._find_used_xmm(instructions)
@@ -662,7 +662,7 @@ index c98dca7..95789a6 100644
          has_fpu = any(insn.mnemonic.startswith("f") for insn in instructions)
  
          # Volatile registers (eax, ecx, edx, esp) are globals - don't declare
-@@ -2129,11 +2429,11 @@ class FunctionTranslator:
+@@ -2475,11 +2775,11 @@ class FunctionTranslator:
          # Only an address that is itself a translated function start is a
          # usable target; anything else is an analysis boundary gap with no
          # callable symbol.
@@ -676,7 +676,7 @@ index c98dca7..95789a6 100644
               jump_table_targets=(self.lifter.jump_table_targets
                                   if coalesced and start in self._recovered_cfg
                                   else None))
-@@ -2147,20 +2447,25 @@ class FunctionTranslator:
+@@ -2493,20 +2793,25 @@ class FunctionTranslator:
          if ((continues_past_end or bypasses_to_end) and end in self.func_db
                  and end not in self.owned_function_starts):
              fallthrough_target = end
@@ -705,7 +705,7 @@ index c98dca7..95789a6 100644
              used_regs.add("ebp")
  
  
-@@ -2283,7 +2588,7 @@ class FunctionTranslator:
+@@ -2629,7 +2934,7 @@ class FunctionTranslator:
          # would still hold. Deliberately not the same as making ebp global:
          # that also changes save/restore, and a callee that fails to restore
          # then corrupts its caller (tried; esp underflowed inside XapiStartup).
@@ -714,7 +714,7 @@ index c98dca7..95789a6 100644
              # The prologue's first PUSH saves the incoming register before
              # MOV establishes this function's frame. It must not push an
              # uninitialized C local into the guest's saved-frame chain.
-@@ -2356,7 +2661,7 @@ class FunctionTranslator:
+@@ -2703,7 +3008,7 @@ class FunctionTranslator:
          # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
          # idiom MSVC emits for odd trailing elements.
          self.lifter.needs_cf = has_carry
@@ -723,7 +723,7 @@ index c98dca7..95789a6 100644
  
          # SSE and MMX are architectural state, declared globally by the
          # runtime exactly like the GPRs and the x87 stack. Declaring either
-@@ -2395,8 +2700,26 @@ class FunctionTranslator:
+@@ -2742,8 +3047,26 @@ class FunctionTranslator:
                  label_addrs.add(succ)
          # Also add any jump targets within the function
          for insn in instructions:
@@ -751,7 +751,7 @@ index c98dca7..95789a6 100644
          label_addrs |= self.lifter.imm_code_refs
          label_addrs.update(debug_slide_bypasses.values())
          label_addrs.update(switch_leaders)
-@@ -2427,7 +2750,14 @@ class FunctionTranslator:
+@@ -2774,7 +3097,14 @@ class FunctionTranslator:
                  "jmp", "ud2", "hlt", "iret", "iretd")
                        or (last.mnemonic == "int3"
                            and last.address not in debug_slide_int3s))
@@ -767,7 +767,7 @@ index c98dca7..95789a6 100644
                  preds[blocks[i + 1].start].add(bb.start)
  
          # Settle the flag state before emitting anything.
-@@ -2486,6 +2816,13 @@ class FunctionTranslator:
+@@ -2833,6 +3163,13 @@ class FunctionTranslator:
                  unseen_entries.update(self.lifter._analyze_switch_table(insn.operands))
          edge_vars, edge_sets, block_lines = [], [], {}
  
@@ -781,7 +781,7 @@ index c98dca7..95789a6 100644
          for bb in blocks:
              # Emit label if this block is a branch target
              if bb.start in label_addrs or bb.start == start:
-@@ -2540,6 +2877,17 @@ class FunctionTranslator:
+@@ -2887,6 +3224,17 @@ class FunctionTranslator:
                           or (bb.last_insn.mnemonic == "int3"
                               and bb.last_insn.address not in debug_slide_int3s))):
                  lines.append("    return; /* trap ends recovered control flow */")

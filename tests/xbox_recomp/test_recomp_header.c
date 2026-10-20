@@ -3,7 +3,7 @@
 // guest memory holds little-endian bytes on any host (the macros read and write them, stores of
 // floats and doubles included), XBOX_PTR applies the guest-to-effective-address transform, the
 // atomics work on little-endian words, the SIMD unions overlay as on x86, and the helpers WiiLibs'
-// patches added (recomp_cvt_si32, recomp_ld80/st80) and the RECOMP_FP_PC fast path give the
+// patches and upstream added (recomp_cvt_si32, recomp_f80_load/store) and the RECOMP_FP_PC fast path give the
 // answers the x86 does. Runs on the host and big-endian (ppc-be), where it matters.
 #define RECOMP_GENERATED_CODE 1
 #include <math.h>
@@ -17,6 +17,7 @@
 // what the header declares and these tests touch
 ptrdiff_t g_xbox_mem_offset;
 RECOMP_TLS uint16_t g_fp_control_word = 0x027F;
+RECOMP_TLS uint32_t g_mxcsr = 0x1F80u;
 
 #define GUEST_SIZE 0x00200000u
 static uint8_t g_guest[GUEST_SIZE];
@@ -157,16 +158,18 @@ TEST shufps_then_movhps(void) {
 }
 
 TEST cvt_si32(void) {
-    ASSERT_EQ(2, recomp_cvt_si32(1.5, 0));
-    ASSERT_EQ(2, recomp_cvt_si32(2.5, 0));
-    ASSERT_EQ(-2, recomp_cvt_si32(-2.5, 0));
-    ASSERT_EQ(1, recomp_cvt_si32(1.5, 1));
-    ASSERT_EQ(-1, recomp_cvt_si32(-1.9, 1));
-    ASSERT_EQ(INT32_MIN, recomp_cvt_si32(3.0e9, 1));
-    ASSERT_EQ(INT32_MIN, recomp_cvt_si32(-3.0e9, 0));
-    ASSERT_EQ(INT32_MIN, recomp_cvt_si32(NAN, 0));
-    ASSERT_EQ(INT32_MAX, recomp_cvt_si32(2147483647.4, 0));
-    ASSERT_EQ(INT32_MIN, recomp_cvt_si32(2147483647.5, 0));
+    ASSERT_EQ(2, recomp_cvt_si32(1.5, 0x1F80u, 0));
+    ASSERT_EQ(2, recomp_cvt_si32(2.5, 0x1F80u, 0));
+    ASSERT_EQ(-2, recomp_cvt_si32(-2.5, 0x1F80u, 0));
+    ASSERT_EQ(1, recomp_cvt_si32(1.5, 0x1F80u, 1));
+    ASSERT_EQ(-1, recomp_cvt_si32(-1.9, 0x1F80u, 1));
+    ASSERT_EQ(INT32_MIN, recomp_cvt_si32(3.0e9, 0x1F80u, 1));
+    ASSERT_EQ(INT32_MIN, recomp_cvt_si32(-3.0e9, 0x1F80u, 0));
+    ASSERT_EQ(INT32_MIN, recomp_cvt_si32(NAN, 0x1F80u, 0));
+    ASSERT_EQ(INT32_MAX, recomp_cvt_si32(2147483647.4, 0x1F80u, 0));
+    ASSERT_EQ(INT32_MIN, recomp_cvt_si32(2147483647.5, 0x1F80u, 0));
+    ASSERT_EQ(1, recomp_cvt_si32(1.5, 0x7F80u, 0));   // MXCSR.RC toward zero
+    ASSERT_EQ(-2, recomp_cvt_si32(-1.5, 0x3F80u, 0));  // MXCSR.RC down
     ASSERT_EQ(2, MMX_CVT_F2I(2.5f, 0) + MMX_CVT_F2I(0.5f, 0) + MMX_CVT_F2I(-0.5f, 1));
     PASS();
 }
@@ -213,23 +216,33 @@ TEST fist_and_frndint_match_the_wide_path(void) {
     PASS();
 }
 
+// fstp m80 and fld m80 as the lifter writes them (upstream's recomp_f80_store/load over MEM32/MEM16)
+static void st80(uint32_t a, double v) {
+    uint64_t m;
+    uint16_t se = recomp_f80_store(v, &m);
+    MEM32(a) = (uint32_t)m; MEM32(a + 4) = (uint32_t)(m >> 32); MEM16(a + 8) = se;
+}
+static double ld80(uint32_t a) {
+    return recomp_f80_load(((uint64_t)MEM32(a + 4) << 32) | MEM32(a), MEM16(a + 8));
+}
+
 TEST extended_80bit(void) {
     guest_reset();
-    recomp_st80(0x800, 1.0);
+    st80(0x800, 1.0);
     static const uint8_t one[] = {0, 0, 0, 0, 0, 0, 0, 0x80, 0xFF, 0x3F};
     ASSERT_MEM_EQ(one, g_guest + 0x800, 10);
-    ASSERT_EQ(1.0, recomp_ld80(0x800));
+    ASSERT_EQ(1.0, ld80(0x800));
     static const double values[] = {-2.5, 1e300, -1e-300, 5e-324, 3.141592653589793, 0.0};
     for (size_t i = 0; i < sizeof values / sizeof values[0]; i++) {
-        recomp_st80(0x810, values[i]);
-        ASSERT_EQ(values[i], recomp_ld80(0x810));
+        st80(0x810, values[i]);
+        ASSERT_EQ(values[i], ld80(0x810));
     }
-    recomp_st80(0x820, -0.0);
-    ASSERT(signbit(recomp_ld80(0x820)));
-    recomp_st80(0x830, INFINITY);
-    ASSERT(isinf(recomp_ld80(0x830)));
-    recomp_st80(0x840, NAN);
-    ASSERT(isnan(recomp_ld80(0x840)));
+    st80(0x820, -0.0);
+    ASSERT(signbit(ld80(0x820)));
+    st80(0x830, INFINITY);
+    ASSERT(isinf(ld80(0x830)));
+    st80(0x840, NAN);
+    ASSERT(isnan(ld80(0x840)));
     PASS();
 }
 

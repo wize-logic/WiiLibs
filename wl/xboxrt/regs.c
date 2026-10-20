@@ -30,4 +30,5 @@ void wl_xb_cpu_reset(WlXbCpu *cpu) {
     memset(cpu, 0, sizeof *cpu);
     cpu->g_fp_control_word = 0x037Fu;
     cpu->g_fp_cc = 0x4000u;
+    cpu->g_mxcsr = 0x1F80u;   // every exception masked, round to nearest
 }

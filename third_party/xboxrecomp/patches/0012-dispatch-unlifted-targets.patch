@@ -38,10 +38,10 @@ every section, the stub of an untranslated function).
  3 files changed, 146 insertions(+), 40 deletions(-)
 
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index cad8da9..b41e431 100644
+index 67a168a..ce01407 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
-@@ -1111,6 +1111,10 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
+@@ -1124,6 +1124,10 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
              return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; "
                      f"RECOMP_ITAIL(0x{target:08X}u); return; }}"
                      f" /* {jcc}: {desc}, manual tail */")
@@ -52,7 +52,7 @@ index cad8da9..b41e431 100644
          name = lifter._call_target_name(target)
          return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
                  f" /* {jcc}: {desc} */")
-@@ -1416,6 +1420,13 @@ class Lifter:
+@@ -1429,6 +1433,13 @@ class Lifter:
          # outside the set is another function's code. None: the range alone
          # decides, as for a caller that lifts single functions.
          self.body_addrs = None
@@ -66,7 +66,7 @@ index cad8da9..b41e431 100644
          # Tables (VA -> arms) whose arms the translator lifted into the
          # current body from outside its range; see _analyze_switch_table.
          self.absorbed_tables = set()
-@@ -1425,6 +1436,20 @@ class Lifter:
+@@ -1438,6 +1449,20 @@ class Lifter:
          return ((self.func_start <= addr < self.func_end)
                  or (self.body_addrs is not None and addr in self.body_addrs))
  
@@ -87,7 +87,7 @@ index cad8da9..b41e431 100644
      def _call_target_name(self, addr):
          """Get the name for a call target address.
  
-@@ -2446,7 +2471,11 @@ class Lifter:
+@@ -2481,7 +2506,11 @@ class Lifter:
          # value -- so writing the true address costs nothing at the return side.
          ret_va = insn.end_address
          if insn.call_target:
@@ -100,7 +100,7 @@ index cad8da9..b41e431 100644
              lines = []
              # Re-publish this function's frame before every call, not just once
              # at `mov ebp, esp`. g_ebp is "the last frame established anywhere",
-@@ -2499,6 +2528,18 @@ class Lifter:
+@@ -2534,6 +2563,18 @@ class Lifter:
                      f"{safe_macro}(0x{insn.call_target:08X}u, "
                      "_icall_esp); "
                      f"/* manual call 0x{insn.call_target:08X} */")
@@ -119,7 +119,7 @@ index cad8da9..b41e431 100644
              else:
                  # Routed through RECOMP_ABI_CALL so -DRECOMP_ABI_CHECK covers
                  # direct calls too. Without it the check sees only indirect
-@@ -2618,13 +2659,18 @@ class Lifter:
+@@ -2653,13 +2694,18 @@ class Lifter:
      def _is_external_target(self, addr):
          """Check if a jump target is outside the current function.
  
@@ -143,7 +143,7 @@ index cad8da9..b41e431 100644
  
      def _read_jump_table(self, table_va, max_entries=256):
          """Read 32-bit jump table entries from the XBE at a given VA.
-@@ -2683,7 +2729,7 @@ class Lifter:
+@@ -2718,7 +2764,7 @@ class Lifter:
              # A table the translator read with bounds and whose arms it
              # lifted into this body (FunctionTranslator._absorb): every arm
              # the body holds is a goto, wherever it sits in the table; the
@@ -152,7 +152,7 @@ index cad8da9..b41e431 100644
              inside = [target for target in targets if self._in_body(target)]
          # Two arms is the smallest thing worth calling a switch; one is more
          # likely a coincidence than a jump table.
-@@ -2755,6 +2801,24 @@ class Lifter:
+@@ -2790,6 +2836,24 @@ class Lifter:
                              tail,
                          ]
                      return [self._forced_tail(tail)]
@@ -177,7 +177,7 @@ index cad8da9..b41e431 100644
                  name = self._call_target_name(insn.jump_target)
                  tail = (f"g_seh_ebp = ebp; {name}(); return; "
                          f"/* tail jmp 0x{insn.jump_target:08X} */")
-@@ -2819,8 +2883,8 @@ class Lifter:
+@@ -2854,8 +2918,8 @@ class Lifter:
              cond = "ecx == 0" if jcc == "jecxz" else "LO16(ecx) == 0"
              if target:
                  if self._is_external_target(target):
@@ -188,7 +188,7 @@ index cad8da9..b41e431 100644
                  return [f"if ({cond}) goto loc_{target:08X}; /* {jcc} */"]
              return [f"/* {jcc} - no target */"]
  
-@@ -2845,8 +2909,8 @@ class Lifter:
+@@ -2880,8 +2944,8 @@ class Lifter:
  
          if target:
              if self._is_external_target(target):
@@ -290,10 +290,10 @@ index 0fc897b..0fd805a 100644
 +    assert f"void sub_{B_CORE:08X}(void) {{ RECOMP_ITAIL(0x{B_CORE:08X}u);" in stub
 +    assert "g_esp +=" not in stub
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 0393cd3..7bfd81c 100644
+index 4e2fea2..85396c4 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -1585,6 +1585,7 @@ class FunctionTranslator:
+@@ -1931,6 +1931,7 @@ class FunctionTranslator:
                  created.add(target)
                  pending.append(target)
          self.interior_entry_starts = created
@@ -301,7 +301,7 @@ index 0393cd3..7bfd81c 100644
          if created:
              print(f"Gave {len(created)} called addresses inside lifted code "
                    f"a function of their own", file=sys.stderr)
-@@ -2964,8 +2965,8 @@ class FunctionTranslator:
+@@ -3311,8 +3312,8 @@ class FunctionTranslator:
                                   f"0x{target:08X} */")
                  else:
                      lines.append(f"    g_seh_ebp = ebp; "
@@ -312,7 +312,7 @@ index 0393cd3..7bfd81c 100644
  
              lines.append(f"")
  
-@@ -3628,38 +3629,29 @@ class BatchTranslator:
+@@ -3975,38 +3976,29 @@ class BatchTranslator:
              stub_lines = [
                  "/**",
                  " * Unresolved call target stubs",

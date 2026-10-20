@@ -19,11 +19,58 @@ the same accesses. A runtime that keeps every guest stack where its
 address map is the identity can address the stack as esp + disp with no
 map at all.
 ---
+ templates/runtime/recomp_types.h | 22 +++++++
+ tools/recomp/__main__.py         |  5 ++
+ tools/recomp/mem_disp.py         | 99 ++++++++++++++++++++++++++++----
+ tools/recomp/test_mem_disp.py    | 24 +++++++-
+ tools/recomp/translator.py       |  6 +-
+ 5 files changed, 140 insertions(+), 16 deletions(-)
 
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index fd32273..b3ad57f 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -547,6 +547,21 @@ void recomp_trace_esp(const char *name, const char *tag);
+ #define MEMF_D(b, d)   MEMF((b) + (d))
+ #define MEMD_D(b, d)   MEMD((b) + (d))
+ 
++/** The same accesses at esp + disp (recomp --stack-disp writes them for an
++ * access whose base is esp itself, disp 0 included). Here exactly
++ * MEMxx_D(esp, disp); a runtime that keeps every guest stack where its
++ * address map is the identity can address the stack as esp + disp without
++ * the map. */
++#define MEM8_SP(b, d)   MEM8_D(b, d)
++#define MEM16_SP(b, d)  MEM16_D(b, d)
++#define MEM32_SP(b, d)  MEM32_D(b, d)
++#define SMEM8_SP(b, d)  SMEM8_D(b, d)
++#define SMEM16_SP(b, d) SMEM16_D(b, d)
++#define SMEM32_SP(b, d) SMEM32_D(b, d)
++#define SMEM64_SP(b, d) SMEM64_D(b, d)
++#define MEMF_SP(b, d)   MEMF_D(b, d)
++#define MEMD_SP(b, d)   MEMD_D(b, d)
++
+ /** Float/double stores. The lifter emits MEMF_SET(addr, v) rather than
+  * "MEMF(addr) = v" so a runtime can store a float some other way without
+  * the generated code changing. A host that keeps guest memory little-endian
+@@ -560,6 +575,13 @@ void recomp_trace_esp(const char *name, const char *tag);
+ #ifndef MEMD_SET
+ #define MEMD_SET(addr, v) ((void)(MEMD(addr) = (double)(v)))
+ #endif
++/* The stores at esp + disp (--stack-disp). */
++#ifndef MEMF_SET_SP
++#define MEMF_SET_SP(b, d, v) MEMF_SET((b) + (d), v)
++#endif
++#ifndef MEMD_SET_SP
++#define MEMD_SET_SP(b, d, v) MEMD_SET((b) + (d), v)
++#endif
+ 
+ /* ================================================================
+  * SSE / XMM register state
 diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 594f4e6..5a1189e 100644
 --- a/tools/recomp/__main__.py
 +++ b/tools/recomp/__main__.py
-@@ -288,6 +288,10 @@
+@@ -288,6 +288,10 @@ def main():
      parser.add_argument("--mem-disp", action="store_true",
                          help="Write a guest access with a small constant displacement as "
                               "MEMxx_D(base, disp), so a runtime can map base once (mem_disp.py)")
@@ -34,7 +81,7 @@ diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
      parser.add_argument("--reg-locals", action="store_true",
                          help="Keep each function's registers (eax..edi, esp, xmm0..7, mm0..7) "
                               "in C locals too, written back to the g_* globals only "
-@@ -373,6 +377,7 @@
+@@ -373,6 +377,7 @@ def main():
      translator.translator.x87_locals = args.x87_locals
      translator.translator.reg_locals = args.reg_locals
      translator.translator.mem_disp = args.mem_disp
@@ -43,9 +90,10 @@ diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
      t_load = time.time() - t0
      print(f"Loaded {len(translator.func_db)} functions, "
 diff --git a/tools/recomp/mem_disp.py b/tools/recomp/mem_disp.py
+index 2d89a00..35df2e3 100644
 --- a/tools/recomp/mem_disp.py
 +++ b/tools/recomp/mem_disp.py
-@@ -15,6 +15,16 @@
+@@ -15,6 +15,16 @@ small displacement from a base the guest dereferences stays in the base's
  region for every valid address, so the two are the same access wherever
  the guest's own access would be valid. A larger displacement (a global
  table indexed by a register, `[eax * 4 + 0x80123456]`) keeps the old form.
@@ -62,7 +110,7 @@ diff --git a/tools/recomp/mem_disp.py b/tools/recomp/mem_disp.py
  """
  
  import re
-@@ -23,6 +33,9 @@
+@@ -23,6 +33,9 @@ _NAMES = ("MEM8", "MEM16", "MEM32", "SMEM8", "SMEM16", "SMEM32", "SMEM64", "MEMF
  _CALL = re.compile(r"\b(" + "|".join(_NAMES) + r")\(")
  _TAIL = re.compile(r"^(?P<base>.*\S)\s*(?P<op>[+-])\s*(?P<disp>0x[0-9A-Fa-f]+|\d+)u?$", re.S)
  LIMIT = 0x8000
@@ -72,7 +120,7 @@ diff --git a/tools/recomp/mem_disp.py b/tools/recomp/mem_disp.py
  
  
  def _split(arg):
-@@ -49,29 +62,91 @@
+@@ -49,29 +62,91 @@ def _split(arg):
      return base, disp
  
  
@@ -177,9 +225,10 @@ diff --git a/tools/recomp/mem_disp.py b/tools/recomp/mem_disp.py
          else:
              out.append(f"{m.group(1)}({inner})")
 diff --git a/tools/recomp/test_mem_disp.py b/tools/recomp/test_mem_disp.py
+index 2b329a6..482a045 100644
 --- a/tools/recomp/test_mem_disp.py
 +++ b/tools/recomp/test_mem_disp.py
-@@ -9,8 +9,8 @@
+@@ -9,8 +9,8 @@ and base a whole sum of terms, or the access keeps its old form.
  from tools.recomp.mem_disp import rewrite
  
  
@@ -190,7 +239,7 @@ diff --git a/tools/recomp/test_mem_disp.py b/tools/recomp/test_mem_disp.py
      assert got == want, (src, got)
      assert n == hits, (src, n)
  
-@@ -42,6 +42,26 @@
+@@ -42,6 +42,26 @@ def test_left_alone():
      check("MEM32(eax - 0x8000)", "MEM32_D(eax, -0x8000)", 1)
  
  
@@ -218,9 +267,10 @@ diff --git a/tools/recomp/test_mem_disp.py b/tools/recomp/test_mem_disp.py
      for name, fn in sorted(globals().items()):
          if name.startswith("test_"):
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index cf26914..55c8baa 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -505,6 +505,8 @@
+@@ -508,6 +508,8 @@ class FunctionTranslator:
          # mem_disp.py: MEMxx(base + small disp) as MEMxx_D(base, disp) (--mem-disp)
          self.mem_disp = False
          self.mem_disp_count = 0
@@ -228,8 +278,8 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
 +        self.stack_disp = False
  
      def discover_static_indirect_targets(self, *, coalescing=False):
-         """Recover function entries from bounded static callback tables."""
-@@ -3089,8 +3091,8 @@
+         """Recover callbacks and the gap entries their bodies reference."""
+@@ -3434,8 +3436,8 @@ class FunctionTranslator:
              key = why or "in locals"
              self.x87_stats[key] = self.x87_stats.get(key, 0) + 1
  
@@ -240,45 +290,3 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
              self.mem_disp_count += n
              return text
          return "\n".join(lines)
-diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
---- a/templates/runtime/recomp_types.h
-+++ b/templates/runtime/recomp_types.h
-@@ -502,6 +502,21 @@
- #define MEMF_D(b, d)   MEMF((b) + (d))
- #define MEMD_D(b, d)   MEMD((b) + (d))
- 
-+/** The same accesses at esp + disp (recomp --stack-disp writes them for an
-+ * access whose base is esp itself, disp 0 included). Here exactly
-+ * MEMxx_D(esp, disp); a runtime that keeps every guest stack where its
-+ * address map is the identity can address the stack as esp + disp without
-+ * the map. */
-+#define MEM8_SP(b, d)   MEM8_D(b, d)
-+#define MEM16_SP(b, d)  MEM16_D(b, d)
-+#define MEM32_SP(b, d)  MEM32_D(b, d)
-+#define SMEM8_SP(b, d)  SMEM8_D(b, d)
-+#define SMEM16_SP(b, d) SMEM16_D(b, d)
-+#define SMEM32_SP(b, d) SMEM32_D(b, d)
-+#define SMEM64_SP(b, d) SMEM64_D(b, d)
-+#define MEMF_SP(b, d)   MEMF_D(b, d)
-+#define MEMD_SP(b, d)   MEMD_D(b, d)
-+
- /** Float/double stores. The lifter emits MEMF_SET(addr, v) rather than
-  * "MEMF(addr) = v" so a runtime can store a float some other way without
-  * the generated code changing. A host that keeps guest memory little-endian
-@@ -514,6 +529,13 @@
- #endif
- #ifndef MEMD_SET
- #define MEMD_SET(addr, v) ((void)(MEMD(addr) = (double)(v)))
-+#endif
-+/* The stores at esp + disp (--stack-disp). */
-+#ifndef MEMF_SET_SP
-+#define MEMF_SET_SP(b, d, v) MEMF_SET((b) + (d), v)
-+#endif
-+#ifndef MEMD_SET_SP
-+#define MEMD_SET_SP(b, d, v) MEMD_SET((b) + (d), v)
- #endif
- 
- /** x87 80-bit extended memory operands: fld m80 and fstp m80.
--- 
-2.43.0
-

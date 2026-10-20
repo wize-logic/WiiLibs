@@ -132,10 +132,10 @@ index 0000000..9742196
 +        assert os.path.exists(os.path.join(out, "recomp_funcs.h"))
 +        assert os.path.exists(os.path.join(out, "recomp_dispatch.c"))
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 3cd9250..a41fff4 100644
+index 6a7f44c..94e8f5b 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -2921,7 +2921,8 @@ class BatchTranslator:
+@@ -3268,7 +3268,8 @@ class BatchTranslator:
  
      def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                                header_name="recomp_funcs.h",
@@ -145,7 +145,7 @@ index 3cd9250..a41fff4 100644
          """
          Translate functions into multiple .c files + a shared header.
  
-@@ -2938,6 +2939,12 @@ class BatchTranslator:
+@@ -3285,6 +3286,12 @@ class BatchTranslator:
          is how a game replaces a recompiled XDK routine (a D3D8 entry point,
          say) with one that drives the host runtime instead of the hardware.
  
@@ -158,7 +158,7 @@ index 3cd9250..a41fff4 100644
          Returns dict with stats and list of generated files.
          """
          import sys
-@@ -3083,26 +3090,43 @@ class BatchTranslator:
+@@ -3430,26 +3437,43 @@ class BatchTranslator:
          # So it tracks the template, like the .c files do. A project that
          # genuinely needs its own can put one earlier on the include path --
          # gen/ is only found because recomp_funcs.h sits beside it.

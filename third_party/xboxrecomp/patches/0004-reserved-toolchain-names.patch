@@ -35,7 +35,7 @@ declaration to clash on the compiler at hand (the negative control).
  create mode 100644 tools/recomp/test_reserved_idents_toolchains.py
 
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index 7f7e152..93f6f0f 100644
+index 2e036c1..cccbff1 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
 @@ -99,7 +99,60 @@ _FUNC_RESERVED_IDENT = frozenset({

@@ -19,9 +19,65 @@ did; a runtime can define it to map base once and add disp on the host.
 A larger displacement (a table indexed by a register, where the
 displacement is the pointer) keeps the old form. Off by default.
 ---
+ templates/runtime/recomp_types.h | 14 ++++++
+ tools/recomp/__main__.py         |  4 ++
+ tools/recomp/mem_disp.py         | 79 ++++++++++++++++++++++++++++++++
+ tools/recomp/test_mem_disp.py    | 49 ++++++++++++++++++++
+ tools/recomp/translator.py       |  8 ++++
+ 5 files changed, 154 insertions(+)
+ create mode 100644 tools/recomp/mem_disp.py
+ create mode 100644 tools/recomp/test_mem_disp.py
 
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index e2feee5..fd32273 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -533,6 +533,20 @@ void recomp_trace_esp(const char *name, const char *tag);
+ #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
+ #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
+ 
++/** The same accesses at base + disp, a small constant (recomp --mem-disp
++ * writes them for MEMxx(base + disp)). Here exactly MEMxx(base + disp); a
++ * runtime whose address map is not a plain addition can map base once and
++ * add disp on the host side. */
++#define MEM8_D(b, d)   MEM8((b) + (d))
++#define MEM16_D(b, d)  MEM16((b) + (d))
++#define MEM32_D(b, d)  MEM32((b) + (d))
++#define SMEM8_D(b, d)  SMEM8((b) + (d))
++#define SMEM16_D(b, d) SMEM16((b) + (d))
++#define SMEM32_D(b, d) SMEM32((b) + (d))
++#define SMEM64_D(b, d) SMEM64((b) + (d))
++#define MEMF_D(b, d)   MEMF((b) + (d))
++#define MEMD_D(b, d)   MEMD((b) + (d))
++
+ /** Float/double stores. The lifter emits MEMF_SET(addr, v) rather than
+  * "MEMF(addr) = v" so a runtime can store a float some other way without
+  * the generated code changing. A host that keeps guest memory little-endian
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index c6760f0..483d395 100644
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -285,6 +285,9 @@ def main():
+                              "g_fp_* globals only where control leaves the "
+                              "function (x87_locals.py); needs a runtime header "
+                              "with RECOMP_FP_PC_CW")
++    parser.add_argument("--mem-disp", action="store_true",
++                        help="Write a guest access with a small constant displacement as "
++                             "MEMxx_D(base, disp), so a runtime can map base once (mem_disp.py)")
+     parser.add_argument("--reg-locals", action="store_true",
+                         help="Keep each function's integer registers (eax..edi, esp) "
+                              "in C locals too, written back to the g_* globals only "
+@@ -369,6 +372,7 @@ def main():
+     )
+     translator.translator.x87_locals = args.x87_locals
+     translator.translator.reg_locals = args.reg_locals
++    translator.translator.mem_disp = args.mem_disp
+ 
+     t_load = time.time() - t0
+     print(f"Loaded {len(translator.func_db)} functions, "
 diff --git a/tools/recomp/mem_disp.py b/tools/recomp/mem_disp.py
 new file mode 100644
+index 0000000..2d89a00
 --- /dev/null
 +++ b/tools/recomp/mem_disp.py
 @@ -0,0 +1,79 @@
@@ -106,6 +162,7 @@ new file mode 100644
 +    return "".join(out), hits
 diff --git a/tools/recomp/test_mem_disp.py b/tools/recomp/test_mem_disp.py
 new file mode 100644
+index 0000000..2b329a6
 --- /dev/null
 +++ b/tools/recomp/test_mem_disp.py
 @@ -0,0 +1,49 @@
@@ -159,9 +216,10 @@ new file mode 100644
 +            fn()
 +    print("ok")
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 49a827a..cf26914 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -23,6 +23,7 @@
+@@ -23,6 +23,7 @@ import sys
  from .config import va_to_file_offset, is_code_address
  from . import config as _config
  from .disasm import Disassembler
@@ -169,7 +227,7 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
  from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                       _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                       detect_setjmp_helpers, _func_ident, _operand_width)
-@@ -501,6 +502,9 @@
+@@ -504,6 +505,9 @@ class FunctionTranslator:
          self.x87_locals = False
          self.reg_locals = False
          self.x87_stats = {}
@@ -178,8 +236,8 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
 +        self.mem_disp_count = 0
  
      def discover_static_indirect_targets(self, *, coalescing=False):
-         """Recover function entries from bounded static callback tables."""
-@@ -3085,6 +3089,10 @@
+         """Recover callbacks and the gap entries their bodies reference."""
+@@ -3430,6 +3434,10 @@ class FunctionTranslator:
              key = why or "in locals"
              self.x87_stats[key] = self.x87_stats.get(key, 0) + 1
  
@@ -190,51 +248,3 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
          return "\n".join(lines)
  
      def _find_used_registers(self, instructions):
-diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
---- a/tools/recomp/__main__.py
-+++ b/tools/recomp/__main__.py
-@@ -285,6 +285,9 @@
-                              "g_fp_* globals only where control leaves the "
-                              "function (x87_locals.py); needs a runtime header "
-                              "with RECOMP_FP_PC_CW")
-+    parser.add_argument("--mem-disp", action="store_true",
-+                        help="Write a guest access with a small constant displacement as "
-+                             "MEMxx_D(base, disp), so a runtime can map base once (mem_disp.py)")
-     parser.add_argument("--reg-locals", action="store_true",
-                         help="Keep each function's integer registers (eax..edi, esp) "
-                              "in C locals too, written back to the g_* globals only "
-@@ -369,6 +372,7 @@
-     )
-     translator.translator.x87_locals = args.x87_locals
-     translator.translator.reg_locals = args.reg_locals
-+    translator.translator.mem_disp = args.mem_disp
- 
-     t_load = time.time() - t0
-     print(f"Loaded {len(translator.func_db)} functions, "
-diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
---- a/templates/runtime/recomp_types.h
-+++ b/templates/runtime/recomp_types.h
-@@ -487,6 +487,20 @@
- /** Float/double memory access. */
- #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
- #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
-+
-+/** The same accesses at base + disp, a small constant (recomp --mem-disp
-+ * writes them for MEMxx(base + disp)). Here exactly MEMxx(base + disp); a
-+ * runtime whose address map is not a plain addition can map base once and
-+ * add disp on the host side. */
-+#define MEM8_D(b, d)   MEM8((b) + (d))
-+#define MEM16_D(b, d)  MEM16((b) + (d))
-+#define MEM32_D(b, d)  MEM32((b) + (d))
-+#define SMEM8_D(b, d)  SMEM8((b) + (d))
-+#define SMEM16_D(b, d) SMEM16((b) + (d))
-+#define SMEM32_D(b, d) SMEM32((b) + (d))
-+#define SMEM64_D(b, d) SMEM64((b) + (d))
-+#define MEMF_D(b, d)   MEMF((b) + (d))
-+#define MEMD_D(b, d)   MEMD((b) + (d))
- 
- /** Float/double stores. The lifter emits MEMF_SET(addr, v) rather than
-  * "MEMF(addr) = v" so a runtime can store a float some other way without
--- 
-2.43.0
-

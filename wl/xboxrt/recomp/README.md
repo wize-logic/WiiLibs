@@ -97,6 +97,7 @@ the guest lock from one guest thread to another.
 | `g_fp_control_word` | `uint16_t` | x87 control word (precision and rounding control) |
 | `g_fp_cmp` | `int` | last x87 compare: -1, 0, 1, 2 unordered |
 | `g_fp_cc` | `uint16_t` | x87 condition codes for `fnstsw` |
+| `g_mxcsr` | `uint32_t` | SSE control and status (0x1F80 at reset): `stmxcsr`/`ldmxcsr`, and its rounding control steers `cvtss2si`/`cvtsd2si` and `MMX_CVT_F2I` (upstream v0.14.0) |
 | `g_xmm0` .. `g_xmm7` | `RecompXmm` | SSE registers |
 | `g_mm0` .. `g_mm7` | `RecompMmx` | MMX registers (declared for every includer, not only generated code) |
 | `g_xbox_code_lo` `g_xbox_code_hi` | `uint32_t` | bounds of the title's executable sections (`RECOMP_ICALL_IS_CODE`; 0 = allow all) |
@@ -115,7 +116,7 @@ Functions:
 | `void recomp_unimpl(const char *text, uint32_t va)` | an instruction the lifter could not translate was reached |
 | `uint64_t xbox_ReadTimeStampCounter(void)` | `rdtsc`, at the Xbox's 733.33 MHz |
 | `volatile uint32_t g_xb_attention`, `void wl_xb_safe_point(void)` | `RECOMP_BACKEDGE()` before every backward jump (patch 0008): when the flag is set (another guest thread or interrupt work waits for the guest lock) the loop gives way at its back edge. With `--x87-locals` and `--reg-locals` (patches 0013 and 0014, the driver's default) the x87 and integer register globals are not current at a back edge, nor at a device access the runtime emulates (the function holds them in locals), so whatever runs there must save and restore them around itself, as wl/xboxrt's thread switch and interrupt work do with the whole register file, and interrupt work must run on a guest stack of its own (wl/xboxrt's service thread's), not below a stale `g_esp` |
-| `uint32_t wl_xb_port_in(uint32_t port, unsigned size)`, `void wl_xb_port_out(uint32_t port, uint32_t value, unsigned size)` | x86 `in`/`out` (patch 0009) |
+| `uint32_t wl_xb_port_in(uint32_t port, unsigned size)`, `void wl_xb_port_out(uint32_t port, uint32_t value, unsigned size)` | x86 `in`/`out`: upstream lifts them to `xbox_PortIn`/`xbox_PortOut` (v0.14.0), which the header maps to these |
 
 From the C library and libgcc: `memcpy`, `memset`, `calloc` (only `recomp_dispatch_init`), libm
 (`sqrt`, `floor`, `floorf`, `ceil`, `ceilf`, `trunc`, `truncf`, `fmod`, `frexp`, `ldexp`, `log`, `exp2`,

@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wize-logic <wizelogic@proton.me>
 Date: Wed, 14 Oct 2026 22:00:00 -0400
-Subject: [PATCH] conformance: every MMX operation in Bink's decoder, the whole result compared
+Subject: [PATCH] conformance: every MMX operation in Bink's decoder, the whole
+ result compared
 
 The MMX cases reported one dword of the result from a register source.
 These run each operation Halo's Bink decoder uses (and their siblings)
@@ -14,10 +15,14 @@ scratch buffer, which the harness compares.
 All pass: the blocky colour in Halo's Bink intro does not come from an
 MMX operation's semantics.
 ---
+ tools/conformance/cases.py | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
 diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
+index d6059c4..30e4955 100644
 --- a/tools/conformance/cases.py
 +++ b/tools/conformance/cases.py
-@@ -765,3 +765,41 @@
+@@ -798,3 +798,41 @@ for _cc in ("b", "e", "be", "u", "nb", "ne", "nbe", "nu"):
  CASES.append(Case("sse_stmxcsr", "stmxcsr stores the default MXCSR controls",
                    ["stmxcsr dword ptr [eax+32]", "and dword ptr [eax+32], 0FFFFFFC0h",
                     "mov eax, dword ptr [eax+32]"], _SSE, "sse"))
@@ -59,6 +64,3 @@ diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
 +    Case("mmx64_movq_reg", "movq mm, mm copies all 64 bits",
 +         _MMX_LOAD + ["movq mm0, mm1"] + _MMX_STORE, _SSE, "sse"),
 +]
--- 
-2.43.0
-

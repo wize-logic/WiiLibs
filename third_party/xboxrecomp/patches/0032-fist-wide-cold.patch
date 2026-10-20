@@ -19,10 +19,10 @@ for a call. A runtime may define either macro first.
  1 file changed, 22 insertions(+), 4 deletions(-)
 
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
-index 2d10409..4bc5ece 100644
+index 8620933..412543f 100644
 --- a/templates/runtime/recomp_types.h
 +++ b/templates/runtime/recomp_types.h
-@@ -343,7 +343,25 @@ static inline int32_t recomp_round_small(double value, uint16_t control) {
+@@ -332,7 +332,25 @@ static inline int32_t recomp_round_small(double value, uint16_t control) {
          return t;
      }
  }
@@ -49,7 +49,7 @@ index 2d10409..4bc5ece 100644
      double rounded;
      if (!isfinite(value)) return value;
      switch((control>>10)&3) {
-@@ -359,7 +377,7 @@ static inline double recomp_frndint_wide(double value, uint16_t control) {
+@@ -348,7 +366,7 @@ static inline double recomp_frndint_wide(double value, uint16_t control) {
      }
      return rounded == 0.0 ? copysign(0.0, value) : rounded;
  }
@@ -58,7 +58,7 @@ index 2d10409..4bc5ece 100644
      if (value > -1073741824.0 && value < 1073741824.0) {
          double rounded = (double)recomp_round_small(value, control);
          return rounded == 0.0 ? copysign(0.0, value) : rounded;
-@@ -368,14 +386,14 @@ static inline double recomp_frndint(double value, uint16_t control) {
+@@ -357,14 +375,14 @@ static inline double recomp_frndint(double value, uint16_t control) {
  }
  /* x87 integer stores use the guest RC bits, independently of host rounding.
   * Masked invalid conversions store the signed integer-indefinite value. */

@@ -32,6 +32,9 @@ DESELECT = {
                                                   "runtime, not vendored)",
     "tools/recomp/test_icall_guarded_runtime.py::test_runtime_site_dump_round_trips_through_the_merge_parser":
         "compiles upstream's src/kernel/icall_feedback.c (not vendored)",
+    "tools/recomp/test_lifter_mxcsr.py::MxcsrLiftTest::test_runtime_declares_the_state":
+        "reads upstream's src/kernel/xbox_memory_layout.c (not vendored); WiiLibs' g_mxcsr is in "
+        "wl/xboxrt/recomp_symbols.inc",
 }
 
 

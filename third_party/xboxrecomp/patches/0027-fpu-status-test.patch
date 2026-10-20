@@ -11,10 +11,10 @@ Subject: [PATCH] recomp: fcom; fnstsw ax; test ah, imm; jcc branches on the
  create mode 100644 tools/recomp/test_fpu_status_test.py
 
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index afb6217..a8a23b6 100644
+index 771e31a..01c73c9 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
-@@ -1179,6 +1179,67 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
+@@ -1156,6 +1156,67 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
      return f"if ({cond_expr}) goto loc_{target:08X}; /* {jcc}: {desc} */"
  
  
@@ -82,7 +82,7 @@ index afb6217..a8a23b6 100644
  def try_match_cmp_jcc(insns, idx, lifter=None):
      """
      Try to match a cmp/test + jcc pattern starting at insns[idx].
-@@ -1197,8 +1258,9 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
+@@ -1174,8 +1235,9 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
          return None
  
      # Same normalised form the snapshot and the recorded state use.

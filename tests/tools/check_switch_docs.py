@@ -6,7 +6,7 @@ title-folder switch the runtime reads (wl/xbox/nv2a_gx.c's k_switches, boot.c's 
 its k_compat, memfast_wii.c's oldcopy) and every WL_XB_* variable it or the replay reads has a row; every
 switch and variable a row of "Off switches" names is still read; every halo.json key of the build-time
 table is one tools/xbox_recomp.py reads. And third_party/xboxrecomp/patches numbered 0001 on without a gap,
-no .pyc among them. A new switch fails this test until its row is written."""
+but for a number third_party/xboxrecomp/README.md's table gives as dropped (a `(NNNN)` row), no .pyc among them. A new switch fails this test until its row is written."""
 import pathlib
 import re
 import sys
@@ -73,7 +73,10 @@ for name in patches:
         bad += 1
     else:
         numbers.append(int(m.group(1)))
-if numbers != list(range(1, len(numbers) + 1)):
+# a dropped patch leaves its number free, so that the others and every reference to them keep theirs
+dropped = {int(n) for n in re.findall(r'^\| \((\d{4})\) \|', (root / 'third_party/xboxrecomp/README.md').read_text(), re.M)}
+free = sorted(n for n in dropped if numbers and n < max(numbers))
+if sorted(numbers + free) != list(range(1, len(numbers) + len(free) + 1)):
     print('patch numbers with a gap or a repeat:', numbers)
     bad += 1
 print(f'{len(files)} switch files, {len(envs)} variables, {len(numbers)} patches, {bad} problems')

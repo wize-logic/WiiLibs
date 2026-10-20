@@ -49,10 +49,10 @@ index 634ff27..d4a31f4 100644
      for name, fn in sorted(globals().items()):
          if name.startswith("test_"):
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 2a36963..28e8f8e 100644
+index cd73beb..acf6566 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -3123,10 +3123,21 @@ class FunctionTranslator:
+@@ -3468,10 +3468,21 @@ class FunctionTranslator:
          """The passes over a translated body's C text: x87_locals (with the
          callees preserve.py proved, self.kept), then mem_disp."""
          if self.reg_locals or (has_fpu and self.x87_locals):

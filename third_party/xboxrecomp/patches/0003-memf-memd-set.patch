@@ -36,10 +36,10 @@ default. test_lifter_sse.py and test_lifter_fpu.py expect the new text.
  create mode 100644 tools/recomp/test_float_store_macro.py
 
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
-index 6ca6fd0..3cfc7b0 100644
+index 559f34d..9b6f824 100644
 --- a/templates/runtime/recomp_types.h
 +++ b/templates/runtime/recomp_types.h
-@@ -450,6 +450,20 @@ void recomp_trace_esp(const char *name, const char *tag);
+@@ -523,6 +523,20 @@ void recomp_trace_esp(const char *name, const char *tag);
  #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
  #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
  
@@ -61,10 +61,10 @@ index 6ca6fd0..3cfc7b0 100644
   * SSE / XMM register state
   *
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index 6b7651f..7f7e152 100644
+index 7fe8a20..2e036c1 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
-@@ -3163,9 +3163,12 @@ class Lifter:
+@@ -3238,9 +3238,12 @@ class Lifter:
              elif op.type == "reg":
                  return f"{op.reg} = {val};"
              elif op.type == "mem":
@@ -79,7 +79,7 @@ index 6b7651f..7f7e152 100644
              return f"/* sse_write? */;"
  
          # ── Packed (128-bit) access ──
-@@ -3538,9 +3541,9 @@ class Lifter:
+@@ -3629,9 +3632,9 @@ class Lifter:
              if len(ops) >= 1 and ops[0].type == "mem":
                  pop = " fp_pop();" if m == "fstp" else ""
                  if ops[0].mem_size == 4:
@@ -88,9 +88,9 @@ index 6b7651f..7f7e152 100644
                  elif ops[0].mem_size == 8:
 -                    return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{do_pop} /* {m} */"]
 +                    return [f"MEMD_SET({_fmt_mem(ops[0])}, fp_top());{do_pop} /* {m} */"]
-             # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
-             # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
-             # is the common idiom for "pop the value fptan/fsincos just pushed";
+                 elif ops[0].mem_size == 10:
+                     # Only fstp has a tbyte form. This was a comment, so the
+                     # spill stored nothing and the stack kept a slot.
 diff --git a/tools/recomp/test_float_store_macro.py b/tools/recomp/test_float_store_macro.py
 new file mode 100644
 index 0000000..ba37e3d

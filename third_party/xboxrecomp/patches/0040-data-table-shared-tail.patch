@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wize-logic <bcolb7@protonmail.com>
+Date: Mon, 19 Oct 2026 22:10:00 -0400
+Subject: [PATCH] disasm: a data-table entry in a gap may share its neighbour's
+ code
+
+_pass_data_ptr_targets takes a table word that lands in a gap only when
+probes_as_callback_body proves a closed CFG inside the gap, or a proven
+tail. An entry whose body shares code with the next function fails that:
+it falls through into the next start, branches into that function's body,
+or tail-jumps to a target found later. v0.13.1 took the linear probe
+(probes_as_function_body), and those entries were translated.
+
+Halo (retail) lost five. The MSVC CRT's fmod dispatches on the operand
+classes through a table (0x25F638); the entry for a zero dividend,
+0x2219C, is `fstp st(0)` falling into the next function's
+`fstp st(0); fldz; ret`. Untranslated, the indirect jump resolved to
+nothing, fmod(0, y) returned y and leaked an x87 slot: an animation
+decoder's blend fraction came out 1.0 instead of 0.0, so machines took
+another pose and the game drifted from v0.13.1's (deterministic runs
+parted at b30's tick 1328). The others: 0x2223E (branches into
+sub_00022251), 0x180380 and 0x1805D0 (tail-jump to 0x1670C0), 0x180830
+(more than 64 instructions to an indirect jmp).
+
+When the closed probes fail, the entry is still an instruction the sweep
+decoded in a gap (not padding); it is taken when the linear stream from it
+reaches a ret or a jmp, the proof a direct call target gets. An entry
+that is itself a jmp is a thunk and stays the tail proof's to decide (by
+its destination: test_table_thunk_chain_requires_a_proven_destination).
+
+Tests: test_data_table_shared_tail.py.
+---
+ tools/disasm/functions.py                   | 17 +++++++-
+ tools/disasm/test_data_table_shared_tail.py | 46 +++++++++++++++++++++
+ 2 files changed, 62 insertions(+), 1 deletion(-)
+ create mode 100644 tools/disasm/test_data_table_shared_tail.py
+
+diff --git a/tools/disasm/functions.py b/tools/disasm/functions.py
+index 2a3b354..bec35aa 100644
+--- a/tools/disasm/functions.py
++++ b/tools/disasm/functions.py
+@@ -882,7 +882,22 @@ class FunctionDetector:
+                 if not (self.engine.probes_as_callback_body(
+                             target, end, lower, tail_targets=tails)
+                         or self.engine.probes_as_vcall_thunk(target)):
+-                    if not self._probes_as_tail_body(target, starts, sections):
++                    # A table entry whose body shares code with its neighbour
++                    # proves no closed CFG inside its gap: it falls through
++                    # into the next function, branches into that function's
++                    # body, or tail-jumps to a target found later. The MSVC
++                    # CRT's fmod dispatches on operand classes through such a
++                    # table; Halo's entry for a zero dividend (fstp; then the
++                    # next function's fstp; fldz; ret) was lost, the indirect
++                    # jump resolved to nothing, and fmod(0, y) returned y with
++                    # an x87 slot leaked. The address is an instruction the
++                    # sweep decoded in a gap, so take the linear proof that a
++                    # direct call target gets: it reaches a ret or a jmp. An
++                    # entry that is itself a jmp is a thunk, and the tail
++                    # proof alone decides it (by its destination).
++                    if not (self._probes_as_tail_body(target, starts, sections)
++                            or (first.mnemonic.lower() != "jmp"
++                                and self.engine.probes_as_function_body(target))):
+                         continue
+             if end <= target:
+                 continue
+diff --git a/tools/disasm/test_data_table_shared_tail.py b/tools/disasm/test_data_table_shared_tail.py
+new file mode 100644
+index 0000000..d58ec48
+--- /dev/null
++++ b/tools/disasm/test_data_table_shared_tail.py
+@@ -0,0 +1,46 @@
++"""A data-table entry in a gap whose body falls through into the next function is an alias."""
++import struct
++
++from tools.disasm.test_returning_body_switch import BASE
++from tools.disasm.engine import DisasmEngine
++from tools.disasm.functions import FunctionDetector, Function
++from tools.disasm.labels import LabelManager
++from tools.disasm.loader import BinaryImage, SectionInfo
++
++
++def _detector(body, entry, known):
++    table = struct.pack('<I', entry)
++    text = SectionInfo('.text', BASE, len(body), 0, len(body), False, True, '')
++    data = SectionInfo('.data', BASE + 0x1000, len(table), len(body), len(table), False, False, '')
++    image = BinaryImage('synthetic', bytes(body) + table, 0, 0x20000, BASE, 0, [text, data])
++    engine = DisasmEngine(image)
++    engine.linear_sweep(text)
++    detector = FunctionDetector(engine, image, None, LabelManager())
++    for start, end in known:
++        detector.functions[start] = Function(start, end, 'known')
++    return engine, detector
++
++
++def test_entry_falling_into_the_next_function_is_found():
++    # the MSVC CRT's fmod class table: the entry for a zero dividend is
++    # fstp st(0), then the next function's fstp st(0); fldz; ret
++    body = bytearray(b'\xcc' * 32)
++    body[0] = 0xc3
++    body[16:18] = b'\xdd\xd8'
++    body[18:23] = b'\xdd\xd8\xd9\xee\xc3'
++    engine, detector = _detector(body, BASE + 16, ((BASE, BASE + 1), (BASE + 18, BASE + 23)))
++    assert not engine.probes_as_callback_body(BASE + 16, BASE + 18, BASE + 1)
++    detector._pass_data_ptr_targets([detector.image.sections[0]])
++    assert BASE + 16 in detector._alias_entries
++
++
++def test_entry_branching_into_the_next_function_is_found():
++    # fstp st(0); test eax, eax; jg into the next function's body; ret
++    body = bytearray(b'\xcc' * 48)
++    body[0] = 0xc3
++    body[16:23] = b'\xdd\xd8\x85\xc0\x7f\x0f\xc3'   # jg BASE+37 (a nop inside it)
++    body[32:40] = b'\xdd\xd8\xd9\xee\x90\x90\xd9\xe8'
++    body[40] = 0xc3
++    engine, detector = _detector(body, BASE + 16, ((BASE, BASE + 1), (BASE + 32, BASE + 41)))
++    detector._pass_data_ptr_targets([detector.image.sections[0]])
++    assert BASE + 16 in detector._alias_entries

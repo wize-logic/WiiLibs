@@ -156,7 +156,7 @@ index 0000000..f5cf7d4
 +    print("ok")
 diff --git a/tools/recomp/touched.py b/tools/recomp/touched.py
 new file mode 100644
-index 0000000..13860bc
+index 0000000..14cf9d7
 --- /dev/null
 +++ b/tools/recomp/touched.py
 @@ -0,0 +1,117 @@
@@ -208,7 +208,7 @@ index 0000000..13860bc
 +    RECOMP_ABI_CALL
 +    memcpy memset memmove fabs fabsf sqrt sqrtf sin cos tan atan atan2 log log2 log10 exp exp2
 +    floor ceil fmod ldexp frexp trunc round rint nearbyint
-+    recomp_fist recomp_frndint recomp_ld80 recomp_st80 recomp_fxam recomp_fprem_cc recomp_cvt_si32
++    recomp_fist recomp_frndint recomp_f80_load recomp_f80_store recomp_fscale recomp_fxam recomp_cvt_si32
 +""".split())
 +_PURE_PREFIX = ("XMM_", "MMX_")
 +
@@ -278,7 +278,7 @@ index 0000000..13860bc
 +                changed = True
 +    return {n: frozenset(t) for n, t in touch.items()}
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 28e8f8e..6039d00 100644
+index acf6566..15f00ea 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
 @@ -31,6 +31,7 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
@@ -289,7 +289,7 @@ index 28e8f8e..6039d00 100644
  
  
  # Float compares snapshot at the compare as well, and their conditions read
-@@ -530,6 +531,10 @@ class FunctionTranslator:
+@@ -533,6 +534,10 @@ class FunctionTranslator:
          # const_load.py: a float or double read from a fixed address in
          # read-only data as a literal (--rodata-consts)
          self.rodata_consts = False
@@ -300,7 +300,7 @@ index 28e8f8e..6039d00 100644
          self.rodata_const_count = 0
          self.kept = {}
          self.preserve_stats = {}
-@@ -3125,7 +3130,7 @@ class FunctionTranslator:
+@@ -3470,7 +3475,7 @@ class FunctionTranslator:
          if self.reg_locals or (has_fpu and self.x87_locals):
              out, why = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS,
                                      x87=self.x87_locals, regs=self.reg_locals,
@@ -309,7 +309,7 @@ index 28e8f8e..6039d00 100644
              key = why or "in locals"
              if why is not None and self.x87_locals and self.reg_locals:
                  # The x87 stack is what does not fit (more than eight positions
-@@ -3134,7 +3139,8 @@ class FunctionTranslator:
+@@ -3479,7 +3484,8 @@ class FunctionTranslator:
                  # in memory, rather than the whole body keeping every register
                  # in its global (a load and a store around each use).
                  regs_only, why_regs = localise_x87(lines, FP_STACK_MACROS, FP_STACK_UNDEFS,
@@ -319,7 +319,7 @@ index 28e8f8e..6039d00 100644
                  if why_regs is None:
                      out, key = regs_only, "registers in locals, x87 not: " + why
              lines = out
-@@ -3467,6 +3473,8 @@ class BatchTranslator:
+@@ -3812,6 +3818,8 @@ class BatchTranslator:
              return translations
          summaries = preserve.analyse(pending)
          t.kept = preserve.preserved_by_name(summaries)
@@ -329,10 +329,10 @@ index 28e8f8e..6039d00 100644
          for s in summaries.values():
              key = "+".join(sorted(s.preserved)) or ("none: " + s.why if s.why else "none")
 diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
-index 39a1e7c..61d4ef1 100644
+index 5e47d18..093f67c 100644
 --- a/tools/recomp/x87_locals.py
 +++ b/tools/recomp/x87_locals.py
-@@ -452,13 +452,14 @@ def _rewrite(code, k, x87=True, regs=False, skip=frozenset()):
+@@ -451,13 +451,14 @@ def _rewrite(code, k, x87=True, regs=False, skip=frozenset()):
  # ------------------------------------------------------------- the pass
  
  class _Node:
@@ -348,7 +348,7 @@ index 39a1e7c..61d4ef1 100644
  
  
  def _body_bounds(lines, macros, undefs):
-@@ -548,14 +549,18 @@ def _nodes(lines, lo, hi):
+@@ -547,14 +548,18 @@ def _nodes(lines, lo, hi):
      return nodes
  
  
@@ -370,7 +370,7 @@ index 39a1e7c..61d4ef1 100644
      except _NotLocal as e:
          return lines, str(e)
  
-@@ -598,6 +603,17 @@ _DIRECT_CALL = re.compile(r"\s*PUSH32\(esp, 0x[0-9A-Fa-f]+u\); RECOMP_ABI_CALL\(
+@@ -597,6 +602,17 @@ _DIRECT_CALL = re.compile(r"\s*PUSH32\(esp, 0x[0-9A-Fa-f]+u\); RECOMP_ABI_CALL\(
                            r"\s*(?:\x01\d+\x02)?\s*")
  
  
@@ -388,7 +388,7 @@ index 39a1e7c..61d4ef1 100644
  def _kept_by(code, kept):
      """The register globals a sync statement leaves in memory as they were
      (so in the locals too): a plain direct call to a function that preserves
-@@ -606,8 +622,9 @@ def _kept_by(code, kept):
+@@ -605,8 +621,9 @@ def _kept_by(code, kept):
      return kept.get(m.group(1), frozenset()) if m else frozenset()
  
  
@@ -399,7 +399,7 @@ index 39a1e7c..61d4ef1 100644
      bounds = _function_bounds(lines) if regs else _body_bounds(lines, macros, undefs)
      if bounds is None:
          raise _NotLocal("no body" if regs else "no x87 macros")
-@@ -641,6 +658,9 @@ def _localise(lines, macros, undefs, x87=True, regs=False, kept=None):
+@@ -640,6 +657,9 @@ def _localise(lines, macros, undefs, x87=True, regs=False, kept=None):
                  raise _NotLocal("a goto in a statement that calls out or returns")
              n.kind = "sync"
              n.keeps = _kept_by(n.code, kept) if regs else frozenset()
@@ -409,7 +409,7 @@ index 39a1e7c..61d4ef1 100644
          elif fp or rg:
              n.kind = "fp"
          else:
-@@ -813,6 +833,13 @@ def _flow(nodes, labels, plan, x87=True, regs=False, skip=frozenset()):
+@@ -812,6 +832,13 @@ def _flow(nodes, labels, plan, x87=True, regs=False, skip=frozenset()):
              positions |= wr | rd
              scalars |= sused
              out = (k2, s[1] | frozenset(wr), s[2], s[3] | frozenset(swr))
@@ -423,7 +423,7 @@ index 39a1e7c..61d4ef1 100644
          else:  # sync: written back before it (see _emit); memory is the truth after
              # the locals of the registers a call gives back still hold them
              out = _mem(n.keeps & (_valid(s) if _is_mem(s) else _REG_KEPT))
-@@ -925,7 +952,16 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow, regs=False):
+@@ -924,7 +951,16 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow, regs=False):
                  f = flush(s)
                  if f:
                      out.append(indent + f + note)

@@ -27,10 +27,10 @@ access, and the same code where the map is an addition.
  3 files changed, 102 insertions(+), 8 deletions(-)
 
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
-index 7f59ae2..13bba38 100644
+index b3ad57f..9747bbd 100644
 --- a/templates/runtime/recomp_types.h
 +++ b/templates/runtime/recomp_types.h
-@@ -537,6 +537,13 @@ void recomp_trace_esp(const char *name, const char *tag);
+@@ -582,6 +582,13 @@ void recomp_trace_esp(const char *name, const char *tag);
  #ifndef MEMD_SET_SP
  #define MEMD_SET_SP(b, d, v) MEMD_SET((b) + (d), v)
  #endif
@@ -42,9 +42,9 @@ index 7f59ae2..13bba38 100644
 +#define MEMD_SET_D(b, d, v) MEMD_SET((b) + (d), v)
 +#endif
  
- /** x87 80-bit extended memory operands: fld m80 and fstp m80.
-  *
-@@ -675,6 +682,19 @@ static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
+ /* ================================================================
+  * SSE / XMM register state
+@@ -660,6 +667,19 @@ static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
  #define XMM_STORE_LOW(addr, src)  recomp_xmm_store_half((addr), (src), 0)
  #define XMM_STORE_HIGH(addr, src) recomp_xmm_store_half((addr), (src), 1)
  
@@ -64,7 +64,7 @@ index 7f59ae2..13bba38 100644
  static inline void recomp_xmm_load_half(RecompXmm *dst, uint32_t addr,
                                          int high) {
      dst->u[high * 2]     = MEM32(addr);
-@@ -1381,6 +1401,12 @@ static inline void MMX_STORE(uint32_t addr, RecompMmx v) {
+@@ -1398,6 +1418,12 @@ static inline void MMX_STORE(uint32_t addr, RecompMmx v) {
      memcpy((void *)XBOX_PTR(addr), &v, 8);
  }
  

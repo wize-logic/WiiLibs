@@ -33,10 +33,10 @@ read each element twice (two volatile reads of a device register).
  create mode 100644 tools/recomp/test_rep_short.py
 
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index 02fe199..fd9a883 100644
+index f5338b6..1e914c5 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
-@@ -3177,9 +3177,15 @@ class Lifter:
+@@ -3163,9 +3163,15 @@ class Lifter:
  
          Validate the entire guest range in 64 bits before the host fast path,
          including a range crossing into MMIO or wrapping the 32-bit address.
@@ -53,7 +53,7 @@ index 02fe199..fd9a883 100644
              "{ uint64_t _n = (uint64_t)ecx * %du;" % size,
              "if (!g_df && esi < 0xFD000000u && edi < 0xFD000000u"
              " && (uint64_t)esi + _n <= 0xFD000000u"
-@@ -3191,8 +3197,40 @@ class Lifter:
+@@ -3177,8 +3183,40 @@ class Lifter:
              f"else {{ uint32_t _i; int32_t _st = RECOMP_DF_STEP({size});",
              f"  for (_i = 0; _i < ecx; _i++) {mem}(edi + _i*_st) = {mem}(esi + _i*_st);",
              "  esi += ecx * _st; edi += ecx * _st; }",
@@ -95,7 +95,7 @@ index 02fe199..fd9a883 100644
  
      def _lift_rep_string(self, insn, m):
          # Every one of these steps by RECOMP_DF_STEP(size) rather than a
-@@ -3223,32 +3261,39 @@ class Lifter:
+@@ -3209,32 +3247,39 @@ class Lifter:
          if "movsw" in m:
              return self._lift_rep_movs(2, m)
          if "stosb" in m:
@@ -146,7 +146,7 @@ index 02fe199..fd9a883 100644
          if "cmpsb" in m:
              return self._rep_compare(m, "MEM8(esi)", "MEM8(edi)", 1, True)
          if "scasb" in m:
-@@ -3289,24 +3334,41 @@ class Lifter:
+@@ -3275,24 +3320,41 @@ class Lifter:
          A zero count leaves the flags as they were. _cf does that by itself
          (only an iteration writes it); for _flags, lift_basic_block loads
          the incoming ZF before this loop when a tracked setter provides it.
@@ -198,8 +198,8 @@ index 02fe199..fd9a883 100644
  
      def _lift_string_op(self, insn, m):
          # Unprefixed forms; direction still comes from EFLAGS.DF.
-@@ -4271,6 +4333,36 @@ class Lifter:
-         return [f"/* FPU: {m} {insn.op_str} */"]
+@@ -4290,6 +4352,36 @@ def _fcmov_statement(insn, cond_expr):
+             f" /* {insn.mnemonic} {insn.op_str} */")
  
  
 +def _rep_at(k, size):
@@ -235,7 +235,7 @@ index 02fe199..fd9a883 100644
  def _is_rep_compare(insn):
      """REPE/REPNE CMPS or SCAS -- the prefixed forms that write `_flags`."""
      if not insn.mnemonic.startswith("rep"):
-@@ -4443,8 +4535,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
+@@ -4471,8 +4563,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
                  zf = _make_condition("je", last_flag_setter, last_flag_ops)
                  sf = _make_condition("js", last_flag_setter, last_flag_ops)
                  lifter.shift_flags_in = (zf[0], sf[0]) if zf and sf else None

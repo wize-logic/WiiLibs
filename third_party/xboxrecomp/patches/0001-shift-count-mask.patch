@@ -33,7 +33,7 @@ inputs only reach counts 0, 1 and 31 once masked).
  create mode 100644 tools/recomp/test_shift_count_mask.py
 
 diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
-index fe73c06..3dc42a7 100644
+index 80e1717..83c849d 100644
 --- a/tools/conformance/cases.py
 +++ b/tools/conformance/cases.py
 @@ -49,6 +49,12 @@ _EDGES = [0x00000000, 0x00000001, 0x0000007F, 0x00000080, 0x000000FF,
@@ -49,7 +49,7 @@ index fe73c06..3dc42a7 100644
  # Doubles for the x87 cases. Ordinary values, the signed zeroes, a tie for
  # the rounding modes, and one pair that is only interesting in reverse
  # (fsubr/fdivr swap the operands, so a/b and b/a must differ).
-@@ -161,6 +167,20 @@ CASES = [
+@@ -183,6 +189,20 @@ CASES = [
           ["shr eax, cl"], _PAIRS),
      Case("rol_cl", "rotate left",
           ["rol eax, cl"], _PAIRS),
@@ -71,10 +71,10 @@ index fe73c06..3dc42a7 100644
           ["shld eax, ecx, 5"], _PAIRS),
  
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index e7ab880..e5530c3 100644
+index baf1834..7fe8a20 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
-@@ -2090,17 +2090,32 @@ class Lifter:
+@@ -2163,17 +2163,32 @@ class Lifter:
          return [f"/* {m}: unhandled */"]
  
      def _lift_shift(self, insn, ops, c_op):

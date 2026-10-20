@@ -286,7 +286,7 @@
     "xbox_recomp_conformance",
     "xbox_recomp_e2e"
    ],
-   "notes": "patches 0001 (shift mask), 0002 (cvt helper), 0003 (MEMF_SET), 0004 (reserved names), 0005 (fld/fstp m80), 0007 (setp/setnp), 0009 (in/out), 0010 (a body holds code outside its range: body_addrs, absorbed switch tables), 0012 (direct targets with no function go through RECOMP_ITAIL), 0015 (sahf reads AH; fprem and the transcendentals write C2), 0016 (the transcendentals keep a static stack depth), 0017 (integer widths and flags of mul, div, sub, add, neg, shifts; cwd), 0018 (stmxcsr, ldmxcsr, fcmovcc)"
+   "notes": "patches 0001 (shift mask), 0003 (MEMF_SET), 0004 (reserved names), 0010 (a body holds code outside its range: body_addrs, absorbed switch tables), 0012 (direct targets with no function go through RECOMP_ITAIL), 0016 (the transcendentals keep a static stack depth and clear C2 themselves), 0017 (integer widths and flags of mul, div, sub, add, neg, shifts; cwd), 0026-0029 (fcom/fnstsw/test branches, rep string forms). Upstream v0.14.0 took over the cvt helper, m80, parity SETcc, in/out, sahf/fprem/C2 and MXCSR/fcmov: 0002, 0005, 0007, 0015 and 0018 keep only their conformance cases, 0009 was dropped"
   },
   {
    "upstream": "tools/recomp/translator.py",
@@ -299,7 +299,7 @@
     "xbox_recomp_conformance",
     "xbox_recomp_e2e"
    ],
-   "notes": "patches 0006 (--runtime-header), 0008 (RECOMP_BACKEDGE before backward jumps), 0010 (the code a jump reaches outside its function is lifted into it; test_interior_targets.py), 0011 (discover_interior_entries: a called interior address gets a function), 0012 (lifter.entry_starts; stubs dispatch by address), 0013 (--x87-locals: translate_function hands each function that uses the x87 to x87_locals.py, which the patch adds with test_x87_locals.py), 0014 (--reg-locals: the integer registers in locals too, every function; test_reg_locals.py), 0015 (a function with a sahf declares _sahf), 0017 (and one with mul or imul the flag snapshot). Upstream changes to decode_function, translate_function, the discover_* passes or the stub writer need these rebased; tests/xbox_recomp/e2e.py (prog_interior.S) runs the shapes against the x86"
+   "notes": "patches 0006 (--runtime-header), 0008 (RECOMP_BACKEDGE before backward jumps), 0010 (the code a jump reaches outside its function is lifted into it; test_interior_targets.py), 0011 (discover_interior_entries: a called interior address gets a function), 0012 (lifter.entry_starts; stubs dispatch by address), 0013 (--x87-locals: translate_function hands each function that uses the x87 to x87_locals.py, which the patch adds with test_x87_locals.py), 0014 (--reg-locals: the integer registers in locals too, every function; test_reg_locals.py), 0017 (a function with mul or imul declares the flag snapshot). Upstream changes to decode_function, translate_function, the discover_* passes or the stub writer need these rebased; tests/xbox_recomp/e2e.py (prog_interior.S) runs the shapes against the x86"
   },
   {
    "upstream": "tools/recomp/__main__.py",
@@ -347,15 +347,7 @@
    "wl": [
     "third_party/xboxrecomp/patches/"
    ],
-   "notes": "patches 0015 (the status word's condition bits) and 0016 (the transcendentals' static stack depth) update the expected text"
-  },
-  {
-   "upstream": "tools/recomp/test_lifter_lahf.py",
-   "kind": "patched",
-   "wl": [
-    "third_party/xboxrecomp/patches/"
-   ],
-   "notes": "patch 0015 (sahf reads AH) updates the expected text"
+   "notes": "patch 0016 (the transcendentals' static stack depth) updates the expected text"
   },
   {
    "upstream": "tools/recomp/test_lifter_rep_compare_flags.py",
@@ -395,19 +387,7 @@
    "wl_tests": [
     "xbox_recomp_conformance"
    ],
-   "notes": "patches 0001, 0002, 0005, 0007, 0015-0018 and 0020 add cases; tests/xbox_recomp/conformance.py replays every case on ppc-be"
-  },
-  {
-   "upstream": "tools/conformance/harness.py",
-   "kind": "patched",
-   "wl": [
-    "third_party/xboxrecomp/patches/",
-    "tests/xbox_recomp/conformance.py"
-   ],
-   "wl_tests": [
-    "xbox_recomp_conformance"
-   ],
-   "notes": "patches 0007 and 0015 declare the ucomiss and sahf snapshots in each lifted case; conformance.py mirrors the lifted-case template"
+   "notes": "patches 0001, 0002 (cvt(t)ss2si/sd2si edges), 0005 (m80), 0007 (parity after fcomi/ucomiss), 0015 (the status word through fnstsw/sahf), 0016-0018 (fcmov, stmxcsr) and 0020 add cases; tests/xbox_recomp/conformance.py replays every case on ppc-be"
   },
   {
    "upstream": "tools/conformance/**",
@@ -433,7 +413,7 @@
     "xbox_recomp_header",
     "xbox_recomp_conformance"
    ],
-   "notes": "the generated-code ABI (patches 0008 and 0009 add the RECOMP_BACKEDGE and RECOMP_PORT_IN/OUT defaults, which WiiLibs' header makes wl/xboxrt's safe point; 0013 adds RECOMP_FP_PC_CW, the precision rounding with the control word as an argument; 0015 adds recomp_fprem_cc, fprem's condition codes). WiiLibs' big-endian header is generated from the patched template by wl/xboxrt/recomp/gen_recomp_types.py; the xbox_recomp_header test fails until it is regenerated"
+   "notes": "the generated-code ABI (patch 0008 adds the RECOMP_BACKEDGE default, which WiiLibs' header makes wl/xboxrt's safe point; upstream's in/out call xbox_PortIn/xbox_PortOut, which the header maps to wl/xboxrt's ports; 0013 adds RECOMP_FP_PC_CW, the precision rounding with the control word as an argument). WiiLibs' big-endian header is generated from the patched template by wl/xboxrt/recomp/gen_recomp_types.py; the xbox_recomp_header test fails until it is regenerated"
   },
   {
    "upstream": "templates/runtime/**",
@@ -487,7 +467,7 @@
     "xboxrecomp_pytest",
     "xbox_recomp_synthetic_title"
    ],
-   "notes": "patch 0019 (a gap-bounded probe for long bodies named by an immediate or a data table; BINKDATA is data). Upstream changes to the discovery passes or the probes need it rebased"
+   "notes": "patch 0019 (BINKDATA is data, loader.py and config.py; upstream v0.14.0's gap-bounded callback probe replaced the patch's own). Upstream changes to the section lists need it rebased"
   },
   {
    "upstream": "tools/func_id/**",

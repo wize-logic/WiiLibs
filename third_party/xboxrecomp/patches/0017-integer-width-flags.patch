@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wize-logic <wizelogic@proton.me>
 Date: Wed, 14 Oct 2026 22:00:00 -0400
-Subject: [PATCH] recomp: integer widths and flags of mul, div, sub, add, neg and shifts
+Subject: [PATCH] recomp: integer widths and flags of mul, div, sub, add, neg
+ and shifts
 
 - One-operand mul, imul, div and idiv were lifted as the dword forms at
   every width. `mul cl` multiplied all of EAX and wrote EDX; `div cl`
@@ -41,10 +42,19 @@ imul_three_of, imul_three_16_of, sub8_signed, sub16_signed,
 add32_signed, add8_signed, neg32_signed, neg8_signed, the three
 <shift>_zero_count_flags and shl_imm_zero_flags.
 ---
+ tools/conformance/cases.py               |  78 ++++++++
+ tools/recomp/lifter.py                   | 227 +++++++++++++++++------
+ tools/recomp/test_integer_width_flags.py | 107 +++++++++++
+ tools/recomp/test_interior_targets.py    |   4 +-
+ tools/recomp/translator.py               |   3 +-
+ 5 files changed, 360 insertions(+), 59 deletions(-)
+ create mode 100644 tools/recomp/test_integer_width_flags.py
+
 diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
+index 983e365..887d764 100644
 --- a/tools/conformance/cases.py
 +++ b/tools/conformance/cases.py
-@@ -675,3 +675,81 @@
+@@ -708,3 +708,81 @@ CASES += [
            "seta cl", "setb ch", "setz dl", "setp dh", "shl ch, 1", "shl dl, 2", "shl dh, 3",
            "or cl, ch", "or cl, dl", "or cl, dh", "movzx eax, cl"], _FP_NAN, "fpu"),
  ]
@@ -127,9 +137,10 @@ diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
 +                  ["cmp ecx, 7", "shl eax, 0", "sete dl", "sets dh", "movzx edx, dx", "xor eax, edx"],
 +                  _SHIFT_COUNTS))
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index 9503b5a..771e31a 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
-@@ -390,7 +390,7 @@
+@@ -390,7 +390,7 @@ COND_MAP = {
  # Instructions that set arithmetic flags (primary set, fully handled)
  FLAG_SETTERS = frozenset({
      "cmp", "test", "sub", "add", "and", "or", "xor",
@@ -138,7 +149,7 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
      "comiss", "comisd", "ucomiss", "ucomisd",  # SSE float compare
  })
  
-@@ -448,7 +448,9 @@
+@@ -453,7 +453,9 @@ _EFLAGS_SETTERS = frozenset({
  
  # Instructions with undefined/unpredictable flags (clear tracking)
  _FLAGS_UNDEFINED = frozenset({
@@ -147,9 +158,9 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
 +    # the lift publishes in _fb like imul's.
 +    "div", "idiv",         # Flags undefined
      "rdtsc", "cpuid",      # Special instructions
-     "lock xadd",           # Lock prefix - complex flag behavior
      # popfd REPLACES every flag with whatever was pushed. Its flags are not
-@@ -673,6 +675,16 @@
+     # architecturally undefined -- they are simply not knowable from the
+@@ -644,6 +646,16 @@ def _make_condition(jcc, flag_setter, flag_ops):
              return f"{expr} /* {flag_setter} */", desc
          return None
  
@@ -166,7 +177,7 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
      # If no operands available for other flag-setters, can't generate condition
      if lhs is None:
          return None
-@@ -832,8 +844,14 @@
+@@ -811,8 +823,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
              return f"({slhs} < 0)", desc
          if jcc == "jns":
              return f"({slhs} >= 0)", desc
@@ -182,7 +193,7 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
              return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
          if jcc in ("jb", "jnae"):
              return f"((uint32_t){lhs} + (uint32_t){rhs} < (uint32_t){rhs})", desc
-@@ -863,14 +881,15 @@
+@@ -842,14 +860,15 @@ def _make_condition(jcc, flag_setter, flag_ops):
              return f"({lhs} < (uint32_t){rhs})", desc
          if jcc in ("jae", "jnb", "jnc"):
              return f"({lhs} >= (uint32_t){rhs})", desc
@@ -206,7 +217,7 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
          return None
  
      # ── adc/sbb: result-based (like add/sub but with carry) ──
-@@ -959,14 +978,12 @@
+@@ -938,14 +957,12 @@ def _make_condition(jcc, flag_setter, flag_ops):
              return f"({slhs} < 0)", desc
          if jcc == "jns":
              return f"({slhs} >= 0)", desc
@@ -227,7 +238,7 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
          return None
  
      # ── shift: result-based ──
-@@ -1095,6 +1112,11 @@
+@@ -1091,6 +1108,11 @@ def _make_condition(jcc, flag_setter, flag_ops):
      return None
  
  
@@ -236,19 +247,10 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
 +                 "jle": "<=", "jng": "<=", "jg": ">", "jnle": ">"}
 +
 +
- # SETcc / CMOVcc forms the lifter turns into a condition. The parity forms
- # matter after fcomi/fucomi (and comiss/ucomiss): "a == b" on doubles is
- # `fucomip; setnp dl; sete al; and al, dl`, because ZF alone is also set by
-@@ -1102,7 +1124,7 @@
- # whatever it held -- and every float equality test came out wrong.
- _SETCC = frozenset(("sete", "setne", "setb", "setae", "setbe", "seta",
-                     "setl", "setge", "setle", "setg", "sets", "setns",
--                    "setp", "setnp", "setpe", "setpo"))
-+                    "setp", "setnp", "setpe", "setpo", "seto", "setno"))
- _CMOVCC = frozenset(("cmove", "cmovne", "cmovb", "cmovae", "cmovbe", "cmova",
-                      "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns",
-                      "cmovp", "cmovnp", "cmovpe", "cmovpo"))
-@@ -1618,6 +1640,9 @@
+ def _make_setcc_value(setcc_mnemonic, flag_setter, flag_ops):
+     """Generate the condition expression for a SETcc instruction."""
+     cc = setcc_mnemonic[3:]
+@@ -1601,6 +1623,9 @@ class Lifter:
              return ["edx = ((int32_t)eax < 0) ? 0xFFFFFFFF : 0; /* cdq */"]
          if m == "cwde":
              return ["eax = SX16(eax); /* cwde */"]
@@ -258,7 +260,7 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
          if m == "cbw":
              return ["SET_LO16(eax, SX8(eax)); /* cbw */"]
          if m == "bswap" and nops >= 1 and ops[0].type == "reg":
-@@ -2209,47 +2234,107 @@
+@@ -2213,47 +2238,107 @@ class Lifter:
          return self._lift_double_shift(insn, ops, "shrd")
  
      def _lift_imul(self, insn, ops):
@@ -400,7 +402,7 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
          return [f"/* {m}: unhandled */"]
  
      def _lift_shift(self, insn, ops, c_op):
-@@ -2279,8 +2364,7 @@
+@@ -2283,8 +2368,7 @@ class Lifter:
              bit = f"{cnt} - 1" if c_op == ">>" else f"({w}u - {cnt}) & 31u"
              out.append(f"if ({cnt}) _cf = (int)((((uint32_t)({dst})) >> ({bit})) & 1);")
          out.append(_fmt_operand_write(ops[0], f"(uint32_t)({dst}) {c_op} {cnt}"))
@@ -410,7 +412,7 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
  
      def _lift_sar(self, insn, ops):
          """Arithmetic shift right, at the operand's own width.
-@@ -2320,7 +2404,28 @@
+@@ -2324,7 +2408,28 @@ class Lifter:
          if self.needs_cf:
              out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> (({cnt}) - 1)) & 1);")
          out.append(_fmt_operand_write(ops[0], f"(uint32_t)(({signed}) >> {cnt})"))
@@ -440,7 +442,7 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
          return out
  
      def _lift_rotate_carry(self, insn, ops, m):
-@@ -4230,7 +4335,13 @@
+@@ -4291,7 +4396,13 @@ def lift_basic_block(lifter, bb, flag_state=None):
              results = lifter._lift_neg(
                  curr, curr.operands, preserve_carry=preserve)
          else:
@@ -454,7 +456,7 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
              # A REPE/REPNE compare whose count is zero leaves EFLAGS alone,
              # but `_flags` would keep whatever it last held -- 0 on entry --
              # so the je after it read "not equal" where the hardware reads
-@@ -4255,6 +4366,10 @@
+@@ -4316,6 +4427,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
              last_flag_ops = list(curr.operands)
          elif curr.mnemonic in _SSE_CMP_NAMED:
              pass  # SSE compares write a mask, not EFLAGS
@@ -467,6 +469,7 @@ diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
                  curr.mnemonic, list(curr.operands))
 diff --git a/tools/recomp/test_integer_width_flags.py b/tools/recomp/test_integer_width_flags.py
 new file mode 100644
+index 0000000..cb536a0
 --- /dev/null
 +++ b/tools/recomp/test_integer_width_flags.py
 @@ -0,0 +1,107 @@
@@ -578,9 +581,10 @@ new file mode 100644
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/tools/recomp/test_interior_targets.py b/tools/recomp/test_interior_targets.py
+index 0fd805a..ed8bf8f 100644
 --- a/tools/recomp/test_interior_targets.py
 +++ b/tools/recomp/test_interior_targets.py
-@@ -113,7 +113,7 @@
+@@ -113,7 +113,7 @@ def test_conditional_jump_into_another_body_is_lifted_in_place():
      subject, code = lift(A)
      assert f"goto loc_{B_BODY:08X};" in code, code
      assert f"loc_{B_BODY:08X}: ;" in code
@@ -589,7 +593,7 @@ diff --git a/tools/recomp/test_interior_targets.py b/tools/recomp/test_interior_
      # no call to a symbol nobody defines
      assert f"sub_{B_BODY:08X}" not in code
      assert B_BODY not in subject.lifter.referenced_calls
-@@ -136,7 +136,7 @@
+@@ -136,7 +136,7 @@ def test_called_address_inside_a_body_gets_a_function():
      assert f"RECOMP_ABI_CALL(0x{B_CORE:08X}u, sub_{B_CORE:08X});" in code, code
      core = subject.translate_function(B_CORE, entry)
      assert "eax = MEM32(esp + 4);" in core, core
@@ -599,17 +603,16 @@ diff --git a/tools/recomp/test_interior_targets.py b/tools/recomp/test_interior_
  
  
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index c373785..49a827a 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -2703,7 +2703,7 @@
-         # cmpxchg belongs here too: it snapshots the compare it performed,
+@@ -3050,7 +3050,8 @@ class FunctionTranslator:
          # because eax may be replaced before the branch reads the result.
          if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
--                                 "lock cmpxchg", "inc", "dec")
-+                                 "lock cmpxchg", "inc", "dec", "mul", "imul")
+                                  "lock cmpxchg", "inc", "dec", "sahf", "fcomi",
+-                                 "fcomip", "fcompi", "fucomi", "fucomip", "fucompi")
++                                 "fcomip", "fcompi", "fucomi", "fucomip", "fucompi",
++                                 "mul", "imul")
                 or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
                 for insn in instructions):
              lines.append("    uint32_t _fa = 0, _fb = 0;")
--- 
-2.43.0
-

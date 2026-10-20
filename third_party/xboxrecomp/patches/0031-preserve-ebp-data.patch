@@ -11,7 +11,7 @@ Code built without frame pointers (MSVC's /Oy) moves a pointer into ebp and stor
  2 files changed, 42 insertions(+), 4 deletions(-)
 
 diff --git a/tools/recomp/preserve.py b/tools/recomp/preserve.py
-index 4ddc9a0..fc5b920 100644
+index 6c5894a..63c7219 100644
 --- a/tools/recomp/preserve.py
 +++ b/tools/recomp/preserve.py
 @@ -24,7 +24,10 @@ function's own control flow (labels and gotos, as x87_locals does):

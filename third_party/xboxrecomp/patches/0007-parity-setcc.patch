@@ -1,46 +1,24 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wize-logic <wizelogic@proton.me>
-Date: Mon, 12 Oct 2026 18:31:10 -0400
-Subject: [PATCH] recomp: lift setp/setnp and cmovp/cmovnp
+Date: Mon, 19 Oct 2026 11:14:48 -0400
+Subject: [PATCH] conformance: the parity flag after fcomi, fucomip and ucomiss
 
-The parity forms of SETcc and CMOVcc were not lifted. They are how float
-equality compiles once the compare sets EFLAGS directly: an unordered
-compare (either operand NaN) sets ZF, PF and CF together, so "a == b" on
-doubles is `fucomip; setnp dl; sete al; and al, dl`, "a != b" uses setp,
-and setp alone is the NaN test. With setnp missing, dl kept whatever it
-held and the equality came out at random. Found by running a gcc -m32
-x87 program lifted against the CPU it was compiled for.
-
-_make_condition already knows the parity condition for every flag setter
-that has one -- fcomi/fucomi (g_fp_cmp == 2), comiss/ucomiss (either
-side NaN) and the result-flag family (RECOMP_PARITY8) -- so the change is
-to let the block pass fuse the parity forms like the others: the SETcc
-and CMOVcc mnemonic lists become two shared sets with the p/np/pe/po
-forms added. A parity form the block pass cannot fuse stays reported as
-unimplemented: the instruction-level fallback reads _flags, which has no
-parity, and would be silently wrong instead.
-
-Tests: test_parity_setcc.py checks setnp after fucomip, setp after
-ucomiss and cmovnp after fcomi fuse with their setter, and that an
-unfused setp is still reported. Conformance cases fpu_fucomip_equal,
-fpu_fucomip_unordered, fpu_fcomi_cmovnp and sse_ucomiss_parity run them
-against the CPU with NaN, infinity and signed-zero inputs. The
-conformance harness declares the comiss/ucomiss snapshot (_fca, _fcb)
-in each lifted case, as the translator does per function, so a case
-using ucomiss compiles.
+Upstream's 2db0a2f and bb2b5c7 lift setp/setnp and cmovp/cmovnp from the
+flag setter, the floating-point compares included. Its parity cases run
+after cmp and test; floating-point equality is where parity matters: an
+unordered compare (either side NaN) sets ZF, PF and CF together, so a == b
+on doubles compiles to `fucomip; setnp; sete; and` and the NaN test is a
+bare setp. These cases run those sequences, and cmovnp after fcomi and
+setp/setnp after ucomiss, on the CPU with NaN operands.
 ---
- tools/conformance/cases.py        | 21 ++++++++++++
- tools/conformance/harness.py      |  3 +-
- tools/recomp/lifter.py            | 35 +++++++++++++------
- tools/recomp/test_parity_setcc.py | 56 +++++++++++++++++++++++++++++++
- 4 files changed, 103 insertions(+), 12 deletions(-)
- create mode 100644 tools/recomp/test_parity_setcc.py
+ tools/conformance/cases.py | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
 
 diff --git a/tools/conformance/cases.py b/tools/conformance/cases.py
-index a44947c..35b70c5 100644
+index 7312b53..21f007d 100644
 --- a/tools/conformance/cases.py
 +++ b/tools/conformance/cases.py
-@@ -585,6 +585,27 @@ for _name, _lo, _hi, _se in (
+@@ -618,6 +618,27 @@ for _name, _lo, _hi, _se in (
           "mov word ptr [eax+40], " + _se, "fld tbyte ptr [eax+32]"],
          [(0.0, 0.0)], "fpu"))
  
@@ -68,147 +46,3 @@ index a44947c..35b70c5 100644
  CASES.append(Case("pushad_popad", "POPAD restores registers and skips saved ESP",
      ["pushad", "mov eax, 0", "mov ecx, 0", "popad", "add eax, ecx"], _PAIRS))
  
-diff --git a/tools/conformance/harness.py b/tools/conformance/harness.py
-index a23525c..ded9cc1 100644
---- a/tools/conformance/harness.py
-+++ b/tools/conformance/harness.py
-@@ -339,8 +339,9 @@ def harness_source(prepared, why_of, tol_of):
-         out.append(f"""static void lif_{name}(void) {{
-     uint32_t ebp = 0; int _cf = 0; int _flags = 0;
-     uint32_t _fa = 0, _fb = 0; int32_t _fas = 0, _fbs = 0;
-+    double _fca = 0.0, _fcb = 0.0; /* the comiss/ucomiss operand snapshot */
-     (void)ebp; (void)_cf; (void)_flags;
--    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
-+    (void)_fa; (void)_fb; (void)_fas; (void)_fbs; (void)_fca; (void)_fcb;
- {_LIFTED_PROLOGUE[kind]}
-     g_esp = (uint32_t)(uintptr_t)(g_guest_stack + sizeof(g_guest_stack) / 2);
- {body}
-diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index e0f9fd3..09ff6f8 100644
---- a/tools/recomp/lifter.py
-+++ b/tools/recomp/lifter.py
-@@ -1065,6 +1065,19 @@ def _make_condition(jcc, flag_setter, flag_ops):
-     return None
- 
- 
-+# SETcc / CMOVcc forms the lifter turns into a condition. The parity forms
-+# matter after fcomi/fucomi (and comiss/ucomiss): "a == b" on doubles is
-+# `fucomip; setnp dl; sete al; and al, dl`, because ZF alone is also set by
-+# an unordered compare. Without them setnp lifted to nothing -- dl kept
-+# whatever it held -- and every float equality test came out wrong.
-+_SETCC = frozenset(("sete", "setne", "setb", "setae", "setbe", "seta",
-+                    "setl", "setge", "setle", "setg", "sets", "setns",
-+                    "setp", "setnp", "setpe", "setpo"))
-+_CMOVCC = frozenset(("cmove", "cmovne", "cmovb", "cmovae", "cmovbe", "cmova",
-+                     "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns",
-+                     "cmovp", "cmovnp", "cmovpe", "cmovpo"))
-+
-+
- def _make_setcc_value(setcc_mnemonic, flag_setter, flag_ops):
-     """Generate the condition expression for a SETcc instruction."""
-     cc = setcc_mnemonic[3:]
-@@ -1645,11 +1658,15 @@ class Lifter:
-             else:
-                 address = "ebx + LO8(eax)"
-             return [f"SET_LO8(eax, MEM8({address})); /* xlatb */"]
--        if m in ("sete", "setne", "setb", "setae", "setbe", "seta",
--                 "setl", "setge", "setle", "setg", "sets", "setns"):
--            return self._lift_setcc(insn, ops, m)
--        if m in ("cmove", "cmovne", "cmovb", "cmovae", "cmovbe", "cmova",
--                 "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns"):
-+        if m in _SETCC or m in _CMOVCC:
-+            # Reached only when the block pass could not fuse the condition
-+            # with its flag setter. The fallback reads _flags, which carries
-+            # no parity, so a parity form stays reported as unimplemented
-+            # rather than silently reading the wrong flag.
-+            if m.endswith(("p", "pe", "po")):
-+                return self._unimplemented(insn, m)
-+            if m in _SETCC:
-+                return self._lift_setcc(insn, ops, m)
-             return self._lift_cmovcc(insn, ops, m)
- 
-         # ── SSE (scalar float) ──
-@@ -4001,9 +4018,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
-                 i += 1
-                 continue
- 
--        if (curr.mnemonic in ("sete", "setne", "setb", "setae", "setbe",
--                              "seta", "setl", "setge", "setle", "setg",
--                              "sets", "setns")
-+        if (curr.mnemonic in _SETCC
-                 and last_flag_setter and len(curr.operands) >= 1):
-             cond = _make_setcc_value(
-                 curr.mnemonic, last_flag_setter, last_flag_ops)
-@@ -4015,9 +4030,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
-                 i += 1
-                 continue
- 
--        if (curr.mnemonic in ("cmove", "cmovne", "cmovb", "cmovae",
--                              "cmovbe", "cmova", "cmovl", "cmovge",
--                              "cmovle", "cmovg", "cmovs", "cmovns")
-+        if (curr.mnemonic in _CMOVCC
-                 and last_flag_setter and len(curr.operands) >= 2):
-             cond = _make_cmovcc_cond(
-                 curr.mnemonic, last_flag_setter, last_flag_ops)
-diff --git a/tools/recomp/test_parity_setcc.py b/tools/recomp/test_parity_setcc.py
-new file mode 100644
-index 0000000..0d47360
---- /dev/null
-+++ b/tools/recomp/test_parity_setcc.py
-@@ -0,0 +1,56 @@
-+"""setp/setnp and cmovp/cmovnp take their condition from the flag setter.
-+
-+Floating-point equality on x86 needs the parity flag: an unordered compare
-+(either side NaN) sets ZF, PF and CF together, so `a == b` on doubles compiles
-+to `fucomip; setnp dl; sete al; and al, dl` and the NaN test is a bare setp.
-+The parity forms were not lifted at all -- setnp left its destination as it
-+was -- so every float equality decided by fcomi/fucomi/ucomiss was wrong.
-+"""
-+
-+import unittest
-+
-+from .disasm import BasicBlock, Instruction, Operand
-+from .lifter import Lifter, lift_basic_block
-+
-+
-+def _block(*insns):
-+    out = []
-+    addr = 0x00011000
-+    for m, ops in insns:
-+        i = Instruction(addr, 2, m, "", "0000")
-+        i.operands = ops
-+        out.append(i)
-+        addr += 2
-+    lines, _ = lift_basic_block(Lifter(), BasicBlock(start=0x00011000, instructions=out))
-+    return "\n".join(lines)
-+
-+
-+def _reg(r):
-+    return Operand(type="reg", reg=r)
-+
-+
-+class ParitySetccTest(unittest.TestCase):
-+    def test_setnp_after_fucomip_reads_the_unordered_result(self):
-+        c = _block(("fucomip", [_reg("st(1)")]), ("setnp", [_reg("dl")]))
-+        self.assertIn("(g_fp_cmp != 2)", c)
-+        self.assertNotIn("RECOMP_UNIMPL", c)
-+
-+    def test_setp_after_ucomiss_is_the_nan_test(self):
-+        mem = Operand(type="mem", mem_base="eax", mem_size=4)
-+        c = _block(("ucomiss", [_reg("xmm0"), mem]), ("setp", [_reg("al")]))
-+        self.assertIn("!=", c)
-+        self.assertNotIn("RECOMP_UNIMPL", c)
-+
-+    def test_cmovnp_after_fcomi(self):
-+        c = _block(("fcomi", [_reg("st(1)")]), ("cmovnp", [_reg("ecx"), _reg("edx")]))
-+        self.assertIn("(g_fp_cmp != 2)", c)
-+        self.assertIn("ecx = edx", c)
-+
-+    def test_an_unfused_parity_form_is_still_reported(self):
-+        lifted = " ".join(Lifter().lift_instruction(
-+            Instruction(0x00011000, 3, "setp", "al", "0f9ac0")))
-+        self.assertIn("RECOMP_UNIMPL", lifted)
-+
-+
-+if __name__ == "__main__":
-+    unittest.main()

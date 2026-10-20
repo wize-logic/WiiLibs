@@ -28,10 +28,10 @@ of a flag it sets when another thread is waiting).
  create mode 100644 tools/recomp/test_lifter_backedge_hook.py
 
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
-index 0ea59fa..1fad7de 100644
+index 9b6f824..0b1bd71 100644
 --- a/templates/runtime/recomp_types.h
 +++ b/templates/runtime/recomp_types.h
-@@ -422,6 +422,13 @@ void recomp_trace_esp(const char *name, const char *tag);
+@@ -495,6 +495,13 @@ void recomp_trace_esp(const char *name, const char *tag);
  #define RECOMP_TRACE_ESP(name, tag) recomp_trace_esp((name), (tag))
  
  
@@ -116,10 +116,10 @@ index 0000000..e8af99d
 +    test_a_jump_to_its_own_block_is_backward()
 +    print("ok")
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index a41fff4..c98dca7 100644
+index 94e8f5b..ab19551 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -2593,6 +2593,28 @@ class FunctionTranslator:
+@@ -2940,6 +2940,28 @@ class FunctionTranslator:
                      f"goto {target};",
                      f"(void)0; /* goto {target} - dead code, label not in function */")
  

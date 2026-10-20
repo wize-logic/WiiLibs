@@ -242,7 +242,7 @@ index 0000000..603144e
 +            fn()
 +    print("ok")
 diff --git a/tools/recomp/touched.py b/tools/recomp/touched.py
-index 13860bc..e4555d6 100644
+index 14cf9d7..9a19643 100644
 --- a/tools/recomp/touched.py
 +++ b/tools/recomp/touched.py
 @@ -24,7 +24,12 @@ code it interrupts as they were (wl_xb_call_guest_preserving).
@@ -297,10 +297,10 @@ index 13860bc..e4555d6 100644
 +    return {n: (t | {X87_BALANCED} if n in cand else t) for n, t in touch.items()}
 +
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 6039d00..e0bd1b5 100644
+index 15f00ea..a51ffeb 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -534,6 +534,9 @@ class FunctionTranslator:
+@@ -537,6 +537,9 @@ class FunctionTranslator:
          # a plain call to a function that touches only some registers writes
          # back and reloads only those (--callee-regs, touched.py)
          self.callee_regs = False
@@ -310,7 +310,7 @@ index 6039d00..e0bd1b5 100644
          self.touched = {}
          self.rodata_const_count = 0
          self.kept = {}
-@@ -3475,6 +3478,8 @@ class BatchTranslator:
+@@ -3820,6 +3823,8 @@ class BatchTranslator:
          t.kept = preserve.preserved_by_name(summaries)
          if t.callee_regs:
              t.touched = touched.analyse(pending)
@@ -319,7 +319,7 @@ index 6039d00..e0bd1b5 100644
          counts = {}
          for s in summaries.values():
              key = "+".join(sorted(s.preserved)) or ("none: " + s.why if s.why else "none")
-@@ -3588,6 +3593,9 @@ class BatchTranslator:
+@@ -3933,6 +3938,9 @@ class BatchTranslator:
          if getattr(self.translator, "preserve_stats", None):
              stats["preserved"] = self.translator.preserve_stats
              stats["kept_call_sites"] = self.translator.kept_sites
@@ -330,7 +330,7 @@ index 6039d00..e0bd1b5 100644
          # a comment is a silent no-op. Surfacing the tally is the difference
          # between "bsf is unimplemented" being a line of build output and being
 diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
-index 61d4ef1..0ebbce2 100644
+index 093f67c..d5b9851 100644
 --- a/tools/recomp/x87_locals.py
 +++ b/tools/recomp/x87_locals.py
 @@ -54,6 +54,14 @@ does not understand runs against memory, so an unknown x87 instruction costs
@@ -357,7 +357,7 @@ index 61d4ef1..0ebbce2 100644
  
  X87_LOCALS_PREFIX = "_x87"
  REG_LOCALS_PREFIX = "_r_"
-@@ -565,6 +573,87 @@ def localise_x87(lines, macros, undefs, x87=True, regs=False, kept=None, touched
+@@ -564,6 +572,87 @@ def localise_x87(lines, macros, undefs, x87=True, regs=False, kept=None, touched
          return lines, str(e)
  
  
@@ -445,7 +445,7 @@ index 61d4ef1..0ebbce2 100644
  def _function_bounds(lines):
      """The body: from after the function's opening brace to its closing one."""
      try:
-@@ -603,13 +692,19 @@ _DIRECT_CALL = re.compile(r"\s*PUSH32\(esp, 0x[0-9A-Fa-f]+u\); RECOMP_ABI_CALL\(
+@@ -602,13 +691,19 @@ _DIRECT_CALL = re.compile(r"\s*PUSH32\(esp, 0x[0-9A-Fa-f]+u\); RECOMP_ABI_CALL\(
                            r"\s*(?:\x01\d+\x02)?\s*")
  
  
@@ -468,7 +468,7 @@ index 61d4ef1..0ebbce2 100644
          return None
      return frozenset(t) | frozenset(("g_esp",))
  
-@@ -658,7 +753,7 @@ def _localise(lines, macros, undefs, x87=True, regs=False, kept=None, touched=No
+@@ -657,7 +752,7 @@ def _localise(lines, macros, undefs, x87=True, regs=False, kept=None, touched=No
                  raise _NotLocal("a goto in a statement that calls out or returns")
              n.kind = "sync"
              n.keeps = _kept_by(n.code, kept) if regs else frozenset()
@@ -477,7 +477,7 @@ index 61d4ef1..0ebbce2 100644
              if t is not None:
                  n.kind, n.touch = "call", t
          elif fp or rg:
-@@ -838,6 +933,10 @@ def _flow(nodes, labels, plan, x87=True, regs=False, skip=frozenset()):
+@@ -837,6 +932,10 @@ def _flow(nodes, labels, plan, x87=True, regs=False, skip=frozenset()):
              # and loaded after it (see _emit), the other locals stay as they were
              if _is_mem(s):
                  out = _mem(_valid(s) - (n.touch - n.keeps))
@@ -488,7 +488,7 @@ index 61d4ef1..0ebbce2 100644
              else:
                  out = (s[0], s[1], s[2], s[3] - n.touch)
          else:  # sync: written back before it (see _emit); memory is the truth after
-@@ -954,6 +1053,11 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow, regs=False):
+@@ -953,6 +1052,11 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow, regs=False):
                      out.append(indent + f + note)
              if n.kind == "call" and not _is_mem(s):
                  f = " ".join("%s = %s;" % (g, _scalar(g)) for g in _SCALARS if g in s[3] and g in n.touch)

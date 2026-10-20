@@ -55,17 +55,20 @@ as it must the others.
 The option is off by default. The template header gains RECOMP_FP_PC_CW
 (RECOMP_FP_PC is that with g_fp_control_word).
 ---
- templates/runtime/recomp_types.h | 5 ++++-
- tools/recomp/__main__.py         | 7 +++++++
- tools/recomp/test_x87_locals.py  | 262 ++++++++++++++++++++++++++++++++++++++++
- tools/recomp/translator.py       | 12 ++++++++++++
- tools/recomp/x87_locals.py       | 697 ++++++++++++++++++++++++++++++++++++++++
- 5 files changed, 982 insertions(+), 1 deletions(-)
+ templates/runtime/recomp_types.h |   5 +-
+ tools/recomp/__main__.py         |   7 +
+ tools/recomp/test_x87_locals.py  | 262 ++++++++++++
+ tools/recomp/translator.py       |  12 +
+ tools/recomp/x87_locals.py       | 697 +++++++++++++++++++++++++++++++
+ 5 files changed, 982 insertions(+), 1 deletion(-)
+ create mode 100644 tools/recomp/test_x87_locals.py
+ create mode 100644 tools/recomp/x87_locals.py
 
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index 0b1bd71..e2feee5 100644
 --- a/templates/runtime/recomp_types.h
 +++ b/templates/runtime/recomp_types.h
-@@ -279,7 +279,10 @@
+@@ -287,7 +287,10 @@ static inline double recomp_fp_round24(double x) {
      x = frexp(x, &e);                      /* |x| in [0.5, 1): float-exact range */
      return ldexp((double)(float)x, e);
  }
@@ -78,9 +81,10 @@ diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
  /* Values in the existing double-backed stack are all representable as normal
   * x87 extended values, including binary64 subnormals. Empty stack tags and
 diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 6bd8014..86c34a1 100644
 --- a/tools/recomp/__main__.py
 +++ b/tools/recomp/__main__.py
-@@ -279,6 +279,12 @@
+@@ -279,6 +279,12 @@ def main():
                               "that file, 'none' writes none (and removes an "
                               "old copy) so the build's include path supplies "
                               "the runtime's own header")
@@ -93,7 +97,7 @@ diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
      parser.add_argument("--seh-prolog", metavar="ADDR",
                          help="Address of __SEH_prolog (hex). Auto-detected if omitted")
      parser.add_argument("--seh-epilog", metavar="ADDR",
-@@ -357,6 +363,7 @@
+@@ -357,6 +363,7 @@ def main():
              os.path.dirname(os.path.abspath(__file__)), "output",
              "icall_sites.json"),
      )
@@ -103,6 +107,7 @@ diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
      print(f"Loaded {len(translator.func_db)} functions, "
 diff --git a/tools/recomp/test_x87_locals.py b/tools/recomp/test_x87_locals.py
 new file mode 100644
+index 0000000..a657ce4
 --- /dev/null
 +++ b/tools/recomp/test_x87_locals.py
 @@ -0,0 +1,262 @@
@@ -369,9 +374,10 @@ new file mode 100644
 +            fn()
 +    print("ok")
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 85396c4..11edf9e 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -26,6 +26,7 @@
+@@ -26,6 +26,7 @@ from .disasm import Disassembler
  from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                       _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                       detect_setjmp_helpers, _func_ident, _operand_width)
@@ -379,9 +385,9 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
  
  
  # Float compares snapshot at the compare as well, and their conditions read
-@@ -494,6 +495,10 @@
-         self.interior_entry_starts = set()
-         self._recovered_cfg = {}
+@@ -497,6 +498,10 @@ class FunctionTranslator:
+         self._weak_function_starts = set()
+         self._reach_memo = {}
          self._ownership_ready = False
 +        # x87_locals.py: keep each body's x87 stack in C locals (--x87-locals).
 +        # x87_stats counts the functions that do and why the others do not.
@@ -389,8 +395,8 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
 +        self.x87_stats = {}
  
      def discover_static_indirect_targets(self, *, coalescing=False):
-         """Recover function entries from bounded static callback tables."""
-@@ -3069,6 +3074,11 @@
+         """Recover callbacks and the gap entries their bodies reference."""
+@@ -3416,6 +3421,11 @@ class FunctionTranslator:
          lines.append(f"}}")
          lines.append(f"")
  
@@ -402,7 +408,7 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
          return "\n".join(lines)
  
      def _find_used_registers(self, instructions):
-@@ -3466,6 +3476,8 @@
+@@ -3813,6 +3823,8 @@ class BatchTranslator:
          }
          stats["unresolved_stubs"] = len(unresolved)
          stats["manual_functions"] = len(manual_decls)
@@ -413,6 +419,7 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
          # between "bsf is unimplemented" being a line of build output and being
 diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
 new file mode 100644
+index 0000000..6ad8ab4
 --- /dev/null
 +++ b/tools/recomp/x87_locals.py
 @@ -0,0 +1,697 @@
@@ -499,7 +506,7 @@ new file mode 100644
 +    RECOMP_PARITY8 RECOMP_DF_STEP RECOMP_FCMP RECOMP_FCMP_CC RECOMP_FP_PC RECOMP_FP_PC_CW
 +    RECOMP_BACKEDGE RECOMP_ATOMIC_CAS32 RECOMP_ATOMIC_ADD32
 +    ROL8 ROL16 ROL32 ROR8 ROR16 ROR32 RC_ROT
-+    recomp_fist recomp_frndint recomp_ld80 recomp_st80 recomp_fxam recomp_cvt_si32
++    recomp_fist recomp_frndint recomp_f80_load recomp_f80_store recomp_fscale recomp_fxam recomp_cvt_si32
 +    memcpy memset memmove
 +    fabs sqrt sin cos tan atan atan2 log log2 log10 exp exp2 ldexp frexp fmod remainder
 +    floor ceil trunc rint nearbyint copysign

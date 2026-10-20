@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wize-logic <wizelogic@proton.me>
 Date: Wed, 14 Oct 2026 13:39:13 -0400
-Subject: [PATCH] recomp: --reg-locals keeps a function's integer registers in C locals
+Subject: [PATCH] recomp: --reg-locals keeps a function's integer registers in
+ C locals
 
 The generated code reads and writes the guest's integer registers as the
 globals g_eax .. g_edi and g_esp (`eax` is a macro for g_eax). Guest
@@ -36,16 +37,18 @@ The header's SIMD helpers (XMM_*, MMX_*) are taken as not leaving the
 function, for both options: they touch guest memory and the SIMD
 registers only.
 ---
- tools/recomp/__main__.py        | 5 +++++
- tools/recomp/test_reg_locals.py | 153 ++++++++++++++++++++++++++++++++++++++++
- tools/recomp/translator.py      | 13 ++++++++-----
- tools/recomp/x87_locals.py      | 212 ++++++++++++++++++++++++++++++++++++++++----------------------------------------
- 4 files changed, 338 insertions(+), 45 deletions(-)
+ tools/recomp/__main__.py        |   5 +
+ tools/recomp/test_reg_locals.py | 153 ++++++++++++++++++++++++
+ tools/recomp/translator.py      |  13 +-
+ tools/recomp/x87_locals.py      | 206 ++++++++++++++++++++++++++------
+ 4 files changed, 335 insertions(+), 42 deletions(-)
+ create mode 100644 tools/recomp/test_reg_locals.py
 
 diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 86c34a1..c6760f0 100644
 --- a/tools/recomp/__main__.py
 +++ b/tools/recomp/__main__.py
-@@ -285,6 +285,10 @@
+@@ -285,6 +285,10 @@ def main():
                               "g_fp_* globals only where control leaves the "
                               "function (x87_locals.py); needs a runtime header "
                               "with RECOMP_FP_PC_CW")
@@ -56,7 +59,7 @@ diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
      parser.add_argument("--seh-prolog", metavar="ADDR",
                          help="Address of __SEH_prolog (hex). Auto-detected if omitted")
      parser.add_argument("--seh-epilog", metavar="ADDR",
-@@ -364,6 +368,7 @@
+@@ -364,6 +368,7 @@ def main():
              "icall_sites.json"),
      )
      translator.translator.x87_locals = args.x87_locals
@@ -66,6 +69,7 @@ diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
      print(f"Loaded {len(translator.func_db)} functions, "
 diff --git a/tools/recomp/test_reg_locals.py b/tools/recomp/test_reg_locals.py
 new file mode 100644
+index 0000000..861c086
 --- /dev/null
 +++ b/tools/recomp/test_reg_locals.py
 @@ -0,0 +1,153 @@
@@ -223,11 +227,12 @@ new file mode 100644
 +            fn()
 +    print("ok")
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 11edf9e..c373785 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -495,9 +495,11 @@
-         self.interior_entry_starts = set()
-         self._recovered_cfg = {}
+@@ -498,9 +498,11 @@ class FunctionTranslator:
+         self._weak_function_starts = set()
+         self._reach_memo = {}
          self._ownership_ready = False
 -        # x87_locals.py: keep each body's x87 stack in C locals (--x87-locals).
 -        # x87_stats counts the functions that do and why the others do not.
@@ -239,7 +244,7 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
          self.x87_stats = {}
  
      def discover_static_indirect_targets(self, *, coalescing=False):
-@@ -3074,8 +3076,9 @@
+@@ -3421,8 +3423,9 @@ class FunctionTranslator:
          lines.append(f"}}")
          lines.append(f"")
  
@@ -251,7 +256,7 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
              key = why or "in locals"
              self.x87_stats[key] = self.x87_stats.get(key, 0) + 1
  
-@@ -3476,7 +3479,7 @@
+@@ -3823,7 +3826,7 @@ class BatchTranslator:
          }
          stats["unresolved_stubs"] = len(unresolved)
          stats["manual_functions"] = len(manual_decls)
@@ -261,9 +266,10 @@ diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
          # Instructions the lifter has no translation for become a comment, and
          # a comment is a silent no-op. Surfacing the tally is the difference
 diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
+index 6ad8ab4..bd3a62a 100644
 --- a/tools/recomp/x87_locals.py
 +++ b/tools/recomp/x87_locals.py
-@@ -64,9 +64,10 @@
+@@ -64,9 +64,10 @@ restored copy comes back the same, and the locals hold the truth.
  
  import re
  
@@ -275,7 +281,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
  
  # Function-like names that never read or write the x87 state and never leave
  # the function: guest memory and register accessors, flag and compare helpers,
-@@ -93,11 +94,28 @@
+@@ -93,11 +94,28 @@ _KEYWORDS = frozenset("""
  
  # The memory model's accessors (translator.FP_STACK_MACROS) and the globals.
  _FP_MACROS = ("fp_push", "fp_pop", "fp_top", "fp_st1", "fp_st")
@@ -305,7 +311,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
  
  _LABEL = re.compile(r"^\s*(loc_[0-9A-Fa-f]+):\s*;\s*$")
  _GOTO = re.compile(r"\bgoto\s+([A-Za-z_]\w*)\s*;")
-@@ -112,7 +130,8 @@
+@@ -112,7 +130,8 @@ _TOKEN = re.compile(
      r"|\bg_fp_stack\s*\[\s*\(\s*g_fp_top\s*\+\s*(?P<gs>\d+)u?\s*\)\s*&\s*7u?\s*\]"
      r"|\(\s*g_fp_top\s*&\s*7u?\s*\)"
      r"|\bRECOMP_FP_PC\s*\("
@@ -315,7 +321,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
  _WRITE_AFTER = re.compile(r"\s*(=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)")
  _WRITE_BEFORE = re.compile(r"(\+\+|--)\s*$")
  _CONTROL = re.compile(r"\b(if|else|for|while|do|switch|case|default|goto|return|break|continue)\b"
-@@ -247,6 +266,8 @@
+@@ -247,6 +266,8 @@ def _calls(code):
          name = m.group(1)
          if name in _KEYWORDS or name in _TRANSPARENT or name in _FP_MACROS:
              continue
@@ -324,7 +330,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
          names.add(name)
      return names
  
-@@ -258,15 +279,59 @@
+@@ -258,15 +279,59 @@ def _slot(p):
  
  
  def _scalar(g):
@@ -387,7 +393,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
          return None
      wr, rd, swr, sused = set(), set(), set(), set()
      moved = [False]
-@@ -283,6 +348,23 @@
+@@ -283,6 +348,23 @@ def _rewrite(code, k):
                  return "".join(out), k
              out.append(text[i:m.start()])
              tok = m.group(0)
@@ -411,7 +417,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
              if tok.startswith("fp_push"):
                  open_at = m.end() - 1
                  close = _match_paren(text, open_at)
-@@ -340,7 +422,7 @@
+@@ -340,7 +422,7 @@ def _rewrite(code, k):
          return None
      if moved[0] and _CONTROL.search(code):
          return None  # a push or pop that may not happen: the depth is not static
@@ -420,7 +426,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
          return None
      return new, k_out, wr, rd, swr, sused
  
-@@ -348,11 +430,12 @@
+@@ -348,11 +430,12 @@ def _rewrite(code, k):
  # ------------------------------------------------------------- the pass
  
  class _Node:
@@ -434,7 +440,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
  
  
  def _body_bounds(lines, macros, undefs):
-@@ -387,7 +470,15 @@
+@@ -387,7 +470,15 @@ def _nodes(lines, lo, hi):
              i += 1
              continue
          if line.lstrip().startswith("#"):
@@ -451,7 +457,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
          code, _ = _protect(line)
          if re.match(r"^\s*\w+\s*:(?!:)", code) and not code.lstrip().startswith(("case", "default")):
              raise _NotLocal("a label of another form")
-@@ -434,45 +525,59 @@
+@@ -434,45 +525,59 @@ def _nodes(lines, lo, hi):
      return nodes
  
  
@@ -498,10 +504,9 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
      # classify
      for n in nodes:
 -        if n.kind == "label":
--            continue
--        fp = bool(_LEFTOVER.search(n.code) or re.search(r"\b(RECOMP_FP_PC|g_fp_control_word|g_fp_cmp|g_fp_cc)\b", n.code))
 +        if n.kind in ("label", "pp"):
-+            continue
+             continue
+-        fp = bool(_LEFTOVER.search(n.code) or re.search(r"\b(RECOMP_FP_PC|g_fp_control_word|g_fp_cmp|g_fp_cc)\b", n.code))
 +        fp = x87 and bool(_LEFTOVER.search(n.code) or re.search(
 +            r"\b(RECOMP_FP_PC|g_fp_control_word|g_fp_cmp|g_fp_cc)\b", n.code))
 +        rg = regs and bool(_REG_TOKEN.search(n.code))
@@ -523,7 +528,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
              n.kind = "fp"
          else:
              n.kind = "plain"
-@@ -482,9 +587,21 @@
+@@ -482,9 +587,21 @@ def _localise(lines, macros, undefs):
  
      # Statements this pass cannot rewrite run against memory.
      for n in nodes:
@@ -547,7 +552,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
              n.kind = "sync"
  
      # The dataflow decides where memory is the truth and where the locals are,
-@@ -493,11 +610,11 @@
+@@ -493,11 +610,11 @@ def _localise(lines, macros, undefs):
      plan = _Plan()
      while True:
          try:
@@ -561,7 +566,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
  
  
  # A state is MEM (memory is the truth: nothing is in the locals) or a tuple
-@@ -550,7 +667,7 @@
+@@ -550,7 +667,7 @@ def _edge_state(out, y, plan):
      return out
  
  
@@ -570,7 +575,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
      """The state before and after each node (None where unreachable)."""
      state_in = [None] * len(nodes)
      state_out = [None] * len(nodes)
-@@ -565,14 +682,21 @@
+@@ -565,14 +682,21 @@ def _flow(nodes, labels, plan):
          n, s = nodes[x], state_in[x]
          if n.kind == "label":
              out = MEM if x in plan.rebase else s
@@ -595,24 +600,22 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
                  rewrites[x] = r
              new, k2, wr, rd, swr, sused = r[1]
              positions |= wr | rd
-@@ -599,11 +723,12 @@
+@@ -599,11 +723,12 @@ def _flow(nodes, labels, plan):
              if new != state_in[y]:
                  state_in[y] = new
                  work.append(y)
 +    x87_seen = any(n.x87 and state_in[x] is not None and n.kind == "fp" for x, n in enumerate(nodes))
      return dict(state_in=state_in, state_out=state_out, rewrites=rewrites,
 -                positions=positions, scalars=scalars, end_state=end_state[0])
--
--
--def _emit(lines, lo, hi, nodes, labels, plan, flow):
 +                positions=positions, scalars=scalars, end_state=end_state[0], x87_seen=x87_seen)
-+
-+
+ 
+ 
+-def _emit(lines, lo, hi, nodes, labels, plan, flow):
 +def _emit(lines, lo, hi, nodes, labels, plan, flow, regs=False):
      state_in, state_out, rewrites = flow["state_in"], flow["state_out"], flow["rewrites"]
      positions, scalars = flow["positions"], flow["scalars"]
      if not positions and not scalars:
-@@ -613,7 +738,7 @@
+@@ -613,7 +738,7 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow):
      pos = sorted(positions)
      used = [g for g in _SCALARS if g in scalars]
      t = X87_LOCALS_PREFIX + "t"
@@ -621,7 +624,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
  
      def flush(s):
          if s == MEM:
-@@ -633,20 +758,23 @@
+@@ -633,20 +758,23 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow):
              return load_macro + ";"
          return ""
  
@@ -649,7 +652,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
      if 0 in plan.want_locals:
          out.append("    " + on_edge(MEM, 0))  # the function entry is an edge from memory
      cursor = lo
-@@ -663,7 +791,7 @@
+@@ -663,7 +791,7 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow):
              if x in plan.rebase:
                  out.append("    /* x87: paths join here at different depths; memory is current */")
          else:
@@ -658,7 +661,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
                  out.append(indent + load_macro + ";")
              if n.kind == "sync":
                  f = flush(s)
-@@ -673,7 +801,7 @@
+@@ -673,7 +801,7 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow):
                  # a goto whose edge needs code gets it in a block of its own
                  code, restore = _protect(lines[n.first])
                  if n.kind == "fp":
@@ -667,7 +670,7 @@ diff --git a/tools/recomp/x87_locals.py b/tools/recomp/x87_locals.py
                  for g in set(n.gotos):
                      c = on_edge(state_out[x], labels[g])
                      if c:
-@@ -682,6 +810,10 @@
+@@ -682,6 +810,10 @@ def _emit(lines, lo, hi, nodes, labels, plan, flow):
                      out.append(indent + restore(code).strip())
                  else:
                      out.extend(lines[n.first:n.last + 1])

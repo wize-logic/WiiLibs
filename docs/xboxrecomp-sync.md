@@ -122,26 +122,59 @@ full SHAs and takes the release name from the newest such commit at or before th
    `advance` refuses while the copy is not at that commit's vendored content or a patch does not
    apply.
 
-## Pending: upstream v0.14.0 (eb0aa1d)
+## Synced: upstream v0.14.0 (eb0aa1d)
 
-Looked at on 2026-10-19 (`fetch`, `brief`; not synced). The copy is at v0.13.1 (193e299, 2026-10-07)
-and `check-map` is clean there (441 upstream files, all mapped; 158 vendored, 36 patches). Upstream's
-head eb0aa1d (v0.14.0 "Other Machines", 2026-10-16) is 98 commits later (122 with merges; 167 files,
-+18,953/-1,461), and the brief maps every new file (no area needs a decision). What it would bring:
+Taken on 2026-10-19, from v0.13.1 (193e299): 98 commits (122 with merges), 17 vendored files added and
+33 changed, none removed; `check-map` clean (516 upstream files, 175 vendored, 39 patches). Upstream's
+head had moved on to v0.15.0 (6376eb8) by then; that range is untriaged. What it brought:
 
-| Area | Upstream commits | For WiiLibs |
+| Area | Upstream commits | What WiiLibs did |
 |---|---|---|
-| lifter (vendored, patched) | `cebfc64` neg in unsigned arithmetic; `e108d0e` xadd / lock xadd flags; `01064f3` FCMOVcc; `c50c597` MXCSR modelled, CVTSS2SI/CVTSD2SI round by its RC; `46aee91`/`6931018` in/out to runtime port I/O, the field pin at 0x80C0; `bb2b5c7` sahf, fcomi, comiss flags; `b40805c` x87 tbyte loads and stores; `2d38bcd` ficom; `999a8c6` x87 trig, remainder, scale edges; `8862b6c` SSE conversions and estimates; `f69a435` FPREM's C2; `bbbaadb` COMISD/UCOMISD double lanes; `2db0a2f` parity SETcc/CMOVcc; `8af3ef7` `tools/recomp/fpdiff.py`, an x87/SSE differential tester | most of it is fixed already by WiiLibs' patches: 0005 (m80), 0007 (parity), 0009 (port I/O), 0015 (sahf, C2), 0017 (neg and widths), 0018 (MXCSR, FCMOVcc) are to be dropped or cut to what upstream lacks, each against its conformance cases; the xadd flags and SSE rounding are new to WiiLibs |
-| analysis (patched) | `0239dd3` ... `4b449d7` (18 commits): static callback recovery (callbacks hidden by aliases, passed as immediates, past inline switch tables, their dependencies and bounds); `34f5e1c` ... `801e288` (15 disasm fixes): tail closure, shared bodies, int3 padding; `2649f5f` blocks that alias bodies branch to | 0019 (discovery gaps) to rebase or drop; the Halo smoke check (functions, unresolved targets, `.text`) to compare with "Reference numbers" |
-| runtime-abi (patched) | `templates/runtime/recomp_types.h` for MXCSR and port I/O | patches 0002, 0003, 0005, 0008, 0009, 0013, 0015, 0021, 0023, 0025, 0030, 0032 touch it; `wl/xboxrt/recomp/` gains the new runtime symbols (`RECOMP_PORT_IN`/`OUT` exist already through 0009) |
-| nv2a, d3d (concept, port) | `1d050ac`, `19ef9f0`, `53f49ad` the pushbuffer executor (a DMA-style walk, fixed-function transform and lighting, back ends); `eed7f4e` oPos.w == 0 drawn with w = 1; `0ca0947` vertex-program triangles that never divide by w; `27c95f4` constant-arrival tracing | facts for `wl/xbox` (the w = 0 vertices, screen-space programs) |
-| audio (concept; LGPL files) | `cde57b3` addresses above 64 MB; `148431d` pitch resampling; `a16163f` device-paced output; `e0d2525` FETINTSTS latched once a trap; `7fe4d49` one idle-voice trap at a time; `5e40efb` the sample-limit interrupt (ISTS bit 3), a real XGSCNT; diagnostics (`a87919d`, `2d9c96c`, `ed1432d`, `b7c311a`) | `src/apu/*` is LGPL (BLOCK): facts only, from a public source, for `wl/xboxapu` (the sample-limit interrupt: Black's DirectSound waited for it) |
-| kernel, memory, io (concept) | `e7462cf` guest thread objects, TLS from TlsDataSize; `f775a5a` events in multiple-object waits; `ae11965` FATX overwrite and rename; `8d0442b` directory searches released at NtClose; `13d9637` a page allocator for the contiguous arena, MmAllocateContiguousMemoryEx's range; POSIX and arm64 hosts, SDL2, a keyboard/mouse pad | facts for `wl/xboxkrnl` (the multiple-object waits, the contiguous range) |
-| conformance, tests, build | `607f62c` C fixtures under MSVC; `1f7ab62`, `c0af02d` exact comparisons; `60a947c` archives linked as a group | the conformance suite's new cases come with the vendored files |
+| lifter (vendored, patched) | `cebfc64` neg in unsigned arithmetic; `e108d0e` xadd / lock xadd flags; `01064f3` FCMOVcc; `c50c597` MXCSR modelled (`g_mxcsr`), CVTSS2SI/CVTSD2SI round by its RC through `recomp_cvt_si32(value, mxcsr, truncate)`; `46aee91`/`6931018` in/out to `xbox_PortIn`/`xbox_PortOut`; `bb2b5c7` sahf, fcomi, comiss flags; `b40805c` x87 tbyte loads and stores (`recomp_f80_load`/`store`); `2d38bcd` ficom; `999a8c6` x87 trig, remainder, scale edges (`recomp_fp_trig_in_range`, `recomp_fprem`, `recomp_fscale`); `8862b6c` SSE conversions and estimates (`recomp_rcpss`/`rsqrtss`, `recomp_sse_d2i`); `f69a435` FPREM's C2; `bbbaadb` COMISD/UCOMISD; `2db0a2f` parity SETcc/CMOVcc; `8af3ef7` `fpdiff.py` | each patch checked against upstream's code (below); `g_mxcsr` joins wl/xboxrt's register file (0x1F80 at reset); the header maps `xbox_PortIn`/`Out` to `wl_xb_port_in`/`out` and rounds `MMX_CVT_F2I` by `g_mxcsr` |
+| analysis (patched) | 18 commits of static callback recovery (`probes_as_callback_body`: a closed CFG inside the gap, no size cap), 15 disasm fixes (tail closure, shared bodies, int3 padding), `2649f5f` | 0019's gap-bounded probe gave way to upstream's; BINKDATA as data is kept |
+| runtime-abi (patched) | `templates/runtime/recomp_types.h`: the helpers above, `g_mxcsr`, `xbox_PortIn`/`Out` | `gen_recomp_types.py`: the MEMF_SET defaults end at the SSE section now, the port anchor is upstream's declarations |
+| nv2a, d3d, audio, kernel, io (concept) | the pushbuffer executor, oPos.w == 0, the APU's sample-limit interrupt and pacing (LGPL `src/apu/*`: facts only), guest thread objects, multiple-object waits, the contiguous arena's allocator, POSIX hosts | nothing vendored; facts for `wl/xbox`, `wl/xboxapu`, `wl/xboxkrnl` left to their owners |
 
-Patches against eb0aa1d, in order (one that fails is left out): 0001, 0004, 0006, 0008, 0010, 0027 and 0028 apply; the other 29
-do not (upstream's own fixes in the same lines, or the context of a patch left out before them). The sync is
-`merge --to eb0aa1d --apply`, then step 5 above, patch by patch from 0002.
+The patches, each rebased with git and compared with upstream's version of the same fix:
+- dropped: 0009 (in/out): upstream's `xbox_PortIn`/`xbox_PortOut` do it. The number is left free so
+  that the others, and every reference to them, keep theirs.
+- cut to their conformance cases, the fix being upstream's: 0002 (also a test of `recomp_cvt_si32`'s
+  edges), 0005 (upstream's m80 load differs from 0005's only for exponent 0 and unnormals, values far
+  below a double's range), 0007, 0015, 0018. Upstream's own cases test parity after cmp/test only and
+  C2 after fprem only; these run the floating-point compares, sahf and the quotient bits on the CPU.
+- cut: 0019 keeps BINKDATA as data.
+- kept, merged by hand: 0003 (beside upstream's tbyte store), 0016 (upstream's range test pushes
+  conditionally and writes `g_fp_cc` inside `recomp_fp_trig_in_range`, out of the x87 locals pass's
+  sight), 0017 (mul/imul join upstream's flag-snapshot setters), 0029 (beside upstream's FCMOV
+  helpers). The helper lists of 0013, 0024, 0036 and 0038 name upstream's `recomp_f80_load`/`store`
+  and `recomp_fscale`; `recomp_fprem` and `recomp_fp_trig_in_range` write `g_fp_cc` and stay calls.
+- the other 25 applied as they were, and 0039 (stack reach, taken on Xbox beside the sync) applies to
+  v0.14.0's lifter unchanged.
+- new: 0040 (data-table shared tail). Upstream's `_pass_data_ptr_targets` now takes a table word in a
+  gap only with a closed CFG inside the gap (`probes_as_callback_body`) or a proven tail; an entry that
+  falls through into the next function, branches into its body or tail-jumps to a target found later
+  was dropped. 0040 falls back to v0.13.1's linear probe (a ret or a jmp ahead): Halo's table entries
+  1,472 -> 1,509, its functions 6,801 -> 6,843.
+
+On Halo (retail, the title's own configuration) against perf/guest-code6 (v0.13.1): 7,687 lifted functions
+became 6,801 and the lifted C 1.37 M lines 1.11 M. Of the 938 functions gone, 845 were `tail_jump_alias` copies
+and 60 `gap_prologue` starts, none with a caller; 822 lie inside another function's body now (upstream's
+alias and shared-body recovery). The Wii program's `sub_` code fell from 1,763,499 to 1,402,998 instructions
+(-20.4%) and the DOL from 8,960,832 to 7,505,984 bytes; the hot TU is unchanged (61,880 / 61,881). The
+backward jumps fell from 7,453 sites to 5,735 (dead copies: the jumps run differ by one in the first 292
+million). The deterministic host runs of a10 and b30 (FRAME 33, HEAP 12, `bounded_loops` off) against Xbox
+fc4b371 parted first at b30's tick 1328 (an awaited volume reached 10 ticks sooner) and at a10's audio
+frame 144000. The cause was five functions reached only through data tables that the new discovery
+dropped (0x2219C, 0x2223E, 0x180380, 0x1805D0, 0x180830): the MSVC CRT's fmod dispatches on its operands'
+classes through a table at 0x25F638, and its entry for a zero dividend, 0x2219C, was not translated, so
+the indirect jump resolved to nothing, fmod(0, y) returned y and leaked an x87 slot, and an animation
+decoder's blend fraction came out 1.0 instead of 0.0 (guest RAM differed from tick 0). With 0040, a10
+is identical (every line, screenshot and audio hash) and b30's lines and screenshots are; b30's audio
+hash parts at frame 69000, and guest RAM dumps differ there only in timestamps. That is the virtual
+clock: the lifted code runs a few backward jumps fewer (285,654,539 for 285,654,540 by the 65,536th
+kernel call, 11 fewer of 347 million by the 131,072nd: loops shaped by the new function boundaries),
+and the deterministic mode counts each. With backward jumps costing nothing, the two builds play b30
+identically, its audio included.
 
 ## Reference numbers
 
