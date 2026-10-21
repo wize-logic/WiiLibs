@@ -482,6 +482,7 @@ static const struct {
 
 static unsigned g_switches_off;
 static unsigned g_switches2_off;
+static bool switched_on2(unsigned bit);
 // (WL_XB_FITVERIFY on the host: projection_fit's kept fits checked against the vertices' at each use)
 static bool g_fit_verify;
 
