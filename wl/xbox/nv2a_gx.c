@@ -69,7 +69,10 @@ enum {
     // half the ring (a larger one sends its words)
     MADE_RING_BYTES = 512u << 10,
     MADE_CHUNKS = 16,
-    MADE_CHUNK_BYTES = MADE_RING_BYTES / MADE_CHUNKS
+    MADE_CHUNK_BYTES = MADE_RING_BYTES / MADE_CHUNKS,
+    // a fused draw's batch of vertices made into the ring, at most (draw_batch: any other's is
+    // WL_XBOX_VSH_BATCH)
+    DRAW_BATCH = 128
 };
 
 // how far (in the depth's 0..1) a fit made with the canonical points may be from a draw's own
@@ -298,11 +301,13 @@ struct WlNv2aGx {
     // a batch of a draw's vertices (WL_XBOX_VSH_BATCH): each one's vertex (in the memo, or made
     // here), the program run for those not kept (their elements as the fetch takes them, where their
     // vertex goes, and its words, a fused batch's way), the runs' inputs and outputs
+    // (a fused draw's batch in the ring up to DRAW_BATCH vertices, draw_batch; made, the inputs and
+    // the outputs only the general way's, WL_XBOX_VSH_BATCH)
     struct {
-        const uint32_t *words[WL_XBOX_VSH_BATCH]; // (their words: batch_vertex's vertex)
-        uint32_t elements[WL_XBOX_VSH_BATCH];
-        PackedVertex *run_vertices[WL_XBOX_VSH_BATCH];
-        uint32_t *words_made[WL_XBOX_VSH_BATCH];
+        const uint32_t *words[DRAW_BATCH]; // (their words: batch_vertex's vertex)
+        uint32_t elements[DRAW_BATCH];
+        PackedVertex *run_vertices[DRAW_BATCH];
+        uint32_t *words_made[DRAW_BATCH];
         PackedVertex made[WL_XBOX_VSH_BATCH];
         float inputs[WL_XBOX_VSH_BATCH][WL_NV2A_ATTRIBS][4];
         WlXboxVshOutput outputs[WL_XBOX_VSH_BATCH];
@@ -325,7 +330,7 @@ struct WlNv2aGx {
         PackedVertex *base;
         uint32_t stride, next, limit, batch_first, made;
         uint16_t memo[MEMO];                // (ring_on: a memo slot's vertex, the draw's slot)
-        uint32_t index[WL_XBOX_VSH_BATCH];  // the batch's vertices' slots
+        uint32_t index[DRAW_BATCH];         // the batch's vertices' slots
     } made;
     // a fused batch's state (the draw's)
     WlXboxVshFused fused;
@@ -470,14 +475,18 @@ static const struct {
 // The second word of switches (the first's 32 bits are used up): the same files and variables, read into
 // g_switches2_off and asked through switched_on2()
 enum {
-    SWITCH2_RESERVED = 1u << 0, // (no switch yet: the next cut takes bit 0 and this line goes)
+    SWITCH2_NO_PSH_MEMO = 1u << 8, // "nopshmemo": the recent pixel programs by all their words, a patched one looked up again
+    SWITCH2_SMALL_BATCH = 1u << 4, // "smallbatch": a fused draw's vertices made 16 indices a batch, as before (draw_batch)
+    SWITCH2_MID_BATCH = 1u << 5,   // "midbatch": a fused draw's batches 64 indices, not 128 (draw_batch)
 };
 
 static const struct {
     const char *file, *env;
     unsigned bit;
 } k_switches2[] = {
-    {NULL, NULL, 0}, // (an empty table has no size in C; the first real switch replaces this entry)
+    {"nopshmemo", "WL_XB_NOPSHMEMO", SWITCH2_NO_PSH_MEMO},
+    {"smallbatch", "WL_XB_SMALLBATCH", SWITCH2_SMALL_BATCH},
+    {"midbatch", "WL_XB_MIDBATCH", SWITCH2_MID_BATCH},
 };
 
 static unsigned g_switches_off;
@@ -508,14 +517,14 @@ void wl_nv2a_gx_set_switches(const char *title_dir) {
             WL_LOG_I(TAG, "draw path: %s (a cut off)", k_switches2[i].file);
         }
     }
-    (void)switched_on2; // (until the first switch of the second word asks it)
 }
 
 static bool switched_on(unsigned bit) {
     return (g_switches_off & bit) == 0;
 }
 
-static bool switched_on2(unsigned bit) {
+// (unused until the first switch of the second word asks it)
+static __attribute__((unused)) bool switched_on2(unsigned bit) {
     return (g_switches2_off & bit) == 0;
 }
 
@@ -1842,6 +1851,7 @@ static bool tev_setup(WlNv2aGx *gx, const WlNv2aKelvin *k) {
     // (a program of the recent draws' by the combiners' own words, not unbiased nor looked up by its
     // structure again: wl_xbox_psh_cache_recent)
     if (recent) {
+        wl_xbox_psh_cache_set_memo(&gx->psh, switched_on2(SWITCH2_NO_PSH_MEMO)); // (psh_cache.h: by structure)
         program = wl_xbox_psh_cache_recent(&gx->psh, words, extra, &textures, &usable);
     }
     if (program == NULL) {
@@ -5334,6 +5344,28 @@ static void xf_position_layout(WlNv2aGx *gx, const WlNv2aKelvin *k, const WlNv2a
     gx->stats.xf_position_draws++;
 }
 
+// The vertices a draw's batches take: a draw whose form is fused (known before its first batch, or
+// found by it) and whose vertices are made into the ring DRAW_BATCH, its form called once for them
+// (the call's prologue, its constants' loads and its GQRs set once for all; the slots' zeroing and
+// write-back, the prefetch and the FIFO's call a batch); the general way, the memo's (its vertices
+// made beside it) and a draw whose landings are kept WL_XBOX_VSH_BATCH. A batch of 128 made
+// vertices writes about 7 KB of slots and asks for the next one's inputs: well within the Wii's
+// 32 KB data cache. The switch "smallbatch" (WL_XB_SMALLBATCH) keeps every batch WL_XBOX_VSH_BATCH, as
+// before; "midbatch" (WL_XB_MIDBATCH) makes a fused draw's DRAW_BATCH / 2.
+static uint32_t draw_batch(const WlNv2aGx *gx, const DrawPlan *plan) {
+#ifdef WL_XBOX_FUSED_CHECK
+    // (each fused batch run the general way too: WL_XBOX_VSH_BATCH's inputs)
+    (void)gx;
+    (void)plan;
+    return WL_XBOX_VSH_BATCH;
+#else
+    return gx->made.ring_on && plan->fused_known && plan->fused != NULL && !plan->landing &&
+                   (plan->xf == NULL || !plan->xf->full) && switched_on2(SWITCH2_SMALL_BATCH)
+               ? (switched_on2(SWITCH2_MID_BATCH) ? DRAW_BATCH : DRAW_BATCH / 2u)
+               : WL_XBOX_VSH_BATCH;
+#endif
+}
+
 static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw *draw) {
     WlNv2aGx *gx = user;
     WlNv2aSurface surface;
@@ -5343,7 +5375,7 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     bool exact, xf_ok, indexed = false, count_pixels = wl_nv2a_k(k, WL_NV2A_K_SET_ZPASS_PIXEL_COUNT_ENABLE) != 0;
     const void *arrays[WL_GX_DIRECT_ARRAY_NORMAL + 1] = {NULL};
     float corners[3][2], area = 0.0f;
-    uint32_t v, seen = 0, first = 0, run, attributes;
+    uint32_t v, seen = 0, first = 0, run, attributes, batch, asked;
     unsigned stage;
     bool rebind, pixel, x_position = false;
 
@@ -5638,12 +5670,21 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
             gx->stats.xf_texgen_vertices += draw->count;
         }
     }
+    // (a draw made into the ring with no projective coordinates to find: its form, unless a plan above
+    // found it, decided now, as its first batch would (fused_for), which then may take DRAW_BATCH too:
+    // draw_batch)
+    if (gx->made.ring_on && !plan.fused_known && !plan.landing && (plan.xf == NULL || !plan.xf->full) &&
+        draw->count != 0 && switched_on2(SWITCH2_SMALL_BATCH) && !projected_possible(gx, &plan)) {
+        plan.fused_known = true;
+        plan.fused = fused_form(gx, &plan);
+    }
+    batch = draw_batch(gx, &plan);
+    run = draw->count < batch ? draw->count : batch;
     // (the first two batches' vertices asked for, then each batch the next one's: wl_nv2a_fetch_prefetch)
-    draw_prefetch(gx, &gx->fetch, draw, 0, 2u * WL_XBOX_VSH_BATCH);
+    asked = run + batch;
+    draw_prefetch(gx, &gx->fetch, draw, 0, asked);
     // (the first batch, which finds the projective coordinates GX is to divide at each pixel)
-    if (draw->count != 0 &&
-        vertices_make(gx, k, draw, 0, draw->count < WL_XBOX_VSH_BATCH ? draw->count : WL_XBOX_VSH_BATCH, &plan,
-                      &layout)) {
+    if (draw->count != 0 && vertices_make(gx, k, draw, 0, run, &plan, &layout)) {
         // (projected coordinates: the position sent, as the other attributes are; or all read from
         // the slots)
         if (gx->made.ring_on) {
@@ -5658,10 +5699,16 @@ static uint32_t backend_draw(void *user, const WlNv2aKelvin *k, const WlNv2aDraw
     }
     draw_bytes(gx, &layout, draw->count);
     wl_gx_direct_primitive_begin(gx_primitive(draw->primitive), draw->count);
+    batch = draw_batch(gx, &plan);
     for (first = 0; first < draw->count; first += run) {
-        run = draw->count - first < WL_XBOX_VSH_BATCH ? draw->count - first : WL_XBOX_VSH_BATCH;
+        run = first == 0 ? run : batch;
+        run = draw->count - first < run ? draw->count - first : run;
         if (first != 0) {
-            draw_prefetch(gx, &gx->fetch, draw, first + WL_XBOX_VSH_BATCH, WL_XBOX_VSH_BATCH);
+            // (the next batch's vertices asked for, from the end of those asked before)
+            uint32_t ahead = first + run + batch;
+
+            draw_prefetch(gx, &gx->fetch, draw, asked, ahead - asked);
+            asked = ahead;
             vertices_make(gx, k, draw, first, run, &plan, NULL);
         }
         // (the batch's vertices into the FIFO in one call: their slots' indices, or their words)

@@ -26,7 +26,7 @@ A guest virtual address becomes an effective address with two instructions:
 | `0x00000000`..`0x0FFFFFFF` | the same | user space: the XBE image at `0x00010000`, stacks, heaps (`NtAllocateVirtualMemory`) |
 | `0x80000000 + P` | `0x10000000 + P` | the contiguous window: physical page `P` (kernel memory, contiguous allocations) |
 | `0xF0000000 + P` | the same as `0x80000000 + P` | the write-combined alias D3D uses |
-| `0xFC000000` up | `0x1C000000` up | devices (`mmio.h`): never mapped, every access faults |
+| `0xFC000000` up | `0x1C000000` up | devices (`mmio.h`): never mapped, every access faults (a mirrored page aside: below) |
 
 The host pointer is `g_xbox_mem_offset + EA` (`wl_xb_ptr`): 0 on the Wii, where the MMU maps the
 EAs, and the base of a 512 MB `PROT_NONE` reservation elsewhere. Guest RAM is 64 MB of physical
@@ -182,6 +182,18 @@ resumes after the instruction:
   xboxrecomp's `mmio_decode.h`) on x86-64 and the PowerPC one on ppc-be. The handler notes the
   faulting host PC first (`wl_xb_mmio_fault_pc`), so a device's trace can name the translated
   function that made the access.
+
+**Mirrored pages** (`wl_xb_mmio_mirror`): a page of registers whose reads have no effect and change only by the
+guest's writes to it is kept as a copy the guest reads as memory: the NV2A's PFB page (D3D's kick reads the
+write-combining buffer's register, writes its flush and polls it: three faults of the kick's four) and the APU
+front end's first page (the free count DirectSound reads before each batch of methods). The device's own reads fill
+it, the written word is read again after each write, which still faults and goes to the device. The host and ppc-be
+map it read-only; the Wii puts a read-only PTE (PP 3) in when the MMU keeps a store out of one (a probe at the first
+mirror logs which), else the read still faults and the DSI's slow entry answers it from the copy in exception
+context (no trampoline, no FP state). A store a page lists as kept (`WlXbMmioFastStore`: the flush, done at once)
+is answered there too. Such an answer is no device access: no safe point, no deterministic tick, so the
+deterministic mode mirrors nothing. The status line every 10 s gives the faults a frame by register and by guest
+site (the host's; the Wii's the totals). Off: `nommiomirror` (below).
 
 **Every device access is a safe point** (`wl_xb_safe_point`, `thread.h`): once the device has
 answered, pending interrupt work runs and a thread waiting for the guest lock gets it. A title that
@@ -550,10 +562,12 @@ so it takes the lock too, or each concurrent run has a copy of its own (AGENTS.m
 folder (read once at boot; the host reads it too) or its host twin (any value unless the row says one), which
 puts back the way before it. The boot logs the ones on. "Since" is the wave whose one commit brought the change
 (wave 2 5f4304c and wave 3 5d95676 of 2026-10-18, wave 4 of 2026-10-19), or its day when it came alone. Three
-tables read them: `wl/xbox/nv2a_gx.c`'s `k_switches` (the draw path's: file and variable side by side),
+tables read them: `wl/xbox/nv2a_gx.c`'s `k_switches` and `k_switches2` (the draw path's, in two words of 32 bits:
+`SWITCH_*` and `SWITCH2_*`; file and variable side by side),
 `boot.c`'s `gx_bisect_options` (GX's, into `wl/platform/gx_direct.h`'s `WlGxBisect`, which `wl/platform/wii/gx_*.c`
 and the host's GX follow) and the rest of `boot.c` (memory, threads, the GPU's options, audio). The test
-`check_switch_docs` (tests/tools) fails while a switch or a `WL_XB_*` variable the code reads has no row here.
+`check_switch_docs` (tests/tools) fails while a switch or a `WL_XB_*` variable the code reads has no row here,
+or two draw-path switches of one word share a bit.
 
 | File | Host | Since | What it turns off (the old way it puts back) |
 |---|---|---|---|
@@ -626,6 +640,10 @@ and the host's GX follow) and the rest of `boot.c` (memory, threads, the GPU's o
 | `olddevpoint` | `WL_XB_OLDDEVPOINT` | wave 4 | a device access's safe point cut short (`wl_xb_device_safe_point`): nothing after a read with the attention down and no line up, only the device's line looked at in a quiet window: the whole safe point every time |
 | `oldservice` | `WL_XB_OLDSERVICE` | wave 4 | the service thread queued for the lock sent back to its sleep unqueued when the holder's poll has just run its work (`yield_if_due`): given the lock anyway, finding nothing to do |
 | `oldfetch` | `WL_XB_OLDFETCH` (the replay too) | wave 6 | a draw's vertices fetched a vertex at a time with its attributes together when their formats are one of the fetch's sets of one stride (`fetch_rows`: the skinned positions the projection's probes fetch, the skinned and static vertices; the element's offset found once, the index read straight into it), and the vertex arrays' formats compared only when one of them was written (`WL_NV2A_DIRTY_ARRAY_FORMATS`; an offset alone moves the starts), the layout's dirty groups kept over a draw without arrays: an attribute at a time for all the vertices, the formats compared at every move of an array (what is fetched and drawn is the same) |
+| `nopshmemo` | `WL_XB_NOPSHMEMO` (the replay too) | wave 7 | the recent pixel programs remembered by their structure (`psh_cache.h`: the words but the constants, the textures but the fog's colour, 32 sets of 8, 56 KB): a program of other constants of its signatures patched without a hash of the state, a structure's variants side by side; off: by all their words, 32 of them, a program patched since looked up again (what is drawn is the same) |
+| `nommiomirror` | `WL_XB_NOMMIOMIRROR` (`WL_XB_MMIO_CHECK=1`: the check) | wave 7 | device pages read as memory (`mmio.h`'s mirrors: the NV2A's PFB page, whose write-combining flush D3D's kick reads twice, and the APU front end's free count DirectSound reads before its methods): a read there is a load from a copy the runtime keeps (the host's and ppc-be's read-only mapping; the Wii's read-only PTE where the MMU keeps a store out of one, else the DSI answered in exception context from the copy, no trampoline), the flush's store answered at once from its handler; deterministic runs mirror nothing: every read through its fault and the device, as before |
+| `smallbatch` | `WL_XB_SMALLBATCH` (the replay too) | wave 7 (draw-batch) | a draw whose vertices are made into the ring and run by a fused form made 16 indices a batch (`draw_batch`), as before: about 9 vertices a call of its form; else 128 indices a batch (its first too, the form decided before it: about 30 to 57 vertices a call on the captures), the call's own cost (its prologue, constants, GQRs) and the batch's (the slots' zeroing and write-back, the prefetch, the FIFO's call) paid a quarter as often; frames the same |
+| `midbatch` | `WL_XB_MIDBATCH` (the replay too) | wave 7 (draw-batch) | such a draw's batches 64 indices, not 128 (a bisect of the data cache's share on the console: 128 made vertices write about 7 KB of slots a batch) |
 <!-- a new switch: its row here (tests/tools/check_switch_docs.py fails until it has one) -->
 
 **Build-time switches** (the title's config for `tools/xbox_recomp.py`, Halo's `halo.json`; the tool's

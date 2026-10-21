@@ -111,6 +111,41 @@ WlResult wl_xb_backend_init(const WlXbMemConfig *cfg, uintptr_t *base_out) {
     return WL_OK;
 }
 
+// The device pages read without a fault (mmio.h): one more object of WL_XB_MIRROR_PAGES pages, read-write
+// outside the span, each page mapped read-only (or not at all) at its device EA.
+uint8_t *wl_xb_backend_mirror(uint32_t ea, bool readable) {
+    static int fd = -1;
+    static uint8_t *rw;
+    static uint32_t used;
+    static uint8_t *for_base; // (a new span, a test's next init: the pages are taken again from the first)
+    if (for_base != g_base) {
+        for_base = g_base;
+        used = 0;
+    }
+    if (g_base == NULL || ea < WL_XB_EA_MMIO || ea >= WL_XB_EA_SPAN || (ea & (WL_XB_PAGE - 1u)) != 0 ||
+        used == WL_XB_MIRROR_PAGES) {
+        return NULL;
+    }
+    if (fd < 0) {
+        fd = open_ram_object();
+        if (fd < 0 || ftruncate(fd, (off_t)WL_XB_MIRROR_PAGES * WL_XB_PAGE) != 0) {
+            return NULL;
+        }
+        void *m = mmap(NULL, WL_XB_MIRROR_PAGES * WL_XB_PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (m == MAP_FAILED) {
+            return NULL;
+        }
+        rw = m;
+    }
+    void *at = mmap(g_base + ea, WL_XB_PAGE, readable ? PROT_READ : PROT_NONE, MAP_SHARED | MAP_FIXED, fd,
+                    (off_t)used * WL_XB_PAGE);
+    if (at == MAP_FAILED) {
+        WL_LOG_E(TAG, "cannot map the device page at EA 0x%x: %s", (unsigned)ea, strerror(errno));
+        return NULL;
+    }
+    return rw + (size_t)used++ * WL_XB_PAGE;
+}
+
 // ---- Paging: the MMU the core asks ----------------------------------------------------------------
 
 static void set_prot(uint32_t p, uint32_t a, uint8_t prot, bool force) {

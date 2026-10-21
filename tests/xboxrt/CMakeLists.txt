@@ -4,6 +4,7 @@ if(NOT TARGET wl_xboxrt)
 endif()
 # Guest memory on the host / ppc-be backend, with the faults through the host's decoder.
 wl_add_test(test_xboxrt_mem SOURCES test_xboxrt_mem.c LIBS wl_xboxrt LABELS unit be)
+wl_add_test(test_xboxrt_mmio_mirror SOURCES test_xboxrt_mmio_mirror.c LIBS wl_xboxrt LABELS unit be)
 # The deterministic clock (det_clock.h) against the count of nanoseconds it replaced.
 wl_add_test(test_xboxrt_det_clock SOURCES test_xboxrt_det_clock.c LIBS wl_xboxrt LABELS unit be)
 # wl_xb_range_ok's benchmark (tools/qemu_icount.py counts its instructions on ppc-be); the count of
@@ -20,6 +21,8 @@ wl_target_defaults(bench_mmio_fault)
 target_link_libraries(bench_mmio_fault PRIVATE wl_xboxrt)
 add_test(NAME bench_mmio_fault_runs COMMAND bench_mmio_fault 1000)
 set_tests_properties(bench_mmio_fault_runs PROPERTIES LABELS "unit;be")
+add_test(NAME bench_mmio_fault_mirror COMMAND bench_mmio_fault 1000 mirror)
+set_tests_properties(bench_mmio_fault_mirror PROPERTIES LABELS "unit;be")
 # The service poll at a device access when nothing is due (KeTickCount and the level sources):
 # tools/qemu_icount.py counts it on ppc-be.
 add_executable(bench_irq_poll bench_irq_poll.c)

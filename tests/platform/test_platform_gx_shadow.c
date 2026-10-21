@@ -415,7 +415,95 @@ TEST maps_as_a_cache(void) {
     PASS();
 }
 
+// The TEV's plan (wl_tev_shadow_plan, its stages compared as words): each stage's calls those of the fields
+// that differ from the stage GX holds, field by field as before (texture maps moved by the cache included),
+// every call for a stage GX does not hold, for random programs changed a few fields at a time.
+static uint32_t g_plan_rng = 0x1234567u;
+static unsigned plan_rnd(unsigned n) {
+    g_plan_rng = g_plan_rng * 1664525u + 1013904223u;
+    return (g_plan_rng >> 8) % n;
+}
+
+static uint8_t plan_reference(const WlTevStage *now, const WlTevStage *was) {
+    uint8_t send = 0;
+
+    if (now->texcoord != was->texcoord || now->texmap != was->texmap || now->channel != was->channel) {
+        send |= WL_TEV_SEND_ORDER;
+    }
+    if (now->ras_swap != was->ras_swap || now->tex_swap != was->tex_swap) {
+        send |= WL_TEV_SEND_SWAP;
+    }
+    send |= now->kcsel != was->kcsel ? WL_TEV_SEND_KCSEL : 0;
+    send |= now->kasel != was->kasel ? WL_TEV_SEND_KASEL : 0;
+    send |= memcmp(now->color.in, was->color.in, 4) ? WL_TEV_SEND_COLOR_IN : 0;
+    send |= memcmp(&now->color.op, &was->color.op, 5) ? WL_TEV_SEND_COLOR_OP : 0;
+    send |= memcmp(now->alpha.in, was->alpha.in, 4) ? WL_TEV_SEND_ALPHA_IN : 0;
+    send |= memcmp(&now->alpha.op, &was->alpha.op, 5) ? WL_TEV_SEND_ALPHA_OP : 0;
+    return send;
+}
+
+static void plan_byte_change(WlTevStage *st) {
+    uint8_t *b = (uint8_t *)st;
+    unsigned at = plan_rnd(sizeof *st);
+
+    b[at] = at == 1 ? (uint8_t)(plan_rnd(3) == 0 ? WL_TEV_NONE : plan_rnd(WL_TEV_TEXMAPS)) : (uint8_t)plan_rnd(256);
+}
+
+TEST tev_plan_sends_the_fields_that_differ(void) {
+    static const uint32_t ka[WL_GX_MAP_KEY_WORDS] = {9, 2, 3, 0x100, 0xFFFFFF};
+    static const uint32_t kb[WL_GX_MAP_KEY_WORDS] = {9, 2, 3, 0x200, 0xFFFFFF};
+    WlTevStage held[WL_TEV_MAX_STAGES];
+    uint32_t known = 0;
+    WlTevProgram p;
+    WlTevSend send;
+    bool kept;
+
+    // (logical map 0 on map 1: the stages that read it held as reading map 1)
+    wl_gx_shadow_maps_cache(true);
+    (void)wl_gx_shadow_texture_forget(0xFFu);
+    wl_gx_shadow_forget();
+    (void)wl_gx_shadow_map_bind(0, ka, &kept);
+    (void)wl_gx_shadow_map_bind(0, kb, &kept);
+    ASSERT_EQ(1u, wl_gx_shadow_map_of(0));
+    memset(&p, 0, sizeof p);
+    p.stage_count = WL_TEV_MAX_STAGES;
+    for (unsigned i = 0; i < WL_TEV_MAX_STAGES; i++) {
+        for (unsigned n = 0; n < 8; n++) {
+            plan_byte_change(&p.stages[i]);
+        }
+        p.stages[i].ras_swap &= 3u;
+        p.stages[i].tex_swap &= 3u;
+    }
+    for (unsigned round = 0; round < 2000; round++) {
+        p.stage_count = (uint8_t)(1u + plan_rnd(WL_TEV_MAX_STAGES));
+        for (unsigned n = plan_rnd(4); n > 0; n--) {
+            WlTevStage *st = &p.stages[plan_rnd(p.stage_count)];
+
+            plan_byte_change(st);
+            st->ras_swap &= 3u;
+            st->tex_swap &= 3u;
+        }
+        wl_tev_shadow_plan(&p, WL_TEV_APPLY_CHANGES, &send);
+        for (unsigned i = 0; i < p.stage_count; i++) {
+            WlTevStage moved = p.stages[i];
+            uint8_t expect;
+
+            if (moved.texmap < WL_TEV_TEXMAPS) {
+                moved.texmap = (uint8_t)wl_gx_shadow_map_of(moved.texmap);
+            }
+            expect = (known & (1u << i)) ? plan_reference(&moved, &held[i]) : (uint8_t)WL_TEV_SEND_STAGE;
+            ASSERT_EQ(expect, send.stages[i]);
+            if (expect != 0) {
+                held[i] = moved;
+                known |= 1u << i;
+            }
+        }
+    }
+    PASS();
+}
+
 SUITE(gx_shadow_suite) {
+    RUN_TEST(tev_plan_sends_the_fields_that_differ);
     RUN_TEST(batches_cut_by_state_and_tokens);
     RUN_TEST(tokens_put_off_to_a_cut);
     RUN_TEST(a_fence_token_waits_for_a_cut_or_a_poll);

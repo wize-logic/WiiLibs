@@ -54,6 +54,7 @@
 void wl_xb_dsi_entry(void);
 uint32_t wl_xb_dsi_fast(uint32_t dar, uint32_t dsisr);
 void wl_xb_dsi_slow(void *frame);
+uint32_t wl_xb_dsi_device_fast(void *frame);
 PPCExcptHandlerFn g_xb_prev_dsi; // read by dsi_wii.S
 
 typedef struct {
@@ -430,6 +431,141 @@ static uint32_t map_page(uint32_t ea, uint32_t keep) {
     return 1;
 }
 
+typedef struct {
+    uint32_t back, pad[3];
+    uint32_t gpr[32];
+    uint32_t pc, msr, cr, lr, ctr, xer, dar, dsisr;
+    uint64_t fpscr;
+    double fpr[14];
+} DsiFrame;
+
+// ---- Mirrored device pages (mmio.h) --------------------------------------------------------------
+// A mirrored page is a page of the heap (cached MEM1 or MEM2) behind a read-only PTE (PP 3) at the
+// device's EA, put in on the first read like any page's: a read is a load, a store faults with
+// DSISR's protection bit and goes to the slow path's device call. The PTE may be evicted like any
+// (its bits name no guest page: nothing harvested); the next read puts it back. Only when the MMU
+// keeps a store out of a read-only page (the probe, once): an MMU that does not (an emulator's)
+// would let the guest's store land in the page instead of the device.
+static struct {
+    uint32_t ea, rpn;
+} g_mirror_pte[WL_XB_MIRROR_PAGES];
+static volatile uint32_t g_mirror_ptes;
+static volatile uint32_t g_probe_ea, g_probe_hit;
+static int g_mmu_protects = -1; // -1: not probed yet
+#define PTE_PP_RO 0x003u
+
+static void mirror_pte_insert(uint32_t ea, uint32_t rpn) {
+    uint32_t hash = primary_hash(ea);
+    uint32_t w1 = (rpn << 12) | PTE_R | PTE_PP_RO;
+    for (uint32_t h = 0; h < 2; h++) {
+        volatile uint32_t *g = pteg((h ? ~hash : hash) & g_pteg_mask);
+        for (uint32_t i = 0; i < 8; i++) {
+            if ((g[2 * i] & 0x80000000u) == 0) {
+                g[2 * i + 1] = w1;
+                __asm__ volatile("eieio" ::: "memory");
+                g[2 * i] = pte_w0(ea, h);
+                __asm__ volatile("sync" ::: "memory");
+                return;
+            }
+        }
+    }
+    uint32_t i = g_evict_rr++ & 7u;
+    uint32_t index = hash & g_pteg_mask;
+    volatile uint32_t *g = pteg(index);
+    pte_drop(&g[2 * i], pte_ea(g[2 * i], index));
+    g_pte_evictions++;
+    g[2 * i + 1] = w1;
+    __asm__ volatile("eieio" ::: "memory");
+    g[2 * i] = pte_w0(ea, 0);
+    __asm__ volatile("sync" ::: "memory");
+}
+
+// Exception context: the mirrored page's PTE for a read at `ea` (1), or 0 (not a mirrored page).
+static uint32_t mirror_map(uint32_t ea) {
+    uint32_t page = ea & ~(WL_XB_PAGE - 1u);
+    for (uint32_t i = 0, n = g_mirror_ptes; i < n; i++) {
+        if (g_mirror_pte[i].ea == page) {
+            mirror_pte_insert(page, g_mirror_pte[i].rpn);
+            g_faults++;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether a store to a read-only PTE faults: the page `ea` (the first mirror, its bytes at `rpn`)
+// mapped read-only, a word read and stored back unchanged, the store's DSI caught by the slow path
+// (g_probe_ea) and skipped. An MMU that lets it through wrote the same word: nothing changed.
+static bool mmu_protects(uint32_t ea, uint32_t rpn) {
+    uint32_t level = IRQ_Disable();
+    mirror_pte_insert(ea, rpn);
+    tlbie(ea);
+    g_probe_hit = 0;
+    g_probe_ea = ea;
+    __asm__ volatile("sync" ::: "memory");
+    volatile uint32_t *word = (volatile uint32_t *)(uintptr_t)ea;
+    uint32_t v = *word;
+    *word = v;
+    __asm__ volatile("sync" ::: "memory");
+    g_probe_ea = 0;
+    volatile uint32_t *w0p = pte_find(ea);
+    if (w0p != NULL) {
+        *w0p = 0;
+        __asm__ volatile("sync" ::: "memory");
+        tlbie(ea);
+    }
+    IRQ_Restore(level);
+    return g_probe_hit != 0;
+}
+
+uint8_t *wl_xb_backend_mirror(uint32_t ea, bool readable) {
+    if (g_htab == NULL || ea < WL_XB_EA_MMIO || ea >= WL_XB_EA_SPAN || (ea & (WL_XB_PAGE - 1u)) != 0 ||
+        g_mirror_ptes == WL_XB_MIRROR_PAGES) {
+        return NULL;
+    }
+    uint8_t *page = memalign(WL_XB_PAGE, WL_XB_PAGE);
+    if (page == NULL) {
+        return NULL;
+    }
+    memset(page, 0, WL_XB_PAGE);
+    uint32_t rpn = (uint32_t)((uintptr_t)page - 0x80000000u) >> 12;
+    if (readable && g_mmu_protects < 0) {
+        g_mmu_protects = mmu_protects(ea, rpn) ? 1 : 0;
+        WL_LOG_I(TAG, "the MMU %s: device pages mirrored %s", g_mmu_protects ? "keeps stores out of read-only pages" :
+                 "lets a store into a read-only page (an emulator's)",
+                 g_mmu_protects ? "for reading (a read is a load)" : "unmapped (a read faults, answered at once from the page)");
+    }
+    if (readable && g_mmu_protects == 1) {
+        uint32_t n = g_mirror_ptes;
+        g_mirror_pte[n].ea = ea;
+        g_mirror_pte[n].rpn = rpn;
+        __asm__ volatile("sync" ::: "memory");
+        g_mirror_ptes = n + 1u;
+    }
+    return page;
+}
+
+// Exception context (the slow path's entry, before the trampoline): a device access a mirrored page
+// answers without its device (mmio.h's wl_xb_mmio_fast_*): the frame's registers and pc updated
+// and 1; else 0 and the slow path goes on. Integers only: no FP, no locks, no calls out of mmio.c
+// and ppc_decode.c's exception-safe parts.
+uint32_t wl_xb_dsi_device_fast(void *frame) {
+    DsiFrame *f = frame;
+    uint32_t ea = f->dar;
+    if (ea < WL_XB_EA_MMIO || ea >= WL_XB_EA_SPAN || ea == g_probe_ea) {
+        return 0;
+    }
+    WlXbPpcAccess a;
+    if (wl_xb_ppc_decode(*(const uint32_t *)f->pc, &a) != WL_XB_PPC_OK) {
+        return 0;
+    }
+    if (!wl_xb_ppc_fast(&a, f->gpr, wl_xb_ppc_ea(&a, f->gpr), wl_xb_ea_to_va(ea))) {
+        return 0;
+    }
+    f->pc += 4u;
+    return 1;
+}
+
 // Exception context: no locks, no FP, no guest memory, no I/O.
 uint32_t wl_xb_dsi_fast(uint32_t dar, uint32_t dsisr) {
     if (dar >= WL_XB_EA_SPAN) {
@@ -437,6 +573,11 @@ uint32_t wl_xb_dsi_fast(uint32_t dar, uint32_t dsisr) {
     }
     if ((dsisr & DSISR_NO_PTE) == 0) {
         return 0;
+    }
+    if (dar >= WL_XB_EA_MMIO) {
+        // a device: a read of a mirrored page gets its read-only PTE (mmio.h); the rest is the slow
+        // path's (where a mirrored read or a kept store may still be answered at once)
+        return (dsisr & DSISR_STORE) == 0 && g_mirror_ptes != 0 ? mirror_map(dar) : 0u;
     }
     uint32_t last = dar + 7u; // a misaligned access may run into the next page
     bool cross = (last >> 12) != (dar >> 12) && last < WL_XB_EA_SPAN;
@@ -453,13 +594,6 @@ uint32_t wl_xb_dsi_fast(uint32_t dar, uint32_t dsisr) {
     return a == 1 ? 1u : 0u;
 }
 
-typedef struct {
-    uint32_t back, pad[3];
-    uint32_t gpr[32];
-    uint32_t pc, msr, cr, lr, ctr, xer, dar, dsisr;
-    uint64_t fpscr;
-    double fpr[14];
-} DsiFrame;
 
 // The slow path for guest RAM: page `ea`'s contents into a frame (paging.c, which may give the
 // guest lock up while the card works), then its PTE. Normal context, the guest lock held.
@@ -499,6 +633,11 @@ static const char *paging_failure(WlResult r) {
 void wl_xb_dsi_slow(void *frame) {
     DsiFrame *f = frame;
     uint32_t ea = f->dar;
+    if (ea == g_probe_ea && ea != 0) {
+        g_probe_hit = 1; // (mmu_protects: the store to the read-only page faulted)
+        f->pc += 4u;
+        return;
+    }
     uint32_t va = wl_xb_ea_to_va(ea);
     bool store = (f->dsisr & DSISR_STORE) != 0;
     const char *what = NULL;

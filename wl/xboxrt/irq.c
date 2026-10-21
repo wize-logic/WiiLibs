@@ -12,6 +12,7 @@
 #include "wl/xboxrt/devices.h"
 #include "wl/xboxrt/irq.h"
 #include "wl/xboxrt/mem.h"
+#include "wl/xboxrt/mmio.h"
 #include "wl/xboxrt/thread.h"
 
 #define TAG "xbirq"
@@ -598,6 +599,7 @@ static void status_report(void) {
     (void)wl_xb_thread_reap();
     wl_xb_thread_stall_check(m.faults_resolved + m.swap_ins + m.file_ins); // paging I/O moves on too
     freeze_check();
+    wl_xb_mmio_log_window(TAG, wl_xb_gpu_flips(), 10u); // the device faults a frame, by register and site (host)
     wl_mem_census_log(TAG, reports++ % 6u != 0u);
     if (reports % 6u == 1u) {
         wl_xb_thread_log_stacks();

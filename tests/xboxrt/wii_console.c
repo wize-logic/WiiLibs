@@ -164,6 +164,37 @@ int main(void) {
         acc = acc * 1.0001 + (double)(wl_xb_rd32(DEV_VA + 4u) & 1u);
     }
     check("mmio_fp_state", g_reads - before == 1000u && acc > 1000.0 && acc < 1200.0);
+    // a mirrored page (mmio.h): reads from the copy (a load through a read-only PTE where the MMU keeps
+    // stores out of one, else the DSI answered in exception context), a write the device's, a kept
+    // store (the flush form) answered in the handler, FP state kept over a thousand of them
+    WlXbDevice dev2 = {"fake2", DEV_VA + 0x10000u, 0x1000u, dev_read, dev_write, NULL};
+    static WlXbMmioFastStore kept;
+    kept.offset = 0x14u;
+    kept.keep = ~0x10000u;
+    kept.model = (uint32_t *)&g_regs[5];
+    check("mirror_register", wl_xb_mmio_register(&dev2) == WL_OK);
+    g_regs[6] = 0x13572468u;
+    g_regs[5] = 0x3u;
+    wl_xb_mmio_set_mirrors(true, false);
+    check("mirror_map", wl_xb_mmio_mirror(DEV_VA + 0x10000u, &kept, 1u) == WL_OK);
+    before = g_reads;
+    uint32_t mea = WL_XB_EA(DEV_VA + 0x10018u);
+    __asm__ volatile("lwbrx %0,0,%1" : "=r"(v) : "r"(mea) : "memory");
+    check("mirror_lwbrx", v == 0x13572468u);
+    __asm__ volatile("lwz %0,0(%1)" : "=r"(v) : "b"(mea) : "memory");
+    check("mirror_lwz", v == 0x68245713u);
+    check("mirror_read16", wl_xb_rd16(DEV_VA + 0x1001Au) == 0x1357u);
+    check("mirror_no_device_read", g_reads == before);
+    wl_xb_wr32(DEV_VA + 0x10018u, 0x0BADBEEFu);
+    check("mirror_write", g_regs[6] == 0x0BADBEEFu && wl_xb_rd32(DEV_VA + 0x10018u) == 0x0BADBEEFu);
+    volatile uint32_t *kp = wl_xb_ptr(DEV_VA + 0x10014u);
+    *kp = *kp | WL_XB_LE32(0x10000u); // the kick's flush: or-in, then poll
+    check("mirror_kept_store", g_regs[5] == 0x3u && WL_XB_LE32(*kp) == 0x3u);
+    acc = 1.0;
+    for (int i = 0; i < 1000; i++) {
+        acc = acc * 1.0001 + (double)(wl_xb_rd32(DEV_VA + 0x10018u) & 1u);
+    }
+    check("mirror_fp_state", acc > 1000.0 && acc < 1200.0 && g_reads == before);
     WlXbMmioStats ms;
     wl_xb_mmio_stats(&ms);
     WL_LOG_I(TAG, "XBRT frames %u, faults %u, PTE evictions %u, device reads %u writes %u", (unsigned)st2.frames,

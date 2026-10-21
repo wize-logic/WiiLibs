@@ -833,5 +833,18 @@ WlResult wl_xb_gpu_attach_nv2a(void *texture_arena, uint32_t texture_bytes) {
     } else {
         WL_LOG_I(TAG, "holdgxlock: the guest lock kept through GX's waits");
     }
-    return wl_xb_gpu_attach(&k_ops, g_gpu);
+    WlResult r = wl_xb_gpu_attach(&k_ops, g_gpu);
+    if (r == WL_OK) {
+        // PFB's first page read as memory (mmio.h's mirrors): D3D's kick reads the write-combining
+        // buffer's register twice around its flush; the flush itself answered at once
+        static WlXbMmioFastStore wbc;
+        wbc.offset = WL_NV2A_PFB_WBC & (WL_XB_PAGE - 1u);
+        wbc.keep = ~(uint32_t)WL_NV2A_PFB_WBC_FLUSH;
+        wbc.model = wl_nv2a_pfb_wbc_word(g_gpu);
+        WlResult m = wl_xb_mmio_mirror(WL_XB_NV2A_BASE + WL_NV2A_PFB_PAGE, &wbc, 1u);
+        if (m != WL_OK) {
+            WL_LOG_W(TAG, "PFB's page not mirrored: %s", wl_result_name(m));
+        }
+    }
+    return r;
 }

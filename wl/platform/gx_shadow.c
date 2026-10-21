@@ -2,6 +2,7 @@
 // The GX state last sent by the direct layer and the TEV (gx_shadow.h).
 #include "wl/platform/gx_shadow.h"
 
+#include <stddef.h>
 #include <string.h>
 
 #include "wl/platform/gx_direct.h"
@@ -116,45 +117,48 @@ bool wl_gx_shadow_differs(WlGxShadowKey key, const void *value, size_t bytes) {
     return true;
 }
 
-static bool same_half(const WlTevHalf *a, const WlTevHalf *b) {
-    return a->op == b->op && a->bias == b->bias && a->scale == b->scale && a->clamp == b->clamp && a->dest == b->dest;
+// A stage's 25 bytes compared as six words and a byte (WlTevStage has no padding): the bytes of each of the
+// stage's calls in them (BYTES_AT(first, n): n bytes of a word from its byte `first` on, as the processor
+// loads the word), the fields GX holds compared at once, no call to memcmp
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define BYTES_AT(first, n) ((uint32_t)(0xFFFFFFFFu >> (32u - 8u * (n))) << (8u * (4u - (first) - (n))))
+#else
+#define BYTES_AT(first, n) ((uint32_t)(0xFFFFFFFFu >> (32u - 8u * (n))) << (8u * (first)))
+#endif
+_Static_assert(offsetof(WlTevStage, texmap) == 1u && offsetof(WlTevStage, ras_swap) == 3u &&
+                   offsetof(WlTevStage, tex_swap) == 4u && offsetof(WlTevStage, kcsel) == 5u &&
+                   offsetof(WlTevStage, kasel) == 6u && offsetof(WlTevStage, color) == 7u &&
+                   offsetof(WlTevStage, alpha) == 16u && offsetof(WlTevHalf, op) == 4u,
+               "a stage's bytes as stage_calls reads them");
+
+static inline uint32_t stage_word(const WlTevStage *stage, unsigned word) {
+    uint32_t v;
+
+    memcpy(&v, (const uint8_t *)stage + 4u * word, sizeof v);
+    return v;
 }
 
-// the calls a stage's fields need, against the stage GX holds (`known`)
-static uint8_t stage_calls(const WlTevStage *now, const WlTevStage *was, bool known) {
+// the calls a stage's fields need, against the stage GX holds (`was`): its bytes, `order` (its first word, the
+// texture map moved) for the first four
+static uint8_t stage_calls(const WlTevStage *now, uint32_t order, const WlTevStage *was) {
+    uint32_t d0 = order ^ stage_word(was, 0), d1 = stage_word(now, 1) ^ stage_word(was, 1),
+             d2 = stage_word(now, 2) ^ stage_word(was, 2), d3 = stage_word(now, 3) ^ stage_word(was, 3),
+             d4 = stage_word(now, 4) ^ stage_word(was, 4), d5 = stage_word(now, 5) ^ stage_word(was, 5);
+    unsigned d6 = (unsigned)(now->alpha.dest ^ was->alpha.dest);
     uint8_t send = 0;
 
-    if (!known) {
-        return WL_TEV_SEND_STAGE;
-    }
-    // (the common case first: the stage as it was, its bytes compared at once)
-    if (memcmp(now, was, sizeof *now) == 0) {
+    // (the common case first: the stage as it was)
+    if ((d0 | d1 | d2 | d3 | d4 | d5 | d6) == 0) {
         return 0;
     }
-    if (now->texcoord != was->texcoord || now->texmap != was->texmap || now->channel != was->channel) {
-        send |= WL_TEV_SEND_ORDER;
-    }
-    if (now->ras_swap != was->ras_swap || now->tex_swap != was->tex_swap) {
-        send |= WL_TEV_SEND_SWAP;
-    }
-    if (now->kcsel != was->kcsel) {
-        send |= WL_TEV_SEND_KCSEL;
-    }
-    if (now->kasel != was->kasel) {
-        send |= WL_TEV_SEND_KASEL;
-    }
-    if (memcmp(now->color.in, was->color.in, sizeof now->color.in) != 0) {
-        send |= WL_TEV_SEND_COLOR_IN;
-    }
-    if (!same_half(&now->color, &was->color)) {
-        send |= WL_TEV_SEND_COLOR_OP;
-    }
-    if (memcmp(now->alpha.in, was->alpha.in, sizeof now->alpha.in) != 0) {
-        send |= WL_TEV_SEND_ALPHA_IN;
-    }
-    if (!same_half(&now->alpha, &was->alpha)) {
-        send |= WL_TEV_SEND_ALPHA_OP;
-    }
+    send |= (d0 & BYTES_AT(0u, 3u)) != 0 ? WL_TEV_SEND_ORDER : 0u;
+    send |= ((d0 & BYTES_AT(3u, 1u)) | (d1 & BYTES_AT(0u, 1u))) != 0 ? WL_TEV_SEND_SWAP : 0u;
+    send |= (d1 & BYTES_AT(1u, 1u)) != 0 ? WL_TEV_SEND_KCSEL : 0u;
+    send |= (d1 & BYTES_AT(2u, 1u)) != 0 ? WL_TEV_SEND_KASEL : 0u;
+    send |= ((d1 & BYTES_AT(3u, 1u)) | (d2 & BYTES_AT(0u, 3u))) != 0 ? WL_TEV_SEND_COLOR_IN : 0u;
+    send |= ((d2 & BYTES_AT(3u, 1u)) | d3) != 0 ? WL_TEV_SEND_COLOR_OP : 0u;
+    send |= d4 != 0 ? WL_TEV_SEND_ALPHA_IN : 0u;
+    send |= (d5 | d6) != 0 ? WL_TEV_SEND_ALPHA_OP : 0u;
     return send;
 }
 
@@ -175,27 +179,9 @@ static inline unsigned bits8(uint32_t v) {
 void wl_tev_shadow_plan(const WlTevProgram *p, uint32_t flags, WlTevSend *out) {
     bool changes = (flags & WL_TEV_APPLY_CHANGES) != 0;
     uint32_t swaps_used = 0;
-    unsigned i, calls = 0, sent = 0;
+    unsigned i, calls = 0, sent = 0, swaps = 0, konst = 0, preload = 0;
 
     memset(out, 0, sizeof *out);
-    for (i = 0; i < p->stage_count; i++) {
-        swaps_used |= (1u << p->stages[i].ras_swap) | (1u << p->stages[i].tex_swap);
-    }
-    if ((flags & WL_TEV_APPLY_SKIP_SWAPS) != 0) {
-        s.swaps_known = 0; // (the caller's: set behind the shadow)
-    } else {
-        for (i = 0; i < WL_TEV_SWAP_TABLES; i++) {
-            if ((swaps_used & (1u << i)) == 0) {
-                continue;
-            }
-            calls++;
-            if (!changes || (s.swaps_known & (1u << i)) == 0 || memcmp(s.swap[i], p->swap[i], 4) != 0) {
-                out->swaps |= (uint8_t)(1u << i);
-                memcpy(s.swap[i], p->swap[i], 4);
-                s.swaps_known |= (uint8_t)(1u << i);
-            }
-        }
-    }
     for (i = 0; i < WL_TEV_KONST_SLOTS; i++) {
         if ((p->konst_mask & (1u << i)) == 0) {
             continue;
@@ -205,6 +191,7 @@ void wl_tev_shadow_plan(const WlTevProgram *p, uint32_t flags, WlTevSend *out) {
             out->konst |= (uint8_t)(1u << i);
             s.konst[i] = p->konst[i];
             s.konst_known |= (uint8_t)(1u << i);
+            konst++;
         }
     }
     for (i = 0; i < WL_TEV_REG_COUNT; i++) {
@@ -216,6 +203,7 @@ void wl_tev_shadow_plan(const WlTevProgram *p, uint32_t flags, WlTevSend *out) {
             out->preload |= (uint8_t)(1u << i);
             s.preload[i] = p->preload[i];
             s.preload_known |= (uint8_t)(1u << i);
+            preload++;
         }
     }
     calls++;
@@ -223,40 +211,58 @@ void wl_tev_shadow_plan(const WlTevProgram *p, uint32_t flags, WlTevSend *out) {
         out->stage_count = true;
         s.stage_count = p->stage_count;
         s.stage_count_known = true;
+        sent++;
     }
     for (i = 0; i < p->stage_count; i++) {
         const WlTevStage *now = &p->stages[i];
-        WlTevStage moved;
+        uint32_t order = stage_word(now, 0);
         uint8_t send;
 
-        if (now->texmap < WL_GX_SHADOW_TEXMAPS && s.map_x[now->texmap] != 0) {
-            // (the map its texture went to: gx_shadow.h's cache)
-            moved = *now;
-            moved.texmap = (uint8_t)(now->texmap ^ s.map_x[now->texmap]);
-            now = &moved;
+        swaps_used |= (1u << now->ras_swap) | (1u << now->tex_swap);
+        if (now->texmap < WL_GX_SHADOW_TEXMAPS) {
+            // (the map its texture went to: gx_shadow.h's cache; map_x 0 where it did not move)
+            order ^= BYTES_AT(1u, 1u) & (s.map_x[now->texmap] * 0x01010101u);
         }
-        send = changes ? stage_calls(now, &s.stages[i], (s.stages_known & (1u << i)) != 0)
-                       : (uint8_t)WL_TEV_SEND_STAGE;
+        send = changes && (s.stages_known & (1u << i)) != 0 ? stage_calls(now, order, &s.stages[i])
+                                                             : (uint8_t)WL_TEV_SEND_STAGE;
         out->stages[i] = send;
-        // (no call: the stage held is this one, byte for byte, stage_calls' every field compared)
+        // (no call: the stage held is this one, byte for byte, stage_calls' every byte compared)
         if (send != 0) {
             s.stages[i] = *now;
+            memcpy(&s.stages[i], &order, sizeof order);
             s.stages_known |= (uint16_t)(1u << i);
             sent += bits8(send);
         }
     }
     calls += 8u * p->stage_count;
     s.maps_moved = false; // (the stages read the maps their textures are on)
-    {
-        const unsigned swaps = bits8(out->swaps), konst = bits8(out->konst), preload = bits8(out->preload);
+    // (the swap tables the stages read)
+    if ((flags & WL_TEV_APPLY_SKIP_SWAPS) != 0) {
+        s.swaps_known = 0; // (the caller's: set behind the shadow)
+    } else {
+        for (i = 0; i < WL_TEV_SWAP_TABLES; i++) {
+            uint32_t held, now;
 
-        sent += swaps + konst + preload + (out->stage_count ? 1u : 0u);
-        s.calls += calls;
-        s.sent += sent;
-        // (a stage's call one BP write; a swap table and a konst colour two, a preloaded register four:
-        // GX_SetTevColor writes its second half three times)
-        fifo_add(WL_GX_FIFO_TEV, BP_BYTES * (sent + swaps + konst + 3u * preload));
+            if ((swaps_used & (1u << i)) == 0) {
+                continue;
+            }
+            calls++;
+            memcpy(&held, s.swap[i], sizeof held);
+            memcpy(&now, p->swap[i], sizeof now);
+            if (!changes || (s.swaps_known & (1u << i)) == 0 || held != now) {
+                out->swaps |= (uint8_t)(1u << i);
+                memcpy(s.swap[i], p->swap[i], 4);
+                s.swaps_known |= (uint8_t)(1u << i);
+                swaps++;
+            }
+        }
     }
+    sent += swaps + konst + preload;
+    s.calls += calls;
+    s.sent += sent;
+    // (a stage's call one BP write; a swap table and a konst colour two, a preloaded register four:
+    // GX_SetTevColor writes its second half three times)
+    fifo_add(WL_GX_FIFO_TEV, BP_BYTES * (sent + swaps + konst + 3u * preload));
 }
 
 bool wl_gx_shadow_tlut_differs(uint32_t slot, const void *entries, uint32_t bytes, uint8_t format) {

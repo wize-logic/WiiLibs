@@ -21,6 +21,7 @@
 #include "wl/base/endian.h"
 #include "wl/xboxapu/ac97.h"
 #include "wl/xboxapu/apu.h"
+#include "wl/xboxapu/apu_regs.h"
 #include "wl/xboxrt/page_census.h"
 #include "wl/xboxrt/crash.h"
 #include "wl/xboxrt/devices.h"
@@ -382,6 +383,15 @@ WlResult wl_xb_audio_attach(const WlXbAudioConfig *cfg) {
     }
     if (r == WL_OK) {
         r = wl_xb_mmio_register(&aci);
+    }
+    if (r == WL_OK) {
+        // the front end's first page read as memory (mmio.h's mirrors): DirectSound reads the free
+        // count before its methods, a constant here (the FIFO is always empty); the methods still
+        // fault (each runs at once)
+        WlResult m = wl_xb_mmio_mirror(WL_XB_APU_BASE + WL_APU_PIO_BASE, NULL, 0u);
+        if (m != WL_OK) {
+            WL_LOG_W(TAG, "the APU's front end not mirrored: %s", wl_result_name(m));
+        }
     }
     if (r == WL_OK) {
         r = wl_xb_service_add_tick(tick, NULL, g_cfg.tick_us);

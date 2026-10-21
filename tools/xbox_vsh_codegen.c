@@ -22,7 +22,7 @@
 //            [--spill] [--no-forward] [--no-alias] [--no-weights]
 //            [--no-r12] [--no-sweep] [--no-splat] [--no-early] [--no-swap] [--no-fold]
 //            [--no-defaults] [--no-resident] [--no-rsq-half] [--no-dead-spills]
-//            [--fused forms.txt] microcode.inc output.c
+//            [--no-split] [--split-always] [--fused forms.txt] microcode.inc output.c
 //            [table]
 //   (table: the name of the table, default xbox_vsh_natives, and of its count, <table>_count;
 //   --if-exists: a microcode file that is not there has no programs, an empty table; --accessor:
@@ -54,7 +54,11 @@
 //   end into a register the prefix alone borrows, as before; --no-rsq-half: RSQ's estimate for 0,
 //   infinity and NaN taken again from |x|, held over its steps, not from |x| / 2, as before;
 //   --no-dead-spills: a skinned form's prefix halves stored to the slot though no load reads them
-//   back, as before))
+//   back, as before; --no-split: a fused form one loop, its split in two passes over the batch
+//   (pr_split_plan: the colours' own instructions in the second, their constants loaded once a
+//   pass) not tried, as before; --split-always: every form that can be split written split, the
+//   cost of its two loops (pr_split_cost) against the one's not asked, the tests'. WL_VSH_SPLIT_LOG
+//   in the environment: each form tried logged with the two costs))
 
 #include "../wl/xbox/vsh.c"
 
@@ -1502,6 +1506,58 @@ static int fused_program(const WlXboxVshProgram *program, const unsigned *needs,
     return made;
 }
 
+/* a fused form's function body: the one loop fused_program made, or the two passes of
+pr_split_plan when they cost less by pr_split_cost (pass B's constants loaded once a pass against
+its moves and its own loop) */
+static void fused_print(FILE *out, const WlXboxVshProgram *program, const unsigned *needs, int reused,
+                        int first_reused, const ReusePrefix *prefix, unsigned long hash, int made) {
+    const WlXboxVshFusedKey *key = pr_fuse;
+    FILE *one = tmpfile(), *two = NULL;
+    long cost = pr_split_cost(), split_cost = 0;
+    int a_reused = first_reused, split = 0, c, planned;
+
+    if (one == NULL) {
+        perror("tmpfile");
+        exit(1);
+    }
+    pr_print(one, reused);
+    pr_spill = 0;
+    planned = pr_split_plan(program, needs, key, first_reused, prefix);
+    if (planned && (two = tmpfile()) != NULL) {
+        pr_split_live = key->live;
+        pr_split_key = *key;
+        pr_split_key.live = (unsigned short)(key->live & ~(unsigned)PR_SPLIT_COLOURS);
+        pr_fuse = &pr_split_key;
+        pr_split = 1;
+        if (fused_program(program, needs, &a_reused, prefix)) {
+            split_cost = pr_split_cost();
+            pr_print(two, a_reused);
+            pr_spill = 0;
+            pr_world_spill = 0;
+            pr_split = 2;
+            pr_split_key.live = (unsigned short)(key->live & PR_SPLIT_COLOURS);
+            if (pr_program(program, needs, 0, prefix)) {
+                split_cost += pr_split_cost();
+                split = split_cost < cost || pr_split_always;
+                if (split)
+                    pr_print(two, 0);
+            }
+        }
+        if (getenv("WL_VSH_SPLIT_LOG"))
+            fprintf(stderr, "xbox_vsh_codegen: %08lx's fused form %d: %d moves, one loop %ld, split %ld%s\n", hash, made,
+                    pr_split_count, cost, split_cost, split ? " (split)" : "");
+        pr_split = 0;
+        pr_spill = 0;
+        pr_fuse = key;
+    }
+    rewind(split ? two : one);
+    while ((c = fgetc(split ? two : one)) != EOF)
+        fputc(c, out);
+    fclose(one);
+    if (two != NULL)
+        fclose(two);
+}
+
 /* the fused forms asked for (--fused): a program's hash and its form */
 enum { MAXIMUM_FORMS = 256, MAXIMUM_FUSED = 16 };
 static struct {
@@ -1607,6 +1663,10 @@ int main(int argc, char **argv) {
             pr_resident_off = 1;
         } else if (strcmp(argv[1], "--no-rsq-half") == 0) {
             pr_rsq_off = 1;
+        } else if (strcmp(argv[1], "--no-split") == 0) {
+            pr_split_off = 1;
+        } else if (strcmp(argv[1], "--split-always") == 0) {
+            pr_split_always = 1;
         } else if (strcmp(argv[1], "--no-dead-spills") == 0) {
             pr_dead_spills_off = 1;
         } else if (strcmp(argv[1], "--colors-positions") == 0) {
@@ -1813,7 +1873,7 @@ int main(int argc, char **argv) {
         /* (its fused forms asked for, the Wii's) */
         fused[program_count - 1] = 0;
         for (index = 0; paired && index < (unsigned long)g_form_count; index++) {
-            int made = fused[program_count - 1], made_at;
+            int made = fused[program_count - 1], made_at, first_reused;
 
             if (g_forms[index].hash != hash)
                 continue;
@@ -1859,14 +1919,14 @@ int main(int argc, char **argv) {
             for (made_at = 0; made_at < g_made_count; made_at++)
                 if (g_made[made_at] == hash)
                     fused_reused = 0;
+            first_reused = fused_reused;
             if (fused_program(&program, needs, &fused_reused, &prefix)) {
                 fprintf(out, "#if WL_XBOX_VSH_PS\n");
                 fprintf(out,
                         "static void program_%08lx_fused_%d(const float (*c)[4], WlXboxVshFused *fused, unsigned count, "
                         "unsigned live)\n{\n",
                         hash, made);
-                pr_print(out, fused_reused);
-                pr_spill = 0;
+                fused_print(out, &program, needs, fused_reused, first_reused, &prefix, hash, made);
                 fprintf(out, "}\n#endif\n\n");
                 fused_index[program_count - 1][made] = (int)index;
                 fused[program_count - 1] = made + 1;

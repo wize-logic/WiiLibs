@@ -44,6 +44,9 @@ uint32_t wl_xb_ppc_ea(const WlXbPpcAccess *a, const uint32_t gpr[32]);
 // gpr (the loaded register, and ra for an update form, which gets `ea`). false when no device
 // claims the address.
 bool wl_xb_ppc_emulate(const WlXbPpcAccess *a, uint32_t gpr[32], uint32_t ea, uint32_t va);
+// The same access answered by a mirrored page without its device (mmio.h's wl_xb_mmio_fast_read and
+// _write), exception-safe: false (gpr untouched) when it is not one, and the device's call follows.
+bool wl_xb_ppc_fast(const WlXbPpcAccess *a, uint32_t gpr[32], uint32_t ea, uint32_t va);
 
 #ifdef __cplusplus
 }

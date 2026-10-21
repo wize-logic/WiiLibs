@@ -72,6 +72,28 @@ template header, and add conformance cases; upstream's own tests pass with them 
 | `0018-mxcsr-fcmov.patch` | conformance cases for `fcmovcc` after `fcomi` (eight conditions; ordered, equal and unordered) and `stmxcsr`; the lifting is upstream's since v0.14.0 (c50c597, 01064f3) |
 | `0019-discovery-gaps.patch` | `BINKDATA` is data (Bink's tables: their pointers are scanned, the blitters they name found, and its bytes make no garbage functions); upstream's gap-bounded callback probe (v0.14.0) replaced this patch's own |
 | `0020-mmx-cases.patch` | conformance cases for every MMX operation in Bink's decoder, the whole 64-bit result compared |
+| `0021-mem-disp.patch` | `--mem-disp`: a small displacement of a guest access is its own operand (`MEMxx_D(base, disp)`), so that a runtime whose guest-to-host map is not a plain addition maps the base once |
+| `0022-simd-reg-locals.patch` | `--reg-locals` keeps the SSE and MMX registers in C locals too |
+| `0023-stack-disp.patch` | `--stack-disp`: an access at `esp + disp` is `MEMxx_SP(esp, disp)` (about half of a function's guest accesses are to its own stack) |
+| `0024-keep-preserved.patch` | `--keep-preserved`: ebx, esi and edi stay in the caller's locals across a call to a function proven to give them back |
+| `0025-mem-disp-args.patch` | `--mem-disp` splits the address of float stores and SSE/MMX accesses too |
+| `0026-simd-loop-latch.patch` | `--reg-locals` keeps the SIMD registers in their locals round a loop, written back after it |
+| `0027-fpu-status-test.patch` | `fcom; fnstsw ax; test ah, imm; jcc` branches on the compare's outcome |
+| `0028-rep-stosd-memset.patch` | `rep stosd` of a byte-uniform value forwards over memory is a `memset` |
+| `0029-short-rep-string.patch` | short `rep movs`, `stos` and `cmps` inline (MSVC's memcpy is `rep movsd` and then `rep movsb` for 0..3 bytes) |
+| `0030-fist-round-small.patch` | `fist` and `frndint` round a value under 2^30 in integers, not through floor, fmod and ldexp |
+| `0031-preserve-ebp-data.patch` | `--keep-preserved` follows ebp used as a general register (code built with `/Oy`) |
+| `0032-fist-wide-cold.patch` | `fist` and `frndint` keep their wide path out of line |
+| `0033-bounded-loops.patch` | `--bounded-loops`: no `RECOMP_BACKEDGE()` in loops that end by themselves (one latch, no call, an exit test on a register the loop moves by a constant) |
+| `0034-rodata-consts.patch` | `--rodata-consts`: a float or double read from a fixed address in read-only data is a literal |
+| `0035-regs-without-x87.patch` | the integer and SIMD registers go into locals where the function's x87 stack cannot be kept in them |
+| `0036-callee-regs.patch` | `--callee-regs`: around a call, only the registers the callee touches are written back and reloaded |
+| `0037-x87-balanced.patch` | `--x87-balanced`: the caller's x87 positions stay in locals across a callee that leaves the stack balanced |
+| `0038-stack-locals.patch` | `--stack-locals`: a function's own stack slots in C locals, not byte-reversed guest memory |
+| `0039-stack-reach.patch` | `--stack-deltas` and `--stack-reach` for `--stack-locals`: a function's esp effect kept where it sets esp from its frame, and across a call only the slots below the callee's reach written back and reloaded |
+| `0040-data-table-shared-tail.patch` | a data-table entry in a gap may share its neighbour's code: v0.14.0's discovery takes a table word in a gap only with a closed CFG inside the gap or a proven tail, which dropped Halo's MSVC CRT `fmod` classes (its entry for a zero dividend) and four more; this falls back to v0.13.1's linear probe (a ret or a jmp ahead) |
+| `0041-stack-frames.patch` | `--stack-icall`, `--stack-align` and `--stack-alloca` for `--stack-locals`: esp followed past indirect calls the caller does not clean, `and esp, -2^k` frames, and the alloca probe (`esp -= eax`) |
+| `0042-movsx-bp-sp.patch` | `movsx r32, bp` and `movsx r32, sp` sign-extend (upstream's facb626, in v0.15.0, taken as it is) and the conformance case `movsx_bp_32`: v0.14.0 zero-extended them, and Halo has 213 `movsx r32, bp`; dropped at the sync to v0.15.0, its case kept |
 
 To change one: `tools/xboxrecomp_sync.py patch-repo DIR` makes a git repository of the pristine copy
 with each patch as a commit; edit there (amend, rebase), then `tools/xboxrecomp_sync.py

@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: MIT
 """The runtime's switches against their documents. wl/xboxrt/README.md's tables ("Files in the title
 folder", "Off switches", the environment variables and the build-time switches) against the code: every
-title-folder switch the runtime reads (wl/xbox/nv2a_gx.c's k_switches, boot.c's title_flag and flag paths,
+title-folder switch the runtime reads (wl/xbox/nv2a_gx.c's k_switches and k_switches2, the draw path's two
+words, no two switches of one word on one bit; boot.c's title_flag and flag paths,
 its k_compat, memfast_wii.c's oldcopy) and every WL_XB_* variable it or the replay reads has a row; every
 switch and variable a row of "Off switches" names is still read; every halo.json key of the build-time
 table is one tools/xbox_recomp.py reads. And third_party/xboxrecomp/patches numbered 0001 on without a gap,
@@ -19,7 +20,8 @@ for f in list((root / 'wl').rglob('*.c')) + [root / 'tools/xbox_nv2a_replay.c']:
     code += f.read_text(errors='replace')
 
 files = set()
-files |= set(re.findall(r'\{"([a-z0-9]+)", "WL_XB_[A-Z0-9_]+", SWITCH_', code))  # nv2a_gx.c k_switches
+# nv2a_gx.c's k_switches (SWITCH_*) and k_switches2 (SWITCH2_*, the second word)
+files |= set(re.findall(r'\{\s*"([a-z0-9]+)",\s*"WL_XB_[A-Z0-9_]+",\s*SWITCH2?_', code))
 files |= set(re.findall(r'title_flag\(cfg, "([a-z0-9]+)"', code))  # boot.c gx_bisect_options & co.
 files |= set(re.findall(r'"%s/([a-z0-9]+)"', code))  # boot.c, memfast_wii.c flag paths
 files |= set(re.findall(r'\{"(old[a-z]+)", (?:WL_XB_COMPAT_[A-Z]+|0u)\}', code))  # boot.c k_compat
@@ -35,6 +37,16 @@ row_text = '\n'.join(rows)
 named_envs = {e for e in re.findall(r'`(WL_XB_[A-Z0-9_]+)', row_text) if not e.startswith('WL_XB_COMPAT_')}
 
 bad = 0
+# the draw path's switch bits: no two names of one word on one bit (a merge of two cuts that took the same
+# bit)
+for word in ('SWITCH', 'SWITCH2'):
+    bits = {}
+    for name, bit in re.findall(r'\b(' + word + r'_[A-Z0-9_]+) = 1u << (\d+)', code):
+        bits.setdefault(int(bit), set()).add(name)
+    for bit, names in sorted(bits.items()):
+        if len(names) > 1:
+            print(f'switch bit {bit} of {word}_ taken twice:', ', '.join(sorted(names)))
+            bad += 1
 for s in sorted(files - named_files):
     print('undocumented switch file:', s)
     bad += 1

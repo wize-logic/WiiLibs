@@ -122,3 +122,8 @@ set_tests_properties(test_xboxrecomp_sync test_xbox_recomp_driver PROPERTIES LAB
 add_test(NAME check_switch_docs
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/check_switch_docs.py ${PROJECT_SOURCE_DIR})
 set_tests_properties(check_switch_docs PROPERTIES LABELS unit)
+# check_switch_docs itself on a copy of the tree: a switch of either draw-path word without its row fails, two
+# switches of one word on one bit fail
+add_test(NAME test_check_switch_docs
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_check_switch_docs.py)
+set_tests_properties(test_check_switch_docs PROPERTIES LABELS unit)

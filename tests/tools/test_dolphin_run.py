@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: MIT
 """Tests for the parts of tools/dolphin_run.py that need no Dolphin: which files of the card a run
 changed (card_changes) and their copy out (copy_out, --sd-out), the copy in of the card (copy_tree), and
-when a run ends early (RunWatch), the wall-clock stamps of marked lines (LineStamps, --stamp), and the command
-line's refusal of --sd-out without --sd."""
+when a run ends early (RunWatch), the wall-clock stamps of marked lines (LineStamps, --stamp), the screenshots'
+requests to the helper on Dolphin's desktop (Shooter, against a stand-in helper), and the command line's refusal
+of --sd-out without --sd."""
 
 import os
 import re
@@ -11,6 +12,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zlib
 from pathlib import Path
@@ -233,6 +236,83 @@ class XwdTests(unittest.TestCase):
         start = png.index(b"IDAT") + 4
         self.assertEqual(b"\0\x10\x20\x30\xa0\xb0\xc0", zlib.decompress(png[start:start + struct.unpack(
             ">I", png[start - 8:start - 4])[0]]))
+
+
+class ShooterTests(unittest.TestCase):
+    """Shooter.shoot's side of CAPTURE_PS1's files (shot-N.req asked, shot-N.png and shot-N.txt answered,
+    shot-end.txt when the helper has ended), with a thread standing in for the helper"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name)
+        self.saved = dolphin_run.NATIVE
+        dolphin_run.NATIVE = False
+        self.shooter = dolphin_run.Shooter.__new__(dolphin_run.Shooter)
+        self.shooter.work, self.shooter.user, self.shooter.display = self.work, self.work / "user", ""
+        self.shooter.count, self.shooter.helper = 0, None
+
+    def tearDown(self):
+        dolphin_run.NATIVE = self.saved
+        self.tmp.cleanup()
+
+    def helper(self, answer: str, image: bytes = b"", end: str = ""):
+        """answers the first request as CAPTURE_PS1 does (or ends without answering, saying END)"""
+        def run():
+            for _ in range(400):
+                requests = list(self.work.glob("shot-*.req"))
+                if requests:
+                    base = self.work / requests[0].stem
+                    requests[0].unlink()
+                    if end:
+                        (self.work / "shot-end.txt").write_text(end + "\n")
+                        return
+                    if image:
+                        Path(f"{base}.png").write_bytes(image)
+                    Path(f"{base}.txt.tmp").write_text(answer + "\n")
+                    os.replace(f"{base}.txt.tmp", f"{base}.txt")
+                    return
+                time.sleep(0.01)
+        thread = threading.Thread(target=run)
+        thread.start()
+        return thread
+
+    def test_an_answered_shot_is_moved_to_the_output(self):
+        thread = self.helper("ok Dolphin 2609 | JIT64 SC | Vulkan | HLE", b"\x89PNG" + bytes(400))
+        out = self.work / "out" / "end.png"
+        self.assertEqual((True, "Dolphin 2609 | JIT64 SC | Vulkan | HLE"), self.shooter.shoot(out, wait=5))
+        thread.join()
+        self.assertEqual(404, out.stat().st_size)
+        self.assertEqual([], sorted(p.name for p in self.work.glob("shot-*")))
+
+    def test_an_error_leaves_the_output_as_it_was(self):
+        out = self.work / "end.png"
+        out.write_bytes(b"earlier")
+        thread = self.helper("error: no window of Dolphin 25832 on this desktop (closed: Dolphin stopping?)")
+        ok, why = self.shooter.shoot(out, wait=5)
+        thread.join()
+        self.assertFalse(ok)
+        self.assertIn("no window of Dolphin 25832", why)
+        self.assertEqual(b"earlier", out.read_bytes())
+
+    def test_a_helper_that_ended_is_not_waited_for(self):
+        thread = self.helper("", end="Dolphin exited")
+        started = time.monotonic()
+        ok, why = self.shooter.shoot(self.work / "end.png", wait=30)
+        thread.join()
+        self.assertFalse(ok)
+        self.assertEqual("the capture helper had ended (Dolphin exited)", why)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual([], list(self.work.glob("shot-*.req")))
+
+    def test_no_answer_in_time(self):
+        ok, why = self.shooter.shoot(self.work / "end.png", wait=0.2)
+        self.assertFalse(ok)
+        self.assertIn("no answer in 0.2 s", why)
+
+    def test_the_helper_script_answers_the_files_asked_for(self):
+        # (CAPTURE_PS1 and Shooter agree on the files' names)
+        for name in ('"shot-*.req"', '"$base.txt"', '"$base.png"', '"shot-end.txt"', '"shot-stop"'):
+            self.assertIn(name, dolphin_run.CAPTURE_PS1)
 
 
 class CommandLineTests(unittest.TestCase):

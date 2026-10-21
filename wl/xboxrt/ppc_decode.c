@@ -139,3 +139,28 @@ bool wl_xb_ppc_emulate(const WlXbPpcAccess *a, uint32_t gpr[32], uint32_t ea, ui
     }
     return true;
 }
+
+bool wl_xb_ppc_fast(const WlXbPpcAccess *a, uint32_t gpr[32], uint32_t ea, uint32_t va) {
+    if (a->store) {
+        uint32_t v = gpr[a->rt];
+        if (a->size != 4 || !wl_xb_mmio_fast_write(va, a->reverse ? v : swap(v, 4), 4)) {
+            return false;
+        }
+    } else {
+        uint32_t v;
+        if (!wl_xb_mmio_fast_read(va, a->size, &v)) {
+            return false;
+        }
+        if (!a->reverse) {
+            v = swap(v, a->size);
+        }
+        if (a->sign) {
+            v = (uint32_t)(int32_t)(int16_t)v;
+        }
+        gpr[a->rt] = v;
+    }
+    if (a->update && a->ra != 0) {
+        gpr[a->ra] = ea;
+    }
+    return true;
+}

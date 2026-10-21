@@ -123,17 +123,50 @@ static uint32_t constant_signature(uint32_t value) {
     return signature;
 }
 
+/* each constant's signature (constant_signature, kept for each slot's last
+value) with the first slot holding the same value (bits 16 on: that slot
+plus one, the slot itself when none before it does) */
+static void signatures_make(WlXboxPshCache *cache, const uint32_t *constants, uint32_t *signatures) {
+    /* (the first slot of each value, by a table of 32 open-addressed
+    places: what a search of the slots before each took, three times over) */
+    uint32_t values[32], used = 0;
+    unsigned char firsts[32];
+    int slot;
+
+    for (slot = 0; slot < NUMBER_OF_SLOTS; slot++) {
+        uint32_t value = constants[slot];
+        unsigned place = (value * 0x9E3779B1u) >> 27, first = (unsigned)slot;
+
+        while (used & (1u << place)) {
+            if (values[place] == value) {
+                first = firsts[place];
+                break;
+            }
+            place = (place + 1) & 31u;
+        }
+        if (first == (unsigned)slot) {
+            used |= 1u << place;
+            values[place] = value;
+            firsts[place] = (unsigned char)slot;
+        }
+        if (cache->signature_values[slot] != value) {
+            cache->signature_values[slot] = value;
+            cache->signatures[slot] = constant_signature(value);
+        }
+        signatures[slot] = cache->signatures[slot] | (uint32_t)(first + 1) << 16;
+    }
+}
+
 /* the structure of a draw's pixel shader, and its constants (the slots
 returned: all of them) */
-static unsigned long structure_make(WlXboxPshCacheKey *key, uint32_t *constants,
-                                    const uint32_t *state, uint32_t extra,
+static unsigned long structure_make(WlXboxPshCache *cache, WlXboxPshCacheKey *key,
+                                    uint32_t *constants, const uint32_t *state, uint32_t extra,
                                     const WlXboxPshTextures *textures) {
     unsigned long count = state[WL_XBOX_PSH_COMBINER_COUNT] & 0xff,
                   reads = (1UL << NUMBER_OF_SLOTS) - 1, stage;
-    int slot, other;
+    int slot;
 
     memset(key, 0, sizeof(*key));
-    memset(constants, 0, NUMBER_OF_SLOTS * sizeof(uint32_t));
     memcpy(key->state, state, sizeof(key->state));
     key->extra = extra;
     if (count > 8)
@@ -154,20 +187,10 @@ static unsigned long structure_make(WlXboxPshCacheKey *key, uint32_t *constants,
     first) */
     memcpy(&key->textures, textures, sizeof(key->textures));
     key->textures.fog_color = 0;
-    for (slot = 0; slot < NUMBER_OF_SLOTS; slot++) {
-        if (reads & (1UL << slot))
-            constants[slot] = slot_value(state, textures, slot);
-    }
-    for (slot = 0; slot < NUMBER_OF_SLOTS; slot++) {
-        if (!(reads & (1UL << slot)))
-            continue;
-        /* (and the first constant equal to it) */
-        for (other = 0;
-             other < slot && (!(reads & (1UL << other)) || constants[other] != constants[slot]);
-             other++)
-            ;
-        key->signatures[slot] = constant_signature(constants[slot]) | (uint32_t)(other + 1) << 16;
-    }
+    /* (every slot read) */
+    for (slot = 0; slot < NUMBER_OF_SLOTS; slot++)
+        constants[slot] = slot_value(state, textures, slot);
+    signatures_make(cache, constants, key->signatures);
     return reads;
 }
 
@@ -380,6 +403,12 @@ void wl_xbox_psh_cache_init(WlXboxPshCache *cache, const WlXboxPshRecipe *recipe
         cache->has_recipe = true;
     }
     cache->random_state = 0x2545F491u;
+    for (int slot = 0; slot < NUMBER_OF_SLOTS; slot++)
+        cache->signatures[slot] = constant_signature(0);
+}
+
+void wl_xbox_psh_cache_set_memo(WlXboxPshCache *cache, bool on) {
+    cache->memo = on;
 }
 
 const WlXboxPshProgram *wl_xbox_psh_cache_program(WlXboxPshCache *cache,
@@ -405,7 +434,7 @@ const WlXboxPshProgram *wl_xbox_psh_cache_program(WlXboxPshCache *cache,
         return &cache->last_entry->program;
     }
     cache->stamp++;
-    reads = structure_make(key, constants, render_state, extra, textures);
+    reads = structure_make(cache, key, constants, render_state, extra, textures);
     hash = words_hash(0x811C9DC5u, key, sizeof(*key));
     set = cache->entries[hash % CACHE_SETS];
     for (way = 0; way < CACHE_WAYS && !structural; way++) {
@@ -436,6 +465,7 @@ const WlXboxPshProgram *wl_xbox_psh_cache_program(WlXboxPshCache *cache,
                 entry->usable = audit_usable;
                 memcpy(&entry->program, audit, sizeof(*audit));
                 entry->version++;
+                entry->structure_version++;
             }
         }
     } else if (structural) {
@@ -469,6 +499,7 @@ const WlXboxPshProgram *wl_xbox_psh_cache_program(WlXboxPshCache *cache,
         memcpy(&entry->key, key, sizeof(*key));
         memcpy(entry->constants, constants, sizeof(constants));
         entry->version++;
+        entry->structure_version++;
         entry->hash = structural ? exact_hash : hash;
         entry->structural = !structural;
         entry->generic = false;
@@ -511,10 +542,182 @@ static unsigned recent_slot(const uint32_t *words, uint32_t extra, uint32_t *has
     return hash % WL_XBOX_PSH_CACHE_RECENT;
 }
 
+/* ---------- the memo: the calls by their structure */
+
+/* the words of a structure: all but the constants (10 to 25, 43 and 44) */
+enum { _structure_run0 = 10, _structure_run1 = WL_XBOX_PSH_CONSTANT1_0 + 8, _structure_run1_end = 43, _structure_run2 = 45 };
+_Static_assert(WL_XBOX_PSH_CONSTANT0_0 == 10 && WL_XBOX_PSH_CONSTANT1_0 == 18 && WL_XBOX_PSH_ALPHA_OUTPUTS0 == 26 &&
+                   WL_XBOX_PSH_FINAL_CONSTANT0 == 43 && WL_XBOX_PSH_FINAL_CONSTANT1 == 44 && WL_XBOX_PSH_WORDS == 57,
+               "the constants are words 10 to 25, 43 and 44");
+
+enum { MEMO_WAYS = WL_XBOX_PSH_CACHE_MEMO_WAYS, MEMO_SETS = WL_XBOX_PSH_CACHE_MEMO / WL_XBOX_PSH_CACHE_MEMO_WAYS };
+_Static_assert(_structure_run0 + (_structure_run1_end - _structure_run1) + (WL_XBOX_PSH_WORDS - _structure_run2) ==
+                   WL_XBOX_PSH_STRUCTURE_WORDS,
+               "a structure's words");
+
+/* the hash of a call's structure: the words that tell structures apart the
+most (the inputs, the final combiner's, the count and the stage modes; the
+outputs compared, not hashed), the extra word and the textures */
+static uint32_t memo_hash(const uint32_t *words, uint32_t extra, const WlXboxPshTextures *textures) {
+    uint32_t hash = extra * 0x9E3779B1u, contents;
+    unsigned index;
+
+    memcpy(&contents, textures->contents, sizeof(contents));
+    for (index = 0; index < _structure_run0; index++)
+        hash = (hash ^ words[index]) * 0x01000193u;
+    for (index = WL_XBOX_PSH_RGB_INPUTS0; index < WL_XBOX_PSH_RGB_INPUTS0 + 8; index++)
+        hash = (hash ^ words[index]) * 0x01000193u;
+    for (index = WL_XBOX_PSH_COMBINER_COUNT; index < WL_XBOX_PSH_WORDS; index++)
+        hash = (hash ^ words[index]) * 0x01000193u;
+    hash = (hash ^ textures->present ^ (uint32_t)textures->fog << 8 ^ textures->unavailable << 16) * 0x01000193u;
+    hash = (hash ^ contents) * 0x01000193u;
+    return hash ^ hash >> 16;
+}
+
+/* whether a call's words have the structure remembered (`structure`: its
+words but the constants) */
+static bool memo_words_same(const uint32_t *structure, const uint32_t *words) {
+    uint32_t differ = 0;
+    unsigned index;
+
+    for (index = 0; index < _structure_run0; index++)
+        differ |= structure[index] ^ words[index];
+    structure += _structure_run0;
+    for (index = _structure_run1; index < _structure_run1_end; index++)
+        differ |= structure[index - _structure_run1] ^ words[index];
+    structure += _structure_run1_end - _structure_run1;
+    for (index = _structure_run2; index < WL_XBOX_PSH_WORDS; index++)
+        differ |= structure[index - _structure_run2] ^ words[index];
+    return differ == 0;
+}
+
+/* whether two calls' textures are the same but for the fog's colour */
+static bool memo_textures_same(const WlXboxPshTextures *a, const WlXboxPshTextures *b) {
+    return ((a->present ^ b->present) | (a->separate_alpha ^ b->separate_alpha) | (a->unavailable ^ b->unavailable) |
+            (a->cube ^ b->cube) | (a->bumped ^ b->bumped) | (a->vertex_color ^ b->vertex_color) |
+            (a->reflected ^ b->reflected) | (unsigned)(a->fog ^ b->fog) |
+            (unsigned)(a->d0_alpha_map ^ b->d0_alpha_map)) == 0 &&
+           !memcmp(a->contents, b->contents, sizeof(a->contents));
+}
+
+/* the constants of a call's words, as structure_make has them */
+static void memo_constants(const uint32_t *words, const WlXboxPshTextures *textures, uint32_t *constants) {
+    memcpy(constants, &words[WL_XBOX_PSH_CONSTANT0_0], 16 * sizeof(uint32_t));
+    constants[_slot_final_c0] = words[WL_XBOX_PSH_FINAL_CONSTANT0];
+    constants[_slot_final_c1] = words[WL_XBOX_PSH_FINAL_CONSTANT1];
+    constants[_slot_fog] = textures->fog_color | 0xFF000000UL;
+}
+_Static_assert(_slot_c0 == 0 && _slot_c1 == 8 && WL_XBOX_PSH_CONSTANT1_0 == WL_XBOX_PSH_CONSTANT0_0 + 8,
+               "the slots c0 and c1 are the words of the constants in order");
+
+/* whether a call's constants are the entry's */
+static bool memo_constants_same(const uint32_t *words, const WlXboxPshTextures *textures,
+                                const WlXboxPshCacheEntry *entry) {
+    uint32_t differ = (words[WL_XBOX_PSH_FINAL_CONSTANT0] ^ entry->constants[_slot_final_c0]) |
+                      (words[WL_XBOX_PSH_FINAL_CONSTANT1] ^ entry->constants[_slot_final_c1]) |
+                      ((textures->fog_color | 0xFF000000UL) ^ entry->constants[_slot_fog]);
+    unsigned index;
+
+    for (index = 0; index < 16; index++)
+        differ |= words[WL_XBOX_PSH_CONSTANT0_0 + index] ^ entry->constants[index];
+    return differ == 0;
+}
+
+static const WlXboxPshProgram *memo_find(WlXboxPshCache *cache, const uint32_t *words, uint32_t extra,
+                                         const WlXboxPshTextures *textures, bool *usable) {
+    uint32_t hash = memo_hash(words, extra, textures), constants[NUMBER_OF_SLOTS], signatures[NUMBER_OF_SLOTS];
+    unsigned set = (hash % MEMO_SETS) * MEMO_WAYS, way;
+    bool made = false;
+
+    for (way = 0; way < MEMO_WAYS; way++) {
+        WlXboxPshCacheEntry *entry = cache->memo_calls[set + way].entry;
+
+        if (!entry || cache->memo_calls[set + way].hash != hash ||
+            cache->memo_calls[set + way].structure_version != entry->structure_version ||
+            cache->memo_calls[set + way].extra != extra ||
+            !memo_words_same(cache->memo_calls[set + way].words, words) ||
+            !memo_textures_same(&cache->memo_calls[set + way].textures, textures))
+            continue;
+        if (memo_constants_same(words, textures, entry))
+            cache->counts.found++;
+        else {
+            /* (the structure's entry when the constants keep its signatures:
+            patched as wl_xbox_psh_cache_program patches a generic structure;
+            an audit due is its own) */
+            if (!made) {
+                memo_constants(words, textures, constants);
+                signatures_make(cache, constants, signatures);
+                made = true;
+            }
+            if (memcmp(signatures, entry->key.signatures, sizeof(signatures)))
+                continue;
+            if (!entry->generic || entry->changes % AUDIT_INTERVAL == 0)
+                return NULL;
+            memcpy(entry->constants, constants, sizeof(constants));
+            constants_patch(entry, &entry->program, constants);
+            entry->version++;
+            entry->changes++;
+            cache->counts.patched++;
+        }
+        cache->memo_calls[set + way].stamp = ++cache->memo_stamp;
+        cache->stamp++;
+        entry->stamp = cache->stamp;
+        cache->last_entry = NULL;
+        cache->counts.recent++;
+        *usable = entry->usable;
+        return &entry->program;
+    }
+    return NULL;
+}
+
+static void memo_remember(WlXboxPshCache *cache, const uint32_t *words, uint32_t extra,
+                          const WlXboxPshTextures *textures) {
+    uint32_t hash = memo_hash(words, extra, textures), *structure;
+    unsigned set = (hash % MEMO_SETS) * MEMO_WAYS, way, victim = set;
+    WlXboxPshCacheEntry *entry = cache->last_entry;
+
+    /* (a structure's entry only: one for a set of constants is found by
+    them) */
+    if (!entry || !entry->structural)
+        return;
+    /* (the way of the call's structure and entry if it has one, else an
+    empty one or the one found longest ago) */
+    for (way = set; way < set + MEMO_WAYS; way++) {
+        WlXboxPshCacheEntry *held = cache->memo_calls[way].entry;
+
+        if (held == entry && cache->memo_calls[way].hash == hash && cache->memo_calls[way].extra == extra &&
+            memo_words_same(cache->memo_calls[way].words, words) &&
+            memo_textures_same(&cache->memo_calls[way].textures, textures)) {
+            victim = way;
+            break;
+        }
+        if (!held || cache->memo_calls[way].structure_version != held->structure_version)
+            cache->memo_calls[way].stamp = 0;
+        if (cache->memo_calls[way].stamp < cache->memo_calls[victim].stamp)
+            victim = way;
+    }
+    cache->memo_calls[victim].hash = hash;
+    cache->memo_calls[victim].structure_version = entry->structure_version;
+    cache->memo_calls[victim].extra = extra;
+    cache->memo_calls[victim].stamp = ++cache->memo_stamp;
+    cache->memo_calls[victim].entry = entry;
+    structure = cache->memo_calls[victim].words;
+    memcpy(structure, words, _structure_run0 * sizeof(uint32_t));
+    memcpy(structure + _structure_run0, &words[_structure_run1],
+           (_structure_run1_end - _structure_run1) * sizeof(uint32_t));
+    memcpy(structure + _structure_run0 + (_structure_run1_end - _structure_run1), &words[_structure_run2],
+           (WL_XBOX_PSH_WORDS - _structure_run2) * sizeof(uint32_t));
+    memcpy(&cache->memo_calls[victim].textures, textures, sizeof(*textures));
+}
+
 const WlXboxPshProgram *wl_xbox_psh_cache_recent(WlXboxPshCache *cache, const uint32_t *words, uint32_t extra,
                                                  const WlXboxPshTextures *textures, bool *usable) {
     uint32_t hash;
-    unsigned slot = recent_slot(words, extra, &hash);
+    unsigned slot;
+
+    if (cache->memo)
+        return memo_find(cache, words, extra, textures, usable);
+    slot = recent_slot(words, extra, &hash);
     WlXboxPshCacheEntry *entry = cache->recent[slot].entry;
 
     if (!entry || cache->recent[slot].hash != hash || cache->recent[slot].version != entry->version ||
@@ -536,8 +739,13 @@ const WlXboxPshProgram *wl_xbox_psh_cache_recent(WlXboxPshCache *cache, const ui
 void wl_xbox_psh_cache_remember(WlXboxPshCache *cache, const uint32_t *words, uint32_t extra,
                                 const WlXboxPshTextures *textures) {
     uint32_t hash;
-    unsigned slot = recent_slot(words, extra, &hash);
+    unsigned slot;
 
+    if (cache->memo) {
+        memo_remember(cache, words, extra, textures);
+        return;
+    }
+    slot = recent_slot(words, extra, &hash);
     if (!cache->last_entry)
         return;
     cache->recent[slot].hash = hash;

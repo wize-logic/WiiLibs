@@ -75,7 +75,6 @@ WriteToConsole = False
 WriteToWindow = False
 """
 
-# PrintWindow on Dolphin's render window (it need not be in front); prints the window title.
 # Dolphin runs headless: this Windows build has no Qt platform but "windows" (no offscreen), and Qt
 # brings a window it restores off the screens back onto them, so Dolphin is started on a desktop of
 # its own (CreateDesktop; a process's windows live on the desktop it was started on and never show on
@@ -138,9 +137,15 @@ $pids = @(Get-CimInstance Win32_Process -Filter "Name='Dolphin.exe'" | Where-Obj
 if ($pids.Count -gt 0) { [Desk]::Close([uint32[]]$pids) }
 """
 
+# The screenshots' helper, on Dolphin's own desktop (a window is seen only from its own desktop) from Dolphin's
+# start on: its types compiled and this run's Dolphin found once, it then waits for a request (a file
+# shot-N.req in the work folder) and answers it within a poll of 50 ms: PrintWindow on Dolphin's render window
+# (it need not be in front) to shot-N.png, "ok <the window's title>" or "error: ..." to shot-N.txt. A capture
+# started only at the end (PowerShell's start, Add-Type, the process query: 3-6 s) came after a title's
+# power-off had closed Dolphin (2026-10-18..20: "no window of Dolphin on this desktop" in most runs). It ends at
+# shot-stop, when Dolphin has exited, or at the limit, saying which in shot-end.txt.
 CAPTURE_PS1 = r"""
-param([string]$Output, [string]$UserFolder)
-trap { Set-Content -Path "$Output.title" -Value "error: $_"; exit 1 }
+param([string]$Work, [string]$UserFolder, [int]$Limit)
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System; using System.Text; using System.Runtime.InteropServices;
@@ -166,22 +171,53 @@ public static class Win {
   public static string Title(IntPtr h) { StringBuilder s = new StringBuilder(256); GetWindowText(h, s, 256); return s.ToString(); }
 }
 "@
-# (this run's Dolphin: the one given this run's user folder, not another program's)
-$ids = @(Get-CimInstance Win32_Process -Filter "Name='Dolphin.exe'" | Where-Object { $_.CommandLine -like "*$UserFolder*" } |
-  ForEach-Object { [uint32]$_.ProcessId })
-$handle = [Win]::Largest([uint32[]]$ids)
-if ($handle -eq [IntPtr]::Zero) { throw "no window of Dolphin $ids on this desktop" }
-$rect = New-Object Win+RECT
-[Win]::GetClientRect($handle, [ref]$rect) | Out-Null
-$bitmap = New-Object System.Drawing.Bitmap ([Math]::Max(1, $rect.Right)), ([Math]::Max(1, $rect.Bottom))
-$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-$dc = $graphics.GetHdc()
-# PW_CLIENTONLY | PW_RENDERFULLCONTENT: the client area as the GPU drew it
-[Win]::PrintWindow($handle, $dc, 3) | Out-Null
-$graphics.ReleaseHdc($dc)
-$bitmap.Save($Output, [System.Drawing.Imaging.ImageFormat]::Png)
-# (run on Dolphin's own desktop, its output goes nowhere: the window's title goes beside the PNG)
-Set-Content -Path "$Output.title" -Value ([Win]::Title($handle))
+function Answer([string]$Path, [string]$Text) {
+  # (written whole, then renamed: the runner reads it as soon as it is there)
+  Set-Content -Path "$Path.tmp" -Value $Text
+  Move-Item -Force -Path "$Path.tmp" -Destination $Path
+}
+function Capture([uint32[]]$Ids, [string]$Output) {
+  if ($Ids.Count -eq 0) { throw "no Dolphin.exe with this run's user folder (not started, or exited)" }
+  $handle = [Win]::Largest($Ids)
+  if ($handle -eq [IntPtr]::Zero) { throw "no window of Dolphin $Ids on this desktop (closed: Dolphin stopping?)" }
+  $rect = New-Object Win+RECT
+  [Win]::GetClientRect($handle, [ref]$rect) | Out-Null
+  $bitmap = New-Object System.Drawing.Bitmap ([Math]::Max(1, $rect.Right)), ([Math]::Max(1, $rect.Bottom))
+  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+  $dc = $graphics.GetHdc()
+  # PW_CLIENTONLY | PW_RENDERFULLCONTENT: the client area as the GPU drew it
+  [Win]::PrintWindow($handle, $dc, 3) | Out-Null
+  $graphics.ReleaseHdc($dc)
+  $bitmap.Save($Output, [System.Drawing.Imaging.ImageFormat]::Png)
+  $graphics.Dispose(); $bitmap.Dispose()
+  return [Win]::Title($handle)
+}
+# (this run's Dolphin: the one given this run's user folder, not another program's; looked up until it is
+# there, then kept)
+$pattern = "*" + [Management.Automation.WildcardPattern]::Escape($UserFolder) + "*"
+$ids = @()
+$ended = "the limit of $Limit s"
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$looked = -1000
+while ($clock.Elapsed.TotalSeconds -lt $Limit) {
+  if (Test-Path (Join-Path $Work "shot-stop")) { $ended = "stopped"; break }
+  if ($clock.ElapsedMilliseconds - $looked -ge 1000) {
+    $looked = $clock.ElapsedMilliseconds
+    if ($ids.Count -eq 0) {
+      $ids = @(Get-CimInstance Win32_Process -Filter "Name='Dolphin.exe'" | Where-Object { $_.CommandLine -like $pattern } |
+        ForEach-Object { [uint32]$_.ProcessId })
+    } elseif (-not @($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })) {
+      $ended = "Dolphin exited"; break
+    }
+  }
+  foreach ($request in @(Get-ChildItem -Path $Work -Filter "shot-*.req" -ErrorAction SilentlyContinue)) {
+    $base = Join-Path $Work $request.BaseName
+    Remove-Item -Force $request.FullName
+    try { Answer "$base.txt" ("ok " + (Capture ([uint32[]]$ids) "$base.png")) } catch { Answer "$base.txt" "error: $_" }
+  }
+  Start-Sleep -Milliseconds 50
+}
+Answer (Join-Path $Work "shot-end.txt") $ended
 """
 
 
@@ -206,6 +242,68 @@ $c.Close()
 """
 
 GDB_PORT = 55020
+
+
+class Shooter:
+    """Screenshots of the render window while Dolphin still runs. Dolphin.exe: CAPTURE_PS1 started on Dolphin's
+    desktop beside it, asked by a file and answering within 50 ms; a Linux Dolphin: xwd on the virtual display.
+    A title's last line is followed by its power-off, which closes Dolphin in a second or two: the shot is taken
+    as the line is seen."""
+
+    def __init__(self, work: Path, user: Path, display: str = "", limit: float = 0):
+        self.work, self.user, self.display, self.count, self.helper = work, user, display, 0, None
+        for old in work.glob("shot-*"):
+            old.unlink(missing_ok=True)
+        if not NATIVE:
+            (work / "capture.ps1").write_text(CAPTURE_PS1)
+            self.helper = subprocess.Popen(
+                [windows_tool("powershell.exe"), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                 to_windows(work / "desktop.ps1"), "launch", to_windows(user), "powershell.exe",
+                 base64.b64encode(subprocess.list2cmdline(
+                     ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", to_windows(work / "capture.ps1"),
+                      to_windows(work), to_windows(user), str(int(limit))]).encode()).decode()],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def shoot(self, output: Path, wait: float = 15) -> tuple[bool, str]:
+        """the render window to OUTPUT (left as it was on a failure): (True, its title) or (False, why not)"""
+        if NATIVE:
+            try:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                return True, x_screenshot(self.display, output)
+            except (ValueError, subprocess.CalledProcessError) as error:
+                return False, str(error)
+        self.count += 1
+        base = self.work / f"shot-{self.count}"
+        answer, end = Path(f"{base}.txt"), self.work / "shot-end.txt"
+        Path(f"{base}.req").touch()
+        # (the helper's start, before its first answer, takes a few seconds)
+        deadline = time.monotonic() + wait
+        while not answer.exists():
+            if end.exists() or time.monotonic() > deadline:
+                Path(f"{base}.req").unlink(missing_ok=True)
+                why = end.read_text(errors="replace").strip() if end.exists() else f"no answer in {wait:g} s"
+                return False, f"the capture helper had ended ({why})"
+            time.sleep(0.05)
+        text = answer.read_text(errors="replace").strip()
+        answer.unlink(missing_ok=True)
+        image = Path(f"{base}.png")
+        if not text.startswith("ok") or not image.exists() or image.stat().st_size <= 200:
+            image.unlink(missing_ok=True)
+            return False, text if not text.startswith("ok") else "an empty capture"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(image), output)
+        return True, text[2:].strip()
+
+    def stop(self) -> None:
+        if self.helper is None:
+            return
+        (self.work / "shot-stop").touch()
+        try:
+            self.helper.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.helper.kill()
+        for old in self.work.glob("shot-*"):
+            old.unlink(missing_ok=True)
 
 
 def find_gdb():
@@ -697,7 +795,9 @@ def main() -> int:
     parser.add_argument("--sd-out", type=Path, metavar="DIR",
                         help="after the run, copy here what the program wrote to the card (files new or changed "
                              "since --sd, with their folders): a log, a save")
-    parser.add_argument("--screenshot", type=Path, help="save the render window here (PNG)")
+    parser.add_argument("--screenshot", type=Path,
+                        help="save the render window here (PNG): at the end, or as the --until line is seen and again "
+                             "2 s later (the later one kept while Dolphin is still there)")
     parser.add_argument("--single-core", action="store_true",
                         help="the GPU emulated on the CPU's thread (slower; no CPU/GPU races)")
     parser.add_argument("--mmu", action="store_true",
@@ -780,7 +880,6 @@ def main() -> int:
     program = work / args.program.name
     shutil.copyfile(args.program, program)
     if not NATIVE:
-        (work / "capture.ps1").write_text(CAPTURE_PS1)
         (work / "desktop.ps1").write_text(DESKTOP_PS1)
     xvfb = None
     if not NATIVE:
@@ -810,6 +909,10 @@ def main() -> int:
     except OSError as error:
         print(f"dolphin_run.py: {error}", file=sys.stderr)
         return 3
+    shooter = None
+    if args.screenshot and not (NATIVE and dolphin.name == "dolphin-emu-nogui"):
+        shooter = Shooter(work, user, environment.get("DISPLAY", "") if NATIVE else "", args.seconds + 600)
+    shot, shot_note = False, ""
     debugger = None
     if args.backtrace:
         (work / "relay.ps1").write_text(RELAY_PS1)
@@ -833,9 +936,15 @@ def main() -> int:
             break
         if args.until and any(args.until in line for line in lines):
             seen_until = True
+            if shooter is not None:
+                # (at once: the line may be a title's last, its power-off next; the shot after 2 s replaces it)
+                shot, shot_note = shooter.shoot(args.screenshot)
             time.sleep(2)  # the frame after it reaches the screen
             break
-        if stamps is not None:
+        if shooter is not None and args.until and stamps is None:
+            # (the --until line seen within a quarter second, while the window is still there)
+            time.sleep(0.25)
+        elif stamps is not None:
             # (four looks a second: a stamp a quarter second late at most)
             for _ in range(4):
                 time.sleep(0.25)
@@ -854,30 +963,17 @@ def main() -> int:
         for line in gdb_backtrace(debugger).splitlines():
             if line.strip() and not line.startswith(("warning:", "Type ", "For help")):
                 print(f"  {line}")
-    if args.screenshot and NATIVE:
-        try:
-            args.screenshot.parent.mkdir(parents=True, exist_ok=True)
-            print(f"screenshot: {args.screenshot} ({x_screenshot(environment['DISPLAY'], args.screenshot)})")
-        except (ValueError, subprocess.CalledProcessError) as error:
-            print(f"no screenshot: {error}", file=sys.stderr)
-    elif args.screenshot:
-        capture = work / "capture.png"
-        # (a window is seen only from its own desktop: the capture runs there too)
-        subprocess.run([windows_tool("powershell.exe"), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                        to_windows(work / "desktop.ps1"), "launch", to_windows(user), "powershell.exe",
-                        base64.b64encode(subprocess.list2cmdline(
-                            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", to_windows(work / "capture.ps1"),
-                             to_windows(capture), to_windows(user)]).encode()).decode()],
-                       capture_output=True, text=True)
-        title = Path(f"{capture}.title")
-        if capture.exists() and capture.stat().st_size > 200:
-            args.screenshot.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(capture), args.screenshot)
-            print(f"screenshot: {args.screenshot} ({title.read_text().strip() if title.exists() else ''})")
+    if shooter is not None:
+        later, note = shooter.shoot(args.screenshot)
+        if later or not shot:
+            shot, shot_note = later, note
+        elif shot:
+            shot_note += f" (as --until was seen; 2 s later: {note})"
+        if shot:
+            print(f"screenshot: {args.screenshot} ({shot_note})")
         else:
-            print(f"no screenshot: {title.read_text().strip() if title.exists() else 'the capture did not run'}",
-                  file=sys.stderr)
-        title.unlink(missing_ok=True)
+            print(f"no screenshot: {shot_note}" + (" (Dolphin had exited by itself)" if exited else ""), file=sys.stderr)
+        shooter.stop()
     if NATIVE:
         # (Dolphin stops the emulation on SIGINT, writing the card back; flatpak passes it on)
         process.send_signal(signal.SIGINT)

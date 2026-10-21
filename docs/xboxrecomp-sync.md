@@ -126,7 +126,8 @@ full SHAs and takes the release name from the newest such commit at or before th
 
 Taken on 2026-10-19, from v0.13.1 (193e299): 98 commits (122 with merges), 17 vendored files added and
 33 changed, none removed; `check-map` clean (516 upstream files, 175 vendored, 39 patches). Upstream's
-head had moved on to v0.15.0 (6376eb8) by then; that range is untriaged. What it brought:
+head had moved on to v0.15.0 (6376eb8) by then; that range is untriaged ("Since the sync, and the next one"
+below). What it brought:
 
 | Area | Upstream commits | What WiiLibs did |
 |---|---|---|
@@ -176,6 +177,43 @@ kernel call, 11 fewer of 347 million by the 131,072nd: loops shaped by the new f
 and the deterministic mode counts each. With backward jumps costing nothing, the two builds play b30
 identically, its audio included.
 
+## Since the sync, and the next one
+
+Patches after the sync: 0040 (above) came with it; 0041 (stack frames: `--stack-icall`, `--stack-align`,
+`--stack-alloca` for `--stack-locals`, halo.json's `stack_icall`, `stack_align`, `stack_alloca`) came with
+wave 6 on v0.14.0's lifter. On 2026-10-21 the copy is at v0.14.0 (eb0aa1d), triaged to it, with 40 patch
+files (0001-0041, 0009 dropped); `status` says every one applies and `check-map` is clean (516 upstream
+files mapped, 175 vendored, 95 rules, 40 patches).
+
+Upstream's head is v0.16.0 (f0f8a46, 2026-10-20): 104 commits (28 merges) after v0.14.0, of which v0.15.0
+(6376eb8, 2026-10-19) is 91 (24 merges). `brief --to` each of them: 14 of the 40 patches apply to v0.15.0 as
+they are (0001-0005, 0007, 0008, 0015, 0019, 0027, 0028, 0030, 0032, 0040), 13 to v0.16.0 (0040 no longer:
+v0.16.0 reworks `tools/disasm/functions.py`'s table entries in a gap, adc827c and 4953472). The other 26 fail on the context
+of `lifter.py`, `translator.py`, `__main__.py` and `recomp_types.h`, which both releases changed; they are
+rebased the way v0.14.0's were (`patch-repo`, a rebase, `export-patches`), each compared with upstream's
+version of the same fix.
+
+What the next sync must not lose:
+- **A real lifter bug: `movsx r32, bp/sp` zero-extends** at v0.14.0 (the register list for a 16-bit
+  source lacks bp and sp; upstream facb626 in v0.15.0 sign-extends). Halo's `.text` has 213 `movsx r32, bp`
+  (a linear sweep with capstone; `sp` none), loop counters and indices kept as signed shorts in ebp
+  (`inc ebp; movsx ecx, bp; cmp ecx, eax; jl`): wrong whenever the short is negative, and Halo marks "none"
+  with -1. A one-line backport (the list in `Lifter`'s movsx case) is worth a patch before the sync, with
+  upstream's `test_lifter_movsx_reg16.py` as its case.
+- More lifter fixes: `pushfd`/`popfd` through a `g_eflags` image with OF and PF rebuilt (e1864d5), `pop esp`
+  (54b64ca), 16-bit `push`/`pop` move esp by 2 (114193f, v0.16.0), `cpuid` as the Pentium III, x87 trig
+  reduced with the hardware's 66-bit pi (b3c90cf: fsin/fcos of large arguments change, against 0016),
+  `lahf` after a carry setter declares `_cf` (e3f6373), an MSVC offset frame owns its frame (c9c9701).
+- Discovery moves the function set again (functions after an embedded switch table, `__chkstk` prologues
+  and vcall thunks, function-pointer tables in code gaps, functions past `nop` padding, byte index tables
+  never entries): the deterministic goldens move with it, as at v0.14.0, and 0040 is rewritten against
+  v0.16.0's proof (or dropped, if it finds Halo's fmod entries itself: the deterministic a10 run says).
+- Opt-in options to look at for Halo: `--entry-stubs`, `--back-edge-yield`, `--skip-library-immediates`,
+  `RECOMP_STUB_LOG=1`.
+- Found at v0.14.0 and still open: on an x86 host upstream's `recomp_rcpss`/`recomp_rsqrtss` are the CPU's
+  12-bit estimates while the Wii computes exactly (Halo has no `rcpss`/`rsqrtss`, so its runs agree); the
+  helper lists of 0013 and 0036 lack `expm1`/`log1p` (an `f2xm1` site spills the x87 stack).
+
 ## Reference numbers
 
 The smoke check on the reference title, Halo: Combat Evolved retail (01.10.12.2276), so a later
@@ -222,3 +260,12 @@ reports each one reached).
   loop that runs through two function starts is still a chain of host tail calls (none in Halo).
 - Upstream's Halo work used the debug build `cachebeta.xbe`, not retail; addresses in upstream's
   code and docs are that build's.
+
+## Patches that are upstream's own
+
+`0042-movsx-bp-sp.patch` is upstream's facb626 (v0.15.0: `movsx r32, bp/sp` sign-extends; v0.14.0
+zero-extends them, and Halo's `.text` has 213 `movsx r32, bp`) taken as it is, its pytest file
+included, plus the conformance case `movsx_bp_32`. At the sync to v0.15.0 or later it no longer
+applies (upstream has its lifter line and its test file): drop those two from it in `patch-repo` and
+keep the case alone (it runs the instruction on the CPU, which upstream's test does not); the lifted C
+does not change.

@@ -57,13 +57,61 @@ uintptr_t wl_xb_mmio_fault_pc(void);
 // read looks only when something waits (wl_xb_device_safe_point; a read raises no device's line).
 extern uint32_t g_xb_mmio_last_write;
 
-// Counters for tests and reports.
+// Counters for tests and reports. reads and writes are the device calls (a fault each); fast_reads
+// and fast_writes the accesses to a mirrored page answered without the device's call (a fault the
+// handler answered at once: wl_xb_mmio_fast_*); check_* the mirror's check (below).
 typedef struct {
     uint32_t reads, writes, unclaimed;
+    uint32_t fast_reads, fast_writes;
+    uint32_t check_reads, check_misses;
 } WlXbMmioStats;
 void wl_xb_mmio_stats(WlXbMmioStats *out);
-// The `top` 256-byte blocks of registers accessed most (device, block, read or written), a line each.
+// The `top` registers accessed most over the run (device, offset, read or written), a line each.
 void wl_xb_mmio_log_hot(const char *tag, uint32_t top);
+// The status line's part (every 10 s): the device faults since the last call over the frames shown
+// since (`flips`: wl_xb_gpu_flips), and the `top` registers and guest sites (the translated function
+// and the offset in it) of the window, a frame (those two the host's only: on the Wii the totals).
+void wl_xb_mmio_log_window(const char *tag, uint32_t flips, uint32_t top);
+
+// ---- Mirrored pages ------------------------------------------------------------------------------
+// A page of device registers whose reads have no effect and whose values change only by the guest's
+// writes to that page (the NV2A's PFB page with the write-back cache's flush; the APU's front-end
+// FIFO with its free count) is mirrored: a page of memory holds what each of its words reads, the
+// device's own reads at the start and the written word read again after each write. Where the
+// platform maps it for reading (the host's PROT_READ; the Wii's read-only PTE when the MMU keeps a
+// store out of one: a probe at the first mirror), a guest read is a plain load and never faults; a
+// store faults as before and goes to the device. Where it is not mapped (an MMU without page
+// protection: Dolphin's, if it has none), a read still faults and the handler answers it from the
+// page without the device's call or the safe point (wl_xb_mmio_fast_read), in exception context
+// on the Wii. A write the device only keeps (a value, some bits dropped: the flush that is done at
+// once) may be answered so too: a WlXbMmioFastStore.
+//
+// A mirrored read is no device access: it is no safe point, and the deterministic mode, which
+// counts device accesses in its clock, mirrors nothing (its runs stay comparable with the Wii's and
+// with earlier builds'). Off: a file "nommiomirror" in the title folder, WL_XB_NOMMIOMIRROR on the
+// host (wl_xb_mmio_set_mirrors). WL_XB_MMIO_CHECK on the host keeps the pages unmapped and compares
+// every read's device value with the page's (check_misses), the deterministic mode included.
+typedef struct {
+    uint32_t offset; // in the page, word aligned; 4-byte stores only
+    uint32_t keep;   // the bits of the stored value the register keeps
+    uint32_t *model; // the device model's copy of the register (it reads it from there)
+} WlXbMmioFastStore;
+// Set before the devices attach (boot): mirrors on (the default) or off, and the check.
+void wl_xb_mmio_set_mirrors(bool on, bool check);
+// Mirrors the page at guest VA `va` (page aligned, inside a registered device; at most
+// WL_XB_MIRROR_PAGES, mem_internal.h). `stores` (kept, not copied) are the writes answered at once.
+// WL_OK also when mirrors are off or the run is deterministic (nothing done); WL_ERR_ARG for a page
+// no device covers; WL_ERR_UNSUPPORTED when the backend has no page for it.
+WlResult wl_xb_mmio_mirror(uint32_t va, const WlXbMmioFastStore *stores, uint32_t n_stores);
+// The word of a mirrored page at `va` read again from its device (a value the device changed by
+// itself). Nothing for a page that is not mirrored.
+void wl_xb_mmio_mirror_refresh(uint32_t va);
+// The fault handler's answer without the device (exception-safe: integers, no locks, no calls out):
+// a read of `size` bytes (1, 2, 4) from a mirrored page, the value as wl_xb_mmio_read gives it; a
+// store of a WlXbMmioFastStore's word. false when it is not one (the device's call follows) or when
+// the guest lock is wanted (the attention up: the safe point's work is due).
+bool wl_xb_mmio_fast_read(uint32_t va, unsigned size, uint32_t *value);
+bool wl_xb_mmio_fast_write(uint32_t va, uint32_t value, unsigned size);
 
 // ---- Fault handling ----------------------------------------------------------------------------
 

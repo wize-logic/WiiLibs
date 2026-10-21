@@ -35,6 +35,12 @@ uintptr_t wl_xb_backend_thread_handle(void);
 // a thread that keeps the guest lock: called with 0 afterwards, while the caller still waits and
 // once it is done, to log what was gathered.
 void wl_xb_backend_probe(uintptr_t handle);
+// A device page the guest reads without a fault (mmio.h's mirrors): `ea` (a device EA, page aligned)
+// mapped read-only (or, `readable` false, not at all: a check's faults) over a page of host memory,
+// whose read-write alias is returned (NULL when none is left or the backend cannot). A store to it
+// faults as before. At most WL_XB_MIRROR_PAGES in a run.
+#define WL_XB_MIRROR_PAGES 4u
+uint8_t *wl_xb_backend_mirror(uint32_t ea, bool readable);
 #if !defined(__wii__)
 // The host's fault on guest RAM under a frame limit (fault_posix.c asks first): WL_OK when the page
 // is open now (the access runs again); WL_ERR_UNSUPPORTED when the EA is not paged guest RAM (no

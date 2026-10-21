@@ -335,12 +335,101 @@ TEST the_recent_calls_found_by_the_callers_words(void) {
     PASS();
 }
 
+// the caller's words as the device has them for the memo: the structure's words a function of the state's
+// (here turned), the constants as the state holds them
+static void memo_words_of(const uint32_t *state, uint32_t *words) {
+    for (int i = 0; i < WL_XBOX_PSH_WORDS; i++) {
+        bool constant = (i >= WL_XBOX_PSH_CONSTANT0_0 && i < WL_XBOX_PSH_CONSTANT1_0 + 8) ||
+                        i == WL_XBOX_PSH_FINAL_CONSTANT0 || i == WL_XBOX_PSH_FINAL_CONSTANT1;
+        words[i] = constant ? state[i] : state[i] ^ 0x5A5A5A5Au;
+    }
+}
+
+static WlXboxPshCache g_plain;
+
+// a device's call: the memo, else the cache and the call remembered
+static const WlXboxPshProgram *memo_call(WlXboxPshCache *cache, const uint32_t *state,
+                                         const WlXboxPshTextures *textures, bool *usable) {
+    uint32_t words[WL_XBOX_PSH_WORDS];
+    const WlXboxPshProgram *program;
+    bool translated;
+
+    memo_words_of(state, words);
+    program = wl_xbox_psh_cache_recent(cache, words, 3, textures, usable);
+    if (program == NULL) {
+        program = wl_xbox_psh_cache_program(cache, state, 3, textures, usable, &translated);
+        wl_xbox_psh_cache_remember(cache, words, 3, textures);
+    }
+    return program;
+}
+
+// wl_xbox_psh_cache_set_memo: the calls remembered by their structure give what the cache gives without
+// them (a cache of its own: the same programs, byte for byte, and fresh translations), for programs drawn
+// in turn with their constants changed within their signatures (patched by the memo) and outside them,
+// with the fog's colour changed, and after more structures than the cache holds
+TEST the_memo_gives_what_the_cache_gives(void) {
+    static uint32_t states[3][WL_XBOX_PSH_WORDS];
+    WlXboxPshTextures textures[3];
+    WlXboxPshCacheCounts counts, plain;
+    unsigned long differ = 0, fresh_differ = 0, calls = 0;
+
+    wl_xbox_psh_cache_init(&g_cache, NULL);
+    wl_xbox_psh_cache_init(&g_plain, NULL);
+    wl_xbox_psh_cache_set_memo(&g_cache, true);
+    for (int n = 0; n < 900; n++) {
+        int which = n % 3;
+        bool usable, plain_usable, translated;
+        const WlXboxPshProgram *program, *expected;
+
+        if (n % 30 < 3) {
+            program_random(states[which], &textures[which]);
+        } else if (rnd() % 4u == 0) {
+            constants_change(states[which], &textures[which], rnd() % 4u == 0 ? false : true);
+        }
+        if (n >= 600 && n % 60 == 0) {
+            // (more structures than the cache holds: the remembered calls' entries pushed out)
+            for (int flood = 0; flood < WL_XBOX_PSH_CACHE_SETS * WL_XBOX_PSH_CACHE_WAYS; flood++) {
+                static uint32_t other[WL_XBOX_PSH_WORDS];
+                WlXboxPshTextures other_textures;
+
+                program_random(other, &other_textures);
+                (void)memo_call(&g_cache, other, &other_textures, &usable);
+                (void)wl_xbox_psh_cache_program(&g_plain, other, 3, &other_textures, &usable, &translated);
+            }
+        }
+        program = memo_call(&g_cache, states[which], &textures[which], &usable);
+        expected = wl_xbox_psh_cache_program(&g_plain, states[which], 3, &textures[which], &plain_usable, &translated);
+        calls++;
+        if (usable != plain_usable || (usable && memcmp(program, expected, sizeof *program))) {
+            differ++;
+        }
+        if (n % 7 == 0) {
+            bool fresh_usable = wl_xbox_psh_translate(states[which], &textures[which], NULL, &g_fresh);
+
+            if (usable != fresh_usable || (usable && memcmp(program, &g_fresh, sizeof g_fresh))) {
+                fresh_differ++;
+            }
+        }
+    }
+    wl_xbox_psh_cache_counts(&g_cache, &counts);
+    wl_xbox_psh_cache_counts(&g_plain, &plain);
+    ASSERT_EQ(0ul, differ);
+    ASSERT_EQ(0ul, fresh_differ);
+    // (found by the memo, some of them patched; fewer translations than calls)
+    ASSERT(counts.recent > calls / 4);
+    ASSERT(counts.patched > 0);
+    ASSERT(counts.evicted > 0);
+    ASSERT_EQ(plain.audits_differ, counts.audits_differ);
+    PASS();
+}
+
 SUITE(psh_cache_suite) {
     RUN_TEST(a_translation_by_way_is_the_translation);
     RUN_TEST(cached_programs_are_fresh_translations);
     RUN_TEST(the_last_call_and_the_extra_word);
     RUN_TEST(the_cache_translates_through_its_recipe);
     RUN_TEST(the_recent_calls_found_by_the_callers_words);
+    RUN_TEST(the_memo_gives_what_the_cache_gives);
 }
 
 GREATEST_MAIN_DEFS();

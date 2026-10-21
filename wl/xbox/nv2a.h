@@ -67,6 +67,13 @@ void wl_nv2a_destroy(WlNv2a *dev);
 // GET to PUT before it returns, then GET = PUT.
 uint32_t wl_nv2a_mmio_read(WlNv2a *dev, uint32_t offset, unsigned size);
 void wl_nv2a_mmio_write(WlNv2a *dev, uint32_t offset, uint32_t value, unsigned size);
+// PFB's first page (0x100000..0x100FFF: the memory's configuration and the write-combining buffer's
+// flush, WL_NV2A_PFB_WBC) reads with no effect and changes only by the guest's writes to it, so a
+// runtime may keep a copy of it the guest reads as memory. The flush is done at once: a write of
+// WBC keeps the value without WL_NV2A_PFB_WBC_FLUSH, in the word returned here (a runtime that
+// answers that write itself stores there, as wl_nv2a_mmio_write would).
+#define WL_NV2A_PFB_PAGE 0x100000u
+uint32_t *wl_nv2a_pfb_wbc_word(WlNv2a *dev);
 // The host's vertical blank: PCRTC's interrupt (if the title enabled it), the frame counters.
 void wl_nv2a_vblank(WlNv2a *dev);
 // An interrupt is pending and enabled (PMC_INTR_0 with PMC_INTR_EN_0): the runtime runs the

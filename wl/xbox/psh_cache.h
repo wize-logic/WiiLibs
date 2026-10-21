@@ -25,7 +25,14 @@ enum {
     WL_XBOX_PSH_CACHE_EVICTED_HASHES = 256,
     /* the recent calls remembered by the caller's own words for them
     (wl_xbox_psh_cache_recent), by a hash of the words */
-    WL_XBOX_PSH_CACHE_RECENT = 32
+    WL_XBOX_PSH_CACHE_RECENT = 32,
+    /* the calls remembered by the structure of the caller's words, its
+    constants left out (wl_xbox_psh_cache_set_memo): 32 sets of 8 (about 56 KB), a structure's
+    variants (other textures, constants of other signatures) side by side;
+    the words of a structure (all but the 18 constants) */
+    WL_XBOX_PSH_CACHE_MEMO = 256,
+    WL_XBOX_PSH_CACHE_MEMO_WAYS = 8,
+    WL_XBOX_PSH_STRUCTURE_WORDS = 39
 };
 
 typedef struct WlXboxPshCacheCounts {
@@ -83,6 +90,10 @@ typedef struct WlXboxPshCacheEntry {
     /* counts each change of its key, constants or program (the recent calls
     that found it hold for it while it is as they found it) */
     uint32_t version;
+    /* counts each change of its key, its program's translation or whether it
+    is generic: not a patch of its constants (the memo's calls hold for it
+    while it is as they found it) */
+    uint32_t structure_version;
     /* the way its translation took (wl_xbox_psh_translate_by_way) */
     int way;
     bool usable;
@@ -114,6 +125,21 @@ typedef struct WlXboxPshCache {
         uint32_t words[WL_XBOX_PSH_WORDS];
         WlXboxPshTextures textures;
     } recent[WL_XBOX_PSH_CACHE_RECENT];
+    /* wl_xbox_psh_cache_recent and _remember by the structure of the
+    caller's words (wl_xbox_psh_cache_set_memo): the words but the
+    constants, the extra word, the textures but the fog's colour, and the
+    structure's entry as it was then (its structure_version); entry NULL: none */
+    bool memo;
+    uint32_t memo_stamp;
+    struct {
+        uint32_t hash, structure_version, extra, stamp;
+        WlXboxPshCacheEntry *entry;
+        uint32_t words[WL_XBOX_PSH_STRUCTURE_WORDS];
+        WlXboxPshTextures textures;
+    } memo_calls[WL_XBOX_PSH_CACHE_MEMO];
+    /* each constant slot's last value and its signature (the structure's
+    signatures made again only where a constant changed) */
+    uint32_t signature_values[WL_XBOX_PSH_CACHE_SLOTS], signatures[WL_XBOX_PSH_CACHE_SLOTS];
     /* (the calls' own: the key looked up, the programs compared) */
     WlXboxPshCacheKey key;
     WlXboxPshProgram expected, trial, audit;
@@ -140,5 +166,14 @@ const WlXboxPshProgram *wl_xbox_psh_cache_recent(WlXboxPshCache *cache, const ui
 /* the last wl_xbox_psh_cache_program's program remembered for the caller's words it made `state` of */
 void wl_xbox_psh_cache_remember(WlXboxPshCache *cache, const uint32_t *words, uint32_t extra,
                                 const WlXboxPshTextures *textures);
+/* With `on` (off after wl_xbox_psh_cache_init), wl_xbox_psh_cache_recent and wl_xbox_psh_cache_remember
+remember the calls by the structure of the caller's words: all of them but the constants (which the caller's
+words must hold where `state` does: WL_XBOX_PSH_CONSTANT0_0 on, the final constants), the extra word and the
+textures but the fog's colour. A recent call then finds the structure's entry while its structure is as it was:
+its program as it is when the constants and the fog's colour are the entry's; else, when the entry is generic and
+the constants keep its signatures, the entry patched for them (counted as wl_xbox_psh_cache_program counts it);
+NULL otherwise (other signatures, an audit due, an entry not generic or for a set of constants). The program is
+what wl_xbox_psh_cache_program would give, a program of other constants patched without a hash of the state. */
+void wl_xbox_psh_cache_set_memo(WlXboxPshCache *cache, bool on);
 /* the counts since wl_xbox_psh_cache_init */
 void wl_xbox_psh_cache_counts(const WlXboxPshCache *cache, WlXboxPshCacheCounts *counts);

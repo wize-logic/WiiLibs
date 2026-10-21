@@ -95,6 +95,30 @@ screen-space position's divide and viewport among them; pr_dead_now: the one bei
 static unsigned char pr_dead[WL_XBOX_VSH_MAX_INSTRUCTIONS];
 static int pr_dead_now;
 
+/* (fused: the split lighting pass, pr_split_plan. A form whose colours need constants the registers
+cannot hold with the rest runs as two loops over the batch: pass A (pr_split 1) the instructions the
+other outputs need and its words but the colours', storing at each instruction pass B reads a half
+of A's (a move) that half to the vertex's scratch in the slot; pass B (pr_split 2) the instructions
+the colours alone need, each move loaded back where it is read, and the colours' words, its
+constants loaded once a pass. The arithmetic and its order are the one loop's. pr_split_off: one
+loop, as before: xbox_vsh_codegen --no-split) */
+enum { PR_SPLIT_MOVES = 24, PR_SPLIT_AT = 112, PR_SPLIT_COLOURS = WL_XBOX_VSH_LIVE_D0 | WL_XBOX_VSH_LIVE_D1 };
+static int pr_split_off, pr_split, pr_split_count;
+/* (xbox_vsh_codegen --split-always: every form pr_split_plan splits written split, cheaper or not) */
+static int pr_split_always;
+/* (each instruction: bit 0 pass A runs it, bit 1 pass B, bit 2 pass B its outputs alone) */
+static unsigned char pr_split_runs[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+static struct {
+    int index, temporary, half, slot; /* (temporary -1 - n: input register n) */
+    int keep;                         /* (pass B's own lanes kept, bit 1 ps0, bit 0 ps1: merged) */
+} pr_split_moves[PR_SPLIT_MOVES];
+/* (pass B: each input register's halves at slots pr_split_input[n] and on, -1 for none) */
+static int pr_split_input[16], pr_split_slots;
+/* (the form's own outputs, pass A's liveness reads them all; the pass's key) */
+static unsigned pr_split_live;
+static WlXboxVshFusedKey pr_split_key;
+static int pr_input_row(unsigned input);
+
 /* the constants that may be loaded once a batch, and how often each is loaded in a vertex */
 static char pr_keys[PR_KEYS][80];
 static int pr_key_uses[PR_KEYS], pr_key_count, pr_hoist_limit, pr_counting;
@@ -295,7 +319,8 @@ static void pr_text(const char *format, ...) {
 }
 
 static void pr_new_label(char *name, size_t size) {
-    snprintf(name, size, ".Lp%%=_%d", pr_label++);
+    /* (split, pass B: its own names, the emulation's labels being the function's) */
+    snprintf(name, size, pr_split == 2 ? ".Lq%%=_%d" : ".Lp%%=_%d", pr_label++);
 }
 
 static void pr_place_label(const char *name) {
@@ -631,7 +656,7 @@ static int pr_pair(const WlXboxVshInstruction *instruction, const WlXboxVshOpera
         return pr_op3(name, a, b, -1);
     }
     case _mux_input:
-        return pr_memory_pair("%[v]", 16 * instruction->input, s0, s1, 0);
+        return pr_memory_pair("%[v]", pr_input_row(instruction->input), s0, s1, 0);
     case _mux_constant: {
         const char *base;
         int offset;
@@ -666,7 +691,7 @@ static int pr_scalar(const WlXboxVshInstruction *instruction, const WlXboxVshOpe
     if ((operand->mux == _mux_input || operand->mux == _mux_constant) && !(s & 1)) {
         /* (the pair that has it in ps0: often loaded for another lane) */
         const char *base = "%[v]";
-        int offset = 16 * instruction->input;
+        int offset = pr_input_row(instruction->input);
 
         *negate = operand->negate;
         if (operand->mux == _mux_constant)
@@ -844,7 +869,7 @@ static void pr_mac(const WlXboxVshInstruction *in, unsigned needed, PrLane resul
                 const WlXboxVshOperand *a = &in->operands[0];
 
                 if (a->mux == _mux_input && (a->swizzle[2] & 3) == 2) {
-                    azw = pr_load(2, "%[v]", 16 * in->input + 8, 0);
+                    azw = pr_load(2, "%[v]", pr_input_row(in->input) + 8, 0);
                     negate[0] = a->negate;
                     if (negate[0]) {
                         /* (-z, 1): the negation is B's */
@@ -1870,7 +1895,8 @@ static void pr_liveness(const WlXboxVshProgram *program, const unsigned *needs, 
         live[pr_temporary_index(program->light.normal)] |= 0xe;
     /* (a "w" form sends the world position: its x, y and z read as the program ends, or where the
     clip-space position is captured: pr_world_spill) */
-    if (pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD && program->world.found && !pr_world_spill)
+    if (pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD && program->world.found && !pr_world_spill &&
+        pr_split != 2)
         live[pr_temporary_index(program->world.temporary)] |= 0xe;
     for (index = (long)program->count - 1; index >= (long)from; index--) {
         const WlXboxVshInstruction *in = &program->instructions[index];
@@ -2239,6 +2265,11 @@ static int pr_fused_sphere(int index) {
 /* (before the loop: the GQRs; the outputs no instruction writes, once) */
 static void pr_fused_start(const WlXboxVshProgram *program, const unsigned *needs, int reused) {
     pr_fused_operands(program, needs, reused);
+    /* (split: pass A's GQRs kept for pass B) */
+    if (pr_split == 2) {
+        pr_defaults(program);
+        return;
+    }
     pr_op(1, 0, 0, NULL, "mfspr 0, 918");
     pr_op(1, 0, 0, NULL, "stw 0, %d(%%[f])", (int)offsetof(WlXboxVshFused, saved));
     pr_op(1, 0, 0, NULL, "mfspr 0, 919");
@@ -2612,6 +2643,187 @@ static int pr_fused_root(int x, int half_x) {
 }
 
 /* GX's words from the outputs (vertices_pack's), where %[w] says */
+/* (split) the instructions each pass runs and the moves, for the form key (its live the whole
+form's; needs: wl_xbox_vsh_live_needs'); 0 when the form is not split: no colour or nothing else, a
+lit form, a colours' instruction in the prefix, reading an input, a0 or the clip-space capture, or
+a half both passes wrote that pass B reads */
+static int pr_split_plan(const WlXboxVshProgram *program, const unsigned *needs, const WlXboxVshFusedKey *key,
+                         int reused, const ReusePrefix *prefix) {
+    unsigned colours = key->live & PR_SPLIT_COLOURS, others = key->live & ~(unsigned)PR_SPLIT_COLOURS;
+    unsigned char last[13][4], loaded[13][2];
+    unsigned inputs[16] = {0};
+    unsigned long index, input_at[16];
+    int b = 0, t, h, k, which;
+
+    if (pr_split_off || key->lit || !colours || !key->colors)
+        return 0;
+    if (key->perspective == WL_XBOX_VSH_FUSED_WORLD)
+        others |= WL_XBOX_VSH_LIVE_POSITION;
+    if (!others)
+        return 0;
+    memset(last, 0, sizeof(last));
+    memset(loaded, 0, sizeof(loaded));
+    pr_split_count = 0;
+    for (index = 0; index < program->count; index++) {
+        const WlXboxVshInstruction *in = &program->instructions[index];
+        int out = in->output_mask && in->output_is_register && (in->output_from_ilu ? in->ilu : in->mac) != 0;
+        unsigned char runs = 0, by;
+        unsigned reads[3], lanes;
+
+        if (needs[index] & others)
+            runs |= 1;
+        if ((needs[index] & colours) && !(needs[index] & others))
+            runs |= 2;
+        else if ((needs[index] & colours) && out && (pr_output_live(in->output_address) & colours))
+            runs |= 2 | 4;
+        pr_split_runs[index] = runs;
+        if (!runs)
+            continue;
+        if (runs & 2) {
+            b = 1;
+            if (in->captures_clip || in->relative)
+                return 0;
+            pr_reads(in, runs & 4 ? WRITE_OUTPUTS : WRITE_ALL, reads);
+            for (which = 0; which < 3; which++) {
+                if (!reads[which])
+                    continue;
+                if (in->operands[which].mux == _mux_input) {
+                    /* (stored where pass B first reads it, past the prefix) */
+                    if (!inputs[in->input & 15])
+                        input_at[in->input & 15] = reused && index < prefix->end ? prefix->end : index;
+                    inputs[in->input & 15] |= reads[which];
+                    continue;
+                }
+                if (in->operands[which].mux != _mux_temporary)
+                    continue;
+                t = pr_temporary_index(in->operands[which].index);
+                for (h = 0; h < 2; h++) {
+                    int a = 0, keep = 0;
+
+                    for (k = 2 * h; k < 2 * h + 2; k++) {
+                        a |= (reads[which] & (8u >> k)) && last[t][k] == 1;
+                        keep |= last[t][k] == 2 ? 2 >> (k & 1) : 0;
+                    }
+                    if (!a || loaded[t][h])
+                        continue;
+                    /* (a move in the prefix, which pass A runs at some vertices alone) */
+                    if (pr_split_count >= PR_SPLIT_MOVES || (reused && index < prefix->end))
+                        return 0;
+                    pr_split_moves[pr_split_count].keep = keep;
+                    pr_split_moves[pr_split_count].slot = pr_split_count;
+                    pr_split_moves[pr_split_count].index = (int)index;
+                    pr_split_moves[pr_split_count].temporary = t;
+                    pr_split_moves[pr_split_count++].half = h;
+                    loaded[t][h] = 1;
+                }
+            }
+        }
+        if (runs & 1) {
+            /* (pass A reads nothing pass B alone writes) */
+            pr_reads(in, WRITE_ALL, reads);
+            for (which = 0; which < 3; which++)
+                if (in->operands[which].mux == _mux_temporary)
+                    for (k = 0; k < 4; k++)
+                        if ((reads[which] & (8u >> k)) && last[pr_temporary_index(in->operands[which].index)][k] == 2)
+                            return 0;
+        }
+        /* (the lanes written: by pass A when it runs the instruction, else by pass B) */
+        by = (runs & 1) ? 1 : (runs & 4) ? 0 : 2;
+        if (!by)
+            continue;
+        for (which = 0; which < 3; which++) {
+            if (which == 0) {
+                if (in->mac == _mac_nop || in->mac == _mac_arl || !in->mac_mask)
+                    continue;
+                t = pr_temporary_index(in->temporary);
+                lanes = in->mac_mask;
+            } else if (which == 1) {
+                if (in->ilu == _ilu_nop || !in->ilu_mask)
+                    continue;
+                t = pr_temporary_index(in->mac != _mac_nop ? 1 : in->temporary);
+                lanes = in->ilu_mask;
+            } else {
+                if (!out || in->output_address != _output_position)
+                    continue;
+                t = 12;
+                lanes = in->output_mask;
+            }
+            for (k = 0; k < 4; k++)
+                if (lanes & (8u >> k)) {
+                    last[t][k] = by;
+                    if (by == 1)
+                        loaded[t][k >> 1] = 0;
+                }
+        }
+    }
+    /* (the input registers pass B reads: both halves' slots, the halves read stored) */
+    pr_split_slots = pr_split_count;
+    for (k = 0; k < 16; k++) {
+        pr_split_input[k] = -1;
+        if (!inputs[k])
+            continue;
+        pr_split_input[k] = pr_split_slots;
+        for (h = 0; h < 2; h++) {
+            if (!(inputs[k] & (0xcu >> (2 * h))))
+                continue;
+            if (pr_split_count >= PR_SPLIT_MOVES)
+                return 0;
+            pr_split_moves[pr_split_count].slot = pr_split_slots + h;
+            pr_split_moves[pr_split_count].index = (int)input_at[k];
+            pr_split_moves[pr_split_count].temporary = -1 - k;
+            pr_split_moves[pr_split_count].keep = 0;
+            pr_split_moves[pr_split_count++].half = h;
+        }
+        pr_split_slots += 2;
+    }
+    return b;
+}
+
+/* (split) an input register's row: pass B's in its scratch (pr_split_input) */
+static int pr_input_row(unsigned input) {
+    if (pr_split == 2 && pr_split_input[input & 15] >= 0)
+        return 8 * pr_split_input[input & 15];
+    return 16 * (int)input;
+}
+
+/* (split, pass A) the vertex's scratch at %[g]: the slot's word 1 its offset in the slot, moved on */
+static void pr_split_scratch(void) {
+    if (pr_split != 1 || !pr_split_count)
+        return;
+    pr_text("lwz %%[g], 4(%%[slot])");
+    pr_text("addi 0, %%[g], %d", 8 * pr_split_slots);
+    pr_text("stw 0, 4(%%[slot])");
+    pr_text("add %%[g], %%[g], %%[slot]");
+}
+
+/* (split) the moves at an instruction: pass A's halves stored to the vertex's scratch (%[g]),
+pass B's loaded from it (%[v]) */
+static void pr_split_moves_at(unsigned long index) {
+    int n, values[1];
+
+    for (n = 0; n < pr_split_count; n++) {
+        int t = pr_split_moves[n].temporary, h = pr_split_moves[n].half, at = 8 * pr_split_moves[n].slot;
+
+        if (pr_split_moves[n].index != (int)index)
+            continue;
+        if (pr_split == 1) {
+            values[0] = t < 0 ? pr_memory_pair("%[v]", 16 * (-1 - t), 2 * h, 2 * h + 1, 0) : pr_half(t, h);
+            pr_op(0, 0, 1, values, "psq_st @0, %d(%%[g]), 0, 0", at);
+        } else if (t >= 0) {
+            /* (an input pass B reads from the scratch where it is read: pr_input_row) */
+            values[0] = pr_new();
+            pr_values[values[0]].fresh = 0;
+            pr_op(0, 1, 1, values, "psq_l @0, %d(%%[v]), 0, 0", at);
+            /* (a lane pass B wrote last kept: ps_merge01 of the two) */
+            if (pr_split_moves[n].keep == 2)
+                values[0] = pr_fused_op("ps_merge01", pr_half(t, h), values[0], -1);
+            else if (pr_split_moves[n].keep == 1)
+                values[0] = pr_fused_op("ps_merge01", values[0], pr_half(t, h), -1);
+            pr_def[t][h] = values[0];
+        }
+    }
+}
+
 static void pr_fused_epilogue(void) {
     const WlXboxVshFusedKey *key = pr_fuse;
     char other[24], done[24];
@@ -2620,6 +2832,23 @@ static void pr_fused_epilogue(void) {
     if (!pr_early) {
         pr_text("lwz %%[ad], 0*%%[ptr](%%[w])");
         pr_text("addi %%[w], %%[w], %%[ptr]");
+    }
+    /* (split, pass B: the colours' words alone, after the words before them) */
+    if (pr_split == 2) {
+        int projected = 0;
+
+        for (n = 0; n < key->stage_count; n++) {
+            unsigned kind = key->stages[n] >> 2;
+
+            if (kind == WL_XBOX_VSH_FUSED_STAGE_SPHERE_XF || kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTED ||
+                kind == WL_XBOX_VSH_FUSED_STAGE_PROJECTED_LINEAR) {
+                word += 3;
+                projected++;
+            }
+        }
+        for (; projected > 1 && projected < 3; projected++)
+            word += 3;
+        goto colours;
     }
     /* the position: (x w, y w, -w) in pixels from the clip-space position
     the program captured, else the screen-space position and the depth */
@@ -2762,10 +2991,14 @@ static void pr_fused_epilogue(void) {
             pr_fused_store(zero, "stfs @0, %d(%%[ad])", 4 * word + 8);
         }
     }
+colours:
+    /* (split, pass A: the colours pass B's) */
+    if (pr_split == 1)
+        word += key->colors;
     /* the colours: each component's byte, value * 255 + 1/2 cut down (a lit
     form's d0 its alpha alone: r, g and b whatever the output held; a value that is %[k]'s 0, the
     output's start value or a write of it, 0 itself, its bytes 0: pr_fold_off, not, as before) */
-    for (n = 0; n < key->colors; n++, word++) {
+    for (n = 0; n < key->colors && pr_split != 1; n++, word++) {
         const char *field = n == 0 ? "%[od0]" : "%[od1]";
         int half;
 
@@ -2804,7 +3037,7 @@ static void pr_fused_epilogue(void) {
         }
     }
     /* the texture coordinates (stage_texcoord's) */
-    for (n = 0; n < key->stage_count; n++, word += 2) {
+    for (n = 0; n < key->stage_count && pr_split != 2; n++, word += 2) {
         unsigned stage = key->stages[n] & 3u, kind = key->stages[n] >> 2;
         int at, st;
 
@@ -2956,9 +3189,14 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
 
         /* (a "w" form: the instructions the position needs kept, the world position among them; the
         clip-space position's own then dead, pr_liveness') */
-        unsigned keep = pr_fuse->live | (pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD ? WL_XBOX_VSH_LIVE_POSITION : 0u);
+        unsigned keep = pr_fuse->live | (pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD && pr_split != 2
+                                             ? WL_XBOX_VSH_LIVE_POSITION
+                                             : 0u);
 
-        if (pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD &&
+        /* (split: pass A's liveness the whole form's, pr_split_moves' halves made) */
+        if (pr_split == 1)
+            keep |= pr_split_live;
+        if (pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD && pr_split != 2 &&
             (!program->world.found || !program->captures_clip || (!program->world.to_end && !pr_world_spill)))
             return 0;
         pr_program_world = program->world.temporary;
@@ -2997,7 +3235,25 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
                 drop |= needs[index] && program->instructions[index].captures_clip;
         if (pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD)
             drop = 2;
-        pr_liveness(program, needs, 0, after, drop);
+        if (pr_split == 2)
+            drop = 1;
+        if (pr_split == 1) {
+            unsigned short own = pr_split_key.live;
+
+            pr_split_key.live = (unsigned short)pr_split_live;
+            pr_liveness(program, needs, 0, after, drop);
+            pr_split_key.live = own;
+        } else {
+            pr_liveness(program, needs, 0, after, drop);
+        }
+    }
+    /* (split: the pass's instructions alone) */
+    if (pr_split) {
+        static unsigned split_needs[WL_XBOX_VSH_MAX_INSTRUCTIONS];
+
+        for (index = 0; index < program->count; index++)
+            split_needs[index] = (pr_split_runs[index] & pr_split) ? needs[index] : 0u;
+        needs = split_needs;
     }
     /* (each block's test: a condition register bit set once a batch) */
     pr_need_count = 0;
@@ -3057,7 +3313,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         }
     }
     pr_place_label(top);
-    if (pr_fuse)
+    if (pr_fuse && pr_split != 2)
         pr_fused_prologue();
     /* the prefix: made, or kept while the inputs it reads are the vertex before's */
     if (reused) {
@@ -3142,6 +3398,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
             pr_text("lwz %%[ad], 0*%%[ptr](%%[w])");
             pr_text("addi %%[w], %%[w], %%[ptr]");
         }
+        pr_split_scratch();
         pr_use_weight = 4;
         pr_prefix_end = pr_body_count;
         pr_forward_on = 1;
@@ -3188,9 +3445,12 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
             pr_text("lwz %%[ad], 0*%%[ptr](%%[w])");
             pr_text("addi %%[w], %%[w], %%[ptr]");
         }
+        pr_split_scratch();
         pr_forward_on = 1;
     }
     for (index = start; index < program->count && !pr_failed; index++) {
+        if (pr_split)
+            pr_split_moves_at(index);
         if (!needs[index])
             continue;
         if (needs[index] != open) {
@@ -3202,7 +3462,8 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         }
         memcpy(pr_live_after, after[index], sizeof(pr_live_after));
         pr_dead_now = pr_dead[index];
-        pr_instruction(&program->instructions[index], WRITE_ALL);
+        pr_instruction(&program->instructions[index],
+                       pr_split == 2 && (pr_split_runs[index] & 4) ? WRITE_OUTPUTS : WRITE_ALL);
     }
     pr_dead_now = 0;
     if (open != ~0u)
@@ -3214,7 +3475,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
         int values[1], live = (pr_fuse->live & WL_XBOX_VSH_LIVE_POSITION) != 0;
 
         if (!(pr_fuse->perspective && pr_fused_captured) && pr_fuse->perspective != WL_XBOX_VSH_FUSED_XF &&
-            pr_fuse->perspective != WL_XBOX_VSH_FUSED_WORLD) {
+            pr_fuse->perspective != WL_XBOX_VSH_FUSED_WORLD && pr_split != 2) {
             values[0] = live ? pr_half(12, 0) : pr_k(0, PRK_ZERO);
             pr_op(0, 0, 1, values, "psq_st @0, 0(%%[o]), 0, 0");
             pr_forward_store(0, 8, values[0]);
@@ -3247,7 +3508,7 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
             pr_lit_values[0] = pr_half(program->light.normal, 0);
             pr_lit_values[1] = pr_half(program->light.normal, 1);
         }
-        if (pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD && !pr_world_spill) {
+        if (pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD && !pr_world_spill && pr_split != 2) {
             pr_world_values[0] = pr_half(program->world.temporary, 0);
             pr_world_values[1] = pr_half(program->world.temporary, 1);
         }
@@ -3261,8 +3522,12 @@ static int pr_generate(const WlXboxVshProgram *program, const unsigned *needs, i
             pr_text("mr %%[v], %%[pv]");
             pr_text("mr %%[pv], %%[ad]");
         }
+        if (pr_split == 2)
+            pr_text("addi %%[v], %%[v], %d", 8 * pr_split_slots);
         pr_text("bdnz %s", top);
-        pr_fused_end();
+        /* (split: the GQRs pass B's, restored after it) */
+        if (pr_split != 1)
+            pr_fused_end();
         if (!pr_failed)
             pr_sweep();
         if (!pr_failed && pr_spill)
@@ -3721,6 +3986,21 @@ static long pr_cost(int prefix) {
     return cost;
 }
 
+/* (split) a loop's cost for a batch of nine vertices, about the forms' average: its ops before the
+loop and nine times the loop's (pr_cost, a prefix's ops three sixteenths) */
+static long pr_split_cost(void) {
+    long cost = 9 * pr_cost(3);
+    int n;
+
+    for (n = 0; n < pr_pre_count; n++) {
+        size_t length = strlen(pr_pre[n].text);
+
+        if (length && pr_pre[n].text[length - 1] != ':')
+            cost += 16;
+    }
+    return cost;
+}
+
 /* a program's asm (pr_program_once): with a reused prefix, the loads hoisted chosen by their count
 and by their count weighted (pr_weighted), the cheaper loop kept */
 static int pr_program(const WlXboxVshProgram *program, const unsigned *needs, int reused,
@@ -3761,28 +4041,41 @@ static void pr_print(FILE *out, int reused) {
     unsigned used = pr_used;
     int n, k;
 
-    if (pr_fuse) {
+    if (pr_fuse && pr_split == 2) {
+        /* (split, pass B: after pass A in the same batch, the count set again: pass A's scratch) */
+        fprintf(out, "\t\t\tslot[0] = (int)n;\n");
+    } else if (pr_fuse) {
         /* (each array's element 0 and stride, and the packed normal's tables, in registers; the
-        count through slot, live unused: GCC's 30 operands and the GPRs) */
+        count through slot, live unused: GCC's 30 operands and the GPRs. Split: the moves' scratch
+        in the slot from PR_SPLIT_AT, WL_XBOX_VSH_BATCH vertices a time) */
         fprintf(out, "\tif (count) {\n\t\tconst char *vp = (const char *)fused->inputs[1];\n"
                      "\t\tconst char *pvp = (const char *)fused->inputs[0];\n\t\tchar *op = (char *)&fused->output;\n"
                      "\t\tconst uint32_t *ep = fused->elements;\n\t\tuint32_t *const *wp = fused->words;\n"
                      "\t\tint slot[%d] __attribute__((aligned(8)));\n\t\tlong g, ra, a0, ad;\n",
-                pr_spill ? PR_SPILL_AT / 4 + 2 * PR_SPILLS : 4);
+                pr_split ? PR_SPLIT_AT / 4 + 2 * pr_split_slots * WL_XBOX_VSH_BATCH
+                         : pr_spill ? PR_SPILL_AT / 4 + 2 * PR_SPILLS : 4);
         for (k = 0; k < 16; k++)
             if (pr_fused_held & (1u << k))
                 fprintf(out, "\t\tconst char *d%d = (const char *)fused->data[%d];\n\t\tlong s%d = (long)fused->stride[%d];\n",
                         k, k, k, k);
         if (pr_fused_cmp())
             fprintf(out, "\t\tconst float *t11 = fused->cmp11, *t10 = fused->cmp10;\n");
-        fprintf(out, "\n\t\t(void)pvp;\n\t\t(void)live;\n\t\tslot[0] = (int)count;\n\t\tslot[2] = 0;\n");
+        if (pr_split)
+            fprintf(out,
+                    "\n\t\t(void)pvp;\n\t\t(void)live;\n\t\twhile (count) {\n"
+                    "\t\t\tunsigned n = count < WL_XBOX_VSH_BATCH ? count : WL_XBOX_VSH_BATCH;\n"
+                    "\t\t\tchar *sp = (char *)slot + %d;\n\t\t\tuint32_t *const *wq = wp;\n\n"
+                    "\t\t\tcount -= n;\n\t\t\tslot[0] = (int)n;\n\t\t\tslot[1] = %d;\n\t\t\tslot[2] = 0;\n",
+                    PR_SPLIT_AT, PR_SPLIT_AT);
+        else
+            fprintf(out, "\n\t\t(void)pvp;\n\t\t(void)live;\n\t\tslot[0] = (int)count;\n\t\tslot[2] = 0;\n");
     } else
         fprintf(out, "\tif (count) {\n\t\tconst char *vp = (const char *)vs;\n\t\tchar *op = (char *)os;\n"
                      "\t\tint slot[2];\n\t\tlong g, ra, a0;\n\n");
     /* (a "w" form's world slot in a register, [ws], where the statement's operands stay within GCC's
     30, an in-and-out one ("+") counted twice; else r12) */
     pr_ws_register = 0;
-    if (pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD) {
+    if (pr_fuse && pr_fuse->perspective == WL_XBOX_VSH_FUSED_WORLD && pr_split != 2) {
         int operands = 7 + 3 + (reused ? 2 : 0) + 6 + (pr_uses_c2 ? 1 : 0) + (pr_fused_fdata() ? 1 : 0) +
                        (pr_fused_cmp() ? 2 : 0) + 1;
 
@@ -3851,10 +4144,13 @@ static void pr_print(FILE *out, int reused) {
         }
         fprintf(out, "\\n\\t\"\n");
     }
-    if (pr_fuse)
-        fprintf(out, "\t\t\t: [v] \"+b\"(vp), [g] \"=&r\"(g), [ra] \"=&b\"(ra), [a0] \"=&r\"(a0),\n"
+    if (pr_fuse && pr_split == 2)
+        fprintf(out, "\t\t\t: [v] \"+b\"(sp), [g] \"=&r\"(g), [ra] \"=&b\"(ra), [a0] \"=&r\"(a0),\n"
+                     "\t\t\t  [w] \"+b\"(wq), [ad] \"=&b\"(ad)");
+    else if (pr_fuse)
+        fprintf(out, "\t\t\t: [v] \"+b\"(vp), [g] \"=&%s\"(g), [ra] \"=&b\"(ra), [a0] \"=&r\"(a0),\n"
                      "\t\t\t  [e] \"+b\"(ep), [w] \"+b\"(wp), [ad] \"=&b\"(ad)%s",
-                reused ? ", [pv] \"+b\"(pvp)" : "");
+                pr_split ? "b" : "r", reused ? ", [pv] \"+b\"(pvp)" : "");
     else
         fprintf(out, "\t\t\t: [v] \"+b\"(vp), [o] \"+b\"(op), [g] \"=&r\"(g), [ra] \"=&b\"(ra), [a0] \"=&r\"(a0)");
     if (pr_fuse) {
@@ -3862,10 +4158,10 @@ static void pr_print(FILE *out, int reused) {
                      "[f] \"b\"(fused), [ptr] \"i\"(sizeof(void *))%s",
                 pr_uses_c2 ? "[c2] \"b\"(c + 128), " : "",
                 pr_fused_fdata() ? ", [fdata] \"i\"(offsetof(WlXboxVshFused, data))" : "");
-        for (k = 0; k < 16; k++)
+        for (k = 0; k < 16 && pr_split != 2; k++)
             if (pr_fused_held & (1u << k))
                 fprintf(out, ",\n\t\t\t  [d%d] \"b\"(d%d), [s%d] \"r\"(s%d)", k, k, k, k);
-        if (pr_fused_cmp())
+        if (pr_fused_cmp() && pr_split != 2)
             fprintf(out, ",\n\t\t\t  [t11] \"b\"(t11), [t10] \"b\"(t10)");
         if (pr_ws_register == 1)
             fprintf(out, ",\n\t\t\t  [ws] \"r\"(fused->world_slot)");
@@ -3892,6 +4188,10 @@ static void pr_print(FILE *out, int reused) {
     for (k = 0; k < 32; k++)
         if (used & (1u << k))
             fprintf(out, ", \"fr%d\"", k);
-    fprintf(out, ");\n\t\t(void)g;\n\t\t(void)ra;\n\t\t(void)a0;\n%s\t}\n",
+    if (pr_split == 1) {
+        fprintf(out, ");\n");
+        return;
+    }
+    fprintf(out, ");\n%s\t\t(void)g;\n\t\t(void)ra;\n\t\t(void)a0;\n%s\t}\n", pr_split == 2 ? "\t\t}\n" : "",
             pr_fuse ? "\t\t(void)ad;\n" : "");
 }

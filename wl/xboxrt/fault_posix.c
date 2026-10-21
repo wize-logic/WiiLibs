@@ -36,13 +36,14 @@ static bool g_installed;
 static const int k_greg[16] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
                                REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
 
-static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *pc) {
+static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *pc, bool *fast) {
     WlXbX86Regs r;
     mcontext_t *mc = &uc->uc_mcontext;
     for (int i = 0; i < 16; i++) {
         r.gpr[i] = (uint64_t)mc->gregs[k_greg[i]];
     }
     r.rip = (uint64_t)mc->gregs[REG_RIP];
+    *fast = false;
     r.rflags = (uint64_t)mc->gregs[REG_EFL];
     if (mc->fpregs != NULL) {
         memcpy(r.xmm, mc->fpregs->_xmm, sizeof r.xmm);
@@ -66,7 +67,7 @@ static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *p
 #elif defined(__powerpc__) && !defined(__powerpc64__)
 #define PPC_NIP 32
 #define PPC_LNK 36
-static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *pc) {
+static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *pc, bool *fast) {
     unsigned long *g = uc->uc_mcontext.uc_regs->gregs;
     uint32_t nip = (uint32_t)g[PPC_NIP];
     *pc = nip;
@@ -83,7 +84,9 @@ static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *p
         gpr[i] = (uint32_t)g[i];
     }
     uint32_t ea = wl_xb_ppc_ea(&a, gpr);
-    if (!wl_xb_ppc_emulate(&a, gpr, ea, va)) {
+    // a mirrored page's answer without its device (mmio.h), as the Wii's handler gives it
+    *fast = wl_xb_ppc_fast(&a, gpr, ea, va);
+    if (!*fast && !wl_xb_ppc_emulate(&a, gpr, ea, va)) {
         *what = "no device at the address";
         return false;
     }
@@ -94,10 +97,11 @@ static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *p
     return true;
 }
 #else
-static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *pc) {
+static bool emulate(ucontext_t *uc, uint32_t va, const char **what, uintptr_t *pc, bool *fast) {
     (void)uc;
     (void)va;
     *pc = 0;
+    *fast = false;
     *what = "no instruction decoder for this host";
     return false;
 }
@@ -147,8 +151,11 @@ static void on_fault(int sig, siginfo_t *si, void *ctx) {
         }
     }
     if (va >= WL_XB_MMIO_BASE && wl_xb_mmio_find(va) != NULL) {
-        if (emulate((ucontext_t *)ctx, va, &what, &pc)) {
-            wl_xb_device_safe_point();
+        bool fast = false;
+        if (emulate((ucontext_t *)ctx, va, &what, &pc, &fast)) {
+            if (!fast) {
+                wl_xb_device_safe_point(); // (a mirror's answer is no device access: no safe point)
+            }
             return;
         }
         WlXbCrash c = {"device access the decoder cannot emulate", what, va, ea, pc, false};

@@ -1008,6 +1008,22 @@ int wl_xb_boot_run(const WlXbTitleConfig *cfg) {
     wl_xb_input_reset(false);
 #endif
     wl_xb_service_add_vblank_hook(input_vblank, NULL);
+    {
+        // device pages read as memory (mmio.h's mirrors: PFB's, the APU front end's), on unless a file
+        // "nommiomirror" (WL_XB_NOMMIOMIRROR on the host); WL_XB_MMIO_CHECK=1 on the host keeps every
+        // read the device's and compares it with the copy (the status line's "mirror check")
+        char flag[sizeof data_dir + 32];
+        snprintf(flag, sizeof flag, "%s/nommiomirror", cfg->title_dir);
+        bool off = wl_platform_fs_exists(flag), check = false;
+#if !defined(__wii__)
+        off = off || getenv("WL_XB_NOMMIOMIRROR") != NULL;
+        check = getenv("WL_XB_MMIO_CHECK") != NULL;
+#endif
+        wl_xb_mmio_set_mirrors(!off, check);
+        if (off) {
+            WL_LOG_I(TAG, "nommiomirror: every device register read through its fault");
+        }
+    }
     wl_xb_devices_register_mcpx();
     WlXbAudioConfig audio;
     wl_xb_audio_config_default(&audio);

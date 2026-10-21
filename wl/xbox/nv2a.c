@@ -774,6 +774,8 @@ static uint32_t read32(WlNv2a *dev, uint32_t offset) {
         return (uint32_t)(wl_nv2a_time(dev) >> 32) & 0x1FFFFFFFu;
     case WL_NV2A_PTIMER_ALARM_0:
         return dev->ptimer_alarm;
+    // (PFB's first page: no read here may have an effect or change but by a write to the page:
+    // WL_NV2A_PFB_PAGE, a runtime's copy of it)
     case WL_NV2A_PFB_CFG0: {
         bool found;
         uint32_t slot = reg_slot(dev, offset, &found);
@@ -979,6 +981,10 @@ uint32_t wl_nv2a_mmio_read(WlNv2a *dev, uint32_t offset, unsigned size) {
     }
     word = read32(dev, offset & ~3u);
     return (word >> shift) & lane_mask(size, 0);
+}
+
+uint32_t *wl_nv2a_pfb_wbc_word(WlNv2a *dev) {
+    return &dev->pfb_wbc;
 }
 
 static void mmio_write(WlNv2a *dev, uint32_t offset, uint32_t value, unsigned size);
